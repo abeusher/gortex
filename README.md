@@ -1,5 +1,9 @@
 # Gortex
 
+[![CI](https://github.com/zzet/gortex/actions/workflows/ci.yml/badge.svg)](https://github.com/zzet/gortex/actions/workflows/ci.yml)
+[![Go Report Card](https://goreportcard.com/badge/github.com/zzet/gortex)](https://goreportcard.com/report/github.com/zzet/gortex)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 Code intelligence engine that indexes repositories into an in-memory knowledge graph and exposes it via CLI, MCP Server, and web UI.
 
 Built for AI coding agents (Claude Code, Cursor, Codex) — one `get_editing_context` call replaces 5-10 file reads, cutting token usage by ~94%.
@@ -141,17 +145,38 @@ gortex binary
 
 **Edge kinds:** `calls`, `imports`, `defines`, `implements`, `extends`, `references`, `member_of`, `instantiates`
 
-## Language Support
+## Language Support (23 languages)
 
+### Code Languages
 | Language | Functions | Methods + MemberOf | Types | Interfaces | Imports | Calls | Variables |
 |----------|-----------|-------------------|-------|------------|---------|-------|-----------|
 | Go | Full | Full (receiver) | Full | Full + Meta["methods"] | Full | Full | Full |
 | TypeScript | Full | Full | Full | Full + Meta["methods"] | Full | Full | Full |
+| JavaScript | Full | Full | Full | - | Full | Full | Full |
 | Python | Full | Full | Full | - | Full | Full | Partial |
 | Rust | Full | Full (impl blocks) | Full | Full + Meta["methods"] | Full | Full | Full |
-| Java | - | Full | Full | Full + Meta["methods"] | Full | Partial | Fields |
+| Java | Full | Full | Full | Full + Meta["methods"] | Full | Full | Fields |
+| Kotlin | Full | Full | Full | Full | Full | Full | Properties |
+| Scala | Full | Full | Full | Full + Meta["methods"] | Full | Full | - |
+| Swift | Full | Full | Full | Full + Meta["methods"] | Full | Full | - |
+| PHP | Full | Full | Full | Full | Full | Full | - |
 | Ruby | Full | Full | Full | - | Full | Full | Constants |
 | Elixir | Full | Full (defmodule) | Modules | - | Full | Full | Attributes |
+| C | Full | - | Structs/Enums | - | Full | Full | Globals |
+| C++ | Full | Full | Classes/Structs | - | Full | Full | - |
+| Bash | Full | - | - | - | source/. | Full | Exports |
+
+### Data & Config Languages
+| Language | What it extracts |
+|----------|-----------------|
+| SQL | Tables (with columns), views, functions, indexes, triggers |
+| Protobuf | Messages (with fields), services + RPCs, enums, imports |
+| HTML | Script/link references, element IDs |
+| CSS | Class selectors, ID selectors, custom properties, @import |
+| YAML | Top-level keys |
+| TOML | Tables, key-value pairs |
+| HCL | Resource/data/module/variable/output blocks |
+| Dockerfile | FROM (base images), ENV/ARG variables |
 
 ## Building
 
@@ -168,6 +193,10 @@ go build -ldflags "-X main.version=v0.3.0" -o gortex ./cmd/gortex/
 
 Requires Go 1.21+ and CGO enabled (for tree-sitter C bindings).
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on adding features, language extractors, and submitting PRs.
+
 ## License
 
-MIT
+MIT - see [LICENSE](LICENSE) for details.
