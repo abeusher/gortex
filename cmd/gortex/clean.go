@@ -23,6 +23,9 @@ func runClean(_ *cobra.Command, _ []string) error {
 	}
 	dirs := []string{
 		".claude/commands",
+		".kiro/steering",
+		".kiro/hooks",
+		".kiro/settings",
 	}
 
 	removed := 0
@@ -54,6 +57,7 @@ func runClean(_ *cobra.Command, _ []string) error {
 	} else {
 		fmt.Fprintf(os.Stderr, "[gortex clean] done (%d items removed)\n", removed)
 		fmt.Fprintln(os.Stderr, "Note: CLAUDE.md was not modified — remove the Gortex block manually if needed.")
+		fmt.Fprintln(os.Stderr, "Note: .kiro/steering/ files with 'gortex-' prefix were removed. Other .kiro/ files were preserved.")
 	}
 
 	return nil

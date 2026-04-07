@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 
 	"github.com/spf13/cobra"
@@ -21,7 +22,7 @@ var initAnalyze bool
 
 var initCmd = &cobra.Command{
 	Use:   "init [path]",
-	Short: "Set up Gortex for a project: creates .mcp.json, .claude/commands/, and CLAUDE.md block",
+	Short: "Set up Gortex for a project: creates configs for Claude Code and Kiro IDE",
 	Args:  cobra.MaximumNArgs(1),
 	RunE:  runInit,
 }
@@ -85,14 +86,22 @@ func runInit(_ *cobra.Command, args []string) error {
 		fmt.Fprintf(os.Stderr, "[gortex init] warning: could not install hook: %v\n", err)
 	}
 
+	// 6. Set up Kiro IDE integration
+	if err := setupKiro(root); err != nil {
+		fmt.Fprintf(os.Stderr, "[gortex init] warning: Kiro setup failed: %v\n", err)
+	}
+
 	fmt.Fprintf(os.Stderr, "[gortex init] done — created:\n")
-	fmt.Fprintf(os.Stderr, "  .mcp.json                     (MCP server config)\n")
-	fmt.Fprintf(os.Stderr, "  .claude/commands/gortex-*.md   (slash commands)\n")
-	fmt.Fprintf(os.Stderr, "  CLAUDE.md                      (Gortex instructions block)\n")
-	fmt.Fprintf(os.Stderr, "  .claude/settings.local.json    (PreToolUse hook)\n")
-	fmt.Fprintf(os.Stderr, "  ~/.claude/skills/gortex-*      (global skills)\n")
+	fmt.Fprintf(os.Stderr, "  .mcp.json                       (MCP server config — shared)\n")
+	fmt.Fprintf(os.Stderr, "  .claude/commands/gortex-*.md     (Claude Code slash commands)\n")
+	fmt.Fprintf(os.Stderr, "  CLAUDE.md                        (Claude Code instructions)\n")
+	fmt.Fprintf(os.Stderr, "  .claude/settings.local.json      (Claude Code PreToolUse hook)\n")
+	fmt.Fprintf(os.Stderr, "  ~/.claude/skills/gortex-*        (Claude Code global skills)\n")
+	fmt.Fprintf(os.Stderr, "  .kiro/settings/mcp.json          (Kiro MCP server config)\n")
+	fmt.Fprintf(os.Stderr, "  .kiro/steering/gortex-*.md       (Kiro steering files)\n")
+	fmt.Fprintf(os.Stderr, "  .kiro/hooks/gortex-*.json        (Kiro agent hooks)\n")
 	fmt.Fprintf(os.Stderr, "\nCommit these files so your team gets Gortex automatically.\n")
-	fmt.Fprintf(os.Stderr, "Run `gortex serve --index . --watch` or let Claude Code start it via .mcp.json.\n")
+	fmt.Fprintf(os.Stderr, "Run `gortex serve --index . --watch` or let your IDE start it via MCP config.\n")
 	return nil
 }
 
@@ -562,3 +571,331 @@ const commandRefactor = `# Refactoring with Gortex
 - Update callers (use find_usages for precise locations)
 - detect_changes to verify affected scope
 `
+
+// ─── Kiro IDE Integration ───────────────────────────────────────────────────
+
+// isKiroInstalled checks whether Kiro IDE is present on this system or project.
+// Returns true if any of: ~/.kiro exists, "kiro" is in PATH, or .kiro/ already exists in the project.
+func isKiroInstalled(root string) bool {
+	// 1. Project already has .kiro/ (team member uses Kiro).
+	if _, err := os.Stat(filepath.Join(root, ".kiro")); err == nil {
+		return true
+	}
+	// 2. User-level Kiro config exists.
+	if home, err := os.UserHomeDir(); err == nil {
+		if _, err := os.Stat(filepath.Join(home, ".kiro")); err == nil {
+			return true
+		}
+	}
+	// 3. "kiro" CLI is in PATH.
+	if path, err := exec.LookPath("kiro"); err == nil && path != "" {
+		return true
+	}
+	return false
+}
+
+// setupKiro creates .kiro/settings/mcp.json, .kiro/steering/*.md, and .kiro/hooks/*.json.
+// Only runs if Kiro is detected on the system or project.
+func setupKiro(root string) error {
+	if !isKiroInstalled(root) {
+		fmt.Fprintf(os.Stderr, "[gortex init] skip Kiro setup (Kiro not detected)\n")
+		return nil
+	}
+	fmt.Fprintf(os.Stderr, "[gortex init] setting up Kiro IDE integration...\n")
+
+	// 1. MCP config: .kiro/settings/mcp.json
+	kiroMCPDir := filepath.Join(root, ".kiro", "settings")
+	if err := os.MkdirAll(kiroMCPDir, 0o755); err != nil {
+		return fmt.Errorf("creating .kiro/settings: %w", err)
+	}
+	kiroMCPPath := filepath.Join(kiroMCPDir, "mcp.json")
+	if err := writeMergeKiroMCP(kiroMCPPath); err != nil {
+		return err
+	}
+
+	// 2. Steering files: .kiro/steering/gortex-*.md
+	steeringDir := filepath.Join(root, ".kiro", "steering")
+	if err := os.MkdirAll(steeringDir, 0o755); err != nil {
+		return fmt.Errorf("creating .kiro/steering: %w", err)
+	}
+	for name, content := range kiroSteering {
+		if err := writeIfNotExists(filepath.Join(steeringDir, name), content); err != nil {
+			return err
+		}
+	}
+
+	// 3. Hooks: .kiro/hooks/gortex-*.json
+	hooksDir := filepath.Join(root, ".kiro", "hooks")
+	if err := os.MkdirAll(hooksDir, 0o755); err != nil {
+		return fmt.Errorf("creating .kiro/hooks: %w", err)
+	}
+	for name, content := range kiroHooks {
+		if err := writeIfNotExists(filepath.Join(hooksDir, name), content); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// writeMergeKiroMCP writes or merges the gortex server into .kiro/settings/mcp.json.
+func writeMergeKiroMCP(path string) error {
+	var config map[string]any
+
+	if data, err := os.ReadFile(path); err == nil {
+		if err := json.Unmarshal(data, &config); err != nil {
+			config = make(map[string]any)
+		}
+	} else {
+		config = make(map[string]any)
+	}
+
+	servers, ok := config["mcpServers"].(map[string]any)
+	if !ok {
+		servers = make(map[string]any)
+	}
+
+	if _, exists := servers["gortex"]; exists {
+		fmt.Fprintf(os.Stderr, "[gortex init] skip %s (gortex server already configured)\n", path)
+		return nil
+	}
+
+	servers["gortex"] = map[string]any{
+		"command":  "gortex",
+		"args":     []string{"serve", "--index", ".", "--watch", "--port", "8766"},
+		"env":      map[string]string{"GORTEX_INDEX_WORKERS": "8"},
+		"disabled": false,
+		"autoApprove": []string{
+			"graph_stats", "search_symbols", "get_symbol", "get_file_summary",
+			"get_editing_context", "get_dependencies", "get_dependents",
+			"get_call_chain", "get_callers", "find_implementations", "find_usages",
+			"get_cluster", "get_symbol_signature", "get_symbol_source", "batch_symbols",
+			"find_import_path", "explain_change_impact", "get_recent_changes",
+			"smart_context", "get_edit_plan", "get_test_targets", "suggest_pattern",
+			"get_communities", "get_community", "get_processes", "get_process",
+			"detect_changes", "index_repository",
+		},
+	}
+	config["mcpServers"] = servers
+
+	data, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "[gortex init] created %s\n", path)
+	return nil
+}
+
+var kiroSteering = map[string]string{
+	"gortex-workflow.md": kiroSteeringWorkflow,
+	"gortex-explore.md":  kiroSteeringExplore,
+	"gortex-debug.md":    kiroSteeringDebug,
+	"gortex-impact.md":   kiroSteeringImpact,
+	"gortex-refactor.md": kiroSteeringRefactor,
+}
+
+const kiroSteeringWorkflow = `---
+inclusion: always
+---
+
+# Gortex Code Intelligence
+
+Gortex is running as an MCP server. It indexes this repository into an in-memory knowledge graph and exposes 28 tools for code navigation, impact analysis, and refactoring.
+
+## Use Gortex tools instead of file reads whenever possible
+
+| Instead of...                         | Use...                                   |
+|---------------------------------------|------------------------------------------|
+| Reading a whole file for one function | ` + "`get_symbol_source`" + ` (80% fewer tokens)   |
+| Reading to find a function            | ` + "`get_symbol`" + ` or ` + "`get_editing_context`" + `    |
+| Multiple ` + "`get_symbol`" + ` calls           | ` + "`batch_symbols`" + ` (one call for N symbols) |
+| Searching for references              | ` + "`find_usages`" + ` (zero false positives)     |
+| Searching to find a symbol by name    | ` + "`search_symbols`" + ` (BM25 + camelCase)      |
+| Reading to understand a file          | ` + "`get_file_summary`" + ` or ` + "`get_editing_context`" + ` |
+| Reading multiple files to trace calls | ` + "`get_call_chain`" + ` / ` + "`get_callers`" + `         |
+| Guessing an import path              | ` + "`find_import_path`" + `                       |
+| Reading files to assess change scope  | ` + "`explain_change_impact`" + `                  |
+| Reading to check a function signature | ` + "`get_symbol_signature`" + `                   |
+| Guessing which tests to run           | ` + "`get_test_targets`" + `                       |
+| Manual dependency ordering            | ` + "`get_edit_plan`" + `                          |
+| Reading files to learn a pattern      | ` + "`suggest_pattern`" + `                        |
+| 5-10 calls to explore for a task      | ` + "`smart_context`" + ` (one call)               |
+
+## Session workflow
+
+1. Call ` + "`graph_stats`" + ` to confirm Gortex is running and orient in the codebase.
+2. If ` + "`total_nodes`" + ` is 0, call ` + "`index_repository`" + ` with path ` + "`\".\"`" + `.
+3. For a new task, call ` + "`smart_context`" + ` with the task description.
+4. Before editing any file, call ` + "`get_editing_context`" + ` first.
+5. To see one function's code, call ` + "`get_symbol_source`" + ` instead of reading the file.
+6. Before any refactor, call ` + "`get_edit_plan`" + ` for dependency-ordered file list.
+7. Before committing, call ` + "`detect_changes`" + ` to verify scope.
+8. After editing, call ` + "`get_test_targets`" + ` to know which tests to run.
+`
+
+const kiroSteeringExplore = `---
+inclusion: manual
+---
+
+# Exploring Codebases with Gortex
+
+## Workflow
+
+1. ` + "`graph_stats`" + ` — confirm index, get node/edge counts
+2. ` + "`get_communities`" + ` — see functional clusters (architecture overview)
+3. ` + "`search_symbols({query: \"<concept>\"})`" + ` — find symbols related to a concept
+4. ` + "`get_processes`" + ` — discover execution flows
+5. ` + "`get_process({id: \"<process-id>\"})`" + ` — trace a specific flow step by step
+6. ` + "`get_editing_context({file_path: \"<file>\"})`" + ` — deep dive on a specific file
+
+## When to use
+
+- "How does authentication work?"
+- "What's the project structure?"
+- "Show me the main components"
+- Understanding code you haven't seen before
+
+## Key tools
+
+- ` + "`get_communities`" + ` for architectural overview (functional clusters with cohesion scores)
+- ` + "`get_processes`" + ` for execution flow discovery (entry points to call chains)
+- ` + "`search_symbols`" + ` for concept-based symbol search (BM25 + camelCase-aware)
+- ` + "`get_editing_context`" + ` for 360-degree file view (symbols, callers, callees, imports)
+`
+
+const kiroSteeringDebug = `---
+inclusion: manual
+---
+
+# Debugging with Gortex
+
+## Workflow
+
+1. ` + "`search_symbols({query: \"<error or suspect>\"})`" + ` — find related symbols
+2. ` + "`get_callers({function_id: \"<suspect>\"})`" + ` — who calls it?
+3. ` + "`get_call_chain({function_id: \"<suspect>\"})`" + ` — what does it call?
+4. ` + "`get_editing_context({file_path: \"<file>\"})`" + ` — full file context
+5. ` + "`get_process({id: \"<process>\"})`" + ` — trace execution flow
+
+## Debugging patterns
+
+| Symptom              | Gortex Approach |
+| -------------------- | --------------- |
+| Error message        | ` + "`search_symbols`" + ` for error-related names, then ` + "`get_callers`" + ` on throw sites |
+| Wrong return value   | ` + "`get_call_chain`" + ` on the function, trace callees for data flow |
+| Intermittent failure | ` + "`get_editing_context`" + `, look for external calls and async deps |
+| Performance issue    | ` + "`find_usages`" + `, find symbols with many callers (hot paths) |
+| Recent regression    | ` + "`detect_changes`" + `, see what your changes affect |
+`
+
+const kiroSteeringImpact = `---
+inclusion: manual
+---
+
+# Impact Analysis with Gortex
+
+## Workflow
+
+1. ` + "`search_symbols({query: \"X\"})`" + ` — find the symbol ID
+2. ` + "`explain_change_impact({symbol_ids: \"<id1>, <id2>\"})`" + ` — risk-tiered blast radius
+3. ` + "`get_dependents({id: \"<symbol-id>\", depth: 3})`" + ` — detailed dependent tree
+4. ` + "`detect_changes({scope: \"staged\"})`" + ` — pre-commit check
+
+## Risk tiers
+
+| Depth | Risk Level     | Meaning                  |
+| ----- | -------------- | ------------------------ |
+| d=1   | WILL BREAK     | Direct callers/importers |
+| d=2   | LIKELY AFFECTED| Indirect dependencies    |
+| d=3   | MAY NEED TESTING| Transitive effects      |
+
+## Before any non-trivial change
+
+- Call ` + "`explain_change_impact`" + ` with all symbols you plan to modify
+- Review the risk level (LOW/MEDIUM/HIGH/CRITICAL)
+- Check ` + "`by_depth`" + `: d=1 items WILL BREAK
+- Note ` + "`affected_processes`" + ` and ` + "`affected_communities`" + `
+- Check ` + "`test_files`" + ` that need re-running
+- Before commit: ` + "`detect_changes`" + ` to verify scope
+`
+
+const kiroSteeringRefactor = `---
+inclusion: manual
+---
+
+# Refactoring with Gortex
+
+## Workflow
+
+1. ` + "`search_symbols({query: \"X\"})`" + ` — find the symbol ID
+2. ` + "`explain_change_impact({symbol_ids: \"<id>\"})`" + ` — map blast radius
+3. ` + "`get_editing_context({file_path: \"<file>\"})`" + ` — see all symbols and relationships
+4. ` + "`find_usages({id: \"<id>\"})`" + ` — every reference to change
+5. ` + "`get_edit_plan({symbol_ids: \"<ids>\"})`" + ` — dependency-ordered edit sequence
+6. Edit in order: interfaces -> implementations -> callers -> tests
+7. ` + "`detect_changes({scope: \"all\"})`" + ` — verify after changes
+
+## Rename symbol
+
+- ` + "`find_usages`" + ` to get every reference location
+- ` + "`explain_change_impact`" + ` to assess blast radius
+- Edit in dependency order: definition, then callers, then tests
+
+## Extract module
+
+- ` + "`get_editing_context`" + ` on the source file to see all symbols
+- ` + "`get_dependents`" + ` on symbols to extract to find external callers
+- ` + "`find_import_path`" + ` for correct import paths in the new location
+
+## Split function/service
+
+- ` + "`get_call_chain`" + ` to understand all callees
+- ` + "`get_callers`" + ` to map all call sites that need updating
+- ` + "`explain_change_impact`" + ` for full blast radius
+`
+
+var kiroHooks = map[string]string{
+	"gortex-smart-context.json": `{
+  "name": "Gortex: Smart Context on Prompt",
+  "version": "1.0.0",
+  "description": "On each new prompt, calls smart_context to assemble task-relevant code context from the knowledge graph in one shot.",
+  "when": {
+    "type": "promptSubmit"
+  },
+  "then": {
+    "type": "askAgent",
+    "prompt": "If the user's message describes a coding task (adding a feature, fixing a bug, refactoring, understanding code), call Gortex's smart_context tool with the task description to get relevant symbols, source code, relationships, and an edit plan in one call. Skip this for non-coding questions or simple chat."
+  }
+}
+`,
+	"gortex-post-edit.json": `{
+  "name": "Gortex: Post-Edit Impact Check",
+  "version": "1.0.0",
+  "description": "After saving a source file, runs detect_changes and get_test_targets to show blast radius and which tests to run.",
+  "when": {
+    "type": "fileEdited",
+    "patterns": ["**/*.go", "**/*.ts", "**/*.tsx", "**/*.js", "**/*.jsx", "**/*.py", "**/*.rs", "**/*.java", "**/*.kt", "**/*.scala", "**/*.swift", "**/*.rb", "**/*.cs", "**/*.php"]
+  },
+  "then": {
+    "type": "askAgent",
+    "prompt": "A source file was just edited. Call Gortex detect_changes with scope unstaged to see which symbols were affected and the risk level. If symbols were changed, also call get_test_targets with those symbol IDs to identify which tests should be run. Briefly report the risk level and test commands."
+  }
+}
+`,
+	"gortex-pre-read.json": `{
+  "name": "Gortex: Enrich File Reads",
+  "version": "1.0.0",
+  "description": "Before reading a source file, calls get_editing_context to inject symbol context, callers, callees, and imports.",
+  "when": {
+    "type": "preToolUse",
+    "toolTypes": ["read"]
+  },
+  "then": {
+    "type": "askAgent",
+    "prompt": "Before reading this file, check if Gortex MCP server is available. If it is, call get_editing_context or get_file_summary for the file being read to get symbol context, callers, and callees first. This saves tokens and gives you architectural awareness before seeing the raw source. If the file is not a source code file (e.g. config, markdown, json), skip this step."
+  }
+}
+`}
