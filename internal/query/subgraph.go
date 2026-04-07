@@ -93,6 +93,118 @@ func (sg *SubGraph) ToDot() string {
 	return b.String()
 }
 
+// ToMermaid returns a Mermaid flowchart representation of the subgraph.
+// Renders in GitHub, Notion, and most markdown viewers.
+func (sg *SubGraph) ToMermaid() string {
+	var b strings.Builder
+	b.WriteString("graph LR\n")
+
+	// Mermaid node shapes by kind.
+	// [text] = rectangle, ([text]) = rounded, ((text)) = circle,
+	// {text} = diamond, >text] = flag, [(text)] = stadium
+	for _, n := range sg.Nodes {
+		safeID := mermaidID(n.ID)
+		label := fmt.Sprintf("%s\n%s", n.Name, n.Kind)
+
+		switch n.Kind {
+		case graph.KindFile:
+			fmt.Fprintf(&b, "  %s[\"%s\"]\n", safeID, mermaidEscape(label))
+		case graph.KindFunction, graph.KindMethod:
+			fmt.Fprintf(&b, "  %s([\"%s\"])\n", safeID, mermaidEscape(label))
+		case graph.KindType, graph.KindInterface:
+			fmt.Fprintf(&b, "  %s[\"%s\"]\n", safeID, mermaidEscape(label))
+		case graph.KindVariable:
+			fmt.Fprintf(&b, "  %s>\"%s\"]\n", safeID, mermaidEscape(label))
+		case graph.KindPackage:
+			fmt.Fprintf(&b, "  %s{\"%s\"}\n", safeID, mermaidEscape(label))
+		default:
+			fmt.Fprintf(&b, "  %s[\"%s\"]\n", safeID, mermaidEscape(label))
+		}
+	}
+
+	b.WriteString("\n")
+
+	// Mermaid edge styles by kind.
+	edgeStyles := map[graph.EdgeKind]string{
+		graph.EdgeCalls:        "-->",
+		graph.EdgeImports:      "-.->",
+		graph.EdgeDefines:      "-->",
+		graph.EdgeImplements:   "-. implements .->",
+		graph.EdgeExtends:      "-. extends .->",
+		graph.EdgeReferences:   "-->",
+		graph.EdgeMemberOf:     "-->",
+		graph.EdgeInstantiates: "-. new .->",
+	}
+
+	for _, e := range sg.Edges {
+		style := edgeStyles[e.Kind]
+		if style == "" {
+			style = "-->"
+		}
+		fromID := mermaidID(e.From)
+		toID := mermaidID(e.To)
+
+		// For simple arrow styles, add the edge kind as label.
+		if style == "-->" || style == "-.->"{
+			fmt.Fprintf(&b, "  %s %s|%s| %s\n", fromID, style, e.Kind, toID)
+		} else {
+			fmt.Fprintf(&b, "  %s %s %s\n", fromID, style, toID)
+		}
+	}
+
+	// Style classes for node coloring.
+	b.WriteString("\n")
+	kindCSS := map[graph.NodeKind]string{
+		graph.KindFile:      "fill:#607D8B,color:#fff",
+		graph.KindPackage:   "fill:#bb9af7,color:#fff",
+		graph.KindFunction:  "fill:#7aa2f7,color:#fff",
+		graph.KindMethod:    "fill:#7dcfff,color:#fff",
+		graph.KindType:      "fill:#9ece6a,color:#fff",
+		graph.KindInterface: "fill:#73daca,color:#fff",
+		graph.KindVariable:  "fill:#ff9e64,color:#fff",
+		graph.KindImport:    "fill:#795548,color:#fff",
+	}
+
+	// Group nodes by kind for class assignment.
+	byKind := make(map[graph.NodeKind][]string)
+	for _, n := range sg.Nodes {
+		byKind[n.Kind] = append(byKind[n.Kind], mermaidID(n.ID))
+	}
+	for kind, ids := range byKind {
+		css := kindCSS[kind]
+		if css == "" {
+			continue
+		}
+		fmt.Fprintf(&b, "  classDef %s %s\n", kind, css)
+		fmt.Fprintf(&b, "  class %s %s\n", strings.Join(ids, ","), kind)
+	}
+
+	return b.String()
+}
+
+// mermaidID converts a node ID to a Mermaid-safe identifier.
+// Mermaid IDs can't contain ::, /, or dots.
+func mermaidID(id string) string {
+	r := strings.NewReplacer(
+		"::", "_",
+		"/", "_",
+		".", "_",
+		"-", "_",
+		" ", "_",
+		"<", "_",
+		">", "_",
+		"(", "_",
+		")", "_",
+	)
+	return r.Replace(id)
+}
+
+// mermaidEscape escapes characters that break Mermaid labels.
+func mermaidEscape(s string) string {
+	s = strings.ReplaceAll(s, "\"", "#quot;")
+	return s
+}
+
 // DefaultOptions returns options with sensible defaults.
 func DefaultOptions() QueryOptions {
 	return QueryOptions{
