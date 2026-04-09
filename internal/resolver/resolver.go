@@ -59,6 +59,7 @@ func (r *Resolver) ResolveFile(filePath string) *ResolveStats {
 }
 
 func (r *Resolver) resolveEdge(e *graph.Edge, stats *ResolveStats) {
+	oldTo := e.To
 	target := strings.TrimPrefix(e.To, unresolvedPrefix)
 
 	switch {
@@ -68,6 +69,11 @@ func (r *Resolver) resolveEdge(e *graph.Edge, stats *ResolveStats) {
 		r.resolveMethodCall(e, strings.TrimPrefix(target, "*."), stats)
 	default:
 		r.resolveFunctionCall(e, target, stats)
+	}
+
+	// Update inEdges index if the target changed during resolution.
+	if e.To != oldTo {
+		r.graph.ReindexEdge(e, oldTo)
 	}
 }
 
@@ -195,7 +201,7 @@ func (r *Resolver) resolveMethodCall(e *graph.Edge, methodName string, stats *Re
 		}
 	}
 
-	// Fallback: name-only heuristic.
+	// Fallback: name-only heuristic (methods first, then functions for pkg.Func() calls).
 	for _, c := range candidates {
 		if c.Kind == graph.KindMethod && filepath.Dir(c.FilePath) == callerDir {
 			e.To = c.ID
@@ -205,6 +211,22 @@ func (r *Resolver) resolveMethodCall(e *graph.Edge, methodName string, stats *Re
 	}
 	for _, c := range candidates {
 		if c.Kind == graph.KindMethod {
+			e.To = c.ID
+			stats.Resolved++
+			return
+		}
+	}
+	// Package-qualified function calls (e.g. parser.ParseFile) arrive here
+	// because the extractor sees "pkg.Func()" as a selector call with "*." prefix.
+	for _, c := range candidates {
+		if c.Kind == graph.KindFunction && filepath.Dir(c.FilePath) == callerDir {
+			e.To = c.ID
+			stats.Resolved++
+			return
+		}
+	}
+	for _, c := range candidates {
+		if c.Kind == graph.KindFunction {
 			e.To = c.ID
 			stats.Resolved++
 			return

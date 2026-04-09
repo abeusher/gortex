@@ -141,6 +141,23 @@ func TestInferImplements_EmptyInterface(t *testing.T) {
 	assert.Equal(t, 0, added)
 }
 
+func TestResolveAll_PackageQualifiedFunctionCall(t *testing.T) {
+	g := graph.New()
+	// Caller in languages package calls parser.ParseFile — dispatched as "*.ParseFile"
+	g.AddNode(&graph.Node{ID: "internal/parser/languages/golang.go::GoExtractor.Extract", Kind: graph.KindMethod, Name: "Extract", FilePath: "internal/parser/languages/golang.go", Language: "go"})
+	g.AddNode(&graph.Node{ID: "internal/parser/treesitter.go::ParseFile", Kind: graph.KindFunction, Name: "ParseFile", FilePath: "internal/parser/treesitter.go", Language: "go"})
+
+	// This is how the Go extractor encodes pkg.Func() calls: "unresolved::*.ParseFile"
+	callEdge := &graph.Edge{From: "internal/parser/languages/golang.go::GoExtractor.Extract", To: "unresolved::*.ParseFile", Kind: graph.EdgeCalls, FilePath: "internal/parser/languages/golang.go", Line: 94}
+	g.AddEdge(callEdge)
+
+	r := New(g)
+	stats := r.ResolveAll()
+
+	assert.Equal(t, 1, stats.Resolved)
+	assert.Equal(t, "internal/parser/treesitter.go::ParseFile", callEdge.To)
+}
+
 func TestResolveMethodCall_TypeAware(t *testing.T) {
 	g := graph.New()
 	g.AddNode(&graph.Node{ID: "pkg/a.go::Caller", Kind: graph.KindFunction, Name: "Caller", FilePath: "pkg/a.go", Language: "go"})

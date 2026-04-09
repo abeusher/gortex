@@ -60,6 +60,7 @@ func (cr *CrossRepoResolver) ResolveForRepo(repoPrefix string) *CrossRepoStats {
 }
 
 func (cr *CrossRepoResolver) resolveEdge(e *graph.Edge, stats *CrossRepoStats) {
+	oldTo := e.To
 	target := strings.TrimPrefix(e.To, unresolvedPrefix)
 
 	switch {
@@ -69,6 +70,10 @@ func (cr *CrossRepoResolver) resolveEdge(e *graph.Edge, stats *CrossRepoStats) {
 		cr.resolveMethodCall(e, strings.TrimPrefix(target, "*."), stats)
 	default:
 		cr.resolveFunctionCall(e, target, stats)
+	}
+
+	if e.To != oldTo {
+		cr.graph.ReindexEdge(e, oldTo)
 	}
 }
 
@@ -208,7 +213,7 @@ func (cr *CrossRepoResolver) resolveMethodCall(e *graph.Edge, methodName string,
 		}
 	}
 
-	// Fallback: name-only matching.
+	// Fallback: name-only matching (methods first, then functions for pkg.Func() calls).
 	for _, c := range candidates {
 		if c.Kind == graph.KindMethod && c.RepoPrefix == callerRepo {
 			e.To = c.ID
@@ -218,6 +223,23 @@ func (cr *CrossRepoResolver) resolveMethodCall(e *graph.Edge, methodName string,
 	}
 	for _, c := range candidates {
 		if c.Kind == graph.KindMethod {
+			e.To = c.ID
+			e.CrossRepo = true
+			stats.Resolved++
+			stats.CrossRepoEdges++
+			stats.ByRepo[c.RepoPrefix]++
+			return
+		}
+	}
+	for _, c := range candidates {
+		if c.Kind == graph.KindFunction && c.RepoPrefix == callerRepo {
+			e.To = c.ID
+			stats.Resolved++
+			return
+		}
+	}
+	for _, c := range candidates {
+		if c.Kind == graph.KindFunction {
 			e.To = c.ID
 			e.CrossRepo = true
 			stats.Resolved++

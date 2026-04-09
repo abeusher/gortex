@@ -58,6 +58,30 @@ func (g *Graph) AddEdge(e *Edge) {
 	g.inEdges[e.To] = append(g.inEdges[e.To], e)
 }
 
+// ReindexEdge updates the inEdges index after an edge's To field has been mutated
+// (e.g., by the resolver changing "unresolved::X" to a real target).
+// oldTo is the previous value of e.To before mutation.
+func (g *Graph) ReindexEdge(e *Edge, oldTo string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if oldTo == e.To {
+		return
+	}
+
+	// Remove from old inEdges slot.
+	inList := g.inEdges[oldTo]
+	for i, ie := range inList {
+		if ie == e {
+			g.inEdges[oldTo] = append(inList[:i], inList[i+1:]...)
+			break
+		}
+	}
+
+	// Add to new inEdges slot.
+	g.inEdges[e.To] = append(g.inEdges[e.To], e)
+}
+
 // GetNode returns a node by ID, or nil if not found.
 func (g *Graph) GetNode(id string) *Node {
 	g.mu.RLock()
