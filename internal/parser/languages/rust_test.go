@@ -1,6 +1,7 @@
 package languages
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -129,4 +130,96 @@ use tokio::net::TcpListener;
 
 	imports := edgesOfKind(result.Edges, graph.EdgeImports)
 	require.Len(t, imports, 2)
+}
+
+func TestRsExtractor_TypeEnv_ExplicitType(t *testing.T) {
+	src := []byte(`struct Config {
+    port: u16,
+}
+
+impl Config {
+    fn start(&self) {}
+}
+
+fn main() {
+    let cfg: Config = Config { port: 8080 };
+    cfg.start();
+}
+`)
+	e := NewRustExtractor()
+	result, err := e.Extract("main.rs", src)
+	require.NoError(t, err)
+
+	calls := edgesOfKind(result.Edges, graph.EdgeCalls)
+	var startCall *graph.Edge
+	for _, c := range calls {
+		if strings.HasSuffix(c.To, "start") {
+			startCall = c
+			break
+		}
+	}
+	require.NotNil(t, startCall, "expected a call edge to start")
+	require.NotNil(t, startCall.Meta, "expected Meta on start call edge")
+	assert.Equal(t, "Config", startCall.Meta["receiver_type"])
+}
+
+func TestRsExtractor_TypeEnv_NewCall(t *testing.T) {
+	src := []byte(`struct Server {
+    port: u16,
+}
+
+impl Server {
+    fn new(port: u16) -> Self {
+        Server { port }
+    }
+
+    fn listen(&self) {}
+}
+
+fn main() {
+    let srv = Server::new(8080);
+    srv.listen();
+}
+`)
+	e := NewRustExtractor()
+	result, err := e.Extract("main.rs", src)
+	require.NoError(t, err)
+
+	calls := edgesOfKind(result.Edges, graph.EdgeCalls)
+	var listenCall *graph.Edge
+	for _, c := range calls {
+		if strings.HasSuffix(c.To, "listen") {
+			listenCall = c
+			break
+		}
+	}
+	require.NotNil(t, listenCall)
+	require.NotNil(t, listenCall.Meta)
+	assert.Equal(t, "Server", listenCall.Meta["receiver_type"])
+}
+
+func TestRsExtractor_TypeEnv_Unknown(t *testing.T) {
+	src := []byte(`fn get_service() -> Box<dyn std::any::Any> {
+    todo!()
+}
+
+fn main() {
+    let svc = get_service();
+    svc.process();
+}
+`)
+	e := NewRustExtractor()
+	result, err := e.Extract("main.rs", src)
+	require.NoError(t, err)
+
+	calls := edgesOfKind(result.Edges, graph.EdgeCalls)
+	var processCall *graph.Edge
+	for _, c := range calls {
+		if strings.HasSuffix(c.To, "process") {
+			processCall = c
+			break
+		}
+	}
+	require.NotNil(t, processCall)
+	assert.Nil(t, processCall.Meta, "unknown type should not produce Meta")
 }

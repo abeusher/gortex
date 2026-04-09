@@ -2,6 +2,7 @@ package languages
 
 import (
 	"strings"
+	"unicode"
 
 	sitter "github.com/smacker/go-tree-sitter"
 	"github.com/smacker/go-tree-sitter/python"
@@ -27,10 +28,22 @@ const (
 
 	pyQCallAttr = `(call
 		function: (attribute
+			object: (_) @call.receiver
 			attribute: (identifier) @call.method)) @call.expr`
 
 	pyQAssignment = `(assignment
 		left: (identifier) @var.name) @var.def`
+
+	// Tier 0: typed assignment — x: Type = expr
+	pyQTypedAssignment = `(assignment
+		left: (identifier) @tvar.name
+		type: (type (identifier) @tvar.type)) @tvar.def`
+
+	// Tier 1: untyped assignment — x = expr (for constructor inference)
+	pyQUntypedAssignment = `(assignment
+		left: (identifier) @uvar.name
+		right: (call
+			function: (identifier) @uvar.callee)) @uvar.def`
 
 	pyQClassMethod = `(class_definition
 		name: (identifier) @class.name
@@ -164,6 +177,9 @@ func (e *PythonExtractor) Extract(filePath string, src []byte) (*parser.Extracti
 		})
 	}
 
+	// Build type environment before extracting calls.
+	tenv := e.buildTypeEnv(root, src)
+
 	// Call sites.
 	funcRanges := buildFuncRanges(result)
 
@@ -184,15 +200,20 @@ func (e *PythonExtractor) Extract(filePath string, src []byte) (*parser.Extracti
 	matches, _ = parser.RunQuery(pyQCallAttr, e.lang, root, src)
 	for _, m := range matches {
 		method := m.Captures["call.method"].Text
+		receiverText := m.Captures["call.receiver"].Text
 		expr := m.Captures["call.expr"]
 		callerID := findEnclosingFunc(funcRanges, expr.StartLine+1)
 		if callerID == "" {
 			continue
 		}
-		result.Edges = append(result.Edges, &graph.Edge{
+		edge := &graph.Edge{
 			From: callerID, To: "unresolved::*." + method,
 			Kind: graph.EdgeCalls, FilePath: filePath, Line: expr.StartLine + 1,
-		})
+		}
+		if recvType, ok := tenv[receiverText]; ok {
+			edge.Meta = map[string]any{"receiver_type": recvType}
+		}
+		result.Edges = append(result.Edges, edge)
 	}
 
 	// Module-level variables (simple assignments at top level).
@@ -219,4 +240,53 @@ func (e *PythonExtractor) Extract(filePath string, src []byte) (*parser.Extracti
 	}
 
 	return result, nil
+}
+
+// buildTypeEnv scans Python assignments for type annotations (Tier 0)
+// and class-constructor calls (Tier 1) to build a variable->type map.
+func (e *PythonExtractor) buildTypeEnv(root *sitter.Node, src []byte) typeEnv {
+	tenv := make(typeEnv)
+
+	// Tier 0: explicit type hints — x: Type = expr
+	matches, _ := parser.RunQuery(pyQTypedAssignment, e.lang, root, src)
+	for _, m := range matches {
+		name := m.Captures["tvar.name"].Text
+		typeName := normalizePyTypeName(m.Captures["tvar.type"].Text)
+		if typeName != "" {
+			tenv[name] = typeName
+		}
+	}
+
+	// Tier 1: constructor calls — x = ClassName(...)
+	// Convention: class names start with an uppercase letter.
+	matches, _ = parser.RunQuery(pyQUntypedAssignment, e.lang, root, src)
+	for _, m := range matches {
+		name := m.Captures["uvar.name"].Text
+		if _, exists := tenv[name]; exists {
+			continue // Tier 0 already resolved
+		}
+		callee := m.Captures["uvar.callee"].Text
+		if callee != "" && unicode.IsUpper(rune(callee[0])) {
+			tenv[name] = callee
+		}
+	}
+
+	return tenv
+}
+
+// normalizePyTypeName strips Optional[], List[], etc. and skips builtins.
+func normalizePyTypeName(t string) string {
+	t = strings.TrimSpace(t)
+	// Strip Optional[...], List[...], etc.
+	if idx := strings.Index(t, "["); idx > 0 {
+		t = t[:idx]
+	}
+	switch t {
+	case "int", "float", "str", "bool", "bytes", "None", "list", "dict", "set", "tuple", "object":
+		return ""
+	}
+	if t == "" || (t[0] >= 'a' && t[0] <= 'z') {
+		return ""
+	}
+	return t
 }

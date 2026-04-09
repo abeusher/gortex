@@ -35,9 +35,20 @@ const (
 	kotlinQCall = `(call_expression
 		(simple_identifier) @call.name) @call.expr`
 
+	kotlinQCallMember = `(call_expression
+		(navigation_expression
+			(_) @call.receiver
+			(navigation_suffix
+				(simple_identifier) @call.method))) @call.expr`
+
 	kotlinQProperty = `(property_declaration
 		(variable_declaration
 			(simple_identifier) @prop.name)) @prop.def`
+
+	kotlinQPropertyTyped = `(property_declaration
+		(variable_declaration
+			(simple_identifier) @tprop.name
+			(user_type) @tprop.type)) @tprop.def`
 )
 
 // KotlinExtractor extracts Kotlin source files.
@@ -218,9 +229,20 @@ func (e *KotlinExtractor) Extract(filePath string, src []byte) (*parser.Extracti
 		})
 	}
 
-	// Call sites.
+	// Build type environment for receiver type inference.
+	tenv := e.buildTypeEnv(root, src)
+
+	// Call sites (with type env).
+	e.extractCalls(root, src, filePath, result, tenv)
+
+	return result, nil
+}
+
+func (e *KotlinExtractor) extractCalls(root *sitter.Node, src []byte, filePath string, result *parser.ExtractionResult, tenv typeEnv) {
 	funcRanges := buildFuncRanges(result)
-	matches, _ = parser.RunQuery(kotlinQCall, e.lang, root, src)
+
+	// Plain calls: foo()
+	matches, _ := parser.RunQuery(kotlinQCall, e.lang, root, src)
 	for _, m := range matches {
 		name := m.Captures["call.name"].Text
 		expr := m.Captures["call.expr"]
@@ -234,7 +256,94 @@ func (e *KotlinExtractor) Extract(filePath string, src []byte) (*parser.Extracti
 		})
 	}
 
-	return result, nil
+	// Member calls: obj.method()
+	matches, _ = parser.RunQuery(kotlinQCallMember, e.lang, root, src)
+	for _, m := range matches {
+		method := m.Captures["call.method"].Text
+		receiverText := m.Captures["call.receiver"].Text
+		expr := m.Captures["call.expr"]
+		callerID := findEnclosingFunc(funcRanges, expr.StartLine+1)
+		if callerID == "" {
+			continue
+		}
+
+		edge := &graph.Edge{
+			From: callerID, To: "unresolved::*." + method,
+			Kind: graph.EdgeCalls, FilePath: filePath, Line: expr.StartLine + 1,
+		}
+		if recvType, ok := tenv[receiverText]; ok {
+			edge.Meta = map[string]any{"receiver_type": recvType}
+		}
+		result.Edges = append(result.Edges, edge)
+	}
+}
+
+// buildTypeEnv scans Kotlin property declarations for type annotations (Tier 0)
+// and constructor calls (Tier 1: uppercase function call = constructor) to build
+// a variable-to-type map.
+func (e *KotlinExtractor) buildTypeEnv(root *sitter.Node, src []byte) typeEnv {
+	tenv := make(typeEnv)
+
+	// Tier 0: explicit type annotations — val x: Type = ...
+	matches, _ := parser.RunQuery(kotlinQPropertyTyped, e.lang, root, src)
+	for _, m := range matches {
+		name := m.Captures["tprop.name"].Text
+		typeName := normalizeKotlinTypeName(m.Captures["tprop.type"].Text)
+		if typeName != "" {
+			tenv[name] = typeName
+		}
+	}
+
+	// Tier 1: constructor calls — val x = Type(...) (uppercase = class constructor)
+	matches, _ = parser.RunQuery(kotlinQProperty, e.lang, root, src)
+	for _, m := range matches {
+		name := m.Captures["prop.name"].Text
+		if _, exists := tenv[name]; exists {
+			continue
+		}
+		defNode := m.Captures["prop.def"].Node
+		if defNode == nil {
+			continue
+		}
+		// Walk the property declaration looking for call_expression with uppercase identifier.
+		walkNodes(defNode, func(n *sitter.Node) {
+			if n.Type() == "call_expression" {
+				// First child should be the function name (simple_identifier).
+				if n.NamedChildCount() > 0 {
+					nameNode := n.NamedChild(0)
+					if nameNode.Type() == "simple_identifier" {
+						funcName := nameNode.Content(src)
+						if len(funcName) > 0 && funcName[0] >= 'A' && funcName[0] <= 'Z' {
+							tenv[name] = funcName
+						}
+					}
+				}
+			}
+		})
+	}
+
+	return tenv
+}
+
+// normalizeKotlinTypeName strips generics and nullable markers from a Kotlin type name.
+func normalizeKotlinTypeName(t string) string {
+	t = strings.TrimSpace(t)
+	// Remove nullable suffix.
+	t = strings.TrimSuffix(t, "?")
+	// Remove generics.
+	if idx := strings.Index(t, "<"); idx > 0 {
+		t = t[:idx]
+	}
+	// Skip Kotlin primitives.
+	switch t {
+	case "Int", "Long", "Short", "Byte", "Float", "Double", "Boolean",
+		"Char", "String", "Unit", "Any", "Nothing":
+		return ""
+	}
+	if t == "" || (t[0] >= 'a' && t[0] <= 'z') {
+		return ""
+	}
+	return t
 }
 
 // extractClassesAndInterfaces walks the root to distinguish class_declaration

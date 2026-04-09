@@ -41,6 +41,10 @@ const (
 	javaQCall = `(method_invocation
 		name: (identifier) @call.name) @call.expr`
 
+	javaQCallMember = `(method_invocation
+		object: (_) @call.receiver
+		name: (identifier) @call.method) @call.expr`
+
 	javaQClassField = `(class_declaration
 		name: (identifier) @class.name
 		body: (class_body
@@ -53,6 +57,18 @@ const (
 		body: (interface_body
 			(method_declaration
 				name: (identifier) @iface.method.name)))`
+
+	// Tier 0: explicit local variable declarations — Type varName = ...
+	javaQLocalVar = `(local_variable_declaration
+		type: (_) @lvar.type
+		declarator: (variable_declarator
+			name: (identifier) @lvar.name)) @lvar.def`
+
+	// Tier 0: explicit field declarations — Type fieldName = ...
+	javaQFieldVar = `(field_declaration
+		type: (_) @fvar.type
+		declarator: (variable_declarator
+			name: (identifier) @fvar.name)) @fvar.def`
 )
 
 // JavaExtractor extracts Java source files.
@@ -299,9 +315,21 @@ func (e *JavaExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 		})
 	}
 
-	// Call sites.
+	// Build type environment for receiver type inference.
+	tenv := e.buildTypeEnv(root, src)
+
+	// Call sites (with type env).
+	e.extractCalls(root, src, filePath, result, tenv)
+
+	return result, nil
+}
+
+// extractCalls extracts plain and member method calls with type-env-aware receiver resolution.
+func (e *JavaExtractor) extractCalls(root *sitter.Node, src []byte, filePath string, result *parser.ExtractionResult, tenv typeEnv) {
 	funcRanges := buildFuncRanges(result)
-	matches, _ = parser.RunQuery(javaQCall, e.lang, root, src)
+
+	// Plain method calls (no receiver): methodName(...)
+	matches, _ := parser.RunQuery(javaQCall, e.lang, root, src)
 	for _, m := range matches {
 		name := m.Captures["call.name"].Text
 		expr := m.Captures["call.expr"]
@@ -315,5 +343,113 @@ func (e *JavaExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 		})
 	}
 
-	return result, nil
+	// Member method calls: receiver.methodName(...)
+	matches, _ = parser.RunQuery(javaQCallMember, e.lang, root, src)
+	for _, m := range matches {
+		method := m.Captures["call.method"].Text
+		receiverText := m.Captures["call.receiver"].Text
+		expr := m.Captures["call.expr"]
+		callerID := findEnclosingFunc(funcRanges, expr.StartLine+1)
+		if callerID == "" {
+			continue
+		}
+
+		edge := &graph.Edge{
+			From: callerID, To: "unresolved::*." + method,
+			Kind: graph.EdgeCalls, FilePath: filePath, Line: expr.StartLine + 1,
+		}
+		if recvType, ok := tenv[receiverText]; ok {
+			edge.Meta = map[string]any{"receiver_type": recvType}
+		}
+		result.Edges = append(result.Edges, edge)
+	}
+}
+
+// buildTypeEnv scans Java variable declarations to build a variable-to-type map.
+// Tier 0: explicit type declarations (Type varName = ...)
+// Tier 1: new expressions (var inferred from object_creation_expression)
+func (e *JavaExtractor) buildTypeEnv(root *sitter.Node, src []byte) typeEnv {
+	tenv := make(typeEnv)
+
+	// Tier 0: local variable declarations — User user = ...
+	matches, _ := parser.RunQuery(javaQLocalVar, e.lang, root, src)
+	for _, m := range matches {
+		name := m.Captures["lvar.name"].Text
+		typeName := normalizeJavaTypeName(m.Captures["lvar.type"].Text)
+		if typeName != "" {
+			tenv[name] = typeName
+		}
+	}
+
+	// Tier 0: field declarations — private User user = ...
+	fieldMatches, _ := parser.RunQuery(javaQFieldVar, e.lang, root, src)
+	for _, m := range fieldMatches {
+		name := m.Captures["fvar.name"].Text
+		if _, exists := tenv[name]; exists {
+			continue
+		}
+		typeName := normalizeJavaTypeName(m.Captures["fvar.type"].Text)
+		if typeName != "" {
+			tenv[name] = typeName
+		}
+	}
+
+	// Tier 1: for local vars where explicit type didn't yield a name
+	// (e.g., Java 10+ var keyword), try to infer from new expression.
+	for _, m := range matches {
+		name := m.Captures["lvar.name"].Text
+		if _, exists := tenv[name]; exists {
+			continue // already have explicit type
+		}
+		defNode := m.Captures["lvar.def"].Node
+		if defNode == nil {
+			continue
+		}
+		walkNodes(defNode, func(n *sitter.Node) {
+			if n.Type() == "object_creation_expression" {
+				typeName := inferTypeFromJavaNewExpr(n, src)
+				if typeName != "" {
+					tenv[name] = typeName
+				}
+			}
+		})
+	}
+
+	return tenv
+}
+
+// normalizeJavaTypeName strips generics and array markers from a Java type name.
+// "User" -> "User", "List<User>" -> "List", "User[]" -> "User"
+func normalizeJavaTypeName(t string) string {
+	t = strings.TrimSpace(t)
+	// Remove array suffix.
+	t = strings.TrimSuffix(t, "[]")
+	// Remove generics.
+	if idx := strings.Index(t, "<"); idx > 0 {
+		t = t[:idx]
+	}
+	// Skip Java primitives and common non-class types.
+	switch t {
+	case "int", "long", "short", "byte", "float", "double", "boolean", "char", "void", "var", "String":
+		return ""
+	}
+	if t == "" || (t[0] >= 'a' && t[0] <= 'z') {
+		return "" // skip lowercase type names (primitives)
+	}
+	return t
+}
+
+// inferTypeFromJavaNewExpr extracts the class name from an object_creation_expression node.
+// new User(...) -> "User", new ArrayList<String>() -> "ArrayList"
+func inferTypeFromJavaNewExpr(node *sitter.Node, src []byte) string {
+	for i := 0; i < int(node.NamedChildCount()); i++ {
+		child := node.NamedChild(i)
+		if child.Type() == "type_identifier" {
+			name := child.Content(src)
+			if len(name) > 0 && name[0] >= 'A' && name[0] <= 'Z' {
+				return name
+			}
+		}
+	}
+	return ""
 }

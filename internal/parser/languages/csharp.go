@@ -87,8 +87,21 @@ const (
 				name: (identifier) @iface.method.name)))`
 
 	csharpQCall = `(invocation_expression
+		function: (identifier) @call.name) @call.expr`
+
+	csharpQCallMember = `(invocation_expression
 		function: (member_access_expression
-			name: (identifier) @call.name)) @call.expr`
+			expression: (_) @call.receiver
+			name: (identifier) @call.method)) @call.expr`
+
+	// Tier 0: explicit type — UserService svc = ...
+	csharpQLocalTyped = `(local_declaration_statement
+		(variable_declaration
+			type: (_) @lvar.type
+			(variable_declarator
+				(identifier) @lvar.name))) @lvar.def`
+
+	// For Tier 1 (new): we walk variable_declarator nodes in buildTypeEnv.
 )
 
 // CSharpExtractor extracts C# source files.
@@ -276,9 +289,20 @@ func (e *CSharpExtractor) Extract(filePath string, src []byte) (*parser.Extracti
 		})
 	}
 
-	// Call sites.
+	// Build type environment for receiver type inference.
+	tenv := e.buildTypeEnv(root, src)
+
+	// Call sites (with type env).
+	e.extractCalls(root, src, filePath, result, tenv)
+
+	return result, nil
+}
+
+func (e *CSharpExtractor) extractCalls(root *sitter.Node, src []byte, filePath string, result *parser.ExtractionResult, tenv typeEnv) {
 	funcRanges := buildFuncRanges(result)
-	matches, _ = parser.RunQuery(csharpQCall, e.lang, root, src)
+
+	// Plain function calls: Foo()
+	matches, _ := parser.RunQuery(csharpQCall, e.lang, root, src)
 	for _, m := range matches {
 		name := m.Captures["call.name"].Text
 		expr := m.Captures["call.expr"]
@@ -287,12 +311,122 @@ func (e *CSharpExtractor) Extract(filePath string, src []byte) (*parser.Extracti
 			continue
 		}
 		result.Edges = append(result.Edges, &graph.Edge{
-			From: callerID, To: "unresolved::*." + name,
+			From: callerID, To: "unresolved::" + name,
 			Kind: graph.EdgeCalls, FilePath: filePath, Line: expr.StartLine + 1,
 		})
 	}
 
-	return result, nil
+	// Member calls: obj.Method()
+	matches, _ = parser.RunQuery(csharpQCallMember, e.lang, root, src)
+	for _, m := range matches {
+		method := m.Captures["call.method"].Text
+		receiverText := m.Captures["call.receiver"].Text
+		expr := m.Captures["call.expr"]
+		callerID := findEnclosingFunc(funcRanges, expr.StartLine+1)
+		if callerID == "" {
+			continue
+		}
+
+		edge := &graph.Edge{
+			From: callerID, To: "unresolved::*." + method,
+			Kind: graph.EdgeCalls, FilePath: filePath, Line: expr.StartLine + 1,
+		}
+		if recvType, ok := tenv[receiverText]; ok {
+			edge.Meta = map[string]any{"receiver_type": recvType}
+		}
+		result.Edges = append(result.Edges, edge)
+	}
+}
+
+// buildTypeEnv scans C# local variable declarations for type annotations (Tier 0)
+// and new/object_creation expressions (Tier 1) to build a variable-to-type map.
+func (e *CSharpExtractor) buildTypeEnv(root *sitter.Node, src []byte) typeEnv {
+	tenv := make(typeEnv)
+
+	// Tier 0: explicit type annotations — UserService svc = ...
+	matches, _ := parser.RunQuery(csharpQLocalTyped, e.lang, root, src)
+	for _, m := range matches {
+		name := m.Captures["lvar.name"].Text
+		typeName := normalizeCSharpTypeName(m.Captures["lvar.type"].Text)
+		if typeName != "" && typeName != "var" {
+			tenv[name] = typeName
+		}
+	}
+
+	// Tier 1: var svc = new UserService() — walk for object_creation_expression
+	// Re-scan the typed locals for "var" declarations and check RHS for new.
+	for _, m := range matches {
+		name := m.Captures["lvar.name"].Text
+		if _, exists := tenv[name]; exists {
+			continue
+		}
+		typeText := m.Captures["lvar.type"].Text
+		if typeText != "var" {
+			continue
+		}
+		defNode := m.Captures["lvar.def"].Node
+		if defNode == nil {
+			continue
+		}
+		walkNodes(defNode, func(n *sitter.Node) {
+			if n.Type() == "object_creation_expression" {
+				typeName := inferTypeFromCSharpNew(n, src)
+				if typeName != "" {
+					tenv[name] = typeName
+				}
+			}
+		})
+	}
+
+	return tenv
+}
+
+// normalizeCSharpTypeName strips generics and nullable markers from a C# type name.
+func normalizeCSharpTypeName(t string) string {
+	t = strings.TrimSpace(t)
+	// Remove nullable suffix.
+	t = strings.TrimSuffix(t, "?")
+	// Remove array suffix.
+	if idx := strings.Index(t, "["); idx > 0 {
+		t = t[:idx]
+	}
+	// Remove generics.
+	if idx := strings.Index(t, "<"); idx > 0 {
+		t = t[:idx]
+	}
+	// Skip C# primitives and keywords.
+	switch t {
+	case "var", "int", "long", "short", "byte", "float", "double", "decimal",
+		"bool", "char", "string", "object", "void", "dynamic":
+		if t == "var" {
+			return "var" // caller handles this specially
+		}
+		return ""
+	}
+	if t == "" || (t[0] >= 'a' && t[0] <= 'z') {
+		return ""
+	}
+	return t
+}
+
+// inferTypeFromCSharpNew extracts the type name from a C# object_creation_expression.
+// new UserService(...) -> "UserService"
+func inferTypeFromCSharpNew(node *sitter.Node, src []byte) string {
+	for i := 0; i < int(node.NamedChildCount()); i++ {
+		child := node.NamedChild(i)
+		if child.Type() == "identifier" || child.Type() == "type_identifier" ||
+			child.Type() == "generic_name" || child.Type() == "qualified_name" {
+			name := child.Content(src)
+			// Strip generics from generic_name.
+			if idx := strings.Index(name, "<"); idx > 0 {
+				name = name[:idx]
+			}
+			if len(name) > 0 && name[0] >= 'A' && name[0] <= 'Z' {
+				return name
+			}
+		}
+	}
+	return ""
 }
 
 func (e *CSharpExtractor) extractMethods(

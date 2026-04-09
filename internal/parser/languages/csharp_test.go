@@ -1,6 +1,7 @@
 package languages
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -221,4 +222,88 @@ namespace MyApp.Services
 	// Call edges (Query, Execute)
 	calls := edgesOfKind(result.Edges, graph.EdgeCalls)
 	assert.GreaterOrEqual(t, len(calls), 2)
+}
+
+func TestCSharpExtractor_TypeEnv_ExplicitType(t *testing.T) {
+	src := []byte(`public class UserService {
+    public void Save() {}
+}
+
+public class App {
+    public void Main() {
+        UserService svc = new UserService();
+        svc.Save();
+    }
+}
+`)
+	e := NewCSharpExtractor()
+	result, err := e.Extract("app.cs", src)
+	require.NoError(t, err)
+
+	calls := edgesOfKind(result.Edges, graph.EdgeCalls)
+	var saveCall *graph.Edge
+	for _, c := range calls {
+		if strings.HasSuffix(c.To, "Save") {
+			saveCall = c
+			break
+		}
+	}
+	require.NotNil(t, saveCall, "expected a call edge to Save")
+	require.NotNil(t, saveCall.Meta, "expected Meta on Save call edge")
+	assert.Equal(t, "UserService", saveCall.Meta["receiver_type"])
+}
+
+func TestCSharpExtractor_TypeEnv_NewExpression(t *testing.T) {
+	src := []byte(`public class Client {
+    public void Connect() {}
+}
+
+public class App {
+    public void Main() {
+        var client = new Client();
+        client.Connect();
+    }
+}
+`)
+	e := NewCSharpExtractor()
+	result, err := e.Extract("app.cs", src)
+	require.NoError(t, err)
+
+	calls := edgesOfKind(result.Edges, graph.EdgeCalls)
+	var connectCall *graph.Edge
+	for _, c := range calls {
+		if strings.HasSuffix(c.To, "Connect") {
+			connectCall = c
+			break
+		}
+	}
+	require.NotNil(t, connectCall)
+	require.NotNil(t, connectCall.Meta)
+	assert.Equal(t, "Client", connectCall.Meta["receiver_type"])
+}
+
+func TestCSharpExtractor_TypeEnv_Unknown(t *testing.T) {
+	src := []byte(`public class App {
+    public object GetService() { return null; }
+
+    public void Main() {
+        var svc = GetService();
+        svc.Process();
+    }
+}
+`)
+	e := NewCSharpExtractor()
+	result, err := e.Extract("app.cs", src)
+	require.NoError(t, err)
+
+	calls := edgesOfKind(result.Edges, graph.EdgeCalls)
+	var processCall *graph.Edge
+	for _, c := range calls {
+		if strings.HasSuffix(c.To, "Process") {
+			processCall = c
+			break
+		}
+	}
+	require.NotNil(t, processCall)
+	assert.Nil(t, processCall.Meta, "unknown type should not produce Meta")
 }

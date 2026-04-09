@@ -46,6 +46,7 @@ const (
 
 	rsQMethodCall = `(call_expression
 		function: (field_expression
+			value: (_) @call.receiver
 			field: (field_identifier) @call.method)) @call.expr`
 
 	rsQConst = `(const_item
@@ -53,6 +54,16 @@ const (
 
 	rsQStatic = `(static_item
 		name: (identifier) @static.name) @static.def`
+
+	// Tier 0: let x: Type = ...
+	rsQLetTyped = `(let_declaration
+		pattern: (identifier) @lvar.name
+		type: (_) @lvar.type) @lvar.def`
+
+	// For Tier 1 we walk let_declaration nodes for struct expressions and ::new() calls.
+	rsQLet = `(let_declaration
+		pattern: (identifier) @let.name
+		value: (_) @let.value) @let.def`
 )
 
 // RustExtractor extracts Rust source files.
@@ -223,38 +234,11 @@ func (e *RustExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 		})
 	}
 
-	// Call sites.
-	funcRanges := buildFuncRanges(result)
+	// Build type environment for receiver type inference.
+	tenv := e.buildTypeEnv(root, src)
 
-	for _, q := range []string{rsQCall, rsQCallPath} {
-		matches, _ = parser.RunQuery(q, e.lang, root, src)
-		for _, m := range matches {
-			name := m.Captures["call.name"].Text
-			expr := m.Captures["call.expr"]
-			callerID := findEnclosingFunc(funcRanges, expr.StartLine+1)
-			if callerID == "" {
-				continue
-			}
-			result.Edges = append(result.Edges, &graph.Edge{
-				From: callerID, To: "unresolved::" + name,
-				Kind: graph.EdgeCalls, FilePath: filePath, Line: expr.StartLine + 1,
-			})
-		}
-	}
-
-	matches, _ = parser.RunQuery(rsQMethodCall, e.lang, root, src)
-	for _, m := range matches {
-		method := m.Captures["call.method"].Text
-		expr := m.Captures["call.expr"]
-		callerID := findEnclosingFunc(funcRanges, expr.StartLine+1)
-		if callerID == "" {
-			continue
-		}
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: callerID, To: "unresolved::*." + method,
-			Kind: graph.EdgeCalls, FilePath: filePath, Line: expr.StartLine + 1,
-		})
-	}
+	// Call sites (with type env).
+	e.extractCalls(root, src, filePath, result, tenv)
 
 	// Constants and statics.
 	for _, q := range []string{rsQConst, rsQStatic} {
@@ -289,4 +273,150 @@ func (e *RustExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 	}
 
 	return result, nil
+}
+
+func (e *RustExtractor) extractCalls(root *sitter.Node, src []byte, filePath string, result *parser.ExtractionResult, tenv typeEnv) {
+	funcRanges := buildFuncRanges(result)
+
+	// Plain and path calls: foo(), module::foo()
+	for _, q := range []string{rsQCall, rsQCallPath} {
+		matches, _ := parser.RunQuery(q, e.lang, root, src)
+		for _, m := range matches {
+			name := m.Captures["call.name"].Text
+			expr := m.Captures["call.expr"]
+			callerID := findEnclosingFunc(funcRanges, expr.StartLine+1)
+			if callerID == "" {
+				continue
+			}
+			result.Edges = append(result.Edges, &graph.Edge{
+				From: callerID, To: "unresolved::" + name,
+				Kind: graph.EdgeCalls, FilePath: filePath, Line: expr.StartLine + 1,
+			})
+		}
+	}
+
+	// Method calls: obj.method()
+	matches, _ := parser.RunQuery(rsQMethodCall, e.lang, root, src)
+	for _, m := range matches {
+		method := m.Captures["call.method"].Text
+		receiverText := m.Captures["call.receiver"].Text
+		expr := m.Captures["call.expr"]
+		callerID := findEnclosingFunc(funcRanges, expr.StartLine+1)
+		if callerID == "" {
+			continue
+		}
+
+		edge := &graph.Edge{
+			From: callerID, To: "unresolved::*." + method,
+			Kind: graph.EdgeCalls, FilePath: filePath, Line: expr.StartLine + 1,
+		}
+		if recvType, ok := tenv[receiverText]; ok {
+			edge.Meta = map[string]any{"receiver_type": recvType}
+		}
+		result.Edges = append(result.Edges, edge)
+	}
+}
+
+// buildTypeEnv scans Rust let declarations for type annotations (Tier 0)
+// and struct expressions / ::new() calls (Tier 1) to build a variable-to-type map.
+func (e *RustExtractor) buildTypeEnv(root *sitter.Node, src []byte) typeEnv {
+	tenv := make(typeEnv)
+
+	// Tier 0: explicit type annotations — let x: Type = ...
+	matches, _ := parser.RunQuery(rsQLetTyped, e.lang, root, src)
+	for _, m := range matches {
+		name := m.Captures["lvar.name"].Text
+		typeName := normalizeRustTypeName(m.Captures["lvar.type"].Text)
+		if typeName != "" {
+			tenv[name] = typeName
+		}
+	}
+
+	// Tier 1: infer from RHS — struct expressions and ::new() calls.
+	matches, _ = parser.RunQuery(rsQLet, e.lang, root, src)
+	for _, m := range matches {
+		name := m.Captures["let.name"].Text
+		if _, exists := tenv[name]; exists {
+			continue
+		}
+		valueNode := m.Captures["let.value"].Node
+		if valueNode == nil {
+			continue
+		}
+		if inferred := inferTypeFromRustExpr(valueNode, src); inferred != "" {
+			tenv[name] = inferred
+		}
+	}
+
+	return tenv
+}
+
+// normalizeRustTypeName strips references, generics, and module paths from a Rust type.
+func normalizeRustTypeName(t string) string {
+	t = strings.TrimSpace(t)
+	// Remove reference prefixes.
+	t = strings.TrimPrefix(t, "&mut ")
+	t = strings.TrimPrefix(t, "&")
+	// Remove generics.
+	if idx := strings.Index(t, "<"); idx > 0 {
+		t = t[:idx]
+	}
+	// Take last segment of module path.
+	if idx := strings.LastIndex(t, "::"); idx >= 0 {
+		t = t[idx+2:]
+	}
+	// Skip primitives.
+	switch t {
+	case "i8", "i16", "i32", "i64", "i128", "isize",
+		"u8", "u16", "u32", "u64", "u128", "usize",
+		"f32", "f64", "bool", "char", "str", "String",
+		"Self", "self":
+		return ""
+	}
+	if t == "" || (t[0] >= 'a' && t[0] <= 'z') {
+		return ""
+	}
+	return t
+}
+
+// inferTypeFromRustExpr inspects a tree-sitter expression node to infer
+// the type of a let declaration's RHS.
+func inferTypeFromRustExpr(node *sitter.Node, src []byte) string {
+	switch node.Type() {
+	case "struct_expression":
+		// Config { port: 8080 } — first named child is the type name.
+		if node.NamedChildCount() > 0 {
+			typeNode := node.NamedChild(0)
+			name := typeNode.Content(src)
+			// Strip module path.
+			if idx := strings.LastIndex(name, "::"); idx >= 0 {
+				name = name[idx+2:]
+			}
+			if len(name) > 0 && name[0] >= 'A' && name[0] <= 'Z' {
+				return name
+			}
+		}
+
+	case "call_expression":
+		// Type::new() — scoped_identifier with path containing ::new
+		if node.NamedChildCount() > 0 {
+			funcNode := node.NamedChild(0)
+			if funcNode.Type() == "scoped_identifier" {
+				funcText := funcNode.Content(src)
+				// e.g. "Config::new" or "module::Config::new"
+				if strings.HasSuffix(funcText, "::new") {
+					typePart := strings.TrimSuffix(funcText, "::new")
+					// Take last segment.
+					if idx := strings.LastIndex(typePart, "::"); idx >= 0 {
+						typePart = typePart[idx+2:]
+					}
+					if len(typePart) > 0 && typePart[0] >= 'A' && typePart[0] <= 'Z' {
+						return typePart
+					}
+				}
+			}
+		}
+	}
+
+	return ""
 }

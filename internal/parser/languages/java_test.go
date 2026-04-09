@@ -109,6 +109,81 @@ func TestJavaExtractor_InterfaceMethods(t *testing.T) {
 	assert.Equal(t, []string{"findById", "save"}, methods)
 }
 
+func TestJavaExtractor_TypeEnv_ExplicitType(t *testing.T) {
+	src := []byte(`public class App {
+    public void run() {
+        UserService svc = new UserService();
+        svc.findUser("123");
+    }
+}
+`)
+	e := NewJavaExtractor()
+	result, err := e.Extract("App.java", src)
+	require.NoError(t, err)
+
+	// The call to svc.findUser should have receiver_type = "UserService".
+	callEdges := edgesOfKind(result.Edges, graph.EdgeCalls)
+	var found bool
+	for _, edge := range callEdges {
+		if edge.To == "unresolved::*.findUser" && edge.Meta != nil {
+			rt, ok := edge.Meta["receiver_type"].(string)
+			if ok && rt == "UserService" {
+				found = true
+			}
+		}
+	}
+	assert.True(t, found, "expected call edge with receiver_type=UserService for svc.findUser()")
+}
+
+func TestJavaExtractor_TypeEnv_NewExpression(t *testing.T) {
+	src := []byte(`public class App {
+    public void run() {
+        var repo = new UserRepository();
+        repo.save(null);
+    }
+}
+`)
+	e := NewJavaExtractor()
+	result, err := e.Extract("App.java", src)
+	require.NoError(t, err)
+
+	// The call to repo.save should have receiver_type = "UserRepository" (inferred from new).
+	callEdges := edgesOfKind(result.Edges, graph.EdgeCalls)
+	var found bool
+	for _, edge := range callEdges {
+		if edge.To == "unresolved::*.save" && edge.Meta != nil {
+			rt, ok := edge.Meta["receiver_type"].(string)
+			if ok && rt == "UserRepository" {
+				found = true
+			}
+		}
+	}
+	assert.True(t, found, "expected call edge with receiver_type=UserRepository for repo.save()")
+}
+
+func TestJavaExtractor_TypeEnv_UnknownType(t *testing.T) {
+	src := []byte(`public class App {
+    public void run() {
+        unknown.doSomething();
+    }
+}
+`)
+	e := NewJavaExtractor()
+	result, err := e.Extract("App.java", src)
+	require.NoError(t, err)
+
+	// The call to unknown.doSomething should NOT have receiver_type metadata.
+	callEdges := edgesOfKind(result.Edges, graph.EdgeCalls)
+	for _, edge := range callEdges {
+		if edge.To == "unresolved::*.doSomething" {
+			if edge.Meta != nil {
+				_, hasRecvType := edge.Meta["receiver_type"]
+				assert.False(t, hasRecvType, "expected no receiver_type for unknown receiver")
+			}
+		}
+	}
+}
+
 func TestJavaExtractor_Imports(t *testing.T) {
 	src := []byte(`import java.util.List;
 import com.example.service.UserService;
