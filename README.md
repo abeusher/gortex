@@ -24,6 +24,7 @@ Built for AI coding agents (Claude Code, Cursor, Codex) — one `smart_context` 
 - **IMPLEMENTS inference** — structural interface satisfaction for Go, TypeScript, Java, Rust, C#, Scala, Swift, Protobuf
 - **PreToolUse hooks** — automatic graph context injection on Read and Grep
 - **Benchmarked** — per-language parsing, query engine, indexer benchmarks
+- **Per-community skills** — `gortex skills` auto-generates SKILL.md per detected community with key files, entry points, cross-community connections, and MCP tool invocations for Claude Code auto-discovery
 - **Eval framework** — SWE-bench harness for A/B benchmarking tool effectiveness with Docker-based environments and multi-model support
 - **Zero dependencies** — everything runs in-process, in memory, no external services
 
@@ -44,6 +45,9 @@ gortex status --index /path/to/repo
 
 # Start MCP server with watch mode and graph caching
 gortex serve --index /path/to/repo --watch
+
+# Generate per-community skills for Claude Code
+gortex skills /path/to/repo
 
 # Start HTTP bridge API for external integrations
 gortex bridge --index /path/to/repo --web --cors-origin '*'
@@ -146,6 +150,7 @@ gortex init [path]           Set up Gortex for a project + install global skills
 gortex serve [flags]         Start the MCP server (--bridge to add HTTP API)
 gortex bridge [flags]        Start standalone HTTP bridge API
 gortex eval-server [flags]   Start eval HTTP server for benchmarking
+gortex skills [path]         Generate per-community SKILL.md files
 gortex index [path...]       Index one or more repositories and print stats
 gortex status [flags]        Show index status (per-repo and per-project in multi-repo mode)
 gortex track <path>          Add a repository to the tracked workspace
@@ -296,6 +301,27 @@ gortex serve --index /path/to/repo --bridge --port 8765
 | `/stats` | GET | Graph statistics by kind and language |
 
 CORS is enabled by default (`--cors-origin '*'`). The bridge can serve the web UI on the same port with `--web`.
+
+## Per-Community Skills
+
+`gortex skills` analyzes your codebase, detects functional communities via Louvain clustering, and generates targeted SKILL.md files that Claude Code auto-discovers:
+
+```bash
+# Generate skills for the current repo
+gortex skills .
+
+# Custom settings
+gortex skills . --min-size 5 --max-communities 10 --output-dir .claude/skills/generated/
+```
+
+Each generated skill includes:
+- **Community metadata** — size, file count, cohesion score
+- **Key files table** — files and their symbols
+- **Entry points** — main functions, handlers, controllers detected via process analysis
+- **Cross-community connections** — which other areas this community interacts with
+- **MCP tool invocations** — pre-written `get_community`, `smart_context`, `find_usages` calls
+
+Skills are written to `.claude/skills/generated/` and a routing table is inserted into CLAUDE.md between `<!-- gortex:skills:start/end -->` markers.
 
 ## Graph Persistence
 
