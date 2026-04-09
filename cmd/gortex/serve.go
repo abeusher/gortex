@@ -7,11 +7,13 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/zzet/gortex/internal/bridge"
 	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/persistence"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
 	gortexmcp "github.com/zzet/gortex/internal/mcp"
@@ -33,6 +35,8 @@ var (
 	serveDebounce   int
 	serveTrack      []string
 	serveProject    string
+	serveCacheDir   string
+	serveNoCache    bool
 )
 
 var serveCmd = &cobra.Command{
@@ -52,6 +56,8 @@ func init() {
 	serveCmd.Flags().StringVar(&serveCORSOrigin, "cors-origin", "*", "allowed CORS origin for bridge API")
 	serveCmd.Flags().StringSliceVar(&serveTrack, "track", nil, "additional repository paths to track")
 	serveCmd.Flags().StringVar(&serveProject, "project", "", "active project name")
+	serveCmd.Flags().StringVar(&serveCacheDir, "cache-dir", "", "graph cache directory (default ~/.cache/gortex/)")
+	serveCmd.Flags().BoolVar(&serveNoCache, "no-cache", false, "disable graph caching")
 	rootCmd.AddCommand(serveCmd)
 }
 
@@ -146,17 +152,60 @@ func runServe(cmd *cobra.Command, args []string) error {
 		errCh <- srv.ServeStdio()
 	}()
 
+	// Create persistence store.
+	var store persistence.Store
+	if serveNoCache {
+		store = persistence.NopStore{}
+	} else {
+		var err error
+		store, err = persistence.NewFileStore(serveCacheDir, version)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[gortex] warning: cache disabled: %v\n", err)
+			store = persistence.NopStore{}
+		}
+	}
+
 	// Background: index, watch, analyze — graph populates while MCP is live.
 	go func() {
 		if serveIndex != "" {
-			fmt.Fprintf(os.Stderr, "[gortex] indexing %s...\n", serveIndex)
-			result, err := idx.Index(serveIndex)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "[gortex] indexing failed: %v\n", err)
-				return
+			commitHash := gitCommitHash(serveIndex)
+			cached := false
+
+			if commitHash != "" && store.Check(serveIndex, commitHash) && store.Validate(serveIndex, commitHash) {
+				snap, err := store.Load(serveIndex, commitHash)
+				if err == nil {
+					for _, n := range snap.Nodes {
+						g.AddNode(n)
+					}
+					for _, e := range snap.Edges {
+						g.AddEdge(e)
+					}
+					idx.SetFileMtimes(snap.FileMtimes)
+					idx.SetRootPath(serveIndex)
+
+					result, err := idx.IncrementalReindex(serveIndex)
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "[gortex] incremental reindex failed: %v\n", err)
+					} else {
+						fmt.Fprintf(os.Stderr, "[gortex] restored graph (%d nodes, %d edges), re-indexed %d stale files in %dms\n",
+							result.NodeCount, result.EdgeCount, result.FileCount, result.DurationMs)
+					}
+					cached = true
+				} else {
+					fmt.Fprintf(os.Stderr, "[gortex] cache load failed, will re-index: %v\n", err)
+				}
 			}
-			fmt.Fprintf(os.Stderr, "[gortex] indexed %d files (%d nodes, %d edges) in %dms\n",
-				result.FileCount, result.NodeCount, result.EdgeCount, result.DurationMs)
+
+			if !cached {
+				fmt.Fprintf(os.Stderr, "[gortex] indexing %s...\n", serveIndex)
+				result, err := idx.Index(serveIndex)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "[gortex] indexing failed: %v\n", err)
+					return
+				}
+				fmt.Fprintf(os.Stderr, "[gortex] indexed %d files (%d nodes, %d edges) in %dms\n",
+					result.FileCount, result.NodeCount, result.EdgeCount, result.DurationMs)
+			}
 		}
 
 		// Start watcher if requested.
@@ -230,6 +279,29 @@ func runServe(cmd *cobra.Command, args []string) error {
 		return err
 	case sig := <-sigCh:
 		fmt.Fprintf(os.Stderr, "\n[gortex] received %s, shutting down\n", sig)
+
+		// Persist graph snapshot on shutdown.
+		if serveIndex != "" {
+			commitHash := gitCommitHash(serveIndex)
+			if commitHash != "" {
+				snap := &persistence.Snapshot{
+					Version:    version,
+					RepoPath:   serveIndex,
+					CommitHash: commitHash,
+					IndexedAt:  time.Now(),
+					Nodes:      g.AllNodes(),
+					Edges:      g.AllEdges(),
+					FileMtimes: idx.FileMtimes(),
+				}
+				if err := store.Save(snap); err != nil {
+					fmt.Fprintf(os.Stderr, "[gortex] cache save failed: %v\n", err)
+				} else {
+					fmt.Fprintf(os.Stderr, "[gortex] saved graph snapshot (%d nodes, %d edges)\n",
+						len(snap.Nodes), len(snap.Edges))
+				}
+			}
+		}
+
 		return nil
 	}
 }

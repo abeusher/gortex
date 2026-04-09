@@ -7,11 +7,13 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/zzet/gortex/internal/bridge"
 	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/persistence"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
 	gortexmcp "github.com/zzet/gortex/internal/mcp"
@@ -30,6 +32,8 @@ var (
 	bridgeWatch      bool
 	bridgeTrack      []string
 	bridgeProject    string
+	bridgeCacheDir   string
+	bridgeNoCache    bool
 )
 
 var bridgeCmd = &cobra.Command{
@@ -47,6 +51,8 @@ func init() {
 	bridgeCmd.Flags().BoolVar(&bridgeWatch, "watch", false, "keep graph in sync with filesystem changes")
 	bridgeCmd.Flags().StringSliceVar(&bridgeTrack, "track", nil, "additional repository paths to track")
 	bridgeCmd.Flags().StringVar(&bridgeProject, "project", "", "active project name")
+	bridgeCmd.Flags().StringVar(&bridgeCacheDir, "cache-dir", "", "graph cache directory (default ~/.cache/gortex/)")
+	bridgeCmd.Flags().BoolVar(&bridgeNoCache, "no-cache", false, "disable graph caching")
 	rootCmd.AddCommand(bridgeCmd)
 }
 
@@ -111,15 +117,58 @@ func runBridge(_ *cobra.Command, _ []string) error {
 	gortexmcp.Version = version
 	srv := gortexmcp.NewServer(eng, g, idx, nil, logger, cfg.Guards.Rules, multiOpts...)
 
-	// Index repository.
-	if bridgeIndex != "" {
-		fmt.Fprintf(os.Stderr, "[gortex] bridge: indexing %s...\n", bridgeIndex)
-		result, err := idx.Index(bridgeIndex)
+	// Create persistence store.
+	var store persistence.Store
+	if bridgeNoCache {
+		store = persistence.NopStore{}
+	} else {
+		var err error
+		store, err = persistence.NewFileStore(bridgeCacheDir, version)
 		if err != nil {
-			return fmt.Errorf("indexing %s: %w", bridgeIndex, err)
+			fmt.Fprintf(os.Stderr, "[gortex] bridge: cache disabled: %v\n", err)
+			store = persistence.NopStore{}
 		}
-		fmt.Fprintf(os.Stderr, "[gortex] bridge: indexed %d files (%d nodes, %d edges) in %dms\n",
-			result.FileCount, result.NodeCount, result.EdgeCount, result.DurationMs)
+	}
+
+	// Index repository (with cache support).
+	if bridgeIndex != "" {
+		commitHash := gitCommitHash(bridgeIndex)
+		cached := false
+
+		if commitHash != "" && store.Check(bridgeIndex, commitHash) && store.Validate(bridgeIndex, commitHash) {
+			snap, err := store.Load(bridgeIndex, commitHash)
+			if err == nil {
+				for _, n := range snap.Nodes {
+					g.AddNode(n)
+				}
+				for _, e := range snap.Edges {
+					g.AddEdge(e)
+				}
+				idx.SetFileMtimes(snap.FileMtimes)
+				idx.SetRootPath(bridgeIndex)
+
+				result, err := idx.IncrementalReindex(bridgeIndex)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "[gortex] bridge: incremental reindex failed: %v\n", err)
+				} else {
+					fmt.Fprintf(os.Stderr, "[gortex] bridge: restored graph (%d nodes, %d edges), re-indexed %d stale files in %dms\n",
+						result.NodeCount, result.EdgeCount, result.FileCount, result.DurationMs)
+				}
+				cached = true
+			} else {
+				fmt.Fprintf(os.Stderr, "[gortex] bridge: cache load failed, will re-index: %v\n", err)
+			}
+		}
+
+		if !cached {
+			fmt.Fprintf(os.Stderr, "[gortex] bridge: indexing %s...\n", bridgeIndex)
+			result, err := idx.Index(bridgeIndex)
+			if err != nil {
+				return fmt.Errorf("indexing %s: %w", bridgeIndex, err)
+			}
+			fmt.Fprintf(os.Stderr, "[gortex] bridge: indexed %d files (%d nodes, %d edges) in %dms\n",
+				result.FileCount, result.NodeCount, result.EdgeCount, result.DurationMs)
+		}
 	}
 
 	// Multi-repo indexing.
@@ -236,6 +285,28 @@ func runBridge(_ *cobra.Command, _ []string) error {
 		return fmt.Errorf("bridge: %w", err)
 	case sig := <-sigCh:
 		fmt.Fprintf(os.Stderr, "\n[gortex] bridge: received %s, shutting down\n", sig)
+
+		if bridgeIndex != "" {
+			commitHash := gitCommitHash(bridgeIndex)
+			if commitHash != "" {
+				snap := &persistence.Snapshot{
+					Version:    version,
+					RepoPath:   bridgeIndex,
+					CommitHash: commitHash,
+					IndexedAt:  time.Now(),
+					Nodes:      g.AllNodes(),
+					Edges:      g.AllEdges(),
+					FileMtimes: idx.FileMtimes(),
+				}
+				if err := store.Save(snap); err != nil {
+					fmt.Fprintf(os.Stderr, "[gortex] bridge: cache save failed: %v\n", err)
+				} else {
+					fmt.Fprintf(os.Stderr, "[gortex] bridge: saved graph snapshot (%d nodes, %d edges)\n",
+						len(snap.Nodes), len(snap.Edges))
+				}
+			}
+		}
+
 		return httpServer.Close()
 	}
 }

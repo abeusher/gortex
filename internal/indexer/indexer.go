@@ -409,6 +409,108 @@ func (idx *Indexer) FileMtimes() map[string]int64 {
 	return out
 }
 
+// SetFileMtimes restores the file modification time map from a persisted snapshot.
+func (idx *Indexer) SetFileMtimes(mtimes map[string]int64) {
+	idx.mtimeMu.Lock()
+	defer idx.mtimeMu.Unlock()
+	idx.fileMtimes = make(map[string]int64, len(mtimes))
+	for k, v := range mtimes {
+		idx.fileMtimes[k] = v
+	}
+}
+
+// SetRootPath sets the root path for relative path computation.
+func (idx *Indexer) SetRootPath(root string) {
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		abs = root
+	}
+	idx.rootPath = abs
+}
+
+// IncrementalReindex walks the file tree and re-indexes only files that changed
+// since the last snapshot. It also evicts nodes for deleted files.
+func (idx *Indexer) IncrementalReindex(root string) (*IndexResult, error) {
+	start := time.Now()
+
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return nil, err
+	}
+	idx.rootPath = absRoot
+
+	// Collect files currently on disk.
+	diskFiles := make(map[string]bool)
+	var staleFiles []string
+
+	err = filepath.WalkDir(absRoot, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if idx.shouldExclude(path, absRoot) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if _, ok := idx.registry.DetectLanguage(path); !ok {
+			return nil
+		}
+		if idx.shouldExclude(path, absRoot) {
+			return nil
+		}
+
+		relPath, _ := filepath.Rel(absRoot, path)
+		relPath = filepath.ToSlash(relPath)
+		diskFiles[relPath] = true
+
+		if idx.IsStale(relPath) {
+			staleFiles = append(staleFiles, path)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// Detect deleted files: in fileMtimes but not on disk.
+	idx.mtimeMu.RLock()
+	var deletedFiles []string
+	for relPath := range idx.fileMtimes {
+		if !diskFiles[relPath] {
+			deletedFiles = append(deletedFiles, relPath)
+		}
+	}
+	idx.mtimeMu.RUnlock()
+
+	// Evict deleted files.
+	for _, relPath := range deletedFiles {
+		graphPath := idx.prefixPath(relPath)
+		idx.graph.EvictFile(graphPath)
+		idx.mtimeMu.Lock()
+		delete(idx.fileMtimes, relPath)
+		idx.mtimeMu.Unlock()
+	}
+
+	// Re-index stale files.
+	for _, f := range staleFiles {
+		if err := idx.IndexFile(f); err != nil {
+			idx.logger.Debug("incremental reindex: failed to index file",
+				zap.String("file", f), zap.Error(err))
+		}
+	}
+
+	// Rebuild search index to ensure consistency.
+	idx.buildSearchIndex()
+
+	return &IndexResult{
+		NodeCount:  idx.graph.Stats().TotalNodes,
+		EdgeCount:  idx.graph.Stats().TotalEdges,
+		FileCount:  len(staleFiles),
+		DurationMs: time.Since(start).Milliseconds(),
+	}, nil
+}
+
 // LastIndexTime returns the timestamp of the last full index.
 func (idx *Indexer) LastIndexTime() time.Time {
 	return idx.lastIndexTime
