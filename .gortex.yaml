@@ -11,6 +11,11 @@ index:
     - "**/*_test.go"
     - "dist/**"
     - "*.pb.go"
+    - ".venv"
+    - "venv"
+    - "env"
+    - ".pyenv"
+    - ".git"
   workers: 8
 
 watch:
@@ -23,6 +28,10 @@ watch:
     - "**/*.swp"
     - "**/.git/**"
     - "**/node_modules/**"
+    - ".venv"
+    - "venv"
+    - "env"
+    - ".pyenv"
 
 query:
   default_depth: 3
