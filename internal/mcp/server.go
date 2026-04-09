@@ -249,6 +249,12 @@ func (s *Server) ServeStdio() error {
 	return server.ServeStdio(s.mcpServer)
 }
 
+// MCPServer returns the underlying MCP server instance.
+// This is used by the eval-server to wire tool dispatch into an HTTP handler.
+func (s *Server) MCPServer() *server.MCPServer {
+	return s.mcpServer
+}
+
 // SetWatcher sets the watcher after background initialization and registers
 // a symbol change callback to record modifications in symbolHistory.
 func (s *Server) SetWatcher(w *indexer.Watcher) {

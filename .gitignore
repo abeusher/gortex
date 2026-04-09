@@ -1,6 +1,7 @@
 # Binary
 ./gortex
 /gortex
+/gortex-linux
 
 # Go
 *.exe
@@ -24,3 +25,23 @@ Thumbs.db
 
 # Debug
 __debug_bin*
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Testing
+.pytest_cache/
+.hypothesis/
+htmlcov/
+.coverage
+
+# Eval results (generated at runtime)
+eval/results/
+eval/scripts/
+eval/logs/
