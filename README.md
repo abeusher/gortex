@@ -13,6 +13,7 @@ Built for AI coding agents (Claude Code, Cursor, Codex) — one `smart_context` 
 - **Multi-repo workspaces** — index multiple repositories into a single graph with cross-repo symbol resolution, project grouping, reference tags, and per-repo scoping
 - **26 languages** — Go, TypeScript, JavaScript, Python, Rust, Java, C#, Kotlin, Swift, Scala, PHP, Ruby, Elixir, C, C++, Dart, Bash, SQL, Protobuf, Markdown, HTML, CSS, YAML, TOML, HCL, Dockerfile
 - **44 MCP tools** — symbol lookup, call chains, blast radius, community detection, process discovery, contract verification, cycle detection, dead code analysis, scaffolding, multi-repo management, and 6 agent-optimized tools
+- **Semantic search** — hybrid BM25 + vector search with RRF fusion. Built-in GloVe word vectors for offline use, or connect to Ollama/OpenAI for transformer-quality embeddings. Build tags for ONNX, GoMLX, and Hugot offline transformer backends
 - **Type-aware resolution** — infers receiver types from variable declarations, composite literals, and Go constructor conventions to disambiguate same-named methods across types
 - **On-disk persistence** — snapshots the graph on shutdown, restores on startup with incremental re-indexing of only changed files (~200ms vs 3-5s full re-index)
 - **Bridge Mode** — HTTP/JSON API exposing all MCP tools for IDE plugins, CI tools, and web UIs with CORS support and tool discovery endpoint
@@ -322,6 +323,38 @@ Each generated skill includes:
 - **MCP tool invocations** — pre-written `get_community`, `smart_context`, `find_usages` calls
 
 Skills are written to `.claude/skills/generated/` and a routing table is inserted into CLAUDE.md between `<!-- gortex:skills:start/end -->` markers.
+
+## Semantic Search
+
+Hybrid BM25 + vector search with Reciprocal Rank Fusion (RRF). Multiple embedding tiers:
+
+```bash
+# Built-in word vectors (always available, zero setup)
+gortex serve --index . --embeddings
+
+# Ollama (best quality, local)
+ollama pull nomic-embed-text
+gortex serve --index . --embeddings-url http://localhost:11434
+
+# OpenAI (best quality, cloud)
+gortex serve --index . --embeddings-url https://api.openai.com/v1 \
+  --embeddings-model text-embedding-3-small
+```
+
+| Tier | Flag | Quality | Offline |
+|------|------|---------|---------|
+| Built-in | `--embeddings` | Basic (GloVe word averaging) | Yes |
+| API | `--embeddings-url` | Best (transformer model) | No |
+| ONNX | `--embeddings` + build tag | Best | Yes |
+| GoMLX | `--embeddings` + build tag | Good | Yes |
+| Hugot | `--embeddings` + build tag | Good | Yes |
+
+Offline transformer backends via build tags:
+```bash
+go build -tags embeddings_onnx ./cmd/gortex/   # needs: brew install onnxruntime
+go build -tags embeddings_gomlx ./cmd/gortex/  # auto-downloads XLA plugin
+go build -tags embeddings_hugot ./cmd/gortex/  # auto-downloads XLA plugin
+```
 
 ## Graph Persistence
 

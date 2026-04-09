@@ -1,6 +1,8 @@
 package indexer
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,6 +12,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/embedding"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/resolver"
@@ -44,6 +47,9 @@ type Indexer struct {
 	// repoPrefix is set in multi-repo mode to prefix all file paths and node IDs.
 	// When empty, the indexer operates in single-repo mode (backward compatible).
 	repoPrefix string
+
+	// embedder is the optional embedding provider for semantic search.
+	embedder embedding.Provider
 
 	// Mtime tracking and parse error retention for index health diagnostics.
 	parseErrors   []IndexError
@@ -81,6 +87,10 @@ func (idx *Indexer) SetRepoPrefix(prefix string) { idx.repoPrefix = prefix }
 
 // RepoPrefix returns the current repository prefix.
 func (idx *Indexer) RepoPrefix() string { return idx.repoPrefix }
+
+// SetEmbedder sets the embedding provider for semantic search.
+// When set, buildSearchIndex will create a HybridBackend with vector search.
+func (idx *Indexer) SetEmbedder(p embedding.Provider) { idx.embedder = p }
 
 // prefixPath prepends the repoPrefix to a relative path when in multi-repo mode.
 // Returns the path unchanged when repoPrefix is empty.
@@ -362,14 +372,74 @@ func (idx *Indexer) EvictFile(filePath string) (int, int) {
 }
 
 // buildSearchIndex populates the search backend from the current graph.
+// When an embedder is set, also builds a vector index and wraps both
+// in a HybridBackend with RRF fusion.
 func (idx *Indexer) buildSearchIndex() {
-	for _, n := range idx.graph.AllNodes() {
+	nodes := idx.graph.AllNodes()
+
+	// Build text index.
+	for _, n := range nodes {
 		if n.Kind == graph.KindFile || n.Kind == graph.KindImport {
 			continue
 		}
 		sig, _ := n.Meta["signature"].(string)
 		idx.search.Add(n.ID, n.Name, n.FilePath, sig)
 	}
+
+	// Build vector index if embedder is available.
+	if idx.embedder == nil {
+		return
+	}
+
+	dims := idx.embedder.Dimensions()
+	if dims == 0 {
+		dims = 300 // default for static provider
+	}
+
+	// Collect texts and IDs for batch embedding.
+	var texts []string
+	var ids []string
+	for _, n := range nodes {
+		if n.Kind == graph.KindFile || n.Kind == graph.KindImport {
+			continue
+		}
+		sig, _ := n.Meta["signature"].(string)
+		text := fmt.Sprintf("%s %s %s %s", n.Kind, n.Name, sig, n.FilePath)
+		texts = append(texts, text)
+		ids = append(ids, n.ID)
+	}
+
+	if len(texts) == 0 {
+		return
+	}
+
+	// Batch embed all symbols.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	vectors, err := idx.embedder.EmbedBatch(ctx, texts)
+	if err != nil {
+		idx.logger.Warn("failed to build vector index", zap.Error(err))
+		return
+	}
+
+	// Detect actual dimensions from first vector.
+	if len(vectors) > 0 && len(vectors[0]) > 0 {
+		dims = len(vectors[0])
+	}
+
+	vecBackend := search.NewVector(dims)
+	for i, vec := range vectors {
+		if vec != nil {
+			vecBackend.Add(ids[i], vec)
+		}
+	}
+
+	// Wrap text + vector into hybrid backend.
+	idx.search = search.NewHybrid(idx.search, vecBackend, idx.embedder)
+	idx.logger.Info("vector index built",
+		zap.Int("symbols", vecBackend.Count()),
+		zap.Int("dimensions", dims))
 }
 
 func (idx *Indexer) shouldExclude(path, root string) bool {

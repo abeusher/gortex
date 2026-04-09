@@ -2,10 +2,25 @@ BINARY    := gortex
 VERSION   ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS   := -s -w -X main.version=$(VERSION)
 
-.PHONY: build test bench lint fmt clean install
+.PHONY: build build-onnx build-gomlx build-hugot \
+       test bench lint fmt clean install \
+       deps-onnx deps-gomlx deps-hugot deps-vectors
+
+# ---------------------------------------------------------------------------
+# Build variants
+# ---------------------------------------------------------------------------
 
 build:
 	go build -ldflags '$(LDFLAGS)' -o $(BINARY) ./cmd/gortex/
+
+build-onnx: deps-onnx
+	go build -tags embeddings_onnx -ldflags '$(LDFLAGS)' -o $(BINARY) ./cmd/gortex/
+
+build-gomlx: deps-gomlx
+	go build -tags embeddings_gomlx -ldflags '$(LDFLAGS)' -o $(BINARY) ./cmd/gortex/
+
+build-hugot: deps-hugot
+	go build -tags embeddings_hugot -ldflags '$(LDFLAGS)' -o $(BINARY) ./cmd/gortex/
 
 test:
 	go test -race ./...
@@ -29,6 +44,44 @@ clean:
 
 install:
 	go install -ldflags '$(LDFLAGS)' ./cmd/gortex/
+
+# ---------------------------------------------------------------------------
+# Embedding backend dependencies
+# ---------------------------------------------------------------------------
+
+# ONNX Runtime — system library required for -tags embeddings_onnx
+deps-onnx:
+	@echo "=== ONNX Runtime dependency ==="
+ifeq ($(shell uname -s),Darwin)
+	@command -v brew >/dev/null 2>&1 || { echo "Error: Homebrew required. Install from https://brew.sh"; exit 1; }
+	@brew list onnxruntime >/dev/null 2>&1 || brew install onnxruntime
+	@echo "✓ onnxruntime installed (macOS/Homebrew)"
+else ifeq ($(shell uname -s),Linux)
+	@dpkg -s libonnxruntime-dev >/dev/null 2>&1 || { echo "Run: sudo apt install libonnxruntime-dev"; exit 1; }
+	@echo "✓ libonnxruntime-dev installed (Linux/apt)"
+endif
+	go get github.com/yalue/onnxruntime_go@latest
+	@echo "✓ Go ONNX bindings ready"
+
+# GoMLX — XLA/PJRT plugin auto-downloads on first run (~100MB)
+deps-gomlx:
+	@echo "=== GoMLX dependency ==="
+	go get github.com/gomlx/gomlx@latest
+	go get github.com/gomlx/onnx-gomlx@latest
+	@echo "✓ GoMLX + ONNX converter installed"
+	@echo "  Note: XLA/PJRT plugin will auto-download on first run (~100MB)"
+
+# Hugot — uses same XLA/PJRT backend as GoMLX
+deps-hugot:
+	@echo "=== Hugot dependency ==="
+	go get github.com/knights-analytics/hugot@latest
+	@echo "✓ Hugot installed"
+	@echo "  Note: XLA/PJRT plugin will auto-download on first run (~100MB)"
+
+# Prepare GloVe word vectors for built-in static embeddings
+deps-vectors:
+	@echo "=== Preparing GloVe word vectors ==="
+	@test -f internal/embedding/data/vectors.bin.gz && echo "✓ Vectors already prepared" || bash scripts/prepare_vectors.sh
 
 # ---------------------------------------------------------------------------
 # Eval framework

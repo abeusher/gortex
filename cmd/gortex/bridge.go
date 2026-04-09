@@ -13,6 +13,7 @@ import (
 
 	"github.com/zzet/gortex/internal/bridge"
 	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/embedding"
 	"github.com/zzet/gortex/internal/persistence"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
@@ -32,8 +33,11 @@ var (
 	bridgeWatch      bool
 	bridgeTrack      []string
 	bridgeProject    string
-	bridgeCacheDir   string
-	bridgeNoCache    bool
+	bridgeCacheDir        string
+	bridgeNoCache         bool
+	bridgeEmbeddings      bool
+	bridgeEmbeddingsURL   string
+	bridgeEmbeddingsModel string
 )
 
 var bridgeCmd = &cobra.Command{
@@ -53,6 +57,9 @@ func init() {
 	bridgeCmd.Flags().StringVar(&bridgeProject, "project", "", "active project name")
 	bridgeCmd.Flags().StringVar(&bridgeCacheDir, "cache-dir", "", "graph cache directory (default ~/.cache/gortex/)")
 	bridgeCmd.Flags().BoolVar(&bridgeNoCache, "no-cache", false, "disable graph caching")
+	bridgeCmd.Flags().BoolVar(&bridgeEmbeddings, "embeddings", false, "enable semantic search")
+	bridgeCmd.Flags().StringVar(&bridgeEmbeddingsURL, "embeddings-url", "", "embedding API URL (e.g. http://localhost:11434 for Ollama)")
+	bridgeCmd.Flags().StringVar(&bridgeEmbeddingsModel, "embeddings-model", "", "embedding model name")
 	rootCmd.AddCommand(bridgeCmd)
 }
 
@@ -70,6 +77,21 @@ func runBridge(_ *cobra.Command, _ []string) error {
 	reg := parser.NewRegistry()
 	languages.RegisterAll(reg)
 	idx := indexer.New(g, reg, cfg.Index, logger)
+
+	// Set up embedding provider for semantic search.
+	if bridgeEmbeddingsURL != "" {
+		embedder := embedding.NewAPIProvider(bridgeEmbeddingsURL, bridgeEmbeddingsModel)
+		idx.SetEmbedder(embedder)
+		fmt.Fprintf(os.Stderr, "[gortex] bridge: semantic search enabled (API: %s)\n", bridgeEmbeddingsURL)
+	} else if bridgeEmbeddings {
+		embedder, err := embedding.NewLocalProvider()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[gortex] bridge: embeddings disabled: %v\n", err)
+		} else {
+			idx.SetEmbedder(embedder)
+			fmt.Fprintf(os.Stderr, "[gortex] bridge: semantic search enabled (local)\n")
+		}
+	}
 
 	// Multi-repo support.
 	cm, err := config.NewConfigManager("")

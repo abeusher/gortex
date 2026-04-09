@@ -13,6 +13,7 @@ import (
 
 	"github.com/zzet/gortex/internal/bridge"
 	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/embedding"
 	"github.com/zzet/gortex/internal/persistence"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
@@ -35,8 +36,11 @@ var (
 	serveDebounce   int
 	serveTrack      []string
 	serveProject    string
-	serveCacheDir   string
-	serveNoCache    bool
+	serveCacheDir      string
+	serveNoCache       bool
+	serveEmbeddings    bool
+	serveEmbeddingsURL string
+	serveEmbeddingsModel string
 )
 
 var serveCmd = &cobra.Command{
@@ -58,6 +62,9 @@ func init() {
 	serveCmd.Flags().StringVar(&serveProject, "project", "", "active project name")
 	serveCmd.Flags().StringVar(&serveCacheDir, "cache-dir", "", "graph cache directory (default ~/.cache/gortex/)")
 	serveCmd.Flags().BoolVar(&serveNoCache, "no-cache", false, "disable graph caching")
+	serveCmd.Flags().BoolVar(&serveEmbeddings, "embeddings", false, "enable semantic search (built-in word vectors or transformer if compiled in)")
+	serveCmd.Flags().StringVar(&serveEmbeddingsURL, "embeddings-url", "", "embedding API URL (e.g. http://localhost:11434 for Ollama)")
+	serveCmd.Flags().StringVar(&serveEmbeddingsModel, "embeddings-model", "", "embedding model name (default: auto-detect)")
 	rootCmd.AddCommand(serveCmd)
 }
 
@@ -75,6 +82,21 @@ func runServe(cmd *cobra.Command, args []string) error {
 	languages.RegisterAll(reg)
 
 	idx := indexer.New(g, reg, cfg.Index, logger)
+
+	// Set up embedding provider for semantic search.
+	if serveEmbeddingsURL != "" {
+		embedder := embedding.NewAPIProvider(serveEmbeddingsURL, serveEmbeddingsModel)
+		idx.SetEmbedder(embedder)
+		fmt.Fprintf(os.Stderr, "[gortex] semantic search enabled (API: %s)\n", serveEmbeddingsURL)
+	} else if serveEmbeddings {
+		embedder, err := embedding.NewLocalProvider()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[gortex] warning: embeddings disabled: %v\n", err)
+		} else {
+			idx.SetEmbedder(embedder)
+			fmt.Fprintf(os.Stderr, "[gortex] semantic search enabled (local)\n")
+		}
+	}
 
 	// Initialize ConfigManager for multi-repo support.
 	cm, err := config.NewConfigManager("")
