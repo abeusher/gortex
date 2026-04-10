@@ -85,8 +85,9 @@ func (s *Server) registerEnhancementTools() {
 	// find_dead_code
 	s.mcpServer.AddTool(
 		mcp.NewTool("find_dead_code",
-			mcp.WithDescription("Returns all symbols with zero incoming call or reference edges, excluding entry points, tests, and exported symbols."),
+			mcp.WithDescription("Returns all symbols with zero incoming call or reference edges, excluding entry points, tests, and exported symbols. Variables are excluded by default because the graph lacks intra-function data-flow edges, making them false positives."),
 			mcp.WithBoolean("compact", mcp.Description("One-line-per-symbol text output")),
+			mcp.WithBoolean("include_variables", mcp.Description("Include variable nodes (excluded by default — they are usually false positives since the graph does not track intra-function data flow)")),
 		),
 		s.handleFindDeadCode,
 	)
@@ -491,7 +492,17 @@ func (s *Server) handlePrefetchContext(_ context.Context, req mcp.CallToolReques
 // ---------------------------------------------------------------------------
 
 func (s *Server) handleFindDeadCode(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	entries := analysis.FindDeadCode(s.graph, s.getProcesses(), nil)
+	opts := analysis.FindDeadCodeOptions{}
+	if v, ok := req.GetArguments()["include_variables"].(bool); ok && v {
+		opts.IncludeVariables = true
+	}
+
+	entries := analysis.FindDeadCode(s.graph, s.getProcesses(), nil, opts)
+
+	variablesNote := ""
+	if !opts.IncludeVariables {
+		variablesNote = "Variables excluded by default (graph lacks intra-function data flow). Pass include_variables=true to include them."
+	}
 
 	if isCompact(req) {
 		var b strings.Builder
@@ -501,13 +512,20 @@ func (s *Server) handleFindDeadCode(_ context.Context, req mcp.CallToolRequest) 
 		if len(entries) == 0 {
 			b.WriteString("no dead code found\n")
 		}
+		if variablesNote != "" {
+			fmt.Fprintf(&b, "\nnote: %s\n", variablesNote)
+		}
 		return mcp.NewToolResultText(b.String()), nil
 	}
 
-	return mcp.NewToolResultJSON(map[string]any{
+	result := map[string]any{
 		"dead_code": entries,
 		"total":     len(entries),
-	})
+	}
+	if variablesNote != "" {
+		result["note"] = variablesNote
+	}
+	return mcp.NewToolResultJSON(result)
 }
 
 func (s *Server) handleFindHotspots(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {

@@ -66,9 +66,16 @@ func (r *Resolver) resolveEdge(e *graph.Edge, stats *ResolveStats) {
 	case strings.HasPrefix(target, "import::"):
 		r.resolveImport(e, strings.TrimPrefix(target, "import::"), stats)
 	case strings.HasPrefix(target, "*."):
+		// Method call or method-value reference (e.g. h.handleHealth)
 		r.resolveMethodCall(e, strings.TrimPrefix(target, "*."), stats)
 	default:
-		r.resolveFunctionCall(e, target, stats)
+		// For instantiates/references edges, try to resolve as a type first;
+		// for calls edges, resolve as a function (original behavior).
+		if e.Kind == graph.EdgeInstantiates || e.Kind == graph.EdgeReferences {
+			r.resolveTypeOrFunc(e, target, stats)
+		} else {
+			r.resolveFunctionCall(e, target, stats)
+		}
 	}
 
 	// Update inEdges index if the target changed during resolution.
@@ -167,6 +174,66 @@ func (r *Resolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *Re
 	stats.Unresolved++
 }
 
+// resolveTypeOrFunc resolves unresolved edges that could be either a type
+// reference (composite literal, type assertion) or a function reference.
+// It first tries to match a type/interface node, then falls back to functions.
+func (r *Resolver) resolveTypeOrFunc(e *graph.Edge, name string, stats *ResolveStats) {
+	candidates := r.graph.FindNodesByName(name)
+	if len(candidates) == 0 {
+		stats.Unresolved++
+		return
+	}
+
+	callerFile := e.FilePath
+	callerDir := filepath.Dir(callerFile)
+
+	// Prefer same-package type match.
+	for _, c := range candidates {
+		if (c.Kind == graph.KindType || c.Kind == graph.KindInterface) &&
+			filepath.Dir(c.FilePath) == callerDir {
+			e.To = c.ID
+			stats.Resolved++
+			return
+		}
+	}
+
+	// Fall back to any type match.
+	callerRepo := r.callerRepoPrefix(e)
+	for _, c := range candidates {
+		if c.Kind == graph.KindType || c.Kind == graph.KindInterface {
+			e.To = c.ID
+			if callerRepo != "" && c.RepoPrefix != "" && c.RepoPrefix != callerRepo {
+				e.CrossRepo = true
+			}
+			stats.Resolved++
+			return
+		}
+	}
+
+	// If no type found, try as function (e.g., bare function name passed as value).
+	for _, c := range candidates {
+		if c.Kind == graph.KindFunction || c.Kind == graph.KindMethod {
+			if filepath.Dir(c.FilePath) == callerDir {
+				e.To = c.ID
+				stats.Resolved++
+				return
+			}
+		}
+	}
+	for _, c := range candidates {
+		if c.Kind == graph.KindFunction || c.Kind == graph.KindMethod {
+			e.To = c.ID
+			if callerRepo != "" && c.RepoPrefix != "" && c.RepoPrefix != callerRepo {
+				e.CrossRepo = true
+			}
+			stats.Resolved++
+			return
+		}
+	}
+
+	stats.Unresolved++
+}
+
 func (r *Resolver) resolveMethodCall(e *graph.Edge, methodName string, stats *ResolveStats) {
 	candidates := r.graph.FindNodesByName(methodName)
 	if len(candidates) == 0 {
@@ -201,7 +268,38 @@ func (r *Resolver) resolveMethodCall(e *graph.Edge, methodName string, stats *Re
 		}
 	}
 
-	// Fallback: name-only heuristic (methods first, then functions for pkg.Func() calls).
+	// Fallback: infer receiver type from the caller node.
+	// If the caller is a method on type X and there's a candidate method on
+	// type X with the same name, prefer it.  This handles e.extractFunctions()
+	// where the type env doesn't have a hint for parameter-bound receivers.
+	callerNode := r.graph.GetNode(e.From)
+	if callerNode != nil && callerNode.Kind == graph.KindMethod {
+		callerRecv := nodeReceiverType(callerNode)
+		if callerRecv != "" {
+			// Same receiver type + same directory = very high confidence.
+			for _, c := range candidates {
+				if c.Kind == graph.KindMethod &&
+					filepath.Dir(c.FilePath) == callerDir &&
+					nodeReceiverType(c) == callerRecv {
+					e.To = c.ID
+					e.Confidence = 0.9
+					stats.Resolved++
+					return
+				}
+			}
+			// Same receiver type, any directory.
+			for _, c := range candidates {
+				if c.Kind == graph.KindMethod && nodeReceiverType(c) == callerRecv {
+					e.To = c.ID
+					e.Confidence = 0.8
+					stats.Resolved++
+					return
+				}
+			}
+		}
+	}
+
+	// Final fallback: name-only heuristic (methods first, then functions for pkg.Func() calls).
 	for _, c := range candidates {
 		if c.Kind == graph.KindMethod && filepath.Dir(c.FilePath) == callerDir {
 			e.To = c.ID

@@ -258,12 +258,26 @@ func TestPropertyDeadCode_Completeness(t *testing.T) {
 				continue
 			}
 
-			// Check incoming calls/references
+			// Variables excluded by default
+			if node.Kind == graph.KindVariable {
+				continue
+			}
+
+			// Go init() excluded
+			if node.Name == "init" && node.Language == "go" {
+				continue
+			}
+
+			// Check incoming edges (calls, references, member_of, implements, instantiates)
 			inEdges := tc.Graph.GetInEdges(node.ID)
 			hasIncoming := false
 			for _, e := range inEdges {
-				if e.Kind == graph.EdgeCalls || e.Kind == graph.EdgeReferences {
+				switch e.Kind {
+				case graph.EdgeCalls, graph.EdgeReferences,
+					graph.EdgeMemberOf, graph.EdgeImplements, graph.EdgeInstantiates:
 					hasIncoming = true
+				}
+				if hasIncoming {
 					break
 				}
 			}

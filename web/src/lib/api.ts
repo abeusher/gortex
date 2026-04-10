@@ -35,7 +35,13 @@ async function callTool(name: string, args: Record<string, unknown> = {}): Promi
 
 async function callToolJSON<T>(name: string, args: Record<string, unknown> = {}): Promise<T> {
   const text = await callTool(name, args)
-  return JSON.parse(text) as T
+  try {
+    return JSON.parse(text) as T
+  } catch {
+    // Some tools return plain text (e.g. compact format) instead of JSON.
+    // Wrap it as an empty result so callers get a valid object.
+    return { nodes: [], edges: [], text } as unknown as T
+  }
 }
 
 // --- Public API ---

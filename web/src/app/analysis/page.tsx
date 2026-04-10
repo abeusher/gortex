@@ -89,10 +89,27 @@ function healthScoreColor(score: number) {
 }
 
 // --- Dead Code Tab ---
+const DEAD_CODE_KINDS = ['function', 'method', 'type', 'variable'] as const
+type DeadCodeKind = (typeof DEAD_CODE_KINDS)[number]
+
 function DeadCodeTab() {
   const [data, setData] = useState<DeadCodeEntry[] | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  // Hide variables by default — local vars in Go are compiler-enforced as used,
+  // so they're false positives from the graph not tracking intra-function data flow
+  const [visibleKinds, setVisibleKinds] = useState<Set<DeadCodeKind>>(
+    new Set(['function', 'method', 'type'])
+  )
+
+  const toggleKind = (kind: DeadCodeKind) => {
+    setVisibleKinds(prev => {
+      const next = new Set(prev)
+      if (next.has(kind)) next.delete(kind)
+      else next.add(kind)
+      return next
+    })
+  }
 
   const load = useCallback(async () => {
     if (data !== null) return
@@ -144,42 +161,83 @@ function DeadCodeTab() {
     return <p className="py-8 text-center text-sm text-zinc-600">No dead code found</p>
   }
 
+  const filtered = data.filter(e => visibleKinds.has(e.kind as DeadCodeKind))
+
+  // Count per kind for the filter buttons
+  const kindCounts: Record<string, number> = {}
+  for (const e of data) {
+    kindCounts[e.kind] = (kindCounts[e.kind] || 0) + 1
+  }
+
   return (
-    <Card className="border-zinc-800 bg-zinc-900">
-      <Table>
-        <TableHeader>
-          <TableRow className="border-zinc-800 hover:bg-transparent">
-            <TableHead className="text-zinc-400">Name</TableHead>
-            <TableHead className="text-zinc-400">Kind</TableHead>
-            <TableHead className="text-zinc-400">File</TableHead>
-            <TableHead className="text-zinc-400">Line</TableHead>
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {data.map((entry) => (
-            <TableRow key={entry.id} className="border-zinc-800">
-              <TableCell>
-                <Link
-                  href={`/symbol/${encodeURIComponent(entry.id)}`}
-                  className="font-mono text-xs text-blue-400 hover:text-blue-300 hover:underline"
-                >
-                  {entry.name}
-                </Link>
-              </TableCell>
-              <TableCell>
-                <Badge variant="outline" className="border-zinc-700 text-zinc-300">
-                  {entry.kind}
-                </Badge>
-              </TableCell>
-              <TableCell className="max-w-xs truncate font-mono text-xs text-zinc-400">
-                {entry.file_path}
-              </TableCell>
-              <TableCell className="text-zinc-400">{entry.start_line}</TableCell>
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </Card>
+    <div className="space-y-3">
+      {/* Kind filter bar */}
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="text-xs text-zinc-500">Filter:</span>
+        {DEAD_CODE_KINDS.map(kind => (
+          <button
+            key={kind}
+            onClick={() => toggleKind(kind)}
+            className={`rounded-md border px-2.5 py-1 text-xs transition-colors ${
+              visibleKinds.has(kind)
+                ? 'border-zinc-600 bg-zinc-800 text-zinc-200'
+                : 'border-zinc-800 bg-transparent text-zinc-600'
+            }`}
+          >
+            {kind} ({kindCounts[kind] ?? 0})
+          </button>
+        ))}
+        <span className="ml-auto text-xs text-zinc-600">
+          {filtered.length} of {data.length} shown
+        </span>
+      </div>
+
+      {!visibleKinds.has('variable') && kindCounts['variable'] && (
+        <p className="text-xs text-zinc-600">
+          {kindCounts['variable']} variables hidden — local variables in Go cannot be unused (compiler-enforced), so these are likely false positives from graph analysis.
+        </p>
+      )}
+
+      {filtered.length === 0 ? (
+        <p className="py-8 text-center text-sm text-zinc-600">No matches for selected filters</p>
+      ) : (
+        <Card className="border-zinc-800 bg-zinc-900">
+          <Table>
+            <TableHeader>
+              <TableRow className="border-zinc-800 hover:bg-transparent">
+                <TableHead className="text-zinc-400">Name</TableHead>
+                <TableHead className="text-zinc-400">Kind</TableHead>
+                <TableHead className="text-zinc-400">File</TableHead>
+                <TableHead className="text-zinc-400">Line</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {filtered.map((entry) => (
+                <TableRow key={entry.id} className="border-zinc-800">
+                  <TableCell>
+                    <Link
+                      href={`/symbol/${encodeURIComponent(entry.id)}`}
+                      className="font-mono text-xs text-blue-400 hover:text-blue-300 hover:underline"
+                    >
+                      {entry.name}
+                    </Link>
+                  </TableCell>
+                  <TableCell>
+                    <Badge variant="outline" className="border-zinc-700 text-zinc-300">
+                      {entry.kind}
+                    </Badge>
+                  </TableCell>
+                  <TableCell className="max-w-xs truncate font-mono text-xs text-zinc-400">
+                    {entry.file_path}
+                  </TableCell>
+                  <TableCell className="text-zinc-400">{entry.start_line}</TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </Card>
+      )}
+    </div>
   )
 }
 

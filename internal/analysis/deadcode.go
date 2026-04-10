@@ -32,10 +32,33 @@ type HotspotEntry struct {
 	ComplexityScore    float64 `json:"complexity_score"`
 }
 
+// FindDeadCodeOptions controls filtering behavior for dead code analysis.
+type FindDeadCodeOptions struct {
+	// IncludeVariables includes variable nodes in the results. Default false.
+	// Variables are excluded by default because the graph does not track
+	// intra-function data flow — local variables always appear "dead" even
+	// though Go's compiler enforces their usage. Package-level variables
+	// cannot be reliably distinguished from locals in the current graph model.
+	IncludeVariables bool
+}
+
 // FindDeadCode returns all symbols with zero incoming calls or references,
 // excluding entry points, test functions, exported symbols, and user-excluded patterns.
-func FindDeadCode(g *graph.Graph, processes *ProcessResult, excludePatterns []string) []DeadCodeEntry {
+// By default, variables are excluded (see FindDeadCodeOptions for rationale).
+func FindDeadCode(g *graph.Graph, processes *ProcessResult, excludePatterns []string, opts ...FindDeadCodeOptions) []DeadCodeEntry {
+	var opt FindDeadCodeOptions
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
+
 	nodes := g.AllNodes()
+	allEdges := g.AllEdges()
+
+	// Build set of interface-required method names per type.
+	// If a type implements an interface, all methods that the interface
+	// requires are alive even if never called directly (they satisfy the
+	// contract).  We index: typeID → set of required method names.
+	ifaceRequiredMethods := buildIfaceRequiredMethods(g, nodes, allEdges)
 
 	// Build set of entry point node IDs from processes
 	entryPoints := make(map[string]bool)
@@ -56,17 +79,71 @@ func FindDeadCode(g *graph.Graph, processes *ProcessResult, excludePatterns []st
 			continue
 		}
 
-		// Count incoming calls and references
+		// Skip variables unless explicitly requested — the graph lacks
+		// intra-function data-flow edges, so variables always look "dead".
+		if n.Kind == graph.KindVariable && !opt.IncludeVariables {
+			continue
+		}
+
+		// Skip implicitly-called constructors/initializers.
+		// Go: init() is called by the runtime.
+		// Python: __init__ is called when a class is instantiated.
+		if n.Name == "init" && n.Language == "go" {
+			continue
+		}
+		if n.Name == "__init__" && n.Language == "python" {
+			continue
+		}
+
+		// Skip vendored/generated C header functions — they're used via C
+		// macros and linker symbols, invisible to the graph.
+		if isVendoredOrGenerated(n.FilePath) {
+			continue
+		}
+
+		// Skip functions in Go files with build constraints — only one
+		// variant is active per build, so the others always look "dead".
+		if n.Language == "go" && hasBuildConstraint(n.FilePath) {
+			continue
+		}
+
+		// Count incoming edges that indicate the symbol is used.
+		// Besides calls and references, we also count:
+		//   - member_of:     methods point to this type → the type is used
+		//   - implements:    a type implements this interface → the interface is used
+		//   - instantiates:  struct literal usage → the type is used
 		inEdges := g.GetInEdges(n.ID)
 		incomingCount := 0
 		for _, e := range inEdges {
-			if e.Kind == graph.EdgeCalls || e.Kind == graph.EdgeReferences {
+			switch e.Kind {
+			case graph.EdgeCalls, graph.EdgeReferences,
+				graph.EdgeMemberOf, graph.EdgeImplements, graph.EdgeInstantiates:
 				incomingCount++
 			}
 		}
 
 		if incomingCount > 0 {
 			continue
+		}
+
+		// For methods with zero incoming edges, check if they exist to satisfy
+		// an interface contract.  Look up the receiver type via member_of edges
+		// and check if any implemented interface requires this method name.
+		if n.Kind == graph.KindMethod {
+			outEdges := g.GetOutEdges(n.ID)
+			for _, e := range outEdges {
+				if e.Kind == graph.EdgeMemberOf {
+					if required, ok := ifaceRequiredMethods[e.To]; ok {
+						if required[n.Name] {
+							incomingCount++ // treat as alive
+							break
+						}
+					}
+				}
+			}
+			if incomingCount > 0 {
+				continue
+			}
 		}
 
 		// Check exclusions
@@ -99,6 +176,66 @@ func FindDeadCode(g *graph.Graph, processes *ProcessResult, excludePatterns []st
 		}
 		return result[i].Line < result[j].Line
 	})
+
+	return result
+}
+
+// buildIfaceRequiredMethods returns a map from type ID → set of method names
+// that the type must implement to satisfy its interfaces.  This is computed by:
+//  1. Collecting all interfaces with their required method names (from Meta["methods"]).
+//  2. Collecting all EdgeImplements edges (type → interface).
+//  3. For each type that implements an interface, merging all required method names.
+func buildIfaceRequiredMethods(g *graph.Graph, nodes []*graph.Node, edges []*graph.Edge) map[string]map[string]bool {
+	// Step 1: interface ID → required method names
+	ifaceMethods := make(map[string]map[string]bool)
+	for _, n := range nodes {
+		if n.Kind != graph.KindInterface || n.Meta == nil {
+			continue
+		}
+		raw, ok := n.Meta["methods"]
+		if !ok {
+			continue
+		}
+		methods := make(map[string]bool)
+		switch v := raw.(type) {
+		case []string:
+			for _, m := range v {
+				methods[m] = true
+			}
+		case []any:
+			for _, m := range v {
+				if s, ok := m.(string); ok {
+					methods[s] = true
+				}
+			}
+		}
+		if len(methods) > 0 {
+			ifaceMethods[n.ID] = methods
+		}
+	}
+
+	if len(ifaceMethods) == 0 {
+		return nil
+	}
+
+	// Step 2: type ID → set of required method names (from all implemented interfaces)
+	result := make(map[string]map[string]bool)
+	for _, e := range edges {
+		if e.Kind != graph.EdgeImplements {
+			continue
+		}
+		// EdgeImplements: From=type, To=interface
+		iface, ok := ifaceMethods[e.To]
+		if !ok {
+			continue
+		}
+		if result[e.From] == nil {
+			result[e.From] = make(map[string]bool)
+		}
+		for m := range iface {
+			result[e.From][m] = true
+		}
+	}
 
 	return result
 }
@@ -260,6 +397,34 @@ func isExportedSymbol(name, lang string) bool {
 	}
 	// For other languages, assume exported if not starting with underscore
 	return len(name) > 0 && !strings.HasPrefix(name, "_")
+}
+
+// isVendoredOrGenerated checks if a file is vendored or generated code that
+// should be excluded from dead code analysis (C headers, tree-sitter bindings, etc.).
+func isVendoredOrGenerated(path string) bool {
+	return strings.Contains(path, "tree_sitter/") ||
+		strings.Contains(path, "vendor/") ||
+		strings.HasSuffix(path, ".h") ||
+		strings.HasSuffix(path, ".c")
+}
+
+// hasBuildConstraint checks if a Go file has build constraints (build tags).
+// Files with build constraints are conditionally compiled — only one variant
+// is active per build, so inactive variants always look "dead".
+func hasBuildConstraint(path string) bool {
+	base := filepath.Base(path)
+	// Common suffixes: _linux.go, _darwin.go, _windows.go, _stub.go, _cgo.go
+	suffixes := []string{
+		"_linux.go", "_darwin.go", "_windows.go", "_freebsd.go",
+		"_amd64.go", "_arm64.go", "_386.go",
+		"_stub.go", "_cgo.go", "_nocgo.go",
+	}
+	for _, s := range suffixes {
+		if strings.HasSuffix(base, s) {
+			return true
+		}
+	}
+	return false
 }
 
 // matchesExcludePattern checks if a node matches any user-configured exclusion pattern.

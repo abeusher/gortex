@@ -76,6 +76,70 @@ const (
 	qShortVar = `(short_var_declaration
 		left: (expression_list (identifier) @svar.name)
 		right: (expression_list (_) @svar.value)) @svar.def`
+
+	// --- Dead-code-accuracy queries ---
+
+	// Composite literals: MyType{...}, &MyType{...}, pkg.Type{...}
+	qCompositeLiteral = `(composite_literal
+		type: (type_identifier) @comp.type) @comp.expr`
+
+	qCompositeLiteralQualified = `(composite_literal
+		type: (qualified_type
+			package: (package_identifier) @comp.pkg
+			name: (type_identifier) @comp.type)) @comp.expr`
+
+	// Type assertions: x.(MyType), x.(pkg.Type)
+	qTypeAssert = `(type_assertion
+		type: (type_identifier) @assert.type) @assert.expr`
+
+	qTypeAssertQualified = `(type_assertion
+		type: (qualified_type
+			package: (package_identifier) @assert.pkg
+			name: (type_identifier) @assert.type)) @assert.expr`
+
+	// Function/method values passed as arguments (not invoked directly).
+	// Selector expression inside argument_list but NOT inside call_expression function position.
+	qSelectorArg = `(argument_list
+		(selector_expression
+			operand: (_) @selarg.receiver
+			field: (field_identifier) @selarg.field)) @selarg.list`
+
+	// Bare identifier passed as argument (function value).
+	qIdentArg = `(argument_list
+		(identifier) @identarg.name) @identarg.list`
+
+	// --- Type references in declarations ---
+
+	// Type identifier in struct field declarations: field apiFormat
+	qFieldType = `(field_declaration
+		type: (type_identifier) @ftype.name) @ftype.decl`
+
+	// Type identifier in const/var declarations: const x apiFormat = ...
+	qConstType = `(const_spec
+		type: (type_identifier) @ctype.name) @ctype.decl`
+
+	qVarType = `(var_spec
+		type: (type_identifier) @vtype.name) @vtype.decl`
+
+	// Type identifier in parameter lists: func foo(x apiFormat)
+	qParamType = `(parameter_declaration
+		type: (type_identifier) @ptype.name) @ptype.decl`
+
+	// --- Struct literal field value references ---
+
+	// Bare identifier as a struct field value: &cobra.Command{RunE: runClean}
+	// AST: keyed_element → literal_element(identifier key) → literal_element(identifier value)
+	qFieldValueIdent = `(keyed_element
+		(literal_element (identifier) @fieldval.key)
+		(literal_element (identifier) @fieldval.value)) @fieldval.elem`
+
+	// Selector expression as a struct field value: {Handler: h.handleHealth}
+	qFieldValueSelector = `(keyed_element
+		(literal_element (identifier) @fieldsel.key)
+		(literal_element
+			(selector_expression
+				operand: (_) @fieldsel.receiver
+				field: (field_identifier) @fieldsel.method))) @fieldsel.elem`
 )
 
 // GoExtractor extracts Go source files into graph nodes and edges.
@@ -135,6 +199,12 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 
 	// Variables and constants.
 	e.extractVarsConsts(root, src, filePath, fileNode.ID, result)
+
+	// Type references: composite literals (struct instantiation), type assertions.
+	e.extractTypeRefs(root, src, filePath, result)
+
+	// Value references: function/method identifiers passed as callbacks.
+	e.extractValueRefs(root, src, filePath, result, tenv)
 
 	return result, nil
 }
@@ -415,6 +485,216 @@ func (e *GoExtractor) extractVarsConsts(root *sitter.Node, src []byte, filePath,
 			})
 		}
 	}
+}
+
+// extractTypeRefs emits EdgeReferences edges for composite literals (struct
+// instantiation) and type assertions/conversions, and EdgeReferences edges for
+// function/method values passed as arguments (not invoked).  These references
+// are invisible to the basic call-graph but are critical for dead-code accuracy.
+func (e *GoExtractor) extractTypeRefs(root *sitter.Node, src []byte, filePath string, result *parser.ExtractionResult) {
+	funcRanges := buildFuncRanges(result)
+
+	// 1. Composite literals: MyType{...}
+	for _, q := range []string{qCompositeLiteral, qCompositeLiteralQualified} {
+		matches, _ := parser.RunQuery(q, e.lang, root, src)
+		for _, m := range matches {
+			typeName := m.Captures["comp.type"].Text
+			expr := m.Captures["comp.expr"]
+			callerID := findEnclosingFunc(funcRanges, expr.StartLine+1)
+			if callerID == "" {
+				callerID = filePath // package-level expression → use file node
+			}
+			result.Edges = append(result.Edges, &graph.Edge{
+				From:     callerID,
+				To:       "unresolved::" + typeName,
+				Kind:     graph.EdgeInstantiates,
+				FilePath: filePath,
+				Line:     expr.StartLine + 1,
+			})
+		}
+	}
+
+	// 2. Type assertions: x.(MyType)
+	for _, q := range []string{qTypeAssert, qTypeAssertQualified} {
+		matches, _ := parser.RunQuery(q, e.lang, root, src)
+		for _, m := range matches {
+			typeName := m.Captures["assert.type"].Text
+			expr := m.Captures["assert.expr"]
+			callerID := findEnclosingFunc(funcRanges, expr.StartLine+1)
+			if callerID == "" {
+				callerID = filePath
+			}
+			result.Edges = append(result.Edges, &graph.Edge{
+				From:     callerID,
+				To:       "unresolved::" + typeName,
+				Kind:     graph.EdgeReferences,
+				FilePath: filePath,
+				Line:     expr.StartLine + 1,
+			})
+		}
+	}
+
+	// 3. Type references in declarations: struct fields, const types, var types, parameters.
+	// These reference the type without calling or instantiating it.
+	typeRefQueries := []struct {
+		query      string
+		captureKey string
+	}{
+		{qFieldType, "ftype"},
+		{qConstType, "ctype"},
+		{qVarType, "vtype"},
+		{qParamType, "ptype"},
+	}
+	for _, tq := range typeRefQueries {
+		matches, _ := parser.RunQuery(tq.query, e.lang, root, src)
+		for _, m := range matches {
+			typeName := m.Captures[tq.captureKey+".name"].Text
+			decl := m.Captures[tq.captureKey+".decl"]
+			callerID := findEnclosingFunc(funcRanges, decl.StartLine+1)
+			if callerID == "" {
+				callerID = filePath
+			}
+			result.Edges = append(result.Edges, &graph.Edge{
+				From:     callerID,
+				To:       "unresolved::" + typeName,
+				Kind:     graph.EdgeReferences,
+				FilePath: filePath,
+				Line:     decl.StartLine + 1,
+			})
+		}
+	}
+}
+
+// extractValueRefs emits EdgeReferences edges for function/method identifiers
+// passed as values (callbacks, handler registrations, etc.) rather than being
+// called directly.  For example:  h.mux.HandleFunc("GET /health", h.handleHealth)
+// creates a reference edge from registerRoutes → handleHealth.
+func (e *GoExtractor) extractValueRefs(root *sitter.Node, src []byte, filePath string, result *parser.ExtractionResult, tenv typeEnv) {
+	funcRanges := buildFuncRanges(result)
+
+	// Selector expressions inside argument lists: h.handleHealth as an arg
+	matches, _ := parser.RunQuery(qSelectorArg, e.lang, root, src)
+	for _, m := range matches {
+		fieldName := m.Captures["selarg.field"].Text
+		receiverText := m.Captures["selarg.receiver"].Text
+		listNode := m.Captures["selarg.list"]
+		callerID := findEnclosingFunc(funcRanges, listNode.StartLine+1)
+		if callerID == "" {
+			callerID = filePath // package-level expression
+		}
+
+		// Skip if this selector is actually the function position of a call
+		// (already handled by extractCalls).  We check the parent of the
+		// selector — if it's a call_expression whose function child is this
+		// selector, skip it.
+		// We detect this heuristically: if the field starts with an uppercase
+		// letter it's likely a package-qualified call (pkg.Func()), not a value.
+		if len(fieldName) > 0 && fieldName[0] >= 'A' && fieldName[0] <= 'Z' {
+			continue
+		}
+
+		edge := &graph.Edge{
+			From:     callerID,
+			To:       "unresolved::*." + fieldName,
+			Kind:     graph.EdgeReferences,
+			FilePath: filePath,
+			Line:     listNode.StartLine + 1,
+		}
+
+		// Attach receiver type hint if available.
+		if recvType, ok := tenv[receiverText]; ok {
+			edge.Meta = map[string]any{"receiver_type": recvType}
+		}
+
+		result.Edges = append(result.Edges, edge)
+	}
+
+	// Bare identifiers inside argument lists: funcName as an arg
+	matches, _ = parser.RunQuery(qIdentArg, e.lang, root, src)
+	for _, m := range matches {
+		name := m.Captures["identarg.name"].Text
+		listNode := m.Captures["identarg.list"]
+		callerID := findEnclosingFunc(funcRanges, listNode.StartLine+1)
+		if callerID == "" {
+			callerID = filePath
+		}
+
+		// Skip common non-function identifiers (keywords, builtins, etc.)
+		if isGoBuiltinOrKeyword(name) {
+			continue
+		}
+
+		result.Edges = append(result.Edges, &graph.Edge{
+			From:     callerID,
+			To:       "unresolved::" + name,
+			Kind:     graph.EdgeReferences,
+			FilePath: filePath,
+			Line:     listNode.StartLine + 1,
+		})
+	}
+
+	// Bare identifiers as struct field values: &cobra.Command{RunE: runClean}
+	matches, _ = parser.RunQuery(qFieldValueIdent, e.lang, root, src)
+	for _, m := range matches {
+		name := m.Captures["fieldval.value"].Text
+		elem := m.Captures["fieldval.elem"]
+		callerID := findEnclosingFunc(funcRanges, elem.StartLine+1)
+		if callerID == "" {
+			callerID = filePath
+		}
+		if isGoBuiltinOrKeyword(name) {
+			continue
+		}
+		result.Edges = append(result.Edges, &graph.Edge{
+			From:     callerID,
+			To:       "unresolved::" + name,
+			Kind:     graph.EdgeReferences,
+			FilePath: filePath,
+			Line:     elem.StartLine + 1,
+		})
+	}
+
+	// Selector expressions as struct field values: {Handler: h.handleHealth}
+	matches, _ = parser.RunQuery(qFieldValueSelector, e.lang, root, src)
+	for _, m := range matches {
+		methodName := m.Captures["fieldsel.method"].Text
+		receiverText := m.Captures["fieldsel.receiver"].Text
+		elem := m.Captures["fieldsel.elem"]
+		callerID := findEnclosingFunc(funcRanges, elem.StartLine+1)
+		if callerID == "" {
+			callerID = filePath
+		}
+
+		edge := &graph.Edge{
+			From:     callerID,
+			To:       "unresolved::*." + methodName,
+			Kind:     graph.EdgeReferences,
+			FilePath: filePath,
+			Line:     elem.StartLine + 1,
+		}
+		if recvType, ok := tenv[receiverText]; ok {
+			edge.Meta = map[string]any{"receiver_type": recvType}
+		}
+		result.Edges = append(result.Edges, edge)
+	}
+}
+
+// isGoBuiltinOrKeyword returns true for identifiers that should not be treated
+// as function-value references (common Go builtins, type names, and literals).
+func isGoBuiltinOrKeyword(name string) bool {
+	switch name {
+	case "nil", "true", "false", "err", "ok", "ctx",
+		"string", "int", "int8", "int16", "int32", "int64",
+		"uint", "uint8", "uint16", "uint32", "uint64",
+		"float32", "float64", "complex64", "complex128",
+		"bool", "byte", "rune", "error", "any",
+		"len", "cap", "make", "new", "append", "copy", "delete",
+		"close", "panic", "recover", "print", "println",
+		"real", "imag", "complex", "clear", "min", "max",
+		"_", "i", "j", "k", "n", "s", "t", "v", "b", "w", "r":
+		return true
+	}
+	return false
 }
 
 // --- Helpers ---
