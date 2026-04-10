@@ -274,14 +274,29 @@ All query commands support `--format text|json|dot` (DOT output for Graphviz vis
 
 ## Web UI
 
-When running `gortex serve`, a web visualization is available at `http://localhost:8765`:
+Gortex includes a standalone Next.js web application (`web/` directory) with 8 pages:
 
-- Sigma.js force-directed graph with ForceAtlas2 layout
-- Node size proportional to degree (connection count = importance)
-- Color-coded by kind (function, type, interface, method, variable, file)
-- Real-time updates via SSE when watch mode is active
-- Filter by node kind, hide test files, search by name
-- Click nodes to highlight neighborhood
+```bash
+# Start the backend
+gortex bridge --index /path/to/repo --web --port 4747
+
+# Start the web UI
+cd web && npm run dev
+# Open http://localhost:3000
+```
+
+| Page | Features |
+|------|----------|
+| **Dashboard** | Health, stats, language pie chart, node kind bar chart |
+| **Graph Explorer** | Interactive Sigma.js + ForceAtlas2, node filters, selection, detail panel |
+| **Search** | Semantic search via bridge API, results grouped by kind |
+| **Symbol Detail** | Source code, signature, callers/callees/usages/deps tabs |
+| **Communities** | Community cards with cohesion bars, expandable members |
+| **Processes** | Execution flow table with step lists |
+| **Analysis** | Dead code, hotspots, cycles, index health — 4 tabs |
+| **AI Chat** | LLM-powered chat with code context (placeholder) |
+
+The legacy embedded web UI (Sigma.js on `:8765`) is still available via `gortex serve --web`.
 
 ## Bridge Mode
 
