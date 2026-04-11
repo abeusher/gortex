@@ -21,6 +21,7 @@ func (s *Server) registerCodingTools() {
 			mcp.WithDescription("The primary tool to call before editing any file. Returns all symbols defined in the file, their signatures, direct dependencies, and immediate callers — everything needed to code without reading raw source lines."),
 			mcp.WithString("file_path", mcp.Required(), mcp.Description("Relative file path")),
 			mcp.WithString("detail", mcp.Description("brief or full (default: brief)")),
+			mcp.WithString("if_none_match", mcp.Description("ETag from a previous response — returns not_modified if content unchanged")),
 		),
 		s.handleGetEditingContext,
 	)
@@ -55,6 +56,7 @@ func (s *Server) registerCodingTools() {
 			mcp.WithDescription("Returns the source code of a specific symbol (function, method, type) without reading the entire file. Use instead of Read when you know which symbol you need — saves 70-80% of tokens compared to reading the whole file."),
 			mcp.WithString("id", mcp.Required(), mcp.Description("Symbol node ID (e.g. pkg/server.go::HandleRequest)")),
 			mcp.WithNumber("context_lines", mcp.Description("Extra lines above/below the symbol (default: 3)")),
+			mcp.WithString("if_none_match", mcp.Description("ETag from a previous response — returns not_modified if content unchanged")),
 		),
 		s.handleGetSymbolSource,
 	)
@@ -65,6 +67,7 @@ func (s *Server) registerCodingTools() {
 			mcp.WithString("ids", mcp.Required(), mcp.Description("Comma-separated list of symbol IDs")),
 			mcp.WithBoolean("include_source", mcp.Description("Include source code for each symbol (default: false)")),
 			mcp.WithNumber("context_lines", mcp.Description("Extra lines above/below source (default: 3, only if include_source)")),
+			mcp.WithString("if_none_match", mcp.Description("ETag from a previous response — returns not_modified if content unchanged")),
 		),
 		s.handleBatchSymbols,
 	)
@@ -234,7 +237,22 @@ func (s *Server) handleGetEditingContext(_ context.Context, req mcp.CallToolRequ
 		}
 	}
 
-	return mcp.NewToolResultJSON(ctx)
+	// ETag conditional fetch.
+	etag := computeETag(ctx)
+	if ifNoneMatch := req.GetString("if_none_match", ""); ifNoneMatch != "" && ifNoneMatch == etag {
+		return notModifiedResult(etag), nil
+	}
+
+	// Add etag to response by marshaling to map.
+	result := map[string]any{
+		"file":      ctx.File,
+		"defines":   ctx.Defines,
+		"imports":   ctx.Imports,
+		"called_by": ctx.CalledBy,
+		"calls":     ctx.Calls,
+		"etag":      etag,
+	}
+	return mcp.NewToolResultJSON(result)
 }
 
 func (s *Server) handleGetSymbolSignature(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -417,6 +435,14 @@ func (s *Server) handleGetSymbolSource(_ context.Context, req mcp.CallToolReques
 	if sig, ok := node.Meta["signature"]; ok {
 		result["signature"] = sig
 	}
+
+	// ETag conditional fetch.
+	etag := computeETag(result)
+	if ifNoneMatch := req.GetString("if_none_match", ""); ifNoneMatch != "" && ifNoneMatch == etag {
+		return notModifiedResult(etag), nil
+	}
+	result["etag"] = etag
+
 	return mcp.NewToolResultJSON(result)
 }
 
@@ -548,11 +574,20 @@ func (s *Server) handleBatchSymbols(_ context.Context, req mcp.CallToolRequest) 
 		results = append(results, entry)
 	}
 
-	return mcp.NewToolResultJSON(map[string]any{
+	batchResult := map[string]any{
 		"symbols":      results,
 		"total":        len(results),
 		"tokens_saved": batchTokensSaved,
-	})
+	}
+
+	// ETag conditional fetch.
+	etag := computeETag(batchResult)
+	if ifNoneMatch := req.GetString("if_none_match", ""); ifNoneMatch != "" && ifNoneMatch == etag {
+		return notModifiedResult(etag), nil
+	}
+	batchResult["etag"] = etag
+
+	return mcp.NewToolResultJSON(batchResult)
 }
 
 // Test file patterns by language.

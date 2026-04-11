@@ -330,6 +330,7 @@ func (s *Server) registerCoreTools() {
 			mcp.WithString("repo", mcp.Description("Filter results to a specific repository prefix")),
 			mcp.WithString("project", mcp.Description("Filter results to repositories in a specific project")),
 			mcp.WithString("ref", mcp.Description("Filter results to repositories with a specific reference tag")),
+			mcp.WithString("if_none_match", mcp.Description("ETag from a previous response — returns not_modified if content unchanged")),
 		),
 		s.handleGetFileSummary,
 	)
@@ -562,7 +563,23 @@ func (s *Server) handleGetFileSummary(_ context.Context, req mcp.CallToolRequest
 	if isCompact(req) {
 		return mcp.NewToolResultText(compactSubGraph(sg)), nil
 	}
-	return mcp.NewToolResultJSON(sg)
+
+	// ETag conditional fetch.
+	etag := computeETag(sg)
+	if ifNoneMatch := req.GetString("if_none_match", ""); ifNoneMatch != "" && ifNoneMatch == etag {
+		return notModifiedResult(etag), nil
+	}
+
+	// Wrap with etag in response.
+	result := map[string]any{
+		"nodes":     sg.Nodes,
+		"edges":     sg.Edges,
+		"total_nodes": len(sg.Nodes),
+		"total_edges": len(sg.Edges),
+		"truncated": sg.Truncated,
+		"etag":      etag,
+	}
+	return mcp.NewToolResultJSON(result)
 }
 
 func (s *Server) handleGetDependencies(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
