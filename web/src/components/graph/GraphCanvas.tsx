@@ -35,10 +35,10 @@ export default function GraphCanvas({ nodes, edges, fitCameraRef, relayoutRef }:
       if (nodeIds.has(node.id)) continue
       nodeIds.add(node.id)
 
-      // Random initial positions
+      // Spread initial positions wide so repulsion has room to work
       graph.addNode(node.id, {
-        x: Math.random() * 100,
-        y: Math.random() * 100,
+        x: (Math.random() - 0.5) * 1000,
+        y: (Math.random() - 0.5) * 1000,
         label: node.name,
         size: 5,
         color: NODE_COLORS[node.kind as NodeKind] || '#6b7280',
@@ -73,32 +73,92 @@ export default function GraphCanvas({ nodes, edges, fitCameraRef, relayoutRef }:
     return graph
   }, [nodes, edges])
 
-  // Start layout
+  // Start layout using a semantic-only graph for positioning.
+  // We exclude 'defines' and 'imports' edges from layout calculation
+  // so that communities form around call/reference patterns instead of
+  // collapsing into a single blob around file nodes.
   const startLayout = useCallback((graph: Graph) => {
     if (layoutRef.current) {
       layoutRef.current.kill()
       layoutRef.current = null
     }
 
-    const settings = inferSettings(graph)
-    const layout = new FA2LayoutSupervisor(graph, {
+    // Build a layout-only graph with semantic edges only
+    const layoutGraph = new Graph({ multi: true, type: 'directed' })
+    const LAYOUT_SKIP_EDGES = new Set(['defines', 'imports'])
+
+    graph.forEachNode((id, attrs) => {
+      layoutGraph.addNode(id, { ...attrs })
+    })
+    graph.forEachEdge((_edge, attrs, source, target) => {
+      const kind = attrs.edgeKind as string
+      if (LAYOUT_SKIP_EDGES.has(kind)) return
+      try {
+        layoutGraph.addEdge(source, target, { ...attrs })
+      } catch {
+        // skip duplicates
+      }
+    })
+
+    // Assign edge weights: cross-community edges are weaker (push clusters apart),
+    // same-file edges are stronger (keep related symbols close).
+    layoutGraph.forEachEdge((edge, attrs, source, target) => {
+      const srcFile = layoutGraph.getNodeAttribute(source, 'filePath') as string
+      const tgtFile = layoutGraph.getNodeAttribute(target, 'filePath') as string
+      const kind = attrs.edgeKind as string
+
+      let weight = 1
+      if (srcFile && tgtFile && srcFile === tgtFile) {
+        weight = 5 // same file — pull together strongly
+      } else if (kind === 'member_of' || kind === 'implements') {
+        weight = 3 // structural relationship
+      } else if (kind === 'calls') {
+        weight = 1 // normal call
+      } else if (kind === 'references' || kind === 'instantiates') {
+        weight = 0.5 // weaker reference
+      }
+      layoutGraph.setEdgeAttribute(edge, 'weight', weight)
+    })
+
+    const settings = inferSettings(layoutGraph)
+    const layout = new FA2LayoutSupervisor(layoutGraph, {
       settings: {
         ...settings,
-        barnesHutOptimize: graph.order > 500,
+        barnesHutOptimize: layoutGraph.order > 500,
         barnesHutTheta: 0.5,
-        slowDown: 5,
+        slowDown: 3,
+        gravity: 0.05,                  // very weak gravity → clusters drift apart
+        scalingRatio: 30,               // strong repulsion → clear gaps between clusters
+        strongGravityMode: false,
+        edgeWeightInfluence: 1,         // respect the weights we assigned
+        outboundAttractionDistribution: true, // hubs don't collapse their neighbors
       },
     })
+
+    // Sync positions back: layoutGraph → display graph
+    const syncPositions = () => {
+      layoutGraph.forEachNode((id, attrs) => {
+        if (graph.hasNode(id)) {
+          graph.setNodeAttribute(id, 'x', attrs.x)
+          graph.setNodeAttribute(id, 'y', attrs.y)
+        }
+      })
+    }
+
+    // Sync periodically while running
+    const syncInterval = setInterval(syncPositions, 100)
 
     layout.start()
     layoutRef.current = layout
 
-    // Auto-stop after 5 seconds
+    // Auto-stop after 8 seconds — enough for strong repulsion to separate clusters
     setTimeout(() => {
       if (layout.isRunning()) {
         layout.stop()
       }
-    }, 5000)
+      syncPositions()
+      clearInterval(syncInterval)
+    }, 8000)
 
     return layout
   }, [])

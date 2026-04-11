@@ -1,7 +1,7 @@
 // Types matching Gortex Go structs
 
-export type NodeKind = 'file' | 'package' | 'function' | 'method' | 'type' | 'interface' | 'variable' | 'import'
-export type EdgeKind = 'calls' | 'imports' | 'defines' | 'implements' | 'extends' | 'references' | 'member_of' | 'instantiates'
+export type NodeKind = 'file' | 'package' | 'function' | 'method' | 'type' | 'interface' | 'variable' | 'import' | 'contract'
+export type EdgeKind = 'calls' | 'imports' | 'defines' | 'implements' | 'extends' | 'references' | 'member_of' | 'instantiates' | 'provides' | 'consumes'
 
 export interface GortexNode {
   id: string

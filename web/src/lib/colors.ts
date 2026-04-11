@@ -9,17 +9,20 @@ export const NODE_COLORS: Record<NodeKind, string> = {
   interface: '#73daca',
   variable: '#ff9e64',
   import: '#795548',
+  contract: '#f7768e',
 }
 
 export const EDGE_COLORS: Record<EdgeKind, string> = {
   calls: '#7aa2f7',
   imports: '#565f89',
-  defines: '#414868',
+  defines: '#6b7280',
   implements: '#9ece6a',
   extends: '#bb9af7',
   references: '#3b4261',
-  member_of: '#3b4261',
+  member_of: '#8b8fa3',
   instantiates: '#e0af68',
+  provides: '#9ece6a',
+  consumes: '#7aa2f7',
 }
 
 export const LANGUAGE_COLORS: Record<string, string> = {

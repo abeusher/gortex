@@ -34,7 +34,9 @@ interface AppState {
   addRecentChange: (e: GraphChangeEvent) => void
 }
 
-const ALL_KINDS = new Set(['file', 'package', 'function', 'method', 'type', 'interface', 'variable', 'import'])
+const ALL_KINDS = new Set(['file', 'package', 'function', 'method', 'type', 'interface', 'import', 'contract'])
+// 'variable' excluded by default — 35% of nodes, mostly noise in the graph view.
+// Users can toggle it on via the filter panel.
 
 export const useStore = create<AppState>((set) => ({
   connected: false,
