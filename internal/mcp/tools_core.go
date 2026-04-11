@@ -85,7 +85,8 @@ func filterNodes(nodes []*graph.Node, allowed map[string]bool) []*graph.Node {
 	}
 	var out []*graph.Node
 	for _, n := range nodes {
-		if allowed[n.RepoPrefix] {
+		// In single-repo mode, nodes have empty RepoPrefix — always include them.
+		if n.RepoPrefix == "" || allowed[n.RepoPrefix] {
 			out = append(out, n)
 		}
 	}
@@ -101,7 +102,7 @@ func filterSubGraph(sg *query.SubGraph, allowed map[string]bool) *query.SubGraph
 	nodeIDs := make(map[string]bool)
 	var nodes []*graph.Node
 	for _, n := range sg.Nodes {
-		if allowed[n.RepoPrefix] {
+		if n.RepoPrefix == "" || allowed[n.RepoPrefix] {
 			nodes = append(nodes, n)
 			nodeIDs[n.ID] = true
 		}
@@ -122,16 +123,28 @@ func filterSubGraph(sg *query.SubGraph, allowed map[string]bool) *query.SubGraph
 }
 
 // compactNodes formats nodes as one-line-per-symbol text.
-// Format: "kind name file_path:start_line"
+// Format: "kind qualifiedName file_path:start_line"
+// For methods, qualifiedName includes the receiver (e.g., "Indexer.Index")
+// so the output can be combined with file_path to reconstruct the full node ID.
 func compactNodes(nodes []*graph.Node) string {
 	var b strings.Builder
 	for _, n := range nodes {
 		if n.Kind == graph.KindFile || n.Kind == graph.KindImport {
 			continue
 		}
-		fmt.Fprintf(&b, "%s %s %s:%d\n", n.Kind, n.Name, n.FilePath, n.StartLine)
+		fmt.Fprintf(&b, "%s %s %s:%d\n", n.Kind, qualifiedName(n), n.FilePath, n.StartLine)
 	}
 	return b.String()
+}
+
+// qualifiedName returns the symbol part of a node ID (after "::").
+// For methods this includes the receiver type (e.g., "Indexer.Index"),
+// for functions/types it's the plain name.
+func qualifiedName(n *graph.Node) string {
+	if idx := strings.LastIndex(n.ID, "::"); idx >= 0 {
+		return n.ID[idx+2:]
+	}
+	return n.Name
 }
 
 // compactSubGraph formats a SubGraph as compact text.
@@ -141,7 +154,7 @@ func compactSubGraph(sg *query.SubGraph) string {
 		if n.Kind == graph.KindFile || n.Kind == graph.KindImport {
 			continue
 		}
-		fmt.Fprintf(&b, "%s %s %s:%d\n", n.Kind, n.Name, n.FilePath, n.StartLine)
+		fmt.Fprintf(&b, "%s %s %s:%d\n", n.Kind, qualifiedName(n), n.FilePath, n.StartLine)
 	}
 	if sg.Truncated {
 		fmt.Fprintf(&b, "... truncated (%d total)\n", sg.TotalNodes)
@@ -316,7 +329,7 @@ func (s *Server) handleGetSymbol(_ context.Context, req mcp.CallToolRequest) (*m
 	if filterErr != nil {
 		return mcp.NewToolResultError(filterErr.Error()), nil
 	}
-	if allowed != nil && !allowed[node.RepoPrefix] {
+	if allowed != nil && node.RepoPrefix != "" && !allowed[node.RepoPrefix] {
 		return mcp.NewToolResultError("symbol not found in specified scope: " + id), nil
 	}
 

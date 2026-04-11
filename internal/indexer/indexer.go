@@ -661,8 +661,16 @@ func (idx *Indexer) IncrementalReindex(root string) (*IndexResult, error) {
 		}
 	}
 
+	// Re-infer interface implementations (edges may have been lost during eviction).
+	idx.resolver.InferImplements()
+
 	// Rebuild search index to ensure consistency.
 	idx.buildSearchIndex()
+
+	// Update totalDetected so index_health reports correctly after cache restore.
+	if idx.totalDetected == 0 {
+		idx.totalDetected = len(diskFiles)
+	}
 
 	// Re-extract contracts only if stale files were re-indexed.
 	if len(staleFiles) > 0 || len(deletedFiles) > 0 {

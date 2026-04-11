@@ -942,6 +942,16 @@ func (s *Server) handleIndexHealth(_ context.Context, req mcp.CallToolRequest) (
 
 	totalDetected := s.indexer.TotalDetected()
 	parseErrors := s.indexer.ParseErrors()
+
+	// When totalDetected is 0 (e.g., graph restored from cache without a full re-index),
+	// fall back to counting file nodes in the graph.
+	if totalDetected == 0 {
+		stats := s.graph.Stats()
+		if fileCount, ok := stats.ByKind[string(graph.KindFile)]; ok {
+			totalDetected = fileCount
+		}
+	}
+
 	successfullyIndexed := totalDetected - len(parseErrors)
 	if successfullyIndexed < 0 {
 		successfullyIndexed = 0

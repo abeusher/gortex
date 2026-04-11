@@ -135,7 +135,7 @@ func runBridge(_ *cobra.Command, _ []string) error {
 	}
 
 	eng := query.NewEngine(g)
-	eng.SetSearch(idx.Search())
+	eng.SetSearchProvider(idx.Search)
 	gortexmcp.Version = version
 	srv := gortexmcp.NewServer(eng, g, idx, nil, logger, cfg.Guards.Rules, multiOpts...)
 
@@ -304,6 +304,8 @@ func runBridge(_ *cobra.Command, _ []string) error {
 					result.FileCount, result.NodeCount, result.EdgeCount, result.DurationMs)
 			}
 		}
+
+		// Search backend is auto-updated via SearchProvider (idx.Search)
 
 		// Set contract registry: in multi-repo mode, merge all per-repo registries.
 		if mi != nil {

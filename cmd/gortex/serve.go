@@ -148,7 +148,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// Create MCP server immediately so the stdio handshake can complete
 	// before indexing (which may take time on large repos).
 	eng := query.NewEngine(g)
-	eng.SetSearch(idx.Search())
+	eng.SetSearchProvider(idx.Search)
 	gortexmcp.Version = version
 	srv := gortexmcp.NewServer(eng, g, idx, nil, logger, cfg.Guards.Rules, multiOpts...)
 
@@ -236,6 +236,8 @@ func runServe(cmd *cobra.Command, args []string) error {
 					result.FileCount, result.NodeCount, result.EdgeCount, result.DurationMs)
 			}
 		}
+
+		// Search backend is auto-updated via SearchProvider (idx.Search)
 
 		// Pass contract registry to MCP server.
 		// In multi-repo mode, merge all per-repo registries.

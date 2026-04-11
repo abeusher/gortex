@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -114,9 +115,13 @@ func readSourceLines(rootPath, relPath string, startLine, endLine int) (string, 
 	return strings.Join(selected, "\n"), nil
 }
 
-// substituteSymbolName replaces all occurrences of oldName with newName in source code.
+// substituteSymbolName replaces whole-word occurrences of oldName with newName in source code.
+// Uses word-boundary matching to avoid corrupting identifiers that contain oldName
+// as a substring (e.g., replacing "Extract" should not affect "GoExtractor").
 func substituteSymbolName(source, oldName, newName string) string {
-	return strings.ReplaceAll(source, oldName, newName)
+	pattern := `\b` + regexp.QuoteMeta(oldName) + `\b`
+	re := regexp.MustCompile(pattern)
+	return re.ReplaceAllString(source, newName)
 }
 
 // filterCallerNodes returns caller nodes from a SubGraph, excluding the example itself.

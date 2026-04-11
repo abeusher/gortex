@@ -8,10 +8,15 @@ import (
 	"github.com/zzet/gortex/internal/search"
 )
 
+// SearchProvider is a function that returns the current search backend.
+// This allows the engine to always use the latest backend even when the
+// indexer replaces it (e.g., wrapping BM25 in HybridBackend for embeddings).
+type SearchProvider func() search.Backend
+
 // Engine provides higher-level query operations over the graph.
 type Engine struct {
-	g      *graph.Graph
-	search search.Backend
+	g              *graph.Graph
+	searchProvider SearchProvider
 }
 
 // NewEngine creates a query engine wrapping the given graph.
@@ -19,9 +24,22 @@ func NewEngine(g *graph.Graph) *Engine {
 	return &Engine{g: g}
 }
 
-// SetSearch sets the search backend for full-text search.
+// SetSearch sets a static search backend (for backward compatibility).
 func (e *Engine) SetSearch(s search.Backend) {
-	e.search = s
+	e.searchProvider = func() search.Backend { return s }
+}
+
+// SetSearchProvider sets a dynamic search provider that is called on every query.
+func (e *Engine) SetSearchProvider(p SearchProvider) {
+	e.searchProvider = p
+}
+
+// getSearch returns the current search backend.
+func (e *Engine) getSearch() search.Backend {
+	if e.searchProvider == nil {
+		return nil
+	}
+	return e.searchProvider()
 }
 
 // GetSymbol returns a node by ID.
@@ -148,7 +166,7 @@ func (e *Engine) SearchSymbols(query string, limit int) []*graph.Node {
 	}
 
 	// Use full-text search backend if available.
-	if e.search != nil && e.search.Count() > 0 {
+	if s := e.getSearch(); s != nil && s.Count() > 0 {
 		return e.searchWithBackend(query, limit)
 	}
 
@@ -158,7 +176,7 @@ func (e *Engine) SearchSymbols(query string, limit int) []*graph.Node {
 
 func (e *Engine) searchWithBackend(query string, limit int) []*graph.Node {
 	// Get BM25/Bleve results.
-	results := e.search.Search(query, limit*2) // fetch extra for dedup/filtering
+	results := e.getSearch().Search(query, limit*2) // fetch extra for dedup/filtering
 
 	seen := make(map[string]bool)
 	var out []*graph.Node
