@@ -675,7 +675,7 @@ const commandExplore = `# Exploring Codebases with Gortex
 3. search_symbols({query: "<concept>"})         -> Find symbols related to a concept
 4. get_processes                                -> Discover execution flows
 5. get_processes({id: "<process-id>"})          -> Trace a specific flow step by step
-6. get_editing_context({file_path: "<file>"})   -> Deep dive on a specific file
+6. get_editing_context({path: "<file>"})   -> Deep dive on a specific file
 ` + "```" + `
 
 ## Checklist
@@ -695,9 +695,9 @@ const commandDebug = `# Debugging with Gortex
 
 ` + "```" + `
 1. search_symbols({query: "<error or suspect>"})          -> Find related symbols
-2. get_callers({function_id: "<suspect>"})                -> Who calls it?
-3. get_call_chain({function_id: "<suspect>"})             -> What does it call?
-4. get_editing_context({file_path: "<file>"})             -> Full file context
+2. get_callers({id: "<suspect>"})                -> Who calls it?
+3. get_call_chain({id: "<suspect>"})             -> What does it call?
+4. get_editing_context({path: "<file>"})             -> Full file context
 5. get_processes({id: "<process>"})                       -> Trace execution flow
 ` + "```" + `
 
@@ -718,7 +718,7 @@ const commandImpact = `# Impact Analysis with Gortex
 
 ` + "```" + `
 1. search_symbols({query: "X"})                                     -> Find the symbol ID
-2. explain_change_impact({symbol_ids: "<id1>, <id2>"})              -> Risk-tiered blast radius
+2. explain_change_impact({ids: "<id1>, <id2>"})              -> Risk-tiered blast radius
 3. get_dependents({id: "<symbol-id>", depth: 3})                    -> Detailed dependent tree
 4. detect_changes({scope: "staged"})                                -> Pre-commit check
 ` + "```" + `
@@ -748,8 +748,8 @@ const commandRefactor = `# Refactoring with Gortex
 
 ` + "```" + `
 1. search_symbols({query: "X"})                                     -> Find the symbol ID
-2. explain_change_impact({symbol_ids: "<id>"})                      -> Map blast radius
-3. get_editing_context({file_path: "<file>"})                       -> See all symbols and relationships
+2. explain_change_impact({ids: "<id>"})                      -> Map blast radius
+3. get_editing_context({path: "<file>"})                       -> See all symbols and relationships
 4. find_usages({id: "<id>"})                                        -> Every reference to change
 5. Plan update order: interfaces -> implementations -> callers -> tests
 6. detect_changes({scope: "all"})                                   -> Verify after changes
@@ -1029,7 +1029,7 @@ inclusion: manual
 3. ` + "`search_symbols({query: \"<concept>\"})`" + ` — find symbols related to a concept
 4. ` + "`get_processes`" + ` — discover execution flows
 5. ` + "`get_process({id: \"<process-id>\"})`" + ` — trace a specific flow step by step
-6. ` + "`get_editing_context({file_path: \"<file>\"})`" + ` — deep dive on a specific file
+6. ` + "`get_editing_context({path: \"<file>\"})`" + ` — deep dive on a specific file
 
 ## When to use
 
@@ -1055,9 +1055,9 @@ inclusion: manual
 ## Workflow
 
 1. ` + "`search_symbols({query: \"<error or suspect>\"})`" + ` — find related symbols
-2. ` + "`get_callers({function_id: \"<suspect>\"})`" + ` — who calls it?
-3. ` + "`get_call_chain({function_id: \"<suspect>\"})`" + ` — what does it call?
-4. ` + "`get_editing_context({file_path: \"<file>\"})`" + ` — full file context
+2. ` + "`get_callers({id: \"<suspect>\"})`" + ` — who calls it?
+3. ` + "`get_call_chain({id: \"<suspect>\"})`" + ` — what does it call?
+4. ` + "`get_editing_context({path: \"<file>\"})`" + ` — full file context
 5. ` + "`get_process({id: \"<process>\"})`" + ` — trace execution flow
 
 ## Debugging patterns
@@ -1080,7 +1080,7 @@ inclusion: manual
 ## Workflow
 
 1. ` + "`search_symbols({query: \"X\"})`" + ` — find the symbol ID
-2. ` + "`explain_change_impact({symbol_ids: \"<id1>, <id2>\"})`" + ` — risk-tiered blast radius
+2. ` + "`explain_change_impact({ids: \"<id1>, <id2>\"})`" + ` — risk-tiered blast radius
 3. ` + "`get_dependents({id: \"<symbol-id>\", depth: 3})`" + ` — detailed dependent tree
 4. ` + "`detect_changes({scope: \"staged\"})`" + ` — pre-commit check
 
@@ -1111,10 +1111,10 @@ inclusion: manual
 ## Workflow
 
 1. ` + "`search_symbols({query: \"X\"})`" + ` — find the symbol ID
-2. ` + "`explain_change_impact({symbol_ids: \"<id>\"})`" + ` — map blast radius
-3. ` + "`get_editing_context({file_path: \"<file>\"})`" + ` — see all symbols and relationships
+2. ` + "`explain_change_impact({ids: \"<id>\"})`" + ` — map blast radius
+3. ` + "`get_editing_context({path: \"<file>\"})`" + ` — see all symbols and relationships
 4. ` + "`find_usages({id: \"<id>\"})`" + ` — every reference to change
-5. ` + "`get_edit_plan({symbol_ids: \"<ids>\"})`" + ` — dependency-ordered edit sequence
+5. ` + "`get_edit_plan({ids: \"<ids>\"})`" + ` — dependency-ordered edit sequence
 6. Edit in order: interfaces -> implementations -> callers -> tests
 7. ` + "`detect_changes({scope: \"all\"})`" + ` — verify after changes
 

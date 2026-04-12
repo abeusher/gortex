@@ -119,11 +119,11 @@ export const api = {
   },
 
   getCallers: async (id: string, depth = 2): Promise<SubGraph> => {
-    return callToolJSON<SubGraph>('get_callers', { function_id: id, depth, compact: true })
+    return callToolJSON<SubGraph>('get_callers', { id, depth, compact: true })
   },
 
   getCallChain: async (id: string, depth = 2): Promise<SubGraph> => {
-    return callToolJSON<SubGraph>('get_call_chain', { function_id: id, depth, compact: true })
+    return callToolJSON<SubGraph>('get_call_chain', { id, depth, compact: true })
   },
 
   findUsages: async (id: string): Promise<SubGraph> => {
@@ -139,7 +139,7 @@ export const api = {
   },
 
   explainChangeImpact: async (symbolIds: string): Promise<unknown> => {
-    return callToolJSON('explain_change_impact', { symbol_ids: symbolIds })
+    return callToolJSON('explain_change_impact', { ids: symbolIds })
   },
 
   findDeadCode: async (): Promise<unknown> => {

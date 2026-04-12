@@ -32,7 +32,7 @@ func (s *Server) registerPrompts() {
 	s.mcpServer.AddPrompt(
 		mcp.NewPrompt("safe_to_change",
 			mcp.WithPromptDescription("Analyze whether it's safe to change specific symbols. Shows blast radius, edit plan, affected tests, and risk level."),
-			mcp.WithArgument("symbol_ids",
+			mcp.WithArgument("ids",
 				mcp.ArgumentDescription("Comma-separated symbol IDs to analyze"),
 				mcp.RequiredArgument(),
 			),
@@ -189,9 +189,9 @@ func (s *Server) handlePromptOrientation(_ context.Context, _ mcp.GetPromptReque
 }
 
 func (s *Server) handlePromptSafeToChange(_ context.Context, req mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
-	idsStr := req.Params.Arguments["symbol_ids"]
+	idsStr := req.Params.Arguments["ids"]
 	if idsStr == "" {
-		return promptError("symbol_ids argument is required"), nil
+		return promptError("ids argument is required"), nil
 	}
 
 	ids := strings.Split(idsStr, ",")

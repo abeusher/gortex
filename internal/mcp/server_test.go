@@ -169,7 +169,7 @@ func TestConfidenceLabels_GetCallers(t *testing.T) {
 	srv, _ := setupTestServer(t)
 
 	// "helper" is called by "main" — get_callers should return edges with confidence_label.
-	result := callTool(t, srv, "get_callers", map[string]any{"function_id": "main.go::helper"})
+	result := callTool(t, srv, "get_callers", map[string]any{"id": "main.go::helper"})
 	require.False(t, result.IsError)
 	text := result.Content[0].(mcplib.TextContent).Text
 	var resp query.SubGraph
@@ -197,7 +197,7 @@ func TestConfidenceLabels_ExplainChangeImpact(t *testing.T) {
 	srv, _ := setupTestServer(t)
 
 	result := callTool(t, srv, "explain_change_impact", map[string]any{
-		"symbol_ids": "main.go::helper",
+		"ids": "main.go::helper",
 	})
 	require.False(t, result.IsError)
 	text := result.Content[0].(mcplib.TextContent).Text
@@ -273,7 +273,7 @@ func TestGetSymbol(t *testing.T) {
 
 func TestGetEditingContext(t *testing.T) {
 	srv, _ := setupTestServer(t)
-	result := callTool(t, srv, "get_editing_context", map[string]any{"file_path": "main.go"})
+	result := callTool(t, srv, "get_editing_context", map[string]any{"path": "main.go"})
 	assert.False(t, result.IsError)
 
 	text := result.Content[0].(mcplib.TextContent).Text

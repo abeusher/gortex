@@ -753,7 +753,7 @@ func TestBatchEditDryRunReturnsPlanOnly(t *testing.T) {
 		engine: eng,
 	}
 
-	editsJSON := `[{"symbol_id":"pkg/b.go::TypeB","old_source":"old","new_source":"new"},{"symbol_id":"pkg/a.go::FuncA","old_source":"old","new_source":"new"}]`
+	editsJSON := `[{"id":"pkg/b.go::TypeB","old_source":"old","new_source":"new"},{"id":"pkg/a.go::FuncA","old_source":"old","new_source":"new"}]`
 
 	ctx := context.Background()
 	req := mcplib.CallToolRequest{}
@@ -802,8 +802,8 @@ func TestBatchEditDryRunReturnsPlanOnly(t *testing.T) {
 
 	// Verify types come before functions in the plan (dependency ordering)
 	firstEntry := plan[0].(map[string]any)
-	if firstEntry["symbol_id"] != "pkg/b.go::TypeB" {
-		t.Errorf("expected TypeB first in dependency order, got %s", firstEntry["symbol_id"])
+	if firstEntry["id"] != "pkg/b.go::TypeB" {
+		t.Errorf("expected TypeB first in dependency order, got %s", firstEntry["id"])
 	}
 }
 

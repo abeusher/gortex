@@ -325,7 +325,7 @@ func (s *Server) registerCoreTools() {
 	s.mcpServer.AddTool(
 		mcp.NewTool("get_file_summary",
 			mcp.WithDescription("Use instead of Read to understand a file's role: returns all its symbols and imports without reading source lines."),
-			mcp.WithString("file_path", mcp.Required(), mcp.Description("Relative file path")),
+			mcp.WithString("path", mcp.Required(), mcp.Description("Relative file path")),
 			mcp.WithBoolean("compact", mcp.Description("One-line-per-symbol text output (saves 50-70% tokens)")),
 			mcp.WithString("repo", mcp.Description("Filter results to a specific repository prefix")),
 			mcp.WithString("project", mcp.Description("Filter results to repositories in a specific project")),
@@ -362,7 +362,7 @@ func (s *Server) registerCoreTools() {
 	s.mcpServer.AddTool(
 		mcp.NewTool("get_call_chain",
 			mcp.WithDescription("Traces the call graph forward from a function without reading source. Use to understand what a function ultimately triggers."),
-			mcp.WithString("function_id", mcp.Required(), mcp.Description("Function node ID")),
+			mcp.WithString("id", mcp.Required(), mcp.Description("Function node ID")),
 			mcp.WithNumber("depth", mcp.Description("Traversal depth (default: 4)")),
 			mcp.WithNumber("limit", mcp.Description("Max nodes (default: 50)")),
 			mcp.WithBoolean("compact", mcp.Description("One-line-per-symbol text output (saves 50-70% tokens)")),
@@ -377,7 +377,7 @@ func (s *Server) registerCoreTools() {
 	s.mcpServer.AddTool(
 		mcp.NewTool("get_callers",
 			mcp.WithDescription("Returns all callers of a function without reading source. Use instead of Grep when you need to know who calls a function."),
-			mcp.WithString("function_id", mcp.Required(), mcp.Description("Function node ID")),
+			mcp.WithString("id", mcp.Required(), mcp.Description("Function node ID")),
 			mcp.WithNumber("depth", mcp.Description("Traversal depth (default: 2)")),
 			mcp.WithNumber("limit", mcp.Description("Max nodes (default: 50)")),
 			mcp.WithBoolean("compact", mcp.Description("One-line-per-symbol text output (saves 50-70% tokens)")),
@@ -389,7 +389,7 @@ func (s *Server) registerCoreTools() {
 	s.mcpServer.AddTool(
 		mcp.NewTool("find_implementations",
 			mcp.WithDescription("Finds all concrete types that implement an interface. Use before changing an interface to identify all types that will be affected."),
-			mcp.WithString("interface_id", mcp.Required(), mcp.Description("Interface node ID")),
+			mcp.WithString("id", mcp.Required(), mcp.Description("Interface node ID")),
 			mcp.WithString("format", mcp.Description("Output format: json (default) or toon")),
 		),
 		s.handleFindImplementations,
@@ -537,9 +537,9 @@ func (s *Server) handleSearchSymbols(_ context.Context, req mcp.CallToolRequest)
 }
 
 func (s *Server) handleGetFileSummary(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	fp, err := req.RequireString("file_path")
+	fp, err := req.RequireString("path")
 	if err != nil {
-		return mcp.NewToolResultError("file_path is required"), nil
+		return mcp.NewToolResultError("path is required"), nil
 	}
 
 	// Auto re-index stale file before querying.
@@ -613,9 +613,9 @@ func (s *Server) handleGetDependents(_ context.Context, req mcp.CallToolRequest)
 }
 
 func (s *Server) handleGetCallChain(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	id, err := req.RequireString("function_id")
+	id, err := req.RequireString("id")
 	if err != nil {
-		return mcp.NewToolResultError("function_id is required"), nil
+		return mcp.NewToolResultError("id is required"), nil
 	}
 	opts := query.QueryOptions{
 		Depth:  req.GetInt("depth", 4),
@@ -635,9 +635,9 @@ func (s *Server) handleGetCallChain(_ context.Context, req mcp.CallToolRequest) 
 }
 
 func (s *Server) handleGetCallers(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	id, err := req.RequireString("function_id")
+	id, err := req.RequireString("id")
 	if err != nil {
-		return mcp.NewToolResultError("function_id is required"), nil
+		return mcp.NewToolResultError("id is required"), nil
 	}
 	opts := query.QueryOptions{
 		Depth:  req.GetInt("depth", 2),
@@ -650,9 +650,9 @@ func (s *Server) handleGetCallers(_ context.Context, req mcp.CallToolRequest) (*
 }
 
 func (s *Server) handleFindImplementations(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	id, err := req.RequireString("interface_id")
+	id, err := req.RequireString("id")
 	if err != nil {
-		return mcp.NewToolResultError("interface_id is required"), nil
+		return mcp.NewToolResultError("id is required"), nil
 	}
 	impls := s.engine.FindImplementations(id)
 

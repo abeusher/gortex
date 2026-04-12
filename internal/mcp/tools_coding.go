@@ -19,7 +19,7 @@ func (s *Server) registerCodingTools() {
 	s.mcpServer.AddTool(
 		mcp.NewTool("get_editing_context",
 			mcp.WithDescription("The primary tool to call before editing any file. Returns all symbols defined in the file, their signatures, direct dependencies, and immediate callers — everything needed to code without reading raw source lines."),
-			mcp.WithString("file_path", mcp.Required(), mcp.Description("Relative file path")),
+			mcp.WithString("path", mcp.Required(), mcp.Description("Relative file path")),
 			mcp.WithString("detail", mcp.Description("brief or full (default: brief)")),
 			mcp.WithString("if_none_match", mcp.Description("ETag from a previous response — returns not_modified if content unchanged")),
 		),
@@ -29,8 +29,8 @@ func (s *Server) registerCodingTools() {
 	s.mcpServer.AddTool(
 		mcp.NewTool("find_import_path",
 			mcp.WithDescription("Given a symbol name you want to use in a file, returns the correct import path. Use instead of reading files or guessing package paths."),
-			mcp.WithString("symbol_name", mcp.Required(), mcp.Description("Name of the symbol to import")),
-			mcp.WithString("target_file", mcp.Required(), mcp.Description("File where you want to use the symbol")),
+			mcp.WithString("name", mcp.Required(), mcp.Description("Name of the symbol to import")),
+			mcp.WithString("path", mcp.Required(), mcp.Description("File where you want to use the symbol (relative path)")),
 		),
 		s.handleFindImportPath,
 	)
@@ -38,7 +38,7 @@ func (s *Server) registerCodingTools() {
 	s.mcpServer.AddTool(
 		mcp.NewTool("explain_change_impact",
 			mcp.WithDescription("Given a list of symbols you plan to modify, returns risk-tiered blast radius: d=1 will break, d=2 likely affected, d=3 needs testing. Includes affected processes and communities."),
-			mcp.WithString("symbol_ids", mcp.Required(), mcp.Description("Comma-separated list of symbol IDs to modify")),
+			mcp.WithString("ids", mcp.Required(), mcp.Description("Comma-separated list of symbol IDs to modify")),
 		),
 		s.handleEnhancedChangeImpact,
 	)
@@ -67,7 +67,7 @@ func (s *Server) registerCodingTools() {
 	s.mcpServer.AddTool(
 		mcp.NewTool("get_test_targets",
 			mcp.WithDescription("Given changed symbol IDs, traces the call graph to find test files and test functions that exercise those symbols. Use after editing to know exactly which tests to run — no guessing, no running the entire suite."),
-			mcp.WithString("symbol_ids", mcp.Required(), mcp.Description("Comma-separated list of changed symbol IDs")),
+			mcp.WithString("ids", mcp.Required(), mcp.Description("Comma-separated list of changed symbol IDs")),
 			mcp.WithNumber("depth", mcp.Description("Caller traversal depth (default: 3)")),
 		),
 		s.handleGetTestTargets,
@@ -76,7 +76,7 @@ func (s *Server) registerCodingTools() {
 	s.mcpServer.AddTool(
 		mcp.NewTool("suggest_pattern",
 			mcp.WithDescription("Given an existing symbol as an example, extracts the structural pattern for creating similar code. Returns the example source, sibling symbols with the same pattern, registration/wiring code, test patterns, and files to edit. Use when adding a new function/handler/extractor that follows an existing convention."),
-			mcp.WithString("example_id", mcp.Required(), mcp.Description("Symbol ID to use as the pattern example")),
+			mcp.WithString("id", mcp.Required(), mcp.Description("Symbol ID to use as the pattern example")),
 		),
 		s.handleSuggestPattern,
 	)
@@ -84,7 +84,7 @@ func (s *Server) registerCodingTools() {
 	s.mcpServer.AddTool(
 		mcp.NewTool("get_edit_plan",
 			mcp.WithDescription("Given symbols you plan to change, returns a dependency-ordered list of files and symbols to edit — definitions first, then implementations, then callers, then tests. Eliminates manual dependency reasoning. Use before any multi-file refactor."),
-			mcp.WithString("symbol_ids", mcp.Required(), mcp.Description("Comma-separated list of symbol IDs to change")),
+			mcp.WithString("ids", mcp.Required(), mcp.Description("Comma-separated list of symbol IDs to change")),
 			mcp.WithNumber("depth", mcp.Description("Dependent traversal depth (default: 3)")),
 		),
 		s.handleGetEditPlan,
@@ -139,9 +139,9 @@ type editingContext struct {
 }
 
 func (s *Server) handleGetEditingContext(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	fp, err := req.RequireString("file_path")
+	fp, err := req.RequireString("path")
 	if err != nil {
-		return mcp.NewToolResultError("file_path is required"), nil
+		return mcp.NewToolResultError("path is required"), nil
 	}
 
 	// Auto re-index stale file before querying.
@@ -248,13 +248,13 @@ func (s *Server) handleGetEditingContext(_ context.Context, req mcp.CallToolRequ
 }
 
 func (s *Server) handleFindImportPath(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	symbolName, err := req.RequireString("symbol_name")
+	symbolName, err := req.RequireString("name")
 	if err != nil {
-		return mcp.NewToolResultError("symbol_name is required"), nil
+		return mcp.NewToolResultError("name is required"), nil
 	}
-	targetFile, err := req.RequireString("target_file")
+	targetFile, err := req.RequireString("path")
 	if err != nil {
-		return mcp.NewToolResultError("target_file is required"), nil
+		return mcp.NewToolResultError("path is required"), nil
 	}
 
 	candidates := s.engine.FindSymbols(symbolName)
@@ -588,9 +588,9 @@ func isTestFile(path string) bool {
 }
 
 func (s *Server) handleGetTestTargets(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	idsStr, err := req.RequireString("symbol_ids")
+	idsStr, err := req.RequireString("ids")
 	if err != nil {
-		return mcp.NewToolResultError("symbol_ids is required"), nil
+		return mcp.NewToolResultError("ids is required"), nil
 	}
 
 	ids := strings.Split(idsStr, ",")
@@ -687,9 +687,9 @@ func (s *Server) handleGetTestTargets(_ context.Context, req mcp.CallToolRequest
 }
 
 func (s *Server) handleSuggestPattern(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	exampleID, err := req.RequireString("example_id")
+	exampleID, err := req.RequireString("id")
 	if err != nil {
-		return mcp.NewToolResultError("example_id is required"), nil
+		return mcp.NewToolResultError("id is required"), nil
 	}
 
 	node := s.engine.GetSymbol(exampleID)
@@ -836,9 +836,9 @@ func (s *Server) handleSuggestPattern(_ context.Context, req mcp.CallToolRequest
 }
 
 func (s *Server) handleGetEditPlan(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	idsStr, err := req.RequireString("symbol_ids")
+	idsStr, err := req.RequireString("ids")
 	if err != nil {
-		return mcp.NewToolResultError("symbol_ids is required"), nil
+		return mcp.NewToolResultError("ids is required"), nil
 	}
 
 	ids := strings.Split(idsStr, ",")

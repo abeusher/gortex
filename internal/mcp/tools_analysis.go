@@ -183,9 +183,9 @@ func (s *Server) handleDetectChanges(_ context.Context, req mcp.CallToolRequest)
 // handleEnhancedChangeImpact replaces the original explain_change_impact with risk tiering
 // and cross-community warnings.
 func (s *Server) handleEnhancedChangeImpact(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	idsStr, err := req.RequireString("symbol_ids")
+	idsStr, err := req.RequireString("ids")
 	if err != nil {
-		return mcp.NewToolResultError("symbol_ids is required"), nil
+		return mcp.NewToolResultError("ids is required"), nil
 	}
 
 	ids := strings.Split(idsStr, ",")

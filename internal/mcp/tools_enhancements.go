@@ -82,7 +82,7 @@ func (s *Server) registerEnhancementTools() {
 	s.mcpServer.AddTool(
 		mcp.NewTool("check_guards",
 			mcp.WithDescription("Evaluates project-specific guard rules against a set of changed symbols. Reports co-change and boundary violations."),
-			mcp.WithString("symbol_ids", mcp.Required(), mcp.Description("Comma-separated list of changed symbol IDs")),
+			mcp.WithString("ids", mcp.Required(), mcp.Description("Comma-separated list of changed symbol IDs")),
 			mcp.WithBoolean("compact", mcp.Description("One-line-per-rule text output")),
 		),
 		s.handleCheckGuards,
@@ -119,7 +119,7 @@ func (s *Server) registerEnhancementTools() {
 	s.mcpServer.AddTool(
 		mcp.NewTool("scaffold",
 			mcp.WithDescription("Generates code scaffolding from an existing symbol pattern, including registration wiring and test stubs."),
-			mcp.WithString("example_id", mcp.Required(), mcp.Description("Symbol ID to use as the pattern example")),
+			mcp.WithString("id", mcp.Required(), mcp.Description("Symbol ID to use as the pattern example")),
 			mcp.WithString("new_name", mcp.Required(), mcp.Description("Name for the new symbol")),
 			mcp.WithBoolean("dry_run", mcp.Description("Return scaffold without writing files (default: true)")),
 			mcp.WithBoolean("compact", mcp.Description("Compact text output")),
@@ -151,7 +151,7 @@ func (s *Server) registerEnhancementTools() {
 	s.mcpServer.AddTool(
 		mcp.NewTool("get_symbol_history",
 			mcp.WithDescription("Returns symbols modified during the current session with modification counts. Flags churning symbols (modified 3+ times)."),
-			mcp.WithString("symbol_id", mcp.Description("Specific symbol ID (omit for all)")),
+			mcp.WithString("id", mcp.Description("Specific symbol ID (omit for all)")),
 			mcp.WithBoolean("compact", mcp.Description("One-line-per-symbol text output")),
 		),
 		s.handleGetSymbolHistory,
@@ -161,7 +161,7 @@ func (s *Server) registerEnhancementTools() {
 	s.mcpServer.AddTool(
 		mcp.NewTool("batch_edit",
 			mcp.WithDescription("Applies multiple symbol edits in dependency order. Re-indexes after each edit. Stops on failure and reports status."),
-			mcp.WithString("edits", mcp.Required(), mcp.Description("JSON array of {symbol_id, old_source, new_source} objects")),
+			mcp.WithString("edits", mcp.Required(), mcp.Description("JSON array of {id, old_source, new_source} objects")),
 			mcp.WithBoolean("dry_run", mcp.Description("Return dependency-ordered plan without applying changes")),
 			mcp.WithBoolean("compact", mcp.Description("One-line-per-edit summary")),
 		),
@@ -261,9 +261,9 @@ func (s *Server) handleVerifyChange(_ context.Context, req mcp.CallToolRequest) 
 // ---------------------------------------------------------------------------
 
 func (s *Server) handleCheckGuards(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	idsStr, err := req.RequireString("symbol_ids")
+	idsStr, err := req.RequireString("ids")
 	if err != nil {
-		return mcp.NewToolResultError("symbol_ids is required"), nil
+		return mcp.NewToolResultError("ids is required"), nil
 	}
 
 	ids := strings.Split(idsStr, ",")
@@ -667,9 +667,9 @@ func (s *Server) handleFindHotspots(_ context.Context, req mcp.CallToolRequest) 
 // ---------------------------------------------------------------------------
 
 func (s *Server) handleScaffold(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	exampleID, err := req.RequireString("example_id")
+	exampleID, err := req.RequireString("id")
 	if err != nil {
-		return mcp.NewToolResultError("example_id is required"), nil
+		return mcp.NewToolResultError("id is required"), nil
 	}
 	newName, err := req.RequireString("new_name")
 	if err != nil {
@@ -1098,7 +1098,7 @@ func (s *Server) handleIndexHealth(_ context.Context, req mcp.CallToolRequest) (
 // ---------------------------------------------------------------------------
 
 func (s *Server) handleGetSymbolHistory(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	symbolID := req.GetString("symbol_id", "")
+	symbolID := req.GetString("id", "")
 
 	if symbolID != "" {
 		// Single symbol history
@@ -1184,15 +1184,15 @@ func (s *Server) handleGetSymbolHistory(_ context.Context, req mcp.CallToolReque
 
 // batchEditItem represents a single edit in a batch.
 type batchEditItem struct {
-	SymbolID  string `json:"symbol_id"`
+	SymbolID  string `json:"id"`
 	OldSource string `json:"old_source"`
 	NewSource string `json:"new_source"`
 }
 
 // batchEditResult represents the outcome of a single edit in the batch.
 type batchEditResult struct {
-	SymbolID string `json:"symbol_id"`
-	FilePath string `json:"file_path"`
+	SymbolID string `json:"id"`
+	FilePath string `json:"path"`
 	Status   string `json:"status"` // "applied", "failed", "skipped"
 	Error    string `json:"error,omitempty"`
 }
@@ -1269,10 +1269,10 @@ func (s *Server) handleBatchEdit(_ context.Context, req mcp.CallToolRequest) (*m
 		var plan []map[string]any
 		for i, o := range ordered {
 			entry := map[string]any{
-				"order":     i + 1,
-				"symbol_id": o.edit.SymbolID,
-				"file_path": o.file,
-				"status":    "planned",
+				"order":  i + 1,
+				"id":     o.edit.SymbolID,
+				"path":   o.file,
+				"status": "planned",
 			}
 			plan = append(plan, entry)
 		}
@@ -1280,7 +1280,7 @@ func (s *Server) handleBatchEdit(_ context.Context, req mcp.CallToolRequest) (*m
 		if isCompact(req) {
 			var b strings.Builder
 			for _, p := range plan {
-				fmt.Fprintf(&b, "%s %s planned\n", p["symbol_id"], p["file_path"])
+				fmt.Fprintf(&b, "%s %s planned\n", p["id"], p["path"])
 			}
 			return mcp.NewToolResultText(b.String()), nil
 		}
