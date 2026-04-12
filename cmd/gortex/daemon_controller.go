@@ -29,6 +29,7 @@ type realController struct {
 	graph         *graph.Graph
 	multiIndexer  *indexer.MultiIndexer
 	configManager *config.ConfigManager
+	multiWatcher  *indexer.MultiWatcher
 	logger        *zap.Logger
 
 	// onShutdown is invoked by the Shutdown method. Used by the daemon
@@ -65,6 +66,19 @@ func (c *realController) Track(ctx context.Context, p daemon.TrackParams) (json.
 	// run `gortex daemon reload`; track from the daemon-v1 surface just
 	// adds to the top-level repo list.
 
+	// Attach a watcher to the newly-tracked repo so file edits in it
+	// flow back into the graph live without a manual reload. Failures
+	// here are logged but don't fail the track — an indexed-but-
+	// unwatched repo is still queryable, just stale if edited.
+	if c.multiWatcher != nil && c.configManager != nil {
+		prefix := config.ResolvePrefix(entry)
+		wcfg := c.configManager.GetRepoConfig(prefix).Watch
+		if err := c.multiWatcher.AddRepo(prefix, wcfg); err != nil {
+			c.logger.Warn("track: attach watcher failed",
+				zap.String("prefix", prefix), zap.Error(err))
+		}
+	}
+
 	return json.Marshal(map[string]any{
 		"status":     "tracked",
 		"path":       absPath,
@@ -93,6 +107,16 @@ func (c *realController) Untrack(_ context.Context, p daemon.UntrackParams) (jso
 				prefix = pfx
 				break
 			}
+		}
+	}
+
+	// Detach the watcher before evicting from the graph — otherwise a
+	// late fsnotify event could race the eviction and try to re-index
+	// files whose nodes are already gone.
+	if c.multiWatcher != nil {
+		if err := c.multiWatcher.RemoveRepo(prefix); err != nil {
+			c.logger.Debug("untrack: detach watcher",
+				zap.String("prefix", prefix), zap.Error(err))
 		}
 	}
 

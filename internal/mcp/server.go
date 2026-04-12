@@ -308,6 +308,11 @@ func (s *Server) InitFeedback(cacheDir, repoPath string) {
 // InitSavings wires the persistent token-savings store into tokenStats so
 // every source-reading tool call accumulates cumulative totals. Call once
 // after NewServer; safe to skip when persistence isn't desired.
+//
+// Propagates to the sessionMap too so per-session counters (daemon path)
+// also flush to the shared persistent store. Without this propagation a
+// proxy that connects before InitSavings runs would hold a tokenStats
+// with nil persistent and silently drop observations.
 func (s *Server) InitSavings(store *savings.Store, repoPath string) {
 	if store == nil || s.tokenStats == nil {
 		return
@@ -316,6 +321,21 @@ func (s *Server) InitSavings(store *savings.Store, repoPath string) {
 	s.tokenStats.persistent = store
 	s.tokenStats.repoPath = repoPath
 	s.tokenStats.mu.Unlock()
+	if s.sessions != nil {
+		s.sessions.setPersistent(store, repoPath)
+	}
+}
+
+// tokenStatsFor returns the tokenStats for the current request. Mirrors
+// sessionFor: when ctx carries a session ID the per-session counter is
+// returned, otherwise the shared default. Per-session counters share
+// the same persistent store so disk totals accumulate across clients.
+func (s *Server) tokenStatsFor(ctx context.Context) *tokenStats {
+	id := SessionIDFromContext(ctx)
+	if id == "" || s.sessions == nil {
+		return s.tokenStats
+	}
+	return s.sessions.get(id).tokenStats
 }
 
 // FlushSavings forces any buffered savings observations to disk. Called on

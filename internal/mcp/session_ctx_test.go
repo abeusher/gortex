@@ -83,3 +83,27 @@ func TestServer_SessionFor_NoIDFallsBackToShared(t *testing.T) {
 	assert.Same(t, srv.session, sess,
 		"ctx without session ID must route to the shared default")
 }
+
+// TestServer_TokenStatsFor_IsolatedCounters proves per-session token
+// savings stay separate. Client A's record() calls must not show up in
+// client B's session-level snapshot — the token_savings field in
+// graph_stats would otherwise merge them and mislead each client about
+// its own efficiency.
+func TestServer_TokenStatsFor_IsolatedCounters(t *testing.T) {
+	srv, _ := setupTestServer(t)
+
+	ctxA := WithSessionID(context.Background(), "session_A")
+	ctxB := WithSessionID(context.Background(), "session_B")
+
+	// A records 1000 saved / 500 returned; B records 300/100.
+	srv.tokenStatsFor(ctxA).record(500, 1500)  // returned=500, fullFile=1500 → saved=1000
+	srv.tokenStatsFor(ctxB).record(100, 400)    // returned=100, fullFile=400 → saved=300
+
+	snapA := srv.tokenStatsFor(ctxA).snapshot()
+	snapB := srv.tokenStatsFor(ctxB).snapshot()
+
+	assert.EqualValues(t, 1000, snapA["tokens_saved"], "session A isolated counter")
+	assert.EqualValues(t, 300, snapB["tokens_saved"], "session B isolated counter")
+	assert.EqualValues(t, 1, snapA["calls_counted"])
+	assert.EqualValues(t, 1, snapB["calls_counted"])
+}

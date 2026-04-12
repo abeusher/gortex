@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -64,4 +65,46 @@ func TestLoadSnapshot_CorruptFile_ReportsError(t *testing.T) {
 	assert.Error(t, err, "corrupt snapshot must not be silently swallowed")
 	assert.False(t, loaded)
 	assert.Equal(t, 0, g.NodeCount())
+}
+
+// TestStartPeriodicSnapshots_WritesOnTick verifies the 10-minute ticker
+// (configurable interval in tests) actually fires and writes to disk.
+// The daemon relies on this for crash-recovery — on a `kill -9` it
+// would otherwise lose everything since the last shutdown snapshot.
+func TestStartPeriodicSnapshots_WritesOnTick(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "periodic.gob.gz")
+	t.Setenv("GORTEX_DAEMON_SNAPSHOT", path)
+
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "a.go::X", Name: "X", Kind: graph.KindFunction, FilePath: "a.go"})
+
+	// 30ms interval — fast enough to observe two or three ticks within
+	// a reasonable test budget, slow enough to survive scheduler jitter.
+	stop := startPeriodicSnapshots(g, "t", 30*time.Millisecond, zap.NewNop())
+	t.Cleanup(stop)
+
+	require.Eventually(t, func() bool {
+		info, err := os.Stat(path)
+		return err == nil && info.Size() > 0
+	}, 2*time.Second, 20*time.Millisecond,
+		"periodic snapshot should land on disk within the budget")
+
+	// Prove a second tick also happens — modify mtime check after capture.
+	info1, err := os.Stat(path)
+	require.NoError(t, err)
+
+	// Add another node to force a different encoded payload on the
+	// next tick; this way a no-op snapshot won't silently pass by
+	// just checking mtime equality.
+	g.AddNode(&graph.Node{ID: "b.go::Y", Name: "Y", Kind: graph.KindFunction, FilePath: "b.go"})
+
+	require.Eventually(t, func() bool {
+		info2, err := os.Stat(path)
+		if err != nil {
+			return false
+		}
+		return info2.ModTime().After(info1.ModTime())
+	}, 2*time.Second, 20*time.Millisecond,
+		"second periodic tick should rewrite the snapshot")
 }

@@ -3,6 +3,8 @@ package mcp
 import (
 	"context"
 	"sync"
+
+	"github.com/zzet/gortex/internal/savings"
 )
 
 // sessionCtxKey is the private context key under which a caller
@@ -44,24 +46,44 @@ func SessionIDFromContext(ctx context.Context) string {
 
 // sessionLocal bundles the per-client state that should not aggregate
 // across sessions: recent agent activity (viewed/modified files and
-// symbols), and session-scoped counters. Shared pieces — the graph,
-// feedback store, cumulative savings — stay on *Server directly.
+// symbols), and session-scoped token-savings counters. Shared pieces —
+// the graph, feedback store, the cumulative savings store on disk —
+// stay on *Server directly or are referenced via pointers that all
+// sessions share.
 type sessionLocal struct {
-	session *sessionState
+	session    *sessionState
+	tokenStats *tokenStats
 }
 
-// newSessionLocal constructs a fresh per-session state container.
-func newSessionLocal() *sessionLocal {
-	return &sessionLocal{session: newSessionState()}
+// newSessionLocal constructs a fresh per-session state container. The
+// persistent savings store pointer is threaded in so per-session
+// record() calls still contribute to cumulative totals on disk — each
+// session's in-memory counters are isolated but the file they flush to
+// is shared.
+func newSessionLocal(persistent *savings.Store, repoPath string) *sessionLocal {
+	return &sessionLocal{
+		session: newSessionState(),
+		tokenStats: &tokenStats{
+			persistent: persistent,
+			repoPath:   repoPath,
+		},
+	}
 }
 
 // sessionMap is a thread-safe string→*sessionLocal registry. Used by
 // *Server to multiplex session-scoped state when running inside the
 // daemon. The embedded / stdio server path doesn't consult this map;
 // it reads *Server.session directly.
+//
+// The map also holds a pointer to the shared persistent savings store,
+// so per-session tokenStats created by lazy get() calls inherit it
+// automatically. Updating it via setPersistent propagates to every
+// existing entry as well.
 type sessionMap struct {
-	mu       sync.Mutex
-	sessions map[string]*sessionLocal
+	mu         sync.Mutex
+	sessions   map[string]*sessionLocal
+	persistent *savings.Store
+	repoPath   string
 }
 
 func newSessionMap() *sessionMap {
@@ -75,7 +97,7 @@ func (m *sessionMap) get(id string) *sessionLocal {
 	defer m.mu.Unlock()
 	sl, ok := m.sessions[id]
 	if !ok {
-		sl = newSessionLocal()
+		sl = newSessionLocal(m.persistent, m.repoPath)
 		m.sessions[id] = sl
 	}
 	return sl
@@ -87,4 +109,23 @@ func (m *sessionMap) release(id string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.sessions, id)
+}
+
+// setPersistent updates the shared savings store pointer and
+// propagates it into every live session so no existing client flushes
+// savings to a stale (or nil) store.
+func (m *sessionMap) setPersistent(store *savings.Store, repoPath string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.persistent = store
+	m.repoPath = repoPath
+	for _, sl := range m.sessions {
+		if sl.tokenStats == nil {
+			continue
+		}
+		sl.tokenStats.mu.Lock()
+		sl.tokenStats.persistent = store
+		sl.tokenStats.repoPath = repoPath
+		sl.tokenStats.mu.Unlock()
+	}
 }

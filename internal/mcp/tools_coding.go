@@ -400,7 +400,7 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 
 	returned := tokens.CountInt64(source)
 	fullFile := int64(tokens.EstimateFromSample(totalFileChars, source))
-	s.tokenStats.record(returned, fullFile)
+	s.tokenStatsFor(ctx).record(returned, fullFile)
 	tokensSaved := fullFile - returned
 	if tokensSaved < 0 {
 		tokensSaved = 0
@@ -466,7 +466,7 @@ func readLines(path string, startLine, endLine, contextLines int) (string, int, 
 	return strings.Join(lines, "\n"), from, totalChars, nil
 }
 
-func (s *Server) handleBatchSymbols(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Server) handleBatchSymbols(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	idsStr, err := req.RequireString("ids")
 	if err != nil {
 		return mcp.NewToolResultError("ids is required"), nil
@@ -552,7 +552,7 @@ func (s *Server) handleBatchSymbols(_ context.Context, req mcp.CallToolRequest) 
 				}
 				entry["tokens_saved"] = saved
 				batchTokensSaved += saved
-				s.tokenStats.record(returned, fullFile)
+				s.tokenStatsFor(ctx).record(returned, fullFile)
 			}
 		}
 
@@ -1017,7 +1017,7 @@ func (s *Server) handleGetEditPlan(_ context.Context, req mcp.CallToolRequest) (
 
 // extractPrefix returns the common prefix of a camelCase/PascalCase name.
 // e.g. "handleGetSymbol" -> "handle", "TestNewServer" -> "Test"
-func (s *Server) handleSmartContext(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	task, err := req.RequireString("task")
 	if err != nil {
 		return mcp.NewToolResultError("task is required"), nil
@@ -1166,7 +1166,7 @@ func (s *Server) handleSmartContext(_ context.Context, req mcp.CallToolRequest) 
 					saved = 0
 				}
 				smartContextTokensSaved += saved
-				s.tokenStats.record(returned, fullFile)
+				s.tokenStatsFor(ctx).record(returned, fullFile)
 			}
 		}
 		symbolContexts = append(symbolContexts, entry)

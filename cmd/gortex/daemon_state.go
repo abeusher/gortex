@@ -28,6 +28,11 @@ type daemonState struct {
 	multiIndexer  *indexer.MultiIndexer
 	configManager *config.ConfigManager
 	mcpServer     *gortexmcp.Server
+
+	// multiWatcher watches tracked repos for fsnotify events and streams
+	// re-indexes into the graph. nil when there's no ConfigManager (rare
+	// — single-repo mode only).
+	multiWatcher *indexer.MultiWatcher
 }
 
 // buildDaemonState constructs the full object graph the daemon needs:
@@ -120,11 +125,36 @@ func buildDaemonState(logger *zap.Logger) (*daemonState, error) {
 		logger.Warn("daemon: savings persistence disabled", zap.Error(err))
 	}
 
+	// Spin up a MultiWatcher so tracked repos pick up file edits live.
+	// Without this a user editing a source file won't see the graph
+	// update until they explicitly `gortex daemon reload`. Every
+	// currently-tracked repo gets its own per-repo Watcher; new repos
+	// added via the `track` control surface get a watcher attached in
+	// realController.Track (follow-up).
+	var mw *indexer.MultiWatcher
+	if mi != nil {
+		watchCfgs := make(map[string]config.WatchConfig)
+		for prefix := range mi.AllMetadata() {
+			watchCfgs[prefix] = cm.GetRepoConfig(prefix).Watch
+		}
+		var err error
+		mw, err = indexer.NewMultiWatcher(mi, watchCfgs, logger)
+		if err != nil {
+			logger.Warn("daemon: multi-watcher init failed", zap.Error(err))
+		} else if err := mw.Start(); err != nil {
+			logger.Warn("daemon: multi-watcher start failed", zap.Error(err))
+			mw = nil
+		} else {
+			logger.Info("daemon: watching", zap.Int("repos", len(watchCfgs)))
+		}
+	}
+
 	return &daemonState{
 		graph:         g,
 		indexer:       idx,
 		multiIndexer:  mi,
 		configManager: cm,
 		mcpServer:     srv,
+		multiWatcher:  mw,
 	}, nil
 }

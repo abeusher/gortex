@@ -756,7 +756,7 @@ func (s *Server) handleGetCluster(_ context.Context, req mcp.CallToolRequest) (*
 	return returnSubGraph(req, sg)
 }
 
-func (s *Server) handleGraphStats(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Server) handleGraphStats(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	stats := s.engine.Stats()
 	result := map[string]any{
 		"total_nodes": stats.TotalNodes,
@@ -770,8 +770,9 @@ func (s *Server) handleGraphStats(_ context.Context, _ mcp.CallToolRequest) (*mc
 		result["per_repo"] = s.graph.RepoStats()
 	}
 
-	// Include session-level token savings.
-	result["token_savings"] = s.tokenStats.snapshot()
+	// Include session-level token savings. Per-session when the caller
+	// has a session ID (daemon path); shared default for embedded/stdio.
+	result["token_savings"] = s.tokenStatsFor(ctx).snapshot()
 
 	// Include cumulative cross-session savings when a persistent store is wired.
 	if cs := s.cumulativeSavingsSnapshot(); cs != nil {

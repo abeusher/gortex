@@ -112,12 +112,15 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		graph:         state.graph,
 		multiIndexer:  state.multiIndexer,
 		configManager: state.configManager,
+		multiWatcher:  state.multiWatcher,
 		logger:        logger,
 		onShutdown: func() error {
-			// Order matters: snapshot first (while the indexer may still
-			// be in the middle of a write), then flush savings so
-			// cumulative totals are consistent with what the next start
-			// will load back.
+			// Stop watchers first so no late events race the snapshot
+			// write — we want the snapshot to reflect a quiescent graph,
+			// not one being mutated by an in-flight re-index.
+			if state.multiWatcher != nil {
+				_ = state.multiWatcher.Stop()
+			}
 			saveSnapshot(state.graph, version, logger)
 			if state.mcpServer != nil {
 				_ = state.mcpServer.FlushSavings()
