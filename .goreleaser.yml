@@ -15,7 +15,10 @@ builds:
     main: ./cmd/gortex/
     binary: gortex
     ldflags:
-      - -s -w -X main.version={{.Version}}
+      # main.version + main.commit get parsed at startup into a SemVer 2.0.0
+      # Version (see internal/version). Commit lands in the +build slot so
+      # `gortex version` output round-trips as canonical semver.
+      - -s -w -X main.version={{.Version}} -X main.commit={{.ShortCommit}} -X main.date={{.Date}}
     env:
       - CGO_ENABLED=1
     goos:

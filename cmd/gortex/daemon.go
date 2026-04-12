@@ -98,7 +98,7 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		return spawnDetachedDaemon()
 	}
 	logger := newLogger()
-	srv := daemon.New(daemon.SocketPath(), version, logger)
+	srv := daemon.New(daemon.SocketPath(), canonicalVersion(), logger)
 
 	// Build the production state: graph, multi-indexer, config manager,
 	// MCP server. The daemon owns one of each — shared by every session

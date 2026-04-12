@@ -1,6 +1,13 @@
 BINARY    := gortex
+
+# VERSION defaults to the nearest annotated tag (e.g. v0.1.0) or "dev" when
+# no tags exist / not a git checkout. COMMIT is the short SHA; DATE is RFC
+# 3339 UTC. internal/version parses main.version and treats main.commit as
+# the +build slot, so `gortex version` prints canonical semver.
 VERSION   ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
-LDFLAGS   := -s -w -X main.version=$(VERSION)
+COMMIT    ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
+DATE      ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+LDFLAGS   := -s -w -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.date=$(DATE)
 
 .PHONY: build build-onnx build-gomlx build-hugot \
        test bench bench-rpi bench-rpi-quick bench-rpi-profile bench-compare \
