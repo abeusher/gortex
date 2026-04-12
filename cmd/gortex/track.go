@@ -8,6 +8,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/daemon"
 )
 
 var trackCmd = &cobra.Command{
@@ -49,13 +50,32 @@ func runTrack(_ *cobra.Command, args []string) error {
 		return fmt.Errorf("path is not a directory: %s", absPath)
 	}
 
-	// Load global config.
+	// Daemon-first: if a daemon is running, it's the source of truth for
+	// tracked repos and it'll index immediately. Falls through to the
+	// config-only behavior below when no daemon is listening.
+	if daemon.IsRunning() {
+		c, err := daemon.Dial(daemon.Handshake{Mode: daemon.ModeControl, ClientName: "cli"})
+		if err == nil {
+			defer c.Close()
+			resp, ctlErr := c.Control(daemon.ControlTrack, daemon.TrackParams{Path: absPath})
+			if ctlErr != nil {
+				return ctlErr
+			}
+			if !resp.OK {
+				return fmt.Errorf("track rejected: %s %s", resp.ErrorCode, resp.ErrorMsg)
+			}
+			fmt.Fprintf(os.Stderr, "[gortex] tracked %s (via daemon)\n", absPath)
+			return nil
+		}
+	}
+
+	// Standalone fallback: update the config file directly. The daemon
+	// (if later started) will pick this up on its next startup.
 	gc, err := config.LoadGlobal()
 	if err != nil {
 		return fmt.Errorf("loading global config: %w", err)
 	}
 
-	// Check for duplicate before adding.
 	for _, existing := range gc.Repos {
 		existingAbs, _ := filepath.Abs(existing.Path)
 		if existingAbs == absPath {
@@ -64,46 +84,59 @@ func runTrack(_ *cobra.Command, args []string) error {
 		}
 	}
 
-	// Add repo entry.
 	entry := config.RepoEntry{Path: absPath}
 	if err := gc.AddRepo(entry); err != nil {
 		return err
 	}
-
-	// Persist to disk.
 	if err := gc.Save(); err != nil {
 		return fmt.Errorf("saving global config: %w", err)
 	}
-
-	fmt.Fprintf(os.Stderr, "[gortex] tracked %s\n", absPath)
+	fmt.Fprintf(os.Stderr, "[gortex] tracked %s (config only — start daemon to index)\n", absPath)
 	return nil
 }
 
 func runUntrack(_ *cobra.Command, args []string) error {
 	rawPath := args[0]
 
-	// Resolve to absolute path.
-	absPath, err := filepath.Abs(rawPath)
-	if err != nil {
-		return fmt.Errorf("resolving path %s: %w", rawPath, err)
+	// Argument can be either a path or a repo prefix; the daemon accepts
+	// both. Resolve to absolute only when it looks like a path (starts
+	// with / or . or has a path separator); otherwise treat as a prefix.
+	target := rawPath
+	if filepath.IsAbs(rawPath) || rawPath == "." || rawPath == ".." {
+		abs, err := filepath.Abs(rawPath)
+		if err != nil {
+			return fmt.Errorf("resolving path %s: %w", rawPath, err)
+		}
+		target = abs
 	}
 
-	// Load global config.
+	if daemon.IsRunning() {
+		c, err := daemon.Dial(daemon.Handshake{Mode: daemon.ModeControl, ClientName: "cli"})
+		if err == nil {
+			defer c.Close()
+			resp, ctlErr := c.Control(daemon.ControlUntrack, daemon.UntrackParams{PathOrPrefix: target})
+			if ctlErr != nil {
+				return ctlErr
+			}
+			if !resp.OK {
+				return fmt.Errorf("untrack rejected: %s %s", resp.ErrorCode, resp.ErrorMsg)
+			}
+			fmt.Fprintf(os.Stderr, "[gortex] untracked %s (via daemon)\n", target)
+			return nil
+		}
+	}
+
+	// Standalone fallback.
 	gc, err := config.LoadGlobal()
 	if err != nil {
 		return fmt.Errorf("loading global config: %w", err)
 	}
-
-	// Remove repo.
-	if err := gc.RemoveRepo(absPath); err != nil {
+	if err := gc.RemoveRepo(target); err != nil {
 		return err
 	}
-
-	// Persist to disk.
 	if err := gc.Save(); err != nil {
 		return fmt.Errorf("saving global config: %w", err)
 	}
-
-	fmt.Fprintf(os.Stderr, "[gortex] untracked %s\n", absPath)
+	fmt.Fprintf(os.Stderr, "[gortex] untracked %s (config only)\n", target)
 	return nil
 }

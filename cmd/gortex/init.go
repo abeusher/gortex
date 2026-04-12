@@ -21,6 +21,9 @@ import (
 
 var initAnalyze bool
 var initHooksOnly bool
+var initGlobal bool
+var initStartDaemon bool
+var initTrackRepo bool
 
 var initCmd = &cobra.Command{
 	Use:   "init [path]",
@@ -32,11 +35,22 @@ var initCmd = &cobra.Command{
 func init() {
 	initCmd.Flags().BoolVar(&initAnalyze, "analyze", false, "index the repo first to generate a richer CLAUDE.md with codebase overview")
 	initCmd.Flags().BoolVar(&initHooksOnly, "hooks", false, "only install/update PreToolUse hooks in .claude/settings.local.json")
+	initCmd.Flags().BoolVar(&initGlobal, "global", false, "install a user-wide config (~/.claude.json) that points every project at the daemon; skip per-repo file creation")
+	initCmd.Flags().BoolVar(&initStartDaemon, "start", false, "start the daemon immediately after --global setup (detached)")
+	initCmd.Flags().BoolVar(&initTrackRepo, "track", false, "track the current repo via the daemon after --global setup")
 	rootCmd.AddCommand(initCmd)
 }
 
-func runInit(_ *cobra.Command, args []string) error {
+func runInit(cmd *cobra.Command, args []string) error {
 	root := "."
+	if len(args) > 0 {
+		root = args[0]
+	}
+	if initGlobal {
+		return runInitGlobal(cmd, root)
+	}
+	// Defensive re-initialize for the per-repo path below.
+	root = "."
 	if len(args) > 0 {
 		root = args[0]
 	}

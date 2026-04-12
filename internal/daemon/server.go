@@ -1,0 +1,454 @@
+package daemon
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"os/signal"
+	"strconv"
+	"sync"
+	"syscall"
+	"time"
+
+	"go.uber.org/zap"
+)
+
+// Server is the long-living Gortex daemon. It owns the Unix socket
+// listener, the session registry, and the control-surface dispatcher.
+// MCP traffic is plumbed through a ToolDispatcher that's injected at
+// construction time — the daemon package deliberately doesn't depend
+// on internal/mcp to keep the direction of imports clean.
+type Server struct {
+	SocketPath string
+	Version    string
+	Logger     *zap.Logger
+
+	// Dispatcher handles MCP mode traffic (JSON-RPC 2.0) after handshake.
+	// A nil Dispatcher means this daemon is control-only — useful for
+	// tests and for early integration before the MCP passthrough lands.
+	MCPDispatcher MCPDispatcher
+
+	// Controller handles control-mode RPCs (track/untrack/reload/status/shutdown).
+	Controller Controller
+
+	sessions *SessionRegistry
+	listener net.Listener
+	started  time.Time
+
+	mu       sync.Mutex
+	shutdown chan struct{}
+	doneOnce sync.Once
+	conns    map[net.Conn]struct{}
+	connsMu  sync.Mutex
+}
+
+// MCPDispatcher is implemented by whichever layer runs the MCP tool
+// handlers. The daemon hands off one JSON-RPC frame at a time (raw bytes,
+// newline-delimited) and the dispatcher returns the response bytes to
+// write back. Session gives the dispatcher the per-client context it
+// needs (scope, session-level state). Return an empty slice to suppress
+// the response (notifications with no reply).
+type MCPDispatcher interface {
+	Dispatch(ctx context.Context, sess *Session, frame []byte) ([]byte, error)
+}
+
+// Controller implements the daemon's control surface. Separated from
+// MCPDispatcher so the two can evolve independently and so control-only
+// tests don't need a full MCP stack.
+type Controller interface {
+	Track(ctx context.Context, params TrackParams) (json.RawMessage, error)
+	Untrack(ctx context.Context, params UntrackParams) (json.RawMessage, error)
+	Reload(ctx context.Context) (json.RawMessage, error)
+	Status(ctx context.Context) (StatusResponse, error)
+	// Shutdown is invoked via the control surface and should return
+	// quickly; the daemon's actual shutdown work happens after the
+	// response is written.
+	Shutdown(ctx context.Context) error
+}
+
+// New builds a Server but does not start listening.
+func New(socketPath, version string, logger *zap.Logger) *Server {
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+	return &Server{
+		SocketPath: socketPath,
+		Version:    version,
+		Logger:     logger,
+		sessions:   NewSessionRegistry(),
+		shutdown:   make(chan struct{}),
+		conns:      make(map[net.Conn]struct{}),
+	}
+}
+
+// Listen creates the socket, writes the PID file, and installs SIGINT/SIGTERM
+// handlers for graceful shutdown. The socket permissions are 0o600 — the
+// daemon is user-local and nothing else on the machine should reach it.
+func (s *Server) Listen() error {
+	if err := EnsureParentDir(s.SocketPath); err != nil {
+		return fmt.Errorf("ensure socket dir: %w", err)
+	}
+	// Remove stale socket file from a crashed previous run. If the daemon
+	// is actually running, the PID check below will catch it and abort.
+	_ = os.Remove(s.SocketPath)
+
+	if err := s.writePIDFile(); err != nil {
+		return fmt.Errorf("pid file: %w", err)
+	}
+
+	lc := &net.ListenConfig{}
+	l, err := lc.Listen(context.Background(), "unix", s.SocketPath)
+	if err != nil {
+		_ = os.Remove(PIDFilePath())
+		return fmt.Errorf("listen: %w", err)
+	}
+	if err := os.Chmod(s.SocketPath, 0o600); err != nil {
+		_ = l.Close()
+		return fmt.Errorf("chmod socket: %w", err)
+	}
+	s.listener = l
+	s.started = time.Now()
+
+	// Install signal handlers once the listener is live.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		s.Logger.Info("daemon: received signal, shutting down")
+		_ = s.Shutdown()
+	}()
+	return nil
+}
+
+// Serve runs the accept loop. Blocks until Shutdown is called or the
+// listener returns an unrecoverable error.
+func (s *Server) Serve() error {
+	if s.listener == nil {
+		return errors.New("daemon: Listen must be called before Serve")
+	}
+	s.Logger.Info("daemon: serving", zap.String("socket", s.SocketPath))
+	for {
+		conn, err := s.listener.Accept()
+		if err != nil {
+			// listener closed during Shutdown — normal exit.
+			select {
+			case <-s.shutdown:
+				return nil
+			default:
+			}
+			if errors.Is(err, net.ErrClosed) {
+				return nil
+			}
+			s.Logger.Warn("daemon: accept failed", zap.Error(err))
+			continue
+		}
+		s.trackConn(conn)
+		go s.handle(conn)
+	}
+}
+
+// handle runs the per-connection lifecycle: handshake → dispatch loop →
+// cleanup. Every exit path must remove the session and close the conn.
+func (s *Server) handle(conn net.Conn) {
+	defer func() {
+		_ = conn.Close()
+		s.untrackConn(conn)
+		if sess := s.sessions.Remove(conn); sess != nil {
+			s.Logger.Debug("daemon: session closed",
+				zap.String("session_id", sess.ID),
+				zap.String("client", sess.ClientName))
+		}
+	}()
+
+	reader := bufio.NewReader(conn)
+	sess, err := s.handshake(conn, reader)
+	if err != nil {
+		s.Logger.Warn("daemon: handshake failed", zap.Error(err))
+		return
+	}
+
+	switch sess.Mode {
+	case ModeMCP:
+		s.serveMCP(conn, reader, sess)
+	case ModeControl:
+		s.serveControl(conn, reader, sess)
+	default:
+		s.Logger.Warn("daemon: unknown mode after handshake",
+			zap.String("mode", string(sess.Mode)))
+	}
+}
+
+// handshake reads one handshake frame, validates it, and replies with an
+// ack. A rejected handshake writes an error ack then closes the connection.
+func (s *Server) handshake(conn net.Conn, reader *bufio.Reader) (*Session, error) {
+	line, err := reader.ReadBytes('\n')
+	if err != nil {
+		return nil, fmt.Errorf("read handshake: %w", err)
+	}
+
+	var h Handshake
+	if err := json.Unmarshal(line, &h); err != nil {
+		_ = WriteJSONLine(conn, HandshakeAck{
+			ErrorCode: ErrInternal,
+			ErrorMsg:  "invalid handshake json: " + err.Error(),
+		})
+		return nil, fmt.Errorf("parse handshake: %w", err)
+	}
+	if h.Version != ProtocolVersion {
+		_ = WriteJSONLine(conn, HandshakeAck{
+			ErrorCode: ErrProtocolMismatch,
+			ErrorMsg: fmt.Sprintf("daemon expects protocol %d, client sent %d",
+				ProtocolVersion, h.Version),
+		})
+		return nil, fmt.Errorf("protocol mismatch: %d vs %d", ProtocolVersion, h.Version)
+	}
+	if h.Mode != ModeMCP && h.Mode != ModeControl {
+		_ = WriteJSONLine(conn, HandshakeAck{
+			ErrorCode: ErrUnsupportedMode,
+			ErrorMsg:  "mode must be 'mcp' or 'control'",
+		})
+		return nil, fmt.Errorf("unsupported mode: %q", h.Mode)
+	}
+
+	sess := s.sessions.Register(conn, h)
+
+	ack := HandshakeAck{
+		OK:            true,
+		SessionID:     sess.ID,
+		DaemonVersion: s.Version,
+	}
+	if err := WriteJSONLine(conn, ack); err != nil {
+		_ = s.sessions.Remove(conn)
+		return nil, fmt.Errorf("write ack: %w", err)
+	}
+	s.Logger.Debug("daemon: session established",
+		zap.String("session_id", sess.ID),
+		zap.String("mode", string(sess.Mode)),
+		zap.String("cwd", sess.CWD),
+		zap.String("client", sess.ClientName))
+	return sess, nil
+}
+
+// serveMCP pumps MCP JSON-RPC frames. Each line on the wire is a single
+// message. The Dispatcher gets the raw frame + session context and
+// returns the raw reply to write back. Nil reply = no response (the
+// client sent a notification).
+func (s *Server) serveMCP(conn net.Conn, reader *bufio.Reader, sess *Session) {
+	if s.MCPDispatcher == nil {
+		_ = WriteJSONLine(conn, map[string]any{
+			"jsonrpc": "2.0",
+			"error": map[string]any{
+				"code":    -32000,
+				"message": "daemon started without MCP dispatcher; control-only mode",
+			},
+			"id": nil,
+		})
+		return
+	}
+	for {
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				s.Logger.Debug("daemon: mcp read closed",
+					zap.String("session_id", sess.ID), zap.Error(err))
+			}
+			return
+		}
+		// Scanner-style: trim trailing newline but keep the payload as-is
+		// so the dispatcher sees valid JSON.
+		if n := len(line); n > 0 && line[n-1] == '\n' {
+			line = line[:n-1]
+		}
+		if len(line) == 0 {
+			continue
+		}
+
+		ctx := context.Background()
+		reply, err := s.MCPDispatcher.Dispatch(ctx, sess, line)
+		if err != nil {
+			s.Logger.Warn("daemon: dispatch error",
+				zap.String("session_id", sess.ID), zap.Error(err))
+			continue
+		}
+		if len(reply) == 0 {
+			continue
+		}
+		// The dispatcher returns a full JSON-RPC frame; re-append newline.
+		if _, werr := conn.Write(append(reply, '\n')); werr != nil {
+			s.Logger.Debug("daemon: mcp write failed",
+				zap.String("session_id", sess.ID), zap.Error(werr))
+			return
+		}
+	}
+}
+
+// serveControl drains ControlRequest messages, invokes the Controller,
+// and writes paired ControlResponse messages.
+func (s *Server) serveControl(conn net.Conn, reader *bufio.Reader, sess *Session) {
+	if s.Controller == nil {
+		_ = WriteJSONLine(conn, ControlResponse{
+			ErrorCode: ErrInternal,
+			ErrorMsg:  "daemon started without controller",
+		})
+		return
+	}
+	for {
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			return
+		}
+		var req ControlRequest
+		if err := json.Unmarshal(line, &req); err != nil {
+			_ = WriteJSONLine(conn, ControlResponse{
+				ErrorCode: ErrInternal,
+				ErrorMsg:  "malformed request: " + err.Error(),
+			})
+			continue
+		}
+		resp := s.handleControl(sess, req)
+		if err := WriteJSONLine(conn, resp); err != nil {
+			return
+		}
+		if req.Kind == ControlShutdown && resp.OK {
+			// Give the client one more moment to flush the ack before the
+			// listener goes away, then stop.
+			go func() {
+				time.Sleep(100 * time.Millisecond)
+				_ = s.Shutdown()
+			}()
+			return
+		}
+	}
+}
+
+func (s *Server) handleControl(_ *Session, req ControlRequest) ControlResponse {
+	ctx := context.Background()
+	switch req.Kind {
+	case ControlTrack:
+		var p TrackParams
+		if err := unmarshalParams(req.Params, &p); err != nil {
+			return controlErr(ErrInternal, err.Error())
+		}
+		result, err := s.Controller.Track(ctx, p)
+		if err != nil {
+			return controlErr(ErrInternal, err.Error())
+		}
+		return ControlResponse{OK: true, Result: result}
+
+	case ControlUntrack:
+		var p UntrackParams
+		if err := unmarshalParams(req.Params, &p); err != nil {
+			return controlErr(ErrInternal, err.Error())
+		}
+		result, err := s.Controller.Untrack(ctx, p)
+		if err != nil {
+			return controlErr(ErrInternal, err.Error())
+		}
+		return ControlResponse{OK: true, Result: result}
+
+	case ControlReload:
+		result, err := s.Controller.Reload(ctx)
+		if err != nil {
+			return controlErr(ErrInternal, err.Error())
+		}
+		return ControlResponse{OK: true, Result: result}
+
+	case ControlStatus:
+		st, err := s.Controller.Status(ctx)
+		if err != nil {
+			return controlErr(ErrInternal, err.Error())
+		}
+		// Daemon-level fields the controller doesn't know about.
+		st.Version = s.Version
+		st.PID = os.Getpid()
+		st.UptimeSeconds = int64(time.Since(s.started).Seconds())
+		st.SocketPath = s.SocketPath
+		st.Sessions = s.sessions.Count()
+		buf, _ := json.Marshal(st)
+		return ControlResponse{OK: true, Result: buf}
+
+	case ControlShutdown:
+		if err := s.Controller.Shutdown(ctx); err != nil {
+			return controlErr(ErrInternal, err.Error())
+		}
+		return ControlResponse{OK: true}
+	}
+	return controlErr(ErrInternal, "unknown control kind: "+req.Kind)
+}
+
+// Shutdown stops the accept loop, closes outstanding connections, and
+// removes the socket and PID files. Safe to call multiple times.
+func (s *Server) Shutdown() error {
+	var first error
+	s.doneOnce.Do(func() {
+		close(s.shutdown)
+		if s.listener != nil {
+			first = s.listener.Close()
+		}
+		// Close all live conns so per-conn goroutines exit their read loops.
+		s.connsMu.Lock()
+		for c := range s.conns {
+			_ = c.Close()
+		}
+		s.connsMu.Unlock()
+		_ = os.Remove(s.SocketPath)
+		_ = os.Remove(PIDFilePath())
+	})
+	return first
+}
+
+// writePIDFile fails if a live daemon is already running, so starting
+// twice is a loud "already running" error rather than a silent overwrite.
+func (s *Server) writePIDFile() error {
+	path := PIDFilePath()
+	if err := EnsureParentDir(path); err != nil {
+		return err
+	}
+	if existing, err := os.ReadFile(path); err == nil {
+		if pid, _ := strconv.Atoi(string(existing)); pid > 0 {
+			if err := syscall.Kill(pid, 0); err == nil {
+				return fmt.Errorf("daemon already running (pid %d)", pid)
+			}
+			// Stale pid file — old daemon crashed without cleanup.
+			_ = os.Remove(path)
+		}
+	}
+	return os.WriteFile(path, []byte(strconv.Itoa(os.Getpid())), 0o600)
+}
+
+func (s *Server) trackConn(c net.Conn) {
+	s.connsMu.Lock()
+	s.conns[c] = struct{}{}
+	s.connsMu.Unlock()
+}
+
+func (s *Server) untrackConn(c net.Conn) {
+	s.connsMu.Lock()
+	delete(s.conns, c)
+	s.connsMu.Unlock()
+}
+
+// Sessions exposes the registry for inspection (status command, tests).
+func (s *Server) Sessions() *SessionRegistry { return s.sessions }
+
+// StartedAt returns the time Listen() completed — used for uptime math.
+func (s *Server) StartedAt() time.Time { return s.started }
+
+// unmarshalParams decodes RawMessage into a typed struct, treating empty
+// or null params as an empty struct (zero value) so callers don't need
+// to special-case missing params.
+func unmarshalParams(raw json.RawMessage, v any) error {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	return json.Unmarshal(raw, v)
+}
+
+func controlErr(code, msg string) ControlResponse {
+	return ControlResponse{ErrorCode: code, ErrorMsg: msg}
+}

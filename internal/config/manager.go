@@ -54,6 +54,36 @@ func (cm *ConfigManager) Global() *GlobalConfig {
 	return cm.global
 }
 
+// Reload re-reads the GlobalConfig from disk, keeping the same config
+// path. Workspace caches are preserved — individual `.gortex.yaml`
+// files are re-read lazily on demand. Used by the daemon's `reload`
+// control RPC to pick up manual edits to the global config without a
+// full process restart.
+func (cm *ConfigManager) Reload() error {
+	cm.mu.Lock()
+	path := cm.global.ConfigPath()
+	cm.mu.Unlock()
+
+	var fresh *GlobalConfig
+	var err error
+	if path != "" {
+		fresh, err = LoadGlobal(path)
+	} else {
+		fresh, err = LoadGlobal()
+	}
+	if err != nil {
+		return fmt.Errorf("reload global config: %w", err)
+	}
+
+	cm.mu.Lock()
+	cm.global = fresh
+	// Drop workspace cache so stale per-repo overrides don't linger;
+	// they'll be reloaded on the next LoadWorkspaceConfig call.
+	cm.workspace = make(map[string]*Config)
+	cm.mu.Unlock()
+	return nil
+}
+
 // LoadWorkspaceConfig loads a .gortex.yaml from the given repo root
 // and caches it under the given repoPrefix. If the file is missing,
 // no entry is cached (global defaults will apply). If the file is

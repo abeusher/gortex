@@ -1,0 +1,215 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"path/filepath"
+	"runtime"
+	"sync"
+	"time"
+
+	"go.uber.org/zap"
+
+	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/daemon"
+	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/indexer"
+)
+
+// realController is the production daemon.Controller implementation. It
+// wraps the MultiIndexer and ConfigManager so track/untrack/reload/status
+// operations go through the same code paths the current `gortex serve`
+// command uses.
+//
+// Methods are serialized via a mutex — track/reload can race with status
+// otherwise. The mutex is coarse; finer locking is a later optimization.
+type realController struct {
+	mu            sync.Mutex
+	graph         *graph.Graph
+	multiIndexer  *indexer.MultiIndexer
+	configManager *config.ConfigManager
+	logger        *zap.Logger
+
+	// onShutdown is invoked by the Shutdown method. Used by the daemon
+	// main to flush savings, close the snapshot store, etc.
+	onShutdown func() error
+}
+
+// Track indexes a new repository and persists it to the global config.
+// Path is resolved to an absolute form before the MultiIndexer sees it.
+func (c *realController) Track(ctx context.Context, p daemon.TrackParams) (json.RawMessage, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.multiIndexer == nil {
+		return nil, fmt.Errorf("multi-repo indexer not initialized")
+	}
+	absPath, err := filepath.Abs(p.Path)
+	if err != nil {
+		return nil, fmt.Errorf("resolve path: %w", err)
+	}
+	entry := config.RepoEntry{Path: absPath, Name: p.Name, Ref: p.Ref}
+	result, err := c.multiIndexer.TrackRepoCtx(ctx, entry)
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		// Already tracked — idempotent.
+		return json.RawMessage(fmt.Sprintf(`{"status":"already_tracked","path":%q}`, absPath)), nil
+	}
+
+	// Project association from TrackParams.Project isn't wired yet — the
+	// config package doesn't expose an AddRepoToProject helper. Callers
+	// who need project scoping can edit ~/.config/gortex/config.yaml and
+	// run `gortex daemon reload`; track from the daemon-v1 surface just
+	// adds to the top-level repo list.
+
+	return json.Marshal(map[string]any{
+		"status":     "tracked",
+		"path":       absPath,
+		"prefix":     config.ResolvePrefix(entry),
+		"file_count": result.FileCount,
+		"node_count": result.NodeCount,
+		"edge_count": result.EdgeCount,
+	})
+}
+
+// Untrack evicts a repo from the graph and drops it from config.
+// PathOrPrefix accepts either an absolute path or a repo prefix.
+func (c *realController) Untrack(_ context.Context, p daemon.UntrackParams) (json.RawMessage, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.multiIndexer == nil {
+		return nil, fmt.Errorf("multi-repo indexer not initialized")
+	}
+
+	prefix := p.PathOrPrefix
+	// Resolve path → prefix if an absolute or relative path was given.
+	if filepath.IsAbs(p.PathOrPrefix) {
+		for pfx, meta := range c.multiIndexer.AllMetadata() {
+			if meta.RootPath == p.PathOrPrefix {
+				prefix = pfx
+				break
+			}
+		}
+	}
+
+	nodesRemoved, edgesRemoved := c.multiIndexer.UntrackRepo(prefix)
+
+	// Persist the config change.
+	if c.configManager != nil {
+		_ = c.configManager.Global().RemoveRepo(prefix)
+		if err := c.configManager.Global().Save(); err != nil {
+			c.logger.Warn("untrack: save config failed", zap.Error(err))
+		}
+	}
+
+	return json.Marshal(map[string]any{
+		"status":        "untracked",
+		"prefix":        prefix,
+		"nodes_removed": nodesRemoved,
+		"edges_removed": edgesRemoved,
+	})
+}
+
+// Reload re-reads the global config, indexes new repos that were added
+// via direct config-file edits, and untracks any that were removed.
+// Existing, unchanged tracked repos keep their current state.
+func (c *realController) Reload(ctx context.Context) (json.RawMessage, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.configManager == nil {
+		return nil, fmt.Errorf("config manager not initialized")
+	}
+	if err := c.configManager.Reload(); err != nil {
+		return nil, fmt.Errorf("reload config: %w", err)
+	}
+
+	var added, removed int
+	wantedPrefixes := make(map[string]bool)
+
+	for _, entry := range c.configManager.Global().Repos {
+		prefix := config.ResolvePrefix(entry)
+		wantedPrefixes[prefix] = true
+		if _, exists := c.multiIndexer.AllMetadata()[prefix]; exists {
+			continue
+		}
+		if _, err := c.multiIndexer.TrackRepoCtx(ctx, entry); err != nil {
+			c.logger.Warn("reload: track failed",
+				zap.String("path", entry.Path), zap.Error(err))
+			continue
+		}
+		added++
+	}
+
+	for prefix := range c.multiIndexer.AllMetadata() {
+		if wantedPrefixes[prefix] {
+			continue
+		}
+		c.multiIndexer.UntrackRepo(prefix)
+		removed++
+	}
+
+	return json.Marshal(map[string]any{
+		"added":   added,
+		"removed": removed,
+	})
+}
+
+// Status gathers per-repo stats and basic process metrics. Daemon-level
+// fields (PID, uptime, socket, session count) are filled in by the
+// daemon itself before the response goes out.
+func (c *realController) Status(_ context.Context) (daemon.StatusResponse, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	var tracked []daemon.TrackedRepoStatus
+	if c.multiIndexer != nil {
+		for prefix, meta := range c.multiIndexer.AllMetadata() {
+			tracked = append(tracked, daemon.TrackedRepoStatus{
+				Prefix:    prefix,
+				Path:      meta.RootPath,
+				Files:     meta.FileCount,
+				Nodes:     meta.NodeCount,
+				Edges:     meta.EdgeCount,
+				LastIndex: meta.LastIndexTime.Unix(),
+			})
+		}
+	}
+
+	var mem runtime.MemStats
+	runtime.ReadMemStats(&mem)
+
+	return daemon.StatusResponse{
+		TrackedRepos: tracked,
+		MemoryBytes:  mem.Alloc,
+	}, nil
+}
+
+// Shutdown gives the caller (the daemon main) a chance to flush any
+// per-instance stores. The actual socket teardown is the Server's job.
+func (c *realController) Shutdown(_ context.Context) error {
+	c.mu.Lock()
+	hook := c.onShutdown
+	c.mu.Unlock()
+	if hook != nil {
+		return hook()
+	}
+	return nil
+}
+
+// touchedRecently is a small helper used by status — daemon uptime is
+// not the same as any repo's last-index time, so we want the freshest
+// of the bunch for display.
+func touchedRecently(metas map[string]*indexer.RepoMetadata) time.Time {
+	var latest time.Time
+	for _, m := range metas {
+		if m.LastIndexTime.After(latest) {
+			latest = m.LastIndexTime
+		}
+	}
+	return latest
+}

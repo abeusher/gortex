@@ -14,6 +14,7 @@ import (
 
 	"github.com/zzet/gortex/internal/bridge"
 	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/embedding"
 	"github.com/zzet/gortex/internal/persistence"
 	"github.com/zzet/gortex/internal/graph"
@@ -50,6 +51,8 @@ var (
 	serveSemantic      bool
 	serveNoSemantic    bool
 	serveSemanticMode  string
+	serveNoDaemon      bool
+	serveForceProxy    bool
 )
 
 var serveCmd = &cobra.Command{
@@ -77,10 +80,31 @@ func init() {
 	serveCmd.Flags().BoolVar(&serveSemantic, "semantic", false, "enable semantic enrichment (SCIP, go/types, LSP)")
 	serveCmd.Flags().BoolVar(&serveNoSemantic, "no-semantic", false, "disable semantic enrichment")
 	serveCmd.Flags().StringVar(&serveSemanticMode, "semantic-mode", "typecheck", "Go analysis mode: typecheck or callgraph")
+	serveCmd.Flags().BoolVar(&serveNoDaemon, "no-daemon", false, "force embedded server, do not connect to a running daemon")
+	serveCmd.Flags().BoolVar(&serveForceProxy, "proxy", false, "require a running daemon and proxy through it (error if unavailable)")
 	rootCmd.AddCommand(serveCmd)
 }
 
 func runServe(cmd *cobra.Command, args []string) error {
+	// Daemon-first: if stdio indicates an MCP client spawned us AND a
+	// daemon is listening, proxy through it instead of spinning up an
+	// embedded server. Terminal invocations fall through to embedded by
+	// default.
+	if shouldTryProxy(serveNoDaemon, serveForceProxy) {
+		ran, proxyErr := runProxy(cmd.Context())
+		if proxyErr != nil {
+			return proxyErr
+		}
+		if ran {
+			return nil
+		}
+		// Daemon unavailable — fall through to embedded.
+		if serveForceProxy {
+			return fmt.Errorf("--proxy was passed but no daemon is running (socket: %s)",
+				daemon.SocketPath())
+		}
+	}
+
 	logger := newLogger()
 	defer func() { _ = logger.Sync() }()
 
