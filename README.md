@@ -46,10 +46,10 @@ Pre-built binaries are published to [GitHub Releases](https://github.com/zzet/go
 ### macOS — Homebrew
 
 ```bash
-brew install zzet/homebrew-tap/gortex
+brew install zzet/tap/gortex
 ```
 
-Homebrew handles updates on `brew upgrade`. No Gatekeeper prompt — `brew` doesn't set the quarantine attribute.
+Homebrew strips the `homebrew-` prefix from tap repositories, so `zzet/homebrew-tap` is installed as `zzet/tap`. Updates via `brew upgrade`. No Gatekeeper prompt — `brew` doesn't set the quarantine attribute on downloads.
 
 ### Linux — Debian / Ubuntu (.deb)
 
