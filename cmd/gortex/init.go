@@ -396,7 +396,7 @@ func installHook(settingsPath string) error {
 
 	if !preToolUseInstalled {
 		appendHookEntry(hooks, "PreToolUse", map[string]any{
-			"matcher": "Read|Grep|Glob",
+			"matcher": "Read|Grep|Glob|Task",
 			"hooks": []any{
 				map[string]any{
 					"type":          "command",
@@ -483,13 +483,15 @@ func appendHookEntry(hooks map[string]any, event string, entry map[string]any) {
 	hooks[event] = append(list, entry)
 }
 
-// upgradeGortexMatcher rewrites the old "Read|Grep" PreToolUse matcher to the
-// current "Read|Grep|Glob". Returns true when a change was made.
+// upgradeGortexMatcher rewrites older PreToolUse matchers to the current
+// "Read|Grep|Glob|Task". Handles the two historical matchers we've shipped
+// ("Read|Grep" and "Read|Grep|Glob"). Returns true when a change was made.
 func upgradeGortexMatcher(hooks map[string]any) bool {
 	pre, ok := hooks["PreToolUse"].([]any)
 	if !ok {
 		return false
 	}
+	const currentMatcher = "Read|Grep|Glob|Task"
 	upgraded := false
 	for _, h := range pre {
 		hm, ok := h.(map[string]any)
@@ -497,13 +499,13 @@ func upgradeGortexMatcher(hooks map[string]any) bool {
 			continue
 		}
 		matcher, _ := hm["matcher"].(string)
-		if matcher != "Read|Grep" {
+		if matcher != "Read|Grep" && matcher != "Read|Grep|Glob" {
 			continue
 		}
 		if !entryInvokesGortexHook(hm) {
 			continue
 		}
-		hm["matcher"] = "Read|Grep|Glob"
+		hm["matcher"] = currentMatcher
 		upgraded = true
 	}
 	return upgraded

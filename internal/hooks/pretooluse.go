@@ -96,6 +96,8 @@ func enrich(input HookInput, port int) enrichResult {
 		return enrichGrep(input.ToolInput, port)
 	case "Glob":
 		return enrichGlob(input.ToolInput)
+	case "Task":
+		return enrichTask(input.ToolInput, port)
 	default:
 		return enrichResult{}
 	}
