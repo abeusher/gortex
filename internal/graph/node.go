@@ -21,14 +21,15 @@ var validNodeKinds = map[NodeKind]bool{
 }
 
 type Node struct {
-	ID         string         `json:"id"`
-	Kind       NodeKind       `json:"kind"`
-	Name       string         `json:"name"`
-	QualName   string         `json:"qual_name,omitempty"`
-	FilePath   string         `json:"file_path"`
-	StartLine  int            `json:"start_line"`
-	EndLine    int            `json:"end_line"`
-	Language   string         `json:"language"`
+	ID        string         `json:"id"`
+	Kind      NodeKind       `json:"kind"`
+	Name      string         `json:"name"`
+	QualName  string         `json:"qual_name,omitempty"`
+	FilePath  string         `json:"file_path"`
+	StartLine int            `json:"start_line"`
+	// EndLine is omitted when zero — File-kind nodes don't have ranges.
+	EndLine  int    `json:"end_line,omitempty"`
+	Language string `json:"language"`
 	Meta       map[string]any `json:"meta,omitempty"`
 	RepoPrefix string         `json:"repo_prefix,omitempty"`
 }

@@ -398,24 +398,22 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 		return mcp.NewToolResultError(fmt.Sprintf("could not read source: %v", err)), nil
 	}
 
+	// Server-side accounting only — the savings value isn't returned to
+	// the caller (agents don't act on it and it burns tokens in every
+	// response). Aggregated stats remain available via the `savings` tool.
 	returned := tokens.CountInt64(source)
 	fullFile := int64(tokens.EstimateFromSample(totalFileChars, source))
 	s.tokenStatsFor(ctx).record(returned, fullFile)
-	tokensSaved := fullFile - returned
-	if tokensSaved < 0 {
-		tokensSaved = 0
-	}
 
 	result := map[string]any{
-		"id":           node.ID,
-		"kind":         node.Kind,
-		"name":         node.Name,
-		"file_path":    node.FilePath,
-		"start_line":   node.StartLine,
-		"end_line":     node.EndLine,
-		"source":       source,
-		"from_line":    startLine,
-		"tokens_saved": tokensSaved,
+		"id":         node.ID,
+		"kind":       node.Kind,
+		"name":       node.Name,
+		"file_path":  node.FilePath,
+		"start_line": node.StartLine,
+		"end_line":   node.EndLine,
+		"source":     source,
+		"from_line":  startLine,
 	}
 	if sig, ok := node.Meta["signature"]; ok {
 		result["signature"] = sig
@@ -484,7 +482,6 @@ func (s *Server) handleBatchSymbols(ctx context.Context, req mcp.CallToolRequest
 	contextLines := req.GetInt("context_lines", 3)
 
 	var results []map[string]any
-	var batchTokensSaved int64
 	for _, id := range ids {
 		node := s.engine.GetSymbol(id)
 		if node == nil {
@@ -546,12 +543,6 @@ func (s *Server) handleBatchSymbols(ctx context.Context, req mcp.CallToolRequest
 				entry["from_line"] = fromLine
 				returned := tokens.CountInt64(source)
 				fullFile := int64(tokens.EstimateFromSample(totalFileChars, source))
-				saved := fullFile - returned
-				if saved < 0 {
-					saved = 0
-				}
-				entry["tokens_saved"] = saved
-				batchTokensSaved += saved
 				s.tokenStatsFor(ctx).record(returned, fullFile)
 			}
 		}
@@ -560,9 +551,8 @@ func (s *Server) handleBatchSymbols(ctx context.Context, req mcp.CallToolRequest
 	}
 
 	batchResult := map[string]any{
-		"symbols":      results,
-		"total":        len(results),
-		"tokens_saved": batchTokensSaved,
+		"symbols": results,
+		"total":   len(results),
 	}
 
 	// ETag conditional fetch.
@@ -1030,9 +1020,10 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 		"task": task,
 	}
 
-	// 1. Extract keywords from task description.
+	// 1. Extract keywords from task description. Kept internal — the
+	// caller doesn't need the derivation to act on the result, and
+	// echoing 5-10 keywords per response is pure token bloat.
 	keywords := extractKeywords(task)
-	result["keywords"] = keywords
 
 	// 2. Search for relevant symbols using each keyword.
 	seen := make(map[string]bool)
@@ -1134,9 +1125,14 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 		relevantSymbols = relevantSymbols[:maxSymbols]
 	}
 
-	// 5. Get source and signatures for relevant symbols.
+	// 5. Get source and signatures for relevant symbols. Source is
+	// only embedded for the top maxSource functions/methods — signatures
+	// alone cover 80% of agent decision-making and each full source
+	// snippet adds several hundred tokens. Callers that need more can
+	// follow up with get_symbol_source for specific IDs.
+	const maxSource = 3
+	sourcesEmbedded := 0
 	var symbolContexts []map[string]any
-	var smartContextTokensSaved int64
 	for _, sym := range relevantSymbols {
 		entry := map[string]any{
 			"id":         sym.ID,
@@ -1148,8 +1144,8 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 		if sig, ok := sym.Meta["signature"]; ok {
 			entry["signature"] = sig
 		}
-		// Get source for functions/methods (not types — those can be large).
-		if (sym.Kind == graph.KindFunction || sym.Kind == graph.KindMethod) &&
+		if sourcesEmbedded < maxSource &&
+			(sym.Kind == graph.KindFunction || sym.Kind == graph.KindMethod) &&
 			sym.StartLine > 0 && sym.EndLine > 0 {
 			absPath := sym.FilePath
 			if s.indexer != nil {
@@ -1159,13 +1155,9 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 			}
 			if source, _, totalFileChars, err := readLines(absPath, sym.StartLine, sym.EndLine, 0); err == nil {
 				entry["source"] = source
+				sourcesEmbedded++
 				returned := tokens.CountInt64(source)
 				fullFile := int64(tokens.EstimateFromSample(totalFileChars, source))
-				saved := fullFile - returned
-				if saved < 0 {
-					saved = 0
-				}
-				smartContextTokensSaved += saved
 				s.tokenStatsFor(ctx).record(returned, fullFile)
 			}
 		}
@@ -1276,9 +1268,6 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 		}
 	}
 	result["files_to_edit"] = filesToEdit
-	if smartContextTokensSaved > 0 {
-		result["tokens_saved"] = smartContextTokensSaved
-	}
 
 	return mcp.NewToolResultJSON(result)
 }

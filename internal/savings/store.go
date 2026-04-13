@@ -4,8 +4,11 @@
 // "Gortex saved N tokens / $X at model rate this month".
 //
 // Storage format: a single JSON file at ~/.cache/gortex/savings.json (or the
-// configured cache dir). Atomic writes via temp-file + rename. Falls back to
-// an in-memory-only store when the path isn't writable.
+// configured cache dir). Atomic writes via temp-file + rename, with an
+// advisory file lock on a sidecar `.lock` file so multiple gortex processes
+// (e.g. a daemon and a parallel `gortex serve`) can write to the same
+// savings file without clobbering each other's deltas. Falls back to an
+// in-memory-only store when the path isn't writable.
 package savings
 
 import (
@@ -16,6 +19,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/gofrs/flock"
 )
 
 const (
@@ -34,21 +39,34 @@ type Totals struct {
 
 // File is the on-disk schema.
 type File struct {
-	Version       int                `json:"version"`
-	FirstSeen     time.Time          `json:"first_seen"`
-	LastUpdated   time.Time          `json:"last_updated"`
-	Totals        Totals             `json:"totals"`
-	PerRepo       map[string]*Totals `json:"per_repo,omitempty"`
+	Version     int                `json:"version"`
+	FirstSeen   time.Time          `json:"first_seen"`
+	LastUpdated time.Time          `json:"last_updated"`
+	Totals      Totals             `json:"totals"`
+	PerRepo     map[string]*Totals `json:"per_repo,omitempty"`
 }
 
 // Store holds the cumulative savings state and flushes to disk periodically.
 // All operations are safe for concurrent use. When path is empty the store
 // still tracks in-memory but never writes to disk.
+//
+// Concurrency model: in-process callers serialize through s.mu. Cross-process
+// safety is achieved on flush by acquiring an advisory flock on a sidecar
+// lock file, re-reading the on-disk totals, merging this process's pending
+// delta, and writing back. A second process that flushed in between just
+// shifts our baseline up; nothing is lost.
 type Store struct {
 	mu      sync.Mutex
 	path    string
 	file    File
-	pending int // observations since last flush
+	delta   Totals             // cumulative this-process contributions since last successful flush
+	perDelta map[string]*Totals // per-repo deltas, same semantics as delta
+	pending int                // observations since last flush
+
+	// stop signals the optional periodic flusher to exit. Nil when no
+	// flusher is running.
+	stopOnce sync.Once
+	stopCh   chan struct{}
 }
 
 // DefaultPath returns the canonical savings.json location under the user's
@@ -67,7 +85,7 @@ func DefaultPath() string {
 // `<path>.corrupt-<ts>` and replaced with a fresh state so a bad write can't
 // permanently break metrics.
 func Open(path string) (*Store, error) {
-	s := &Store{path: path}
+	s := &Store{path: path, perDelta: make(map[string]*Totals)}
 	s.file.Version = schemaVersion
 	s.file.FirstSeen = time.Now().UTC()
 	s.file.PerRepo = make(map[string]*Totals)
@@ -76,25 +94,38 @@ func Open(path string) (*Store, error) {
 		return s, nil
 	}
 
+	loaded, err := readFile(path)
+	if err != nil {
+		return s, err
+	}
+	if loaded != nil {
+		s.file = *loaded
+	}
+	return s, nil
+}
+
+// readFile loads the savings file at path. Returns (nil, nil) when the file
+// doesn't exist or is corrupt (in which case it's renamed to a .corrupt-N
+// sidecar so future opens get a clean slate).
+func readFile(path string) (*File, error) {
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return s, nil
+		return nil, nil
 	}
 	if err != nil {
-		return s, fmt.Errorf("read savings: %w", err)
+		return nil, fmt.Errorf("read savings: %w", err)
 	}
 
 	var loaded File
 	if jerr := json.Unmarshal(data, &loaded); jerr != nil || loaded.Version != schemaVersion {
 		backup := fmt.Sprintf("%s.corrupt-%d", path, time.Now().Unix())
 		_ = os.Rename(path, backup)
-		return s, nil
+		return nil, nil
 	}
 	if loaded.PerRepo == nil {
 		loaded.PerRepo = make(map[string]*Totals)
 	}
-	s.file = loaded
-	return s, nil
+	return &loaded, nil
 }
 
 // AddObservation increments the store by one source-reading tool call. When
@@ -116,6 +147,10 @@ func (s *Store) AddObservation(repoPath string, returned, saved int64) {
 	s.file.Totals.CallsCounted++
 	s.file.LastUpdated = time.Now().UTC()
 
+	s.delta.TokensSaved += saved
+	s.delta.TokensReturned += returned
+	s.delta.CallsCounted++
+
 	if repoPath != "" {
 		t := s.file.PerRepo[repoPath]
 		if t == nil {
@@ -125,6 +160,15 @@ func (s *Store) AddObservation(repoPath string, returned, saved int64) {
 		t.TokensSaved += saved
 		t.TokensReturned += returned
 		t.CallsCounted++
+
+		dt := s.perDelta[repoPath]
+		if dt == nil {
+			dt = &Totals{}
+			s.perDelta[repoPath] = dt
+		}
+		dt.TokensSaved += saved
+		dt.TokensReturned += returned
+		dt.CallsCounted++
 	}
 
 	s.pending++
@@ -162,6 +206,60 @@ func (s *Store) Flush() error {
 	return s.flushLocked()
 }
 
+// Pending reports whether the store has unflushed observations. Lets a
+// background ticker skip the flock+IO when nothing has happened.
+func (s *Store) Pending() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pending > 0
+}
+
+// StartPeriodicFlush kicks off a goroutine that flushes the store every
+// interval if there are pending observations. Returns a stop function the
+// caller should invoke at shutdown to terminate the ticker. Calling
+// StartPeriodicFlush more than once on the same Store is a no-op for the
+// extra calls (returns a no-op stopper).
+//
+// The point of the periodic flusher is to bound on-crash data loss to
+// roughly `interval` worth of observations even when the call rate is too
+// low to trip the every-N-observations flush.
+func (s *Store) StartPeriodicFlush(interval time.Duration) func() {
+	if s == nil || interval <= 0 {
+		return func() {}
+	}
+
+	s.mu.Lock()
+	if s.stopCh != nil {
+		s.mu.Unlock()
+		return func() {}
+	}
+	stop := make(chan struct{})
+	s.stopCh = stop
+	s.mu.Unlock()
+
+	go func() {
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-t.C:
+				if s.Pending() {
+					_ = s.Flush()
+				}
+			}
+		}
+	}()
+
+	return func() {
+		s.stopOnce.Do(func() { close(stop) })
+	}
+}
+
 // Reset wipes all cumulative data and removes the persisted file. Used by
 // `gortex savings --reset`.
 func (s *Store) Reset() error {
@@ -176,6 +274,8 @@ func (s *Store) Reset() error {
 		FirstSeen: time.Now().UTC(),
 		PerRepo:   make(map[string]*Totals),
 	}
+	s.delta = Totals{}
+	s.perDelta = make(map[string]*Totals)
 	s.pending = 0
 
 	if s.path == "" {
@@ -188,6 +288,12 @@ func (s *Store) Reset() error {
 }
 
 // flushLocked must be called with s.mu held.
+//
+// The flush is cross-process safe: an advisory flock on `<path>.lock`
+// serializes with other gortex processes writing the same file. Inside the
+// critical section we re-read the on-disk file, add this process's pending
+// deltas to it, and write back. That way two parallel writers each get
+// their contributions persisted instead of last-flusher-wins.
 func (s *Store) flushLocked() error {
 	if s.path == "" {
 		s.pending = 0
@@ -195,6 +301,52 @@ func (s *Store) flushLocked() error {
 	}
 	if err := os.MkdirAll(filepath.Dir(s.path), 0o755); err != nil {
 		return err
+	}
+
+	lockPath := s.path + ".lock"
+	fl := flock.New(lockPath)
+	if err := fl.Lock(); err != nil {
+		return fmt.Errorf("acquire savings lock: %w", err)
+	}
+	defer func() { _ = fl.Unlock() }()
+
+	// Re-read whatever's on disk now — another process may have flushed
+	// since we last loaded. Merge our deltas onto that baseline.
+	merged, err := readFile(s.path)
+	if err != nil {
+		return err
+	}
+	if merged == nil {
+		// File missing (or was just backed up as corrupt). Start fresh
+		// from our in-memory baseline — s.file already includes both
+		// any value loaded at Open time and everything observed in this
+		// process, so don't re-add the delta on top. Deep-copy PerRepo
+		// so the merged copy doesn't alias s.file's map.
+		fresh := s.file
+		fresh.PerRepo = make(map[string]*Totals, len(s.file.PerRepo))
+		for k, v := range s.file.PerRepo {
+			cp := *v
+			fresh.PerRepo[k] = &cp
+		}
+		merged = &fresh
+	} else {
+		mergeTotals(&merged.Totals, &s.delta)
+		if merged.PerRepo == nil {
+			merged.PerRepo = make(map[string]*Totals)
+		}
+		for repo, dt := range s.perDelta {
+			t := merged.PerRepo[repo]
+			if t == nil {
+				t = &Totals{}
+				merged.PerRepo[repo] = t
+			}
+			mergeTotals(t, dt)
+		}
+		if merged.FirstSeen.IsZero() || s.file.FirstSeen.Before(merged.FirstSeen) {
+			merged.FirstSeen = s.file.FirstSeen
+		}
+		merged.LastUpdated = time.Now().UTC()
+		merged.Version = schemaVersion
 	}
 
 	// Atomic write: temp file in the same dir, then rename.
@@ -206,7 +358,7 @@ func (s *Store) flushLocked() error {
 
 	enc := json.NewEncoder(tmp)
 	enc.SetIndent("", "  ")
-	if err := enc.Encode(s.file); err != nil {
+	if err := enc.Encode(merged); err != nil {
 		_ = tmp.Close()
 		_ = os.Remove(tmpName)
 		return err
@@ -219,6 +371,19 @@ func (s *Store) flushLocked() error {
 		_ = os.Remove(tmpName)
 		return err
 	}
+
+	// Adopt the merged view as our authoritative in-memory state and
+	// clear the delta — anything new arriving after this point will be
+	// what we commit on the next flush.
+	s.file = *merged
+	s.delta = Totals{}
+	s.perDelta = make(map[string]*Totals)
 	s.pending = 0
 	return nil
+}
+
+func mergeTotals(dst, src *Totals) {
+	dst.TokensSaved += src.TokensSaved
+	dst.TokensReturned += src.TokensReturned
+	dst.CallsCounted += src.CallsCounted
 }

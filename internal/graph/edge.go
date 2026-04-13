@@ -16,16 +16,25 @@ const (
 )
 
 type Edge struct {
-	From            string         `json:"from"`
-	To              string         `json:"to"`
-	Kind            EdgeKind       `json:"kind"`
-	FilePath        string         `json:"file_path"`
-	Line            int            `json:"line"`
-	Confidence      float64        `json:"confidence,omitempty"`
-	ConfidenceLabel string         `json:"confidence_label,omitempty"`
-	Origin          string         `json:"origin,omitempty"`
-	CrossRepo       bool           `json:"cross_repo,omitempty"`
-	Meta            map[string]any `json:"meta,omitempty"`
+	From     string   `json:"from"`
+	To       string   `json:"to"`
+	Kind     EdgeKind `json:"kind"`
+	FilePath string   `json:"file_path"`
+	Line     int      `json:"line"`
+	// Confidence is the numeric score (0..1). Kept on the in-memory
+	// struct for internal filtering (min_tier, etc.) but excluded from
+	// JSON — agents act on ConfidenceLabel, and the float adds ~15
+	// chars to every edge in large graph responses.
+	Confidence      float64 `json:"-"`
+	ConfidenceLabel string  `json:"confidence_label,omitempty"`
+	Origin          string  `json:"origin,omitempty"`
+	CrossRepo       bool    `json:"cross_repo,omitempty"`
+	// Meta is intentionally excluded from JSON. It holds internal
+	// instrumentation (semantic_source, provider hints, etc.) that agents
+	// don't consume but that adds measurable bytes to every edge in
+	// responses returning hundreds of call-graph edges. Internal callers
+	// can still read/write the field; external MCP consumers don't see it.
+	Meta map[string]any `json:"-"`
 }
 
 // Edge.Origin values — call-graph confidence tiers, highest → lowest. Use

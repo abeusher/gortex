@@ -7,7 +7,162 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
+
+func TestStartPeriodicFlush_FlushesPendingObservations(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "savings.json")
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stop := s.StartPeriodicFlush(50 * time.Millisecond)
+	defer stop()
+
+	s.AddObservation("/some/repo", 100, 200)
+	if got := s.Snapshot().Totals.CallsCounted; got != 1 {
+		t.Fatalf("CallsCounted before flush = %d, want 1", got)
+	}
+
+	// Wait for the ticker to fire and write to disk.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("expected savings file to exist after periodic flush: %v", err)
+	}
+
+	// Re-open in a fresh store and confirm the observation persisted.
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := s2.Snapshot().Totals.CallsCounted; got != 1 {
+		t.Errorf("re-opened CallsCounted = %d, want 1", got)
+	}
+}
+
+func TestStartPeriodicFlush_StopsCleanly(t *testing.T) {
+	s, err := Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stop := s.StartPeriodicFlush(10 * time.Millisecond)
+	stop()
+	stop() // idempotent — should not panic on double-close
+
+	// Calling StartPeriodicFlush again after stop is currently a no-op
+	// (see comment on StartPeriodicFlush). This test pins that behavior.
+	stop2 := s.StartPeriodicFlush(10 * time.Millisecond)
+	stop2()
+}
+
+func TestFlush_MergesConcurrentProcessDeltas(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "savings.json")
+
+	// Simulate two independent processes writing to the same savings
+	// file. Both Open the empty file (baseline = 0), each adds its own
+	// observations, then both Flush. Without merge-on-flush the second
+	// flusher overwrites the first; with it, both contributions land.
+	a, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	a.AddObservation("/repo-a", 50, 150)
+	a.AddObservation("/repo-a", 50, 150)
+	b.AddObservation("/repo-b", 30, 70)
+
+	if err := a.Flush(); err != nil {
+		t.Fatalf("a.Flush: %v", err)
+	}
+	if err := b.Flush(); err != nil {
+		t.Fatalf("b.Flush: %v", err)
+	}
+
+	// Re-open and verify merged totals = a's contribution + b's.
+	final, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap := final.Snapshot()
+
+	if got, want := snap.Totals.CallsCounted, int64(3); got != want {
+		t.Errorf("merged CallsCounted = %d, want %d", got, want)
+	}
+	if got, want := snap.Totals.TokensSaved, int64(150+150+70); got != want {
+		t.Errorf("merged TokensSaved = %d, want %d", got, want)
+	}
+	if got, want := snap.Totals.TokensReturned, int64(50+50+30); got != want {
+		t.Errorf("merged TokensReturned = %d, want %d", got, want)
+	}
+	if len(snap.PerRepo) != 2 {
+		t.Errorf("merged PerRepo size = %d, want 2", len(snap.PerRepo))
+	}
+	if r := snap.PerRepo["/repo-a"]; r == nil || r.CallsCounted != 2 {
+		t.Errorf("repo-a calls = %v, want 2", r)
+	}
+	if r := snap.PerRepo["/repo-b"]; r == nil || r.CallsCounted != 1 {
+		t.Errorf("repo-b calls = %v, want 1", r)
+	}
+}
+
+func TestFlush_FlockBlocksConcurrentWriters(t *testing.T) {
+	// Verify the flock is actually held: a second goroutine flushing
+	// shouldn't see partial state. We hammer two stores in parallel and
+	// expect the final on-disk total to equal the sum of contributions.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "savings.json")
+
+	const perStore = 200
+	stores := make([]*Store, 4)
+	for i := range stores {
+		s, err := Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stores[i] = s
+	}
+
+	var wg sync.WaitGroup
+	for i, s := range stores {
+		wg.Add(1)
+		go func(s *Store, repo string) {
+			defer wg.Done()
+			for j := 0; j < perStore; j++ {
+				s.AddObservation(repo, 1, 10)
+			}
+			_ = s.Flush()
+		}(s, "/repo-"+string(rune('a'+i)))
+	}
+	wg.Wait()
+
+	final, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap := final.Snapshot()
+	wantCalls := int64(len(stores) * perStore)
+	if got := snap.Totals.CallsCounted; got != wantCalls {
+		t.Errorf("merged CallsCounted = %d, want %d (delta lost across processes)", got, wantCalls)
+	}
+	wantSaved := wantCalls * 10
+	if got := snap.Totals.TokensSaved; got != wantSaved {
+		t.Errorf("merged TokensSaved = %d, want %d", got, wantSaved)
+	}
+}
 
 func TestOpen_MissingFile_ReturnsEmpty(t *testing.T) {
 	dir := t.TempDir()

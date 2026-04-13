@@ -140,6 +140,13 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 	stopSnapshotter := startPeriodicSnapshots(state.graph, version, 10*time.Minute, logger)
 	defer stopSnapshotter()
 
+	// Periodic savings flush — 5 minute interval. Bounds on-crash data
+	// loss for the savings counters even when the call rate is too low
+	// to trip the every-N-observations flush. No-op when persistence
+	// isn't wired (e.g. cache dir unavailable).
+	stopSavingsFlush := state.mcpServer.StartPeriodicSavingsFlush(5 * time.Minute)
+	defer stopSavingsFlush()
+
 	if err := srv.Listen(); err != nil {
 		return err
 	}

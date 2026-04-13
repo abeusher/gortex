@@ -23,11 +23,11 @@ import (
 // surfaced here.
 func (s *Server) handleGetRepoOutline(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	const (
-		topCommunitiesN      = 5
-		topHotspotsN         = 10
-		topMostImportedN     = 10
-		topEntryPointsN      = 10
-		topLanguagesN        = 5
+		topCommunitiesN  = 5
+		topHotspotsN     = 5
+		topMostImportedN = 10
+		topEntryPointsN  = 10
+		topLanguagesN    = 5
 	)
 
 	stats := s.engine.Stats()

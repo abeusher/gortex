@@ -341,16 +341,37 @@ func (s *Server) tokenStatsFor(ctx context.Context) *tokenStats {
 // FlushSavings forces any buffered savings observations to disk. Called on
 // server shutdown to minimize data loss on unclean exits.
 func (s *Server) FlushSavings() error {
-	if s.tokenStats == nil {
+	store := s.savingsStore()
+	if store == nil {
+		return nil
+	}
+	return store.Flush()
+}
+
+// StartPeriodicSavingsFlush starts a background ticker that flushes the
+// savings store every interval if there are pending observations. Returns
+// a stop function for clean shutdown. No-op when persistence isn't wired.
+//
+// This bounds on-crash data loss to roughly `interval` worth of observations
+// even when the call rate is too low to trip the every-N-observations flush.
+func (s *Server) StartPeriodicSavingsFlush(interval time.Duration) func() {
+	store := s.savingsStore()
+	if store == nil {
+		return func() {}
+	}
+	return store.StartPeriodicFlush(interval)
+}
+
+// savingsStore extracts the persistent savings store via tokenStats. Returns
+// nil when persistence isn't initialized.
+func (s *Server) savingsStore() *savings.Store {
+	if s == nil || s.tokenStats == nil {
 		return nil
 	}
 	s.tokenStats.mu.Lock()
 	store := s.tokenStats.persistent
 	s.tokenStats.mu.Unlock()
-	if store == nil {
-		return nil
-	}
-	return store.Flush()
+	return store
 }
 
 // cumulativeSavingsSnapshot exposes the persistent savings state for

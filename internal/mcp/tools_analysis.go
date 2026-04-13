@@ -60,21 +60,25 @@ func (s *Server) handleGetCommunities(_ context.Context, req mcp.CallToolRequest
 		})
 	}
 
+	// List mode deliberately omits per-community `files` (can be hundreds
+	// of paths each). Callers who want that drill into a specific
+	// community via `id`; the detail response includes the full member
+	// set. `file_count` preserves size signal without the string array.
 	type summary struct {
-		ID       string   `json:"id"`
-		Label    string   `json:"label"`
-		Size     int      `json:"size"`
-		Files    []string `json:"files"`
-		Cohesion float64  `json:"cohesion"`
+		ID        string  `json:"id"`
+		Label     string  `json:"label"`
+		Size      int     `json:"size"`
+		FileCount int     `json:"file_count"`
+		Cohesion  float64 `json:"cohesion"`
 	}
 	var summaries []summary
 	for _, c := range comms.Communities {
 		summaries = append(summaries, summary{
-			ID:       c.ID,
-			Label:    c.Label,
-			Size:     c.Size,
-			Files:    c.Files,
-			Cohesion: c.Cohesion,
+			ID:        c.ID,
+			Label:     c.Label,
+			Size:      c.Size,
+			FileCount: len(c.Files),
+			Cohesion:  c.Cohesion,
 		})
 	}
 	return mcp.NewToolResultJSON(map[string]any{

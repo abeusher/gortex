@@ -128,16 +128,16 @@ func TestTokenSavings_GetSymbolSource(t *testing.T) {
 	firstResult := results[0].(map[string]any)
 	symbolID := firstResult["id"].(string)
 
-	// Call get_symbol_source — should include tokens_saved.
+	// Call get_symbol_source. Per-call tokens_saved was dropped from the
+	// response (it bloated every reply with a stat agents don't act on);
+	// the savings are still recorded server-side and surface via graph_stats.
 	result := callTool(t, srv, "get_symbol_source", map[string]any{"id": symbolID})
 	require.False(t, result.IsError)
 	text = result.Content[0].(mcplib.TextContent).Text
 	var resp map[string]any
 	require.NoError(t, json.Unmarshal([]byte(text), &resp))
-	assert.Contains(t, resp, "tokens_saved")
 	assert.Contains(t, resp, "source")
-	// tokens_saved should be >= 0 (for a 1-line function in a small file, could be small)
-	assert.GreaterOrEqual(t, resp["tokens_saved"].(float64), float64(0))
+	assert.NotContains(t, resp, "tokens_saved", "per-call telemetry should not leak into responses")
 
 	// graph_stats should now reflect the session savings.
 	statsResult := callTool(t, srv, "graph_stats", nil)

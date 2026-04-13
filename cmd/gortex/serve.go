@@ -258,6 +258,8 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 	if savingsStore, err := savings.Open(savingsPath); err == nil {
 		srv.InitSavings(savingsStore, serveIndex)
+		stopSavingsFlush := srv.StartPeriodicSavingsFlush(5 * time.Minute)
+		defer stopSavingsFlush()
 		defer func() { _ = srv.FlushSavings() }()
 	} else {
 		fmt.Fprintf(os.Stderr, "[gortex] savings persistence disabled: %v\n", err)
