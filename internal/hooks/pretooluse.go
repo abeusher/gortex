@@ -3,6 +3,7 @@ package hooks
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -189,33 +190,117 @@ func isNarrowRead(toolInput map[string]any) bool {
 	return false
 }
 
-// enrichGrep provides symbol search results for the grep pattern and suggests graph alternatives.
-// Grep is not blocked — it's too useful for non-symbol searches (strings, patterns, config).
-func enrichGrep(toolInput map[string]any, port int) enrichResult {
+// grepProbeTimeout caps the search_symbols probe so hooks never slow Grep.
+const grepProbeTimeout = 200 * time.Millisecond
+
+// grepSymbolHit mirrors daemon.SymbolHit but lives in this package so the
+// probe interface can be swapped for tests without dragging the full
+// daemon-protocol types into hook unit tests.
+type grepSymbolHit struct {
+	Name     string `json:"name"`
+	Kind     string `json:"kind"`
+	FilePath string `json:"file_path"`
+	Line     int    `json:"line"`
+}
+
+// errProbeTimeout is the sentinel returned by the probe when the daemon
+// didn't reply within grepProbeTimeout. Differentiates from "daemon
+// unreachable" / "no hits" so telemetry can record it correctly.
+var errProbeTimeout = errors.New("probe timeout")
+
+// errDaemonUnreachable is returned when the daemon socket can't be dialed
+// (no daemon, wrong path, permissions). Treated as "no signal" — fall
+// through to soft guidance, do not log telemetry.
+var errDaemonUnreachable = errors.New("daemon unreachable")
+
+// grepProbeFn is the function the Grep enrichment uses to query the
+// graph for symbol matches. Defaults to the daemon-socket implementation;
+// tests swap it for a stub.
+type grepProbeFn func(pattern string, timeout time.Duration) ([]grepSymbolHit, error)
+
+// grepProbe is the indirection point. Production reads probeViaDaemon;
+// tests reassign this var via a t.Cleanup-restored helper.
+var grepProbe grepProbeFn = probeViaDaemon
+
+// enrichGrep classifies the Grep pattern and, for symbol-shaped patterns,
+// probes the local daemon's search_symbols endpoint. On ≥1 hit the call is
+// denied with top matches and a bypass hint; on miss/timeout/non-symbol the
+// existing soft guidance is returned so Grep proceeds.
+func enrichGrep(toolInput map[string]any, _ int) enrichResult {
 	pattern, ok := toolInput["pattern"].(string)
-	if !ok || len(pattern) < 3 {
+	if !ok || pattern == "" {
 		return enrichResult{}
 	}
 
-	var guidance strings.Builder
-	guidance.WriteString("[Gortex] PREFER graph tools over Grep:\n")
-	guidance.WriteString("  - To find a symbol by name: use `search_symbols` (BM25 + camelCase-aware)\n")
-	guidance.WriteString("  - To find all references: use `find_usages` (zero false positives)\n")
-	guidance.WriteString("  - To find callers: use `get_callers`\n")
-	guidance.WriteString("  - To find implementations: use `find_implementations`\n")
+	guidance := defaultGrepGuidance()
 
-	resp, err := queryGortex(port, "/api/graph/search?q="+url.QueryEscape(pattern))
-	if err != nil || resp == "" || resp == "[]" || resp == "[]\n" || resp == "null\n" {
-		return enrichResult{context: guidance.String()}
+	if classifyGrepPattern(pattern) != GrepPatternSymbol {
+		if len(pattern) > 2 {
+			logHookDecision("Grep", pattern, DecisionSkippedNonSymbol, 0, 0)
+			return enrichResult{context: guidance}
+		}
+		return enrichResult{}
 	}
 
-	var nodes []any
-	if err := json.Unmarshal([]byte(resp), &nodes); err != nil || len(nodes) == 0 {
-		return enrichResult{context: guidance.String()}
+	start := time.Now()
+	hits, err := grepProbe(pattern, grepProbeTimeout)
+	dur := time.Since(start)
+	switch {
+	case errors.Is(err, errProbeTimeout):
+		logHookDecision("Grep", pattern, DecisionTimedOut, 0, dur)
+		return enrichResult{context: guidance}
+	case errors.Is(err, errDaemonUnreachable):
+		// No daemon = no signal. Don't pollute telemetry with infra noise.
+		return enrichResult{context: guidance}
+	case err != nil:
+		// Other transport/decode failure — treat as miss so we have a record.
+		logHookDecision("Grep", pattern, DecisionProbedMiss, 0, dur)
+		return enrichResult{context: guidance}
 	}
 
-	fmt.Fprintf(&guidance, "\n%d symbols match \"%s\" in the knowledge graph.", len(nodes), pattern)
-	return enrichResult{context: guidance.String()}
+	if len(hits) == 0 {
+		logHookDecision("Grep", pattern, DecisionProbedMiss, 0, dur)
+		return enrichResult{context: guidance}
+	}
+
+	logHookDecision("Grep", pattern, DecisionProbedHit, len(hits), dur)
+	return enrichResult{
+		deny:   true,
+		reason: formatGrepDeny(pattern, hits),
+	}
+}
+
+func defaultGrepGuidance() string {
+	var b strings.Builder
+	b.WriteString("[Gortex] PREFER graph tools over Grep:\n")
+	b.WriteString("  - To find a symbol by name: use `search_symbols` (BM25 + camelCase-aware)\n")
+	b.WriteString("  - To find all references: use `find_usages` (zero false positives)\n")
+	b.WriteString("  - To find callers: use `get_callers`\n")
+	b.WriteString("  - To find implementations: use `find_implementations`\n")
+	return b.String()
+}
+
+func formatGrepDeny(pattern string, hits []grepSymbolHit) string {
+	const maxShown = 5
+	var b strings.Builder
+	fmt.Fprintf(&b, "[Gortex] BLOCKED: \"%s\" matches %d symbol(s) in the knowledge graph. Use `search_symbols` or `find_usages` instead:\n\n", pattern, len(hits))
+	shown := len(hits)
+	if shown > maxShown {
+		shown = maxShown
+	}
+	for i := 0; i < shown; i++ {
+		h := hits[i]
+		kind := h.Kind
+		if kind == "" {
+			kind = "symbol"
+		}
+		fmt.Fprintf(&b, "  %s — %s:%d (%s)\n", h.Name, h.FilePath, h.Line, kind)
+	}
+	if len(hits) > maxShown {
+		fmt.Fprintf(&b, "  ... and %d more\n", len(hits)-maxShown)
+	}
+	b.WriteString("\nTo force text search, add a regex metachar (e.g. \\b) or quote the pattern.")
+	return b.String()
 }
 
 // enrichGlob suggests graph alternatives for file discovery.

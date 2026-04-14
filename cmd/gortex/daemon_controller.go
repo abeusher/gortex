@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -239,6 +240,52 @@ func (c *realController) Status(_ context.Context) (daemon.StatusResponse, error
 		Ready:         c.ready.Load(),
 		WarmupSeconds: c.warmupSeconds.Load(),
 	}, nil
+}
+
+// SearchSymbols runs a substring match over node names and returns the
+// matching symbols. It's the cheap probe path for clients (notably the
+// Grep-redirect hook) that need a fast yes/no without setting up a full
+// MCP session. File and Import nodes are excluded — the hook only cares
+// about real symbol matches.
+func (c *realController) SearchSymbols(_ context.Context, p daemon.SearchSymbolsParams) (daemon.SearchSymbolsResult, error) {
+	c.mu.Lock()
+	g := c.graph
+	c.mu.Unlock()
+
+	if g == nil || p.Query == "" {
+		return daemon.SearchSymbolsResult{}, nil
+	}
+
+	limit := p.Limit
+	if limit <= 0 || limit > 50 {
+		limit = 20
+	}
+	needle := strings.ToLower(p.Query)
+	hits := make([]daemon.SymbolHit, 0, limit)
+	for _, n := range g.AllNodes() {
+		if n == nil {
+			continue
+		}
+		if n.Kind == graph.KindFile || n.Kind == graph.KindImport {
+			continue
+		}
+		if p.Repo != "" && n.RepoPrefix != p.Repo {
+			continue
+		}
+		if !strings.Contains(strings.ToLower(n.Name), needle) {
+			continue
+		}
+		hits = append(hits, daemon.SymbolHit{
+			Name:     n.Name,
+			Kind:     string(n.Kind),
+			FilePath: n.FilePath,
+			Line:     n.StartLine,
+		})
+		if len(hits) >= limit {
+			break
+		}
+	}
+	return daemon.SearchSymbolsResult{Hits: hits}, nil
 }
 
 // AttachWatcher is called by warmup to hand over the MultiWatcher once

@@ -30,6 +30,9 @@ type fakeController struct {
 	statusCalls   int
 	shutdownCalls int
 	shutdownErr   error
+	searchCalls   []SearchSymbolsParams
+	searchHits    []SymbolHit
+	searchErr     error
 }
 
 func (f *fakeController) Track(_ context.Context, p TrackParams) (json.RawMessage, error) {
@@ -69,6 +72,16 @@ func (f *fakeController) Shutdown(_ context.Context) error {
 	defer f.mu.Unlock()
 	f.shutdownCalls++
 	return f.shutdownErr
+}
+
+func (f *fakeController) SearchSymbols(_ context.Context, p SearchSymbolsParams) (SearchSymbolsResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.searchCalls = append(f.searchCalls, p)
+	if f.searchErr != nil {
+		return SearchSymbolsResult{}, f.searchErr
+	}
+	return SearchSymbolsResult{Hits: f.searchHits}, nil
 }
 
 // newDaemon spins up a Server on a short socket path + Fake controller.

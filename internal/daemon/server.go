@@ -77,6 +77,10 @@ type Controller interface {
 	Untrack(ctx context.Context, params UntrackParams) (json.RawMessage, error)
 	Reload(ctx context.Context) (json.RawMessage, error)
 	Status(ctx context.Context) (StatusResponse, error)
+	// SearchSymbols is the cheap probe path used by external clients
+	// (Claude Code's Grep-redirect hook) that need a single short answer
+	// without setting up a full MCP session.
+	SearchSymbols(ctx context.Context, params SearchSymbolsParams) (SearchSymbolsResult, error)
 	// Shutdown is invoked via the control surface and should return
 	// quickly; the daemon's actual shutdown work happens after the
 	// response is written.
@@ -387,6 +391,21 @@ func (s *Server) handleControl(_ *Session, req ControlRequest) ControlResponse {
 		st.SocketPath = s.SocketPath
 		st.Sessions = s.sessions.Count()
 		buf, _ := json.Marshal(st)
+		return ControlResponse{OK: true, Result: buf}
+
+	case ControlSearchSymbols:
+		var p SearchSymbolsParams
+		if err := unmarshalParams(req.Params, &p); err != nil {
+			return controlErr(ErrInternal, err.Error())
+		}
+		result, err := s.Controller.SearchSymbols(ctx, p)
+		if err != nil {
+			return controlErr(ErrInternal, err.Error())
+		}
+		buf, err := json.Marshal(result)
+		if err != nil {
+			return controlErr(ErrInternal, "marshal search result: "+err.Error())
+		}
 		return ControlResponse{OK: true, Result: buf}
 
 	case ControlShutdown:

@@ -86,11 +86,12 @@ type ControlResponse struct {
 
 // Control operation kinds. One constant per kind so callers can't typo.
 const (
-	ControlTrack    = "track"
-	ControlUntrack  = "untrack"
-	ControlReload   = "reload"
-	ControlStatus   = "status"
-	ControlShutdown = "shutdown"
+	ControlTrack         = "track"
+	ControlUntrack       = "untrack"
+	ControlReload        = "reload"
+	ControlStatus        = "status"
+	ControlShutdown      = "shutdown"
+	ControlSearchSymbols = "search_symbols"
 )
 
 // TrackParams is the payload for ControlTrack.
@@ -122,6 +123,30 @@ type StatusResponse struct {
 	// return partial results until warmup completes.
 	Ready          bool  `json:"ready"`
 	WarmupSeconds  int64 `json:"warmup_seconds"`
+}
+
+// SearchSymbolsParams is the payload for ControlSearchSymbols.
+// Repo (optional) limits results to one repo prefix; Limit caps the result
+// count (zero defaults to a small built-in cap so unbounded calls can't
+// stall the hook).
+type SearchSymbolsParams struct {
+	Query string `json:"query"`
+	Limit int    `json:"limit,omitempty"`
+	Repo  string `json:"repo,omitempty"`
+}
+
+// SymbolHit is one entry in SearchSymbolsResult.Hits.
+type SymbolHit struct {
+	Name     string `json:"name"`
+	Kind     string `json:"kind,omitempty"`
+	FilePath string `json:"file_path"`
+	Line     int    `json:"line,omitempty"`
+}
+
+// SearchSymbolsResult is the payload returned under Result for a
+// successful ControlSearchSymbols call.
+type SearchSymbolsResult struct {
+	Hits []SymbolHit `json:"hits"`
 }
 
 // TrackedRepoStatus is one row in StatusResponse.TrackedRepos.
