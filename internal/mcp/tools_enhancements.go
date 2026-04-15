@@ -1480,7 +1480,8 @@ func (s *Server) handleContracts(ctx context.Context, req mcp.CallToolRequest) (
 // ---------------------------------------------------------------------------
 
 func (s *Server) handleGetContracts(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	if s.contractRegistry == nil {
+	registry := s.effectiveContractRegistry()
+	if registry == nil {
 		return mcp.NewToolResultError("no contract registry available — index a repository first"), nil
 	}
 
@@ -1490,9 +1491,9 @@ func (s *Server) handleGetContracts(_ context.Context, req mcp.CallToolRequest) 
 
 	var all []contracts.Contract
 	if repo != "" {
-		all = s.contractRegistry.ByRepo(repo)
+		all = registry.ByRepo(repo)
 	} else {
-		all = s.contractRegistry.All()
+		all = registry.All()
 	}
 
 	// Apply filters.
@@ -1562,17 +1563,18 @@ func (s *Server) handleGetContracts(_ context.Context, req mcp.CallToolRequest) 
 // ---------------------------------------------------------------------------
 
 func (s *Server) handleCheckContracts(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	if s.contractRegistry == nil {
+	registry := s.effectiveContractRegistry()
+	if registry == nil {
 		return mcp.NewToolResultError("no contract registry available — index a repository first"), nil
 	}
 
 	repo := req.GetString("repo", "")
 
 	// If repo is specified, build a filtered registry for matching.
-	reg := s.contractRegistry
+	reg := registry
 	if repo != "" {
 		reg = contracts.NewRegistry()
-		for _, c := range s.contractRegistry.ByRepo(repo) {
+		for _, c := range registry.ByRepo(repo) {
 			reg.Add(c)
 		}
 	}

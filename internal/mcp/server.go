@@ -494,9 +494,30 @@ func (s *Server) MCPServer() *server.MCPServer {
 	return s.mcpServer
 }
 
-// SetContractRegistry sets the contract registry for the MCP server.
+// SetContractRegistry sets an explicit contract registry override for the MCP
+// server. Used by single-indexer callers and tests. In multi-repo mode the
+// server prefers a freshly-merged registry from MultiIndexer (see
+// effectiveContractRegistry) so that repos tracked or re-indexed at runtime
+// are visible immediately.
 func (s *Server) SetContractRegistry(r *contracts.Registry) {
 	s.contractRegistry = r
+}
+
+// effectiveContractRegistry resolves the current contract registry. It prefers
+// a live view over any snapshot: in multi-repo mode it re-merges per-repo
+// registries on every call so that track_repository / index_repository at
+// runtime take effect without a restart. Falls back to the single indexer,
+// then to the explicit override.
+func (s *Server) effectiveContractRegistry() *contracts.Registry {
+	if s.multiIndexer != nil {
+		return s.multiIndexer.MergedContractRegistry()
+	}
+	if s.indexer != nil {
+		if cr := s.indexer.ContractRegistry(); cr != nil {
+			return cr
+		}
+	}
+	return s.contractRegistry
 }
 
 // SetSemanticManager sets the semantic enrichment manager for the MCP server.
