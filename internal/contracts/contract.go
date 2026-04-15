@@ -45,12 +45,27 @@ type Contract struct {
 // paramPatterns matches common path parameter styles and normalises them to {param}.
 var paramPatterns = regexp.MustCompile(`:(\w+)|<(\w+(?::\w+)?)>|\{(\w+)\}`)
 
+// tplBasePrefix matches a leading JS/TS template-literal placeholder
+// optionally preceded by "/" — e.g. ${API_URL}, /${TUCK_API_URL},
+// ${process.env.HOST} — that a consumer glues onto the front of an
+// endpoint path to produce the full URL. Stripping it lets consumer
+// contracts match providers' canonical "/v1/..." paths.
+var tplBasePrefix = regexp.MustCompile(`^/?\$\{[^}]+\}`)
+
+// tplInlineParam matches any remaining ${name} placeholders in path
+// segments (e.g. /users/${id}/tags). Those are path parameters and
+// become {name} so they match provider routes like /users/{id}/tags.
+var tplInlineParam = regexp.MustCompile(`\$\{([^}]+)\}`)
+
 // NormalizeHTTPPath converts path parameters from various frameworks into the
 // canonical {param} form.  Examples:
 //
-//	/users/:id        -> /users/{id}
-//	/users/<int:id>   -> /users/{id}
-//	/users/{id}       -> /users/{id}  (no change)
+//	/users/:id             -> /users/{id}
+//	/users/<int:id>        -> /users/{id}
+//	/users/{id}            -> /users/{id}  (no change)
+//	${API_URL}/users       -> /users
+//	/${TUCK_API_URL}/users -> /users
+//	/users/${id}           -> /users/{id}
 func NormalizeHTTPPath(path string) string {
 	// Strip leading/trailing whitespace and quotes.
 	path = strings.Trim(path, " \t\"'`")
@@ -68,6 +83,16 @@ func NormalizeHTTPPath(path string) string {
 			path = "/"
 		}
 	}
+
+	// Strip a leading template-literal placeholder (with optional leading
+	// slash) — the base-URL slot that a consumer interpolates. After this
+	// the path is the same shape as the provider's route declaration.
+	path = tplBasePrefix.ReplaceAllString(path, "")
+
+	// Any remaining ${name} placeholders are inline path parameters.
+	// Replace with {name} so they collapse to the canonical param form
+	// the regular parameter normaliser understands.
+	path = tplInlineParam.ReplaceAllString(path, "{$1}")
 
 	// Normalise parameter placeholders.
 	path = paramPatterns.ReplaceAllStringFunc(path, func(m string) string {

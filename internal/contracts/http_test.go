@@ -328,22 +328,38 @@ def call_service():
 
 func TestNormalizeHTTPPath(t *testing.T) {
 	tests := []struct {
+		name     string
 		input    string
 		expected string
 	}{
-		{"/users/:id", "/users/{id}"},
-		{"/users/<int:id>", "/users/{id}"},
-		{"/users/{id}", "/users/{id}"},
-		{`"/api/v1/items/"`, "/api/v1/items"},
-		{"api/users", "/api/users"},
-		{"/", "/"},
+		{"gin-style param", "/users/:id", "/users/{id}"},
+		{"typed angle param", "/users/<int:id>", "/users/{id}"},
+		{"canonical brace param", "/users/{id}", "/users/{id}"},
+		{"trailing slash + quotes", `"/api/v1/items/"`, "/api/v1/items"},
+		{"missing leading slash", "api/users", "/api/users"},
+		{"root", "/", "/"},
+
+		// T1.2: scheme+authority stripping.
+		{"http scheme", "http://api.example.com/v1/users", "/v1/users"},
+		{"https scheme with port", "https://api.example.com:443/v1/users", "/v1/users"},
+		{"scheme only", "http://api.example.com", "/"},
+
+		// T1.1: JS/TS template-literal base-URL stripping.
+		{"leading tpl placeholder", "${API_URL}/v1/tucks", "/v1/tucks"},
+		{"leading slash then placeholder", "/${TUCK_API_URL}/v1/tucks", "/v1/tucks"},
+		{"dotted placeholder", "${process.env.API_URL}/v1/users", "/v1/users"},
+		{"inline placeholder becomes param", "/v1/users/${id}", "/v1/users/{id}"},
+		{"base + inline param", "${BASE}/v1/users/${id}/tags", "/v1/users/{id}/tags"},
+		{"tpl inside host", "https://${HOST}/v1/users", "/v1/users"},
 	}
 
 	for _, tt := range tests {
-		got := NormalizeHTTPPath(tt.input)
-		if got != tt.expected {
-			t.Errorf("NormalizeHTTPPath(%q) = %q, want %q", tt.input, got, tt.expected)
-		}
+		t.Run(tt.name, func(t *testing.T) {
+			got := NormalizeHTTPPath(tt.input)
+			if got != tt.expected {
+				t.Errorf("NormalizeHTTPPath(%q) = %q, want %q", tt.input, got, tt.expected)
+			}
+		})
 	}
 }
 
