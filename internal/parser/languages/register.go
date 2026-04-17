@@ -37,4 +37,12 @@ func RegisterAll(reg *parser.Registry) {
 	reg.Register(NewClojureExtractor())
 	reg.Register(NewErlangExtractor())
 	reg.Register(NewRExtractor())
+	reg.Register(NewVerseExtractor())
+	reg.Register(NewALExtractor())
+	reg.Register(NewAutoHotkeyExtractor())
+	reg.Register(NewAssemblyExtractor())
+	reg.Register(NewGDScriptExtractor())
+	reg.Register(NewNixExtractor())
+	reg.Register(NewFortranExtractor())
+	reg.Register(NewSolidityExtractor())
 }
