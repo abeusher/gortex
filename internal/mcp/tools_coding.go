@@ -50,6 +50,7 @@ func (s *Server) registerCodingTools() {
 			mcp.WithString("id", mcp.Required(), mcp.Description("Symbol node ID (e.g. pkg/server.go::HandleRequest)")),
 			mcp.WithNumber("context_lines", mcp.Description("Extra lines above/below the symbol (default: 3)")),
 			mcp.WithString("if_none_match", mcp.Description("ETag from a previous response — returns not_modified if content unchanged")),
+			mcp.WithString("format", mcp.Description("Output format: json (default) or gcx (GCX1 compact wire format)")),
 		),
 		s.handleGetSymbolSource,
 	)
@@ -61,6 +62,7 @@ func (s *Server) registerCodingTools() {
 			mcp.WithBoolean("include_source", mcp.Description("Include source code for each symbol (default: false)")),
 			mcp.WithNumber("context_lines", mcp.Description("Extra lines above/below source (default: 3, only if include_source)")),
 			mcp.WithString("if_none_match", mcp.Description("ETag from a previous response — returns not_modified if content unchanged")),
+			mcp.WithString("format", mcp.Description("Output format: json (default) or gcx (GCX1 compact wire format)")),
 		),
 		s.handleBatchSymbols,
 	)
@@ -264,6 +266,9 @@ func (s *Server) handleGetEditingContext(ctx context.Context, req mcp.CallToolRe
 		"calls":     out.Calls,
 		"etag":      etag,
 	}
+	if isGCX(req) {
+		return gcxResponse(encodeGeneric("get_editing_context", result))
+	}
 	return mcp.NewToolResultJSON(result)
 }
 
@@ -426,6 +431,10 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 	}
 	result["etag"] = etag
 
+	if isGCX(req) {
+		return gcxResponse(encodeGetSymbolSource(node, source, startLine, etag))
+	}
+
 	return mcp.NewToolResultJSON(result)
 }
 
@@ -561,6 +570,10 @@ func (s *Server) handleBatchSymbols(ctx context.Context, req mcp.CallToolRequest
 		return notModifiedResult(etag), nil
 	}
 	batchResult["etag"] = etag
+
+	if isGCX(req) {
+		return gcxResponse(encodeBatchSymbols(results, includeSource))
+	}
 
 	return mcp.NewToolResultJSON(batchResult)
 }
@@ -1269,6 +1282,9 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 	}
 	result["files_to_edit"] = filesToEdit
 
+	if isGCX(req) {
+		return gcxResponse(encodeGeneric("smart_context", result))
+	}
 	return mcp.NewToolResultJSON(result)
 }
 

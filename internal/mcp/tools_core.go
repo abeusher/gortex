@@ -90,15 +90,30 @@ func nodesToTOONRows(nodes []*graph.Node) []toonNodeRow {
 	return rows
 }
 
-// returnSubGraph returns a SubGraph in the requested format (JSON, compact, or TOON).
+// returnSubGraph returns a SubGraph in the requested format (JSON, compact, GCX, or TOON).
 func returnSubGraph(req mcp.CallToolRequest, sg *query.SubGraph) (*mcp.CallToolResult, error) {
 	if isCompact(req) {
 		return mcp.NewToolResultText(compactSubGraph(sg)), nil
+	}
+	if isGCX(req) {
+		tool := requestToolName(req)
+		if tool == "" {
+			tool = "subgraph"
+		}
+		return gcxResponse(encodeSubGraph(tool, sg))
 	}
 	if isTOON(req) {
 		return subGraphToTOON(sg)
 	}
 	return mcp.NewToolResultJSON(sg)
+}
+
+// requestToolName extracts the MCP tool name from a CallToolRequest.
+// mcp-go surfaces the name on req.Params.Name so we can route multiple
+// subgraph-returning tools through the same encoder with distinct
+// header tags.
+func requestToolName(req mcp.CallToolRequest) string {
+	return req.Params.Name
 }
 
 // subGraphToTOON converts a SubGraph to a TOON-encoded text result.
@@ -331,7 +346,7 @@ func (s *Server) registerCoreTools() {
 			mcp.WithString("query", mcp.Required(), mcp.Description("Search query — can be symbol name, concept, or multiple keywords")),
 			mcp.WithNumber("limit", mcp.Description("Max results (default: 20)")),
 			mcp.WithBoolean("compact", mcp.Description("Return one-line-per-result text instead of JSON objects (saves 50-70% tokens)")),
-			mcp.WithString("format", mcp.Description("Output format: json (default) or toon (TOON tabular format, ~40% fewer tokens)")),
+			mcp.WithString("format", mcp.Description("Output format: json (default), gcx (GCX1 compact wire format — round-trippable, ~40% fewer tokens), or toon")),
 			mcp.WithString("repo", mcp.Description("Filter results to a specific repository prefix")),
 			mcp.WithString("project", mcp.Description("Filter results to repositories in a specific project")),
 			mcp.WithString("ref", mcp.Description("Filter results to repositories with a specific reference tag")),
@@ -359,7 +374,7 @@ func (s *Server) registerCoreTools() {
 			mcp.WithNumber("depth", mcp.Description("Traversal depth (default: 2)")),
 			mcp.WithNumber("limit", mcp.Description("Max nodes (default: 50)")),
 			mcp.WithBoolean("compact", mcp.Description("One-line-per-symbol text output (saves 50-70% tokens)")),
-			mcp.WithString("format", mcp.Description("Output format: json (default) or toon")),
+			mcp.WithString("format", mcp.Description("Output format: json (default), gcx (GCX1 compact wire format), or toon")),
 			mcp.WithString("min_tier", mcp.Description(minTierParamDescription)),
 		),
 		s.handleGetDependencies,
@@ -372,7 +387,7 @@ func (s *Server) registerCoreTools() {
 			mcp.WithNumber("depth", mcp.Description("Traversal depth (default: 3)")),
 			mcp.WithNumber("limit", mcp.Description("Max nodes (default: 50)")),
 			mcp.WithBoolean("compact", mcp.Description("One-line-per-symbol text output (saves 50-70% tokens)")),
-			mcp.WithString("format", mcp.Description("Output format: json (default) or toon")),
+			mcp.WithString("format", mcp.Description("Output format: json (default), gcx (GCX1 compact wire format), or toon")),
 			mcp.WithString("min_tier", mcp.Description(minTierParamDescription)),
 		),
 		s.handleGetDependents,
@@ -385,7 +400,7 @@ func (s *Server) registerCoreTools() {
 			mcp.WithNumber("depth", mcp.Description("Traversal depth (default: 4)")),
 			mcp.WithNumber("limit", mcp.Description("Max nodes (default: 50)")),
 			mcp.WithBoolean("compact", mcp.Description("One-line-per-symbol text output (saves 50-70% tokens)")),
-			mcp.WithString("format", mcp.Description("Output format: json (default) or toon")),
+			mcp.WithString("format", mcp.Description("Output format: json (default), gcx (GCX1 compact wire format), or toon")),
 			mcp.WithString("repo", mcp.Description("Filter results to a specific repository prefix")),
 			mcp.WithString("project", mcp.Description("Filter results to repositories in a specific project")),
 			mcp.WithString("ref", mcp.Description("Filter results to repositories with a specific reference tag")),
@@ -401,7 +416,7 @@ func (s *Server) registerCoreTools() {
 			mcp.WithNumber("depth", mcp.Description("Traversal depth (default: 2)")),
 			mcp.WithNumber("limit", mcp.Description("Max nodes (default: 50)")),
 			mcp.WithBoolean("compact", mcp.Description("One-line-per-symbol text output (saves 50-70% tokens)")),
-			mcp.WithString("format", mcp.Description("Output format: json (default) or toon")),
+			mcp.WithString("format", mcp.Description("Output format: json (default), gcx (GCX1 compact wire format), or toon")),
 			mcp.WithString("min_tier", mcp.Description(minTierParamDescription)),
 		),
 		s.handleGetCallers,
@@ -411,7 +426,7 @@ func (s *Server) registerCoreTools() {
 		mcp.NewTool("find_implementations",
 			mcp.WithDescription("Finds all concrete types that implement an interface. Use before changing an interface to identify all types that will be affected."),
 			mcp.WithString("id", mcp.Required(), mcp.Description("Interface node ID")),
-			mcp.WithString("format", mcp.Description("Output format: json (default) or toon")),
+			mcp.WithString("format", mcp.Description("Output format: json (default), gcx (GCX1 compact wire format), or toon")),
 			mcp.WithString("min_tier", mcp.Description(minTierParamDescription)),
 		),
 		s.handleFindImplementations,
@@ -423,7 +438,7 @@ func (s *Server) registerCoreTools() {
 			mcp.WithString("id", mcp.Required(), mcp.Description("Node ID")),
 			mcp.WithNumber("limit", mcp.Description("Max nodes (default: 50)")),
 			mcp.WithBoolean("compact", mcp.Description("One-line-per-symbol text output (saves 50-70% tokens)")),
-			mcp.WithString("format", mcp.Description("Output format: json (default) or toon")),
+			mcp.WithString("format", mcp.Description("Output format: json (default), gcx (GCX1 compact wire format), or toon")),
 			mcp.WithString("repo", mcp.Description("Filter results to a specific repository prefix")),
 			mcp.WithString("project", mcp.Description("Filter results to repositories in a specific project")),
 			mcp.WithString("ref", mcp.Description("Filter results to repositories with a specific reference tag")),
@@ -439,7 +454,7 @@ func (s *Server) registerCoreTools() {
 			mcp.WithNumber("radius", mcp.Description("Bidirectional hops (default: 2)")),
 			mcp.WithNumber("limit", mcp.Description("Max nodes (default: 50)")),
 			mcp.WithBoolean("compact", mcp.Description("One-line-per-symbol text output (saves 50-70% tokens)")),
-			mcp.WithString("format", mcp.Description("Output format: json (default) or toon")),
+			mcp.WithString("format", mcp.Description("Output format: json (default), gcx (GCX1 compact wire format), or toon")),
 		),
 		s.handleGetCluster,
 	)
@@ -561,6 +576,11 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	}
 
 	total := len(nodes)
+
+	if isGCX(req) {
+		return gcxResponse(encodeSearchSymbols(nodes, total, limit))
+	}
+
 	if len(nodes) > limit {
 		nodes = nodes[:limit]
 	}
@@ -620,6 +640,10 @@ func (s *Server) handleGetFileSummary(_ context.Context, req mcp.CallToolRequest
 	etag := computeETag(sg)
 	if ifNoneMatch := req.GetString("if_none_match", ""); ifNoneMatch != "" && ifNoneMatch == etag {
 		return notModifiedResult(etag), nil
+	}
+
+	if isGCX(req) {
+		return gcxResponse(encodeFileSummary(sg, etag))
 	}
 
 	// Wrap with etag in response.
@@ -760,6 +784,9 @@ func (s *Server) handleFindUsages(_ context.Context, req mcp.CallToolRequest) (*
 	sg = filterSubGraph(sg, allowed)
 	sg.FilterByMinTier(minTier)
 	enrichSubGraphEdges(sg)
+	if isGCX(req) {
+		return gcxResponse(encodeFindUsages(sg))
+	}
 	return returnSubGraph(req, sg)
 }
 

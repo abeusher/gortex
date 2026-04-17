@@ -1552,10 +1552,14 @@ func (s *Server) handleGetContracts(_ context.Context, req mcp.CallToolRequest) 
 		byRepo[repo].Total++
 	}
 
-	return mcp.NewToolResultJSON(map[string]any{
+	payload := map[string]any{
 		"by_repo": byRepo,
 		"total":   len(filtered),
-	})
+	}
+	if isGCX(req) {
+		return gcxResponse(encodeGeneric("contracts.list", payload))
+	}
+	return mcp.NewToolResultJSON(payload)
 }
 
 // ---------------------------------------------------------------------------
@@ -1622,7 +1626,7 @@ func (s *Server) handleCheckContracts(_ context.Context, req mcp.CallToolRequest
 		return mcp.NewToolResultText(b.String()), nil
 	}
 
-	return mcp.NewToolResultJSON(map[string]any{
+	payload := map[string]any{
 		"matched":          result.Matched,
 		"orphan_providers": result.OrphanProviders,
 		"orphan_consumers": result.OrphanConsumers,
@@ -1631,7 +1635,11 @@ func (s *Server) handleCheckContracts(_ context.Context, req mcp.CallToolRequest
 			"orphan_providers": len(result.OrphanProviders),
 			"orphan_consumers": len(result.OrphanConsumers),
 		},
-	})
+	}
+	if isGCX(req) {
+		return gcxResponse(encodeGeneric("contracts.check", payload))
+	}
+	return mcp.NewToolResultJSON(payload)
 }
 
 // ---------------------------------------------------------------------------
