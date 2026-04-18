@@ -21,7 +21,9 @@ func NewDockerfileExtractor() *DockerfileExtractor {
 }
 
 func (e *DockerfileExtractor) Language() string     { return "dockerfile" }
-func (e *DockerfileExtractor) Extensions() []string { return []string{".dockerfile"} }
+func (e *DockerfileExtractor) Extensions() []string {
+	return []string{".dockerfile", "Dockerfile", "Containerfile"}
+}
 
 func (e *DockerfileExtractor) Extract(filePath string, src []byte) (*parser.ExtractionResult, error) {
 	tree, err := parser.ParseFile(src, e.lang)

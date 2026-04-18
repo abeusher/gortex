@@ -60,4 +60,53 @@ func RegisterAll(reg *parser.Registry) {
 	reg.Register(NewVimExtractor())
 	reg.Register(NewEmacsLispExtractor())
 	reg.Register(NewRacketExtractor())
+
+	// Template engines
+	reg.Register(NewBladeExtractor())
+	reg.Register(NewEJSExtractor())
+	reg.Register(NewHandlebarsExtractor())
+	reg.Register(NewJinjaExtractor())
+	reg.Register(NewTwigExtractor())
+	reg.Register(NewERBExtractor())
+	reg.Register(NewLiquidExtractor())
+	reg.Register(NewPugExtractor())
+
+	// Build / shell
+	reg.Register(NewMakefileExtractor())
+	reg.Register(NewCMakeExtractor())
+	reg.Register(NewBatchExtractor())
+
+	// Blockchain / smart-contract
+	reg.Register(NewMoveExtractor())
+	reg.Register(NewCairoExtractor())
+	reg.Register(NewNoirExtractor())
+	reg.Register(NewTactExtractor())
+	reg.Register(NewBallerinaExtractor())
+
+	// Scientific / enterprise
+	reg.Register(NewApexExtractor())
+	reg.Register(NewABAPExtractor())
+	reg.Register(NewMatlabExtractor())
+	reg.Register(NewMathematicaExtractor())
+	reg.Register(NewSASExtractor())
+	reg.Register(NewStataExtractor())
+
+	// Emerging
+	reg.Register(NewMojoExtractor())
+	reg.Register(NewOdinExtractor())
+	reg.Register(NewVlangExtractor())
+	reg.Register(NewHareExtractor())
+	reg.Register(NewCarbonExtractor())
+	reg.Register(NewReScriptExtractor())
+	reg.Register(NewGleamExtractor())
+
+	// Legacy / JVM / data
+	reg.Register(NewCoffeeScriptExtractor())
+	reg.Register(NewActionScriptExtractor())
+	reg.Register(NewDExtractor())
+	reg.Register(NewValaExtractor())
+	reg.Register(NewGroovyExtractor())
+	reg.Register(NewJSONExtractor())
+	// ObjC registered last so it wins the `.m` extension over Matlab.
+	reg.Register(NewObjCExtractor())
 }
