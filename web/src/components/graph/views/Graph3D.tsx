@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from 'react'
 import type { Repo } from '@/lib/schema'
+import type { GraphData } from '@/lib/types'
 import { ThreeDSkyline } from './Skyline'
 import { ThreeDStrata } from './Strata'
 import { ThreeDOrbital } from './Orbital'
@@ -19,7 +20,13 @@ const MODES: { id: ThreeDMode; label: string; hint: string }[] = [
   { id: 'city',     label: 'City',     hint: 'Buildings = symbols · skybridges = contracts' },
 ]
 
-export function Graph3D({ repos }: { repos: Repo[] }) {
+export function Graph3D({
+  graph, repos, filterRepos,
+}: {
+  graph: GraphData | null
+  repos: Repo[]
+  filterRepos: Set<string>
+}) {
   const [sub, setSub] = useState<ThreeDMode>('skyline')
 
   useEffect(() => {
@@ -53,11 +60,11 @@ export function Graph3D({ repos }: { repos: Repo[] }) {
         <div className="threeD-picker-hint">{mode.hint}</div>
       </div>
       <div style={{ width: '100%', height: '100%' }}>
-        {sub === 'skyline'  && <ThreeDSkyline  repos={repos} />}
-        {sub === 'strata'   && <ThreeDStrata   repos={repos} />}
-        {sub === 'orbital'  && <ThreeDOrbital  repos={repos} />}
-        {sub === 'galaxies' && <ThreeDGalaxies repos={repos} />}
-        {sub === 'city'     && <ThreeDCity     repos={repos} />}
+        {sub === 'skyline'  && <ThreeDSkyline  graph={graph} repos={repos} filterRepos={filterRepos} />}
+        {sub === 'strata'   && <ThreeDStrata   graph={graph} repos={repos} filterRepos={filterRepos} />}
+        {sub === 'orbital'  && <ThreeDOrbital  graph={graph} repos={repos} filterRepos={filterRepos} />}
+        {sub === 'galaxies' && <ThreeDGalaxies graph={graph} repos={repos} filterRepos={filterRepos} />}
+        {sub === 'city'     && <ThreeDCity     graph={graph} repos={repos} filterRepos={filterRepos} />}
       </div>
     </div>
   )

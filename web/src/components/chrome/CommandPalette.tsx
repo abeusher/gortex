@@ -5,8 +5,7 @@ import { useRouter } from 'next/navigation'
 import { Icon } from '@/components/primitives/Icon'
 import { useCmdK } from '@/lib/cmdk'
 import { useInspector } from '@/lib/inspector'
-import { useSymbolSearch } from '@/lib/hooks'
-import { RECENT_SEARCHES } from '@/lib/seed'
+import { useSymbolSearch, useRecentSearches } from '@/lib/hooks'
 
 const JUMPS = [
   { k: 'Dashboard',     sub: 'control room',          meta: 'G D', href: '/' },
@@ -23,6 +22,7 @@ export function CommandPalette() {
   const [q, setQ] = useState('')
   const [idx, setIdx] = useState(0)
   const { data: results, loading } = useSymbolSearch(q, 12)
+  const { recents, push: pushRecent } = useRecentSearches()
 
   useEffect(() => {
     function h(e: KeyboardEvent) {
@@ -87,20 +87,23 @@ export function CommandPalette() {
                 <span className="meta">{r.meta}</span>
               </div>
             ))}
-            {/* Recent searches are still seeded — see lib/seed.ts header. */}
-            <div className="sec-ti">Recent</div>
-            {RECENT_SEARCHES.map((r, i) => (
-              <div key={i} className="cmd-row" onClick={() => setQ(r.q)}>
-                <Icon name="history" size={12} />
-                <div>
-                  <div className="k mono">{r.q}</div>
-                  <div className="sub">
-                    {r.kind} · {r.hits} hits
+            {recents.length > 0 && (
+              <>
+                <div className="sec-ti">Recent</div>
+                {recents.map((r, i) => (
+                  <div key={i} className="cmd-row" onClick={() => setQ(r.q)}>
+                    <Icon name="history" size={12} />
+                    <div>
+                      <div className="k mono">{r.q}</div>
+                      <div className="sub">
+                        {r.kind} · {r.hits} hits
+                      </div>
+                    </div>
+                    <span className="meta">↵</span>
                   </div>
-                </div>
-                <span className="meta">↵</span>
-              </div>
-            ))}
+                ))}
+              </>
+            )}
           </div>
         )}
         {q && (
@@ -125,6 +128,7 @@ export function CommandPalette() {
                     community: '',
                     caveats: [],
                   })
+                  pushRecent({ q, kind: s.kind, hits: results?.length ?? 0 })
                   setOpen(false)
                 }}
               >

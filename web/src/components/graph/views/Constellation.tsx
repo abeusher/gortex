@@ -2,80 +2,113 @@
 
 import { useMemo } from 'react'
 import { useInspector } from '@/lib/inspector'
+import type { GraphData, GortexNode } from '@/lib/types'
 import type { Repo } from '@/lib/schema'
-import { rnd, sampleSymbolName } from './rng'
+import {
+  computeDegree, groupByRepo, stableSortByDegreeDesc, seededRng,
+  layoutRepos, shortName,
+} from './layout'
 
-type Node = { x: number; y: number; repo: string; color: string; size: number; label: string | null }
+// Caps node count per repo so very large repos (100k+ nodes in the
+// daedalus tree) don't blow up the SVG. The top-degree slice preserves
+// the topologically interesting symbols.
+const MAX_NODES_PER_REPO = 80
+const MAX_EDGES = 800
+const W = 1100
+const H = 640
 
-function buildConstellation(repos: Repo[]): Node[] {
-  const r = rnd(7)
-  const out: Node[] = []
-  repos.forEach((rep) => {
-    const cx = 200 + 700 * r()
-    const cy = 160 + 420 * r()
-    const n = Math.min(60, Math.max(10, Math.round(rep.nodes / 180)))
-    for (let i = 0; i < n; i++) {
-      const rr = Math.sqrt(r()) * (60 + 50 * (rep.nodes > 500 ? 1 : 0.5))
-      const t = r() * Math.PI * 2
-      const size = 1.5 + r() * (rep.nodes > 2000 ? 5 : 3.5)
-      out.push({
-        x: cx + Math.cos(t) * rr,
-        y: cy + Math.sin(t) * rr,
-        repo: rep.id,
-        color: rep.color,
-        size,
-        label: i === 0 ? rep.id : r() > 0.85 ? sampleSymbolName(r) : null,
-      })
-    }
-  })
-  return out
+type Placed = {
+  node: GortexNode
+  x: number
+  y: number
+  size: number
+  color: string
+  repo: string
+  label: boolean
+  degree: number
 }
 
-export function GraphConstellation({ repos, filterRepos }: { repos: Repo[]; filterRepos: Set<string> }) {
+export function GraphConstellation({
+  graph, repos, filterRepos,
+}: {
+  graph: GraphData | null
+  repos: Repo[]
+  filterRepos: Set<string>
+}) {
   const setSym = useInspector((s) => s.setSym)
-  const nodes = useMemo(() => buildConstellation(repos), [repos])
-  const filt = useMemo(
-    () => nodes.filter((n) => !filterRepos.size || filterRepos.has(n.repo)),
-    [nodes, filterRepos],
-  )
-  const edges = useMemo(() => {
-    const es: [number, number, number][] = []
-    const r = rnd(11)
-    for (let i = 0; i < 260; i++) {
-      const a = Math.floor(r() * filt.length)
-      const b = Math.floor(r() * filt.length)
-      if (a !== b && filt[a] && filt[b]) {
-        es.push([a, b, filt[a].repo === filt[b].repo ? 0.35 : 0.8])
-      }
+
+  const { placed, edges } = useMemo(() => {
+    if (!graph) return { placed: [] as Placed[], edges: [] as [Placed, Placed, boolean][] }
+
+    const degree = computeDegree(graph.nodes, graph.edges)
+    const buckets = groupByRepo(graph.nodes)
+    const visibleRepos = repos.filter((r) => !filterRepos.size || filterRepos.has(r.id))
+    const layouts = layoutRepos(visibleRepos, buckets, W, H)
+
+    const placed: Placed[] = []
+    const byId = new Map<string, Placed>()
+    for (const L of layouts) {
+      const sorted = stableSortByDegreeDesc(L.nodes, degree).slice(0, MAX_NODES_PER_REPO)
+      const rng = seededRng(hashString(L.id))
+      sorted.forEach((n, i) => {
+        const t = i / Math.max(1, sorted.length - 1)
+        const r = L.radius * 0.95 * Math.sqrt(t + 0.02)
+        const angle = i * 2.39996 + rng() * 0.2
+        const x = L.cx + Math.cos(angle) * r
+        const y = L.cy + Math.sin(angle) * r * 0.75
+        const deg = degree.get(n.id) ?? 0
+        const size = 1.8 + Math.min(6, Math.log2(deg + 1) * 1.1)
+        const p: Placed = {
+          node: n, x, y, size, color: L.color, repo: L.id,
+          label: i < 4 || deg >= 10,
+          degree: deg,
+        }
+        placed.push(p)
+        byId.set(n.id, p)
+      })
     }
-    return es
-  }, [filt])
+
+    const sortedEdges = [...graph.edges].sort((a, b) => {
+      const da = (degree.get(a.from) ?? 0) + (degree.get(a.to) ?? 0)
+      const db = (degree.get(b.from) ?? 0) + (degree.get(b.to) ?? 0)
+      return db - da
+    })
+    const edges: [Placed, Placed, boolean][] = []
+    for (const e of sortedEdges) {
+      const a = byId.get(e.from)
+      const b = byId.get(e.to)
+      if (!a || !b || a === b) continue
+      edges.push([a, b, !!e.cross_repo])
+      if (edges.length >= MAX_EDGES) break
+    }
+
+    return { placed, edges }
+  }, [graph, repos, filterRepos])
 
   return (
-    <svg viewBox="0 0 1100 640" width="100%" height="100%" style={{ display: 'block' }}>
-      {edges.map(([a, b, w], i) => (
+    <svg viewBox={`0 0 ${W} ${H}`} width="100%" height="100%" style={{ display: 'block' }}>
+      {edges.map(([a, b, cross], i) => (
         <line
           key={i}
-          x1={filt[a].x}
-          y1={filt[a].y}
-          x2={filt[b].x}
-          y2={filt[b].y}
-          stroke={w > 0.5 ? 'var(--accent)' : 'var(--line-2)'}
-          strokeWidth={w > 0.5 ? 0.5 : 0.3}
-          opacity={w > 0.5 ? 0.3 : 0.5}
+          x1={a.x}
+          y1={a.y}
+          x2={b.x}
+          y2={b.y}
+          stroke={cross ? 'var(--accent)' : 'var(--line-2)'}
+          strokeWidth={cross ? 0.6 : 0.3}
+          opacity={cross ? 0.45 : 0.4}
         />
       ))}
-      {filt.map((n, i) => (
+      {placed.map((p, i) => (
         <g
           key={i}
           onClick={() =>
-            n.label &&
             setSym({
-              id: `${n.repo}::${n.label}`,
-              kind: 'function',
-              name: n.label,
-              repo: n.repo,
-              file: '',
+              id: p.node.id,
+              kind: (p.node.kind as 'function') ?? 'function',
+              name: p.node.name,
+              repo: p.repo,
+              file: p.node.file_path,
               sig: '',
               callers: 0,
               callees: 0,
@@ -83,16 +116,37 @@ export function GraphConstellation({ repos, filterRepos }: { repos: Repo[]; filt
               caveats: [],
             })
           }
-          style={{ cursor: n.label ? 'pointer' : 'default' }}
+          style={{ cursor: 'pointer' }}
         >
-          <circle cx={n.x} cy={n.y} r={n.size} fill={n.color} opacity="0.9" />
-          {n.label && (
-            <text x={n.x + n.size + 3} y={n.y + 3} fontFamily="JetBrains Mono" fontSize="10" fill="var(--fg-1)" opacity="0.9">
-              {n.label}
+          <circle cx={p.x} cy={p.y} r={p.size} fill={p.color} opacity={0.85 + Math.min(0.15, p.degree * 0.01)} />
+          {p.label && (
+            <text
+              x={p.x + p.size + 3}
+              y={p.y + 3}
+              fontFamily="JetBrains Mono"
+              fontSize="10"
+              fill="var(--fg-1)"
+              opacity="0.85"
+            >
+              {shortName(p.node, 22)}
             </text>
           )}
         </g>
       ))}
+      {placed.length === 0 && (
+        <text x={W / 2} y={H / 2} textAnchor="middle" fill="var(--fg-3)" fontFamily="JetBrains Mono" fontSize="12">
+          No graph data — run `gortex index .` to populate.
+        </text>
+      )}
     </svg>
   )
+}
+
+function hashString(s: string): number {
+  let h = 2166136261 >>> 0
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i)
+    h = Math.imul(h, 16777619) >>> 0
+  }
+  return h
 }

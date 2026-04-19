@@ -21,8 +21,11 @@
  *                     selects, which we cannot resolve without a real
  *                     investigation entity.
  *
- *  - RECENT_SEARCHES — placeholder; should move to localStorage once
- *                     the search page tracks user history.
+ * Recent searches are no longer here — they moved to localStorage
+ * (see `useRecentSearches` in lib/hooks.ts).
+ *
+ * Graph views (/graph) now consume real data via `useGraph()` and the
+ * `/v1/graph` endpoint. No rnd-seeded nodes/edges remain.
  *
  * If you find anything else mocked outside this file, it is a bug —
  * file an issue or wire it to /v1/*.
@@ -57,14 +60,6 @@ export const INVESTIGATION_FLOW: InvestigationStep[] = [
   { idx: 8,  repo: 'email-worker', where: 'internal/handler.go:OnExtracted',          what: 'fetch preview metadata' },
   { idx: 9,  repo: 'worker',       where: 'internal/notifier.go:PushTuckUpdated',     what: 'emit push.TuckUpdated' },
   { idx: 10, repo: 'tuck_app',     where: 'features/sync/listener.dart:onPush',       what: 'client sync receives update' },
-]
-
-// MOCK: see header — placeholder until search history persists.
-export const RECENT_SEARCHES = [
-  { q: 'ExtractLinks',   kind: 'function',  hits: 5 },
-  { q: 'TuckRepository', kind: 'type',      hits: 12 },
-  { q: 'RegisterRoutes', kind: 'function',  hits: 3 },
-  { q: 'kind:interface', kind: 'facet',     hits: 412 },
 ]
 
 // MOCK: see header — investigation hypothesis and pinned source peek.

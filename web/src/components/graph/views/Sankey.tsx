@@ -80,6 +80,10 @@ export function GraphSankey() {
 
   return (
     <svg viewBox={`0 0 ${W} ${H}`} width="100%" height="100%">
+      <text x={16} y={16} fontFamily="IBM Plex Sans" fontSize="10" fill="var(--fg-3)"
+        style={{ textTransform: 'uppercase', letterSpacing: '0.08em' }}>
+        Illustrative · runtime flow requires a tracing source (e.g. OTel)
+      </text>
       {ribbons}
       {cols.map((c, ci) => (
         <g key={ci}>

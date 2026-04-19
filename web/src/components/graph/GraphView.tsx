@@ -4,7 +4,7 @@ import { useEffect, useState } from 'react'
 import { Icon } from '@/components/primitives/Icon'
 import { CaveatBadge } from '@/components/primitives/Caveat'
 import { useTweaks } from '@/lib/tweaks'
-import { useDashboard, useRepos } from '@/lib/hooks'
+import { useDashboard, useRepos, useGraph } from '@/lib/hooks'
 import { GraphConstellation } from './views/Constellation'
 import { GraphHierarchical } from './views/Hierarchical'
 import { GraphSankey } from './views/Sankey'
@@ -93,6 +93,7 @@ export function GraphView() {
   const showMinimap = useTweaks((s) => s.showMinimap)
   const { data: repos, loading, error } = useRepos()
   const { data: dash } = useDashboard()
+  const { data: graph, loading: graphLoading, error: graphError } = useGraph()
   const [mode, setMode] = useState<Mode>('constellation')
   const [filtered, setFiltered] = useState<Set<string>>(new Set())
 
@@ -120,15 +121,15 @@ export function GraphView() {
         <div>
           <h1>Graph explorer</h1>
           <div className="sub">
-            {loading
-              ? 'Loading repos…'
-              : `${filtered.size} of ${repoList.length} repos · ${dash?.stats.total_nodes?.toLocaleString() ?? '—'} nodes · ${dash?.stats.total_edges?.toLocaleString() ?? '—'} edges`}
+            {loading || graphLoading
+              ? 'Loading graph…'
+              : `${filtered.size} of ${repoList.length} repos · ${(graph?.nodes.length ?? dash?.stats.total_nodes ?? 0).toLocaleString()} nodes · ${(graph?.edges.length ?? dash?.stats.total_edges ?? 0).toLocaleString()} edges`}
           </div>
         </div>
       </div>
-      {error && (
+      {(error || graphError) && (
         <div style={{ padding: 22, color: 'var(--danger)', fontSize: 13 }}>
-          Failed to load repositories: {error}
+          Failed to load graph: {error ?? graphError}
         </div>
       )}
       <div className="graph-wrap">
@@ -154,10 +155,10 @@ export function GraphView() {
           </div>
 
           <div style={{ width: '100%', height: '100%' }}>
-            {mode === 'constellation' && <GraphConstellation repos={visibleRepos} filterRepos={filtered} />}
-            {mode === 'tree' && <GraphHierarchical />}
+            {mode === 'constellation' && <GraphConstellation graph={graph} repos={repoList} filterRepos={filtered} />}
+            {mode === 'tree' && <GraphHierarchical graph={graph} repos={repoList} filterRepos={filtered} />}
             {mode === 'sankey' && <GraphSankey />}
-            {mode === '3d' && <Graph3D repos={visibleRepos} />}
+            {mode === '3d' && <Graph3D graph={graph} repos={repoList} filterRepos={filtered} />}
           </div>
 
           <div className="legend-box">

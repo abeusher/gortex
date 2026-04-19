@@ -6,6 +6,7 @@ import type {
   Repo, Process, Contract, Caveat, Activity, Guard, Community,
   DashboardSnapshot,
 } from './schema'
+import type { GraphData } from './types'
 
 type Async<T> = {
   data: T | null
@@ -60,6 +61,12 @@ export function useRepos(): Async<Repo[]> {
   return useAsync(async () => (await api.repos()).repos)
 }
 
+export function useGraph(opts?: { project?: string; repo?: string }): Async<GraphData> {
+  const project = opts?.project ?? ''
+  const repo = opts?.repo ?? ''
+  return useAsync(() => api.getGraph({ project: project || undefined, repo: repo || undefined }), [project, repo])
+}
+
 export function useProcesses(): Async<Process[]> {
   return useAsync(async () => (await api.processes()).processes)
 }
@@ -86,6 +93,44 @@ export function useActivity(limit = 20): Async<Activity[]> {
 
 export function useSymbolSearch(query: string, limit = 20) {
   return useAsync(() => api.searchSymbols(query, limit), [query, limit])
+}
+
+// Recent search history is stored in localStorage — the server does not
+// persist user history. `push` adds/updates an entry; `clear` wipes.
+export type RecentSearch = { q: string; kind: string; hits: number; ts: number }
+const RECENT_KEY = 'gortex:recents'
+const RECENT_MAX = 8
+
+function readRecents(): RecentSearch[] {
+  if (typeof window === 'undefined') return []
+  try {
+    const raw = window.localStorage.getItem(RECENT_KEY)
+    if (!raw) return []
+    const parsed = JSON.parse(raw) as RecentSearch[]
+    return Array.isArray(parsed) ? parsed : []
+  } catch {
+    return []
+  }
+}
+
+export function useRecentSearches(): {
+  recents: RecentSearch[]
+  push: (entry: Omit<RecentSearch, 'ts'>) => void
+  clear: () => void
+} {
+  const [recents, setRecents] = useState<RecentSearch[]>([])
+  useEffect(() => { setRecents(readRecents()) }, [])
+  const push = (entry: Omit<RecentSearch, 'ts'>) => {
+    const now = Date.now()
+    const next = [{ ...entry, ts: now }, ...readRecents().filter((e) => e.q !== entry.q)].slice(0, RECENT_MAX)
+    if (typeof window !== 'undefined') window.localStorage.setItem(RECENT_KEY, JSON.stringify(next))
+    setRecents(next)
+  }
+  const clear = () => {
+    if (typeof window !== 'undefined') window.localStorage.removeItem(RECENT_KEY)
+    setRecents([])
+  }
+  return { recents, push, clear }
 }
 
 export function useUsages(id: string | null) {
