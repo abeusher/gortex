@@ -412,6 +412,9 @@ func (r *Resolver) resolveTypeOrFunc(e *graph.Edge, name string, stats *ResolveS
 func (r *Resolver) resolveMethodCall(e *graph.Edge, methodName string, stats *ResolveStats) {
 	candidates := r.graph.FindNodesByName(methodName)
 	if len(candidates) == 0 {
+		if r.applyBuiltinIfKnown(e, methodName, stats) {
+			return
+		}
 		stats.Unresolved++
 		return
 	}
@@ -506,7 +509,34 @@ func (r *Resolver) resolveMethodCall(e *graph.Edge, methodName string, stats *Re
 		}
 	}
 
+	// Name matched something, but not in a way we accepted. Give the
+	// built-in classifier a chance before declaring the edge dead —
+	// `arr.push` on an Array may also match an unrelated `push` method
+	// elsewhere in the graph, in which case we'd rather label it as a
+	// built-in than silently misresolve.
+	if r.applyBuiltinIfKnown(e, methodName, stats) {
+		return
+	}
 	stats.Unresolved++
+}
+
+// applyBuiltinIfKnown routes an unresolvable method call to the
+// built-in stub (`builtin::<lang>::<category>::<method>`) when the
+// caller's language and the method name are both in our lookup tables.
+// Returns true when the edge was rewritten; caller should skip its
+// Unresolved increment in that case.
+func (r *Resolver) applyBuiltinIfKnown(e *graph.Edge, methodName string, stats *ResolveStats) bool {
+	lang := langFromFilePath(e.FilePath)
+	if lang == "" {
+		return false
+	}
+	category, ok := classifyBuiltin(methodName, lang)
+	if !ok {
+		return false
+	}
+	e.To = "builtin::" + lang + "::" + category + "::" + methodName
+	stats.External++
+	return true
 }
 
 // edgeReceiverType extracts the receiver_type from Edge.Meta, if present.

@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from 'react'
 import { Icon } from '@/components/primitives/Icon'
+import { CodeBlock } from '@/components/primitives/CodeBlock'
 import {
   useProcesses, useRepos, useProcessDetail, useSymbolSource, useSymbol,
 } from '@/lib/hooks'
@@ -19,6 +20,7 @@ function crossLabel(s: StepInfo): string {
   if (s.kind === 'stdlib') return s.path ? `stdlib (${s.path})` : 'stdlib'
   if (s.kind === 'dep') return s.path ? `dep (${s.path})` : 'dep'
   if (s.kind === 'external') return s.path ? `external (${s.path})` : 'external'
+  if (s.kind === 'builtin') return s.path ? `builtin (${s.path})` : 'builtin'
   if (s.kind === 'unresolved') return 'unresolved'
   return s.repo || '—'
 }
@@ -29,11 +31,24 @@ type StepInfo = {
   symbol: string
   // kind reflects where the target lives. 'firstParty' is indexed code
   // in one of the tracked repos; the rest are resolver-emitted stubs
-  // (see internal/resolver/resolver.go — resolveImport / resolveExtern).
-  kind: 'firstParty' | 'stdlib' | 'dep' | 'external' | 'unresolved'
+  // (see internal/resolver/resolver.go — resolveImport / resolveExtern
+  // and the builtin classifier in builtins.go).
+  kind: 'firstParty' | 'stdlib' | 'dep' | 'external' | 'builtin' | 'unresolved'
 }
 
 function parseStepId(id: string): StepInfo {
+  // `builtin::<lang>::<category>::<method>` — classifier output for
+  // language built-ins (String.startsWith, Array.push, list.append, …)
+  // that the resolver couldn't attribute to an import.
+  if (id.startsWith('builtin::')) {
+    const rest = id.slice('builtin::'.length)
+    const parts = rest.split('::')
+    // lang::category::method. If the format ever grows, fall back to
+    // joining all but the last segment as path so we never drop data.
+    const method = parts[parts.length - 1] ?? ''
+    const path = parts.slice(0, -1).join(' · ')
+    return { repo: 'builtin', path, symbol: method, kind: 'builtin' }
+  }
   // Prefixes emitted by the resolver for externs — no real file to read.
   if (id.startsWith('stdlib::') || id.startsWith('dep::')) {
     const rest = id.slice(id.indexOf('::') + 2)
@@ -303,6 +318,8 @@ export function ProcessesView() {
                   ? { label: 'stdlib', color: 'var(--violet)' }
                   : cur.kind === 'dep'
                   ? { label: 'dep', color: 'var(--warn)' }
+                  : cur.kind === 'builtin'
+                  ? { label: cur.path || 'builtin', color: 'var(--violet)' }
                   : cur.kind === 'external'
                   ? { label: 'external', color: 'var(--fg-3)' }
                   : cur.kind === 'unresolved'
@@ -448,11 +465,31 @@ export function ProcessesView() {
                     </div>
                   )
                 }
+                if (info.kind === 'builtin') {
+                  return (
+                    <div className="faint" style={{ fontSize: 12, lineHeight: 1.6 }}>
+                      <div>
+                        Language built-in —{' '}
+                        <span className="mono" style={{ color: 'var(--fg-1)' }}>
+                          {info.path}.{info.symbol}
+                        </span>
+                        . No user source to view.
+                      </div>
+                      <div style={{ marginTop: 6 }}>
+                        The resolver recognised this method as part of the runtime
+                        (`Array`, `String`, `list`, DOM, …). Classification comes from
+                        <span className="mono"> internal/resolver/builtins.go</span>; extend
+                        the map if you see a common method labelled &quot;unresolved&quot;.
+                      </div>
+                    </div>
+                  )
+                }
                 if (info.kind === 'unresolved') {
                   return (
                     <div className="faint" style={{ fontSize: 12 }}>
                       Unresolved call — the parser couldn&apos;t attribute this symbol to an
-                      import. Often a language built-in or a dynamically bound reference.
+                      import. Often a dynamically-bound method, a macro-expanded name,
+                      or a built-in the classifier doesn&apos;t yet know about.
                     </div>
                   )
                 }
@@ -466,7 +503,13 @@ export function ProcessesView() {
                     </div>
                   )
                 }
-                return <pre className="code" style={{ margin: 0, whiteSpace: 'pre', overflow: 'auto' }}>{source}</pre>
+                return (
+                  <CodeBlock
+                    code={source}
+                    filePath={node?.file_path ?? info.path}
+                    maxHeight="100%"
+                  />
+                )
               })()}
             </div>
           </div>

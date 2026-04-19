@@ -57,6 +57,37 @@ async function callToolJSON<T>(name: string, args: Record<string, unknown> = {})
   }
 }
 
+// clipByBraces walks a block of source and keeps the leading lines up
+// to (and including) the line that closes the first top-level `{…}`
+// block. Used when the parser didn't record end_line, so we still
+// render a whole method body without dragging in the following
+// declaration. Strings and comments containing braces are imperfect —
+// cheap heuristic, not a parser — but works for the usual Dart / TS
+// / Go cases we hit in practice. One-liner declarations terminated
+// by a bare `;` on their own line short-circuit (abstract methods,
+// arrow-body functions, etc.).
+function clipByBraces(lines: string[]): string[] {
+  let depth = 0
+  let opened = false
+  const out: string[] = []
+  for (const line of lines) {
+    out.push(line)
+    for (const ch of line) {
+      if (ch === '{') {
+        depth++
+        opened = true
+      } else if (ch === '}' && opened) {
+        depth--
+      }
+    }
+    if (opened && depth <= 0) return out
+    // No brace has opened yet and this line ends a statement — treat
+    // it as a one-liner signature (e.g. `int get foo => 42;`).
+    if (!opened && /;\s*(\/\/.*)?$/.test(line)) return out
+  }
+  return out
+}
+
 export const api = {
   // --- Health & stats ---
   health: async (): Promise<HealthResponse> => {
@@ -155,12 +186,45 @@ export const api = {
     } catch { return null }
   },
 
-  getSymbolSource: async (id: string): Promise<string> => {
-    const result = await callTool('get_symbol_source', { id })
+  // Some parsers (Dart, historically the TS extractor) only record a
+  // symbol's declaration line, not its end_line — so requesting
+  // context_lines: 0 returns just the signature. We ask for a 20-line
+  // window around the symbol and then clip locally:
+  //   * Skip leading context so rendering starts at start_line.
+  //   * If end_line > start_line, trust it and slice that many lines.
+  //   * Otherwise brace-balance from the opening `{` to find the real
+  //     end of the block. One-liner declarations terminated by `;`
+  //     short-circuit so abstract methods and arrow-functions don't
+  //     run off the end of the window.
+  getSymbolSource: async (id: string, contextLines = 20): Promise<string> => {
+    const result = await callTool('get_symbol_source', { id, context_lines: contextLines })
+    let parsed: {
+      source?: string
+      from_line?: number
+      start_line?: number
+      end_line?: number
+    }
     try {
-      const parsed = JSON.parse(result)
-      return parsed.source || result
-    } catch { return result }
+      parsed = JSON.parse(result)
+    } catch {
+      return result
+    }
+    const src = parsed.source
+    if (typeof src !== 'string' || src.length === 0) return result
+
+    const fromLine = parsed.from_line ?? 1
+    const startLine = parsed.start_line ?? fromLine
+    const endLine = parsed.end_line ?? startLine
+
+    const allLines = src.split('\n')
+    const leadSkip = Math.max(0, startLine - fromLine)
+    const bodyLines = allLines.slice(leadSkip)
+
+    if (endLine > startLine) {
+      const bodyLen = endLine - startLine + 1
+      return bodyLines.slice(0, bodyLen).join('\n')
+    }
+    return clipByBraces(bodyLines).join('\n')
   },
 
   getCallers: async (id: string, depth = 2): Promise<SubGraph> => {

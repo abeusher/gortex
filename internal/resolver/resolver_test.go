@@ -109,6 +109,66 @@ func TestResolveAll_ExternDep(t *testing.T) {
 	assert.Equal(t, "dep::github.com/pkg/errors::Wrap", callEdge.To)
 }
 
+// A TypeScript selector call into a String built-in (`.startsWith`) has
+// no in-graph target, but we classify it rather than mark it unresolved
+// — flow traces render `builtin (js · string)` instead of plain
+// `unresolved`.
+func TestResolveAll_BuiltinFromTS(t *testing.T) {
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "src/foo.ts", Kind: graph.KindFile, Name: "foo.ts", FilePath: "src/foo.ts", Language: "typescript"})
+	g.AddNode(&graph.Node{ID: "src/foo.ts::Caller", Kind: graph.KindFunction, Name: "Caller", FilePath: "src/foo.ts", Language: "typescript"})
+
+	callEdge := &graph.Edge{
+		From: "src/foo.ts::Caller", To: "unresolved::*.startsWith",
+		Kind: graph.EdgeCalls, FilePath: "src/foo.ts", Line: 5,
+	}
+	g.AddEdge(callEdge)
+
+	r := New(g)
+	stats := r.ResolveAll()
+
+	assert.Equal(t, 1, stats.External)
+	assert.Equal(t, "builtin::ts::string::startsWith", callEdge.To)
+}
+
+// Python `list.append` — verifies the py classifier branch.
+func TestResolveAll_BuiltinFromPython(t *testing.T) {
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "a.py", Kind: graph.KindFile, Name: "a.py", FilePath: "a.py", Language: "python"})
+	g.AddNode(&graph.Node{ID: "a.py::caller", Kind: graph.KindFunction, Name: "caller", FilePath: "a.py", Language: "python"})
+
+	callEdge := &graph.Edge{
+		From: "a.py::caller", To: "unresolved::*.append",
+		Kind: graph.EdgeCalls, FilePath: "a.py", Line: 2,
+	}
+	g.AddEdge(callEdge)
+
+	r := New(g)
+	stats := r.ResolveAll()
+
+	assert.Equal(t, 1, stats.External)
+	assert.Equal(t, "builtin::py::list::append", callEdge.To)
+}
+
+// Unknown method on a known language still falls through to Unresolved
+// — the classifier is not a catch-all.
+func TestResolveAll_UnknownBuiltinStaysUnresolved(t *testing.T) {
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "src/foo.ts", Kind: graph.KindFile, Name: "foo.ts", FilePath: "src/foo.ts", Language: "typescript"})
+	g.AddNode(&graph.Node{ID: "src/foo.ts::caller", Kind: graph.KindFunction, Name: "caller", FilePath: "src/foo.ts", Language: "typescript"})
+
+	callEdge := &graph.Edge{
+		From: "src/foo.ts::caller", To: "unresolved::*.mySuperObscureThing",
+		Kind: graph.EdgeCalls, FilePath: "src/foo.ts", Line: 2,
+	}
+	g.AddEdge(callEdge)
+
+	r := New(g)
+	stats := r.ResolveAll()
+
+	assert.Equal(t, 1, stats.Unresolved)
+}
+
 // When the referenced symbol is actually indexed (e.g. another repo in
 // a multi-repo setup), the extern edge rewires to the real node.
 func TestResolveAll_ExternResolvesToIndexedSymbol(t *testing.T) {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -286,15 +287,31 @@ func (h *Handler) handleProcesses(w http.ResponseWriter, r *http.Request) {
 // single entry per contract ID so users see one row per route, not two.
 
 type contractEntry struct {
-	ID        string   `json:"id"`
-	Name      string   `json:"name"`
-	Kind      string   `json:"kind"` // REST | EVENT | URL
-	Producer  string   `json:"producer"`
-	Consumers []string `json:"consumers"`
-	Version   string   `json:"version"`
-	Breaking  bool     `json:"breaking"`
-	Callers   int      `json:"callers"`
-	Last      string   `json:"last"`
+	ID        string             `json:"id"`
+	Name      string             `json:"name"`
+	Kind      string             `json:"kind"`  // REST | EVENT | URL | ENV | DEP (coarse, for badge)
+	Type      string             `json:"type"`  // http | grpc | graphql | topic | ws | env | openapi | dependency
+	Scope     string             `json:"scope"` // own | external
+	Producer  string             `json:"producer"`
+	Consumers []string           `json:"consumers"`
+	Version   string             `json:"version"`
+	Breaking  bool                `json:"breaking"`
+	Callers   int                 `json:"callers"`
+	Last      string              `json:"last"`
+	Locations []contractLocation `json:"locations"`
+}
+
+// contractLocation is a single on-disk occurrence of a contract —
+// either a provider handler or a consumer call site. The UI uses this
+// to expand a contract row into a jump-list of file:line entries and
+// to resolve symbol IDs back to source via /v1/tools/get_symbol_source.
+type contractLocation struct {
+	Role       string         `json:"role"` // provider | consumer
+	RepoPrefix string         `json:"repo_prefix"`
+	SymbolID   string         `json:"symbol_id"`
+	FilePath   string         `json:"file_path"`
+	Line       int            `json:"line"`
+	Meta       map[string]any `json:"meta,omitempty"`
 }
 
 func (h *Handler) handleContracts(w http.ResponseWriter, r *http.Request) {
@@ -329,15 +346,23 @@ func (h *Handler) handleContracts(w http.ResponseWriter, r *http.Request) {
 	for _, group := range w0.ByRepo {
 		for kind, items := range group.Contracts {
 			for _, c := range items {
-				e, ok := merged[c.ID]
+				// Upstream NormalizeHTTPPath preserves parameter names,
+				// so a provider's "/v1/workspaces/{wid}/tags/{id}" and
+				// a consumer's "/v1/workspaces/{workspaceId}/tags/{id}"
+				// hash to different contract IDs for the same route.
+				// Re-canonicalize by positional params so they merge.
+				key := canonicalContractKey(c.ID)
+				e, ok := merged[key]
 				if !ok {
 					e = &contractEntry{
-						ID:        c.ID,
-						Name:      c.ID,
+						ID:        key,
+						Name:      key,
 						Kind:      uiContractKind(kind),
+						Type:      kind,
 						Consumers: []string{},
+						Locations: []contractLocation{},
 					}
-					merged[c.ID] = e
+					merged[key] = e
 				}
 				if c.Role == "provider" && e.Producer == "" {
 					e.Producer = c.RepoPrefix
@@ -345,12 +370,34 @@ func (h *Handler) handleContracts(w http.ResponseWriter, r *http.Request) {
 				if c.Role == "consumer" && c.RepoPrefix != "" && !contains(e.Consumers, c.RepoPrefix) {
 					e.Consumers = append(e.Consumers, c.RepoPrefix)
 				}
+				e.Locations = append(e.Locations, contractLocation{
+					Role:       c.Role,
+					RepoPrefix: c.RepoPrefix,
+					SymbolID:   c.SymbolID,
+					FilePath:   c.FilePath,
+					Line:       c.Line,
+					Meta:       c.Meta,
+				})
 				e.Callers++
 			}
 		}
 	}
 	out := make([]contractEntry, 0, len(merged))
 	for _, e := range merged {
+		e.Scope = contractScope(e.Type, e.Producer)
+		sort.SliceStable(e.Locations, func(i, j int) bool {
+			a, b := e.Locations[i], e.Locations[j]
+			if a.Role != b.Role {
+				return a.Role == "provider" // providers first
+			}
+			if a.RepoPrefix != b.RepoPrefix {
+				return a.RepoPrefix < b.RepoPrefix
+			}
+			if a.FilePath != b.FilePath {
+				return a.FilePath < b.FilePath
+			}
+			return a.Line < b.Line
+		})
 		out = append(out, *e)
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -371,10 +418,48 @@ func uiContractKind(raw string) string {
 	case "http", "grpc", "graphql", "openapi":
 		return "REST"
 	case "env":
-		return "URL"
+		return "ENV"
+	case "dependency":
+		return "DEP"
 	default:
 		return strings.ToUpper(raw)
 	}
+}
+
+// contractScope decides whether a merged contract row represents something
+// defined in the active project ("own") or something it only consumes
+// ("external"). Go-module / package dependency contracts are always
+// external by construction; for the rest, a row is own iff we found a
+// provider inside the active-project repo set.
+func contractScope(rawType, producer string) string {
+	if rawType == "dependency" {
+		return "external"
+	}
+	if producer == "" {
+		return "external"
+	}
+	return "own"
+}
+
+// canonicalContractIDParam matches any {name} path-parameter placeholder
+// in a contract ID. We rewrite the name to a positional {p1}, {p2}, …
+// so the same HTTP route matches regardless of whether the provider
+// called the param {id} and the consumer called it {entityId}.
+var canonicalContractIDParam = regexp.MustCompile(`\{[^}]+\}`)
+
+// canonicalContractKey returns a merge-stable key for a raw contract
+// ID. Only IDs whose first segment is "http" are rewritten; other
+// contract types (grpc, topic, env, dependency) already have structural
+// IDs that don't embed param names.
+func canonicalContractKey(id string) string {
+	if !strings.HasPrefix(id, "http::") {
+		return id
+	}
+	i := 0
+	return canonicalContractIDParam.ReplaceAllStringFunc(id, func(string) string {
+		i++
+		return fmt.Sprintf("{p%d}", i)
+	})
 }
 
 func contains(ss []string, x string) bool {

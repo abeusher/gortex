@@ -30,16 +30,40 @@ export type Process = {
   crosses: string[]
 }
 
+export type ContractKind = 'REST' | 'EVENT' | 'URL' | 'ENV' | 'DEP'
+export type ContractType =
+  | 'http'
+  | 'grpc'
+  | 'graphql'
+  | 'topic'
+  | 'ws'
+  | 'env'
+  | 'openapi'
+  | 'dependency'
+export type ContractScope = 'own' | 'external'
+
+export type ContractLocation = {
+  role: 'provider' | 'consumer' | string
+  repo_prefix: string
+  symbol_id: string
+  file_path: string
+  line: number
+  meta?: Record<string, unknown>
+}
+
 export type Contract = {
   id: string
   name: string
-  kind: 'REST' | 'EVENT' | 'URL' | string
+  kind: ContractKind | string
+  type: ContractType | string
+  scope: ContractScope
   producer: string
   consumers: string[]
   version: string
   breaking: boolean
   callers: number
   last: string
+  locations: ContractLocation[]
 }
 
 export type Community = {

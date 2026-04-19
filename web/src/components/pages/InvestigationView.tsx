@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Icon } from '@/components/primitives/Icon'
 import { CaveatBadge } from '@/components/primitives/Caveat'
+import { CodeBlock } from '@/components/primitives/CodeBlock'
 import {
   useContracts, useGuards, useProcesses, useProcessDetail,
   useActivity, useSymbolSource, useSymbol,
@@ -13,14 +14,21 @@ type StepInfo = {
   repo: string
   path: string
   symbol: string
-  kind: 'firstParty' | 'stdlib' | 'dep' | 'external' | 'unresolved'
+  kind: 'firstParty' | 'stdlib' | 'dep' | 'external' | 'builtin' | 'unresolved'
 }
 
 // Splits a node ID into its parts. Handles first-party IDs
 // ("<repo>/<path>::<sym>") as well as resolver-emitted externs
 // ("stdlib::encoding/json::NewEncoder" / "dep::github.com/..::Wrap" /
-// "external::<path>") so the UI can badge cross-boundary calls.
+// "external::<path>" / "builtin::<lang>::<cat>::<method>") so the UI
+// can badge cross-boundary calls.
 function parseStepId(id: string): StepInfo {
+  if (id.startsWith('builtin::')) {
+    const parts = id.slice('builtin::'.length).split('::')
+    const method = parts[parts.length - 1] ?? ''
+    const path = parts.slice(0, -1).join(' · ')
+    return { repo: 'builtin', path, symbol: method, kind: 'builtin' }
+  }
   if (id.startsWith('stdlib::') || id.startsWith('dep::')) {
     const rest = id.slice(id.indexOf('::') + 2)
     const sym = rest.lastIndexOf('::')
@@ -201,7 +209,11 @@ export function InvestigationView() {
                 <div className="faint" style={{ fontSize: 12 }}>Select a step to view its source.</div>
               )}
               {!sourceLoading && source && (
-                <pre className="code" style={{ margin: 0, maxHeight: 420, overflow: 'auto' }}>{source}</pre>
+                <CodeBlock
+                  code={source}
+                  filePath={selectedStepId ? parseStepId(selectedStepId).path : undefined}
+                  maxHeight={420}
+                />
               )}
             </div>
           </div>
