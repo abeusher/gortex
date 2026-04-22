@@ -264,3 +264,71 @@ public class App {}
 	imports := edgesOfKind(result.Edges, graph.EdgeImports)
 	require.Len(t, imports, 2)
 }
+
+func TestJavaExtractor_SpringBeanAnnotation(t *testing.T) {
+	// @Bean on a method inside a @Configuration class should emit an
+	// EdgeProvides from the class to the method with binding="bean"
+	// and provides_for set to the return type. Without this the
+	// indexer's DI post-pass can't link bean consumers back to the
+	// factory.
+	src := []byte(`
+package com.example;
+
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import java.time.Clock;
+
+@Configuration
+public class Clocks {
+    @Bean
+    public Clock systemClock() {
+        return Clock.systemUTC();
+    }
+}
+`)
+	e := NewJavaExtractor()
+	result, err := e.Extract("Clocks.java", src)
+	require.NoError(t, err)
+
+	var found *graph.Edge
+	for _, ed := range edgesOfKind(result.Edges, graph.EdgeProvides) {
+		if ed.Meta == nil {
+			continue
+		}
+		if b, _ := ed.Meta["binding"].(string); b == "bean" {
+			found = ed
+			break
+		}
+	}
+	require.NotNil(t, found, "expected @Bean provides edge")
+	assert.Equal(t, "Clock", found.Meta["provides_for"])
+	assert.Equal(t, "Clocks.java::Clocks.systemClock", found.To)
+}
+
+func TestJavaExtractor_ConstructorParamsCaptured(t *testing.T) {
+	// Constructor nodes stash params_src on Meta so the indexer's
+	// Spring-bean post-pass can match consumers to factories by
+	// type-name presence in the signature.
+	src := []byte(`
+package c;
+public class X {
+    private final Clock clock;
+    public X(Clock clock, int foo) { this.clock = clock; }
+}
+`)
+	e := NewJavaExtractor()
+	result, err := e.Extract("X.java", src)
+	require.NoError(t, err)
+
+	var ctor *graph.Node
+	for _, n := range nodesOfKind(result.Nodes, graph.KindMethod) {
+		if n.Name == "X.<init>" {
+			ctor = n
+			break
+		}
+	}
+	require.NotNil(t, ctor)
+	params, _ := ctor.Meta["params_src"].(string)
+	assert.Contains(t, params, "Clock")
+	assert.Contains(t, params, "foo")
+}

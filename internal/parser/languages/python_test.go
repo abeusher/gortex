@@ -179,3 +179,62 @@ def main():
 	require.NotNil(t, processCall)
 	assert.Nil(t, processCall.Meta, "unknown type should not produce Meta")
 }
+
+func TestPythonExtractor_FastAPIDepends(t *testing.T) {
+	// Depends(target) in a parameter default (or Annotated[T, Depends(target)])
+	// should produce a direct call edge from the handler to target, not
+	// just to the generic Depends function. Without this pass,
+	// callers(target) is empty for any DI-only factory.
+	src := []byte(`
+from fastapi import Depends
+from typing import Annotated
+
+def get_settings():
+    return {"db": "x"}
+
+def handler(settings: Annotated[dict, Depends(get_settings)]):
+    return settings
+`)
+	e := NewPythonExtractor()
+	result, err := e.Extract("app.py", src)
+	require.NoError(t, err)
+
+	var found *graph.Edge
+	for _, c := range edgesOfKind(result.Edges, graph.EdgeCalls) {
+		if c.Meta == nil {
+			continue
+		}
+		if v, _ := c.Meta["via"].(string); v == "fastapi.Depends" {
+			if strings.HasSuffix(c.To, "get_settings") {
+				found = c
+				break
+			}
+		}
+	}
+	require.NotNil(t, found, "expected a fastapi.Depends edge to get_settings")
+	assert.Equal(t, "app.py::handler", found.From)
+}
+
+func TestPythonExtractor_DependsOnlyOnIdentifierArg(t *testing.T) {
+	// Depends() with a non-identifier argument (lambda, attribute access)
+	// shouldn't produce a bogus edge — we can only statically resolve
+	// plain identifier targets.
+	src := []byte(`
+from fastapi import Depends
+
+def handler(x = Depends(lambda: 42), y = Depends(obj.method)):
+    return x
+`)
+	e := NewPythonExtractor()
+	result, err := e.Extract("app.py", src)
+	require.NoError(t, err)
+
+	for _, c := range edgesOfKind(result.Edges, graph.EdgeCalls) {
+		if c.Meta == nil {
+			continue
+		}
+		if v, _ := c.Meta["via"].(string); v == "fastapi.Depends" {
+			t.Fatalf("unexpected fastapi.Depends edge: %+v", c)
+		}
+	}
+}

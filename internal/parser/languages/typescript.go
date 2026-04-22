@@ -1078,44 +1078,126 @@ func collectThisParamTypes(root *sitter.Node, src []byte, tenv typeEnv) {
 			return
 		}
 		walkNodes(n, func(m *sitter.Node) {
-			if m.Type() != "method_definition" {
-				return
-			}
-			nameNode := m.ChildByFieldName("name")
-			if nameNode == nil || nameNode.Content(src) != "constructor" {
-				return
-			}
-			params := m.ChildByFieldName("parameters")
-			if params == nil {
-				return
-			}
-			for i := 0; i < int(params.NamedChildCount()); i++ {
-				p := params.NamedChild(i)
-				if p == nil {
-					continue
+			switch m.Type() {
+			case "method_definition":
+				nameNode := m.ChildByFieldName("name")
+				if nameNode == nil || nameNode.Content(src) != "constructor" {
+					return
 				}
-				// Only required_parameter nodes can carry the parameter-
-				// property shorthand; plain identifiers bail out.
-				if p.Type() != "required_parameter" && p.Type() != "optional_parameter" {
-					continue
+				params := m.ChildByFieldName("parameters")
+				if params == nil {
+					return
 				}
-				if !hasParameterPropertyModifier(p) {
-					continue
+				for i := 0; i < int(params.NamedChildCount()); i++ {
+					p := params.NamedChild(i)
+					if p == nil {
+						continue
+					}
+					// Only required_parameter nodes can carry the parameter-
+					// property shorthand; plain identifiers bail out.
+					if p.Type() != "required_parameter" && p.Type() != "optional_parameter" {
+						continue
+					}
+					if !hasParameterPropertyModifier(p) {
+						continue
+					}
+					paramName := paramIdentifier(p, src)
+					if paramName == "" {
+						continue
+					}
+					typeName := paramTypeAnnotation(p, src)
+					if typeName == "" {
+						continue
+					}
+					// Key by `this.<name>` so extractCalls' receiverText
+					// lookup ("this.svc") matches directly.
+					tenv["this."+paramName] = typeName
 				}
-				paramName := paramIdentifier(p, src)
-				if paramName == "" {
-					continue
+			case "public_field_definition":
+				// Angular's inject() function-style DI: `private users =
+				// inject(UsersService)`. The field has no explicit type
+				// annotation, but the initializer is a call whose first
+				// identifier argument IS the type. Record it so call
+				// sites `this.users.foo()` resolve correctly. Without
+				// this the resolver's same-dir name-match fallback
+				// picks an arbitrary method when more than one class
+				// defines the called name.
+				name := classFieldName(m, src)
+				if name == "" {
+					return
 				}
-				typeName := paramTypeAnnotation(p, src)
-				if typeName == "" {
-					continue
+				// Prefer an explicit type annotation when present; fall
+				// back to inject() initializer inference.
+				if t := classFieldTypeAnnotation(m, src); t != "" {
+					tenv["this."+name] = t
+					return
 				}
-				// Key by `this.<name>` so extractCalls' receiverText
-				// lookup ("this.svc") matches directly.
-				tenv["this."+paramName] = typeName
+				if t := injectInitializerType(m, src); t != "" {
+					tenv["this."+name] = t
+				}
 			}
 		})
 	})
+}
+
+// classFieldName returns the identifier name of a public_field_definition
+// node (`private readonly NAME: T = ...`). Returns "" when the field
+// has no identifier or is a computed property.
+func classFieldName(field *sitter.Node, src []byte) string {
+	nameNode := field.ChildByFieldName("name")
+	if nameNode == nil || nameNode.Type() != "property_identifier" {
+		return ""
+	}
+	return nameNode.Content(src)
+}
+
+// classFieldTypeAnnotation returns the normalised type name from a
+// field's type_annotation child, or "" when absent.
+func classFieldTypeAnnotation(field *sitter.Node, src []byte) string {
+	for i := 0; i < int(field.NamedChildCount()); i++ {
+		c := field.NamedChild(i)
+		if c == nil || c.Type() != "type_annotation" {
+			continue
+		}
+		for j := 0; j < int(c.NamedChildCount()); j++ {
+			tn := c.NamedChild(j)
+			if tn == nil {
+				continue
+			}
+			return normalizeTypeName(tn.Content(src))
+		}
+	}
+	return ""
+}
+
+// injectInitializerType returns the class-name argument of an
+// `inject(X)` call when that call is the initializer of a class field.
+// Returns "" when the field has no initializer, the initializer isn't
+// an inject() call, or the argument isn't a plain identifier.
+func injectInitializerType(field *sitter.Node, src []byte) string {
+	value := field.ChildByFieldName("value")
+	if value == nil || value.Type() != "call_expression" {
+		return ""
+	}
+	fn := value.ChildByFieldName("function")
+	if fn == nil || fn.Type() != "identifier" || fn.Content(src) != "inject" {
+		return ""
+	}
+	args := value.ChildByFieldName("arguments")
+	if args == nil {
+		return ""
+	}
+	for i := 0; i < int(args.NamedChildCount()); i++ {
+		arg := args.NamedChild(i)
+		if arg == nil {
+			continue
+		}
+		if arg.Type() == "identifier" {
+			return arg.Content(src)
+		}
+		return ""
+	}
+	return ""
 }
 
 // hasParameterPropertyModifier reports whether a required_parameter node

@@ -246,6 +246,25 @@ func (e *PythonExtractor) Extract(filePath string, src []byte) (*parser.Extracti
 			From: callerID, To: "unresolved::" + name,
 			Kind: graph.EdgeCalls, FilePath: filePath, Line: expr.StartLine + 1,
 		})
+
+		// FastAPI dependency injection: `Depends(target)` appears in a
+		// parameter default or inside `Annotated[T, Depends(target)]`,
+		// and the usual call-edge path only links the caller to
+		// `Depends`, not to the target. Without this pass,
+		// find_usages(target) for DI-injected factories returns empty
+		// even though the target is exactly what the handler ends up
+		// invoking. Emit a direct edge from the enclosing function to
+		// the first identifier argument of Depends so the target shows
+		// up as a caller relationship.
+		if name == "Depends" && expr.Node != nil {
+			if dep := firstIdentifierArg(expr.Node, src); dep != "" {
+				result.Edges = append(result.Edges, &graph.Edge{
+					From: callerID, To: "unresolved::" + dep,
+					Kind: graph.EdgeCalls, FilePath: filePath, Line: expr.StartLine + 1,
+					Meta: map[string]any{"via": "fastapi.Depends"},
+				})
+			}
+		}
 	}
 
 	matches, _ = parser.RunQuery(pyQCallAttr, e.lang, root, src)
@@ -341,6 +360,36 @@ func (e *PythonExtractor) buildTypeEnv(root *sitter.Node, src []byte) typeEnv {
 	}
 
 	return tenv
+}
+
+// firstIdentifierArg returns the string content of the first positional
+// argument to a Python call_expression when that argument is a bare
+// identifier (function name or class name), or "" otherwise. Used for
+// FastAPI's Depends(target) where we want the target, not Depends
+// itself, to show up as the called symbol. Non-identifier arguments —
+// lambdas, attribute access, calls — are skipped because they can't
+// be statically resolved to a graph node.
+func firstIdentifierArg(callNode *sitter.Node, src []byte) string {
+	args := callNode.ChildByFieldName("arguments")
+	if args == nil {
+		return ""
+	}
+	for i := 0; i < int(args.NamedChildCount()); i++ {
+		arg := args.NamedChild(i)
+		if arg == nil {
+			continue
+		}
+		// Skip keyword arguments — Depends(use_cache=False, ...) shouldn't
+		// produce a call edge to `False`.
+		if arg.Type() == "keyword_argument" {
+			continue
+		}
+		if arg.Type() == "identifier" {
+			return arg.Content(src)
+		}
+		return ""
+	}
+	return ""
 }
 
 // extractPyReturnType walks a function_definition node for a return_type child

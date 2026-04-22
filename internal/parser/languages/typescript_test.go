@@ -737,3 +737,58 @@ export class X {
 		}
 	}
 }
+
+func TestTSExtractor_AngularInjectFunction(t *testing.T) {
+	// Angular's `inject()` function-style DI inside a class field
+	// initializer should type `this.<field>` as the target class so
+	// the resolver can route method calls correctly.
+	src := []byte(`
+import { Injectable, inject } from '@angular/core';
+import { UsersService } from './users.service';
+
+@Injectable({ providedIn: 'root' })
+export class AuthService {
+  private readonly users = inject(UsersService);
+  findUser(id: string) {
+    return this.users.findOne(id);
+  }
+}
+`)
+	e := NewTypeScriptExtractor()
+	result, err := e.Extract("auth.service.ts", src)
+	require.NoError(t, err)
+
+	// The findOne call should carry receiver_type=UsersService on its
+	// edge Meta, which the resolver uses to pick UsersService.findOne
+	// even if other classes in the repo define a findOne too.
+	var call *graph.Edge
+	for _, ed := range edgesOfKind(result.Edges, graph.EdgeCalls) {
+		if ed.Meta != nil {
+			if rt, _ := ed.Meta["receiver_type"].(string); rt == "UsersService" {
+				call = ed
+				break
+			}
+		}
+	}
+	require.NotNil(t, call, "expected a call with receiver_type=UsersService")
+}
+
+func TestTSExtractor_AngularInjectOnlyIdentifierArg(t *testing.T) {
+	// `inject()` with a non-identifier argument (e.g. `inject(TOKEN)` where
+	// TOKEN is imported as a non-class value) should still be accepted —
+	// our extractor only gates on the argument being an identifier, not
+	// on its being a class. A non-identifier argument yields no type.
+	src := []byte(`
+import { inject } from '@angular/core';
+
+export class X {
+  private thing = inject(something.else);
+  foo() { return this.thing; }
+}
+`)
+	e := NewTypeScriptExtractor()
+	result, err := e.Extract("x.ts", src)
+	require.NoError(t, err)
+	// Should not panic; no assertion needed beyond parse cleanliness.
+	_ = result
+}

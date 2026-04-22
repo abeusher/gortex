@@ -261,6 +261,29 @@ func (e *JavaExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 		result.Edges = append(result.Edges, &graph.Edge{
 			From: id, To: classID, Kind: graph.EdgeMemberOf, FilePath: filePath, Line: def.StartLine + 1,
 		})
+		// Spring @Bean factory methods: when a method in a
+		// @Configuration class is decorated with @Bean, Spring calls
+		// it at context-init to produce a bean of the method's return
+		// type. Emit an EdgeProvides from the config class to the
+		// method so the indexer's DI post-pass links consumers typed
+		// as the return type back to this factory. Without this,
+		// `callers:systemClock` on an @Bean method returns empty.
+		if def.Node != nil && javaMethodHasAnnotation(def.Node, src, "Bean") {
+			rt, _ := node.Meta["return_type"].(string)
+			if rt != "" {
+				result.Edges = append(result.Edges, &graph.Edge{
+					From:     classID,
+					To:       id,
+					Kind:     graph.EdgeProvides,
+					FilePath: filePath,
+					Line:     def.StartLine + 1,
+					Meta: map[string]any{
+						"provides_for": rt,
+						"binding":      "bean",
+					},
+				})
+			}
+		}
 	}
 
 	// Fallback: methods not inside a class declaration.
@@ -307,11 +330,18 @@ func (e *JavaExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 		seen[id] = true
 		// Mark line so fallback query skips this constructor.
 		seen[filePath+"::_ctor_L"+fmt.Sprint(def.StartLine+1)] = true
+		// Stash param-type text so the indexer's Spring-bean
+		// post-pass can match consumers to factory methods by type
+		// name. Simpler and more precise than scanning method bodies.
+		meta := map[string]any{"receiver": className}
+		if params := javaParamsSource(def.Node, src); params != "" {
+			meta["params_src"] = params
+		}
 		result.Nodes = append(result.Nodes, &graph.Node{
 			ID: id, Kind: graph.KindMethod, Name: className + ".<init>",
 			FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
 			Language: "java",
-			Meta:     map[string]any{"receiver": className},
+			Meta:     meta,
 		})
 		result.Edges = append(result.Edges, &graph.Edge{
 			From: fileNode.ID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
@@ -513,6 +543,51 @@ func normalizeJavaTypeName(t string) string {
 
 // extractJavaMethodReturnType walks a method_declaration node to find the return
 // type child (typically a type_identifier) and returns the normalized type name.
+// javaParamsSource returns the raw source text of a constructor or
+// method's formal_parameters child, including the parentheses. Used
+// by the DI post-pass to string-match parameter types without a full
+// re-parse of the method signature.
+func javaParamsSource(methodNode *sitter.Node, src []byte) string {
+	if methodNode == nil {
+		return ""
+	}
+	for i := 0; i < int(methodNode.NamedChildCount()); i++ {
+		c := methodNode.NamedChild(i)
+		if c != nil && c.Type() == "formal_parameters" {
+			return c.Content(src)
+		}
+	}
+	return ""
+}
+
+// javaMethodHasAnnotation reports whether a method_declaration node
+// carries a top-level annotation of the given name (e.g. "Bean",
+// "Autowired"). The tree-sitter-java grammar places annotations inside
+// a `modifiers` wrapper as either `marker_annotation` (no args) or
+// `annotation` (with args). Name is the bare identifier after @.
+func javaMethodHasAnnotation(methodNode *sitter.Node, src []byte, name string) bool {
+	for i := 0; i < int(methodNode.NamedChildCount()); i++ {
+		c := methodNode.NamedChild(i)
+		if c == nil || c.Type() != "modifiers" {
+			continue
+		}
+		for j := 0; j < int(c.NamedChildCount()); j++ {
+			m := c.NamedChild(j)
+			if m == nil {
+				continue
+			}
+			if m.Type() != "marker_annotation" && m.Type() != "annotation" {
+				continue
+			}
+			nameNode := m.ChildByFieldName("name")
+			if nameNode != nil && nameNode.Content(src) == name {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func extractJavaMethodReturnType(methodNode *sitter.Node, src []byte) string {
 	for i := 0; i < int(methodNode.NamedChildCount()); i++ {
 		child := methodNode.NamedChild(i)
