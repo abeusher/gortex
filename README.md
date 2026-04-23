@@ -24,27 +24,27 @@ See [docs/agents.md](docs/agents.md) for the adapter matrix, per-agent schema no
 - **Knowledge graph** — every file, symbol, import, call chain, and type relationship in one queryable structure
 - **Multi-repo workspaces** — index multiple repositories into a single graph with cross-repo symbol resolution, project grouping, reference tags, and per-repo scoping
 - **92 languages** — tree-sitter + regex extractors across core programming (Go, TypeScript, Python, Rust, Java, C#, Kotlin, Swift, C, C++, …), scripting (Bash, PowerShell, Perl, Lua, …), functional (Haskell, OCaml, Elixir, Clojure, …), template engines (Blade, EJS, Jinja, Twig, ERB, Liquid, Pug, Handlebars), blockchain (Solidity, Move, Cairo, Noir, Tact, Ballerina), scientific (Julia, R, MATLAB, Mathematica, SAS, Stata, Fortran, COBOL, Ada, Pascal, ABAP, Apex), emerging (Mojo, Odin, V, Hare, Carbon, ReScript, Gleam), build/data (Makefile, CMake, Dockerfile, SQL, Protobuf, JSON, YAML, TOML, HCL), and more. See [docs/languages.md](docs/languages.md) for the full table
-- **49 MCP tools** — symbol lookup, call chains, blast radius, community/process discovery, contract detection, unified `analyze` (dead code, hotspots, cycles), scaffolding, inline editing, symbol renaming, read-free file writes (`edit_file` / `write_file` — no Read-before-Edit roundtrip for docs/configs/specs), multi-repo management, agent feedback loop, context export, graph-validated config hygiene (`audit_agent_config`), opening-move routing (`plan_turn`), narrative repo overview (`get_repo_outline`), test-coverage gaps (`get_untested_symbols`), and 18 agent-optimized tools
+- **50 MCP tools** — symbol lookup, call chains, blast radius, community/process discovery, contract detection, unified `analyze` (dead code, hotspots, cycles), scaffolding, inline editing, symbol renaming, read-free file writes (`edit_file` / `write_file` — no Read-before-Edit roundtrip for docs/configs/specs), multi-axis structured retrieval (`winnow_symbols`), multi-repo management, agent feedback loop, context export, graph-validated config hygiene (`audit_agent_config`), opening-move routing (`plan_turn`), narrative repo overview (`get_repo_outline`), test-coverage gaps (`get_untested_symbols`), and 18 agent-optimized tools
 - **Semantic search** — hybrid BM25 + vector search with RRF fusion. Hugot (pure-Go ONNX runtime with MiniLM-L6-v2) is bundled by default and auto-downloads the model on first use — zero-config, no native dependencies. GloVe word vectors remain as fallback. Optional build tags switch to ONNX or GoMLX for higher throughput
 - **LSP-enriched call-graph tiers** — every edge carries an `origin` tier (`lsp_resolved` / `lsp_dispatch` / `ast_resolved` / `ast_inferred` / `text_matched`); pass `min_tier` to `get_callers`, `find_usages`, `find_implementations`, etc. to restrict results to compiler-verified edges for high-stakes refactors
 - **MCP progress notifications** — long-running indexing and track_repository calls emit `notifications/progress` with stage messages (walking files → parsing → resolving → semantic enrichment → search index → contracts → done) so hosts show real progress bars on large repos
 - **Type-aware resolution** — infers receiver types from variable declarations, composite literals, and Go constructor conventions to disambiguate same-named methods across types
 - **On-disk persistence** — snapshots the graph on shutdown, restores on startup with incremental re-indexing of only changed files (~200ms vs 3-5s full re-index)
-- **Bridge Mode** — HTTP/JSON API exposing all MCP tools for IDE plugins, CI tools, and web UIs with CORS support and tool discovery endpoint
+- **HTTP server (`gortex server`)** — versioned `/v1/*` JSON API exposing all MCP tools (`/v1/health`, `/v1/tools`, `/v1/tools/{name}`, `/v1/stats`, `/v1/graph`, `/v1/events` SSE) for IDE plugins, CI, and the Next.js web UI. Localhost bind + bearer-token auth (`--auth-token` / `$GORTEX_SERVER_TOKEN`) by default; CORS configurable for separate frontend origins
 - **Semantic enrichment** — pluggable SCIP, go/types, and LSP providers upgrade edge confidence from ~70-85% (tree-sitter) to 95-100% (compiler-verified). Additive — graceful degradation when external tools unavailable
 - **Agent feedback loop** — unified `feedback` tool (`action: "record"` / `"query"`) lets agents report which symbols were useful/missing. Cross-session persistence improves future `smart_context` quality via feedback-aware reranking
 - **Context export** — `export_context` tool + `gortex context` CLI render graph context as portable markdown/JSON briefings for sharing outside MCP (Slack, PRs, docs, non-MCP AI tools)
 - **ETag conditional fetch** — content-hash based `if_none_match` on source-reading tools avoids re-transmitting unchanged symbols during iterative editing
 - **Token savings tracking** — per-call `tokens_saved` field on source-reading tools + session-level metrics in `graph_stats` (calls counted, tokens returned, tokens saved, efficiency ratio)
-- **GCX1 compact wire format** — published, round-trippable text format for MCP tool responses. Opt-in per call via `format: "gcx"` on 13 tools. **Median −27.4% tiktoken savings** vs JSON across a 20-case benchmark (best case −38.3%), 100% round-trip integrity. Spec: [`docs/wire-format.md`](docs/wire-format.md). TypeScript decoder on npm: [`@gortex/wire`](https://www.npmjs.com/package/@gortex/wire). Reproducible harness: [`bench/wire-format/`](bench/wire-format/)
+- **GCX1 compact wire format** — published, round-trippable text format for MCP tool responses. Opt-in per call via `format: "gcx"` on 13 tools. **Median −27.4% tiktoken savings** vs JSON across a 20-case benchmark (best case −38.3%), 100% round-trip integrity. Spec: [`docs/wire-format.md`](docs/wire-format.md). Standalone MIT-licensed reference implementations: Go ([`github.com/gortexhq/gcx-go`](https://github.com/gortexhq/gcx-go)) and TypeScript ([`github.com/gortexhq/gcx-ts`](https://github.com/gortexhq/gcx-ts), npm [`@gortex/wire`](https://www.npmjs.com/package/@gortex/wire)). Reproducible harness: [`bench/wire-format/`](bench/wire-format/)
 - **7 MCP resources** — lightweight graph context without tool calls
 - **3 MCP prompts** — `pre_commit`, `orientation`, `safe_to_change` for guided workflows
 - **Two-tier config** — global config (`~/.config/gortex/config.yaml`) for projects and repo lists, per-repo `.gortex.yaml` for guards, excludes, and local overrides
 - **Guard rules** — project-specific constraints (co-change, boundary) enforced via `check_guards`
 - **Watch mode** — surgical graph updates on file change across all tracked repos, live sync with agents
-- **Web UI** — Sigma.js force-directed visualization with node size proportional to importance
+- **Web UI** — standalone Next.js 15 app (`web/`) that talks to `gortex server` over `/v1/*`, with Sigma.js 2D graphs and five react-three-fiber 3D views (City, Strata, Galaxies, Constellation, Graph3D)
 - **IMPLEMENTS inference** — structural interface satisfaction for Go, TypeScript, Java, Rust, C#, Scala, Swift, Protobuf
-- **PreToolUse + PreCompact + Stop hooks** — PreToolUse enriches Read/Grep/Glob with graph context and redirects to Gortex MCP tools; matching `Task` also briefs spawned subagents with an inline tool-swap table + task-scoped `smart_context` so subagents don't fall back to grep/Read. PreCompact injects a condensed orientation snapshot (index stats, recently-modified symbols, top hotspots, feedback-ranked symbols) before Claude Code compacts the conversation. Stop runs post-task diagnostics (`detect_changes` → `get_test_targets`, `check_guards`, `analyze dead_code`, `contracts check` on modified symbols) so the agent self-corrects before handoff. All hooks degrade silently when the bridge is unreachable
+- **PreToolUse + PreCompact + Stop hooks** — PreToolUse enriches Read/Grep/Glob/Bash (`codebase-search` / `rg` / `grep` probes routed through graph tools) with graph context and redirects to Gortex MCP tools; matching `Task` also briefs spawned subagents with an inline tool-swap table + task-scoped `smart_context` so subagents don't fall back to grep/Read. PreCompact injects a condensed orientation snapshot (index stats, recently-modified symbols, top hotspots, feedback-ranked symbols) before Claude Code compacts the conversation. Stop runs post-task diagnostics (`detect_changes` → `get_test_targets`, `check_guards`, `analyze dead_code`, `contracts check` on modified symbols) so the agent self-corrects before handoff. All hooks degrade silently when the server is unreachable
 - **Long-living daemon (optional)** — `gortex daemon start` runs a single shared process that holds the graph for every tracked repo. Each Claude Code / Cursor / Kiro window connects as a thin stdio proxy over a Unix socket, getting per-client session isolation (recent activity, token stats) + cross-repo queries by default. Live fsnotify watching on every tracked repo so file edits flow into the graph without manual reload. `gortex install` sets up user-level config; `gortex daemon install-service` installs a LaunchAgent (macOS) or systemd `--user` unit (Linux) so the OS supervises lifecycle and auto-starts at login — no sudo required. Binaries fall back to embedded mode if the daemon isn't running; the feature is additive
 - **Benchmarked** — per-language parsing, query engine, indexer benchmarks
 - **Per-community skills** — `gortex init --skills` (default on) auto-generates SKILL.md per detected community with key files, entry points, cross-community connections, and MCP tool invocations for Claude Code auto-discovery; the same routing table lands in every detected agent's per-repo instructions file
@@ -237,7 +237,7 @@ gortex mcp --no-daemon --watch          # explicit embedded mode
 ### Other commands
 
 ```bash
-gortex server --index . --web           # HTTP server API + web graph UI at :4747
+gortex server --index .                  # HTTP/JSON API on :4747 (/v1/*). Run `cd web && npm run dev` for the UI.
 gortex savings                           # cumulative tokens saved + $ avoided across sessions
 gortex version
 ```
@@ -374,17 +374,20 @@ Tool-usage guidance for agents that have a user-level surface (Claude Code, Anti
 ```
 gortex install               One-time machine-wide setup (user-level MCP, skills, hooks, daemon wiring)
 gortex init [path]           Per-repo setup (.mcp.json, hooks, community routing, per-community SKILL.md)
-gortex mcp [flags]           Start the MCP server (--server to add HTTP API)
-gortex server [flags]        Start standalone HTTP server API
-gortex eval-server [flags]   Start eval HTTP server for benchmarking
-gortex eval <subcommand>     Retrieval-quality + token-savings benchmarks (recall, embedders, swebench, tokens)
+gortex init doctor           Zero-op drift report across all detected agents (human or --json)
+gortex mcp [flags]            Start the MCP stdio server (auto-detects daemon; --no-daemon / --proxy; --server adds HTTP API)
+gortex server [flags]         Start the HTTP/JSON API under /v1/* (--bind, --auth-token, --watch, --cors-origin)
+gortex daemon <subcommand>   start / stop / restart / reload / status / logs / install-service / service-status / uninstall-service
+gortex eval <subcommand>     Retrieval + token benchmarks — recall, embedders, swebench, tokens
+gortex eval-server [flags]   HTTP server used by the swebench harness
 gortex context [flags]       Generate portable context briefing for a task
 gortex savings [flags]       Show cumulative token savings + cost avoided across sessions
 gortex index [path...]       Index one or more repositories and print stats
 gortex status [flags]        Show index status (per-repo and per-project in multi-repo mode)
 gortex track <path>          Add a repository to the tracked workspace
 gortex untrack <path>        Remove a repository from the tracked workspace
-gortex query <subcommand>    Query the knowledge graph
+gortex config exclude ...    add / list / remove entries in the effective ignore list
+gortex query <subcommand>    Query the knowledge graph from the CLI
 gortex clean                 Remove Gortex files from a project
 gortex version               Print version
 ```
@@ -404,16 +407,19 @@ gortex query stats                      Show graph statistics
 
 All query commands support `--format text|json|dot` (DOT output for Graphviz visualization).
 
-## MCP Tools (49)
+## MCP Tools (50)
 
 ### Core Navigation
 | Tool | Description |
 |------|-------------|
 | `graph_stats` | Node/edge counts by kind, language, per-repo stats, and session token savings |
 | `search_symbols` | Find symbols by name (replaces Grep). Accepts `repo`, `project`, `ref` params |
+| `winnow_symbols` | Structured constraint-chain retrieval — `kind`, `language`, `community`, `path_prefix`, `min_fan_in`, `min_fan_out`, `min_churn`, `text_match` with per-axis score contributions |
 | `get_symbol` | Symbol location and signature (replaces Read). Accepts `repo`, `project`, `ref` params |
 | `get_file_summary` | All symbols and imports in a file. Accepts `repo`, `project`, `ref` params |
 | `get_editing_context` | **Primary pre-edit tool** — symbols, signatures, callers, callees |
+| `get_repo_outline` | Narrative single-call repo overview — top languages, communities, hotspots, most-imported files, entry points |
+| `plan_turn` | Opening-move router — returns ranked next calls with pre-filled args for a task description (~200 tokens) |
 
 ### Graph Traversal
 | Tool | Description |
@@ -445,6 +451,7 @@ All query commands support `--format text|json|dot` (DOT output for Graphviz vis
 | `smart_context` | Task-aware minimal context — replaces 5-10 exploration calls |
 | `get_edit_plan` | Dependency-ordered edit sequence for multi-file refactors |
 | `get_test_targets` | Maps changed symbols to test files and run commands |
+| `get_untested_symbols` | Inverse of `get_test_targets` — functions/methods not reached from any test file, ranked by fan-in |
 | `suggest_pattern` | Extracts code pattern from an example — source, registration, tests |
 | `export_context` | Portable markdown/JSON context briefing for sharing outside MCP |
 | `feedback` | `action: "record"`: report useful/missing symbols. `action: "query"`: aggregated stats — most useful, most missed, accuracy metrics |
@@ -510,41 +517,45 @@ All query commands support `--format text|json|dot` (DOT output for Graphviz vis
 
 ## Web UI
 
-Gortex includes a standalone Next.js web application (`web/` directory) with 10 pages:
+Gortex ships a standalone Next.js 15 application under `web/`. It runs separately from the backend and talks to `gortex server` over `/v1/*`:
 
 ```bash
-# Start the backend
-gortex server --index /path/to/repo --web --port 4747
+# 1) Start the HTTP backend (localhost:4747 by default, bearer-auth in non-localhost binds)
+gortex server --index /path/to/repo --watch
 
-# Start the web UI
-cd web && npm run dev
+# 2) Start the frontend in another terminal
+cd web
+# point the UI at the backend (and at an auth token if you set one on the server)
+echo 'NEXT_PUBLIC_GORTEX_URL=http://localhost:4747' > .env.local
+npm install && npm run dev
 # Open http://localhost:3000
 ```
 
 | Page | Features |
 |------|----------|
 | **Dashboard** | Health, stats, language pie chart, node kind bar chart |
-| **Graph Explorer** | Interactive Sigma.js + ForceAtlas2, node filters, selection, detail panel |
-| **Search** | Semantic search via server API, results grouped by kind |
+| **Graph Explorer** | Sigma.js 2D + five react-three-fiber 3D modes (City / Strata / Galaxies / Constellation / Graph3D), node filters, selection, detail panel |
+| **Search** | Semantic + BM25 search via `/v1/*`, results grouped by kind |
 | **Symbol Detail** | Source code, signature, callers/callees/usages/deps tabs |
 | **Communities** | Community cards with cohesion bars, expandable members |
-| **Processes** | Execution flow table with step lists |
+| **Processes** | Collapsible call-tree steps, product vs test process split |
 | **Analysis** | Dead code, hotspots, cycles, index health — 4 tabs |
-| **Contracts** | API contracts (HTTP, gRPC, GraphQL, topics, WebSocket, env vars) with provider/consumer matching |
+| **Contracts** | API contracts (HTTP, gRPC, GraphQL, topics, WebSocket, env vars) with provider/consumer matching, request/response type tracing, `yours / tests / deps / all` scope filter |
 | **Services** | Service-level graph visualization with per-repo stats |
 | **AI Chat** | LLM-powered chat with code context (placeholder) |
 
-The legacy embedded web UI (Sigma.js on `:8765`) is still available via `gortex mcp --web`.
-
 ## Server Mode
 
-The `gortex server` command exposes all MCP tools as an HTTP/JSON API for external integrations:
+The `gortex server` command exposes all MCP tools as an HTTP/JSON API under versioned `/v1/*` routes:
 
 ```bash
-# Standalone HTTP server with web UI
-gortex server --index /path/to/repo --web --port 4747
+# Standalone HTTP backend (default bind 127.0.0.1:4747)
+gortex server --index /path/to/repo --watch
 
-# HTTP server alongside MCP stdio
+# Non-localhost bind requires an auth token
+gortex server --index . --bind 0.0.0.0 --auth-token "$(openssl rand -hex 32)"
+
+# HTTP API alongside MCP stdio (same process)
 gortex mcp --index /path/to/repo --server --port 8765
 ```
 
@@ -553,12 +564,12 @@ gortex mcp --index /path/to/repo --server --port 8765
 |----------|--------|-------------|
 | `/v1/health` | GET | Status, node/edge counts, uptime |
 | `/v1/tools` | GET | List all available tools with descriptions |
-| `/v1/tools/{name}` | POST | Invoke any MCP tool with JSON arguments |
-| `/v1/stats` | GET | Graph statistics by kind and language |
+| `/v1/tools/{name}` | POST | Invoke any MCP tool with JSON arguments. Accepts `?format=gcx` or top-level `"format"` in the body |
+| `/v1/stats` | GET | Graph statistics by kind and language, plus `server_id` + `started_at` |
 | `/v1/graph` | GET | Full brief-graph dump (nodes + edges + stats); accepts `?project=` and/or `?repo=` for scoping |
-| `/v1/events` | GET | SSE stream of graph-change events (requires `--watch`) |
+| `/v1/events` | GET | SSE stream of graph-change events (requires `--watch`). Accepts `?token=<t>` for `EventSource` auth |
 
-CORS is enabled by default (`--cors-origin '*'`). The Next.js frontend in `web/` is the intended UI — it runs separately (`cd web && npm run dev`) and talks to the server over `/v1/*`.
+**Auth & binding.** The server defaults to `--bind 127.0.0.1` and runs unauthenticated on localhost only (logs `server: unauthenticated mode; localhost only`). Set `--auth-token <token>` or `$GORTEX_SERVER_TOKEN` to require `Authorization: Bearer <token>` on every `/v1/*` request (constant-time compare; CORS preflights bypass). Non-localhost binds without a token are rejected at startup. CORS origin is configurable via `--cors-origin` (default `*`).
 
 ## Cross-Repo API Contracts
 
@@ -566,7 +577,7 @@ Gortex detects API contracts across repos and matches providers to consumers:
 
 ```bash
 # After indexing, contracts are auto-detected
-gortex server --index . --web
+gortex server --index .
 
 # Via MCP tools
 contracts                        # list all detected contracts (default action)
@@ -700,12 +711,12 @@ Parsing dominates wall time (65–80%); reference resolution and search-index bu
 
 ```
 gortex binary
-  CLI (cobra)  ──> MultiIndexer ──> In-Memory Graph (shared, per-repo indexed)
-  MCP Server ──────────────────────> Query Engine (repo/project/ref scoping)
-  Bridge API ──────────────────────> (HTTP/JSON over MCP tools)
-  Web Server ──────────────────────> (Nodes + Edges + byRepo index)
-  MCP Prompts ─────────────────────> (pre_commit, orientation, safe_to_change)
-  MCP Resources ───────────────────> (session, stats, schema, communities, processes)
+  CLI (cobra)    ──> MultiIndexer ──> In-Memory Graph (shared, per-repo indexed)
+  MCP (stdio)    ──────────────────> Query Engine (repo/project/ref scoping)
+  HTTP /v1/*     ──────────────────> same tools + /v1/graph + /v1/events (SSE)
+  Daemon (unix)  ──────────────────> shared graph for every MCP client, session isolation
+  MCP Prompts    ──────────────────> (pre_commit, orientation, safe_to_change)
+  MCP Resources  ──────────────────> (session, stats, schema, communities, processes)
                    MultiWatcher <── filesystem events (fsnotify, per-repo)
                    CrossRepoResolver ──> cross-repo edge creation (type-aware)
                    Persistence ──> gob+gzip snapshot (pluggable backend)
