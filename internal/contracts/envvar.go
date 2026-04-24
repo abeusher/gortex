@@ -46,25 +46,47 @@ func (e *EnvVarExtractor) SupportedLanguages() []string {
 	return []string{"go", "typescript", "javascript", "python", "java", "env", "yaml"}
 }
 
+// envCodePrefilterMarkers covers every code-path regex (consumer
+// + provider). A file must contain at least one of these before we
+// run the seven consumer regexes and one provider regex — typical
+// .go/.ts source files without env-var access short-circuit here.
+// Env files and docker-compose are routed to separate extractors
+// before this check.
+var envCodePrefilterMarkers = [][]byte{
+	[]byte("Getenv"),      // os.Getenv / System.getenv (both capitalised)
+	[]byte("getenv"),      // python os.getenv / lowercase variants
+	[]byte("LookupEnv"),   // os.LookupEnv
+	[]byte("Setenv"),      // os.Setenv provider
+	[]byte("process.env"), // TS/JS
+	[]byte("os.environ"),  // python
+}
+
 func (e *EnvVarExtractor) Extract(filePath string, src []byte, nodes []*graph.Node, edges []*graph.Edge) []Contract {
 	var contracts []Contract
 
 	if isEnvFile(filePath) {
 		contracts = append(contracts, e.extractEnvFileProviders(filePath, src)...)
-	} else if isDockerCompose(filePath) {
-		contracts = append(contracts, e.extractDockerComposeProviders(filePath, src)...)
-	} else {
-		// Thread file nodes into consumer extraction so each os.Getenv
-		// site anchors on its enclosing function — required for tools
-		// like get_dependencies(handler) to trace which env vars a
-		// request needs read.
-		fileNodes := filterFileNodes(filePath, nodes)
-		sort.Slice(fileNodes, func(i, j int) bool {
-			return fileNodes[i].StartLine < fileNodes[j].StartLine
-		})
-		contracts = append(contracts, e.extractCodeConsumers(filePath, src, fileNodes)...)
-		contracts = append(contracts, e.extractCodeProviders(filePath, src)...)
+		return contracts
 	}
+	if isDockerCompose(filePath) {
+		contracts = append(contracts, e.extractDockerComposeProviders(filePath, src)...)
+		return contracts
+	}
+
+	if !srcHasAnyMarker(src, envCodePrefilterMarkers) {
+		return nil
+	}
+
+	// Thread file nodes into consumer extraction so each os.Getenv
+	// site anchors on its enclosing function — required for tools
+	// like get_dependencies(handler) to trace which env vars a
+	// request needs read.
+	fileNodes := filterFileNodes(filePath, nodes)
+	sort.Slice(fileNodes, func(i, j int) bool {
+		return fileNodes[i].StartLine < fileNodes[j].StartLine
+	})
+	contracts = append(contracts, e.extractCodeConsumers(filePath, src, fileNodes)...)
+	contracts = append(contracts, e.extractCodeProviders(filePath, src)...)
 
 	return contracts
 }

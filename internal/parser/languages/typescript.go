@@ -10,78 +10,104 @@ import (
 	"github.com/zzet/gortex/internal/parser"
 )
 
-const (
-	tsQFunction = `(function_declaration
-		name: (identifier) @func.name) @func.def`
+// tsQAll is one tree-sitter query with 13 alternation patterns covering
+// everything the TypeScript extractor needs at the root of a file. One
+// query = one tree walk per Extract call, down from 14 walks in the
+// per-query-per-call design. Each pattern uses a disjoint set of
+// capture names so the dispatch below can branch on which name is set.
+//
+// method_definition and public_field_definition are captured at file
+// scope here (hoisted out of per-class subqueries); the dispatcher
+// walks up from the matched node to find the enclosing class.
+const tsQAll = `
+[
+  (function_declaration
+    name: (identifier) @func.name) @func.def
 
-	tsQArrow = `(lexical_declaration
-		(variable_declarator
-			name: (identifier) @func.name
-			value: (arrow_function) @func.body)) @func.def`
+  (lexical_declaration
+    (variable_declarator
+      name: (identifier) @arrow.name
+      value: (arrow_function) @arrow.body)) @arrow.def
 
-	tsQClass = `(class_declaration
-		name: (type_identifier) @class.name) @class.def`
+  (class_declaration
+    name: (type_identifier) @class.name) @class.def
 
-	tsQInterface = `(interface_declaration
-		name: (type_identifier) @iface.name) @iface.def`
+  (interface_declaration
+    name: (type_identifier) @iface.name) @iface.def
 
-	tsQTypeAlias = `(type_alias_declaration
-		name: (type_identifier) @type.name) @type.def`
+  (type_alias_declaration
+    name: (type_identifier) @type.name) @type.def
 
-	tsQMethod = `(method_definition
-		name: (property_identifier) @method.name) @method.def`
+  (enum_declaration
+    name: (identifier) @enum.name) @enum.def
 
-	tsQImport = `(import_statement
-		source: (string) @import.path) @import.def`
+  (import_statement
+    source: (string) @import.path) @import.def
 
-	tsQCall = `(call_expression
-		function: (identifier) @call.name) @call.expr`
+  (call_expression
+    function: (identifier) @call.name) @call.expr
 
-	tsQCallMember = `(call_expression
-		function: (member_expression
-			object: (_) @call.receiver
-			property: (property_identifier) @call.method)) @call.expr`
+  (call_expression
+    function: (member_expression
+      object: (_) @callm.receiver
+      property: (property_identifier) @callm.method)) @callm.expr
 
-	tsQVar = `(lexical_declaration
-		(variable_declarator
-			name: (identifier) @var.name)) @var.def`
+  (lexical_declaration
+    (variable_declarator
+      name: (identifier) @tvar.name
+      type: (type_annotation (_) @tvar.type))) @tvar.def
 
-	tsQVarTyped = `(lexical_declaration
-		(variable_declarator
-			name: (identifier) @tvar.name
-			type: (type_annotation (_) @tvar.type))) @tvar.def`
+  (lexical_declaration
+    (variable_declarator
+      name: (identifier) @var.name)) @var.def
 
-	tsQExport = `(export_statement
-		(function_declaration
-			name: (identifier) @func.name)) @func.def`
+  (method_definition
+    name: (property_identifier) @method.name) @method.def
 
-	// Enums and their members. Tree-sitter-typescript represents an
-	// enum body as `enum_body` containing either bare
-	// `property_identifier` values or `enum_assignment` nodes with a
-	// name field. We capture both via the parent enum_declaration so
-	// a single query walks both patterns.
-	tsQEnum = `(enum_declaration
-		name: (identifier) @enum.name) @enum.def`
-
-	// Class property (field) declarations — `readonly foo: string`,
-	// `private _bar = 42`, etc. These are typed, visible members that
-	// agents should be able to search for. Distinct from method
-	// definitions (already handled by tsQMethod).
-	tsQClassProperty = `(public_field_definition
-		name: (property_identifier) @prop.name) @prop.def`
-)
+  (public_field_definition
+    name: (property_identifier) @prop.name) @prop.def
+]
+`
 
 // TypeScriptExtractor extracts TypeScript/JavaScript source files.
 type TypeScriptExtractor struct {
 	lang *sitter.Language
+	qAll *parser.PreparedQuery
 }
 
 func NewTypeScriptExtractor() *TypeScriptExtractor {
-	return &TypeScriptExtractor{lang: typescript.GetLanguage()}
+	lang := typescript.GetLanguage()
+	return &TypeScriptExtractor{
+		lang: lang,
+		qAll: parser.MustPreparedQuery(tsQAll, lang),
+	}
 }
 
 func (e *TypeScriptExtractor) Language() string     { return "typescript" }
 func (e *TypeScriptExtractor) Extensions() []string { return []string{".ts", ".tsx"} }
+
+// deferredCall holds a call_expression match whose edge can only be
+// emitted after every function/method node exists (so funcRanges can
+// attribute the call to its enclosing definition) and after the type
+// env is fully populated.
+type deferredCall struct {
+	name     string // identifier callee name (or "" for member calls)
+	method   string // method name for member calls
+	receiver string // receiver text for member calls
+	line     int    // 1-based line of the call_expression
+	isMember bool
+}
+
+// deferredVar holds a lexical_declaration match whose emission is
+// delayed until arrow-function names for the whole file are known
+// (otherwise a `const foo = () => {}` would emit both a function and a
+// variable node for foo).
+type deferredVar struct {
+	name    string
+	defNode *sitter.Node
+	startLn int // 0-based
+	endLn   int // 0-based
+}
 
 func (e *TypeScriptExtractor) Extract(filePath string, src []byte) (*parser.ExtractionResult, error) {
 	tree, err := parser.ParseFile(src, e.lang)
@@ -98,397 +124,491 @@ func (e *TypeScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 		FilePath: filePath, StartLine: 1, EndLine: int(root.EndPoint().Row) + 1,
 		Language: "typescript",
 	}
+	fileID := fileNode.ID
 	result.Nodes = append(result.Nodes, fileNode)
 
-	// Functions.
-	for _, q := range []string{tsQFunction, tsQExport} {
-		e.extractFuncs(q, root, src, filePath, fileNode.ID, result)
-	}
-
-	// Arrow functions assigned to variables.
-	e.extractArrowFuncs(root, src, filePath, fileNode.ID, result)
-
-	// Classes.
-	e.extractClasses(root, src, filePath, fileNode.ID, result)
-
-	// Interfaces.
-	e.extractInterfaces(root, src, filePath, fileNode.ID, result)
-
-	// Enums (declaration + members).
-	e.extractEnums(root, src, filePath, fileNode.ID, result)
-
-	// Type aliases.
-	e.extractTypeAliases(root, src, filePath, fileNode.ID, result)
-
-	// Imports. Returned alias→path map threads into extractCalls so
-	// selector calls like `json.parse` attribute to the owning module.
-	imports := e.extractImports(root, src, filePath, fileNode.ID, result)
-
-	// Build type environment for receiver type inference.
-	tenv := e.buildTypeEnv(root, src)
-
-	// Call sites (with type env + imports).
-	e.extractCalls(root, src, filePath, result, tenv, imports)
-
-	// Variables.
-	e.extractVariables(root, src, filePath, fileNode.ID, result)
-
-	return result, nil
-}
-
-func (e *TypeScriptExtractor) extractFuncs(q string, root *sitter.Node, src []byte, filePath, fileID string, result *parser.ExtractionResult) {
-	matches, _ := parser.RunQuery(q, e.lang, root, src)
-	for _, m := range matches {
-		name := m.Captures["func.name"].Text
-		def := m.Captures["func.def"]
-		id := filePath + "::" + name
-		result.Nodes = append(result.Nodes, &graph.Node{
-			ID: id, Kind: graph.KindFunction, Name: name,
-			FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
-			Language: "typescript", Meta: map[string]any{"signature": fmt.Sprintf("function %s()", name)},
-		})
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
-		})
-	}
-}
-
-func (e *TypeScriptExtractor) extractArrowFuncs(root *sitter.Node, src []byte, filePath, fileID string, result *parser.ExtractionResult) {
-	matches, _ := parser.RunQuery(tsQArrow, e.lang, root, src)
-	for _, m := range matches {
-		name := m.Captures["func.name"].Text
-		def := m.Captures["func.def"]
-		id := filePath + "::" + name
-		result.Nodes = append(result.Nodes, &graph.Node{
-			ID: id, Kind: graph.KindFunction, Name: name,
-			FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
-			Language: "typescript", Meta: map[string]any{"signature": fmt.Sprintf("const %s = () =>", name)},
-		})
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
-		})
-	}
-}
-
-func (e *TypeScriptExtractor) extractClasses(root *sitter.Node, src []byte, filePath, fileID string, result *parser.ExtractionResult) {
-	matches, _ := parser.RunQuery(tsQClass, e.lang, root, src)
-	for _, m := range matches {
-		name := m.Captures["class.name"].Text
-		def := m.Captures["class.def"]
-		id := filePath + "::" + name
-		result.Nodes = append(result.Nodes, &graph.Node{
-			ID: id, Kind: graph.KindType, Name: name,
-			FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
-			Language: "typescript",
-		})
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
-		})
-
-		// Methods inside the class.
-		e.extractMethods(def.Node, src, filePath, id, result)
-
-		// Fields / properties inside the class. Without this,
-		// class_body's public_field_definition children are
-		// invisible to search; a typical VSCode class (10-30
-		// fields) loses most of its surface area in the graph.
-		e.extractClassProperties(def.Node, src, filePath, id, result)
-
-		// NestJS module providers: `@Module({ providers: [{ provide: X,
-		// useClass: Y }] })` declares that when a consumer asks for X it
-		// receives Y. Emit an EdgeProvides from the module to Y tagged
-		// with provides_for=X so the resolver can pick the bound
-		// implementation when receiver_type is abstract. useValue /
-		// useFactory / useExisting variants emit a different-shaped edge
-		// (module → token) that the DI-token feature consumes below.
-		if def.Node != nil {
-			emitModuleBindings(def.Node, src, id, filePath, result)
-			// @Inject(TOKEN) on constructor params: the declaring class
-			// consumes the token. Emit an EdgeConsumes from the class
-			// (not the constructor method) to the token so find_usages
-			// on the token surfaces the consumer directly.
-			emitInjectConsumers(def.Node, src, id, filePath, result)
-		}
-	}
-}
-
-// extractEnums adds enum declarations (as KindType) plus each member
-// (as KindVariable with a member_of edge back to the enum). Enums are
-// first-class value namespaces in TypeScript: `KeybindingWeight.EditorCore`
-// resolves to a member, so users should be able to search for both the
-// enum and its cases.
-func (e *TypeScriptExtractor) extractEnums(root *sitter.Node, src []byte, filePath, fileID string, result *parser.ExtractionResult) {
-	matches, _ := parser.RunQuery(tsQEnum, e.lang, root, src)
-	for _, m := range matches {
-		name := m.Captures["enum.name"].Text
-		def := m.Captures["enum.def"]
-		id := filePath + "::" + name
-
-		result.Nodes = append(result.Nodes, &graph.Node{
-			ID: id, Kind: graph.KindType, Name: name,
-			FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
-			Language: "typescript",
-			Meta:     map[string]any{"kind": "enum"},
-		})
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileID, To: id, Kind: graph.EdgeDefines,
-			FilePath: filePath, Line: def.StartLine + 1,
-		})
-
-		// Walk the enum body for member names. The grammar yields
-		// enum_body → (property_identifier | enum_assignment) children.
-		// Handle both so `FOO` and `FOO = 1` style members both land.
-		if def.Node == nil {
-			continue
-		}
-		for i := 0; i < int(def.Node.ChildCount()); i++ {
-			child := def.Node.Child(i)
-			if child == nil || child.Type() != "enum_body" {
-				continue
-			}
-			for j := 0; j < int(child.ChildCount()); j++ {
-				mem := child.Child(j)
-				if mem == nil {
-					continue
-				}
-				var memberName string
-				var memberNode *sitter.Node
-				switch mem.Type() {
-				case "property_identifier":
-					memberName = mem.Content(src)
-					memberNode = mem
-				case "enum_assignment":
-					nameNode := mem.ChildByFieldName("name")
-					if nameNode != nil {
-						memberName = nameNode.Content(src)
-						memberNode = mem
-					}
-				}
-				if memberName == "" || memberNode == nil {
-					continue
-				}
-				memberID := id + "." + memberName
-				result.Nodes = append(result.Nodes, &graph.Node{
-					ID: memberID, Kind: graph.KindVariable, Name: memberName,
-					FilePath:  filePath,
-					StartLine: int(memberNode.StartPoint().Row) + 1,
-					EndLine:   int(memberNode.EndPoint().Row) + 1,
-					Language:  "typescript",
-					Meta:      map[string]any{"receiver": name, "kind": "enum_member"},
-				})
-				result.Edges = append(result.Edges, &graph.Edge{
-					From: memberID, To: id, Kind: graph.EdgeMemberOf,
-					FilePath: filePath, Line: int(memberNode.StartPoint().Row) + 1,
-				})
-			}
-		}
-	}
-}
-
-// extractClassProperties walks a class_body for public_field_definition
-// nodes and adds them as KindVariable with member_of edges to the class.
-// TS classes routinely carry 10-30 typed fields; missing them bleeds a
-// lot of useful graph surface area.
-func (e *TypeScriptExtractor) extractClassProperties(classNode *sitter.Node, src []byte, filePath, classID string, result *parser.ExtractionResult) {
-	className := classID[strings.LastIndex(classID, "::")+2:]
-	matches, _ := parser.RunQuery(tsQClassProperty, e.lang, classNode, src)
-	for _, m := range matches {
-		name := m.Captures["prop.name"].Text
-		def := m.Captures["prop.def"]
-		id := filePath + "::" + className + "." + name
-		result.Nodes = append(result.Nodes, &graph.Node{
-			ID: id, Kind: graph.KindVariable, Name: name,
-			FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
-			Language: "typescript",
-			Meta:     map[string]any{"receiver": className, "kind": "class_property"},
-		})
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: id, To: classID, Kind: graph.EdgeMemberOf,
-			FilePath: filePath, Line: def.StartLine + 1,
-		})
-	}
-}
-
-func (e *TypeScriptExtractor) extractMethods(classNode *sitter.Node, src []byte, filePath, classID string, result *parser.ExtractionResult) {
-	className := classID[strings.LastIndex(classID, "::")+2:]
-	matches, _ := parser.RunQuery(tsQMethod, e.lang, classNode, src)
-	for _, m := range matches {
-		name := m.Captures["method.name"].Text
-		def := m.Captures["method.def"]
-		id := filePath + "::" + className + "." + name
-		node := &graph.Node{
-			ID: id, Kind: graph.KindMethod, Name: name,
-			FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
-			Language: "typescript",
-			Meta:     map[string]any{"receiver": className},
-		}
-		// Walk the method_definition node's children for a return type annotation.
-		if def.Node != nil {
-			if rt := extractTSMethodReturnType(def.Node, src); rt != "" {
-				node.Meta["return_type"] = rt
-			}
-		}
-		result.Nodes = append(result.Nodes, node)
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: id, To: classID, Kind: graph.EdgeMemberOf, FilePath: filePath, Line: def.StartLine + 1,
-		})
-		// NestJS-style decorator dispatch: `@UseGuards(AuthGuard)` on a
-		// method binds `AuthGuard.canActivate` to framework-side invocation
-		// when the method handles a request. No source call site exists,
-		// so the graph is blind to it without this synthetic edge. Also
-		// covers @UseInterceptors / @UseFilters / @UsePipes.
-		//
-		// In tree-sitter-typescript, method decorators are SIBLINGS of the
-		// method_definition inside class_body (not children), so we walk
-		// prev siblings backward until we hit a non-decorator node.
-		if def.Node != nil {
-			for sib := def.Node.PrevSibling(); sib != nil && sib.Type() == "decorator"; sib = sib.PrevSibling() {
-				emitDispatchFromDecorator(sib, src, id, filePath, result)
-			}
-		}
-	}
-}
-
-func (e *TypeScriptExtractor) extractInterfaces(root *sitter.Node, src []byte, filePath, fileID string, result *parser.ExtractionResult) {
-	matches, _ := parser.RunQuery(tsQInterface, e.lang, root, src)
-	for _, m := range matches {
-		name := m.Captures["iface.name"].Text
-		def := m.Captures["iface.def"]
-		id := filePath + "::" + name
-
-		// Walk the interface body to extract method/property signature names.
-		var methods []string
-		if def.Node != nil {
-			methods = extractTSInterfaceMethods(def.Node, src)
-		}
-
-		result.Nodes = append(result.Nodes, &graph.Node{
-			ID: id, Kind: graph.KindInterface, Name: name,
-			FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
-			Language: "typescript",
-			Meta:     map[string]any{"methods": methods},
-		})
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
-		})
-	}
-}
-
-func (e *TypeScriptExtractor) extractTypeAliases(root *sitter.Node, src []byte, filePath, fileID string, result *parser.ExtractionResult) {
-	matches, _ := parser.RunQuery(tsQTypeAlias, e.lang, root, src)
-	for _, m := range matches {
-		name := m.Captures["type.name"].Text
-		def := m.Captures["type.def"]
-		id := filePath + "::" + name
-		result.Nodes = append(result.Nodes, &graph.Node{
-			ID: id, Kind: graph.KindType, Name: name,
-			FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
-			Language: "typescript",
-		})
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
-		})
-	}
-}
-
-// extractImports emits one EdgeImports per import_statement and returns
-// a per-file alias→importPath map. We only record aliases that appear
-// as receivers in selector calls downstream:
-//
-//   import foo from 'mod'          → foo → mod   (default)
-//   import * as foo from 'mod'     → foo → mod   (namespace)
-//   import { a, b as c } from 'x'  → not tracked (called as bare identifier)
-//
-// Named imports are intentionally skipped — `a(x)` is already a plain
-// call matched by tsQCall and doesn't go through the selector-call path.
-func (e *TypeScriptExtractor) extractImports(root *sitter.Node, src []byte, filePath, fileID string, result *parser.ExtractionResult) map[string]string {
 	imports := map[string]string{}
-	matches, _ := parser.RunQuery(tsQImport, e.lang, root, src)
-	for _, m := range matches {
-		path := m.Captures["import.path"]
-		importPath := strings.Trim(path.Text, `"'`)
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileID, To: "unresolved::import::" + importPath,
-			Kind: graph.EdgeImports, FilePath: filePath, Line: path.StartLine + 1,
-		})
-		// Walk the import_statement node to find aliases. tsQImport
-		// captures the whole statement as `import.def` so we already
-		// have the AST node.
-		defCap, ok := m.Captures["import.def"]
-		if !ok || defCap.Node == nil {
+	arrowNames := map[string]bool{}
+	tenv := make(typeEnv)
+
+	var calls []deferredCall
+	var vars []deferredVar
+	// classCarries accumulates (class_declaration node, classID) pairs
+	// as they're matched, so the post-pass can run a single
+	// walkClassMembers per class — covering @Inject consumer edges,
+	// NestJS dynamic-module factory providers, and `this.<field>`
+	// tenv seeding all in one walk. Replaces three separate
+	// walkNodes passes (emitInjectConsumers, emitDynamicModuleBindings,
+	// collectThisParamTypesInClass) per the §6.6 consolidation in
+	// spec-extractor-perf.md.
+	var classCarries []classCarry
+
+	parser.EachMatch(e.qAll, root, src, func(m parser.QueryResult) {
+		switch {
+		case m.Captures["func.def"] != nil:
+			e.emitFunction(m, filePath, fileID, result)
+
+		case m.Captures["arrow.def"] != nil:
+			if name := e.emitArrow(m, filePath, fileID, result); name != "" {
+				arrowNames[name] = true
+			}
+
+		case m.Captures["class.def"] != nil:
+			classID := e.emitClass(m, filePath, fileID, src, result)
+			if def := m.Captures["class.def"]; def.Node != nil && classID != "" {
+				classCarries = append(classCarries, classCarry{node: def.Node, id: classID})
+			}
+
+		case m.Captures["iface.def"] != nil:
+			e.emitInterface(m, filePath, fileID, src, result)
+
+		case m.Captures["type.def"] != nil:
+			e.emitTypeAlias(m, filePath, fileID, result)
+
+		case m.Captures["enum.def"] != nil:
+			e.emitEnum(m, filePath, fileID, src, result)
+
+		case m.Captures["import.def"] != nil:
+			e.emitImport(m, filePath, fileID, src, result, imports)
+
+		case m.Captures["method.def"] != nil:
+			e.emitMethod(m, filePath, src, result)
+
+		case m.Captures["prop.def"] != nil:
+			e.emitClassProperty(m, filePath, src, result)
+
+		case m.Captures["call.expr"] != nil:
+			expr := m.Captures["call.expr"]
+			calls = append(calls, deferredCall{
+				name: m.Captures["call.name"].Text,
+				line: expr.StartLine + 1,
+			})
+
+		case m.Captures["callm.expr"] != nil:
+			expr := m.Captures["callm.expr"]
+			calls = append(calls, deferredCall{
+				method:   m.Captures["callm.method"].Text,
+				receiver: m.Captures["callm.receiver"].Text,
+				line:     expr.StartLine + 1,
+				isMember: true,
+			})
+
+		case m.Captures["tvar.def"] != nil:
+			name := m.Captures["tvar.name"].Text
+			if tn := normalizeTypeName(m.Captures["tvar.type"].Text); tn != "" {
+				tenv[name] = tn
+			}
+
+		case m.Captures["var.def"] != nil:
+			def := m.Captures["var.def"]
+			vars = append(vars, deferredVar{
+				name:    m.Captures["var.name"].Text,
+				defNode: def.Node,
+				startLn: def.StartLine,
+				endLn:   def.EndLine,
+			})
+		}
+	})
+
+	// Tier 0b: single per-class walk dispatching three concerns at
+	// once — @Inject consumer edges, NestJS dynamic-module factory
+	// providers (forRoot / forFeature / register / *Async), and
+	// `this.<field>` tenv seeding from constructor parameter-property
+	// shorthand or class field annotations / inject() initializers.
+	// Folding the three previous walks into one cuts per-class
+	// walkNodes cost by ~3× on NestJS-style class-heavy files
+	// (spec-extractor-perf.md §6.6).
+	for _, cc := range classCarries {
+		walkClassMembers(cc.node, src, cc.id, filePath, result, tenv)
+	}
+
+	// Tier 1: type inference from `new Expr()` initializers in plain
+	// variable declarations. Runs against the already-buffered var
+	// matches so we don't re-query the tree.
+	for _, v := range vars {
+		if _, seen := tenv[v.name]; seen {
 			continue
 		}
-		for i := 0; i < int(defCap.Node.NamedChildCount()); i++ {
-			child := defCap.Node.NamedChild(i)
-			if child.Type() != "import_clause" {
-				continue
+		if v.defNode == nil {
+			continue
+		}
+		walkNodes(v.defNode, func(n *sitter.Node) {
+			if n.Type() != "variable_declarator" {
+				return
 			}
-			for j := 0; j < int(child.NamedChildCount()); j++ {
-				c := child.NamedChild(j)
-				switch c.Type() {
-				case "identifier": // default import: `import Foo from ...`
-					imports[c.Content(src)] = importPath
-				case "namespace_import": // `import * as Foo from ...`
-					for k := 0; k < int(c.NamedChildCount()); k++ {
-						if id := c.NamedChild(k); id.Type() == "identifier" {
-							imports[id.Content(src)] = importPath
-						}
+			for i := 0; i < int(n.NamedChildCount()); i++ {
+				child := n.NamedChild(i)
+				if child.Type() == "new_expression" {
+					if tn := inferTypeFromNewExpr(child, src); tn != "" {
+						tenv[v.name] = tn
 					}
+					return
 				}
 			}
-		}
-	}
-	return imports
-}
-
-func (e *TypeScriptExtractor) extractVariables(root *sitter.Node, src []byte, filePath, fileID string, result *parser.ExtractionResult) {
-	matches, _ := parser.RunQuery(tsQVar, e.lang, root, src)
-
-	// Collect names already extracted as arrow functions so we skip them.
-	arrowNames := make(map[string]bool)
-	for _, n := range result.Nodes {
-		if n.Kind == graph.KindFunction && n.FilePath == filePath {
-			arrowNames[n.Name] = true
-		}
+		})
 	}
 
-	for _, m := range matches {
-		name := m.Captures["var.name"].Text
-		def := m.Captures["var.def"]
+	// Now every function/method node is in result; build the line
+	// range map used to attribute calls to their caller.
+	funcRanges := buildFuncRanges(result)
 
-		// Skip variables already captured as arrow functions.
-		if arrowNames[name] {
+	for _, c := range calls {
+		callerID := findEnclosingFunc(funcRanges, c.line)
+		if callerID == "" {
 			continue
 		}
+		if !c.isMember {
+			result.Edges = append(result.Edges, &graph.Edge{
+				From: callerID, To: "unresolved::" + c.name,
+				Kind: graph.EdgeCalls, FilePath: filePath, Line: c.line,
+			})
+			continue
+		}
+		// Namespace/default import receiver (e.g. `fs.readFile`): attach
+		// the module path so the resolver can classify externally.
+		if importPath, ok := imports[c.receiver]; ok {
+			result.Edges = append(result.Edges, &graph.Edge{
+				From: callerID, To: "unresolved::extern::" + importPath + "::" + c.method,
+				Kind: graph.EdgeCalls, FilePath: filePath, Line: c.line,
+			})
+			continue
+		}
+		edge := &graph.Edge{
+			From: callerID, To: "unresolved::*." + c.method,
+			Kind: graph.EdgeCalls, FilePath: filePath, Line: c.line,
+		}
+		if recvType, ok := tenv[c.receiver]; ok {
+			edge.Meta = map[string]any{"receiver_type": recvType}
+		} else if strings.Contains(c.receiver, ".") || strings.Contains(c.receiver, "(") {
+			if chainType := resolveChainType(c.receiver, tenv, result); chainType != "" {
+				edge.Meta = map[string]any{"receiver_type": chainType}
+			}
+		}
+		result.Edges = append(result.Edges, edge)
+	}
 
-		// Only extract module-level variables: the lexical_declaration's parent
-		// should be the program (root) node or an export_statement whose parent
-		// is the program node.
-		parent := def.Node.Parent()
+	for _, v := range vars {
+		if arrowNames[v.name] || v.defNode == nil {
+			continue
+		}
+		parent := v.defNode.Parent()
 		if parent != nil && parent.Type() == "export_statement" {
 			parent = parent.Parent()
 		}
 		if parent == nil || parent.Type() != "program" {
 			continue
 		}
-
-		id := filePath + "::" + name
+		id := filePath + "::" + v.name
 		result.Nodes = append(result.Nodes, &graph.Node{
-			ID: id, Kind: graph.KindVariable, Name: name,
-			FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
+			ID: id, Kind: graph.KindVariable, Name: v.name,
+			FilePath: filePath, StartLine: v.startLn + 1, EndLine: v.endLn + 1,
 			Language: "typescript",
 		})
 		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
+			From: fileID, To: id, Kind: graph.EdgeDefines,
+			FilePath: filePath, Line: v.startLn + 1,
 		})
+	}
+
+	return result, nil
+}
+
+// --- per-match emit helpers ------------------------------------------
+
+func (e *TypeScriptExtractor) emitFunction(m parser.QueryResult, filePath, fileID string, result *parser.ExtractionResult) {
+	name := m.Captures["func.name"].Text
+	def := m.Captures["func.def"]
+	id := filePath + "::" + name
+	result.Nodes = append(result.Nodes, &graph.Node{
+		ID: id, Kind: graph.KindFunction, Name: name,
+		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
+		Language: "typescript",
+		Meta:     map[string]any{"signature": fmt.Sprintf("function %s()", name)},
+	})
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: fileID, To: id, Kind: graph.EdgeDefines,
+		FilePath: filePath, Line: def.StartLine + 1,
+	})
+}
+
+func (e *TypeScriptExtractor) emitArrow(m parser.QueryResult, filePath, fileID string, result *parser.ExtractionResult) string {
+	name := m.Captures["arrow.name"].Text
+	def := m.Captures["arrow.def"]
+	id := filePath + "::" + name
+	result.Nodes = append(result.Nodes, &graph.Node{
+		ID: id, Kind: graph.KindFunction, Name: name,
+		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
+		Language: "typescript",
+		Meta:     map[string]any{"signature": fmt.Sprintf("const %s = () =>", name)},
+	})
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: fileID, To: id, Kind: graph.EdgeDefines,
+		FilePath: filePath, Line: def.StartLine + 1,
+	})
+	return name
+}
+
+// emitClass writes the class node + Defines edge and runs the
+// shallow @Module(...) decorator scan. The deeper per-class walk
+// (constructor / fields / static factories) is deferred to the
+// post-pass walkClassMembers loop so all three concerns can share
+// one walkNodes traversal — see §6.6.
+func (e *TypeScriptExtractor) emitClass(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult) string {
+	name := m.Captures["class.name"].Text
+	def := m.Captures["class.def"]
+	id := filePath + "::" + name
+	result.Nodes = append(result.Nodes, &graph.Node{
+		ID: id, Kind: graph.KindType, Name: name,
+		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
+		Language: "typescript",
+	})
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: fileID, To: id, Kind: graph.EdgeDefines,
+		FilePath: filePath, Line: def.StartLine + 1,
+	})
+	if def.Node != nil {
+		// @Module(...) lives on the class's direct decorator children
+		// (a shallow scan, not a walkNodes), so handling it inline
+		// keeps the @Module Provides edges grouped with the class node
+		// they originate from. @Inject consumer edges and dynamic-
+		// module factory providers are dispatched from walkClassMembers
+		// in the post-pass.
+		emitModuleBindings(def.Node, src, id, filePath, result)
+	}
+	return id
+}
+
+func (e *TypeScriptExtractor) emitInterface(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult) {
+	name := m.Captures["iface.name"].Text
+	def := m.Captures["iface.def"]
+	id := filePath + "::" + name
+	var methods []string
+	if def.Node != nil {
+		methods = extractTSInterfaceMethods(def.Node, src)
+	}
+	result.Nodes = append(result.Nodes, &graph.Node{
+		ID: id, Kind: graph.KindInterface, Name: name,
+		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
+		Language: "typescript",
+		Meta:     map[string]any{"methods": methods},
+	})
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: fileID, To: id, Kind: graph.EdgeDefines,
+		FilePath: filePath, Line: def.StartLine + 1,
+	})
+}
+
+func (e *TypeScriptExtractor) emitTypeAlias(m parser.QueryResult, filePath, fileID string, result *parser.ExtractionResult) {
+	name := m.Captures["type.name"].Text
+	def := m.Captures["type.def"]
+	id := filePath + "::" + name
+	result.Nodes = append(result.Nodes, &graph.Node{
+		ID: id, Kind: graph.KindType, Name: name,
+		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
+		Language: "typescript",
+	})
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: fileID, To: id, Kind: graph.EdgeDefines,
+		FilePath: filePath, Line: def.StartLine + 1,
+	})
+}
+
+func (e *TypeScriptExtractor) emitEnum(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult) {
+	name := m.Captures["enum.name"].Text
+	def := m.Captures["enum.def"]
+	id := filePath + "::" + name
+
+	result.Nodes = append(result.Nodes, &graph.Node{
+		ID: id, Kind: graph.KindType, Name: name,
+		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
+		Language: "typescript",
+		Meta:     map[string]any{"kind": "enum"},
+	})
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: fileID, To: id, Kind: graph.EdgeDefines,
+		FilePath: filePath, Line: def.StartLine + 1,
+	})
+
+	if def.Node == nil {
+		return
+	}
+	// Walk the enum body for member names. The grammar yields enum_body
+	// → (property_identifier | enum_assignment) children; handle both.
+	for i := 0; i < int(def.Node.ChildCount()); i++ {
+		child := def.Node.Child(i)
+		if child == nil || child.Type() != "enum_body" {
+			continue
+		}
+		for j := 0; j < int(child.ChildCount()); j++ {
+			mem := child.Child(j)
+			if mem == nil {
+				continue
+			}
+			var memberName string
+			var memberNode *sitter.Node
+			switch mem.Type() {
+			case "property_identifier":
+				memberName = mem.Content(src)
+				memberNode = mem
+			case "enum_assignment":
+				nameNode := mem.ChildByFieldName("name")
+				if nameNode != nil {
+					memberName = nameNode.Content(src)
+					memberNode = mem
+				}
+			}
+			if memberName == "" || memberNode == nil {
+				continue
+			}
+			memberID := id + "." + memberName
+			result.Nodes = append(result.Nodes, &graph.Node{
+				ID: memberID, Kind: graph.KindVariable, Name: memberName,
+				FilePath:  filePath,
+				StartLine: int(memberNode.StartPoint().Row) + 1,
+				EndLine:   int(memberNode.EndPoint().Row) + 1,
+				Language:  "typescript",
+				Meta:      map[string]any{"receiver": name, "kind": "enum_member"},
+			})
+			result.Edges = append(result.Edges, &graph.Edge{
+				From: memberID, To: id, Kind: graph.EdgeMemberOf,
+				FilePath: filePath, Line: int(memberNode.StartPoint().Row) + 1,
+			})
+		}
 	}
 }
 
-// extractTSInterfaceMethods walks children of an interface_declaration node
-// to find method_signature and property_signature entries and returns their names.
+// emitImport records the import edge and, for default/namespace imports,
+// populates the alias→path map used when classifying member-call
+// receivers against imported modules.
+//
+// Named imports are intentionally skipped — `a(x)` is already a plain
+// call matched by the call-expression pattern and doesn't go through
+// the selector-call path.
+func (e *TypeScriptExtractor) emitImport(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, imports map[string]string) {
+	path := m.Captures["import.path"]
+	importPath := strings.Trim(path.Text, `"'`)
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: fileID, To: "unresolved::import::" + importPath,
+		Kind: graph.EdgeImports, FilePath: filePath, Line: path.StartLine + 1,
+	})
+	defCap, ok := m.Captures["import.def"]
+	if !ok || defCap.Node == nil {
+		return
+	}
+	for i := 0; i < int(defCap.Node.NamedChildCount()); i++ {
+		child := defCap.Node.NamedChild(i)
+		if child.Type() != "import_clause" {
+			continue
+		}
+		for j := 0; j < int(child.NamedChildCount()); j++ {
+			c := child.NamedChild(j)
+			switch c.Type() {
+			case "identifier": // default: `import Foo from ...`
+				imports[c.Content(src)] = importPath
+			case "namespace_import": // `import * as Foo from ...`
+				for k := 0; k < int(c.NamedChildCount()); k++ {
+					if id := c.NamedChild(k); id.Type() == "identifier" {
+						imports[id.Content(src)] = importPath
+					}
+				}
+			}
+		}
+	}
+}
+
+// emitMethod is called once per method_definition captured at root
+// scope. The enclosing class is found by walking up the parent chain
+// to the nearest class_declaration; methods that don't live inside a
+// class (defensively: object literal method shorthand would parse as
+// a `method_definition` in some grammar variants, but tree-sitter's
+// TS grammar classifies those as `pair` — in practice this branch
+// skips nothing that the legacy per-class scan caught).
+func (e *TypeScriptExtractor) emitMethod(m parser.QueryResult, filePath string, src []byte, result *parser.ExtractionResult) {
+	def := m.Captures["method.def"]
+	if def.Node == nil {
+		return
+	}
+	classNode := findEnclosingClass(def.Node)
+	if classNode == nil {
+		return
+	}
+	classNameNode := classNode.ChildByFieldName("name")
+	if classNameNode == nil {
+		return
+	}
+	className := classNameNode.Content(src)
+	classID := filePath + "::" + className
+	name := m.Captures["method.name"].Text
+	id := classID + "." + name
+	node := &graph.Node{
+		ID: id, Kind: graph.KindMethod, Name: name,
+		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
+		Language: "typescript",
+		Meta:     map[string]any{"receiver": className},
+	}
+	if rt := extractTSMethodReturnType(def.Node, src); rt != "" {
+		node.Meta["return_type"] = rt
+	}
+	result.Nodes = append(result.Nodes, node)
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: id, To: classID, Kind: graph.EdgeMemberOf,
+		FilePath: filePath, Line: def.StartLine + 1,
+	})
+	// NestJS-style dispatch decorators (@UseGuards/@UseInterceptors/...)
+	// are SIBLINGS of method_definition inside class_body — walk backward.
+	for sib := def.Node.PrevSibling(); sib != nil && sib.Type() == "decorator"; sib = sib.PrevSibling() {
+		emitDispatchFromDecorator(sib, src, id, filePath, result)
+	}
+}
+
+func (e *TypeScriptExtractor) emitClassProperty(m parser.QueryResult, filePath string, src []byte, result *parser.ExtractionResult) {
+	def := m.Captures["prop.def"]
+	if def.Node == nil {
+		return
+	}
+	classNode := findEnclosingClass(def.Node)
+	if classNode == nil {
+		return
+	}
+	classNameNode := classNode.ChildByFieldName("name")
+	if classNameNode == nil {
+		return
+	}
+	className := classNameNode.Content(src)
+	classID := filePath + "::" + className
+	name := m.Captures["prop.name"].Text
+	id := classID + "." + name
+	result.Nodes = append(result.Nodes, &graph.Node{
+		ID: id, Kind: graph.KindVariable, Name: name,
+		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
+		Language: "typescript",
+		Meta:     map[string]any{"receiver": className, "kind": "class_property"},
+	})
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: id, To: classID, Kind: graph.EdgeMemberOf,
+		FilePath: filePath, Line: def.StartLine + 1,
+	})
+}
+
+// findEnclosingClass walks up the parent chain looking for the nearest
+// class_declaration ancestor. Returns nil when the node is not inside
+// a class.
+func findEnclosingClass(n *sitter.Node) *sitter.Node {
+	for p := n.Parent(); p != nil; p = p.Parent() {
+		if p.Type() == "class_declaration" {
+			return p
+		}
+	}
+	return nil
+}
+
+// --- helpers (unchanged) ---------------------------------------------
+
+// extractTSInterfaceMethods walks children of an interface_declaration
+// node to find method_signature and property_signature entries and
+// returns their names.
 func extractTSInterfaceMethods(ifaceNode *sitter.Node, src []byte) []string {
 	var methods []string
-	// Find the interface_body child.
 	var body *sitter.Node
 	for i := 0; i < int(ifaceNode.NamedChildCount()); i++ {
 		child := ifaceNode.NamedChild(i)
@@ -500,12 +620,10 @@ func extractTSInterfaceMethods(ifaceNode *sitter.Node, src []byte) []string {
 	if body == nil {
 		return methods
 	}
-
 	for i := 0; i < int(body.NamedChildCount()); i++ {
 		child := body.NamedChild(i)
 		switch child.Type() {
 		case "method_signature", "property_signature":
-			// The first named child is typically the property_identifier (name).
 			for j := 0; j < int(child.NamedChildCount()); j++ {
 				nameNode := child.NamedChild(j)
 				if nameNode.Type() == "property_identifier" {
@@ -518,114 +636,6 @@ func extractTSInterfaceMethods(ifaceNode *sitter.Node, src []byte) []string {
 	return methods
 }
 
-func (e *TypeScriptExtractor) extractCalls(root *sitter.Node, src []byte, filePath string, result *parser.ExtractionResult, tenv typeEnv, imports map[string]string) {
-	funcRanges := buildFuncRanges(result)
-
-	matches, _ := parser.RunQuery(tsQCall, e.lang, root, src)
-	for _, m := range matches {
-		name := m.Captures["call.name"].Text
-		expr := m.Captures["call.expr"]
-		callerID := findEnclosingFunc(funcRanges, expr.StartLine+1)
-		if callerID == "" {
-			continue
-		}
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: callerID, To: "unresolved::" + name,
-			Kind: graph.EdgeCalls, FilePath: filePath, Line: expr.StartLine + 1,
-		})
-	}
-
-	matches, _ = parser.RunQuery(tsQCallMember, e.lang, root, src)
-	for _, m := range matches {
-		method := m.Captures["call.method"].Text
-		receiverText := m.Captures["call.receiver"].Text
-		expr := m.Captures["call.expr"]
-		callerID := findEnclosingFunc(funcRanges, expr.StartLine+1)
-		if callerID == "" {
-			continue
-		}
-
-		// Namespace/default import receiver (e.g. `fs.readFile`): attach
-		// the module path so the resolver can classify externally.
-		if importPath, ok := imports[receiverText]; ok {
-			result.Edges = append(result.Edges, &graph.Edge{
-				From: callerID, To: "unresolved::extern::" + importPath + "::" + method,
-				Kind: graph.EdgeCalls, FilePath: filePath, Line: expr.StartLine + 1,
-			})
-			continue
-		}
-
-		edge := &graph.Edge{
-			From: callerID, To: "unresolved::*." + method,
-			Kind: graph.EdgeCalls, FilePath: filePath, Line: expr.StartLine + 1,
-		}
-		if recvType, ok := tenv[receiverText]; ok {
-			edge.Meta = map[string]any{"receiver_type": recvType}
-		} else if strings.Contains(receiverText, ".") || strings.Contains(receiverText, "(") {
-			if chainType := resolveChainType(receiverText, tenv, result); chainType != "" {
-				edge.Meta = map[string]any{"receiver_type": chainType}
-			}
-		}
-		result.Edges = append(result.Edges, edge)
-	}
-}
-
-// buildTypeEnv scans TypeScript variable declarations for type annotations (Tier 0)
-// and new expressions (Tier 1) to build a variable→type map.
-func (e *TypeScriptExtractor) buildTypeEnv(root *sitter.Node, src []byte) typeEnv {
-	tenv := make(typeEnv)
-
-	// Tier 0: explicit type annotations — const x: Type = ...
-	matches, _ := parser.RunQuery(tsQVarTyped, e.lang, root, src)
-	for _, m := range matches {
-		name := m.Captures["tvar.name"].Text
-		typeName := normalizeTypeName(m.Captures["tvar.type"].Text)
-		if typeName != "" {
-			tenv[name] = typeName
-		}
-	}
-
-	// Tier 0b: constructor parameters with visibility modifiers
-	// (`constructor(private readonly svc: UsersService) {}`) are stored
-	// as class members accessible through `this.svc`. Without this the
-	// extractor can't type `this.svc.foo()` call expressions, so the
-	// resolver falls back to "caller's receiver type" and method-name
-	// collisions inside the containing class cause self-loops — as
-	// seen with UsersController.create → UsersController.create.
-	collectThisParamTypes(root, src, tenv)
-
-	// Tier 1: new expressions — const x = new Type(...)
-	// Walk all variable declarators and check if RHS is a new_expression.
-	matches, _ = parser.RunQuery(tsQVar, e.lang, root, src)
-	for _, m := range matches {
-		name := m.Captures["var.name"].Text
-		if _, exists := tenv[name]; exists {
-			continue // already have explicit type
-		}
-		// Find the variable_declarator node to check its value child.
-		defNode := m.Captures["var.def"].Node
-		if defNode == nil {
-			continue
-		}
-		walkNodes(defNode, func(n *sitter.Node) {
-			if n.Type() == "variable_declarator" {
-				for i := 0; i < int(n.NamedChildCount()); i++ {
-					child := n.NamedChild(i)
-					if child.Type() == "new_expression" {
-						typeName := inferTypeFromNewExpr(child, src)
-						if typeName != "" {
-							tenv[name] = typeName
-						}
-						return
-					}
-				}
-			}
-		})
-	}
-
-	return tenv
-}
-
 // emitModuleBindings walks a class_declaration's decorators, finds the
 // @Module(...) decorator (if any), and emits one EdgeProvides edge per
 // `{ provide: X, useClass: Y }` entry in its `providers` array. The
@@ -635,10 +645,6 @@ func (e *TypeScriptExtractor) buildTypeEnv(root *sitter.Node, src []byte) typeEn
 // (useValue / useFactory / useExisting / bare class references) are
 // skipped here — they'll be handled by the @Inject(TOKEN) feature.
 func emitModuleBindings(classNode *sitter.Node, src []byte, classID, filePath string, result *parser.ExtractionResult) {
-	// Decorators on classes come as siblings via an export_statement
-	// wrapper OR as children of class_declaration, depending on the
-	// grammar version and whether the class is exported. Walk both
-	// directions to be robust.
 	decorators := classDecorators(classNode)
 	for _, dec := range decorators {
 		call := nestDecoratorCall(dec)
@@ -653,7 +659,6 @@ func emitModuleBindings(classNode *sitter.Node, src []byte, classID, filePath st
 		if args == nil {
 			continue
 		}
-		// The Module decorator takes one object literal arg.
 		var config *sitter.Node
 		for i := 0; i < int(args.NamedChildCount()); i++ {
 			c := args.NamedChild(i)
@@ -667,20 +672,12 @@ func emitModuleBindings(classNode *sitter.Node, src []byte, classID, filePath st
 		}
 		emitProvidersFromObject(config, src, classID, filePath, result, "@Module")
 	}
-	// Dynamic modules: forRoot / forFeature / forRootAsync /
-	// forFeatureAsync are static methods returning a DynamicModule
-	// config object with the same `providers:` shape as the @Module
-	// decorator. Extraction mirrors the decorator path — the static
-	// method's return object feeds the same helper.
-	emitDynamicModuleBindings(classNode, src, classID, filePath, result)
+	// Dynamic-module factory bindings (forRoot/forFeature/register/*Async)
+	// are emitted by walkClassMembers in the post-pass — same walkNodes
+	// pass that handles @Inject consumers and `this.<field>` tenv
+	// seeding (§6.6).
 }
 
-// emitProvidersFromObject walks the `providers: [...]` array inside a
-// NestJS module config object (whether it came from a @Module decorator
-// or a static DynamicModule return) and emits the appropriate
-// EdgeProvides edges. originTag names the decorator / method the
-// binding originated from so find_usages can tell the agent where to
-// look for the module wiring.
 func emitProvidersFromObject(config *sitter.Node, src []byte, classID, filePath string, result *parser.ExtractionResult, originTag string) {
 	providersNode := objectFieldValue(config, src, "providers")
 	if providersNode == nil || providersNode.Type() != "array" {
@@ -695,7 +692,6 @@ func emitProvidersFromObject(config *sitter.Node, src []byte, classID, filePath 
 		if abstract == "" {
 			continue
 		}
-		// useClass: abstract type bound to a concrete implementation.
 		if concrete := objectFieldIdentifier(entry, src, "useClass"); concrete != "" {
 			result.Edges = append(result.Edges, &graph.Edge{
 				From:     classID,
@@ -711,8 +707,6 @@ func emitProvidersFromObject(config *sitter.Node, src []byte, classID, filePath 
 			})
 			continue
 		}
-		// useValue / useFactory / useExisting: the token IS the public
-		// face of the binding.
 		for _, variant := range []string{"useValue", "useFactory", "useExisting"} {
 			if objectFieldValue(entry, src, variant) == nil {
 				continue
@@ -734,13 +728,6 @@ func emitProvidersFromObject(config *sitter.Node, src []byte, classID, filePath 
 	}
 }
 
-// emitDynamicModuleBindings walks a class for static methods named
-// forRoot / forFeature (+async variants) and extracts providers from
-// any object literals they return. This is the standard NestJS
-// DynamicModule pattern used by ConfigModule.forRoot({...}),
-// TypeOrmModule.forFeature([...]), etc. — the providers array is
-// computed at module import time, so without this pass the agent
-// sees the static method but misses every provider declared inside it.
 var dynamicModuleMethods = map[string]struct{}{
 	"forRoot":         {},
 	"forRootAsync":    {},
@@ -750,55 +737,177 @@ var dynamicModuleMethods = map[string]struct{}{
 	"registerAsync":   {},
 }
 
-func emitDynamicModuleBindings(classNode *sitter.Node, src []byte, classID, filePath string, result *parser.ExtractionResult) {
+// classCarry pairs a class_declaration node with the classID
+// derived from the main-pass match, so the post-pass can dispatch
+// per-member work without re-deriving the ID. See walkClassMembers.
+type classCarry struct {
+	node *sitter.Node
+	id   string
+}
+
+// walkClassMembers walks a class subtree exactly once and dispatches
+// every per-member concern in one pass:
+//
+//   - constructor parameters → @Inject(TOKEN) decorators emit
+//     EdgeConsumes; TS parameter-property shorthand seeds
+//     tenv["this.<name>"] from the explicit type annotation.
+//   - public_field_definition → field-level @Inject decorators
+//     emit EdgeConsumes; field type annotation OR `inject(...)`
+//     initializer seeds tenv["this.<name>"].
+//   - static factory methods named forRoot / forFeature /
+//     register / *Async (NestJS DynamicModule pattern) → emit
+//     EdgeProvides for each `{ provide, useClass }` entry in the
+//     returned object.
+//
+// Replaces three previous walkNodes passes (emitInjectConsumers,
+// emitDynamicModuleBindings, collectThisParamTypesInClass) — see
+// spec-extractor-perf.md §6.6.
+func walkClassMembers(classNode *sitter.Node, src []byte, classID, filePath string, result *parser.ExtractionResult, tenv typeEnv) {
+	seenInject := make(map[string]struct{})
 	walkNodes(classNode, func(n *sitter.Node) {
-		if n.Type() != "method_definition" {
-			return
-		}
-		nameNode := n.ChildByFieldName("name")
-		if nameNode == nil {
-			return
-		}
-		if _, ok := dynamicModuleMethods[nameNode.Content(src)]; !ok {
-			return
-		}
-		// Static-only: plain instance methods with these names are not
-		// NestJS dynamic-module factories. Look for a `static` keyword
-		// among the method's children.
-		if !methodIsStatic(n) {
-			return
-		}
-		body := n.ChildByFieldName("body")
-		if body == nil {
-			return
-		}
-		// Find the FIRST return_statement that returns an object. Most
-		// real-world forRoot bodies return a single object at the end;
-		// conditional returns (`return cached ?? { ... }`) aren't
-		// attempted here — they're rare and ambiguous.
-		var cfg *sitter.Node
-		walkNodes(body, func(m *sitter.Node) {
-			if cfg != nil || m.Type() != "return_statement" {
+		switch n.Type() {
+		case "method_definition":
+			nameNode := n.ChildByFieldName("name")
+			if nameNode == nil {
 				return
 			}
-			for i := 0; i < int(m.NamedChildCount()); i++ {
-				c := m.NamedChild(i)
-				if c != nil && c.Type() == "object" {
-					cfg = c
-					return
-				}
+			methodName := nameNode.Content(src)
+			if methodName == "constructor" {
+				dispatchConstructorMembers(n, src, classID, filePath, result, tenv, seenInject)
+				return
 			}
-		})
-		if cfg == nil {
-			return
+			// NestJS DynamicModule factory: only static methods named
+			// from the dynamicModuleMethods set qualify.
+			if _, ok := dynamicModuleMethods[methodName]; !ok {
+				return
+			}
+			if !methodIsStatic(n) {
+				return
+			}
+			body := n.ChildByFieldName("body")
+			if body == nil {
+				return
+			}
+			cfg := findReturnedConfigObject(body)
+			if cfg == nil {
+				return
+			}
+			emitProvidersFromObject(cfg, src, classID, filePath, result, methodName)
+
+		case "public_field_definition":
+			dispatchClassField(n, src, classID, filePath, result, tenv, seenInject)
 		}
-		emitProvidersFromObject(cfg, src, classID, filePath, result, nameNode.Content(src))
 	})
 }
 
-// methodIsStatic reports whether a method_definition has the `static`
-// modifier among its children. Tree-sitter-typescript places modifiers
-// as unnamed children (anonymous tokens) preceding the method name.
+// dispatchConstructorMembers handles both @Inject(TOKEN) decorators
+// on constructor parameters AND tenv seeding from TS parameter-
+// property shorthand (`constructor(private readonly foo: Bar) {}`).
+func dispatchConstructorMembers(method *sitter.Node, src []byte, classID, filePath string, result *parser.ExtractionResult, tenv typeEnv, seenInject map[string]struct{}) {
+	params := method.ChildByFieldName("parameters")
+	if params == nil {
+		return
+	}
+	for i := 0; i < int(params.NamedChildCount()); i++ {
+		p := params.NamedChild(i)
+		if p == nil {
+			continue
+		}
+		// @Inject decorator on the parameter → consumer edge.
+		for j := 0; j < int(p.ChildCount()); j++ {
+			c := p.Child(j)
+			if c != nil && c.Type() == "decorator" {
+				emitInjectFromDecorator(c, src, classID, filePath, result, seenInject)
+			}
+		}
+		// Parameter-property shorthand → tenv["this.<name>"].
+		if p.Type() != "required_parameter" && p.Type() != "optional_parameter" {
+			continue
+		}
+		if !hasParameterPropertyModifier(p) {
+			continue
+		}
+		paramName := paramIdentifier(p, src)
+		if paramName == "" {
+			continue
+		}
+		typeName := paramTypeAnnotation(p, src)
+		if typeName == "" {
+			continue
+		}
+		tenv["this."+paramName] = typeName
+	}
+}
+
+// dispatchClassField handles both @Inject decorators and tenv
+// seeding for a public_field_definition. tenv prefers an explicit
+// type annotation; falls back to the type inferred from an
+// `inject(Foo)` initializer.
+func dispatchClassField(field *sitter.Node, src []byte, classID, filePath string, result *parser.ExtractionResult, tenv typeEnv, seenInject map[string]struct{}) {
+	for i := 0; i < int(field.ChildCount()); i++ {
+		c := field.Child(i)
+		if c != nil && c.Type() == "decorator" {
+			emitInjectFromDecorator(c, src, classID, filePath, result, seenInject)
+		}
+	}
+	name := classFieldName(field, src)
+	if name == "" {
+		return
+	}
+	if t := classFieldTypeAnnotation(field, src); t != "" {
+		tenv["this."+name] = t
+		return
+	}
+	if t := injectInitializerType(field, src); t != "" {
+		tenv["this."+name] = t
+	}
+}
+
+// emitInjectFromDecorator emits one EdgeConsumes for an @Inject(TOKEN)
+// decorator, deduping against seenInject so multiple @Inject sites
+// for the same token (constructor + field) don't double-emit.
+func emitInjectFromDecorator(dec *sitter.Node, src []byte, classID, filePath string, result *parser.ExtractionResult, seenInject map[string]struct{}) {
+	tok := injectDecoratorArg(dec, src)
+	if tok == "" {
+		return
+	}
+	if _, dup := seenInject[tok]; dup {
+		return
+	}
+	seenInject[tok] = struct{}{}
+	result.Edges = append(result.Edges, &graph.Edge{
+		From:     classID,
+		To:       "unresolved::" + tok,
+		Kind:     graph.EdgeConsumes,
+		FilePath: filePath,
+		Line:     int(dec.StartPoint().Row) + 1,
+		Meta: map[string]any{
+			"di_token": tok,
+			"via":      "@Inject",
+		},
+	})
+}
+
+// findReturnedConfigObject finds the first object literal returned
+// from a static factory method's body (NestJS DynamicModule shape).
+// Inner walkNodes is bounded by method body, which is small.
+func findReturnedConfigObject(body *sitter.Node) *sitter.Node {
+	var cfg *sitter.Node
+	walkNodes(body, func(m *sitter.Node) {
+		if cfg != nil || m.Type() != "return_statement" {
+			return
+		}
+		for i := 0; i < int(m.NamedChildCount()); i++ {
+			c := m.NamedChild(i)
+			if c != nil && c.Type() == "object" {
+				cfg = c
+				return
+			}
+		}
+	})
+	return cfg
+}
+
 func methodIsStatic(m *sitter.Node) bool {
 	for i := 0; i < int(m.ChildCount()); i++ {
 		c := m.Child(i)
@@ -809,20 +918,14 @@ func methodIsStatic(m *sitter.Node) bool {
 	return false
 }
 
-// classDecorators returns decorator nodes applicable to a class_declaration.
-// In tree-sitter-typescript, decorators appear either as children of the
-// class_declaration directly or, when the class is `export`-ed, as
-// children of the enclosing export_statement preceding the class.
 func classDecorators(classNode *sitter.Node) []*sitter.Node {
 	var decs []*sitter.Node
-	// Direct children first.
 	for i := 0; i < int(classNode.ChildCount()); i++ {
 		c := classNode.Child(i)
 		if c != nil && c.Type() == "decorator" {
 			decs = append(decs, c)
 		}
 	}
-	// Parent export_statement siblings.
 	parent := classNode.Parent()
 	if parent != nil && parent.Type() == "export_statement" {
 		for i := 0; i < int(parent.ChildCount()); i++ {
@@ -835,9 +938,6 @@ func classDecorators(classNode *sitter.Node) []*sitter.Node {
 	return decs
 }
 
-// objectFieldValue returns the `value` child of a `pair` node inside the
-// given object literal whose key matches the supplied name, or nil when
-// absent. Works on tree-sitter's JS/TS object grammar.
 func objectFieldValue(objNode *sitter.Node, src []byte, name string) *sitter.Node {
 	for i := 0; i < int(objNode.NamedChildCount()); i++ {
 		p := objNode.NamedChild(i)
@@ -856,9 +956,6 @@ func objectFieldValue(objNode *sitter.Node, src []byte, name string) *sitter.Nod
 	return nil
 }
 
-// objectFieldIdentifier is a thin wrapper on objectFieldValue that only
-// returns a value when it's a plain identifier (the shape we care about
-// for `useClass: Y` entries). Returns "" otherwise.
 func objectFieldIdentifier(objNode *sitter.Node, src []byte, name string) string {
 	v := objectFieldValue(objNode, src, name)
 	if v == nil || v.Type() != "identifier" {
@@ -867,11 +964,6 @@ func objectFieldIdentifier(objNode *sitter.Node, src []byte, name string) string
 	return v.Content(src)
 }
 
-// objectFieldToken accepts either an identifier or a string literal —
-// what shows up as the `provide:` key. NestJS permits both shapes:
-// `{ provide: MyToken, ... }` (identifier) and `{ provide: 'MY_TOKEN',
-// ... }` (literal). The returned string is the token name with any
-// surrounding quotes stripped.
 func objectFieldToken(objNode *sitter.Node, src []byte, name string) string {
 	v := objectFieldValue(objNode, src, name)
 	if v == nil {
@@ -881,8 +973,6 @@ func objectFieldToken(objNode *sitter.Node, src []byte, name string) string {
 	case "identifier":
 		return v.Content(src)
 	case "string":
-		// String literal: strip the two surrounding quotes. Escape
-		// handling isn't needed — injection tokens are simple ASCII.
 		s := v.Content(src)
 		if len(s) >= 2 {
 			return s[1 : len(s)-1]
@@ -891,80 +981,6 @@ func objectFieldToken(objNode *sitter.Node, src []byte, name string) string {
 	return ""
 }
 
-// emitInjectConsumers scans a class_declaration for two @Inject shapes
-// and emits an EdgeConsumes for each discovered (class, token) pair:
-//  1. Constructor parameter properties:
-//     `constructor(@Inject(TOKEN) private readonly foo: T) {}`
-//  2. Decorated class fields:
-//     `@Inject(TOKEN) private readonly foo!: T;`
-// Field decorators are siblings of the `public_field_definition` inside
-// class_body (same layout as method decorators), so the walker traverses
-// prev siblings per field. The edge source is the class (not the ctor
-// method or field), matching the grain callers get when they ask
-// `find_usages(TOKEN)`.
-func emitInjectConsumers(classNode *sitter.Node, src []byte, classID, filePath string, result *parser.ExtractionResult) {
-	seen := make(map[string]struct{})
-	emit := func(dec *sitter.Node) {
-		tok := injectDecoratorArg(dec, src)
-		if tok == "" {
-			return
-		}
-		if _, dup := seen[tok]; dup {
-			return
-		}
-		seen[tok] = struct{}{}
-		result.Edges = append(result.Edges, &graph.Edge{
-			From:     classID,
-			To:       "unresolved::" + tok,
-			Kind:     graph.EdgeConsumes,
-			FilePath: filePath,
-			Line:     int(dec.StartPoint().Row) + 1,
-			Meta: map[string]any{
-				"di_token": tok,
-				"via":      "@Inject",
-			},
-		})
-	}
-	walkNodes(classNode, func(n *sitter.Node) {
-		switch n.Type() {
-		case "method_definition":
-			nameNode := n.ChildByFieldName("name")
-			if nameNode == nil || nameNode.Content(src) != "constructor" {
-				return
-			}
-			params := n.ChildByFieldName("parameters")
-			if params == nil {
-				return
-			}
-			for i := 0; i < int(params.NamedChildCount()); i++ {
-				p := params.NamedChild(i)
-				if p == nil {
-					continue
-				}
-				for j := 0; j < int(p.ChildCount()); j++ {
-					c := p.Child(j)
-					if c != nil && c.Type() == "decorator" {
-						emit(c)
-					}
-				}
-			}
-		case "public_field_definition":
-			// Unlike method_definition, tree-sitter-typescript embeds
-			// field decorators AS CHILDREN of the field node, not
-			// siblings. Walk direct children for decorator entries.
-			for i := 0; i < int(n.ChildCount()); i++ {
-				c := n.Child(i)
-				if c != nil && c.Type() == "decorator" {
-					emit(c)
-				}
-			}
-		}
-	})
-}
-
-// injectDecoratorArg returns the first identifier or string-literal
-// argument of an `@Inject(...)` decorator, or "" when the decorator
-// isn't @Inject or its argument isn't a simple token.
 func injectDecoratorArg(dec *sitter.Node, src []byte) string {
 	call := nestDecoratorCall(dec)
 	if call == nil {
@@ -996,11 +1012,6 @@ func injectDecoratorArg(dec *sitter.Node, src []byte) string {
 	return ""
 }
 
-// nestDispatchDecorators maps a NestJS-style dispatch decorator name to
-// the entry-point method name on its argument class. `@UseGuards(X)`
-// causes X.canActivate to run; `@UseInterceptors(Y)` → Y.intercept; etc.
-// Decorators not in this table are ignored (they don't produce runtime
-// dispatch we can link statically).
 var nestDispatchDecorators = map[string]string{
 	"UseGuards":       "canActivate",
 	"UseInterceptors": "intercept",
@@ -1008,13 +1019,6 @@ var nestDispatchDecorators = map[string]string{
 	"UsePipes":        "transform",
 }
 
-// emitDispatchFromDecorator inspects one decorator node. If it's one of
-// the recognised NestJS dispatch decorators (@UseGuards, @UseInterceptors,
-// @UseFilters, @UsePipes), it emits one unresolved edge from methodID to
-// the entry-point method on each class argument. Each edge carries
-// receiver_type so the resolver's Pass 1 disambiguates by class rather
-// than falling back to name-only heuristics. Non-identifier arguments
-// (`new X()`, literals) are silently skipped.
 func emitDispatchFromDecorator(dec *sitter.Node, src []byte, methodID, filePath string, result *parser.ExtractionResult) {
 	callNode := nestDecoratorCall(dec)
 	if callNode == nil {
@@ -1052,9 +1056,6 @@ func emitDispatchFromDecorator(dec *sitter.Node, src []byte, methodID, filePath 
 	}
 }
 
-// nestDecoratorCall returns the call_expression child of a decorator node
-// if the decorator has the shape `@Name(args)`. Plain `@Name` without
-// parens returns nil (those can't bind arguments, so nothing to emit).
 func nestDecoratorCall(dec *sitter.Node) *sitter.Node {
 	for i := 0; i < int(dec.NamedChildCount()); i++ {
 		c := dec.NamedChild(i)
@@ -1065,84 +1066,6 @@ func nestDecoratorCall(dec *sitter.Node) *sitter.Node {
 	return nil
 }
 
-// collectThisParamTypes walks every class_declaration, finds constructors
-// that use TypeScript's "parameter property" shorthand
-// (`constructor(private readonly svc: UsersService) {}`), and seeds the
-// type env so later `this.svc.foo()` call sites can be typed. A parameter
-// property is a required_parameter whose first child is an accessibility
-// or readonly modifier — that's how the tree-sitter-typescript grammar
-// distinguishes them from plain constructor args.
-func collectThisParamTypes(root *sitter.Node, src []byte, tenv typeEnv) {
-	walkNodes(root, func(n *sitter.Node) {
-		if n.Type() != "class_declaration" {
-			return
-		}
-		walkNodes(n, func(m *sitter.Node) {
-			switch m.Type() {
-			case "method_definition":
-				nameNode := m.ChildByFieldName("name")
-				if nameNode == nil || nameNode.Content(src) != "constructor" {
-					return
-				}
-				params := m.ChildByFieldName("parameters")
-				if params == nil {
-					return
-				}
-				for i := 0; i < int(params.NamedChildCount()); i++ {
-					p := params.NamedChild(i)
-					if p == nil {
-						continue
-					}
-					// Only required_parameter nodes can carry the parameter-
-					// property shorthand; plain identifiers bail out.
-					if p.Type() != "required_parameter" && p.Type() != "optional_parameter" {
-						continue
-					}
-					if !hasParameterPropertyModifier(p) {
-						continue
-					}
-					paramName := paramIdentifier(p, src)
-					if paramName == "" {
-						continue
-					}
-					typeName := paramTypeAnnotation(p, src)
-					if typeName == "" {
-						continue
-					}
-					// Key by `this.<name>` so extractCalls' receiverText
-					// lookup ("this.svc") matches directly.
-					tenv["this."+paramName] = typeName
-				}
-			case "public_field_definition":
-				// Angular's inject() function-style DI: `private users =
-				// inject(UsersService)`. The field has no explicit type
-				// annotation, but the initializer is a call whose first
-				// identifier argument IS the type. Record it so call
-				// sites `this.users.foo()` resolve correctly. Without
-				// this the resolver's same-dir name-match fallback
-				// picks an arbitrary method when more than one class
-				// defines the called name.
-				name := classFieldName(m, src)
-				if name == "" {
-					return
-				}
-				// Prefer an explicit type annotation when present; fall
-				// back to inject() initializer inference.
-				if t := classFieldTypeAnnotation(m, src); t != "" {
-					tenv["this."+name] = t
-					return
-				}
-				if t := injectInitializerType(m, src); t != "" {
-					tenv["this."+name] = t
-				}
-			}
-		})
-	})
-}
-
-// classFieldName returns the identifier name of a public_field_definition
-// node (`private readonly NAME: T = ...`). Returns "" when the field
-// has no identifier or is a computed property.
 func classFieldName(field *sitter.Node, src []byte) string {
 	nameNode := field.ChildByFieldName("name")
 	if nameNode == nil || nameNode.Type() != "property_identifier" {
@@ -1151,8 +1074,6 @@ func classFieldName(field *sitter.Node, src []byte) string {
 	return nameNode.Content(src)
 }
 
-// classFieldTypeAnnotation returns the normalised type name from a
-// field's type_annotation child, or "" when absent.
 func classFieldTypeAnnotation(field *sitter.Node, src []byte) string {
 	for i := 0; i < int(field.NamedChildCount()); i++ {
 		c := field.NamedChild(i)
@@ -1170,10 +1091,6 @@ func classFieldTypeAnnotation(field *sitter.Node, src []byte) string {
 	return ""
 }
 
-// injectInitializerType returns the class-name argument of an
-// `inject(X)` call when that call is the initializer of a class field.
-// Returns "" when the field has no initializer, the initializer isn't
-// an inject() call, or the argument isn't a plain identifier.
 func injectInitializerType(field *sitter.Node, src []byte) string {
 	value := field.ChildByFieldName("value")
 	if value == nil || value.Type() != "call_expression" {
@@ -1200,9 +1117,6 @@ func injectInitializerType(field *sitter.Node, src []byte) string {
 	return ""
 }
 
-// hasParameterPropertyModifier reports whether a required_parameter node
-// carries one of the visibility/readonly modifiers that promote a ctor
-// arg to a class member in TypeScript.
 func hasParameterPropertyModifier(p *sitter.Node) bool {
 	for i := 0; i < int(p.ChildCount()); i++ {
 		c := p.Child(i)
@@ -1213,21 +1127,17 @@ func hasParameterPropertyModifier(p *sitter.Node) bool {
 		case "accessibility_modifier", "readonly":
 			return true
 		case "override_modifier":
-			// `override` can accompany a visibility modifier; keep
-			// scanning rather than returning false.
+			// `override` can accompany a visibility modifier; keep scanning.
 		}
 	}
 	return false
 }
 
-// paramIdentifier finds the underlying identifier name for a required_parameter
-// — handles both `foo: T` and `foo?: T` / `foo = default`.
 func paramIdentifier(p *sitter.Node, src []byte) string {
 	pattern := p.ChildByFieldName("pattern")
 	if pattern != nil && pattern.Type() == "identifier" {
 		return pattern.Content(src)
 	}
-	// Fallback: first identifier child.
 	for i := 0; i < int(p.NamedChildCount()); i++ {
 		c := p.NamedChild(i)
 		if c != nil && c.Type() == "identifier" {
@@ -1237,14 +1147,9 @@ func paramIdentifier(p *sitter.Node, src []byte) string {
 	return ""
 }
 
-// paramTypeAnnotation extracts the type name from a required_parameter's
-// type_annotation child, applying the same normalization as Tier 0 var
-// declarations (strip generics, arrays, nullable unions, primitives).
 func paramTypeAnnotation(p *sitter.Node, src []byte) string {
 	ta := p.ChildByFieldName("type")
 	if ta == nil {
-		// Some grammar versions don't expose a "type" field on parameters;
-		// fall back to the first type_annotation child.
 		for i := 0; i < int(p.NamedChildCount()); i++ {
 			c := p.NamedChild(i)
 			if c != nil && c.Type() == "type_annotation" {
@@ -1266,39 +1171,32 @@ func paramTypeAnnotation(p *sitter.Node, src []byte) string {
 	return ""
 }
 
-// normalizeTypeName strips generics, arrays, and nullable markers from a type name.
-// "User" → "User", "User[]" → "User", "User<T>" → "User", "User | null" → "User"
+// normalizeTypeName strips generics, arrays, and nullable markers.
+// "User" → "User", "User[]" → "User", "User<T>" → "User",
+// "User | null" → "User".
 func normalizeTypeName(t string) string {
-	// Strip leading/trailing whitespace.
 	t = strings.TrimSpace(t)
-	// Remove array suffix.
 	t = strings.TrimSuffix(t, "[]")
-	// Remove generics.
 	if idx := strings.Index(t, "<"); idx > 0 {
 		t = t[:idx]
 	}
-	// Remove nullable union.
 	if idx := strings.Index(t, " |"); idx > 0 {
 		t = t[:idx]
 	}
-	// Skip primitives.
 	switch t {
 	case "string", "number", "boolean", "void", "any", "unknown", "never", "null", "undefined":
 		return ""
 	}
 	if t == "" || (t[0] >= 'a' && t[0] <= 'z') {
-		return "" // skip lowercase type names (primitives, type aliases like 'object')
+		return ""
 	}
 	return t
 }
 
-// extractTSMethodReturnType walks a method_definition node's children to find
-// a type_annotation child and returns the normalized type name.
 func extractTSMethodReturnType(methodNode *sitter.Node, src []byte) string {
 	for i := 0; i < int(methodNode.NamedChildCount()); i++ {
 		child := methodNode.NamedChild(i)
 		if child.Type() == "type_annotation" {
-			// The type_annotation's first named child is the actual type node.
 			if child.NamedChildCount() > 0 {
 				typeNode := child.NamedChild(0)
 				return normalizeTypeName(typeNode.Content(src))
@@ -1308,8 +1206,6 @@ func extractTSMethodReturnType(methodNode *sitter.Node, src []byte) string {
 	return ""
 }
 
-// inferTypeFromNewExpr extracts the class name from a new_expression node.
-// new User(...) → "User"
 func inferTypeFromNewExpr(node *sitter.Node, src []byte) string {
 	for i := 0; i < int(node.NamedChildCount()); i++ {
 		child := node.NamedChild(i)

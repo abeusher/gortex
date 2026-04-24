@@ -36,7 +36,28 @@ func (e *WebSocketExtractor) SupportedLanguages() []string {
 	return []string{"go", "typescript", "javascript", "python"}
 }
 
+// wsPrefilterMarkers covers every emit/listen regex:
+//   - `.emit(` → socket.io emit
+//   - `JSON.stringify` + `type:` → raw WS send with typed payload
+//   - `WriteJSON` + `"type":` → Go gorilla/websocket idiom
+//   - `.on(` / `.addEventListener(` → listeners
+//
+// `.on(` is intentionally loose (matches any event listener); we
+// accept false positives from non-WS code so we don't miss legit
+// WS handlers on raw `ws.on("message", ...)`.
+var wsPrefilterMarkers = [][]byte{
+	[]byte(".emit("),
+	[]byte(".on("),
+	[]byte(".addEventListener("),
+	[]byte("WriteJSON"),
+	[]byte("JSON.stringify"),
+}
+
 func (e *WebSocketExtractor) Extract(filePath string, src []byte, nodes []*graph.Node, edges []*graph.Edge) []Contract {
+	if !srcHasAnyMarker(src, wsPrefilterMarkers) {
+		return nil
+	}
+
 	var contracts []Contract
 	text := string(src)
 	lines := strings.Split(text, "\n")

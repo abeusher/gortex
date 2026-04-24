@@ -21,12 +21,25 @@ const (
 )
 
 // BashExtractor extracts Bash/Shell source files.
+// Tier B per spec-extractor-perf.md: three small queries with an
+// inter-pass ordering constraint (funcRanges must be built before
+// command attribution), so we precompile each query at init but
+// don't merge into an alternation.
 type BashExtractor struct {
-	lang *sitter.Language
+	lang        *sitter.Language
+	qFunction   *parser.PreparedQuery
+	qVariable   *parser.PreparedQuery
+	qCommand    *parser.PreparedQuery
 }
 
 func NewBashExtractor() *BashExtractor {
-	return &BashExtractor{lang: bash.GetLanguage()}
+	lang := bash.GetLanguage()
+	return &BashExtractor{
+		lang:      lang,
+		qFunction: parser.MustPreparedQuery(bashQFunction, lang),
+		qVariable: parser.MustPreparedQuery(bashQVariable, lang),
+		qCommand:  parser.MustPreparedQuery(bashQCommand, lang),
+	}
 }
 
 func (e *BashExtractor) Language() string     { return "bash" }
@@ -52,13 +65,12 @@ func (e *BashExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 	seen := make(map[string]bool)
 
 	// Functions.
-	matches, _ := parser.RunQuery(bashQFunction, e.lang, root, src)
-	for _, m := range matches {
+	parser.EachMatch(e.qFunction, root, src, func(m parser.QueryResult) {
 		name := m.Captures["func.name"].Text
 		def := m.Captures["func.def"]
 		id := filePath + "::" + name
 		if seen[id] {
-			continue
+			return
 		}
 		seen[id] = true
 
@@ -70,36 +82,36 @@ func (e *BashExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 		result.Edges = append(result.Edges, &graph.Edge{
 			From: fileNode.ID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
 		})
-	}
+	})
 
 	// Top-level variable assignments.
-	matches, _ = parser.RunQuery(bashQVariable, e.lang, root, src)
-	for _, m := range matches {
+	parser.EachMatch(e.qVariable, root, src, func(m parser.QueryResult) {
 		name := m.Captures["var.name"].Text
 		def := m.Captures["var.def"]
 		// Only top-level: parent is program.
-		if def.Node != nil && def.Node.Parent() != nil && def.Node.Parent().Type() == "program" {
-			id := filePath + "::" + name
-			if seen[id] {
-				continue
-			}
-			seen[id] = true
-			result.Nodes = append(result.Nodes, &graph.Node{
-				ID: id, Kind: graph.KindVariable, Name: name,
-				FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
-				Language: "bash",
-			})
-			result.Edges = append(result.Edges, &graph.Edge{
-				From: fileNode.ID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
-			})
+		if def.Node == nil || def.Node.Parent() == nil || def.Node.Parent().Type() != "program" {
+			return
 		}
-	}
+		id := filePath + "::" + name
+		if seen[id] {
+			return
+		}
+		seen[id] = true
+		result.Nodes = append(result.Nodes, &graph.Node{
+			ID: id, Kind: graph.KindVariable, Name: name,
+			FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
+			Language: "bash",
+		})
+		result.Edges = append(result.Edges, &graph.Edge{
+			From: fileNode.ID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
+		})
+	})
 
 	// Command calls — extract source/dot imports and general call sites.
+	// funcRanges depends on the function pass above.
 	funcRanges := buildFuncRanges(result)
 
-	matches, _ = parser.RunQuery(bashQCommand, e.lang, root, src)
-	for _, m := range matches {
+	parser.EachMatch(e.qCommand, root, src, func(m parser.QueryResult) {
 		cmdName := m.Captures["cmd.name"].Text
 		expr := m.Captures["cmd.expr"]
 
@@ -119,19 +131,19 @@ func (e *BashExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 					})
 				}
 			}
-			continue
+			return
 		}
 
 		// Regular command call.
 		callerID := findEnclosingFunc(funcRanges, expr.StartLine+1)
 		if callerID == "" {
-			continue
+			return
 		}
 		result.Edges = append(result.Edges, &graph.Edge{
 			From: callerID, To: "unresolved::" + cmdName,
 			Kind: graph.EdgeCalls, FilePath: filePath, Line: expr.StartLine + 1,
 		})
-	}
+	})
 
 	return result, nil
 }

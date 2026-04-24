@@ -448,8 +448,99 @@ var httpPatterns = []httpPattern{
 	},
 }
 
+// httpPrefilterMarkers is the per-language substring prefilter.
+// Files whose language appears here must contain at least one
+// marker before the ~30 HTTP regexes run — otherwise we skip the
+// file entirely. See spec-extractor-perf.md §6.3 and the gRPC
+// reference implementation. Languages whose HTTP patterns hinge on
+// bare keywords (python's `path(`, ruby/elixir's top-level `get`,
+// `post`) are intentionally absent: any marker tight enough to
+// reject non-HTTP files would also reject legitimate HTTP files,
+// so the regex scan carries the whole cost.
+var httpPrefilterMarkers = map[string][][]byte{
+	"go": {
+		[]byte("Handle"),  // HandleFunc, .Handle(
+		[]byte("http."),   // http.Get/Post/NewRequest
+		[]byte("router."), // gin/echo/chi router var
+		[]byte("app."),    // fiber/gin app var
+		[]byte("mux."),    // net/http mux
+		[]byte(".GET("),   // fiber uppercase verbs
+		[]byte(".POST("),
+		[]byte(".PUT("),
+		[]byte(".DELETE("),
+		[]byte(".PATCH("),
+	},
+	"typescript": httpTsJsMarkers,
+	"javascript": httpTsJsMarkers,
+	"java":       httpJvmMarkers,
+	"kotlin":     httpJvmMarkers,
+	"dart": {
+		[]byte("dio."), // lowercased dio instance
+		[]byte("Dio."), // PascalCase Dio class
+		[]byte("http."),
+		[]byte("Router"),   // shelf_router `Router()` / `router.`
+		[]byte("..get("),   // shelf_router cascade form
+		[]byte("..post("),  // idem
+		[]byte("..put("),   // idem
+		[]byte("..delete("),
+		[]byte("..patch("),
+		[]byte("..head("),
+		[]byte("..options("),
+	},
+	// rust: the reqwest consumer pattern is `\w+\.(get|post|...)(`,
+	// and those verbs are universal Rust method calls. Any marker
+	// tight enough to reject non-HTTP files would also reject
+	// reqwest consumers, so we leave rust out and run the regex
+	// scan unconditionally.
+	"csharp": {
+		[]byte("[Http"),      // attribute routing
+		[]byte(".Map"),       // minimal APIs
+		[]byte("GetAsync("),  // HttpClient consumer idiom
+		[]byte("PostAsync("), // idem
+		[]byte("PutAsync("),
+		[]byte("DeleteAsync("),
+		[]byte("PatchAsync("),
+	},
+	"php": {
+		[]byte("Route::"),
+		[]byte("#[Route"),
+		[]byte("->get("),
+		[]byte("->post("),
+		[]byte("->put("),
+		[]byte("->delete("),
+		[]byte("->patch("),
+	},
+}
+
+var httpTsJsMarkers = [][]byte{
+	[]byte("fetch("),
+	[]byte("axios"),
+	[]byte("@Get("),
+	[]byte("@Post("),
+	[]byte("@Put("),
+	[]byte("@Delete("),
+	[]byte("@Patch("),
+	[]byte("@Head("),
+	[]byte("@Options("),
+	[]byte("app."),
+	[]byte("router."),
+}
+
+var httpJvmMarkers = [][]byte{
+	[]byte("Mapping"), // @GetMapping / @PostMapping / @RequestMapping
+	[]byte("@Path"),   // JAX-RS
+	[]byte("HttpClient"),
+	[]byte("RestTemplate"),
+	[]byte("WebClient"),
+}
+
 // Extract scans src for HTTP route patterns and returns contracts.
 func (h *HTTPExtractor) Extract(filePath string, src []byte, nodes []*graph.Node, edges []*graph.Edge) []Contract {
+	lang := detectLanguage(filePath)
+	if markers, ok := httpPrefilterMarkers[lang]; ok && !srcHasAnyMarker(src, markers) {
+		return nil
+	}
+
 	text := string(src)
 	lines := strings.Split(text, "\n")
 
@@ -458,8 +549,6 @@ func (h *HTTPExtractor) Extract(filePath string, src []byte, nodes []*graph.Node
 	sort.Slice(fileNodes, func(i, j int) bool {
 		return fileNodes[i].StartLine < fileNodes[j].StartLine
 	})
-
-	lang := detectLanguage(filePath)
 
 	var out []Contract
 

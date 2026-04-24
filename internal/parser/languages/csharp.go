@@ -10,111 +10,102 @@ import (
 	"github.com/zzet/gortex/internal/parser"
 )
 
-const (
-	csharpQClass = `(class_declaration
-		name: (identifier) @class.name) @class.def`
+// qCSharpAll is a single tree-sitter query alternating over every
+// pattern the C# extractor needs. One tree walk per file replaces the
+// 13 `parser.RunQuery` calls the previous design made (each of which
+// recompiled its query and ran an independent cursor over the whole
+// tree). Capture names are disjoint across patterns so the dispatch in
+// Extract can branch on which name is set. Class / struct / interface
+// membership for methods, constructors, fields, and properties is
+// resolved via a parent walk on the captured node — the legacy nested
+// queries duplicated each member pattern across class_declaration and
+// struct_declaration; the parent walk collapses them into a single
+// pattern per member kind.
+const qCSharpAll = `
+[
+  (namespace_declaration
+    name: (_) @ns.name) @ns.def
 
-	csharpQInterface = `(interface_declaration
-		name: (identifier) @iface.name) @iface.def`
+  (class_declaration
+    name: (identifier) @class.name) @class.def
 
-	csharpQStruct = `(struct_declaration
-		name: (identifier) @struct.name) @struct.def`
+  (interface_declaration
+    name: (identifier) @iface.name) @iface.def
 
-	csharpQEnum = `(enum_declaration
-		name: (identifier) @enum.name) @enum.def`
+  (struct_declaration
+    name: (identifier) @struct.name) @struct.def
 
-	csharpQNamespace = `(namespace_declaration
-		name: (_) @ns.name) @ns.def`
+  (enum_declaration
+    name: (identifier) @enum.name) @enum.def
 
-	csharpQUsing = `(using_directive (_) @using.path) @using.def`
+  (method_declaration
+    name: (identifier) @method.name) @method.def
 
-	csharpQClassMethod = `(class_declaration
-		name: (identifier) @class.name
-		body: (declaration_list
-			(method_declaration
-				name: (identifier) @method.name) @method.def))`
+  (constructor_declaration
+    name: (identifier) @ctor.name) @ctor.def
 
-	csharpQStructMethod = `(struct_declaration
-		name: (identifier) @struct.name
-		body: (declaration_list
-			(method_declaration
-				name: (identifier) @method.name) @method.def))`
+  (field_declaration
+    (variable_declaration
+      (variable_declarator
+        name: (identifier) @field.name))) @field.def
 
-	csharpQClassConstructor = `(class_declaration
-		name: (identifier) @class.name
-		body: (declaration_list
-			(constructor_declaration
-				name: (identifier) @ctor.name) @ctor.def))`
+  (property_declaration
+    name: (identifier) @prop.name) @prop.def
 
-	csharpQStructConstructor = `(struct_declaration
-		name: (identifier) @struct.name
-		body: (declaration_list
-			(constructor_declaration
-				name: (identifier) @ctor.name) @ctor.def))`
+  (using_directive (_) @using.path) @using.def
 
-	csharpQClassField = `(class_declaration
-		name: (identifier) @class.name
-		body: (declaration_list
-			(field_declaration
-				(variable_declaration
-					(variable_declarator
-						name: (identifier) @field.name))) @field.def))`
+  (invocation_expression
+    function: (identifier) @call.name) @call.expr
 
-	csharpQStructField = `(struct_declaration
-		name: (identifier) @struct.name
-		body: (declaration_list
-			(field_declaration
-				(variable_declaration
-					(variable_declarator
-						name: (identifier) @field.name))) @field.def))`
+  (invocation_expression
+    function: (member_access_expression
+      expression: (_) @callm.receiver
+      name: (identifier) @callm.method)) @callm.expr
 
-	csharpQClassProperty = `(class_declaration
-		name: (identifier) @class.name
-		body: (declaration_list
-			(property_declaration
-				name: (identifier) @prop.name) @prop.def))`
+  (local_declaration_statement
+    (variable_declaration
+      type: (_) @lvar.type
+      (variable_declarator
+        (identifier) @lvar.name))) @lvar.def
+]
+`
 
-	csharpQStructProperty = `(struct_declaration
-		name: (identifier) @struct.name
-		body: (declaration_list
-			(property_declaration
-				name: (identifier) @prop.name) @prop.def))`
-
-	csharpQIfaceMethod = `(interface_declaration
-		name: (identifier) @iface.name
-		body: (declaration_list
-			(method_declaration
-				name: (identifier) @iface.method.name)))`
-
-	csharpQCall = `(invocation_expression
-		function: (identifier) @call.name) @call.expr`
-
-	csharpQCallMember = `(invocation_expression
-		function: (member_access_expression
-			expression: (_) @call.receiver
-			name: (identifier) @call.method)) @call.expr`
-
-	// Tier 0: explicit type — UserService svc = ...
-	csharpQLocalTyped = `(local_declaration_statement
-		(variable_declaration
-			type: (_) @lvar.type
-			(variable_declarator
-				(identifier) @lvar.name))) @lvar.def`
-
-	// For Tier 1 (new): we walk variable_declarator nodes in buildTypeEnv.
-)
-
-// CSharpExtractor extracts C# source files.
+// CSharpExtractor extracts C# source files into graph nodes and edges.
 type CSharpExtractor struct {
 	lang *sitter.Language
+	qAll *parser.PreparedQuery
 }
 
 func NewCSharpExtractor() *CSharpExtractor {
-	return &CSharpExtractor{lang: csharp.GetLanguage()}
+	lang := csharp.GetLanguage()
+	return &CSharpExtractor{
+		lang: lang,
+		qAll: parser.MustPreparedQuery(qCSharpAll, lang),
+	}
 }
 
 func (e *CSharpExtractor) Language() string     { return "csharp" }
 func (e *CSharpExtractor) Extensions() []string { return []string{".cs"} }
+
+// --- Deferred match buffers ----------------------------------------
+
+type csharpDeferredCall struct {
+	name       string
+	receiver   string
+	line       int
+	isMember   bool
+}
+
+// csharpDeferredLocal buffers a local variable declaration for the
+// post-pass type-env build. Matches the legacy two-stage pass: Tier 0
+// records explicit types (`Foo svc = ...`); Tier 1 walks the def node
+// for `var svc = new Foo()` to recover the type when Tier 0 left a
+// "var" key without a real annotation.
+type csharpDeferredLocal struct {
+	name    string
+	rawType string
+	defNode *sitter.Node
+}
 
 func (e *CSharpExtractor) Extract(filePath string, src []byte) (*parser.ExtractionResult, error) {
 	tree, err := parser.ParseFile(src, e.lang)
@@ -131,258 +122,384 @@ func (e *CSharpExtractor) Extract(filePath string, src []byte) (*parser.Extracti
 		FilePath: filePath, StartLine: 1, EndLine: int(root.EndPoint().Row) + 1,
 		Language: "csharp",
 	}
+	fileID := fileNode.ID
 	result.Nodes = append(result.Nodes, fileNode)
 
 	seen := make(map[string]bool)
+	ifaceMethods := make(map[string][]string) // interface name → method names
 
-	// Namespaces.
-	matches, _ := parser.RunQuery(csharpQNamespace, e.lang, root, src)
-	for _, m := range matches {
-		name := m.Captures["ns.name"].Text
-		def := m.Captures["ns.def"]
-		id := filePath + "::" + name
-		if seen[id] {
-			continue
+	var calls []csharpDeferredCall
+	var locals []csharpDeferredLocal
+
+	parser.EachMatch(e.qAll, root, src, func(m parser.QueryResult) {
+		switch {
+
+		case m.Captures["ns.def"] != nil:
+			e.emitNamespace(m, filePath, fileID, result, seen)
+
+		case m.Captures["class.def"] != nil:
+			e.emitContainer(m, "class", graph.KindType, filePath, fileID, result, seen)
+
+		case m.Captures["iface.def"] != nil:
+			e.emitContainer(m, "iface", graph.KindInterface, filePath, fileID, result, seen)
+
+		case m.Captures["struct.def"] != nil:
+			e.emitContainer(m, "struct", graph.KindType, filePath, fileID, result, seen)
+
+		case m.Captures["enum.def"] != nil:
+			e.emitContainer(m, "enum", graph.KindType, filePath, fileID, result, seen)
+
+		case m.Captures["method.def"] != nil:
+			e.emitMethod(m, filePath, fileID, src, result, seen, ifaceMethods)
+
+		case m.Captures["ctor.def"] != nil:
+			e.emitConstructor(m, filePath, fileID, src, result, seen)
+
+		case m.Captures["field.def"] != nil:
+			e.emitField(m, filePath, fileID, src, result, seen)
+
+		case m.Captures["prop.def"] != nil:
+			e.emitProperty(m, filePath, fileID, src, result, seen)
+
+		case m.Captures["using.def"] != nil:
+			e.emitUsing(m, filePath, fileID, result)
+
+		case m.Captures["callm.expr"] != nil:
+			expr := m.Captures["callm.expr"]
+			calls = append(calls, csharpDeferredCall{
+				name:     m.Captures["callm.method"].Text,
+				receiver: m.Captures["callm.receiver"].Text,
+				line:     expr.StartLine + 1,
+				isMember: true,
+			})
+
+		case m.Captures["call.expr"] != nil:
+			expr := m.Captures["call.expr"]
+			calls = append(calls, csharpDeferredCall{
+				name: m.Captures["call.name"].Text,
+				line: expr.StartLine + 1,
+			})
+
+		case m.Captures["lvar.def"] != nil:
+			locals = append(locals, csharpDeferredLocal{
+				name:    m.Captures["lvar.name"].Text,
+				rawType: m.Captures["lvar.type"].Text,
+				defNode: m.Captures["lvar.def"].Node,
+			})
 		}
-		seen[id] = true
-		result.Nodes = append(result.Nodes, &graph.Node{
-			ID: id, Kind: graph.KindPackage, Name: name,
-			FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
-			Language: "csharp",
-		})
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileNode.ID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
-		})
-	}
+	})
 
-	// Classes.
-	matches, _ = parser.RunQuery(csharpQClass, e.lang, root, src)
-	for _, m := range matches {
-		name := m.Captures["class.name"].Text
-		def := m.Captures["class.def"]
-		id := filePath + "::" + name
-		if seen[id] {
-			continue
-		}
-		seen[id] = true
-		result.Nodes = append(result.Nodes, &graph.Node{
-			ID: id, Kind: graph.KindType, Name: name,
-			FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
-			Language: "csharp",
-		})
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileNode.ID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
-		})
-	}
-
-	// Interfaces.
-	matches, _ = parser.RunQuery(csharpQInterface, e.lang, root, src)
-	for _, m := range matches {
-		name := m.Captures["iface.name"].Text
-		def := m.Captures["iface.def"]
-		id := filePath + "::" + name
-		if seen[id] {
-			continue
-		}
-		seen[id] = true
-		result.Nodes = append(result.Nodes, &graph.Node{
-			ID: id, Kind: graph.KindInterface, Name: name,
-			FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
-			Language: "csharp",
-		})
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileNode.ID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
-		})
-	}
-
-	// Interface method names into Meta["methods"].
-	ifaceMethodMatches, _ := parser.RunQuery(csharpQIfaceMethod, e.lang, root, src)
-	ifaceMethods := make(map[string][]string)
-	for _, m := range ifaceMethodMatches {
-		ifaceName := m.Captures["iface.name"].Text
-		methodName := m.Captures["iface.method.name"].Text
-		ifaceMethods[ifaceName] = append(ifaceMethods[ifaceName], methodName)
-	}
+	// Stamp interface method names onto interface nodes' Meta["methods"].
 	for _, n := range result.Nodes {
-		if n.Kind == graph.KindInterface {
-			if methods, ok := ifaceMethods[n.Name]; ok {
-				if n.Meta == nil {
-					n.Meta = make(map[string]any)
-				}
-				n.Meta["methods"] = methods
+		if n.Kind != graph.KindInterface {
+			continue
+		}
+		if methods, ok := ifaceMethods[n.Name]; ok {
+			if n.Meta == nil {
+				n.Meta = make(map[string]any)
 			}
+			n.Meta["methods"] = methods
 		}
 	}
 
-	// Structs.
-	matches, _ = parser.RunQuery(csharpQStruct, e.lang, root, src)
-	for _, m := range matches {
-		name := m.Captures["struct.name"].Text
-		def := m.Captures["struct.def"]
-		id := filePath + "::" + name
-		if seen[id] {
+	// Build type environment in legacy precedence:
+	//   Tier 0 — explicit type annotations (skip "var" placeholder)
+	//   Tier 1 — `var x = new Foo()` walk for `var`-keyed locals only
+	tenv := make(typeEnv)
+	for _, l := range locals {
+		typeName := normalizeCSharpTypeName(l.rawType)
+		if typeName != "" && typeName != "var" {
+			tenv[l.name] = typeName
+		}
+	}
+	for _, l := range locals {
+		if _, exists := tenv[l.name]; exists {
 			continue
 		}
-		seen[id] = true
-		result.Nodes = append(result.Nodes, &graph.Node{
-			ID: id, Kind: graph.KindType, Name: name,
-			FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
-			Language: "csharp",
-		})
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileNode.ID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
-		})
-	}
-
-	// Enums.
-	matches, _ = parser.RunQuery(csharpQEnum, e.lang, root, src)
-	for _, m := range matches {
-		name := m.Captures["enum.name"].Text
-		def := m.Captures["enum.def"]
-		id := filePath + "::" + name
-		if seen[id] {
+		if l.rawType != "var" {
 			continue
 		}
-		seen[id] = true
-		result.Nodes = append(result.Nodes, &graph.Node{
-			ID: id, Kind: graph.KindType, Name: name,
-			FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
-			Language: "csharp",
-		})
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileNode.ID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
-		})
-	}
-
-	// Methods in classes.
-	e.extractMethods(filePath, src, root, result, seen, csharpQClassMethod, "class.name")
-
-	// Methods in structs.
-	e.extractMethods(filePath, src, root, result, seen, csharpQStructMethod, "struct.name")
-
-	// Constructors in classes.
-	e.extractConstructors(filePath, src, root, result, seen, csharpQClassConstructor, "class.name")
-
-	// Constructors in structs.
-	e.extractConstructors(filePath, src, root, result, seen, csharpQStructConstructor, "struct.name")
-
-	// Fields in classes.
-	e.extractFields(filePath, src, root, result, seen, csharpQClassField, "class.name", "field")
-
-	// Fields in structs.
-	e.extractFields(filePath, src, root, result, seen, csharpQStructField, "struct.name", "field")
-
-	// Properties in classes.
-	e.extractFields(filePath, src, root, result, seen, csharpQClassProperty, "class.name", "prop")
-
-	// Properties in structs.
-	e.extractFields(filePath, src, root, result, seen, csharpQStructProperty, "struct.name", "prop")
-
-	// Using directives.
-	matches, _ = parser.RunQuery(csharpQUsing, e.lang, root, src)
-	for _, m := range matches {
-		path := m.Captures["using.path"]
-		importPath := strings.ReplaceAll(path.Text, ".", "/")
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileNode.ID, To: "unresolved::import::" + importPath,
-			Kind: graph.EdgeImports, FilePath: filePath, Line: path.StartLine + 1,
+		if l.defNode == nil {
+			continue
+		}
+		walkNodes(l.defNode, func(n *sitter.Node) {
+			if n.Type() == "object_creation_expression" {
+				typeName := inferTypeFromCSharpNew(n, src)
+				if typeName != "" {
+					tenv[l.name] = typeName
+				}
+			}
 		})
 	}
 
-	// Build type environment for receiver type inference.
-	tenv := e.buildTypeEnv(root, src)
-
-	// Call sites (with type env).
-	e.extractCalls(root, src, filePath, result, tenv)
+	// Resolve calls against funcRanges + tenv.
+	funcRanges := buildFuncRanges(result)
+	for _, c := range calls {
+		callerID := findEnclosingFunc(funcRanges, c.line)
+		if callerID == "" {
+			continue
+		}
+		if c.isMember {
+			edge := &graph.Edge{
+				From: callerID, To: "unresolved::*." + c.name,
+				Kind: graph.EdgeCalls, FilePath: filePath, Line: c.line,
+			}
+			if recvType, ok := tenv[c.receiver]; ok {
+				edge.Meta = map[string]any{"receiver_type": recvType}
+			} else if strings.Contains(c.receiver, ".") || strings.Contains(c.receiver, "(") {
+				if chainType := resolveChainType(c.receiver, tenv, result); chainType != "" {
+					edge.Meta = map[string]any{"receiver_type": chainType}
+				}
+			}
+			result.Edges = append(result.Edges, edge)
+			continue
+		}
+		result.Edges = append(result.Edges, &graph.Edge{
+			From: callerID, To: "unresolved::" + c.name,
+			Kind: graph.EdgeCalls, FilePath: filePath, Line: c.line,
+		})
+	}
 
 	return result, nil
 }
 
-func (e *CSharpExtractor) extractCalls(root *sitter.Node, src []byte, filePath string, result *parser.ExtractionResult, tenv typeEnv) {
-	funcRanges := buildFuncRanges(result)
+// --- Per-match emit helpers -----------------------------------------
 
-	// Plain function calls: Foo()
-	matches, _ := parser.RunQuery(csharpQCall, e.lang, root, src)
-	for _, m := range matches {
-		name := m.Captures["call.name"].Text
-		expr := m.Captures["call.expr"]
-		callerID := findEnclosingFunc(funcRanges, expr.StartLine+1)
-		if callerID == "" {
-			continue
-		}
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: callerID, To: "unresolved::" + name,
-			Kind: graph.EdgeCalls, FilePath: filePath, Line: expr.StartLine + 1,
-		})
+func (e *CSharpExtractor) emitNamespace(m parser.QueryResult, filePath, fileID string, result *parser.ExtractionResult, seen map[string]bool) {
+	name := m.Captures["ns.name"].Text
+	def := m.Captures["ns.def"]
+	id := filePath + "::" + name
+	if seen[id] {
+		return
 	}
-
-	// Member calls: obj.Method()
-	matches, _ = parser.RunQuery(csharpQCallMember, e.lang, root, src)
-	for _, m := range matches {
-		method := m.Captures["call.method"].Text
-		receiverText := m.Captures["call.receiver"].Text
-		expr := m.Captures["call.expr"]
-		callerID := findEnclosingFunc(funcRanges, expr.StartLine+1)
-		if callerID == "" {
-			continue
-		}
-
-		edge := &graph.Edge{
-			From: callerID, To: "unresolved::*." + method,
-			Kind: graph.EdgeCalls, FilePath: filePath, Line: expr.StartLine + 1,
-		}
-		if recvType, ok := tenv[receiverText]; ok {
-			edge.Meta = map[string]any{"receiver_type": recvType}
-		} else if strings.Contains(receiverText, ".") || strings.Contains(receiverText, "(") {
-			if chainType := resolveChainType(receiverText, tenv, result); chainType != "" {
-				edge.Meta = map[string]any{"receiver_type": chainType}
-			}
-		}
-		result.Edges = append(result.Edges, edge)
-	}
+	seen[id] = true
+	result.Nodes = append(result.Nodes, &graph.Node{
+		ID: id, Kind: graph.KindPackage, Name: name,
+		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
+		Language: "csharp",
+	})
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
+	})
 }
 
-// buildTypeEnv scans C# local variable declarations for type annotations (Tier 0)
-// and new/object_creation expressions (Tier 1) to build a variable-to-type map.
-func (e *CSharpExtractor) buildTypeEnv(root *sitter.Node, src []byte) typeEnv {
-	tenv := make(typeEnv)
+// emitContainer collapses the per-kind class/interface/struct/enum
+// node emission. The capture-name prefix selects which capture set to
+// read from (the legacy code repeated this body four times).
+func (e *CSharpExtractor) emitContainer(m parser.QueryResult, kind string, nodeKind graph.NodeKind, filePath, fileID string, result *parser.ExtractionResult, seen map[string]bool) {
+	name := m.Captures[kind+".name"].Text
+	def := m.Captures[kind+".def"]
+	id := filePath + "::" + name
+	if seen[id] {
+		return
+	}
+	seen[id] = true
+	result.Nodes = append(result.Nodes, &graph.Node{
+		ID: id, Kind: nodeKind, Name: name,
+		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
+		Language: "csharp",
+	})
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
+	})
+}
 
-	// Tier 0: explicit type annotations — UserService svc = ...
-	matches, _ := parser.RunQuery(csharpQLocalTyped, e.lang, root, src)
-	for _, m := range matches {
-		name := m.Captures["lvar.name"].Text
-		typeName := normalizeCSharpTypeName(m.Captures["lvar.type"].Text)
-		if typeName != "" && typeName != "var" {
-			tenv[name] = typeName
-		}
+func (e *CSharpExtractor) emitMethod(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool, ifaceMethods map[string][]string) {
+	name := m.Captures["method.name"].Text
+	def := m.Captures["method.def"]
+	startLine1 := def.StartLine + 1
+
+	owner := csharpDirectMemberOwner(def.Node, src, "class_declaration", "struct_declaration", "interface_declaration")
+	if owner.kind == "" {
+		// Method outside a recognised container — legacy didn't emit
+		// these (its nested queries required class/struct/interface
+		// parentage), so skip.
+		return
 	}
 
-	// Tier 1: var svc = new UserService() — walk for object_creation_expression
-	// Re-scan the typed locals for "var" declarations and check RHS for new.
-	for _, m := range matches {
-		name := m.Captures["lvar.name"].Text
-		if _, exists := tenv[name]; exists {
-			continue
-		}
-		typeText := m.Captures["lvar.type"].Text
-		if typeText != "var" {
-			continue
-		}
-		defNode := m.Captures["lvar.def"].Node
-		if defNode == nil {
-			continue
-		}
-		walkNodes(defNode, func(n *sitter.Node) {
-			if n.Type() == "object_creation_expression" {
-				typeName := inferTypeFromCSharpNew(n, src)
-				if typeName != "" {
-					tenv[name] = typeName
-				}
+	// Interface methods: legacy only collected names; no graph node was
+	// emitted for them. Mirror that.
+	if owner.kind == "interface_declaration" {
+		ifaceMethods[owner.name] = append(ifaceMethods[owner.name], name)
+		return
+	}
+
+	id := filePath + "::" + owner.name + "." + name
+	if seen[id] {
+		id = filePath + "::" + owner.name + "." + name + "_L" + fmt.Sprint(startLine1)
+	}
+	if seen[id] {
+		return
+	}
+	seen[id] = true
+	meta := map[string]any{"receiver": owner.name}
+	if rt := extractCSharpMethodReturnType(def.Node, src, name); rt != "" {
+		meta["return_type"] = rt
+	}
+	result.Nodes = append(result.Nodes, &graph.Node{
+		ID: id, Kind: graph.KindMethod, Name: name,
+		FilePath: filePath, StartLine: startLine1, EndLine: def.EndLine + 1,
+		Language: "csharp",
+		Meta:     meta,
+	})
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: startLine1,
+	})
+	ownerID := filePath + "::" + owner.name
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: id, To: ownerID, Kind: graph.EdgeMemberOf, FilePath: filePath, Line: startLine1,
+	})
+}
+
+func (e *CSharpExtractor) emitConstructor(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool) {
+	def := m.Captures["ctor.def"]
+	startLine1 := def.StartLine + 1
+	owner := csharpDirectMemberOwner(def.Node, src, "class_declaration", "struct_declaration")
+	if owner.kind == "" {
+		return
+	}
+	id := filePath + "::" + owner.name + ".<init>"
+	if seen[id] {
+		id = filePath + "::" + owner.name + ".<init>_L" + fmt.Sprint(startLine1)
+	}
+	if seen[id] {
+		return
+	}
+	seen[id] = true
+	result.Nodes = append(result.Nodes, &graph.Node{
+		ID: id, Kind: graph.KindMethod, Name: owner.name + ".<init>",
+		FilePath: filePath, StartLine: startLine1, EndLine: def.EndLine + 1,
+		Language: "csharp",
+		Meta:     map[string]any{"receiver": owner.name},
+	})
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: startLine1,
+	})
+	ownerID := filePath + "::" + owner.name
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: id, To: ownerID, Kind: graph.EdgeMemberOf, FilePath: filePath, Line: startLine1,
+	})
+}
+
+func (e *CSharpExtractor) emitField(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool) {
+	def := m.Captures["field.def"]
+	owner := csharpDirectMemberOwner(def.Node, src, "class_declaration", "struct_declaration")
+	if owner.kind == "" {
+		return
+	}
+	name := m.Captures["field.name"].Text
+	id := filePath + "::" + owner.name + "." + name
+	if seen[id] {
+		return
+	}
+	seen[id] = true
+	result.Nodes = append(result.Nodes, &graph.Node{
+		ID: id, Kind: graph.KindVariable, Name: name,
+		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
+		Language: "csharp",
+	})
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
+	})
+	ownerID := filePath + "::" + owner.name
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: id, To: ownerID, Kind: graph.EdgeMemberOf, FilePath: filePath, Line: def.StartLine + 1,
+	})
+}
+
+func (e *CSharpExtractor) emitProperty(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool) {
+	def := m.Captures["prop.def"]
+	owner := csharpDirectMemberOwner(def.Node, src, "class_declaration", "struct_declaration")
+	if owner.kind == "" {
+		return
+	}
+	name := m.Captures["prop.name"].Text
+	id := filePath + "::" + owner.name + "." + name
+	if seen[id] {
+		return
+	}
+	seen[id] = true
+	result.Nodes = append(result.Nodes, &graph.Node{
+		ID: id, Kind: graph.KindVariable, Name: name,
+		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
+		Language: "csharp",
+	})
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
+	})
+	ownerID := filePath + "::" + owner.name
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: id, To: ownerID, Kind: graph.EdgeMemberOf, FilePath: filePath, Line: def.StartLine + 1,
+	})
+}
+
+func (e *CSharpExtractor) emitUsing(m parser.QueryResult, filePath, fileID string, result *parser.ExtractionResult) {
+	path := m.Captures["using.path"]
+	importPath := strings.ReplaceAll(path.Text, ".", "/")
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: fileID, To: "unresolved::import::" + importPath,
+		Kind: graph.EdgeImports, FilePath: filePath, Line: path.StartLine + 1,
+	})
+}
+
+// --- Helpers --------------------------------------------------------
+
+type csharpOwner struct {
+	kind string // class_declaration / struct_declaration / interface_declaration
+	name string
+}
+
+// csharpDirectMemberOwner mirrors the legacy nested queries: the
+// member must be a direct child of the container's declaration_list.
+// Returns kind == "" when the member isn't directly inside one of the
+// allowed container kinds (skipping nested types, top-level statements,
+// etc. — none of which the legacy extractor handled).
+func csharpDirectMemberOwner(member *sitter.Node, src []byte, allowed ...string) csharpOwner {
+	if member == nil {
+		return csharpOwner{}
+	}
+	parent := member.Parent()
+	if parent == nil || parent.Type() != "declaration_list" {
+		return csharpOwner{}
+	}
+	grand := parent.Parent()
+	if grand == nil {
+		return csharpOwner{}
+	}
+	gtype := grand.Type()
+	for _, a := range allowed {
+		if gtype == a {
+			nameNode := grand.ChildByFieldName("name")
+			if nameNode == nil {
+				return csharpOwner{}
 			}
-		})
+			return csharpOwner{kind: gtype, name: nameNode.Content(src)}
+		}
 	}
+	return csharpOwner{}
+}
 
-	return tenv
+// extractCSharpMethodReturnType walks a method_declaration node for
+// the type child preceding the method name.
+func extractCSharpMethodReturnType(methodNode *sitter.Node, src []byte, methodName string) string {
+	if methodNode == nil {
+		return ""
+	}
+	for i := 0; i < int(methodNode.ChildCount()); i++ {
+		child := methodNode.Child(i)
+		if child.Type() == "identifier" && string(src[child.StartByte():child.EndByte()]) == methodName {
+			break
+		}
+		switch child.Type() {
+		case "predefined_type", "identifier", "qualified_name", "generic_name",
+			"nullable_type", "array_type", "tuple_type":
+			rawType := string(src[child.StartByte():child.EndByte()])
+			if rt := normalizeCSharpTypeName(rawType); rt != "" && rt != "var" {
+				return rt
+			}
+		}
+	}
+	return ""
 }
 
 // normalizeCSharpTypeName strips generics and nullable markers from a C# type name.
@@ -431,122 +548,4 @@ func inferTypeFromCSharpNew(node *sitter.Node, src []byte) string {
 		}
 	}
 	return ""
-}
-
-func (e *CSharpExtractor) extractMethods(
-	filePath string, src []byte, root *sitter.Node,
-	result *parser.ExtractionResult, seen map[string]bool,
-	query string, ownerCapture string,
-) {
-	matches, _ := parser.RunQuery(query, e.lang, root, src)
-	for _, m := range matches {
-		ownerName := m.Captures[ownerCapture].Text
-		name := m.Captures["method.name"].Text
-		def := m.Captures["method.def"]
-		id := filePath + "::" + ownerName + "." + name
-		if seen[id] {
-			id = filePath + "::" + ownerName + "." + name + "_L" + fmt.Sprint(def.StartLine+1)
-		}
-		if seen[id] {
-			continue
-		}
-		seen[id] = true
-		meta := map[string]any{"receiver": ownerName}
-		// Extract return type from method_declaration node.
-		// In C# tree-sitter, method_declaration has a type child before the name.
-		if def.Node != nil {
-			for i := 0; i < int(def.Node.ChildCount()); i++ {
-				child := def.Node.Child(i)
-				if child.Type() == "identifier" && string(src[child.StartByte():child.EndByte()]) == name {
-					break
-				}
-				childType := child.Type()
-				// Type nodes include predefined_type, identifier, qualified_name, generic_name, nullable_type, array_type, etc.
-				switch childType {
-				case "predefined_type", "identifier", "qualified_name", "generic_name",
-					"nullable_type", "array_type", "tuple_type":
-					rawType := string(src[child.StartByte():child.EndByte()])
-					if rt := normalizeCSharpTypeName(rawType); rt != "" && rt != "var" {
-						meta["return_type"] = rt
-					}
-				}
-			}
-		}
-		result.Nodes = append(result.Nodes, &graph.Node{
-			ID: id, Kind: graph.KindMethod, Name: name,
-			FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
-			Language: "csharp",
-			Meta:     meta,
-		})
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: filePath, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
-		})
-		ownerID := filePath + "::" + ownerName
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: id, To: ownerID, Kind: graph.EdgeMemberOf, FilePath: filePath, Line: def.StartLine + 1,
-		})
-	}
-}
-
-func (e *CSharpExtractor) extractConstructors(
-	filePath string, src []byte, root *sitter.Node,
-	result *parser.ExtractionResult, seen map[string]bool,
-	query string, ownerCapture string,
-) {
-	matches, _ := parser.RunQuery(query, e.lang, root, src)
-	for _, m := range matches {
-		ownerName := m.Captures[ownerCapture].Text
-		def := m.Captures["ctor.def"]
-		id := filePath + "::" + ownerName + ".<init>"
-		if seen[id] {
-			id = filePath + "::" + ownerName + ".<init>_L" + fmt.Sprint(def.StartLine+1)
-		}
-		if seen[id] {
-			continue
-		}
-		seen[id] = true
-		result.Nodes = append(result.Nodes, &graph.Node{
-			ID: id, Kind: graph.KindMethod, Name: ownerName + ".<init>",
-			FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
-			Language: "csharp",
-			Meta:     map[string]any{"receiver": ownerName},
-		})
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: filePath, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
-		})
-		ownerID := filePath + "::" + ownerName
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: id, To: ownerID, Kind: graph.EdgeMemberOf, FilePath: filePath, Line: def.StartLine + 1,
-		})
-	}
-}
-
-func (e *CSharpExtractor) extractFields(
-	filePath string, src []byte, root *sitter.Node,
-	result *parser.ExtractionResult, seen map[string]bool,
-	query string, ownerCapture string, fieldCapture string,
-) {
-	matches, _ := parser.RunQuery(query, e.lang, root, src)
-	for _, m := range matches {
-		ownerName := m.Captures[ownerCapture].Text
-		name := m.Captures[fieldCapture+".name"].Text
-		def := m.Captures[fieldCapture+".def"]
-		id := filePath + "::" + ownerName + "." + name
-		if seen[id] {
-			continue
-		}
-		seen[id] = true
-		result.Nodes = append(result.Nodes, &graph.Node{
-			ID: id, Kind: graph.KindVariable, Name: name,
-			FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
-			Language: "csharp",
-		})
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: filePath, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
-		})
-		ownerID := filePath + "::" + ownerName
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: id, To: ownerID, Kind: graph.EdgeMemberOf, FilePath: filePath, Line: def.StartLine + 1,
-		})
-	}
 }

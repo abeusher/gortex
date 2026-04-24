@@ -46,7 +46,29 @@ func (e *TopicExtractor) SupportedLanguages() []string {
 	return []string{"go", "typescript", "javascript", "python"}
 }
 
+// topicPrefilterMarkers covers every publish/subscribe regex
+// without redundancy: `basic_publish` / `basic_consume` are
+// omitted because `publish` / `consume` are substrings of them;
+// `topic` (no colon) covers both `topic:` and `topics:`. A file
+// without any of these can not produce a contract, so we
+// short-circuit before the eleven FindAllStringSubmatchIndex
+// passes.
+var topicPrefilterMarkers = [][]byte{
+	[]byte("Publish"),   // .Publish( / channel.publish(
+	[]byte("publish"),   // lowercase + basic_publish
+	[]byte("Produce"),   // .Produce(
+	[]byte("produce"),   // .produce(
+	[]byte("Subscribe"), // .Subscribe(
+	[]byte("subscribe"), // .subscribe(
+	[]byte("consume"),   // .consume( / basic_consume
+	[]byte("topic"),     // TS {topic:...} / {topics:[...]}
+}
+
 func (e *TopicExtractor) Extract(filePath string, src []byte, nodes []*graph.Node, edges []*graph.Edge) []Contract {
+	if !srcHasAnyMarker(src, topicPrefilterMarkers) {
+		return nil
+	}
+
 	var contracts []Contract
 	text := string(src)
 	lines := strings.Split(text, "\n")

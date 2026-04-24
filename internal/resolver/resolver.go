@@ -2,6 +2,7 @@ package resolver
 
 import (
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 
@@ -36,6 +37,14 @@ type Resolver struct {
 	graph        *graph.Graph
 	dirIndex     map[string][]*graph.Node
 	lastDirIndex map[string][]*graph.Node
+	// providesForIdx maps `provides_for: AbstractName` (from @Module
+	// useClass entries) → the set of concrete class names bound to it.
+	// Populated once at the start of ResolveAll; consulted in O(1) by
+	// resolveMethodCall's DI-binding fallback instead of re-walking
+	// graph.AllEdges per call edge. Nil outside a resolution pass and
+	// empty-but-non-nil when the graph has no @Module bindings, so
+	// callers can short-circuit with len().
+	providesForIdx map[string]map[string]struct{}
 	// mu serialises resolution phases against the shared graph.
 	// Pointer so every Resolver built from the same *graph.Graph
 	// locks the same mutex — necessary for MultiIndexer's per-repo
@@ -55,23 +64,119 @@ func New(g *graph.Graph) *Resolver {
 }
 
 // ResolveAll resolves all unresolved edges in the graph.
+//
+// Edge resolution is partitioned across runtime.NumCPU() workers
+// (§6.5 of spec-extractor-perf.md). Each worker iterates a disjoint
+// slice and calls resolveEdge, which:
+//
+//   - mutates only its own e.To field (per-edge ownership, no
+//     write-write races between workers),
+//   - reads graph state via Find/Get methods that take per-shard
+//     RLocks (concurrent-safe),
+//   - calls graph.ReindexEdge which acquires write locks on three
+//     specific shards (e.From, oldTo, newTo) — concurrency between
+//     workers serialises only on shard collisions, not globally.
+//
+// Stats are aggregated per-worker and summed at the end so
+// `Resolved++` etc. don't race. r.mu serialises ResolveAll calls
+// against each other; nothing inside this function takes that lock.
 func (r *Resolver) ResolveAll() *ResolveStats {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	r.buildDirIndexes()
 	defer r.clearDirIndexes()
-
-	stats := &ResolveStats{}
+	r.buildProvidesForIndex()
+	defer r.clearProvidesForIndex()
 
 	edges := r.graph.AllEdges()
+	// Pre-filter to the unresolved subset so workers don't burn time
+	// re-walking the whole edge slice — ~95% of edges in a settled
+	// graph are already resolved.
+	pending := edges[:0:0]
 	for _, e := range edges {
-		if !strings.HasPrefix(e.To, unresolvedPrefix) {
+		if strings.HasPrefix(e.To, unresolvedPrefix) {
+			pending = append(pending, e)
+		}
+	}
+	if len(pending) == 0 {
+		return &ResolveStats{}
+	}
+
+	workers := runtime.NumCPU()
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > len(pending) {
+		workers = len(pending)
+	}
+
+	perWorkerStats := make([]ResolveStats, workers)
+	perWorkerJobs := make([][]reindexJob, workers)
+	var wg sync.WaitGroup
+	chunk := (len(pending) + workers - 1) / workers
+	for w := 0; w < workers; w++ {
+		start := w * chunk
+		end := start + chunk
+		if end > len(pending) {
+			end = len(pending)
+		}
+		if start >= end {
 			continue
 		}
-		r.resolveEdge(e, stats)
+		wg.Add(1)
+		go func(idx int, slice []*graph.Edge) {
+			defer wg.Done()
+			ws := &perWorkerStats[idx]
+			// Pre-size the jobs slice to the worker's chunk; over-
+			// allocates by ~5% (only resolved/external edges produce
+			// a job), but a few KB of headroom beats the growth
+			// amortisation cost across millions of edges.
+			jobs := make([]reindexJob, 0, len(slice))
+			for _, e := range slice {
+				clone := cloneEdgeForResolve(e)
+				oldTo, changed := r.resolveEdge(clone, ws)
+				if changed {
+					jobs = append(jobs, reindexJob{
+						edge:       e,
+						oldTo:      oldTo,
+						newTo:      clone.To,
+						crossRepo:  clone.CrossRepo,
+						confidence: clone.Confidence,
+						meta:       clone.Meta,
+					})
+				}
+			}
+			perWorkerJobs[idx] = jobs
+		}(w, pending[start:end])
 	}
-	return stats
+	wg.Wait()
+
+	// Apply mutations + ReindexEdge serially. Mutating e.To inside
+	// a worker would race with the bucket-maintenance reads inside
+	// every other worker's ReindexEdge — keyOf(swappedEdge) reads
+	// swappedEdge.To, which a neighbouring worker might be writing.
+	// Running both phases serially after the worker barrier removes
+	// the race entirely; it costs ~5% of resolver wall time on a
+	// 12k-edge vscode pass and buys a clean -race run plus simpler
+	// reasoning.
+	for i := range perWorkerJobs {
+		for _, j := range perWorkerJobs[i] {
+			j.edge.To = j.newTo
+			j.edge.CrossRepo = j.crossRepo
+			j.edge.Confidence = j.confidence
+			j.edge.Meta = j.meta
+			r.graph.ReindexEdge(j.edge, j.oldTo)
+		}
+	}
+
+	total := &ResolveStats{}
+	for i := range perWorkerStats {
+		total.Resolved += perWorkerStats[i].Resolved
+		total.Unresolved += perWorkerStats[i].Unresolved
+		total.External += perWorkerStats[i].External
+	}
+	return total
 }
 
 // buildDirIndexes builds two lookup maps for resolveImport. Populated
@@ -110,10 +215,13 @@ func (r *Resolver) ResolveFile(filePath string) *ResolveStats {
 
 	r.buildDirIndexes()
 	defer r.clearDirIndexes()
+	r.buildProvidesForIndex()
+	defer r.clearProvidesForIndex()
 
 	stats := &ResolveStats{}
 
 	// Get all nodes in the file, then check their outgoing edges.
+	// Single-threaded path — apply ReindexEdge inline as before.
 	nodes := r.graph.GetFileNodes(filePath)
 	for _, n := range nodes {
 		edges := r.graph.GetOutEdges(n.ID)
@@ -121,14 +229,61 @@ func (r *Resolver) ResolveFile(filePath string) *ResolveStats {
 			if !strings.HasPrefix(e.To, unresolvedPrefix) {
 				continue
 			}
-			r.resolveEdge(e, stats)
+			oldTo, changed := r.resolveEdge(e, stats)
+			if changed {
+				r.graph.ReindexEdge(e, oldTo)
+			}
 		}
 	}
 	return stats
 }
 
-func (r *Resolver) resolveEdge(e *graph.Edge, stats *ResolveStats) {
-	oldTo := e.To
+// reindexJob captures the resolved state for an edge whose target
+// changed during a parallel resolution pass.
+//
+// Workers operate on shallow clones of each edge (cloneEdgeForResolve
+// below) so mutating helpers can write to the clone freely without
+// racing with: (a) other workers reading neighbouring edges' fields
+// during bucket maintenance, or (b) the serial post-pass that reads
+// each edge's To via keyOf. Once the worker phase completes, the
+// resolved fields (To, CrossRepo, Confidence, Meta) are copied onto
+// the real edge and graph.ReindexEdge is called — both serially.
+type reindexJob struct {
+	edge       *graph.Edge
+	oldTo      string
+	newTo      string
+	crossRepo  bool
+	confidence float64
+	meta       map[string]any
+}
+
+// cloneEdgeForResolve returns a deep-enough copy of e for safe
+// worker-local mutation by resolveEdge: every scalar / string field
+// is value-copied; Meta is duplicated when present so a helper
+// writing `clone.Meta["resolution"] = ...` doesn't mutate a map
+// shared with the original (and therefore with other goroutines
+// inspecting that map). Meta is the only reference-typed field on
+// Edge that resolveEdge may write to today; any future Edge field
+// of map / slice type will need handling here too.
+func cloneEdgeForResolve(e *graph.Edge) *graph.Edge {
+	clone := *e
+	if clone.Meta != nil {
+		dup := make(map[string]any, len(clone.Meta))
+		for k, v := range clone.Meta {
+			dup[k] = v
+		}
+		clone.Meta = dup
+	}
+	return &clone
+}
+
+// resolveEdge mutates e.To in place and returns the prior value
+// when a resolution actually happened (i.e. e.To != oldTo). The
+// caller decides whether to call graph.ReindexEdge immediately
+// (single-threaded ResolveFile) or to defer the reindex (parallel
+// ResolveAll). When nothing changed the returned bool is false.
+func (r *Resolver) resolveEdge(e *graph.Edge, stats *ResolveStats) (oldTo string, changed bool) {
+	oldTo = e.To
 	target := strings.TrimPrefix(e.To, unresolvedPrefix)
 
 	switch {
@@ -158,10 +313,7 @@ func (r *Resolver) resolveEdge(e *graph.Edge, stats *ResolveStats) {
 		}
 	}
 
-	// Update inEdges index if the target changed during resolution.
-	if e.To != oldTo {
-		r.graph.ReindexEdge(e, oldTo)
-	}
+	return oldTo, e.To != oldTo
 }
 
 // resolveExtern handles "extern::<importPath>::<symbol>" targets produced
@@ -601,40 +753,57 @@ func (r *Resolver) resolveTokenRef(e *graph.Edge, name string, stats *ResolveSta
 	stats.Resolved++
 }
 
+// buildProvidesForIndex walks AllEdges once and materialises a map of
+// abstract type → concrete class names declared via `@Module({ providers:
+// [{ provide: X, useClass: Y }] })`. boundImplsFor then consults this
+// index in O(1) per call edge instead of the O(E) scan that made this
+// path the dominant serial cost on large repos — e.g. a vscode index
+// had ~10k call edges triggering a full 30k-edge scan each, for 300M
+// comparisons that found nothing (vscode has zero NestJS modules).
+func (r *Resolver) buildProvidesForIndex() {
+	idx := make(map[string]map[string]struct{})
+	for _, ed := range r.graph.AllEdges() {
+		if ed.Kind != graph.EdgeProvides || ed.Meta == nil {
+			continue
+		}
+		pf, _ := ed.Meta["provides_for"].(string)
+		if pf == "" {
+			continue
+		}
+		if b, _ := ed.Meta["binding"].(string); b != "useClass" {
+			continue
+		}
+		to := ed.To
+		var name string
+		if strings.HasPrefix(to, "unresolved::") {
+			name = strings.TrimPrefix(to, "unresolved::")
+		} else if cut := strings.LastIndex(to, "::"); cut >= 0 {
+			name = to[cut+2:]
+		} else {
+			name = to
+		}
+		set, ok := idx[pf]
+		if !ok {
+			set = make(map[string]struct{})
+			idx[pf] = set
+		}
+		set[name] = struct{}{}
+	}
+	r.providesForIdx = idx
+}
+
+func (r *Resolver) clearProvidesForIndex() { r.providesForIdx = nil }
+
 // boundImplsFor returns the set of concrete class names bound to the
 // abstract type `abstractName` via @Module({ providers: [{ provide: X,
 // useClass: Y }] })` entries. Keys are class names (e.g. "EmailNotifier")
 // so the caller can match against nodeReceiverType of method candidates.
 // Empty when no binding exists.
 func (r *Resolver) boundImplsFor(abstractName string) map[string]struct{} {
-	if abstractName == "" {
+	if abstractName == "" || len(r.providesForIdx) == 0 {
 		return nil
 	}
-	out := make(map[string]struct{})
-	for _, ed := range r.graph.AllEdges() {
-		if ed.Kind != graph.EdgeProvides || ed.Meta == nil {
-			continue
-		}
-		if pf, _ := ed.Meta["provides_for"].(string); pf != abstractName {
-			continue
-		}
-		if b, _ := ed.Meta["binding"].(string); b != "useClass" {
-			continue
-		}
-		// ed.To is either a resolved class node ID or "unresolved::Name".
-		// Pull the name off either shape.
-		to := ed.To
-		if strings.HasPrefix(to, "unresolved::") {
-			out[strings.TrimPrefix(to, "unresolved::")] = struct{}{}
-			continue
-		}
-		if idx := strings.LastIndex(to, "::"); idx >= 0 {
-			out[to[idx+2:]] = struct{}{}
-		} else {
-			out[to] = struct{}{}
-		}
-	}
-	return out
+	return r.providesForIdx[abstractName]
 }
 
 // edgeReceiverType extracts the receiver_type from Edge.Meta, if present.
@@ -726,35 +895,93 @@ func (r *Resolver) InferImplements() int {
 	}
 
 	// Step 3: For each type, check if its method set satisfies each interface.
-	added := 0
-	for typeID, methods := range typeMethods {
-		typeNode := r.graph.GetNode(typeID)
-		if typeNode == nil || (typeNode.Kind != graph.KindType && typeNode.Kind != graph.KindInterface) {
+	//
+	// The (types × interfaces) cross product is embarrassingly parallel —
+	// each type's check is independent and the only write is an AddEdge
+	// at the end. We chunk types across NumCPU workers, collect pair
+	// results into per-worker slices, and apply them serially at the end
+	// (AddEdge contends on Graph mutation internally). On large repos
+	// like vscode this cuts InferImplements wall time roughly N×.
+	type pair struct {
+		typeID, ifaceID, filePath string
+		line                      int
+	}
+
+	typeList := make([]string, 0, len(typeMethods))
+	for tid := range typeMethods {
+		typeList = append(typeList, tid)
+	}
+
+	workers := runtime.NumCPU()
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > len(typeList) {
+		workers = len(typeList)
+	}
+	if workers == 0 {
+		return 0
+	}
+
+	results := make([][]pair, workers)
+	var wg sync.WaitGroup
+	chunk := (len(typeList) + workers - 1) / workers
+	for w := 0; w < workers; w++ {
+		start := w * chunk
+		end := start + chunk
+		if end > len(typeList) {
+			end = len(typeList)
+		}
+		if start >= end {
 			continue
 		}
-		// Don't let a type implement itself.
-		for _, iface := range ifaces {
-			if iface.id == typeID {
-				continue
-			}
-			// Check if all required methods are present.
-			satisfies := true
-			for m := range iface.methods {
-				if !methods[m] {
-					satisfies = false
-					break
+		wg.Add(1)
+		go func(idx int, slice []string) {
+			defer wg.Done()
+			var out []pair
+			for _, typeID := range slice {
+				methods := typeMethods[typeID]
+				typeNode := r.graph.GetNode(typeID)
+				if typeNode == nil || (typeNode.Kind != graph.KindType && typeNode.Kind != graph.KindInterface) {
+					continue
+				}
+				for _, iface := range ifaces {
+					if iface.id == typeID {
+						continue
+					}
+					satisfies := true
+					for m := range iface.methods {
+						if !methods[m] {
+							satisfies = false
+							break
+						}
+					}
+					if satisfies {
+						out = append(out, pair{
+							typeID:   typeID,
+							ifaceID:  iface.id,
+							filePath: typeNode.FilePath,
+							line:     typeNode.StartLine,
+						})
+					}
 				}
 			}
-			if satisfies {
-				r.graph.AddEdge(&graph.Edge{
-					From:     typeID,
-					To:       iface.id,
-					Kind:     graph.EdgeImplements,
-					FilePath: typeNode.FilePath,
-					Line:     typeNode.StartLine,
-				})
-				added++
-			}
+			results[idx] = out
+		}(w, typeList[start:end])
+	}
+	wg.Wait()
+
+	added := 0
+	for _, chunkResults := range results {
+		for _, p := range chunkResults {
+			r.graph.AddEdge(&graph.Edge{
+				From:     p.typeID,
+				To:       p.ifaceID,
+				Kind:     graph.EdgeImplements,
+				FilePath: p.filePath,
+				Line:     p.line,
+			})
+			added++
 		}
 	}
 

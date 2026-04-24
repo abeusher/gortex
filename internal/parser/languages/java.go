@@ -10,93 +10,93 @@ import (
 	"github.com/zzet/gortex/internal/parser"
 )
 
-const (
-	javaQClass = `(class_declaration
-		name: (identifier) @class.name) @class.def`
+// qJavaAll is a single tree-sitter query alternating over every pattern
+// the Java extractor needs. One tree walk per file replaces the 13
+// `parser.RunQuery` calls the previous design made (each of which
+// recompiled its query and ran an independent cursor over the whole
+// tree). Capture names are disjoint across patterns so the dispatch in
+// Extract can branch on which name is set. Class/interface/enum
+// membership is resolved via a parent walk on the captured node rather
+// than nested queries — same behaviour, one cursor pass.
+const qJavaAll = `
+[
+  (class_declaration
+    name: (identifier) @class.name) @class.def
 
-	javaQInterface = `(interface_declaration
-		name: (identifier) @iface.name) @iface.def`
+  (interface_declaration
+    name: (identifier) @iface.name) @iface.def
 
-	javaQMethod = `(method_declaration
-		name: (identifier) @method.name) @method.def`
+  (enum_declaration
+    name: (identifier) @enum.name) @enum.def
 
-	javaQClassMethod = `(class_declaration
-		name: (identifier) @class.name
-		body: (class_body
-			(method_declaration
-				name: (identifier) @method.name) @method.def))`
+  (method_declaration
+    name: (identifier) @method.name) @method.def
 
-	javaQConstructor = `(constructor_declaration
-		name: (identifier) @ctor.name) @ctor.def`
+  (constructor_declaration
+    name: (identifier) @ctor.name) @ctor.def
 
-	javaQClassConstructor = `(class_declaration
-		name: (identifier) @class.name
-		body: (class_body
-			(constructor_declaration
-				name: (identifier) @ctor.name) @ctor.def))`
+  (enum_constant
+    name: (identifier) @enum_member.name) @enum_member.def
 
-	javaQImport = `(import_declaration
-		(scoped_identifier) @import.path) @import.def`
+  (field_declaration
+    type: (_) @fvar.type
+    declarator: (variable_declarator
+      name: (identifier) @fvar.name)) @fvar.def
 
-	javaQCall = `(method_invocation
-		name: (identifier) @call.name) @call.expr`
+  (local_variable_declaration
+    type: (_) @lvar.type
+    declarator: (variable_declarator
+      name: (identifier) @lvar.name)) @lvar.def
 
-	javaQCallMember = `(method_invocation
-		object: (_) @call.receiver
-		name: (identifier) @call.method) @call.expr`
+  (import_declaration
+    (scoped_identifier) @import.path) @import.def
 
-	javaQClassField = `(class_declaration
-		name: (identifier) @class.name
-		body: (class_body
-			(field_declaration
-				declarator: (variable_declarator
-					name: (identifier) @field.name)) @field.def))`
+  (method_invocation
+    name: (identifier) @call.name) @call.expr
 
-	javaQIfaceMethod = `(interface_declaration
-		name: (identifier) @iface.name
-		body: (interface_body
-			(method_declaration
-				name: (identifier) @iface.method.name)))`
+  (method_invocation
+    object: (_) @callm.receiver
+    name: (identifier) @callm.method) @callm.expr
+]
+`
 
-	// Tier 0: explicit local variable declarations — Type varName = ...
-	javaQLocalVar = `(local_variable_declaration
-		type: (_) @lvar.type
-		declarator: (variable_declarator
-			name: (identifier) @lvar.name)) @lvar.def`
-
-	// Tier 0: explicit field declarations — Type fieldName = ...
-	javaQFieldVar = `(field_declaration
-		type: (_) @fvar.type
-		declarator: (variable_declarator
-			name: (identifier) @fvar.name)) @fvar.def`
-
-	// Enums. Java enums are first-class classes with members — a
-	// typical codebase has dozens of them (Status, Role, EventType,
-	// etc.) and they're common navigation targets. Skipping them
-	// leaves enterprise Java graphs materially incomplete.
-	javaQEnum = `(enum_declaration
-		name: (identifier) @enum.name) @enum.def`
-
-	// Enum constants (members) — the right-hand-side values inside
-	// an enum body: `ACTIVE, INACTIVE, PENDING(5)` etc.
-	javaQEnumConstant = `(enum_declaration
-		name: (identifier) @enum.name
-		body: (enum_body
-			(enum_constant
-				name: (identifier) @enum.member) @enum.member.def))`
-)
-
-// JavaExtractor extracts Java source files.
+// JavaExtractor extracts Java source files into graph nodes and edges.
 type JavaExtractor struct {
 	lang *sitter.Language
+	qAll *parser.PreparedQuery
 }
 
 func NewJavaExtractor() *JavaExtractor {
-	return &JavaExtractor{lang: java.GetLanguage()}
+	lang := java.GetLanguage()
+	return &JavaExtractor{
+		lang: lang,
+		qAll: parser.MustPreparedQuery(qJavaAll, lang),
+	}
 }
 
 func (e *JavaExtractor) Language() string     { return "java" }
 func (e *JavaExtractor) Extensions() []string { return []string{".java"} }
+
+// --- Deferred match buffers ----------------------------------------
+
+type javaDeferredCall struct {
+	name       string // method name
+	receiver   string // selector receiver text (empty for plain call)
+	line       int    // 1-based call_expression start line
+	isSelector bool
+}
+
+// javaDeferredVar buffers a variable declaration for the post-pass
+// type-environment build. The legacy extractor materialised the env in
+// three ordered tiers (lvar explicit, then fvar explicit-no-overwrite,
+// then lvar `new Foo()` inference); document-order dispatch alone can't
+// reproduce that precedence, so we buffer and resolve at the end.
+type javaDeferredVar struct {
+	name     string
+	explicit string // normalized type from explicit annotation, "" if none
+	defNode  *sitter.Node
+	isLocal  bool
+}
 
 func (e *JavaExtractor) Extract(filePath string, src []byte) (*parser.ExtractionResult, error) {
 	tree, err := parser.ParseFile(src, e.lang)
@@ -113,140 +113,281 @@ func (e *JavaExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 		FilePath: filePath, StartLine: 1, EndLine: int(root.EndPoint().Row) + 1,
 		Language: "java",
 	}
+	fileID := fileNode.ID
 	result.Nodes = append(result.Nodes, fileNode)
 
 	seen := make(map[string]bool)
+	ifaceMethods := make(map[string][]string) // interface name → declared method names
 
-	// Classes.
-	matches, _ := parser.RunQuery(javaQClass, e.lang, root, src)
-	for _, m := range matches {
-		name := m.Captures["class.name"].Text
-		def := m.Captures["class.def"]
-		id := filePath + "::" + name
-		if seen[id] {
-			continue
+	var calls []javaDeferredCall
+	var varBuf []javaDeferredVar
+
+	parser.EachMatch(e.qAll, root, src, func(m parser.QueryResult) {
+		switch {
+
+		case m.Captures["class.def"] != nil:
+			e.emitClass(m, filePath, fileID, result, seen)
+
+		case m.Captures["iface.def"] != nil:
+			e.emitInterface(m, filePath, fileID, result, seen)
+
+		case m.Captures["enum.def"] != nil:
+			e.emitEnum(m, filePath, fileID, result, seen)
+
+		case m.Captures["method.def"] != nil:
+			e.emitMethod(m, filePath, fileID, src, result, seen, ifaceMethods)
+
+		case m.Captures["ctor.def"] != nil:
+			e.emitConstructor(m, filePath, fileID, src, result, seen)
+
+		case m.Captures["enum_member.def"] != nil:
+			e.emitEnumMember(m, filePath, src, result)
+
+		case m.Captures["fvar.def"] != nil:
+			e.emitField(m, filePath, fileID, src, result, seen)
+			// Always buffer for tenv post-pass — interface and enum
+			// fields contribute to the type env even though they're
+			// not emitted as graph nodes.
+			varBuf = append(varBuf, javaDeferredVar{
+				name:     m.Captures["fvar.name"].Text,
+				explicit: normalizeJavaTypeName(m.Captures["fvar.type"].Text),
+				defNode:  m.Captures["fvar.def"].Node,
+				isLocal:  false,
+			})
+
+		case m.Captures["lvar.def"] != nil:
+			varBuf = append(varBuf, javaDeferredVar{
+				name:     m.Captures["lvar.name"].Text,
+				explicit: normalizeJavaTypeName(m.Captures["lvar.type"].Text),
+				defNode:  m.Captures["lvar.def"].Node,
+				isLocal:  true,
+			})
+
+		case m.Captures["import.def"] != nil:
+			e.emitImport(m, filePath, fileID, result)
+
+		case m.Captures["callm.expr"] != nil:
+			expr := m.Captures["callm.expr"]
+			calls = append(calls, javaDeferredCall{
+				name:       m.Captures["callm.method"].Text,
+				receiver:   m.Captures["callm.receiver"].Text,
+				line:       expr.StartLine + 1,
+				isSelector: true,
+			})
+
+		case m.Captures["call.expr"] != nil:
+			// Plain-call pattern fires for `bar()` AND for the inner
+			// `bar` of `foo.bar()` — the legacy extractor emitted both
+			// edges, so we mirror that here.
+			expr := m.Captures["call.expr"]
+			calls = append(calls, javaDeferredCall{
+				name: m.Captures["call.name"].Text,
+				line: expr.StartLine + 1,
+			})
 		}
-		seen[id] = true
-		result.Nodes = append(result.Nodes, &graph.Node{
-			ID: id, Kind: graph.KindType, Name: name,
-			FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
-			Language: "java",
-		})
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileNode.ID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
-		})
-	}
+	})
 
-	// Enums — declaration + each constant as a member. KindType
-	// matches how classes are stored; Meta carries "kind":"enum" so
-	// downstream consumers can still distinguish enums from classes.
-	matches, _ = parser.RunQuery(javaQEnum, e.lang, root, src)
-	for _, m := range matches {
-		name := m.Captures["enum.name"].Text
-		def := m.Captures["enum.def"]
-		id := filePath + "::" + name
-		if seen[id] {
-			continue
-		}
-		seen[id] = true
-		result.Nodes = append(result.Nodes, &graph.Node{
-			ID: id, Kind: graph.KindType, Name: name,
-			FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
-			Language: "java",
-			Meta:     map[string]any{"kind": "enum"},
-		})
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileNode.ID, To: id, Kind: graph.EdgeDefines,
-			FilePath: filePath, Line: def.StartLine + 1,
-		})
-	}
-
-	// Enum constants (members).
-	memberMatches, _ := parser.RunQuery(javaQEnumConstant, e.lang, root, src)
-	for _, m := range memberMatches {
-		enumName := m.Captures["enum.name"].Text
-		memberName := m.Captures["enum.member"].Text
-		memberDef := m.Captures["enum.member.def"]
-		enumID := filePath + "::" + enumName
-		memberID := enumID + "." + memberName
-		result.Nodes = append(result.Nodes, &graph.Node{
-			ID: memberID, Kind: graph.KindVariable, Name: memberName,
-			FilePath:  filePath,
-			StartLine: memberDef.StartLine + 1,
-			EndLine:   memberDef.EndLine + 1,
-			Language:  "java",
-			Meta:      map[string]any{"receiver": enumName, "kind": "enum_member"},
-		})
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: memberID, To: enumID, Kind: graph.EdgeMemberOf,
-			FilePath: filePath, Line: memberDef.StartLine + 1,
-		})
-	}
-
-	// Interfaces.
-	matches, _ = parser.RunQuery(javaQInterface, e.lang, root, src)
-	for _, m := range matches {
-		name := m.Captures["iface.name"].Text
-		def := m.Captures["iface.def"]
-		id := filePath + "::" + name
-		if seen[id] {
-			continue
-		}
-		seen[id] = true
-		result.Nodes = append(result.Nodes, &graph.Node{
-			ID: id, Kind: graph.KindInterface, Name: name,
-			FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
-			Language: "java",
-		})
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileNode.ID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
-		})
-	}
-
-	// Extract interface method names into Meta["methods"] for IMPLEMENTS inference.
-	ifaceMethodMatches, _ := parser.RunQuery(javaQIfaceMethod, e.lang, root, src)
-	ifaceMethods := make(map[string][]string)
-	for _, m := range ifaceMethodMatches {
-		ifaceName := m.Captures["iface.name"].Text
-		methodName := m.Captures["iface.method.name"].Text
-		ifaceMethods[ifaceName] = append(ifaceMethods[ifaceName], methodName)
-	}
+	// Stamp interface method names onto interface nodes' Meta["methods"]
+	// for IMPLEMENTS inference.
 	for _, n := range result.Nodes {
-		if n.Kind == graph.KindInterface {
-			name := n.Name
-			if methods, ok := ifaceMethods[name]; ok {
-				if n.Meta == nil {
-					n.Meta = make(map[string]any)
+		if n.Kind != graph.KindInterface {
+			continue
+		}
+		if methods, ok := ifaceMethods[n.Name]; ok {
+			if n.Meta == nil {
+				n.Meta = make(map[string]any)
+			}
+			n.Meta["methods"] = methods
+		}
+	}
+
+	// Build type environment in the same precedence the legacy code used:
+	//   1. lvar Tier 0 — explicit annotation (overwrites prior key)
+	//   2. fvar Tier 0 — explicit annotation (no overwrite)
+	//   3. lvar Tier 1 — walk defNode for object_creation_expression
+	tenv := make(typeEnv)
+	for _, v := range varBuf {
+		if v.isLocal && v.explicit != "" {
+			tenv[v.name] = v.explicit
+		}
+	}
+	for _, v := range varBuf {
+		if v.isLocal {
+			continue
+		}
+		if v.explicit == "" {
+			continue
+		}
+		if _, exists := tenv[v.name]; exists {
+			continue
+		}
+		tenv[v.name] = v.explicit
+	}
+	for _, v := range varBuf {
+		if !v.isLocal {
+			continue
+		}
+		if _, exists := tenv[v.name]; exists {
+			continue
+		}
+		if v.defNode == nil {
+			continue
+		}
+		walkNodes(v.defNode, func(n *sitter.Node) {
+			if n.Type() == "object_creation_expression" {
+				typeName := inferTypeFromJavaNewExpr(n, src)
+				if typeName != "" {
+					tenv[v.name] = typeName
 				}
-				n.Meta["methods"] = methods
+			}
+		})
+	}
+
+	// All function/method nodes have been emitted; map call sites to
+	// their enclosing definition.
+	funcRanges := buildFuncRanges(result)
+	for _, c := range calls {
+		callerID := findEnclosingFunc(funcRanges, c.line)
+		if callerID == "" {
+			continue
+		}
+		edge := &graph.Edge{
+			From: callerID, To: "unresolved::*." + c.name,
+			Kind: graph.EdgeCalls, FilePath: filePath, Line: c.line,
+		}
+		if c.isSelector {
+			if recvType, ok := tenv[c.receiver]; ok {
+				edge.Meta = map[string]any{"receiver_type": recvType}
+			} else if strings.Contains(c.receiver, ".") || strings.Contains(c.receiver, "(") {
+				if chainType := resolveChainType(c.receiver, tenv, result); chainType != "" {
+					edge.Meta = map[string]any{"receiver_type": chainType}
+				}
 			}
 		}
+		result.Edges = append(result.Edges, edge)
 	}
 
-	// Methods (with class membership).
-	matches, _ = parser.RunQuery(javaQClassMethod, e.lang, root, src)
-	for _, m := range matches {
-		className := m.Captures["class.name"].Text
-		name := m.Captures["method.name"].Text
-		def := m.Captures["method.def"]
+	return result, nil
+}
+
+// --- Per-match emit helpers -----------------------------------------
+
+func (e *JavaExtractor) emitClass(m parser.QueryResult, filePath, fileID string, result *parser.ExtractionResult, seen map[string]bool) {
+	name := m.Captures["class.name"].Text
+	def := m.Captures["class.def"]
+	id := filePath + "::" + name
+	if seen[id] {
+		return
+	}
+	seen[id] = true
+	result.Nodes = append(result.Nodes, &graph.Node{
+		ID: id, Kind: graph.KindType, Name: name,
+		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
+		Language: "java",
+	})
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
+	})
+}
+
+func (e *JavaExtractor) emitInterface(m parser.QueryResult, filePath, fileID string, result *parser.ExtractionResult, seen map[string]bool) {
+	name := m.Captures["iface.name"].Text
+	def := m.Captures["iface.def"]
+	id := filePath + "::" + name
+	if seen[id] {
+		return
+	}
+	seen[id] = true
+	result.Nodes = append(result.Nodes, &graph.Node{
+		ID: id, Kind: graph.KindInterface, Name: name,
+		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
+		Language: "java",
+	})
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
+	})
+}
+
+func (e *JavaExtractor) emitEnum(m parser.QueryResult, filePath, fileID string, result *parser.ExtractionResult, seen map[string]bool) {
+	name := m.Captures["enum.name"].Text
+	def := m.Captures["enum.def"]
+	id := filePath + "::" + name
+	if seen[id] {
+		return
+	}
+	seen[id] = true
+	result.Nodes = append(result.Nodes, &graph.Node{
+		ID: id, Kind: graph.KindType, Name: name,
+		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
+		Language: "java",
+		Meta:     map[string]any{"kind": "enum"},
+	})
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: fileID, To: id, Kind: graph.EdgeDefines,
+		FilePath: filePath, Line: def.StartLine + 1,
+	})
+}
+
+func (e *JavaExtractor) emitEnumMember(m parser.QueryResult, filePath string, src []byte, result *parser.ExtractionResult) {
+	def := m.Captures["enum_member.def"]
+	enumNode := findEnclosingJavaContainer(def.Node, "enum_declaration")
+	if enumNode == nil {
+		return
+	}
+	enumName := javaIdentifierName(enumNode, src)
+	if enumName == "" {
+		return
+	}
+	memberName := m.Captures["enum_member.name"].Text
+	enumID := filePath + "::" + enumName
+	memberID := enumID + "." + memberName
+	result.Nodes = append(result.Nodes, &graph.Node{
+		ID: memberID, Kind: graph.KindVariable, Name: memberName,
+		FilePath:  filePath,
+		StartLine: def.StartLine + 1,
+		EndLine:   def.EndLine + 1,
+		Language:  "java",
+		Meta:      map[string]any{"receiver": enumName, "kind": "enum_member"},
+	})
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: memberID, To: enumID, Kind: graph.EdgeMemberOf,
+		FilePath: filePath, Line: def.StartLine + 1,
+	})
+}
+
+func (e *JavaExtractor) emitMethod(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool, ifaceMethods map[string][]string) {
+	name := m.Captures["method.name"].Text
+	def := m.Captures["method.def"]
+	startLine1 := def.StartLine + 1
+	lineKey := filePath + "::_method_L" + fmt.Sprint(startLine1)
+	if seen[lineKey] {
+		return
+	}
+	seen[lineKey] = true
+
+	enclosing := findEnclosingJavaContainerAny(def.Node, "class_declaration", "interface_declaration", "enum_declaration")
+
+	// Inside a class — emit as receiver-qualified method (the only
+	// container the legacy extractor's class-method query matched).
+	if enclosing != nil && enclosing.Type() == "class_declaration" {
+		className := javaIdentifierName(enclosing, src)
+		if className == "" {
+			return
+		}
 		id := filePath + "::" + className + "." + name
 		if seen[id] {
-			// Methods can share names (overloads), disambiguate by line.
-			id = filePath + "::" + className + "." + name + "_L" + fmt.Sprint(def.StartLine+1)
+			id = filePath + "::" + className + "." + name + "_L" + fmt.Sprint(startLine1)
 		}
 		if seen[id] {
-			continue
+			return
 		}
 		seen[id] = true
-		// Mark line so fallback query skips this method.
-		seen[filePath+"::_method_L"+fmt.Sprint(def.StartLine+1)] = true
 		node := &graph.Node{
 			ID: id, Kind: graph.KindMethod, Name: name,
-			FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
+			FilePath: filePath, StartLine: startLine1, EndLine: def.EndLine + 1,
 			Language: "java",
 			Meta:     map[string]any{"receiver": className},
 		}
-		// Extract return type from the method_declaration node.
 		if def.Node != nil {
 			if rt := extractJavaMethodReturnType(def.Node, src); rt != "" {
 				node.Meta["return_type"] = rt
@@ -254,29 +395,27 @@ func (e *JavaExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 		}
 		result.Nodes = append(result.Nodes, node)
 		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileNode.ID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
+			From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: startLine1,
 		})
-		// MemberOf edge to containing class.
 		classID := filePath + "::" + className
 		result.Edges = append(result.Edges, &graph.Edge{
-			From: id, To: classID, Kind: graph.EdgeMemberOf, FilePath: filePath, Line: def.StartLine + 1,
+			From: id, To: classID, Kind: graph.EdgeMemberOf, FilePath: filePath, Line: startLine1,
 		})
+
 		// Spring @Bean factory methods: when a method in a
 		// @Configuration class is decorated with @Bean, Spring calls
 		// it at context-init to produce a bean of the method's return
 		// type. Emit an EdgeProvides from the config class to the
 		// method so the indexer's DI post-pass links consumers typed
-		// as the return type back to this factory. Without this,
-		// `callers:systemClock` on an @Bean method returns empty.
+		// as the return type back to this factory.
 		if def.Node != nil && javaMethodHasAnnotation(def.Node, src, "Bean") {
-			rt, _ := node.Meta["return_type"].(string)
-			if rt != "" {
+			if rt, _ := node.Meta["return_type"].(string); rt != "" {
 				result.Edges = append(result.Edges, &graph.Edge{
 					From:     classID,
 					To:       id,
 					Kind:     graph.EdgeProvides,
 					FilePath: filePath,
-					Line:     def.StartLine + 1,
+					Line:     startLine1,
 					Meta: map[string]any{
 						"provides_for": rt,
 						"binding":      "bean",
@@ -284,240 +423,187 @@ func (e *JavaExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 				})
 			}
 		}
+		return
 	}
 
-	// Fallback: methods not inside a class declaration.
-	// Track lines already covered by class-scoped methods to avoid duplicates.
-	matches, _ = parser.RunQuery(javaQMethod, e.lang, root, src)
-	for _, m := range matches {
-		name := m.Captures["method.name"].Text
-		def := m.Captures["method.def"]
-		lineKey := filePath + "::_method_L" + fmt.Sprint(def.StartLine+1)
-		if seen[lineKey] {
-			continue
+	// Interface method — record the name for IMPLEMENTS inference and
+	// emit a flat method node (mirrors legacy fallback).
+	if enclosing != nil && enclosing.Type() == "interface_declaration" {
+		ifaceName := javaIdentifierName(enclosing, src)
+		if ifaceName != "" {
+			ifaceMethods[ifaceName] = append(ifaceMethods[ifaceName], name)
 		}
-		id := filePath + "::" + name
-		if seen[id] {
-			id = filePath + "::" + name + "_L" + fmt.Sprint(def.StartLine+1)
-		}
-		if seen[id] {
-			continue
-		}
-		seen[id] = true
-		result.Nodes = append(result.Nodes, &graph.Node{
-			ID: id, Kind: graph.KindMethod, Name: name,
-			FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
-			Language: "java",
-		})
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileNode.ID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
-		})
 	}
 
-	// Constructors (with class membership).
-	matches, _ = parser.RunQuery(javaQClassConstructor, e.lang, root, src)
-	for _, m := range matches {
-		className := m.Captures["class.name"].Text
-		def := m.Captures["ctor.def"]
-		id := filePath + "::" + className + ".<init>"
-		if seen[id] {
-			// Multiple constructors (overloads), disambiguate by line.
-			id = filePath + "::" + className + ".<init>_L" + fmt.Sprint(def.StartLine+1)
-		}
-		if seen[id] {
-			continue
-		}
-		seen[id] = true
-		// Mark line so fallback query skips this constructor.
-		seen[filePath+"::_ctor_L"+fmt.Sprint(def.StartLine+1)] = true
-		// Stash param-type text so the indexer's Spring-bean
-		// post-pass can match consumers to factory methods by type
-		// name. Simpler and more precise than scanning method bodies.
-		meta := map[string]any{"receiver": className}
-		if params := javaParamsSource(def.Node, src); params != "" {
-			meta["params_src"] = params
-		}
-		result.Nodes = append(result.Nodes, &graph.Node{
-			ID: id, Kind: graph.KindMethod, Name: className + ".<init>",
-			FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
-			Language: "java",
-			Meta:     meta,
-		})
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileNode.ID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
-		})
-		// MemberOf edge to containing class.
-		classID := filePath + "::" + className
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: id, To: classID, Kind: graph.EdgeMemberOf, FilePath: filePath, Line: def.StartLine + 1,
-		})
+	// Fallback: enum method, interface method, or method outside any
+	// container — emit flat (legacy `javaQMethod` fallback path).
+	id := filePath + "::" + name
+	if seen[id] {
+		id = filePath + "::" + name + "_L" + fmt.Sprint(startLine1)
 	}
+	if seen[id] {
+		return
+	}
+	seen[id] = true
+	result.Nodes = append(result.Nodes, &graph.Node{
+		ID: id, Kind: graph.KindMethod, Name: name,
+		FilePath: filePath, StartLine: startLine1, EndLine: def.EndLine + 1,
+		Language: "java",
+	})
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: startLine1,
+	})
+}
 
-	// Fallback: constructors not matched by class-scoped query.
-	matches, _ = parser.RunQuery(javaQConstructor, e.lang, root, src)
-	for _, m := range matches {
+func (e *JavaExtractor) emitConstructor(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool) {
+	def := m.Captures["ctor.def"]
+	startLine1 := def.StartLine + 1
+	lineKey := filePath + "::_ctor_L" + fmt.Sprint(startLine1)
+	if seen[lineKey] {
+		return
+	}
+	seen[lineKey] = true
+
+	enclosing := findEnclosingJavaContainer(def.Node, "class_declaration")
+	if enclosing == nil {
+		// Legacy fallback path — constructor outside a class. The
+		// tree-sitter-java grammar makes this unreachable in valid
+		// source, but keep parity with the old extractor.
 		name := m.Captures["ctor.name"].Text
-		def := m.Captures["ctor.def"]
-		lineKey := filePath + "::_ctor_L" + fmt.Sprint(def.StartLine+1)
-		if seen[lineKey] {
-			continue
-		}
 		id := filePath + "::" + name + ".<init>"
 		if seen[id] {
-			continue
+			return
 		}
 		seen[id] = true
 		result.Nodes = append(result.Nodes, &graph.Node{
 			ID: id, Kind: graph.KindMethod, Name: name + ".<init>",
-			FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
+			FilePath: filePath, StartLine: startLine1, EndLine: def.EndLine + 1,
 			Language: "java",
 		})
 		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileNode.ID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
+			From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: startLine1,
 		})
+		return
 	}
 
-	// Fields (with class membership).
-	matches, _ = parser.RunQuery(javaQClassField, e.lang, root, src)
-	for _, m := range matches {
-		className := m.Captures["class.name"].Text
-		name := m.Captures["field.name"].Text
-		def := m.Captures["field.def"]
-		id := filePath + "::" + className + "." + name
-		if seen[id] {
-			continue
-		}
-		seen[id] = true
-		result.Nodes = append(result.Nodes, &graph.Node{
-			ID: id, Kind: graph.KindVariable, Name: name,
-			FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
-			Language: "java",
-		})
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileNode.ID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
-		})
-		classID := filePath + "::" + className
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: id, To: classID, Kind: graph.EdgeMemberOf, FilePath: filePath, Line: def.StartLine + 1,
-		})
+	className := javaIdentifierName(enclosing, src)
+	if className == "" {
+		return
 	}
-
-	// Imports.
-	matches, _ = parser.RunQuery(javaQImport, e.lang, root, src)
-	for _, m := range matches {
-		path := m.Captures["import.path"]
-		importPath := strings.ReplaceAll(path.Text, ".", "/")
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileNode.ID, To: "unresolved::import::" + importPath,
-			Kind: graph.EdgeImports, FilePath: filePath, Line: path.StartLine + 1,
-		})
+	id := filePath + "::" + className + ".<init>"
+	if seen[id] {
+		id = filePath + "::" + className + ".<init>_L" + fmt.Sprint(startLine1)
 	}
-
-	// Build type environment for receiver type inference.
-	tenv := e.buildTypeEnv(root, src)
-
-	// Call sites (with type env).
-	e.extractCalls(root, src, filePath, result, tenv)
-
-	return result, nil
+	if seen[id] {
+		return
+	}
+	seen[id] = true
+	// Stash param-type text so the indexer's Spring-bean post-pass can
+	// match consumers to factory methods by type name.
+	meta := map[string]any{"receiver": className}
+	if params := javaParamsSource(def.Node, src); params != "" {
+		meta["params_src"] = params
+	}
+	result.Nodes = append(result.Nodes, &graph.Node{
+		ID: id, Kind: graph.KindMethod, Name: className + ".<init>",
+		FilePath: filePath, StartLine: startLine1, EndLine: def.EndLine + 1,
+		Language: "java",
+		Meta:     meta,
+	})
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: startLine1,
+	})
+	classID := filePath + "::" + className
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: id, To: classID, Kind: graph.EdgeMemberOf, FilePath: filePath, Line: startLine1,
+	})
 }
 
-// extractCalls extracts plain and member method calls with type-env-aware receiver resolution.
-func (e *JavaExtractor) extractCalls(root *sitter.Node, src []byte, filePath string, result *parser.ExtractionResult, tenv typeEnv) {
-	funcRanges := buildFuncRanges(result)
-
-	// Plain method calls (no receiver): methodName(...)
-	matches, _ := parser.RunQuery(javaQCall, e.lang, root, src)
-	for _, m := range matches {
-		name := m.Captures["call.name"].Text
-		expr := m.Captures["call.expr"]
-		callerID := findEnclosingFunc(funcRanges, expr.StartLine+1)
-		if callerID == "" {
-			continue
-		}
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: callerID, To: "unresolved::*." + name,
-			Kind: graph.EdgeCalls, FilePath: filePath, Line: expr.StartLine + 1,
-		})
+func (e *JavaExtractor) emitField(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool) {
+	def := m.Captures["fvar.def"]
+	enclosing := findEnclosingJavaContainer(def.Node, "class_declaration")
+	if enclosing == nil {
+		return
 	}
-
-	// Member method calls: receiver.methodName(...)
-	matches, _ = parser.RunQuery(javaQCallMember, e.lang, root, src)
-	for _, m := range matches {
-		method := m.Captures["call.method"].Text
-		receiverText := m.Captures["call.receiver"].Text
-		expr := m.Captures["call.expr"]
-		callerID := findEnclosingFunc(funcRanges, expr.StartLine+1)
-		if callerID == "" {
-			continue
-		}
-
-		edge := &graph.Edge{
-			From: callerID, To: "unresolved::*." + method,
-			Kind: graph.EdgeCalls, FilePath: filePath, Line: expr.StartLine + 1,
-		}
-		if recvType, ok := tenv[receiverText]; ok {
-			edge.Meta = map[string]any{"receiver_type": recvType}
-		} else if strings.Contains(receiverText, ".") || strings.Contains(receiverText, "(") {
-			if chainType := resolveChainType(receiverText, tenv, result); chainType != "" {
-				edge.Meta = map[string]any{"receiver_type": chainType}
-			}
-		}
-		result.Edges = append(result.Edges, edge)
+	className := javaIdentifierName(enclosing, src)
+	if className == "" {
+		return
 	}
+	name := m.Captures["fvar.name"].Text
+	id := filePath + "::" + className + "." + name
+	if seen[id] {
+		return
+	}
+	seen[id] = true
+	result.Nodes = append(result.Nodes, &graph.Node{
+		ID: id, Kind: graph.KindVariable, Name: name,
+		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
+		Language: "java",
+	})
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
+	})
+	classID := filePath + "::" + className
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: id, To: classID, Kind: graph.EdgeMemberOf, FilePath: filePath, Line: def.StartLine + 1,
+	})
 }
 
-// buildTypeEnv scans Java variable declarations to build a variable-to-type map.
-// Tier 0: explicit type declarations (Type varName = ...)
-// Tier 1: new expressions (var inferred from object_creation_expression)
-func (e *JavaExtractor) buildTypeEnv(root *sitter.Node, src []byte) typeEnv {
-	tenv := make(typeEnv)
+func (e *JavaExtractor) emitImport(m parser.QueryResult, filePath, fileID string, result *parser.ExtractionResult) {
+	path := m.Captures["import.path"]
+	importPath := strings.ReplaceAll(path.Text, ".", "/")
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: fileID, To: "unresolved::import::" + importPath,
+		Kind: graph.EdgeImports, FilePath: filePath, Line: path.StartLine + 1,
+	})
+}
 
-	// Tier 0: local variable declarations — User user = ...
-	matches, _ := parser.RunQuery(javaQLocalVar, e.lang, root, src)
-	for _, m := range matches {
-		name := m.Captures["lvar.name"].Text
-		typeName := normalizeJavaTypeName(m.Captures["lvar.type"].Text)
-		if typeName != "" {
-			tenv[name] = typeName
+// --- Helpers --------------------------------------------------------
+
+// findEnclosingJavaContainer walks the parent chain of n looking for
+// the nearest ancestor whose Type() matches t. Returns nil if none.
+func findEnclosingJavaContainer(n *sitter.Node, t string) *sitter.Node {
+	if n == nil {
+		return nil
+	}
+	for p := n.Parent(); p != nil; p = p.Parent() {
+		if p.Type() == t {
+			return p
 		}
 	}
+	return nil
+}
 
-	// Tier 0: field declarations — private User user = ...
-	fieldMatches, _ := parser.RunQuery(javaQFieldVar, e.lang, root, src)
-	for _, m := range fieldMatches {
-		name := m.Captures["fvar.name"].Text
-		if _, exists := tenv[name]; exists {
-			continue
-		}
-		typeName := normalizeJavaTypeName(m.Captures["fvar.type"].Text)
-		if typeName != "" {
-			tenv[name] = typeName
-		}
+// findEnclosingJavaContainerAny walks the parent chain of n looking for
+// the nearest ancestor whose Type() matches any of types. Returns nil
+// if none.
+func findEnclosingJavaContainerAny(n *sitter.Node, types ...string) *sitter.Node {
+	if n == nil {
+		return nil
 	}
-
-	// Tier 1: for local vars where explicit type didn't yield a name
-	// (e.g., Java 10+ var keyword), try to infer from new expression.
-	for _, m := range matches {
-		name := m.Captures["lvar.name"].Text
-		if _, exists := tenv[name]; exists {
-			continue // already have explicit type
-		}
-		defNode := m.Captures["lvar.def"].Node
-		if defNode == nil {
-			continue
-		}
-		walkNodes(defNode, func(n *sitter.Node) {
-			if n.Type() == "object_creation_expression" {
-				typeName := inferTypeFromJavaNewExpr(n, src)
-				if typeName != "" {
-					tenv[name] = typeName
-				}
+	for p := n.Parent(); p != nil; p = p.Parent() {
+		pt := p.Type()
+		for _, t := range types {
+			if pt == t {
+				return p
 			}
-		})
+		}
 	}
+	return nil
+}
 
-	return tenv
+// javaIdentifierName returns the source text of the `name` field
+// (typically an `identifier`) on a Java declaration node, or "" if
+// missing.
+func javaIdentifierName(declNode *sitter.Node, src []byte) string {
+	if declNode == nil {
+		return ""
+	}
+	nameNode := declNode.ChildByFieldName("name")
+	if nameNode == nil {
+		return ""
+	}
+	return nameNode.Content(src)
 }
 
 // normalizeJavaTypeName strips generics and array markers from a Java type name.
@@ -541,11 +627,9 @@ func normalizeJavaTypeName(t string) string {
 	return t
 }
 
-// extractJavaMethodReturnType walks a method_declaration node to find the return
-// type child (typically a type_identifier) and returns the normalized type name.
 // javaParamsSource returns the raw source text of a constructor or
-// method's formal_parameters child, including the parentheses. Used
-// by the DI post-pass to string-match parameter types without a full
+// method's formal_parameters child, including the parentheses. Used by
+// the DI post-pass to string-match parameter types without a full
 // re-parse of the method signature.
 func javaParamsSource(methodNode *sitter.Node, src []byte) string {
 	if methodNode == nil {
@@ -588,6 +672,9 @@ func javaMethodHasAnnotation(methodNode *sitter.Node, src []byte, name string) b
 	return false
 }
 
+// extractJavaMethodReturnType walks a method_declaration node to find
+// the return type child (typically a type_identifier) and returns the
+// normalized type name.
 func extractJavaMethodReturnType(methodNode *sitter.Node, src []byte) string {
 	for i := 0; i < int(methodNode.NamedChildCount()); i++ {
 		child := methodNode.NamedChild(i)

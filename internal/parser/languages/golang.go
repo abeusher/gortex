@@ -10,149 +10,148 @@ import (
 	"github.com/zzet/gortex/internal/parser"
 )
 
-// Tree-sitter query patterns for Go source files.
-const (
-	qPackage = `(package_clause (package_identifier) @pkg.name)`
+// qGoAll is a single tree-sitter query that alternates over every pattern
+// the Go extractor needs. One tree walk per file replaces the 20+
+// `parser.RunQuery` calls the previous design made per Extract call
+// (each of which recompiled its query and ran an independent cursor
+// over the whole tree). Capture names are disjoint across patterns so
+// the dispatch in Extract can branch on which name is set.
+const qGoAll = `
+[
+  (package_clause (package_identifier) @pkg.name)
 
-	qFunction = `(function_declaration
-		name: (identifier) @func.name
-		parameters: (parameter_list) @func.params
-		result: (_)? @func.result) @func.def`
+  (function_declaration
+    name: (identifier) @func.name
+    parameters: (parameter_list) @func.params
+    result: (_)? @func.result) @func.def
 
-	qMethod = `(method_declaration
-		receiver: (parameter_list) @method.receiver
-		name: (field_identifier) @method.name
-		parameters: (parameter_list) @method.params
-		result: (_)? @method.result) @method.def`
+  (method_declaration
+    receiver: (parameter_list) @method.receiver
+    name: (field_identifier) @method.name
+    parameters: (parameter_list) @method.params
+    result: (_)? @method.result) @method.def
 
-	qStruct = `(type_declaration
-		(type_spec
-			name: (type_identifier) @type.name
-			type: (struct_type) @type.body)) @type.def`
+  (type_declaration
+    (type_spec
+      name: (type_identifier) @typedef.name
+      type: (_) @typedef.body)) @typedef.def
 
-	qInterface = `(type_declaration
-		(type_spec
-			name: (type_identifier) @iface.name
-			type: (interface_type) @iface.body)) @iface.def`
+  (type_declaration
+    (type_alias
+      name: (type_identifier) @alias.name
+      type: (_) @alias.type)) @alias.def
 
-	qTypeOther = `(type_declaration
-		(type_spec
-			name: (type_identifier) @typedef.name
-			type: (_) @typedef.type)) @typedef.def`
+  (import_spec
+    name: (package_identifier)? @import.alias
+    path: (interpreted_string_literal) @import.path) @import.spec
 
-	qTypeAlias = `(type_declaration
-		(type_alias
-			name: (type_identifier) @alias.name
-			type: (_) @alias.type)) @alias.def`
+  (call_expression
+    function: (identifier) @call.name) @call.expr
 
-	qImportSingle = `(import_declaration
-		(import_spec
-			name: (package_identifier)? @import.alias
-			path: (interpreted_string_literal) @import.path))`
+  (call_expression
+    function: (selector_expression
+      operand: (_) @callm.receiver
+      field: (field_identifier) @callm.method)) @callm.expr
 
-	qImportBlock = `(import_declaration
-		(import_spec_list
-			(import_spec
-				name: (package_identifier)? @import.alias
-				path: (interpreted_string_literal) @import.path)))`
+  (var_declaration
+    (var_spec
+      name: (identifier) @var.name
+      type: (_)? @var.type)) @var.def
 
-	qCallPlain = `(call_expression
-		function: (identifier) @call.name) @call.expr`
+  (const_declaration
+    (const_spec
+      name: (identifier) @const.name)) @const.def
 
-	qCallSelector = `(call_expression
-		function: (selector_expression
-			operand: (_) @call.receiver
-			field: (field_identifier) @call.method)) @call.expr`
+  (short_var_declaration
+    left: (expression_list (identifier) @svar.name)
+    right: (expression_list (_) @svar.value)) @svar.def
 
-	qVar = `(var_declaration
-		(var_spec
-			name: (identifier) @var.name
-			type: (_)? @var.type)) @var.def`
+  (composite_literal
+    type: (type_identifier) @comp.type) @comp.expr
 
-	qConst = `(const_declaration
-		(const_spec
-			name: (identifier) @const.name)) @const.def`
+  (composite_literal
+    type: (qualified_type
+      package: (package_identifier) @compq.pkg
+      name: (type_identifier) @compq.type)) @compq.expr
 
-	qShortVar = `(short_var_declaration
-		left: (expression_list (identifier) @svar.name)
-		right: (expression_list (_) @svar.value)) @svar.def`
+  (field_declaration
+    type: (type_identifier) @ftype.name) @ftype.decl
 
-	// --- Dead-code-accuracy queries ---
+  (const_spec
+    type: (type_identifier) @ctype.name) @ctype.decl
 
-	// Composite literals: MyType{...}, &MyType{...}, pkg.Type{...}
-	qCompositeLiteral = `(composite_literal
-		type: (type_identifier) @comp.type) @comp.expr`
+  (var_spec
+    type: (type_identifier) @vtype.name) @vtype.decl
 
-	qCompositeLiteralQualified = `(composite_literal
-		type: (qualified_type
-			package: (package_identifier) @comp.pkg
-			name: (type_identifier) @comp.type)) @comp.expr`
+  (parameter_declaration
+    type: (type_identifier) @ptype.name) @ptype.decl
 
-	// Type assertions: x.(MyType), x.(pkg.Type)
-	qTypeAssert = `(type_assertion
-		type: (type_identifier) @assert.type) @assert.expr`
+  (argument_list
+    (selector_expression
+      operand: (_) @selarg.receiver
+      field: (field_identifier) @selarg.field)) @selarg.list
 
-	qTypeAssertQualified = `(type_assertion
-		type: (qualified_type
-			package: (package_identifier) @assert.pkg
-			name: (type_identifier) @assert.type)) @assert.expr`
+  (argument_list
+    (identifier) @identarg.name) @identarg.list
 
-	// Function/method values passed as arguments (not invoked directly).
-	// Selector expression inside argument_list but NOT inside call_expression function position.
-	qSelectorArg = `(argument_list
-		(selector_expression
-			operand: (_) @selarg.receiver
-			field: (field_identifier) @selarg.field)) @selarg.list`
+  (keyed_element
+    (literal_element (identifier) @fieldval.key)
+    (literal_element (identifier) @fieldval.value)) @fieldval.elem
 
-	// Bare identifier passed as argument (function value).
-	qIdentArg = `(argument_list
-		(identifier) @identarg.name) @identarg.list`
-
-	// --- Type references in declarations ---
-
-	// Type identifier in struct field declarations: field apiFormat
-	qFieldType = `(field_declaration
-		type: (type_identifier) @ftype.name) @ftype.decl`
-
-	// Type identifier in const/var declarations: const x apiFormat = ...
-	qConstType = `(const_spec
-		type: (type_identifier) @ctype.name) @ctype.decl`
-
-	qVarType = `(var_spec
-		type: (type_identifier) @vtype.name) @vtype.decl`
-
-	// Type identifier in parameter lists: func foo(x apiFormat)
-	qParamType = `(parameter_declaration
-		type: (type_identifier) @ptype.name) @ptype.decl`
-
-	// --- Struct literal field value references ---
-
-	// Bare identifier as a struct field value: &cobra.Command{RunE: runClean}
-	// AST: keyed_element → literal_element(identifier key) → literal_element(identifier value)
-	qFieldValueIdent = `(keyed_element
-		(literal_element (identifier) @fieldval.key)
-		(literal_element (identifier) @fieldval.value)) @fieldval.elem`
-
-	// Selector expression as a struct field value: {Handler: h.handleHealth}
-	qFieldValueSelector = `(keyed_element
-		(literal_element (identifier) @fieldsel.key)
-		(literal_element
-			(selector_expression
-				operand: (_) @fieldsel.receiver
-				field: (field_identifier) @fieldsel.method))) @fieldsel.elem`
-)
+  (keyed_element
+    (literal_element (identifier) @fieldsel.key)
+    (literal_element
+      (selector_expression
+        operand: (_) @fieldsel.receiver
+        field: (field_identifier) @fieldsel.method))) @fieldsel.elem
+]
+`
 
 // GoExtractor extracts Go source files into graph nodes and edges.
 type GoExtractor struct {
 	lang *sitter.Language
+	qAll *parser.PreparedQuery
 }
 
 func NewGoExtractor() *GoExtractor {
-	return &GoExtractor{lang: golang.GetLanguage()}
+	lang := golang.GetLanguage()
+	return &GoExtractor{
+		lang: lang,
+		qAll: parser.MustPreparedQuery(qGoAll, lang),
+	}
 }
 
 func (e *GoExtractor) Language() string     { return "go" }
 func (e *GoExtractor) Extensions() []string { return []string{".go"} }
+
+// --- Deferred match buffers ----------------------------------------
+
+type goDeferredCall struct {
+	callName    string // plain call
+	method      string // selector call method name
+	receiver    string // selector call receiver text
+	line        int    // 1-based line of call_expression
+	isSelector  bool
+}
+
+type goDeferredTypeRef struct {
+	typeName string
+	pkg      string // optional qualifier
+	line     int
+	kind     graph.EdgeKind
+}
+
+type goDeferredValueSel struct {
+	field    string
+	receiver string
+	line     int
+	kind     graph.EdgeKind
+}
+
+type goDeferredValueIdent struct {
+	name string
+	line int
+}
 
 func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionResult, error) {
 	tree, err := parser.ParseFile(src, e.lang)
@@ -164,7 +163,6 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 	root := tree.RootNode()
 	result := &parser.ExtractionResult{}
 
-	// File node.
 	fileNode := &graph.Node{
 		ID:        filePath,
 		Kind:      graph.KindFile,
@@ -174,620 +172,486 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 		EndLine:   int(root.EndPoint().Row) + 1,
 		Language:  "go",
 	}
+	fileID := fileNode.ID
 	result.Nodes = append(result.Nodes, fileNode)
 
-	// Package declaration.
-	pkgName := e.extractPackage(root, src, filePath, result)
+	imports := map[string]string{} // alias → importPath
+	tenv := make(typeEnv)
+	seenTypeName := map[string]bool{} // dedup when alias + typedef match same name
 
-	// Functions.
-	e.extractFunctions(root, src, filePath, fileNode.ID, result)
+	var calls []goDeferredCall
+	var typeRefs []goDeferredTypeRef
+	var instantiates []goDeferredTypeRef
+	var valueSels []goDeferredValueSel
+	var valueIdents []goDeferredValueIdent
+	var fieldValSels []goDeferredValueSel
+	var fieldValIdents []goDeferredValueIdent
 
-	// Methods.
-	e.extractMethods(root, src, filePath, fileNode.ID, result)
+	parser.EachMatch(e.qAll, root, src, func(m parser.QueryResult) {
+		switch {
 
-	// Types: structs, interfaces, type aliases.
-	e.extractTypes(root, src, filePath, fileNode.ID, result)
+		// Package: just a marker; not emitted as a graph node.
+		case m.Captures["pkg.name"] != nil:
+			// No-op (the package name is not currently surfaced as a node).
 
-	// Imports. Returned map is alias→importPath so downstream call-site
-	// extraction can attribute selector calls like `json.NewEncoder` to
-	// the owning package instead of the generic `unresolved::*.Method`.
-	imports := e.extractImports(root, src, filePath, fileNode.ID, pkgName, result)
+		case m.Captures["func.def"] != nil:
+			e.emitFunction(m, filePath, fileID, src, result)
 
-	// Build type environment for receiver type inference.
-	tenv := e.buildTypeEnv(root, src)
+		case m.Captures["method.def"] != nil:
+			e.emitMethod(m, filePath, fileID, src, result)
 
-	// Call sites (with type env for receiver resolution, plus imports
-	// so imported-package calls get a stable extern:: target).
-	e.extractCalls(root, src, filePath, result, tenv, imports)
+		case m.Captures["typedef.def"] != nil:
+			e.emitTypeDecl(m, filePath, fileID, src, result, seenTypeName)
 
-	// Variables and constants.
-	e.extractVarsConsts(root, src, filePath, fileNode.ID, result)
+		case m.Captures["alias.def"] != nil:
+			e.emitTypeAlias(m, filePath, fileID, result, seenTypeName)
 
-	// Type references: composite literals (struct instantiation), type assertions.
-	e.extractTypeRefs(root, src, filePath, result)
+		case m.Captures["import.spec"] != nil:
+			e.emitImport(m, filePath, fileID, result, imports)
 
-	// Value references: function/method identifiers passed as callbacks.
-	e.extractValueRefs(root, src, filePath, result, tenv)
+		case m.Captures["call.expr"] != nil:
+			expr := m.Captures["call.expr"]
+			calls = append(calls, goDeferredCall{
+				callName: m.Captures["call.name"].Text,
+				line:     expr.StartLine + 1,
+			})
+
+		case m.Captures["callm.expr"] != nil:
+			expr := m.Captures["callm.expr"]
+			calls = append(calls, goDeferredCall{
+				method:     m.Captures["callm.method"].Text,
+				receiver:   m.Captures["callm.receiver"].Text,
+				line:       expr.StartLine + 1,
+				isSelector: true,
+			})
+
+		case m.Captures["var.def"] != nil:
+			e.emitVar(m, filePath, fileID, result, tenv)
+
+		case m.Captures["const.def"] != nil:
+			e.emitConst(m, filePath, fileID, result)
+
+		case m.Captures["svar.def"] != nil:
+			e.recordShortVarType(m, src, tenv)
+
+		case m.Captures["comp.expr"] != nil:
+			expr := m.Captures["comp.expr"]
+			instantiates = append(instantiates, goDeferredTypeRef{
+				typeName: m.Captures["comp.type"].Text,
+				line:     expr.StartLine + 1,
+				kind:     graph.EdgeInstantiates,
+			})
+
+		case m.Captures["compq.expr"] != nil:
+			expr := m.Captures["compq.expr"]
+			instantiates = append(instantiates, goDeferredTypeRef{
+				typeName: m.Captures["compq.type"].Text,
+				pkg:      m.Captures["compq.pkg"].Text,
+				line:     expr.StartLine + 1,
+				kind:     graph.EdgeInstantiates,
+			})
+
+		case m.Captures["ftype.decl"] != nil:
+			decl := m.Captures["ftype.decl"]
+			typeRefs = append(typeRefs, goDeferredTypeRef{
+				typeName: m.Captures["ftype.name"].Text,
+				line:     decl.StartLine + 1,
+				kind:     graph.EdgeReferences,
+			})
+
+		case m.Captures["ctype.decl"] != nil:
+			decl := m.Captures["ctype.decl"]
+			typeRefs = append(typeRefs, goDeferredTypeRef{
+				typeName: m.Captures["ctype.name"].Text,
+				line:     decl.StartLine + 1,
+				kind:     graph.EdgeReferences,
+			})
+
+		case m.Captures["vtype.decl"] != nil:
+			decl := m.Captures["vtype.decl"]
+			typeRefs = append(typeRefs, goDeferredTypeRef{
+				typeName: m.Captures["vtype.name"].Text,
+				line:     decl.StartLine + 1,
+				kind:     graph.EdgeReferences,
+			})
+
+		case m.Captures["ptype.decl"] != nil:
+			decl := m.Captures["ptype.decl"]
+			typeRefs = append(typeRefs, goDeferredTypeRef{
+				typeName: m.Captures["ptype.name"].Text,
+				line:     decl.StartLine + 1,
+				kind:     graph.EdgeReferences,
+			})
+
+		case m.Captures["selarg.list"] != nil:
+			list := m.Captures["selarg.list"]
+			valueSels = append(valueSels, goDeferredValueSel{
+				field:    m.Captures["selarg.field"].Text,
+				receiver: m.Captures["selarg.receiver"].Text,
+				line:     list.StartLine + 1,
+				kind:     graph.EdgeReferences,
+			})
+
+		case m.Captures["identarg.list"] != nil:
+			list := m.Captures["identarg.list"]
+			valueIdents = append(valueIdents, goDeferredValueIdent{
+				name: m.Captures["identarg.name"].Text,
+				line: list.StartLine + 1,
+			})
+
+		case m.Captures["fieldval.elem"] != nil:
+			elem := m.Captures["fieldval.elem"]
+			fieldValIdents = append(fieldValIdents, goDeferredValueIdent{
+				name: m.Captures["fieldval.value"].Text,
+				line: elem.StartLine + 1,
+			})
+
+		case m.Captures["fieldsel.elem"] != nil:
+			elem := m.Captures["fieldsel.elem"]
+			fieldValSels = append(fieldValSels, goDeferredValueSel{
+				field:    m.Captures["fieldsel.method"].Text,
+				receiver: m.Captures["fieldsel.receiver"].Text,
+				line:     elem.StartLine + 1,
+				kind:     graph.EdgeReferences,
+			})
+		}
+	})
+
+	// All function/method nodes have been emitted; now map call sites to
+	// their enclosing definition.
+	funcRanges := buildFuncRanges(result)
+
+	// --- Calls ---
+	for _, c := range calls {
+		callerID := findEnclosingFunc(funcRanges, c.line)
+		if callerID == "" {
+			continue
+		}
+		if !c.isSelector {
+			result.Edges = append(result.Edges, &graph.Edge{
+				From: callerID, To: "unresolved::" + c.callName,
+				Kind: graph.EdgeCalls, FilePath: filePath, Line: c.line,
+			})
+			continue
+		}
+		if importPath, ok := imports[c.receiver]; ok {
+			result.Edges = append(result.Edges, &graph.Edge{
+				From: callerID, To: "unresolved::extern::" + importPath + "::" + c.method,
+				Kind: graph.EdgeCalls, FilePath: filePath, Line: c.line,
+			})
+			continue
+		}
+		edge := &graph.Edge{
+			From: callerID, To: "unresolved::*." + c.method,
+			Kind: graph.EdgeCalls, FilePath: filePath, Line: c.line,
+		}
+		if recvType, ok := tenv[c.receiver]; ok {
+			edge.Meta = map[string]any{"receiver_type": recvType}
+		} else if strings.Contains(c.receiver, ".") || strings.Contains(c.receiver, "(") {
+			if chainType := resolveChainType(c.receiver, tenv, result); chainType != "" {
+				edge.Meta = map[string]any{"receiver_type": chainType}
+			}
+		}
+		result.Edges = append(result.Edges, edge)
+	}
+
+	// --- Composite literals (instantiations) ---
+	for _, r := range instantiates {
+		callerID := findEnclosingFunc(funcRanges, r.line)
+		if callerID == "" {
+			callerID = filePath
+		}
+		result.Edges = append(result.Edges, &graph.Edge{
+			From: callerID, To: "unresolved::" + r.typeName,
+			Kind: r.kind, FilePath: filePath, Line: r.line,
+		})
+	}
+
+	// --- Type assertions + declaration type references ---
+	for _, r := range typeRefs {
+		callerID := findEnclosingFunc(funcRanges, r.line)
+		if callerID == "" {
+			callerID = filePath
+		}
+		result.Edges = append(result.Edges, &graph.Edge{
+			From: callerID, To: "unresolved::" + r.typeName,
+			Kind: r.kind, FilePath: filePath, Line: r.line,
+		})
+	}
+
+	// --- Function/method values passed as arguments ---
+	// Selector expression in arg position: h.handleHealth
+	for _, v := range valueSels {
+		callerID := findEnclosingFunc(funcRanges, v.line)
+		if callerID == "" {
+			callerID = filePath
+		}
+		edge := &graph.Edge{
+			From: callerID, To: "unresolved::*." + v.field,
+			Kind: v.kind, FilePath: filePath, Line: v.line,
+		}
+		if recvType, ok := tenv[v.receiver]; ok {
+			edge.Meta = map[string]any{"receiver_type": recvType}
+		}
+		result.Edges = append(result.Edges, edge)
+	}
+
+	// Bare identifier in arg position: funcName as a value.
+	for _, v := range valueIdents {
+		if isGoBuiltinOrKeyword(v.name) {
+			continue
+		}
+		callerID := findEnclosingFunc(funcRanges, v.line)
+		if callerID == "" {
+			callerID = filePath
+		}
+		result.Edges = append(result.Edges, &graph.Edge{
+			From: callerID, To: "unresolved::" + v.name,
+			Kind: graph.EdgeReferences, FilePath: filePath, Line: v.line,
+		})
+	}
+
+	// Bare identifier as struct field value: &X{RunE: runClean}
+	for _, v := range fieldValIdents {
+		if isGoBuiltinOrKeyword(v.name) {
+			continue
+		}
+		callerID := findEnclosingFunc(funcRanges, v.line)
+		if callerID == "" {
+			callerID = filePath
+		}
+		result.Edges = append(result.Edges, &graph.Edge{
+			From: callerID, To: "unresolved::" + v.name,
+			Kind: graph.EdgeReferences, FilePath: filePath, Line: v.line,
+		})
+	}
+
+	// Selector as struct field value: {Handler: h.handleHealth}
+	for _, v := range fieldValSels {
+		callerID := findEnclosingFunc(funcRanges, v.line)
+		if callerID == "" {
+			callerID = filePath
+		}
+		edge := &graph.Edge{
+			From: callerID, To: "unresolved::*." + v.field,
+			Kind: v.kind, FilePath: filePath, Line: v.line,
+		}
+		if recvType, ok := tenv[v.receiver]; ok {
+			edge.Meta = map[string]any{"receiver_type": recvType}
+		}
+		result.Edges = append(result.Edges, edge)
+	}
 
 	return result, nil
 }
 
-func (e *GoExtractor) extractPackage(root *sitter.Node, src []byte, filePath string, result *parser.ExtractionResult) string {
-	matches, err := parser.RunQuery(qPackage, e.lang, root, src)
-	if err != nil || len(matches) == 0 {
-		return ""
+// --- Per-match emit helpers -----------------------------------------
+
+func (e *GoExtractor) emitFunction(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult) {
+	name := m.Captures["func.name"].Text
+	def := m.Captures["func.def"]
+	id := filePath + "::" + name
+	node := &graph.Node{
+		ID:        id,
+		Kind:      graph.KindFunction,
+		Name:      name,
+		FilePath:  filePath,
+		StartLine: def.StartLine + 1,
+		EndLine:   def.EndLine + 1,
+		Language:  "go",
+		Meta:      make(map[string]any),
 	}
-	name := matches[0].Captures["pkg.name"].Text
-	return name
+	node.Meta["signature"] = buildFuncSignature(name, m.Captures["func.params"], m.Captures["func.result"])
+	if resultCap, ok := m.Captures["func.result"]; ok && resultCap.Text != "" {
+		if rt := normalizeGoTypeName(resultCap.Text); rt != "" {
+			node.Meta["return_type"] = rt
+		}
+	}
+	scanGoPragmas(src, def.StartLine, node)
+	result.Nodes = append(result.Nodes, node)
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
+	})
 }
 
-func (e *GoExtractor) extractFunctions(root *sitter.Node, src []byte, filePath, fileID string, result *parser.ExtractionResult) {
-	matches, err := parser.RunQuery(qFunction, e.lang, root, src)
-	if err != nil {
+func (e *GoExtractor) emitMethod(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult) {
+	name := m.Captures["method.name"].Text
+	def := m.Captures["method.def"]
+	receiverText := m.Captures["method.receiver"].Text
+	receiverType := extractReceiverType(receiverText)
+
+	id := filePath + "::" + receiverType + "." + name
+	node := &graph.Node{
+		ID:        id,
+		Kind:      graph.KindMethod,
+		Name:      name,
+		FilePath:  filePath,
+		StartLine: def.StartLine + 1,
+		EndLine:   def.EndLine + 1,
+		Language:  "go",
+		Meta: map[string]any{
+			"receiver": receiverType,
+		},
+	}
+	node.Meta["signature"] = buildMethodSignature(receiverText, name, m.Captures["method.params"], m.Captures["method.result"])
+	if resultCap, ok := m.Captures["method.result"]; ok && resultCap.Text != "" {
+		if rt := normalizeGoTypeName(resultCap.Text); rt != "" {
+			node.Meta["return_type"] = rt
+		}
+	}
+	scanGoPragmas(src, def.StartLine, node)
+	result.Nodes = append(result.Nodes, node)
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
+	})
+
+	typeID := filePath + "::" + receiverType
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: id, To: typeID, Kind: graph.EdgeMemberOf, FilePath: filePath, Line: def.StartLine + 1,
+	})
+}
+
+// emitTypeDecl handles the generic `type X <body>` form. The body node
+// discriminates struct vs interface vs named primitive — interfaces
+// carry their method-signature set in Meta for structural inference.
+func (e *GoExtractor) emitTypeDecl(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool) {
+	name := m.Captures["typedef.name"].Text
+	if seen[name] {
 		return
 	}
-	for _, m := range matches {
-		name := m.Captures["func.name"].Text
-		def := m.Captures["func.def"]
+	seen[name] = true
+	def := m.Captures["typedef.def"]
+	body := m.Captures["typedef.body"]
+	id := filePath + "::" + name
 
-		id := filePath + "::" + name
-		node := &graph.Node{
-			ID:        id,
-			Kind:      graph.KindFunction,
-			Name:      name,
-			FilePath:  filePath,
-			StartLine: def.StartLine + 1,
-			EndLine:   def.EndLine + 1,
-			Language:  "go",
-			Meta:      make(map[string]any),
-		}
-		node.Meta["signature"] = buildFuncSignature(name, m.Captures["func.params"], m.Captures["func.result"])
-		if resultCap, ok := m.Captures["func.result"]; ok && resultCap.Text != "" {
-			if rt := normalizeGoTypeName(resultCap.Text); rt != "" {
-				node.Meta["return_type"] = rt
-			}
-		}
-		scanGoPragmas(src, def.StartLine, node)
-		result.Nodes = append(result.Nodes, node)
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
-		})
+	node := &graph.Node{
+		ID: id, Name: name,
+		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
+		Language: "go",
 	}
+	if body != nil && body.Node != nil && body.Node.Type() == "interface_type" {
+		node.Kind = graph.KindInterface
+		node.Meta = map[string]any{"methods": extractInterfaceMethods(body.Node, src)}
+	} else {
+		node.Kind = graph.KindType
+	}
+	result.Nodes = append(result.Nodes, node)
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
+	})
 }
 
-func (e *GoExtractor) extractMethods(root *sitter.Node, src []byte, filePath, fileID string, result *parser.ExtractionResult) {
-	matches, err := parser.RunQuery(qMethod, e.lang, root, src)
-	if err != nil {
+func (e *GoExtractor) emitTypeAlias(m parser.QueryResult, filePath, fileID string, result *parser.ExtractionResult, seen map[string]bool) {
+	name := m.Captures["alias.name"].Text
+	if seen[name] {
 		return
 	}
-	for _, m := range matches {
-		name := m.Captures["method.name"].Text
-		def := m.Captures["method.def"]
-		receiverText := m.Captures["method.receiver"].Text
-		receiverType := extractReceiverType(receiverText)
-
-		id := filePath + "::" + receiverType + "." + name
-		node := &graph.Node{
-			ID:        id,
-			Kind:      graph.KindMethod,
-			Name:      name,
-			FilePath:  filePath,
-			StartLine: def.StartLine + 1,
-			EndLine:   def.EndLine + 1,
-			Language:  "go",
-			Meta: map[string]any{
-				"receiver": receiverType,
-			},
-		}
-		node.Meta["signature"] = buildMethodSignature(receiverText, name, m.Captures["method.params"], m.Captures["method.result"])
-		if resultCap, ok := m.Captures["method.result"]; ok && resultCap.Text != "" {
-			if rt := normalizeGoTypeName(resultCap.Text); rt != "" {
-				node.Meta["return_type"] = rt
-			}
-		}
-		scanGoPragmas(src, def.StartLine, node)
-		result.Nodes = append(result.Nodes, node)
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
-		})
-
-		// MemberOf edge to receiver type.
-		typeID := filePath + "::" + receiverType
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: id, To: typeID, Kind: graph.EdgeMemberOf, FilePath: filePath, Line: def.StartLine + 1,
-		})
-	}
+	seen[name] = true
+	def := m.Captures["alias.def"]
+	id := filePath + "::" + name
+	result.Nodes = append(result.Nodes, &graph.Node{
+		ID: id, Kind: graph.KindType, Name: name,
+		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
+		Language: "go",
+	})
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
+	})
 }
 
-func (e *GoExtractor) extractTypes(root *sitter.Node, src []byte, filePath, fileID string, result *parser.ExtractionResult) {
-	// Track which names we've already added to avoid duplicates between
-	// struct/interface queries and the general type alias query.
-	seen := make(map[string]bool)
-
-	// Structs.
-	matches, _ := parser.RunQuery(qStruct, e.lang, root, src)
-	for _, m := range matches {
-		name := m.Captures["type.name"].Text
-		def := m.Captures["type.def"]
-		seen[name] = true
-		id := filePath + "::" + name
-		result.Nodes = append(result.Nodes, &graph.Node{
-			ID: id, Kind: graph.KindType, Name: name,
-			FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
-			Language: "go",
-		})
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
-		})
+// emitImport records an import edge and populates the alias→path map
+// used when classifying selector calls against imported packages. Blank
+// and dot imports are skipped in the map (they don't introduce a
+// callable identifier) but still produce EdgeImports.
+func (e *GoExtractor) emitImport(m parser.QueryResult, filePath, fileID string, result *parser.ExtractionResult, imports map[string]string) {
+	pathCap := m.Captures["import.path"]
+	importPath := strings.Trim(pathCap.Text, `"`)
+	result.Edges = append(result.Edges, &graph.Edge{
+		From:     fileID,
+		To:       "unresolved::import::" + importPath,
+		Kind:     graph.EdgeImports,
+		FilePath: filePath,
+		Line:     pathCap.StartLine + 1,
+	})
+	alias := ""
+	if a, ok := m.Captures["import.alias"]; ok {
+		alias = strings.TrimSpace(a.Text)
 	}
-
-	// Interfaces.
-	matches, _ = parser.RunQuery(qInterface, e.lang, root, src)
-	for _, m := range matches {
-		name := m.Captures["iface.name"].Text
-		def := m.Captures["iface.def"]
-		seen[name] = true
-		id := filePath + "::" + name
-
-		// Extract method specs from the interface body by walking child nodes.
-		var methods []string
-		if body := m.Captures["iface.body"]; body != nil && body.Node != nil {
-			methods = extractInterfaceMethods(body.Node, src)
+	switch alias {
+	case "_", ".":
+		return
+	case "":
+		alias = importPath
+		if i := strings.LastIndex(importPath, "/"); i >= 0 {
+			alias = importPath[i+1:]
 		}
-
-		node := &graph.Node{
-			ID: id, Kind: graph.KindInterface, Name: name,
-			FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
-			Language: "go",
-			Meta:     map[string]any{"methods": methods},
-		}
-		result.Nodes = append(result.Nodes, node)
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
-		})
 	}
-
-	// Other type declarations (named types that aren't struct/interface).
-	matches, _ = parser.RunQuery(qTypeOther, e.lang, root, src)
-	for _, m := range matches {
-		name := m.Captures["typedef.name"].Text
-		if seen[name] {
-			continue
-		}
-		seen[name] = true
-		def := m.Captures["typedef.def"]
-		id := filePath + "::" + name
-		result.Nodes = append(result.Nodes, &graph.Node{
-			ID: id, Kind: graph.KindType, Name: name,
-			FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
-			Language: "go",
-		})
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
-		})
-	}
-
-	// True type aliases (type X = Y).
-	matches, _ = parser.RunQuery(qTypeAlias, e.lang, root, src)
-	for _, m := range matches {
-		name := m.Captures["alias.name"].Text
-		if seen[name] {
-			continue
-		}
-		def := m.Captures["alias.def"]
-		id := filePath + "::" + name
-		result.Nodes = append(result.Nodes, &graph.Node{
-			ID: id, Kind: graph.KindType, Name: name,
-			FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
-			Language: "go",
-		})
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
-		})
-	}
+	imports[alias] = importPath
 }
 
-// extractImports emits one EdgeImports per import spec and returns a
-// per-file alias→importPath map. The alias is the explicit one when
-// present, else the last path segment (Go's default). Blank and dot
-// imports are skipped in the map — they don't introduce a callable
-// identifier (only side-effects / merged names).
-func (e *GoExtractor) extractImports(root *sitter.Node, src []byte, filePath, fileID, _ string, result *parser.ExtractionResult) map[string]string {
-	imports := map[string]string{}
-	for _, q := range []string{qImportSingle, qImportBlock} {
-		matches, err := parser.RunQuery(q, e.lang, root, src)
-		if err != nil {
-			continue
-		}
-		for _, m := range matches {
-			pathCap := m.Captures["import.path"]
-			importPath := strings.Trim(pathCap.Text, `"`)
-			result.Edges = append(result.Edges, &graph.Edge{
-				From:     fileID,
-				To:       "unresolved::import::" + importPath,
-				Kind:     graph.EdgeImports,
-				FilePath: filePath,
-				Line:     pathCap.StartLine + 1,
-			})
-			alias := ""
-			if a, ok := m.Captures["import.alias"]; ok {
-				alias = strings.TrimSpace(a.Text)
-			}
-			switch alias {
-			case "_", ".":
-				continue
-			case "":
-				alias = importPath
-				if i := strings.LastIndex(importPath, "/"); i >= 0 {
-					alias = importPath[i+1:]
-				}
-			}
-			imports[alias] = importPath
-		}
+func (e *GoExtractor) emitVar(m parser.QueryResult, filePath, fileID string, result *parser.ExtractionResult, tenv typeEnv) {
+	nameCap := m.Captures["var.name"]
+	def := m.Captures["var.def"]
+	if nameCap == nil || nameCap.Text == "" || nameCap.Text == "_" {
+		return
 	}
-	return imports
-}
-
-func (e *GoExtractor) extractCalls(root *sitter.Node, src []byte, filePath string, result *parser.ExtractionResult, tenv typeEnv, imports map[string]string) {
-	funcRanges := buildFuncRanges(result)
-
-	// Plain function calls: foo()
-	matches, _ := parser.RunQuery(qCallPlain, e.lang, root, src)
-	for _, m := range matches {
-		callName := m.Captures["call.name"].Text
-		expr := m.Captures["call.expr"]
-		callerID := findEnclosingFunc(funcRanges, expr.StartLine+1)
-		if callerID == "" {
-			continue
-		}
-		result.Edges = append(result.Edges, &graph.Edge{
-			From:     callerID,
-			To:       "unresolved::" + callName,
-			Kind:     graph.EdgeCalls,
-			FilePath: filePath,
-			Line:     expr.StartLine + 1,
-		})
-	}
-
-	// Selector calls: x.Method()
-	matches, _ = parser.RunQuery(qCallSelector, e.lang, root, src)
-	for _, m := range matches {
-		methodName := m.Captures["call.method"].Text
-		receiverText := m.Captures["call.receiver"].Text
-		expr := m.Captures["call.expr"]
-		callerID := findEnclosingFunc(funcRanges, expr.StartLine+1)
-		if callerID == "" {
-			continue
-		}
-
-		// Package-qualified call (json.NewEncoder, fmt.Println, …): use
-		// the import path as the extern target so the resolver can
-		// classify it as stdlib / dep / cross-repo and the UI can render
-		// a meaningful "crosses web → encoding/json" label. Takes
-		// precedence over receiver-type inference — a bare identifier
-		// that matches an import alias is always a package reference.
-		if importPath, ok := imports[receiverText]; ok {
-			result.Edges = append(result.Edges, &graph.Edge{
-				From:     callerID,
-				To:       "unresolved::extern::" + importPath + "::" + methodName,
-				Kind:     graph.EdgeCalls,
-				FilePath: filePath,
-				Line:     expr.StartLine + 1,
-			})
-			continue
-		}
-
-		edge := &graph.Edge{
-			From:     callerID,
-			To:       "unresolved::*." + methodName,
-			Kind:     graph.EdgeCalls,
-			FilePath: filePath,
-			Line:     expr.StartLine + 1,
-		}
-
-		// Attach receiver type hint from type env (Tier 0+1) or chain resolution (Tier 2).
-		if recvType, ok := tenv[receiverText]; ok {
-			edge.Meta = map[string]any{"receiver_type": recvType}
-		} else if strings.Contains(receiverText, ".") || strings.Contains(receiverText, "(") {
-			if chainType := resolveChainType(receiverText, tenv, result); chainType != "" {
-				edge.Meta = map[string]any{"receiver_type": chainType}
-			}
-		}
-
-		result.Edges = append(result.Edges, edge)
-	}
-}
-
-func (e *GoExtractor) extractVarsConsts(root *sitter.Node, src []byte, filePath, fileID string, result *parser.ExtractionResult) {
-	for _, q := range []string{qVar, qConst} {
-		matches, err := parser.RunQuery(q, e.lang, root, src)
-		if err != nil {
-			continue
-		}
-		for _, m := range matches {
-			var name string
-			var def *parser.CapturedNode
-			if c, ok := m.Captures["var.name"]; ok {
-				name = c.Text
-				def = m.Captures["var.def"]
-			} else if c, ok := m.Captures["const.name"]; ok {
-				name = c.Text
-				def = m.Captures["const.def"]
-			}
-			if name == "" || name == "_" {
-				continue
-			}
-			id := filePath + "::" + name
-			result.Nodes = append(result.Nodes, &graph.Node{
-				ID: id, Kind: graph.KindVariable, Name: name,
-				FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
-				Language: "go",
-			})
-			result.Edges = append(result.Edges, &graph.Edge{
-				From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
-			})
+	name := nameCap.Text
+	id := filePath + "::" + name
+	result.Nodes = append(result.Nodes, &graph.Node{
+		ID: id, Kind: graph.KindVariable, Name: name,
+		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
+		Language: "go",
+	})
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
+	})
+	if typeCap, ok := m.Captures["var.type"]; ok && typeCap.Text != "" {
+		if typeName := normalizeGoTypeName(typeCap.Text); typeName != "" {
+			tenv[name] = typeName
 		}
 	}
 }
 
-// extractTypeRefs emits EdgeReferences edges for composite literals (struct
-// instantiation) and type assertions/conversions, and EdgeReferences edges for
-// function/method values passed as arguments (not invoked).  These references
-// are invisible to the basic call-graph but are critical for dead-code accuracy.
-func (e *GoExtractor) extractTypeRefs(root *sitter.Node, src []byte, filePath string, result *parser.ExtractionResult) {
-	funcRanges := buildFuncRanges(result)
-
-	// 1. Composite literals: MyType{...}
-	for _, q := range []string{qCompositeLiteral, qCompositeLiteralQualified} {
-		matches, _ := parser.RunQuery(q, e.lang, root, src)
-		for _, m := range matches {
-			typeName := m.Captures["comp.type"].Text
-			expr := m.Captures["comp.expr"]
-			callerID := findEnclosingFunc(funcRanges, expr.StartLine+1)
-			if callerID == "" {
-				callerID = filePath // package-level expression → use file node
-			}
-			result.Edges = append(result.Edges, &graph.Edge{
-				From:     callerID,
-				To:       "unresolved::" + typeName,
-				Kind:     graph.EdgeInstantiates,
-				FilePath: filePath,
-				Line:     expr.StartLine + 1,
-			})
-		}
+func (e *GoExtractor) emitConst(m parser.QueryResult, filePath, fileID string, result *parser.ExtractionResult) {
+	nameCap := m.Captures["const.name"]
+	def := m.Captures["const.def"]
+	if nameCap == nil || nameCap.Text == "" || nameCap.Text == "_" {
+		return
 	}
+	name := nameCap.Text
+	id := filePath + "::" + name
+	result.Nodes = append(result.Nodes, &graph.Node{
+		ID: id, Kind: graph.KindVariable, Name: name,
+		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
+		Language: "go",
+	})
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
+	})
+}
 
-	// 2. Type assertions: x.(MyType)
-	for _, q := range []string{qTypeAssert, qTypeAssertQualified} {
-		matches, _ := parser.RunQuery(q, e.lang, root, src)
-		for _, m := range matches {
-			typeName := m.Captures["assert.type"].Text
-			expr := m.Captures["assert.expr"]
-			callerID := findEnclosingFunc(funcRanges, expr.StartLine+1)
-			if callerID == "" {
-				callerID = filePath
-			}
-			result.Edges = append(result.Edges, &graph.Edge{
-				From:     callerID,
-				To:       "unresolved::" + typeName,
-				Kind:     graph.EdgeReferences,
-				FilePath: filePath,
-				Line:     expr.StartLine + 1,
-			})
-		}
+// recordShortVarType infers a type from the RHS expression of a short
+// variable declaration (`x := NewFoo()` or `x := &Foo{...}`) and records
+// it in tenv so subsequent selector-call edges attach a receiver_type
+// meta. No graph output — short-var-declared locals are not first-class
+// nodes in the current schema.
+func (e *GoExtractor) recordShortVarType(m parser.QueryResult, src []byte, tenv typeEnv) {
+	name := m.Captures["svar.name"].Text
+	valueCap := m.Captures["svar.value"]
+	if valueCap == nil || valueCap.Node == nil {
+		return
 	}
-
-	// 3. Type references in declarations: struct fields, const types, var types, parameters.
-	// These reference the type without calling or instantiating it.
-	typeRefQueries := []struct {
-		query      string
-		captureKey string
-	}{
-		{qFieldType, "ftype"},
-		{qConstType, "ctype"},
-		{qVarType, "vtype"},
-		{qParamType, "ptype"},
-	}
-	for _, tq := range typeRefQueries {
-		matches, _ := parser.RunQuery(tq.query, e.lang, root, src)
-		for _, m := range matches {
-			typeName := m.Captures[tq.captureKey+".name"].Text
-			decl := m.Captures[tq.captureKey+".decl"]
-			callerID := findEnclosingFunc(funcRanges, decl.StartLine+1)
-			if callerID == "" {
-				callerID = filePath
-			}
-			result.Edges = append(result.Edges, &graph.Edge{
-				From:     callerID,
-				To:       "unresolved::" + typeName,
-				Kind:     graph.EdgeReferences,
-				FilePath: filePath,
-				Line:     decl.StartLine + 1,
-			})
-		}
+	if inferred := inferTypeFromGoExpr(valueCap.Node, src); inferred != "" {
+		tenv[name] = inferred
 	}
 }
 
-// extractValueRefs emits EdgeReferences edges for function/method identifiers
-// passed as values (callbacks, handler registrations, etc.) rather than being
-// called directly.  For example:  h.mux.HandleFunc("GET /health", h.handleHealth)
-// creates a reference edge from registerRoutes → handleHealth.
-func (e *GoExtractor) extractValueRefs(root *sitter.Node, src []byte, filePath string, result *parser.ExtractionResult, tenv typeEnv) {
-	funcRanges := buildFuncRanges(result)
-
-	// Selector expressions inside argument lists: h.handleHealth as an arg
-	matches, _ := parser.RunQuery(qSelectorArg, e.lang, root, src)
-	for _, m := range matches {
-		fieldName := m.Captures["selarg.field"].Text
-		receiverText := m.Captures["selarg.receiver"].Text
-		listNode := m.Captures["selarg.list"]
-		callerID := findEnclosingFunc(funcRanges, listNode.StartLine+1)
-		if callerID == "" {
-			callerID = filePath // package-level expression
-		}
-
-		// NOTE: We previously skipped uppercase field names here as a heuristic
-		// to avoid package-qualified calls (pkg.Func()). However, the tree-sitter
-		// query qSelectorArg only matches selectors inside argument_list, never
-		// in call function position, so the skip was over-broad and suppressed
-		// legitimate method value references like http.HandlerFunc(s.ServeHTTP).
-
-		edge := &graph.Edge{
-			From:     callerID,
-			To:       "unresolved::*." + fieldName,
-			Kind:     graph.EdgeReferences,
-			FilePath: filePath,
-			Line:     listNode.StartLine + 1,
-		}
-
-		// Attach receiver type hint if available.
-		if recvType, ok := tenv[receiverText]; ok {
-			edge.Meta = map[string]any{"receiver_type": recvType}
-		}
-
-		result.Edges = append(result.Edges, edge)
-	}
-
-	// Bare identifiers inside argument lists: funcName as an arg
-	matches, _ = parser.RunQuery(qIdentArg, e.lang, root, src)
-	for _, m := range matches {
-		name := m.Captures["identarg.name"].Text
-		listNode := m.Captures["identarg.list"]
-		callerID := findEnclosingFunc(funcRanges, listNode.StartLine+1)
-		if callerID == "" {
-			callerID = filePath
-		}
-
-		// Skip common non-function identifiers (keywords, builtins, etc.)
-		if isGoBuiltinOrKeyword(name) {
-			continue
-		}
-
-		result.Edges = append(result.Edges, &graph.Edge{
-			From:     callerID,
-			To:       "unresolved::" + name,
-			Kind:     graph.EdgeReferences,
-			FilePath: filePath,
-			Line:     listNode.StartLine + 1,
-		})
-	}
-
-	// Bare identifiers as struct field values: &cobra.Command{RunE: runClean}
-	matches, _ = parser.RunQuery(qFieldValueIdent, e.lang, root, src)
-	for _, m := range matches {
-		name := m.Captures["fieldval.value"].Text
-		elem := m.Captures["fieldval.elem"]
-		callerID := findEnclosingFunc(funcRanges, elem.StartLine+1)
-		if callerID == "" {
-			callerID = filePath
-		}
-		if isGoBuiltinOrKeyword(name) {
-			continue
-		}
-		result.Edges = append(result.Edges, &graph.Edge{
-			From:     callerID,
-			To:       "unresolved::" + name,
-			Kind:     graph.EdgeReferences,
-			FilePath: filePath,
-			Line:     elem.StartLine + 1,
-		})
-	}
-
-	// Selector expressions as struct field values: {Handler: h.handleHealth}
-	matches, _ = parser.RunQuery(qFieldValueSelector, e.lang, root, src)
-	for _, m := range matches {
-		methodName := m.Captures["fieldsel.method"].Text
-		receiverText := m.Captures["fieldsel.receiver"].Text
-		elem := m.Captures["fieldsel.elem"]
-		callerID := findEnclosingFunc(funcRanges, elem.StartLine+1)
-		if callerID == "" {
-			callerID = filePath
-		}
-
-		edge := &graph.Edge{
-			From:     callerID,
-			To:       "unresolved::*." + methodName,
-			Kind:     graph.EdgeReferences,
-			FilePath: filePath,
-			Line:     elem.StartLine + 1,
-		}
-		if recvType, ok := tenv[receiverText]; ok {
-			edge.Meta = map[string]any{"receiver_type": recvType}
-		}
-		result.Edges = append(result.Edges, edge)
-	}
-}
-
-// isGoBuiltinOrKeyword returns true for identifiers that should not be treated
-// as function-value references (common Go builtins, type names, and literals).
-func isGoBuiltinOrKeyword(name string) bool {
-	switch name {
-	case "nil", "true", "false", "err", "ok", "ctx",
-		"string", "int", "int8", "int16", "int32", "int64",
-		"uint", "uint8", "uint16", "uint32", "uint64",
-		"float32", "float64", "complex64", "complex128",
-		"bool", "byte", "rune", "error", "any",
-		"len", "cap", "make", "new", "append", "copy", "delete",
-		"close", "panic", "recover", "print", "println",
-		"real", "imag", "complex", "clear", "min", "max",
-		"_", "i", "j", "k", "n", "s", "t", "v", "b", "w", "r":
-		return true
-	}
-	return false
-}
-
-// scanGoPragmas inspects up to 5 source lines immediately before a function or
-// method declaration for Go compiler pragmas (//export, //go:linkname) and sets
-// the corresponding Meta keys on the node.  startLine is 0-based (tree-sitter).
-func scanGoPragmas(src []byte, startLine int, node *graph.Node) {
-	// Walk backward through src to find the start of each preceding line.
-	// We scan at most 5 lines before the declaration.
-	lineNum := 0 // 0-based line number
-	lineStarts := make([]int, 0, startLine+1)
-	for i := range src {
-		if lineNum > startLine {
-			break
-		}
-		if i == 0 || src[i-1] == '\n' {
-			lineStarts = append(lineStarts, i)
-			lineNum++
-		}
-	}
-
-	for scanLine := startLine - 1; scanLine >= 0 && scanLine >= startLine-5; scanLine-- {
-		if scanLine >= len(lineStarts) {
-			continue
-		}
-		start := lineStarts[scanLine]
-		end := len(src)
-		if scanLine+1 < len(lineStarts) {
-			end = lineStarts[scanLine+1]
-		}
-		line := strings.TrimSpace(string(src[start:end]))
-
-		// Stop scanning if we hit a non-comment, non-empty line (the previous
-		// declaration's body).
-		if line != "" && !strings.HasPrefix(line, "//") {
-			break
-		}
-
-		if strings.HasPrefix(line, "//export ") {
-			node.Meta["cgo_export"] = true
-			return
-		}
-		if strings.HasPrefix(line, "//go:linkname ") {
-			node.Meta["go_linkname"] = true
-			return
-		}
-	}
-}
-
-// --- Helpers ---
+// --- Helpers -------------------------------------------------------
 
 type funcRange struct {
 	id        string
-	startLine int // 1-based
-	endLine   int // 1-based
+	startLine int
+	endLine   int
 }
 
 func buildFuncRanges(result *parser.ExtractionResult) []funcRange {
@@ -812,7 +676,7 @@ func findEnclosingFunc(ranges []funcRange, line int) string {
 }
 
 // extractReceiverType extracts the type name from a Go receiver parameter list.
-// "(s *Server)" -> "Server", "(s Server)" -> "Server"
+// "(s *Server)" -> "Server", "(s Server)" -> "Server".
 func extractReceiverType(receiver string) string {
 	receiver = strings.Trim(receiver, "()")
 	parts := strings.Fields(receiver)
@@ -841,13 +705,12 @@ func buildMethodSignature(receiver, name string, params, result *parser.Captured
 }
 
 // extractInterfaceMethods walks the children of an interface_type node
-// and returns the names of all method_spec entries.
+// and returns the names of all method_spec / method_elem entries.
 func extractInterfaceMethods(ifaceNode *sitter.Node, src []byte) []string {
 	var methods []string
 	for i := 0; i < int(ifaceNode.NamedChildCount()); i++ {
 		child := ifaceNode.NamedChild(i)
 		if child.Type() == "method_elem" || child.Type() == "method_spec" {
-			// The first named child of a method_spec is the field_identifier (name).
 			for j := 0; j < int(child.NamedChildCount()); j++ {
 				nameNode := child.NamedChild(j)
 				if nameNode.Type() == "field_identifier" {
@@ -867,106 +730,130 @@ func captureText(c *parser.CapturedNode) string {
 	return c.Text
 }
 
-// --- Type environment for receiver type inference ---
+// --- Type environment -----------------------------------------------
 
 // typeEnv maps variable name → inferred type name within a file.
 type typeEnv map[string]string
 
-// buildTypeEnv scans variable declarations and short variable declarations
-// to infer types (Tier 0: explicit annotations, Tier 1: composite literals
-// and Go constructor convention).
-func (e *GoExtractor) buildTypeEnv(root *sitter.Node, src []byte) typeEnv {
-	tenv := make(typeEnv)
-
-	// Tier 0: explicit var declarations — var x Type
-	matches, _ := parser.RunQuery(qVar, e.lang, root, src)
-	for _, m := range matches {
-		name := m.Captures["var.name"].Text
-		if typeCap, ok := m.Captures["var.type"]; ok && typeCap.Text != "" {
-			typeName := normalizeGoTypeName(typeCap.Text)
-			if typeName != "" {
-				tenv[name] = typeName
-			}
-		}
-	}
-
-	// Tier 0 + Tier 1: short variable declarations — x := expr
-	matches, _ = parser.RunQuery(qShortVar, e.lang, root, src)
-	for _, m := range matches {
-		name := m.Captures["svar.name"].Text
-		valueCap := m.Captures["svar.value"]
-		if valueCap == nil || valueCap.Node == nil {
-			continue
-		}
-		if inferred := inferTypeFromGoExpr(valueCap.Node, src); inferred != "" {
-			tenv[name] = inferred
-		}
-	}
-
-	return tenv
-}
-
 // normalizeGoTypeName strips pointer prefix and package qualifier.
-// "*User" → "User", "pkg.User" → "User", "*pkg.User" → "User"
+// "*pkg.Foo" → "Foo", "[]*Foo" → "Foo", "map[K]V" → "" (skipped —
+// receiver typing doesn't help for map/slice/chan types).
 func normalizeGoTypeName(t string) string {
-	t = strings.TrimPrefix(t, "*")
-	if idx := strings.LastIndex(t, "."); idx >= 0 {
-		t = t[idx+1:]
+	t = strings.TrimSpace(t)
+	// Strip array / slice prefixes.
+	t = strings.TrimPrefix(t, "[]")
+	if strings.HasPrefix(t, "[") {
+		if end := strings.Index(t, "]"); end >= 0 {
+			t = t[end+1:]
+		}
 	}
-	if t == "" || t[0] < 'A' || t[0] > 'Z' {
-		return "" // skip built-in types like int, string, etc.
+	// Skip map/chan/func types — can't meaningfully resolve a method call
+	// through them at the grain we support.
+	if strings.HasPrefix(t, "map[") || strings.HasPrefix(t, "chan ") || strings.HasPrefix(t, "func(") {
+		return ""
+	}
+	// Strip pointer prefix.
+	t = strings.TrimPrefix(t, "*")
+	// Keep only last segment of a package-qualified name.
+	if i := strings.LastIndex(t, "."); i >= 0 {
+		t = t[i+1:]
+	}
+	// Skip generics.
+	if i := strings.Index(t, "["); i >= 0 {
+		t = t[:i]
+	}
+	// Skip Go primitives — a method call receiver is never a primitive in
+	// code we can link to.
+	switch t {
+	case "string", "int", "int8", "int16", "int32", "int64",
+		"uint", "uint8", "uint16", "uint32", "uint64",
+		"float32", "float64", "complex64", "complex128",
+		"bool", "byte", "rune", "error", "any":
+		return ""
+	}
+	if t == "" {
+		return ""
 	}
 	return t
 }
 
-// inferTypeFromGoExpr inspects a tree-sitter expression node to infer
-// the type of a short variable declaration's RHS.
+// inferTypeFromGoExpr inspects the AST of a short-var RHS and returns
+// the inferred type name — supports composite literals (`Foo{...}`),
+// pointer composite literals (`&Foo{...}`), qualified composite
+// literals (`pkg.Foo{...}`), and the Go constructor convention
+// (`NewFoo(...)` → `Foo`). Returns "" when the expression doesn't
+// unambiguously name a type.
 func inferTypeFromGoExpr(node *sitter.Node, src []byte) string {
 	switch node.Type() {
 	case "composite_literal":
-		// User{} or User{field: val}
-		// First named child is the type identifier.
-		if node.NamedChildCount() > 0 {
-			typeNode := node.NamedChild(0)
-			return normalizeGoTypeName(typeNode.Content(src))
-		}
-
+		return compositeLiteralType(node, src)
 	case "unary_expression":
-		// &User{} — operand is composite_literal
+		// `&Foo{...}` — operator is "&" (first child), operand is
+		// the composite literal.
 		for i := 0; i < int(node.NamedChildCount()); i++ {
-			child := node.NamedChild(i)
-			if child.Type() == "composite_literal" {
-				return inferTypeFromGoExpr(child, src)
+			c := node.NamedChild(i)
+			if c != nil && c.Type() == "composite_literal" {
+				return compositeLiteralType(c, src)
 			}
 		}
-
 	case "call_expression":
-		// NewUser() → "User" (Go constructor convention)
-		if node.NamedChildCount() > 0 {
-			funcNode := node.NamedChild(0)
-			if funcNode.Type() == "identifier" {
-				funcName := funcNode.Content(src)
-				if strings.HasPrefix(funcName, "New") && len(funcName) > 3 {
-					candidate := funcName[3:]
-					if len(candidate) > 0 && candidate[0] >= 'A' && candidate[0] <= 'Z' {
-						return candidate
-					}
-				}
+		// Constructor convention: NewFoo(...) → Foo. Only applies
+		// when the called identifier starts with "New".
+		fn := node.ChildByFieldName("function")
+		if fn == nil {
+			return ""
+		}
+		var callName string
+		switch fn.Type() {
+		case "identifier":
+			callName = fn.Content(src)
+		case "selector_expression":
+			field := fn.ChildByFieldName("field")
+			if field != nil {
+				callName = field.Content(src)
 			}
+		}
+		if strings.HasPrefix(callName, "New") && len(callName) > 3 {
+			return callName[3:]
 		}
 	}
-
 	return ""
 }
 
-// --- Tier 2: Chain resolution ---
+// compositeLiteralType returns the type name of a composite literal,
+// handling both `Foo{...}` (type_identifier) and `pkg.Foo{...}`
+// (qualified_type) shapes.
+func compositeLiteralType(lit *sitter.Node, src []byte) string {
+	t := lit.ChildByFieldName("type")
+	if t == nil {
+		return ""
+	}
+	switch t.Type() {
+	case "type_identifier":
+		return t.Content(src)
+	case "qualified_type":
+		nameNode := t.ChildByFieldName("name")
+		if nameNode != nil {
+			return nameNode.Content(src)
+		}
+	case "pointer_type":
+		// *Foo{...} — rare but defensible.
+		for i := 0; i < int(t.NamedChildCount()); i++ {
+			c := t.NamedChild(i)
+			if c != nil && c.Type() == "type_identifier" {
+				return c.Content(src)
+			}
+		}
+	}
+	return ""
+}
 
-// resolveChainType tries to infer the type of a chained expression like
-// "svc.GetUser()" by looking up the root variable in the type env, then
-// following method return types through already-extracted nodes.
+// resolveChainType walks a dotted/chained receiver expression text like
+// `svc.GetUser().Save()` and returns the inferred type of the final
+// segment when each hop is typed — first segment via tenv, subsequent
+// segments via a method's return_type Meta. Returns "" on the first
+// unresolvable hop.
 func resolveChainType(expr string, tenv typeEnv, result *parser.ExtractionResult) string {
-	// Strip balanced parentheses and their contents.
-	// "svc.GetUser(arg1, arg2).Save()" → "svc.GetUser.Save"
 	cleaned := stripCallArgs(expr)
 
 	parts := strings.Split(cleaned, ".")
@@ -974,18 +861,16 @@ func resolveChainType(expr string, tenv typeEnv, result *parser.ExtractionResult
 		return ""
 	}
 
-	// Look up the root variable.
 	currentType, ok := tenv[parts[0]]
 	if !ok {
 		return ""
 	}
 
-	// Walk the chain: for each segment, find a method on currentType and read return_type.
 	for i := 1; i < len(parts); i++ {
 		methodName := parts[i]
 		returnType := findMethodReturnType(currentType, methodName, result)
 		if returnType == "" {
-			return "" // chain breaks
+			return ""
 		}
 		currentType = returnType
 	}
@@ -993,8 +878,9 @@ func resolveChainType(expr string, tenv typeEnv, result *parser.ExtractionResult
 	return currentType
 }
 
-// stripCallArgs removes balanced parenthesized argument lists from an expression.
-// "svc.GetUser(arg1).Save()" → "svc.GetUser.Save"
+// stripCallArgs removes balanced parentheses (and anything inside them)
+// from a receiver expression so "svc.GetUser(arg).Save()" collapses to
+// "svc.GetUser.Save" for chain walking.
 func stripCallArgs(expr string) string {
 	var b strings.Builder
 	depth := 0
@@ -1015,8 +901,10 @@ func stripCallArgs(expr string) string {
 	return b.String()
 }
 
-// findMethodReturnType searches extracted nodes for a method with the given
-// receiver type and name, returning its Meta["return_type"] if found.
+// findMethodReturnType scans result.Nodes for a method (or package-level
+// function, for pkg.Func cases) with the given name on the given
+// receiver type and returns its return_type Meta. Empty string when
+// not found or unannotated.
 func findMethodReturnType(receiverType, methodName string, result *parser.ExtractionResult) string {
 	for _, n := range result.Nodes {
 		if n.Kind != graph.KindMethod && n.Kind != graph.KindFunction {
@@ -1032,4 +920,76 @@ func findMethodReturnType(receiverType, methodName string, result *parser.Extrac
 		}
 	}
 	return ""
+}
+
+// scanGoPragmas inspects up to 5 source lines immediately before a
+// function or method declaration looking for `//go:*` or `//export`
+// comments and stamps them onto the node's Meta. Lets callers flag
+// special Go entry points (cgo exports, linkname) so dead-code
+// detection doesn't mark them as dead.
+func scanGoPragmas(src []byte, startLine int, node *graph.Node) {
+	// startLine is 0-based here (matches tree-sitter's row numbering at
+	// the call site).
+	if startLine <= 0 {
+		return
+	}
+	// Build a list of line-start byte offsets up to startLine.
+	var lineStarts []int
+	lineStarts = append(lineStarts, 0)
+	lineNum := 1
+	for i := 0; i < len(src) && lineNum <= startLine; i++ {
+		if src[i] != '\n' {
+			continue
+		}
+		if i == 0 || src[i-1] == '\n' {
+			lineStarts = append(lineStarts, i)
+			lineNum++
+		}
+		lineStarts = append(lineStarts, i+1)
+		lineNum++
+	}
+
+	for scanLine := startLine - 1; scanLine >= 0 && scanLine >= startLine-5; scanLine-- {
+		if scanLine >= len(lineStarts) {
+			continue
+		}
+		start := lineStarts[scanLine]
+		end := len(src)
+		if scanLine+1 < len(lineStarts) {
+			end = lineStarts[scanLine+1]
+		}
+		line := strings.TrimSpace(string(src[start:end]))
+		if line != "" && !strings.HasPrefix(line, "//") {
+			break
+		}
+		if strings.HasPrefix(line, "//export ") {
+			node.Meta["cgo_export"] = true
+			return
+		}
+		if strings.HasPrefix(line, "//go:linkname ") {
+			node.Meta["go_linkname"] = true
+			return
+		}
+	}
+}
+
+// isGoBuiltinOrKeyword returns true for identifiers that should not be
+// treated as function-value references (common Go builtins, type names,
+// literals).
+func isGoBuiltinOrKeyword(name string) bool {
+	switch name {
+	case "nil", "true", "false", "err", "ok", "ctx",
+		"string", "int", "int8", "int16", "int32", "int64",
+		"uint", "uint8", "uint16", "uint32", "uint64",
+		"float32", "float64", "complex64", "complex128",
+		"bool", "byte", "rune", "error", "any",
+		"make", "new", "len", "cap", "append", "copy", "delete",
+		"panic", "recover", "print", "println", "close":
+		return true
+	}
+	// Skip lowercase single-letter identifiers (loop vars, etc.)
+	if len(name) == 1 && name[0] >= 'a' && name[0] <= 'z' {
+		return true
+	}
+	return false
 }

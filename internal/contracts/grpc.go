@@ -1,6 +1,7 @@
 package contracts
 
 import (
+	"bytes"
 	"fmt"
 	"regexp"
 	"sort"
@@ -65,18 +66,32 @@ func (e *GRPCExtractor) SupportedLanguages() []string {
 	return []string{"protobuf", "proto", "go", "typescript", "python"}
 }
 
+// Cheap substring markers that act as a pre-filter before the regex
+// scans. Every gRPC consumer pattern in extractConsumers hinges on a
+// `Client(` construction (Go, TS) or `Stub(` (Python) — so if the
+// file has neither, none of the 9 regexes can match. bytes.Contains
+// is ~100× cheaper than a regex walk and short-circuits 99% of files
+// in gRPC-free repositories.
+var (
+	grpcClientMarker = []byte("Client(")
+	grpcStubMarker   = []byte("Stub(")
+)
+
 func (e *GRPCExtractor) Extract(filePath string, src []byte, nodes []*graph.Node, edges []*graph.Edge) []Contract {
 	var contracts []Contract
 
 	if strings.HasSuffix(filePath, ".proto") {
 		contracts = append(contracts, e.extractProtoProviders(filePath, src)...)
-	} else {
-		fileNodes := filterFileNodes(filePath, nodes)
-		sort.Slice(fileNodes, func(i, j int) bool {
-			return fileNodes[i].StartLine < fileNodes[j].StartLine
-		})
-		contracts = append(contracts, e.extractConsumers(filePath, src, fileNodes)...)
+		return contracts
 	}
+	if !bytes.Contains(src, grpcClientMarker) && !bytes.Contains(src, grpcStubMarker) {
+		return nil
+	}
+	fileNodes := filterFileNodes(filePath, nodes)
+	sort.Slice(fileNodes, func(i, j int) bool {
+		return fileNodes[i].StartLine < fileNodes[j].StartLine
+	})
+	contracts = append(contracts, e.extractConsumers(filePath, src, fileNodes)...)
 
 	return contracts
 }

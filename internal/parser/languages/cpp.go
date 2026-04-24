@@ -10,46 +10,72 @@ import (
 	"github.com/zzet/gortex/internal/parser"
 )
 
-// Tree-sitter query patterns for C++ source files.
-const (
-	qCppFunction = `(function_definition
-		declarator: (function_declarator
-			declarator: (identifier) @func.name)) @func.def`
+// qCppAll is a single tree-sitter query alternating over every pattern
+// the C++ extractor needs. One tree walk per file replaces the 8
+// `parser.RunQuery` calls the previous design made (each of which
+// recompiled its query and ran an independent cursor over the whole
+// tree). Capture names are disjoint across patterns so the dispatch
+// in Extract can branch on which name is set. Class-method extraction
+// still walks the class_specifier body inline — C++ methods can have
+// declarators other than bare identifiers (destructor_name,
+// field_identifier, qualified_identifier), which the legacy code
+// handled via extractFuncName and an explicit body walk; keeping that
+// walk inside the class.def dispatch preserves behaviour while still
+// collapsing the repeated whole-tree scans into one.
+const qCppAll = `
+[
+  (namespace_definition
+    name: (namespace_identifier) @ns.name) @ns.def
 
-	qCppClass = `(class_specifier
-		name: (type_identifier) @class.name) @class.def`
+  (class_specifier
+    name: (type_identifier) @class.name) @class.def
 
-	qCppStruct = `(struct_specifier
-		name: (type_identifier) @struct.name) @struct.def`
+  (struct_specifier
+    name: (type_identifier) @struct.name) @struct.def
 
-	qCppEnum = `(enum_specifier
-		name: (type_identifier) @enum.name) @enum.def`
+  (enum_specifier
+    name: (type_identifier) @enum.name) @enum.def
 
-	qCppInclude = `(preproc_include
-		path: (_) @include.path) @include.def`
+  (function_definition
+    declarator: (function_declarator
+      declarator: (identifier) @func.name)) @func.def
 
-	qCppCall = `(call_expression
-		function: (identifier) @call.name) @call.expr`
+  (preproc_include
+    path: (_) @include.path) @include.def
 
-	qCppMethodCall = `(call_expression
-		function: (field_expression
-			field: (field_identifier) @call.method)) @call.expr`
+  (call_expression
+    function: (identifier) @call.name) @call.expr
 
-	qCppNamespace = `(namespace_definition
-		name: (namespace_identifier) @ns.name) @ns.def`
-)
+  (call_expression
+    function: (field_expression
+      field: (field_identifier) @callm.method)) @callm.expr
+]
+`
 
 // CppExtractor extracts C++ source files into graph nodes and edges.
 type CppExtractor struct {
 	lang *sitter.Language
+	qAll *parser.PreparedQuery
 }
 
 func NewCppExtractor() *CppExtractor {
-	return &CppExtractor{lang: cpp.GetLanguage()}
+	lang := cpp.GetLanguage()
+	return &CppExtractor{
+		lang: lang,
+		qAll: parser.MustPreparedQuery(qCppAll, lang),
+	}
 }
 
 func (e *CppExtractor) Language() string     { return "cpp" }
 func (e *CppExtractor) Extensions() []string { return []string{".cpp", ".cc", ".cxx", ".hpp"} }
+
+// --- Deferred call buffer ----------------------------------------
+
+type cppDeferredCall struct {
+	name     string
+	line     int
+	isMember bool
+}
 
 func (e *CppExtractor) Extract(filePath string, src []byte) (*parser.ExtractionResult, error) {
 	tree, err := parser.ParseFile(src, e.lang)
@@ -66,83 +92,113 @@ func (e *CppExtractor) Extract(filePath string, src []byte) (*parser.ExtractionR
 		FilePath: filePath, StartLine: 1, EndLine: int(root.EndPoint().Row) + 1,
 		Language: "cpp",
 	}
+	fileID := fileNode.ID
 	result.Nodes = append(result.Nodes, fileNode)
 
 	seen := make(map[string]bool)
+	var calls []cppDeferredCall
 
-	// Namespaces.
-	e.extractNamespaces(root, src, filePath, fileNode.ID, result)
+	parser.EachMatch(e.qAll, root, src, func(m parser.QueryResult) {
+		switch {
 
-	// Classes (with methods via manual walking).
-	e.extractClasses(root, src, filePath, fileNode.ID, seen, result)
+		case m.Captures["ns.def"] != nil:
+			e.emitNamespace(m, filePath, fileID, result)
 
-	// Structs.
-	e.extractStructs(root, src, filePath, fileNode.ID, seen, result)
+		case m.Captures["class.def"] != nil:
+			e.emitClass(m, filePath, fileID, src, result, seen)
 
-	// Enums.
-	e.extractEnums(root, src, filePath, fileNode.ID, seen, result)
+		case m.Captures["struct.def"] != nil:
+			e.emitStruct(m, filePath, fileID, result, seen)
 
-	// Free functions (not inside classes).
-	e.extractFunctions(root, src, filePath, fileNode.ID, seen, result)
+		case m.Captures["enum.def"] != nil:
+			e.emitEnum(m, filePath, fileID, result, seen)
 
-	// Includes.
-	e.extractIncludes(root, src, filePath, fileNode.ID, result)
+		case m.Captures["func.def"] != nil:
+			e.emitFunction(m, filePath, fileID, result, seen)
 
-	// Call sites.
-	e.extractCalls(root, src, filePath, result)
+		case m.Captures["include.def"] != nil:
+			e.emitInclude(m, filePath, fileID, result)
+
+		case m.Captures["callm.expr"] != nil:
+			expr := m.Captures["callm.expr"]
+			calls = append(calls, cppDeferredCall{
+				name:     m.Captures["callm.method"].Text,
+				line:     expr.StartLine + 1,
+				isMember: true,
+			})
+
+		case m.Captures["call.expr"] != nil:
+			expr := m.Captures["call.expr"]
+			calls = append(calls, cppDeferredCall{
+				name: m.Captures["call.name"].Text,
+				line: expr.StartLine + 1,
+			})
+		}
+	})
+
+	// Resolve call edges against funcRanges.
+	funcRanges := buildFuncRanges(result)
+	for _, c := range calls {
+		callerID := findEnclosingFunc(funcRanges, c.line)
+		if callerID == "" {
+			continue
+		}
+		if c.isMember {
+			result.Edges = append(result.Edges, &graph.Edge{
+				From: callerID, To: "unresolved::*." + c.name,
+				Kind: graph.EdgeCalls, FilePath: filePath, Line: c.line,
+			})
+			continue
+		}
+		result.Edges = append(result.Edges, &graph.Edge{
+			From: callerID, To: "unresolved::" + c.name,
+			Kind: graph.EdgeCalls, FilePath: filePath, Line: c.line,
+		})
+	}
 
 	return result, nil
 }
 
-func (e *CppExtractor) extractNamespaces(root *sitter.Node, src []byte, filePath, fileID string, result *parser.ExtractionResult) {
-	matches, err := parser.RunQuery(qCppNamespace, e.lang, root, src)
-	if err != nil {
-		return
-	}
-	for _, m := range matches {
-		name := m.Captures["ns.name"].Text
-		def := m.Captures["ns.def"]
-		id := filePath + "::" + name
-		result.Nodes = append(result.Nodes, &graph.Node{
-			ID: id, Kind: graph.KindPackage, Name: name,
-			FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
-			Language: "cpp",
-		})
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
-		})
-	}
+// --- Per-match emit helpers -----------------------------------------
+
+func (e *CppExtractor) emitNamespace(m parser.QueryResult, filePath, fileID string, result *parser.ExtractionResult) {
+	name := m.Captures["ns.name"].Text
+	def := m.Captures["ns.def"]
+	id := filePath + "::" + name
+	result.Nodes = append(result.Nodes, &graph.Node{
+		ID: id, Kind: graph.KindPackage, Name: name,
+		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
+		Language: "cpp",
+	})
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
+	})
 }
 
-func (e *CppExtractor) extractClasses(root *sitter.Node, src []byte, filePath, fileID string, seen map[string]bool, result *parser.ExtractionResult) {
-	matches, err := parser.RunQuery(qCppClass, e.lang, root, src)
-	if err != nil {
+// emitClass emits the class node and walks its body inline for methods.
+// The inline body walk replaces legacy extractClassMethods and catches
+// declarators the outer function_definition query misses
+// (field_identifier, destructor_name, qualified_identifier).
+func (e *CppExtractor) emitClass(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool) {
+	className := m.Captures["class.name"].Text
+	def := m.Captures["class.def"]
+	classID := filePath + "::" + className
+	if seen[classID] {
 		return
 	}
-	for _, m := range matches {
-		className := m.Captures["class.name"].Text
-		def := m.Captures["class.def"]
-		classID := filePath + "::" + className
-		if seen[classID] {
-			continue
-		}
-		seen[classID] = true
-		result.Nodes = append(result.Nodes, &graph.Node{
-			ID: classID, Kind: graph.KindType, Name: className,
-			FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
-			Language: "cpp",
-		})
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileID, To: classID, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
-		})
-
-		// Walk the class body to find methods.
-		e.extractClassMethods(def.Node, src, filePath, fileID, className, classID, seen, result)
-	}
+	seen[classID] = true
+	result.Nodes = append(result.Nodes, &graph.Node{
+		ID: classID, Kind: graph.KindType, Name: className,
+		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
+		Language: "cpp",
+	})
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: fileID, To: classID, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
+	})
+	e.walkClassBody(def.Node, src, filePath, fileID, className, classID, seen, result)
 }
 
-func (e *CppExtractor) extractClassMethods(classNode *sitter.Node, src []byte, filePath, fileID, className, classID string, seen map[string]bool, result *parser.ExtractionResult) {
-	// Find the field_declaration_list (class body).
+func (e *CppExtractor) walkClassBody(classNode *sitter.Node, src []byte, filePath, fileID, className, classID string, seen map[string]bool, result *parser.ExtractionResult) {
 	var body *sitter.Node
 	for i := 0; i < int(classNode.NamedChildCount()); i++ {
 		child := classNode.NamedChild(i)
@@ -154,19 +210,14 @@ func (e *CppExtractor) extractClassMethods(classNode *sitter.Node, src []byte, f
 	if body == nil {
 		return
 	}
-
-	// Walk the body looking for function_definition nodes.
 	for i := 0; i < int(body.NamedChildCount()); i++ {
 		child := body.NamedChild(i)
-		// Handle access specifiers that wrap declarations.
-		if child.Type() == "access_specifier" {
+		switch child.Type() {
+		case "access_specifier":
 			continue
-		}
-		if child.Type() == "function_definition" {
+		case "function_definition":
 			e.addMethodFromNode(child, src, filePath, fileID, className, classID, seen, result)
-		}
-		// Also check inside declaration_list (e.g. under access specifiers).
-		if child.Type() == "declaration_list" {
+		case "declaration_list":
 			for j := 0; j < int(child.NamedChildCount()); j++ {
 				gc := child.NamedChild(j)
 				if gc.Type() == "function_definition" {
@@ -178,7 +229,6 @@ func (e *CppExtractor) extractClassMethods(classNode *sitter.Node, src []byte, f
 }
 
 func (e *CppExtractor) addMethodFromNode(funcNode *sitter.Node, src []byte, filePath, fileID, className, classID string, seen map[string]bool, result *parser.ExtractionResult) {
-	// Extract method name from function_definition -> declarator -> declarator.
 	methodName := extractFuncName(funcNode, src)
 	if methodName == "" {
 		return
@@ -194,7 +244,7 @@ func (e *CppExtractor) addMethodFromNode(funcNode *sitter.Node, src []byte, file
 		return
 	}
 	seen[id] = true
-	// Mark line so free function extraction skips this.
+	// Mark line so the function_definition dispatcher skips this.
 	seen[filePath+"::_method_L"+fmt.Sprint(startLine)] = true
 
 	result.Nodes = append(result.Nodes, &graph.Node{
@@ -211,10 +261,89 @@ func (e *CppExtractor) addMethodFromNode(funcNode *sitter.Node, src []byte, file
 	})
 }
 
+func (e *CppExtractor) emitStruct(m parser.QueryResult, filePath, fileID string, result *parser.ExtractionResult, seen map[string]bool) {
+	name := m.Captures["struct.name"].Text
+	def := m.Captures["struct.def"]
+	id := filePath + "::" + name
+	if seen[id] {
+		return
+	}
+	seen[id] = true
+	result.Nodes = append(result.Nodes, &graph.Node{
+		ID: id, Kind: graph.KindType, Name: name,
+		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
+		Language: "cpp",
+	})
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
+	})
+}
+
+func (e *CppExtractor) emitEnum(m parser.QueryResult, filePath, fileID string, result *parser.ExtractionResult, seen map[string]bool) {
+	name := m.Captures["enum.name"].Text
+	def := m.Captures["enum.def"]
+	id := filePath + "::" + name
+	if seen[id] {
+		return
+	}
+	seen[id] = true
+	result.Nodes = append(result.Nodes, &graph.Node{
+		ID: id, Kind: graph.KindType, Name: name,
+		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
+		Language: "cpp",
+	})
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
+	})
+}
+
+// emitFunction emits a free function. When the same line was already
+// claimed by the class-body walk (seen "_method_L<line>"), this is a
+// class method with a bare identifier declarator that was emitted
+// through addMethodFromNode — skip the duplicate.
+func (e *CppExtractor) emitFunction(m parser.QueryResult, filePath, fileID string, result *parser.ExtractionResult, seen map[string]bool) {
+	name := m.Captures["func.name"].Text
+	def := m.Captures["func.def"]
+	startLine := def.StartLine + 1
+	lineKey := filePath + "::_method_L" + fmt.Sprint(startLine)
+	if seen[lineKey] {
+		return
+	}
+	id := filePath + "::" + name
+	if seen[id] {
+		id = filePath + "::" + name + "_L" + fmt.Sprint(startLine)
+	}
+	if seen[id] {
+		return
+	}
+	seen[id] = true
+	result.Nodes = append(result.Nodes, &graph.Node{
+		ID: id, Kind: graph.KindFunction, Name: name,
+		FilePath: filePath, StartLine: startLine, EndLine: def.EndLine + 1,
+		Language: "cpp",
+	})
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: startLine,
+	})
+}
+
+func (e *CppExtractor) emitInclude(m parser.QueryResult, filePath, fileID string, result *parser.ExtractionResult) {
+	pathCap := m.Captures["include.path"]
+	includePath := strings.Trim(pathCap.Text, `"<>`)
+	result.Edges = append(result.Edges, &graph.Edge{
+		From:     fileID,
+		To:       "unresolved::import::" + includePath,
+		Kind:     graph.EdgeImports,
+		FilePath: filePath,
+		Line:     pathCap.StartLine + 1,
+	})
+}
+
+// --- Helpers --------------------------------------------------------
+
 // extractFuncName walks a function_definition node to find the function name.
 // It handles both `identifier` (free functions) and `field_identifier` (methods).
 func extractFuncName(funcNode *sitter.Node, src []byte) string {
-	// function_definition -> declarator (function_declarator) -> declarator (identifier or field_identifier)
 	for i := 0; i < int(funcNode.NamedChildCount()); i++ {
 		child := funcNode.NamedChild(i)
 		if child.Type() == "function_declarator" {
@@ -224,7 +353,6 @@ func extractFuncName(funcNode *sitter.Node, src []byte) string {
 				case "identifier", "field_identifier", "destructor_name":
 					return gc.Content(src)
 				case "qualified_identifier":
-					// e.g. ClassName::methodName — extract last part.
 					return lastIdentifier(gc, src)
 				}
 			}
@@ -244,145 +372,4 @@ func lastIdentifier(node *sitter.Node, src []byte) string {
 		}
 	}
 	return name
-}
-
-func (e *CppExtractor) extractStructs(root *sitter.Node, src []byte, filePath, fileID string, seen map[string]bool, result *parser.ExtractionResult) {
-	matches, err := parser.RunQuery(qCppStruct, e.lang, root, src)
-	if err != nil {
-		return
-	}
-	for _, m := range matches {
-		name := m.Captures["struct.name"].Text
-		def := m.Captures["struct.def"]
-		id := filePath + "::" + name
-		if seen[id] {
-			continue
-		}
-		seen[id] = true
-		result.Nodes = append(result.Nodes, &graph.Node{
-			ID: id, Kind: graph.KindType, Name: name,
-			FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
-			Language: "cpp",
-		})
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
-		})
-	}
-}
-
-func (e *CppExtractor) extractEnums(root *sitter.Node, src []byte, filePath, fileID string, seen map[string]bool, result *parser.ExtractionResult) {
-	matches, err := parser.RunQuery(qCppEnum, e.lang, root, src)
-	if err != nil {
-		return
-	}
-	for _, m := range matches {
-		name := m.Captures["enum.name"].Text
-		def := m.Captures["enum.def"]
-		id := filePath + "::" + name
-		if seen[id] {
-			continue
-		}
-		seen[id] = true
-		result.Nodes = append(result.Nodes, &graph.Node{
-			ID: id, Kind: graph.KindType, Name: name,
-			FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
-			Language: "cpp",
-		})
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
-		})
-	}
-}
-
-func (e *CppExtractor) extractFunctions(root *sitter.Node, src []byte, filePath, fileID string, seen map[string]bool, result *parser.ExtractionResult) {
-	matches, err := parser.RunQuery(qCppFunction, e.lang, root, src)
-	if err != nil {
-		return
-	}
-	for _, m := range matches {
-		name := m.Captures["func.name"].Text
-		def := m.Captures["func.def"]
-		startLine := def.StartLine + 1
-		// Skip methods already extracted from class bodies.
-		lineKey := filePath + "::_method_L" + fmt.Sprint(startLine)
-		if seen[lineKey] {
-			continue
-		}
-		id := filePath + "::" + name
-		if seen[id] {
-			id = filePath + "::" + name + "_L" + fmt.Sprint(startLine)
-		}
-		if seen[id] {
-			continue
-		}
-		seen[id] = true
-		result.Nodes = append(result.Nodes, &graph.Node{
-			ID: id, Kind: graph.KindFunction, Name: name,
-			FilePath: filePath, StartLine: startLine, EndLine: def.EndLine + 1,
-			Language: "cpp",
-		})
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: startLine,
-		})
-	}
-}
-
-func (e *CppExtractor) extractIncludes(root *sitter.Node, src []byte, filePath, fileID string, result *parser.ExtractionResult) {
-	matches, err := parser.RunQuery(qCppInclude, e.lang, root, src)
-	if err != nil {
-		return
-	}
-	for _, m := range matches {
-		pathCap := m.Captures["include.path"]
-		// Strip quotes and angle brackets.
-		includePath := pathCap.Text
-		includePath = strings.Trim(includePath, `"<>`)
-		result.Edges = append(result.Edges, &graph.Edge{
-			From:     fileID,
-			To:       "unresolved::import::" + includePath,
-			Kind:     graph.EdgeImports,
-			FilePath: filePath,
-			Line:     pathCap.StartLine + 1,
-		})
-	}
-}
-
-func (e *CppExtractor) extractCalls(root *sitter.Node, src []byte, filePath string, result *parser.ExtractionResult) {
-	funcRanges := buildFuncRanges(result)
-
-	// Plain function calls: foo()
-	matches, _ := parser.RunQuery(qCppCall, e.lang, root, src)
-	for _, m := range matches {
-		callName := m.Captures["call.name"].Text
-		expr := m.Captures["call.expr"]
-		callerID := findEnclosingFunc(funcRanges, expr.StartLine+1)
-		if callerID == "" {
-			continue
-		}
-		result.Edges = append(result.Edges, &graph.Edge{
-			From:     callerID,
-			To:       "unresolved::" + callName,
-			Kind:     graph.EdgeCalls,
-			FilePath: filePath,
-			Line:     expr.StartLine + 1,
-		})
-	}
-
-	// Method calls: obj.method()
-	matches, _ = parser.RunQuery(qCppMethodCall, e.lang, root, src)
-	for _, m := range matches {
-		methodName := m.Captures["call.method"].Text
-		expr := m.Captures["call.expr"]
-		callerID := findEnclosingFunc(funcRanges, expr.StartLine+1)
-		if callerID == "" {
-			continue
-		}
-		result.Edges = append(result.Edges, &graph.Edge{
-			From:     callerID,
-			To:       "unresolved::*." + methodName,
-			Kind:     graph.EdgeCalls,
-			FilePath: filePath,
-			Line:     expr.StartLine + 1,
-		})
-	}
 }

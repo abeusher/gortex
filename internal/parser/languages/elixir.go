@@ -31,12 +31,22 @@ var elixirKeywords = map[string]bool{
 }
 
 // ElixirExtractor extracts Elixir source files.
+// Tier B per spec-extractor-perf.md: only two queries (plain
+// call + dot call), so we precompile each but don't merge.
+// extractCalls runs after walkNode so funcRanges is ready.
 type ElixirExtractor struct {
-	lang *sitter.Language
+	lang        *sitter.Language
+	qFuncCall   *parser.PreparedQuery
+	qDotCall    *parser.PreparedQuery
 }
 
 func NewElixirExtractor() *ElixirExtractor {
-	return &ElixirExtractor{lang: elixir.GetLanguage()}
+	lang := elixir.GetLanguage()
+	return &ElixirExtractor{
+		lang:      lang,
+		qFuncCall: parser.MustPreparedQuery(qExFuncCall, lang),
+		qDotCall:  parser.MustPreparedQuery(qExDotCall, lang),
+	}
 }
 
 func (e *ElixirExtractor) Language() string     { return "elixir" }
@@ -292,41 +302,39 @@ func (e *ElixirExtractor) extractCalls(root *sitter.Node, src []byte, filePath s
 	funcRanges := buildFuncRanges(result)
 
 	// Dot calls: Module.function()
-	matches, _ := parser.RunQuery(qExDotCall, e.lang, root, src)
-	for _, m := range matches {
+	parser.EachMatch(e.qDotCall, root, src, func(m parser.QueryResult) {
 		method := m.Captures["call.method"].Text
 		expr := m.Captures["call.expr"]
 		callerID := findEnclosingFunc(funcRanges, expr.StartLine+1)
 		if callerID == "" {
-			continue
+			return
 		}
 		result.Edges = append(result.Edges, &graph.Edge{
 			From: callerID, To: "unresolved::*." + method,
 			Kind: graph.EdgeCalls, FilePath: filePath, Line: expr.StartLine + 1,
 		})
-	}
+	})
 
 	// Plain calls: func_name() — filter out keywords.
-	matches, _ = parser.RunQuery(qExFuncCall, e.lang, root, src)
-	for _, m := range matches {
+	parser.EachMatch(e.qFuncCall, root, src, func(m parser.QueryResult) {
 		name := m.Captures["call.name"].Text
 		if elixirKeywords[name] {
-			continue
+			return
 		}
 		// Skip common Elixir macros/constructs.
 		if name == "do" || name == "end" {
-			continue
+			return
 		}
 		expr := m.Captures["call.expr"]
 		callerID := findEnclosingFunc(funcRanges, expr.StartLine+1)
 		if callerID == "" {
-			continue
+			return
 		}
 		result.Edges = append(result.Edges, &graph.Edge{
 			From: callerID, To: "unresolved::" + name,
 			Kind: graph.EdgeCalls, FilePath: filePath, Line: expr.StartLine + 1,
 		})
-	}
+	})
 }
 
 // --- AST helpers ---

@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
+	"github.com/zzet/gortex/internal/contracts"
 	"github.com/zzet/gortex/internal/graph"
 )
 
@@ -105,6 +106,55 @@ func TestLoadSnapshot_DropsStaleAbsPathNodes(t *testing.T) {
 		assert.False(t, strings.HasPrefix(e.To, "/"),
 			"edge To references a dropped stale node: %s → %s", e.From, e.To)
 	}
+}
+
+// TestSnapshotRoundTrip_NodeMetaWithShape guards against regressing on
+// gob-registration of *contracts.Shape. The indexer attaches a Shape to
+// contract-referenced type nodes via Meta["shape"]; without the Register
+// call, saveSnapshot aborts on the first such node with "type not
+// registered for interface: contracts.Shape" and the snapshot file is
+// never written.
+func TestSnapshotRoundTrip_NodeMetaWithShape(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "snap.gob.gz")
+	t.Setenv("GORTEX_DAEMON_SNAPSHOT", path)
+
+	orig := graph.New()
+	orig.AddNode(&graph.Node{
+		ID:       "a.go::Req",
+		Name:     "Req",
+		Kind:     graph.KindType,
+		FilePath: "a.go",
+		Meta: map[string]any{
+			"shape": &contracts.Shape{
+				Kind: "struct",
+				Fields: []contracts.ShapeField{
+					{Name: "ID", Type: "string", Required: true},
+				},
+			},
+		},
+	})
+
+	saveSnapshot(orig, nil, nil, "v-test", zap.NewNop())
+
+	info, err := os.Stat(path)
+	require.NoError(t, err, "snapshot file must exist — encode must not have aborted")
+	require.Greater(t, info.Size(), int64(0), "snapshot must not be empty")
+
+	restored := graph.New()
+	result, err := loadSnapshot(restored, zap.NewNop())
+	require.NoError(t, err)
+	require.True(t, result.Loaded)
+
+	n := restored.GetNode("a.go::Req")
+	require.NotNil(t, n)
+	require.NotNil(t, n.Meta["shape"], "shape must survive round-trip")
+
+	shape, ok := n.Meta["shape"].(*contracts.Shape)
+	require.True(t, ok, "decoded shape must keep its concrete *contracts.Shape type, got %T", n.Meta["shape"])
+	assert.Equal(t, "struct", shape.Kind)
+	require.Len(t, shape.Fields, 1)
+	assert.Equal(t, "ID", shape.Fields[0].Name)
 }
 
 func TestLoadSnapshot_MissingFile_NotAnError(t *testing.T) {

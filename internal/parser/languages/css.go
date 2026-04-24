@@ -17,12 +17,24 @@ const (
 )
 
 // CSSExtractor extracts CSS files into graph nodes and edges.
+// Tier B per spec-extractor-perf.md: only three queries, so the
+// merged-alternation pattern wouldn't pay; precompiling each query
+// once at init still removes the per-file sitter.NewQuery cost.
 type CSSExtractor struct {
-	lang *sitter.Language
+	lang     *sitter.Language
+	qImport  *parser.PreparedQuery
+	qClass   *parser.PreparedQuery
+	qID      *parser.PreparedQuery
 }
 
 func NewCSSExtractor() *CSSExtractor {
-	return &CSSExtractor{lang: css.GetLanguage()}
+	lang := css.GetLanguage()
+	return &CSSExtractor{
+		lang:    lang,
+		qImport: parser.MustPreparedQuery(qCssImport, lang),
+		qClass:  parser.MustPreparedQuery(qCssClass, lang),
+		qID:     parser.MustPreparedQuery(qCssId, lang),
+	}
 }
 
 func (e *CSSExtractor) Language() string     { return "css" }
@@ -63,17 +75,13 @@ func (e *CSSExtractor) Extract(filePath string, src []byte) (*parser.ExtractionR
 }
 
 func (e *CSSExtractor) extractImports(root *sitter.Node, src []byte, filePath, fileID string, result *parser.ExtractionResult) {
-	matches, err := parser.RunQuery(qCssImport, e.lang, root, src)
-	if err != nil {
-		return
-	}
-	for _, m := range matches {
+	parser.EachMatch(e.qImport, root, src, func(m parser.QueryResult) {
 		def := m.Captures["import.def"]
 		importText := def.Text
 		// Extract the path from @import url("...") or @import "..."
 		importPath := extractCSSImportPath(importText)
 		if importPath == "" {
-			continue
+			return
 		}
 		result.Edges = append(result.Edges, &graph.Edge{
 			From:     fileID,
@@ -82,20 +90,16 @@ func (e *CSSExtractor) extractImports(root *sitter.Node, src []byte, filePath, f
 			FilePath: filePath,
 			Line:     def.StartLine + 1,
 		})
-	}
+	})
 }
 
 func (e *CSSExtractor) extractClasses(root *sitter.Node, src []byte, filePath, fileID string, result *parser.ExtractionResult, seen map[string]bool) {
-	matches, err := parser.RunQuery(qCssClass, e.lang, root, src)
-	if err != nil {
-		return
-	}
-	for _, m := range matches {
+	parser.EachMatch(e.qClass, root, src, func(m parser.QueryResult) {
 		name := m.Captures["class.name"].Text
 		def := m.Captures["class.def"]
 		id := filePath + "::." + name
 		if seen[id] {
-			continue
+			return
 		}
 		seen[id] = true
 		result.Nodes = append(result.Nodes, &graph.Node{
@@ -107,20 +111,16 @@ func (e *CSSExtractor) extractClasses(root *sitter.Node, src []byte, filePath, f
 			From: fileID, To: id, Kind: graph.EdgeDefines,
 			FilePath: filePath, Line: def.StartLine + 1,
 		})
-	}
+	})
 }
 
 func (e *CSSExtractor) extractIDs(root *sitter.Node, src []byte, filePath, fileID string, result *parser.ExtractionResult, seen map[string]bool) {
-	matches, err := parser.RunQuery(qCssId, e.lang, root, src)
-	if err != nil {
-		return
-	}
-	for _, m := range matches {
+	parser.EachMatch(e.qID, root, src, func(m parser.QueryResult) {
 		name := m.Captures["id.name"].Text
 		def := m.Captures["id.def"]
 		id := filePath + "::#" + name
 		if seen[id] {
-			continue
+			return
 		}
 		seen[id] = true
 		result.Nodes = append(result.Nodes, &graph.Node{
@@ -132,7 +132,7 @@ func (e *CSSExtractor) extractIDs(root *sitter.Node, src []byte, filePath, fileI
 			From: fileID, To: id, Kind: graph.EdgeDefines,
 			FilePath: filePath, Line: def.StartLine + 1,
 		})
-	}
+	})
 }
 
 func (e *CSSExtractor) extractCustomProperties(root *sitter.Node, src []byte, filePath, fileID string, result *parser.ExtractionResult, seen map[string]bool) {

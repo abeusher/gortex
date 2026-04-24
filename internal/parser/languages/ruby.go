@@ -9,52 +9,67 @@ import (
 	"github.com/zzet/gortex/internal/parser"
 )
 
-const (
-	qRbClass = `(class name: (constant) @class.name) @class.def`
+// qRubyAll is a single tree-sitter query alternating over every pattern
+// the Ruby extractor needs. One tree walk per file replaces the 7
+// `parser.RunQuery` calls the previous design made. Capture names are
+// disjoint across patterns so the dispatch in Extract can branch on
+// which name is set. Class/module membership for methods and singleton
+// methods is resolved via a strict parent walk
+// (method → body_statement → class) — nested defs inside another
+// method's body fall through to the free-function bucket, mirroring
+// the legacy nested-query semantics exactly.
+const qRubyAll = `
+[
+  (class
+    name: (constant) @class.name) @class.def
 
-	qRbModule = `(module name: (constant) @mod.name) @mod.def`
+  (module
+    name: (constant) @mod.name) @mod.def
 
-	qRbMethod = `(method name: (identifier) @method.name) @method.def`
+  (method
+    name: (identifier) @method.name) @method.def
 
-	qRbCall = `(call method: (identifier) @call.name) @call.expr`
+  (singleton_method
+    name: (identifier) @singleton.name) @singleton.def
 
-	qRbRequire = `(call
-		method: (identifier) @req.method
-		arguments: (argument_list
-			(string (string_content) @req.path))) @req.def`
+  (call
+    method: (identifier) @req.method
+    arguments: (argument_list
+      (string (string_content) @req.path))) @req.def
 
-	qRbClassMethod = `(class
-		name: (constant) @class.name
-		body: (body_statement
-			(method
-				name: (identifier) @method.name) @method.def))`
+  (call
+    method: (identifier) @call.name) @call.expr
 
-	// `def self.foo` appears in the grammar as singleton_method (not
-	// method). Ruby class methods live in this branch exclusively; a
-	// Rails User.authenticate / Rails.logger style factory is one of
-	// these, so the extractor would miss them without a second query.
-	qRbSingletonMethod = `(class
-		name: (constant) @class.name
-		body: (body_statement
-			(singleton_method
-				name: (identifier) @method.name) @method.def))`
-
-	qRbAssignment = `(assignment
-		left: (constant) @const.name
-		right: (_) @const.value) @const.def`
-)
+  (assignment
+    left: (constant) @const.name
+    right: (_) @const.value) @const.def
+]
+`
 
 // RubyExtractor extracts Ruby source files into graph nodes and edges.
 type RubyExtractor struct {
 	lang *sitter.Language
+	qAll *parser.PreparedQuery
 }
 
 func NewRubyExtractor() *RubyExtractor {
-	return &RubyExtractor{lang: ruby.GetLanguage()}
+	lang := ruby.GetLanguage()
+	return &RubyExtractor{
+		lang: lang,
+		qAll: parser.MustPreparedQuery(qRubyAll, lang),
+	}
 }
 
 func (e *RubyExtractor) Language() string     { return "ruby" }
 func (e *RubyExtractor) Extensions() []string { return []string{".rb", ".rake", ".gemspec"} }
+
+// --- Deferred call buffer ----------------------------------------
+
+type rubyDeferredCall struct {
+	name    string
+	line    int
+	hasRecv bool
+}
 
 func (e *RubyExtractor) Extract(filePath string, src []byte) (*parser.ExtractionResult, error) {
 	tree, err := parser.ParseFile(src, e.lang)
@@ -75,195 +90,256 @@ func (e *RubyExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 		EndLine:   int(root.EndPoint().Row) + 1,
 		Language:  "ruby",
 	}
+	fileID := fileNode.ID
 	result.Nodes = append(result.Nodes, fileNode)
 
 	seen := make(map[string]bool)
-	methodLines := make(map[int]bool) // track lines already extracted as class methods
+	var calls []rubyDeferredCall
 
-	// --- Modules ---
-	matches, _ := parser.RunQuery(qRbModule, e.lang, root, src)
-	for _, m := range matches {
-		name := m.Captures["mod.name"].Text
-		def := m.Captures["mod.def"]
-		id := filePath + "::" + name
-		if seen[id] {
-			continue
-		}
-		seen[id] = true
-		result.Nodes = append(result.Nodes, &graph.Node{
-			ID: id, Kind: graph.KindPackage, Name: name,
-			FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
-			Language: "ruby",
-		})
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileNode.ID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
-		})
-	}
+	parser.EachMatch(e.qAll, root, src, func(m parser.QueryResult) {
+		switch {
 
-	// --- Class methods (before top-level methods so we can skip them) ---
-	// Instance methods first, then singleton methods (def self.x) under
-	// the same path — both belong to the class but have different AST
-	// shapes. Without this second pass, Rails-style `User.authenticate`
-	// (a self.method) is invisible to search and to any graph query.
-	for _, q := range []string{qRbClassMethod, qRbSingletonMethod} {
-		matches, _ = parser.RunQuery(q, e.lang, root, src)
-		for _, m := range matches {
-			className := m.Captures["class.name"].Text
-			methodName := m.Captures["method.name"].Text
-			def := m.Captures["method.def"]
+		case m.Captures["class.def"] != nil:
+			e.emitClass(m, filePath, fileID, result, seen)
 
-			id := filePath + "::" + className + "." + methodName
-			if seen[id] {
-				continue
+		case m.Captures["mod.def"] != nil:
+			e.emitModule(m, filePath, fileID, result, seen)
+
+		case m.Captures["method.def"] != nil:
+			e.emitMethod(m, filePath, fileID, src, result, seen)
+
+		case m.Captures["singleton.def"] != nil:
+			e.emitSingletonMethod(m, filePath, fileID, src, result, seen)
+
+		case m.Captures["req.def"] != nil:
+			e.emitRequire(m, filePath, fileID, result)
+
+		case m.Captures["call.expr"] != nil:
+			name := m.Captures["call.name"].Text
+			if name == "require" || name == "require_relative" {
+				// Handled by the require pattern above.
+				return
 			}
-			seen[id] = true
-			methodLines[def.StartLine] = true
-
-			result.Nodes = append(result.Nodes, &graph.Node{
-				ID: id, Kind: graph.KindMethod, Name: methodName,
-				FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
-				Language: "ruby", Meta: map[string]any{
-					"receiver":  className,
-					"signature": "def " + methodName,
-				},
+			expr := m.Captures["call.expr"]
+			hasRecv := false
+			if expr.Node != nil {
+				if expr.Node.ChildByFieldName("receiver") != nil {
+					hasRecv = true
+				}
+			}
+			calls = append(calls, rubyDeferredCall{
+				name:    name,
+				line:    expr.StartLine + 1,
+				hasRecv: hasRecv,
 			})
-			result.Edges = append(result.Edges, &graph.Edge{
-				From: fileNode.ID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
-			})
-			typeID := filePath + "::" + className
-			result.Edges = append(result.Edges, &graph.Edge{
-				From: id, To: typeID, Kind: graph.EdgeMemberOf, FilePath: filePath, Line: def.StartLine + 1,
-			})
-		}
-	}
 
-	// --- Classes ---
-	matches, _ = parser.RunQuery(qRbClass, e.lang, root, src)
-	for _, m := range matches {
-		name := m.Captures["class.name"].Text
-		def := m.Captures["class.def"]
-		id := filePath + "::" + name
-		if seen[id] {
-			continue
+		case m.Captures["const.def"] != nil:
+			e.emitConstant(m, filePath, fileID, result, seen)
 		}
-		seen[id] = true
-		result.Nodes = append(result.Nodes, &graph.Node{
-			ID: id, Kind: graph.KindType, Name: name,
-			FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
-			Language: "ruby",
-		})
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileNode.ID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
-		})
-	}
+	})
 
-	// --- Top-level methods (skip lines already extracted as class methods) ---
-	matches, _ = parser.RunQuery(qRbMethod, e.lang, root, src)
-	for _, m := range matches {
-		name := m.Captures["method.name"].Text
-		def := m.Captures["method.def"]
-		if methodLines[def.StartLine] {
-			continue
-		}
-		id := filePath + "::" + name
-		if seen[id] {
-			continue
-		}
-		seen[id] = true
-		result.Nodes = append(result.Nodes, &graph.Node{
-			ID: id, Kind: graph.KindFunction, Name: name,
-			FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
-			Language: "ruby", Meta: map[string]any{"signature": "def " + name},
-		})
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileNode.ID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
-		})
-	}
-
-	// --- Imports (require / require_relative) ---
-	matches, _ = parser.RunQuery(qRbRequire, e.lang, root, src)
-	for _, m := range matches {
-		method := m.Captures["req.method"].Text
-		if method != "require" && method != "require_relative" {
-			continue
-		}
-		path := m.Captures["req.path"]
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileNode.ID, To: "unresolved::import::" + path.Text,
-			Kind: graph.EdgeImports, FilePath: filePath, Line: path.StartLine + 1,
-		})
-	}
-
-	// --- Call sites ---
+	// Resolve call edges against funcRanges.
 	funcRanges := buildFuncRanges(result)
-
-	matches, _ = parser.RunQuery(qRbCall, e.lang, root, src)
-	for _, m := range matches {
-		name := m.Captures["call.name"].Text
-		expr := m.Captures["call.expr"]
-		// Skip require/require_relative — already handled as imports.
-		if name == "require" || name == "require_relative" {
-			continue
-		}
-		callerID := findEnclosingFunc(funcRanges, expr.StartLine+1)
+	for _, c := range calls {
+		callerID := findEnclosingFunc(funcRanges, c.line)
 		if callerID == "" {
 			continue
 		}
-
-		// Check if the call has a receiver (obj.method style).
-		callNode := expr.Node
-		var target string
-		if callNode != nil {
-			receiver := callNode.ChildByFieldName("receiver")
-			if receiver != nil {
-				target = "unresolved::*." + name
-			} else {
-				target = "unresolved::" + name
-			}
-		} else {
-			target = "unresolved::" + name
+		target := "unresolved::" + c.name
+		if c.hasRecv {
+			target = "unresolved::*." + c.name
 		}
-
 		result.Edges = append(result.Edges, &graph.Edge{
 			From: callerID, To: target,
-			Kind: graph.EdgeCalls, FilePath: filePath, Line: expr.StartLine + 1,
+			Kind: graph.EdgeCalls, FilePath: filePath, Line: c.line,
 		})
 	}
 
-	// --- Constants (uppercase assignments) ---
-	matches, _ = parser.RunQuery(qRbAssignment, e.lang, root, src)
-	for _, m := range matches {
-		name := m.Captures["const.name"].Text
-		def := m.Captures["const.def"]
-		// Ruby constants start with an uppercase letter.
-		if len(name) == 0 || !isUpperASCII(name[0]) {
-			continue
-		}
-		id := filePath + "::" + name
-		if seen[id] {
-			continue
-		}
-		seen[id] = true
-		result.Nodes = append(result.Nodes, &graph.Node{
-			ID: id, Kind: graph.KindVariable, Name: name,
-			FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
-			Language: "ruby",
-		})
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileNode.ID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
-		})
-	}
-
-	// Rails-style callback dispatch: before_action / after_action /
-	// around_action / skip_before_action / before_filter (legacy) /
-	// after_filter. These declarations bind callback methods to
-	// controller actions — runtime dispatch with no explicit call
-	// site. For each match we emit one EdgeCalls per (action, callback)
-	// pair so both `callers:callback` and `call_chain:action` answer
-	// the way a Rails developer would expect.
+	// Rails-style callback dispatch — preserves legacy behaviour exactly.
 	emitRailsCallbacks(root, src, filePath, result)
 
 	return result, nil
+}
+
+// --- Per-match emit helpers -----------------------------------------
+
+func (e *RubyExtractor) emitClass(m parser.QueryResult, filePath, fileID string, result *parser.ExtractionResult, seen map[string]bool) {
+	name := m.Captures["class.name"].Text
+	def := m.Captures["class.def"]
+	id := filePath + "::" + name
+	if seen[id] {
+		return
+	}
+	seen[id] = true
+	result.Nodes = append(result.Nodes, &graph.Node{
+		ID: id, Kind: graph.KindType, Name: name,
+		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
+		Language: "ruby",
+	})
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
+	})
+}
+
+func (e *RubyExtractor) emitModule(m parser.QueryResult, filePath, fileID string, result *parser.ExtractionResult, seen map[string]bool) {
+	name := m.Captures["mod.name"].Text
+	def := m.Captures["mod.def"]
+	id := filePath + "::" + name
+	if seen[id] {
+		return
+	}
+	seen[id] = true
+	result.Nodes = append(result.Nodes, &graph.Node{
+		ID: id, Kind: graph.KindPackage, Name: name,
+		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
+		Language: "ruby",
+	})
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
+	})
+}
+
+// emitMethod classifies a `def name` definition: direct child of a
+// class's body_statement → method of that class; anything else → free
+// top-level function. Mirrors the legacy qRbClassMethod +
+// qRbMethod-fallback semantics.
+func (e *RubyExtractor) emitMethod(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool) {
+	name := m.Captures["method.name"].Text
+	def := m.Captures["method.def"]
+	startLine1 := def.StartLine + 1
+
+	className := rubyDirectClassParent(def.Node, src)
+	if className != "" {
+		id := filePath + "::" + className + "." + name
+		if seen[id] {
+			return
+		}
+		seen[id] = true
+		result.Nodes = append(result.Nodes, &graph.Node{
+			ID: id, Kind: graph.KindMethod, Name: name,
+			FilePath: filePath, StartLine: startLine1, EndLine: def.EndLine + 1,
+			Language: "ruby", Meta: map[string]any{
+				"receiver":  className,
+				"signature": "def " + name,
+			},
+		})
+		result.Edges = append(result.Edges, &graph.Edge{
+			From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: startLine1,
+		})
+		classID := filePath + "::" + className
+		result.Edges = append(result.Edges, &graph.Edge{
+			From: id, To: classID, Kind: graph.EdgeMemberOf, FilePath: filePath, Line: startLine1,
+		})
+		return
+	}
+
+	id := filePath + "::" + name
+	if seen[id] {
+		return
+	}
+	seen[id] = true
+	result.Nodes = append(result.Nodes, &graph.Node{
+		ID: id, Kind: graph.KindFunction, Name: name,
+		FilePath: filePath, StartLine: startLine1, EndLine: def.EndLine + 1,
+		Language: "ruby", Meta: map[string]any{"signature": "def " + name},
+	})
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: startLine1,
+	})
+}
+
+// emitSingletonMethod mirrors the legacy qRbSingletonMethod pattern.
+// `def self.foo` (and other `def receiver.foo` forms) is only
+// meaningful as a class method — if we can't attribute it to an
+// enclosing class, skip, matching legacy behaviour.
+func (e *RubyExtractor) emitSingletonMethod(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool) {
+	name := m.Captures["singleton.name"].Text
+	def := m.Captures["singleton.def"]
+	startLine1 := def.StartLine + 1
+
+	className := rubyDirectClassParent(def.Node, src)
+	if className == "" {
+		return
+	}
+	id := filePath + "::" + className + "." + name
+	if seen[id] {
+		return
+	}
+	seen[id] = true
+	result.Nodes = append(result.Nodes, &graph.Node{
+		ID: id, Kind: graph.KindMethod, Name: name,
+		FilePath: filePath, StartLine: startLine1, EndLine: def.EndLine + 1,
+		Language: "ruby", Meta: map[string]any{
+			"receiver":  className,
+			"signature": "def " + name,
+		},
+	})
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: startLine1,
+	})
+	classID := filePath + "::" + className
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: id, To: classID, Kind: graph.EdgeMemberOf, FilePath: filePath, Line: startLine1,
+	})
+}
+
+func (e *RubyExtractor) emitRequire(m parser.QueryResult, filePath, fileID string, result *parser.ExtractionResult) {
+	method := m.Captures["req.method"].Text
+	if method != "require" && method != "require_relative" {
+		return
+	}
+	path := m.Captures["req.path"]
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: fileID, To: "unresolved::import::" + path.Text,
+		Kind: graph.EdgeImports, FilePath: filePath, Line: path.StartLine + 1,
+	})
+}
+
+func (e *RubyExtractor) emitConstant(m parser.QueryResult, filePath, fileID string, result *parser.ExtractionResult, seen map[string]bool) {
+	name := m.Captures["const.name"].Text
+	def := m.Captures["const.def"]
+	if len(name) == 0 || !isUpperASCII(name[0]) {
+		return
+	}
+	id := filePath + "::" + name
+	if seen[id] {
+		return
+	}
+	seen[id] = true
+	result.Nodes = append(result.Nodes, &graph.Node{
+		ID: id, Kind: graph.KindVariable, Name: name,
+		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
+		Language: "ruby",
+	})
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
+	})
+}
+
+// --- Helpers --------------------------------------------------------
+
+// rubyDirectClassParent returns the enclosing class name when the
+// method/singleton_method is a direct child of a class's body_statement
+// (mirrors the legacy nested qRbClassMethod / qRbSingletonMethod
+// patterns). Returns "" for nested-in-method definitions or top-level
+// defs, preserving the legacy free-function bucket.
+func rubyDirectClassParent(def *sitter.Node, src []byte) string {
+	if def == nil {
+		return ""
+	}
+	parent := def.Parent()
+	if parent == nil || parent.Type() != "body_statement" {
+		return ""
+	}
+	grand := parent.Parent()
+	if grand == nil || grand.Type() != "class" {
+		return ""
+	}
+	nameNode := grand.ChildByFieldName("name")
+	if nameNode == nil {
+		return ""
+	}
+	return nameNode.Content(src)
 }
 
 // railsCallbackMethods enumerates the Rails controller macros that

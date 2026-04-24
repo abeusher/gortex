@@ -1,8 +1,20 @@
 package contracts
 
 import (
+	"encoding/gob"
 	"strings"
 )
+
+// Shape is stored in graph.Node.Meta (a map[string]any), which gets
+// gob-encoded into the daemon snapshot. Gob refuses to encode a concrete
+// type reached through an interface slot unless that type is registered,
+// so the first node with a shape would abort the snapshot write with
+// "type not registered for interface: contracts.Shape". Register the
+// pointer form because that's what ExtractShape returns and what the
+// indexer writes into Meta.
+func init() {
+	gob.Register((*Shape)(nil))
+}
 
 // Shape captures the externally-visible structure of a type that's
 // referenced as a contract's request / response body. It's attached to

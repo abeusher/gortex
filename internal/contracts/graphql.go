@@ -27,12 +27,37 @@ func (e *GraphQLExtractor) SupportedLanguages() []string {
 	return []string{"graphql", "go", "typescript", "javascript", "python"}
 }
 
+// gqlConsumerMarkers is the substring prefilter for the consumer
+// scan. Every consumer pattern needs one of:
+//   - a gql`` tagged template literal (marker: "gql`")
+//   - a bare `query` / `mutation` / `subscription` operation block
+//
+// Reject any file that contains none. Schema files (.graphql/.gql)
+// are already routed to extractSchemaProviders before this check.
+var gqlConsumerMarkers = [][]byte{
+	[]byte("gql`"),
+	[]byte("query"),
+	[]byte("mutation"),
+	[]byte("subscription"),
+}
+
 func (e *GraphQLExtractor) Extract(filePath string, src []byte, nodes []*graph.Node, edges []*graph.Edge) []Contract {
 	var contracts []Contract
 
-	if strings.HasSuffix(filePath, ".graphql") || strings.HasSuffix(filePath, ".gql") {
+	isSchemaFile := strings.HasSuffix(filePath, ".graphql") || strings.HasSuffix(filePath, ".gql")
+	if isSchemaFile {
 		contracts = append(contracts, e.extractSchemaProviders(filePath, src)...)
 	}
+
+	// Consumer scan: skip entirely when the file has no marker
+	// substring that any consumer regex could possibly match. A
+	// schema-only .graphql file lacks lowercase `query`/`mutation`/
+	// `subscription` operation blocks and no gql-tagged templates,
+	// so it short-circuits here — the provider pass ran above.
+	if !srcHasAnyMarker(src, gqlConsumerMarkers) {
+		return contracts
+	}
+
 	// Consumer queries can live in any source file. Thread file nodes
 	// through so findEnclosingSymbol can anchor each consumer contract
 	// on its calling function — required for EdgeMatches bridges.

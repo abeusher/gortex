@@ -2,7 +2,6 @@ package languages
 
 import (
 	"fmt"
-	"strings"
 
 	sitter "github.com/smacker/go-tree-sitter"
 	"github.com/smacker/go-tree-sitter/javascript"
@@ -10,59 +9,85 @@ import (
 	"github.com/zzet/gortex/internal/parser"
 )
 
-const (
-	jsQFunction = `(function_declaration
-		name: (identifier) @func.name) @func.def`
+// qJSAll is a single tree-sitter query alternating over every pattern
+// the JavaScript extractor needs. One tree walk per file replaces the
+// 9+ `parser.RunQuery` calls (counting the per-class jsQMethod re-run).
+// Capture names are disjoint across patterns so the dispatch in Extract
+// can branch on which name is set. Method-to-class membership uses a
+// parent walk on method_definition; the const-arrow-vs-var dedupe from
+// spec §4 is handled by emitting arrow first and skipping the var
+// pattern when the name is already owned by an arrow.
+const qJSAll = `
+[
+  (function_declaration
+    name: (identifier) @func.name) @func.def
 
-	jsQArrow = `(lexical_declaration
-		(variable_declarator
-			name: (identifier) @func.name
-			value: (arrow_function) @func.body)) @func.def`
+  (lexical_declaration
+    (variable_declarator
+      name: (identifier) @arrow.name
+      value: (arrow_function))) @arrow.def
 
-	jsQClass = `(class_declaration
-		name: (identifier) @class.name) @class.def`
+  (class_declaration
+    name: (identifier) @class.name) @class.def
 
-	jsQMethod = `(method_definition
-		name: (property_identifier) @method.name) @method.def`
+  (method_definition
+    name: (property_identifier) @method.name) @method.def
 
-	jsQImport = `(import_statement
-		source: (string (string_fragment) @import.path)) @import.def`
+  (import_statement
+    source: (string (string_fragment) @import.path)) @import.def
 
-	jsQRequire = `(call_expression
-		function: (identifier) @req.name
-		arguments: (arguments (string (string_fragment) @req.path))) @req.def`
+  (call_expression
+    function: (identifier) @req.name
+    arguments: (arguments (string (string_fragment) @req.path))) @req.def
 
-	jsQCall = `(call_expression
-		function: (identifier) @call.name) @call.expr`
+  (call_expression
+    function: (identifier) @call.name) @call.expr
 
-	jsQCallMember = `(call_expression
-		function: (member_expression
-			property: (property_identifier) @call.method)) @call.expr`
+  (call_expression
+    function: (member_expression
+      property: (property_identifier) @callm.method)) @callm.expr
 
-	jsQVar = `(lexical_declaration
-		(variable_declarator
-			name: (identifier) @var.name)) @var.def`
+  (lexical_declaration
+    (variable_declarator
+      name: (identifier) @var.name)) @var.def
 
-	jsQVarDecl = `(variable_declaration
-		(variable_declarator
-			name: (identifier) @var.name)) @var.def`
-
-	jsQExport = `(export_statement
-		(function_declaration
-			name: (identifier) @func.name)) @func.def`
-)
+  (variable_declaration
+    (variable_declarator
+      name: (identifier) @varDecl.name)) @varDecl.def
+]
+`
 
 // JavaScriptExtractor extracts JavaScript source files.
 type JavaScriptExtractor struct {
 	lang *sitter.Language
+	qAll *parser.PreparedQuery
 }
 
 func NewJavaScriptExtractor() *JavaScriptExtractor {
-	return &JavaScriptExtractor{lang: javascript.GetLanguage()}
+	lang := javascript.GetLanguage()
+	return &JavaScriptExtractor{
+		lang: lang,
+		qAll: parser.MustPreparedQuery(qJSAll, lang),
+	}
 }
 
 func (e *JavaScriptExtractor) Language() string     { return "javascript" }
 func (e *JavaScriptExtractor) Extensions() []string { return []string{".js", ".jsx", ".mjs"} }
+
+// --- Deferred match buffers ----------------------------------------
+
+type jsDeferredCall struct {
+	name     string
+	line     int
+	isMember bool
+}
+
+type jsDeferredVar struct {
+	name    string
+	defNode *sitter.Node
+	line    int
+	endLine int
+}
 
 func (e *JavaScriptExtractor) Extract(filePath string, src []byte) (*parser.ExtractionResult, error) {
 	tree, err := parser.ParseFile(src, e.lang)
@@ -79,203 +104,223 @@ func (e *JavaScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 		FilePath: filePath, StartLine: 1, EndLine: int(root.EndPoint().Row) + 1,
 		Language: "javascript",
 	}
+	fileID := fileNode.ID
 	result.Nodes = append(result.Nodes, fileNode)
 
-	// Functions.
-	for _, q := range []string{jsQFunction, jsQExport} {
-		e.extractFuncs(q, root, src, filePath, fileNode.ID, result)
+	arrowNames := make(map[string]bool)
+
+	var calls []jsDeferredCall
+	var vars []jsDeferredVar
+
+	parser.EachMatch(e.qAll, root, src, func(m parser.QueryResult) {
+		switch {
+
+		case m.Captures["func.def"] != nil:
+			e.emitFunction(m, filePath, fileID, result)
+
+		case m.Captures["arrow.def"] != nil:
+			e.emitArrow(m, filePath, fileID, result, arrowNames)
+
+		case m.Captures["class.def"] != nil:
+			e.emitClass(m, filePath, fileID, result)
+
+		case m.Captures["method.def"] != nil:
+			e.emitMethod(m, filePath, src, result)
+
+		case m.Captures["import.def"] != nil:
+			e.emitImport(m, filePath, fileID, result)
+
+		case m.Captures["req.def"] != nil:
+			e.emitRequire(m, filePath, fileID, result)
+
+		case m.Captures["callm.expr"] != nil:
+			expr := m.Captures["callm.expr"]
+			calls = append(calls, jsDeferredCall{
+				name:     m.Captures["callm.method"].Text,
+				line:     expr.StartLine + 1,
+				isMember: true,
+			})
+
+		case m.Captures["call.expr"] != nil:
+			expr := m.Captures["call.expr"]
+			calls = append(calls, jsDeferredCall{
+				name: m.Captures["call.name"].Text,
+				line: expr.StartLine + 1,
+			})
+
+		case m.Captures["var.def"] != nil:
+			def := m.Captures["var.def"]
+			vars = append(vars, jsDeferredVar{
+				name:    m.Captures["var.name"].Text,
+				defNode: def.Node,
+				line:    def.StartLine + 1,
+				endLine: def.EndLine + 1,
+			})
+
+		case m.Captures["varDecl.def"] != nil:
+			def := m.Captures["varDecl.def"]
+			vars = append(vars, jsDeferredVar{
+				name:    m.Captures["varDecl.name"].Text,
+				defNode: def.Node,
+				line:    def.StartLine + 1,
+				endLine: def.EndLine + 1,
+			})
+		}
+	})
+
+	// Module-level variable emission — skip names already emitted as
+	// arrow functions (the const-arrow-vs-var dedupe from spec §4).
+	for _, v := range vars {
+		if arrowNames[v.name] {
+			continue
+		}
+		parent := v.defNode.Parent()
+		if parent != nil && parent.Type() == "export_statement" {
+			parent = parent.Parent()
+		}
+		if parent == nil || parent.Type() != "program" {
+			continue
+		}
+		id := filePath + "::" + v.name
+		result.Nodes = append(result.Nodes, &graph.Node{
+			ID: id, Kind: graph.KindVariable, Name: v.name,
+			FilePath: filePath, StartLine: v.line, EndLine: v.endLine,
+			Language: "javascript",
+		})
+		result.Edges = append(result.Edges, &graph.Edge{
+			From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: v.line,
+		})
 	}
 
-	// Arrow functions assigned to variables.
-	e.extractArrowFuncs(root, src, filePath, fileNode.ID, result)
-
-	// Classes.
-	e.extractClasses(root, src, filePath, fileNode.ID, result)
-
-	// Imports.
-	e.extractImports(root, src, filePath, fileNode.ID, result)
-
-	// Require calls.
-	e.extractRequires(root, src, filePath, fileNode.ID, result)
-
-	// Call sites.
-	e.extractCalls(root, src, filePath, result)
-
-	// Variables.
-	e.extractVariables(root, src, filePath, fileNode.ID, result)
+	// Resolve calls against funcRanges.
+	funcRanges := buildFuncRanges(result)
+	for _, c := range calls {
+		callerID := findEnclosingFunc(funcRanges, c.line)
+		if callerID == "" {
+			continue
+		}
+		if c.isMember {
+			result.Edges = append(result.Edges, &graph.Edge{
+				From: callerID, To: "unresolved::*." + c.name,
+				Kind: graph.EdgeCalls, FilePath: filePath, Line: c.line,
+			})
+			continue
+		}
+		result.Edges = append(result.Edges, &graph.Edge{
+			From: callerID, To: "unresolved::" + c.name,
+			Kind: graph.EdgeCalls, FilePath: filePath, Line: c.line,
+		})
+	}
 
 	return result, nil
 }
 
-func (e *JavaScriptExtractor) extractFuncs(q string, root *sitter.Node, src []byte, filePath, fileID string, result *parser.ExtractionResult) {
-	matches, _ := parser.RunQuery(q, e.lang, root, src)
-	for _, m := range matches {
-		name := m.Captures["func.name"].Text
-		def := m.Captures["func.def"]
-		id := filePath + "::" + name
-		result.Nodes = append(result.Nodes, &graph.Node{
-			ID: id, Kind: graph.KindFunction, Name: name,
-			FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
-			Language: "javascript", Meta: map[string]any{"signature": fmt.Sprintf("function %s()", name)},
-		})
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
-		})
-	}
+// --- Per-match emit helpers -----------------------------------------
+
+func (e *JavaScriptExtractor) emitFunction(m parser.QueryResult, filePath, fileID string, result *parser.ExtractionResult) {
+	name := m.Captures["func.name"].Text
+	def := m.Captures["func.def"]
+	id := filePath + "::" + name
+	result.Nodes = append(result.Nodes, &graph.Node{
+		ID: id, Kind: graph.KindFunction, Name: name,
+		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
+		Language: "javascript", Meta: map[string]any{"signature": fmt.Sprintf("function %s()", name)},
+	})
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
+	})
 }
 
-func (e *JavaScriptExtractor) extractArrowFuncs(root *sitter.Node, src []byte, filePath, fileID string, result *parser.ExtractionResult) {
-	matches, _ := parser.RunQuery(jsQArrow, e.lang, root, src)
-	for _, m := range matches {
-		name := m.Captures["func.name"].Text
-		def := m.Captures["func.def"]
-		id := filePath + "::" + name
-		result.Nodes = append(result.Nodes, &graph.Node{
-			ID: id, Kind: graph.KindFunction, Name: name,
-			FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
-			Language: "javascript", Meta: map[string]any{"signature": fmt.Sprintf("const %s = () =>", name)},
-		})
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
-		})
-	}
+func (e *JavaScriptExtractor) emitArrow(m parser.QueryResult, filePath, fileID string, result *parser.ExtractionResult, arrowNames map[string]bool) {
+	name := m.Captures["arrow.name"].Text
+	def := m.Captures["arrow.def"]
+	arrowNames[name] = true
+	id := filePath + "::" + name
+	result.Nodes = append(result.Nodes, &graph.Node{
+		ID: id, Kind: graph.KindFunction, Name: name,
+		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
+		Language: "javascript", Meta: map[string]any{"signature": fmt.Sprintf("const %s = () =>", name)},
+	})
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
+	})
 }
 
-func (e *JavaScriptExtractor) extractClasses(root *sitter.Node, src []byte, filePath, fileID string, result *parser.ExtractionResult) {
-	matches, _ := parser.RunQuery(jsQClass, e.lang, root, src)
-	for _, m := range matches {
-		name := m.Captures["class.name"].Text
-		def := m.Captures["class.def"]
-		id := filePath + "::" + name
-		result.Nodes = append(result.Nodes, &graph.Node{
-			ID: id, Kind: graph.KindType, Name: name,
-			FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
-			Language: "javascript",
-		})
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
-		})
-
-		// Methods inside the class.
-		e.extractMethods(def.Node, src, filePath, id, result)
-	}
+func (e *JavaScriptExtractor) emitClass(m parser.QueryResult, filePath, fileID string, result *parser.ExtractionResult) {
+	name := m.Captures["class.name"].Text
+	def := m.Captures["class.def"]
+	id := filePath + "::" + name
+	result.Nodes = append(result.Nodes, &graph.Node{
+		ID: id, Kind: graph.KindType, Name: name,
+		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
+		Language: "javascript",
+	})
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
+	})
 }
 
-func (e *JavaScriptExtractor) extractMethods(classNode *sitter.Node, src []byte, filePath, classID string, result *parser.ExtractionResult) {
-	matches, _ := parser.RunQuery(jsQMethod, e.lang, classNode, src)
-	for _, m := range matches {
-		name := m.Captures["method.name"].Text
-		def := m.Captures["method.def"]
-		id := filePath + "::" + classID[strings.LastIndex(classID, "::")+2:] + "." + name
-		result.Nodes = append(result.Nodes, &graph.Node{
-			ID: id, Kind: graph.KindMethod, Name: name,
-			FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
-			Language: "javascript",
-		})
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: id, To: classID, Kind: graph.EdgeMemberOf, FilePath: filePath, Line: def.StartLine + 1,
-		})
+// emitMethod walks up to the enclosing class_declaration and emits the
+// method with a MemberOf edge. Mirrors the legacy per-class
+// extractMethods re-run of jsQMethod.
+func (e *JavaScriptExtractor) emitMethod(m parser.QueryResult, filePath string, src []byte, result *parser.ExtractionResult) {
+	def := m.Captures["method.def"]
+	classNode := findEnclosingJSContainer(def.Node, "class_declaration")
+	if classNode == nil {
+		return
 	}
+	nameNode := classNode.ChildByFieldName("name")
+	if nameNode == nil {
+		return
+	}
+	className := nameNode.Content(src)
+	name := m.Captures["method.name"].Text
+	classID := filePath + "::" + className
+	id := filePath + "::" + className + "." + name
+	result.Nodes = append(result.Nodes, &graph.Node{
+		ID: id, Kind: graph.KindMethod, Name: name,
+		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
+		Language: "javascript",
+	})
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: id, To: classID, Kind: graph.EdgeMemberOf, FilePath: filePath, Line: def.StartLine + 1,
+	})
 }
 
-func (e *JavaScriptExtractor) extractImports(root *sitter.Node, src []byte, filePath, fileID string, result *parser.ExtractionResult) {
-	matches, _ := parser.RunQuery(jsQImport, e.lang, root, src)
-	for _, m := range matches {
-		importPath := m.Captures["import.path"].Text
-		line := m.Captures["import.def"].StartLine + 1
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileID, To: "unresolved::import::" + importPath,
-			Kind: graph.EdgeImports, FilePath: filePath, Line: line,
-		})
-	}
+func (e *JavaScriptExtractor) emitImport(m parser.QueryResult, filePath, fileID string, result *parser.ExtractionResult) {
+	importPath := m.Captures["import.path"].Text
+	line := m.Captures["import.def"].StartLine + 1
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: fileID, To: "unresolved::import::" + importPath,
+		Kind: graph.EdgeImports, FilePath: filePath, Line: line,
+	})
 }
 
-func (e *JavaScriptExtractor) extractRequires(root *sitter.Node, src []byte, filePath, fileID string, result *parser.ExtractionResult) {
-	matches, _ := parser.RunQuery(jsQRequire, e.lang, root, src)
-	for _, m := range matches {
-		name := m.Captures["req.name"].Text
-		if name != "require" {
-			continue
-		}
-		reqPath := m.Captures["req.path"].Text
-		line := m.Captures["req.def"].StartLine + 1
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileID, To: "unresolved::import::" + reqPath,
-			Kind: graph.EdgeImports, FilePath: filePath, Line: line,
-		})
+func (e *JavaScriptExtractor) emitRequire(m parser.QueryResult, filePath, fileID string, result *parser.ExtractionResult) {
+	if m.Captures["req.name"].Text != "require" {
+		return
 	}
+	reqPath := m.Captures["req.path"].Text
+	line := m.Captures["req.def"].StartLine + 1
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: fileID, To: "unresolved::import::" + reqPath,
+		Kind: graph.EdgeImports, FilePath: filePath, Line: line,
+	})
 }
 
-func (e *JavaScriptExtractor) extractCalls(root *sitter.Node, src []byte, filePath string, result *parser.ExtractionResult) {
-	funcRanges := buildFuncRanges(result)
+// --- Helpers --------------------------------------------------------
 
-	matches, _ := parser.RunQuery(jsQCall, e.lang, root, src)
-	for _, m := range matches {
-		name := m.Captures["call.name"].Text
-		expr := m.Captures["call.expr"]
-		callerID := findEnclosingFunc(funcRanges, expr.StartLine+1)
-		if callerID == "" {
-			continue
-		}
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: callerID, To: "unresolved::" + name,
-			Kind: graph.EdgeCalls, FilePath: filePath, Line: expr.StartLine + 1,
-		})
+// findEnclosingJSContainer walks the parent chain of n looking for the
+// nearest ancestor whose Type() matches t. Returns nil if none.
+func findEnclosingJSContainer(n *sitter.Node, t string) *sitter.Node {
+	if n == nil {
+		return nil
 	}
-
-	matches, _ = parser.RunQuery(jsQCallMember, e.lang, root, src)
-	for _, m := range matches {
-		method := m.Captures["call.method"].Text
-		expr := m.Captures["call.expr"]
-		callerID := findEnclosingFunc(funcRanges, expr.StartLine+1)
-		if callerID == "" {
-			continue
-		}
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: callerID, To: "unresolved::*." + method,
-			Kind: graph.EdgeCalls, FilePath: filePath, Line: expr.StartLine + 1,
-		})
-	}
-}
-
-func (e *JavaScriptExtractor) extractVariables(root *sitter.Node, src []byte, filePath, fileID string, result *parser.ExtractionResult) {
-	// Collect names already extracted as arrow functions so we skip them.
-	arrowNames := make(map[string]bool)
-	for _, n := range result.Nodes {
-		if n.Kind == graph.KindFunction && n.FilePath == filePath {
-			arrowNames[n.Name] = true
+	for p := n.Parent(); p != nil; p = p.Parent() {
+		if p.Type() == t {
+			return p
 		}
 	}
-
-	for _, q := range []string{jsQVar, jsQVarDecl} {
-		matches, _ := parser.RunQuery(q, e.lang, root, src)
-		for _, m := range matches {
-			name := m.Captures["var.name"].Text
-			def := m.Captures["var.def"]
-
-			// Skip variables already captured as arrow functions.
-			if arrowNames[name] {
-				continue
-			}
-
-			// Only extract module-level variables.
-			parent := def.Node.Parent()
-			if parent != nil && parent.Type() == "export_statement" {
-				parent = parent.Parent()
-			}
-			if parent == nil || parent.Type() != "program" {
-				continue
-			}
-
-			id := filePath + "::" + name
-			result.Nodes = append(result.Nodes, &graph.Node{
-				ID: id, Kind: graph.KindVariable, Name: name,
-				FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
-				Language: "javascript",
-			})
-			result.Edges = append(result.Edges, &graph.Edge{
-				From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
-			})
-		}
-	}
+	return nil
 }
+
