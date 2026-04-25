@@ -19,6 +19,18 @@ See [docs/agents.md](docs/agents.md) for the adapter matrix, per-agent schema no
 
 ![Gortex Web UI — force-directed knowledge graph visualization](assets/graph.png)
 
+## Installation
+
+```bash
+curl -fsSL https://get.gortex.dev | sh
+```
+
+> Detects OS/arch, downloads the signed release tarball, verifies the SHA256 against `checksums.txt` (and cosign if installed), drops the binary in `$HOME/.local/bin`, and adds it to your shell rc. Re-runs upgrade in place. No silent sudo. Linux + macOS, amd64 + arm64. Windows support is planned.
+
+For Homebrew, package managers (`.deb` / `.rpm` / `.apk`), direct binary download, supply-chain verification (cosign + SLSA-3 + VirusTotal), and from-source builds — see [docs/installation.md](docs/installation.md).
+
+**New to Gortex?** After installing, see [docs/onboarding.md](docs/onboarding.md) for the 15-minute walkthrough: `gortex install` (once per machine) → `gortex init` (once per repo) → verify your AI assistant uses graph tools → what to do if it doesn't.
+
 ## Features
 
 - **Knowledge graph** — every file, symbol, import, call chain, and type relationship in one queryable structure
@@ -51,18 +63,6 @@ See [docs/agents.md](docs/agents.md) for the adapter matrix, per-agent schema no
 - **Eval framework** — SWE-bench harness for A/B benchmarking tool effectiveness with Docker-based environments and multi-model support
 - **`gortex eval` CLI** — first-class evaluation harness. Subcommands: `recall` (fixture-driven any-hit R@1/5/20 + MRR per ranker, per-tier breakdown, p50/p95 latency, tokens-returned, optional LLM judge for CQS-style dual-judge scoring), `embedders` (ONNX variant comparison — size + init + embed latency + end-to-end quality across MiniLM variants, BGE, Jina), `swebench` (passthrough), `tokens` (GCX1 wire-format bench). Seed fixture at [`bench/fixtures/retrieval.yaml`](bench/fixtures/retrieval.yaml); published BM25 baseline on Gortex: **R@1 42.3% · R@5 56.4% · R@20 69.9% · exact R@5 95.2%**
 - **Zero dependencies** — everything runs in-process, in memory, no external services
-
-## Installation
-
-```bash
-curl -fsSL https://get.gortex.dev | sh
-```
-
-> Detects OS/arch, downloads the signed release tarball, verifies the SHA256 against `checksums.txt` (and cosign if installed), drops the binary in `$HOME/.local/bin`, and adds it to your shell rc. Re-runs upgrade in place. No silent sudo. Linux + macOS, amd64 + arm64. Windows support is planned.
-
-For Homebrew, package managers (`.deb` / `.rpm` / `.apk`), direct binary download, supply-chain verification (cosign + SLSA-3 + VirusTotal), and from-source builds — see [docs/installation.md](docs/installation.md).
-
-**New to Gortex?** After installing, see [docs/onboarding.md](docs/onboarding.md) for the 15-minute walkthrough: `gortex install` (once per machine) → `gortex init` (once per repo) → verify your AI assistant uses graph tools → what to do if it doesn't.
 
 ## Quick Start
 

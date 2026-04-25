@@ -257,6 +257,11 @@ func (mi *MultiIndexer) indexMultiRepo(repos []config.RepoEntry) (map[string]*In
 			}
 			idx.SetRepoPrefix(prefix)
 			idx.SetTrackedRepoModules(trackedModules)
+			// Defer the cross-cutting passes (ResolveAll, InferImplements,
+			// semantic enrich, contract extract+commit) so they don't race
+			// against each other across goroutines on the shared graph.
+			// They run serially below via RunDeferredPasses after wg.Wait().
+			idx.SetDeferResolve(true)
 
 			result, err := idx.Index(absPath)
 			if err != nil {
@@ -302,6 +307,20 @@ func (mi *MultiIndexer) indexMultiRepo(repos []config.RepoEntry) (map[string]*In
 		results[rr.prefix] = rr.result
 	}
 	mi.mu.Unlock()
+
+	// Run the per-repo passes that the goroutines above deferred. Serial
+	// across repos is the simple correctness fix: ResolveAll mutates
+	// Edge.Meta on edges in the shared graph, and the contract pass walks
+	// every edge — running them in parallel across repos races. Inside a
+	// single repo's ResolveAll the resolver still uses its own worker
+	// pool, and parsing (the dominant cost on a fresh index) already ran
+	// in parallel above, so the wall-time hit is small.
+	deferCtx := context.Background()
+	for prefix := range results {
+		if idx, ok := mi.indexers[prefix]; ok {
+			idx.RunDeferredPasses(deferCtx)
+		}
+	}
 
 	// spec-launch.md §11 step H: run a global cross-repo resolution
 	// pass once every repo is indexed, with the §4.2 cross-workspace

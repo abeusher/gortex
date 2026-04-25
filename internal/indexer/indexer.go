@@ -113,6 +113,16 @@ type Indexer struct {
 	upgradeOnce      sync.Once
 	upgradeSpawnedMu sync.Mutex
 	upgradeSpawned   int
+
+	// deferResolve, when set, makes IndexCtx skip the cross-cutting passes
+	// (per-repo ResolveAll / InferImplements / semantic enrichment / contract
+	// extraction + commit) so the multi-repo orchestrator can run them
+	// serially after the parallel fan-out joins. Without this, two
+	// goroutines indexing different repos into the shared graph race on
+	// Edge.Meta during the resolver's mutation phase vs. the contract
+	// pass's graph walk via AllEdges().
+	deferResolve       bool
+	pendingContractReg *contracts.Registry
 }
 
 // contractCacheEntry is a cached contract-extraction result for one file.
@@ -274,6 +284,54 @@ func (idx *Indexer) SetContractRegistry(reg *contracts.Registry) {
 // SetTrackedRepoModules sets the map of tracked repo names to Go module paths.
 // This enables the GoModExtractor to detect cross-repo dependencies.
 func (idx *Indexer) SetTrackedRepoModules(m map[string]string) { idx.trackedRepoModules = m }
+
+// SetDeferResolve toggles whether IndexCtx defers the cross-cutting passes
+// to a later RunDeferredPasses call. See the deferResolve field comment.
+func (idx *Indexer) SetDeferResolve(v bool) { idx.deferResolve = v }
+
+// RunDeferredPasses runs the cross-cutting passes that IndexCtx skipped in
+// deferred mode: per-repo ResolveAll, InferImplements, semantic enrichment,
+// and contract extraction + commit. Safe to call only after IndexCtx has
+// populated the graph for this repo. Idempotent — second calls are a no-op
+// because the pending registry is cleared at the end.
+func (idx *Indexer) RunDeferredPasses(ctx context.Context) {
+	if idx.pendingContractReg == nil {
+		return
+	}
+	reporter := progress.FromContext(ctx)
+
+	reporter.Report("resolving references", 0, 0)
+	idx.resolver.ResolveAll()
+
+	reporter.Report("inferring interfaces", 0, 0)
+	idx.resolver.InferImplements()
+
+	if idx.semanticMgr != nil && idx.semanticMgr.Enabled() && idx.semanticMgr.HasProviders() {
+		reporter.Report("semantic enrichment", 0, 0)
+		roots := map[string]string{"default": idx.rootPath}
+		results, err := idx.semanticMgr.EnrichAll(idx.graph, roots)
+		if err != nil {
+			idx.logger.Warn("semantic enrichment failed", zap.Error(err))
+		} else if len(results) > 0 {
+			for _, r := range results {
+				idx.logger.Info("semantic enrichment result",
+					zap.String("provider", r.Provider),
+					zap.String("language", r.Language),
+					zap.Int("confirmed", r.EdgesConfirmed),
+					zap.Int("added", r.EdgesAdded),
+					zap.Int("refuted", r.EdgesRefuted),
+					zap.Float64("coverage", r.CoveragePercent),
+				)
+			}
+		}
+	}
+
+	reporter.Report("extracting contracts", 0, 0)
+	idx.extractGoModContracts(idx.pendingContractReg)
+	idx.extractDIContracts(idx.pendingContractReg)
+	idx.commitContracts(idx.pendingContractReg)
+	idx.pendingContractReg = nil
+}
 
 // RootPath returns the root path used for relative path computation.
 func (idx *Indexer) RootPath() string { return idx.rootPath }
@@ -641,31 +699,39 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (*IndexResult, er
 	idx.totalDetected = len(files)
 	idx.lastIndexTime = time.Now()
 
-	reporter.Report("resolving references", 0, 0)
-	// Resolve cross-file references.
-	idx.resolver.ResolveAll()
+	if idx.deferResolve {
+		// Multi-repo orchestrator runs these serially after wg.Wait()
+		// to avoid races on the shared graph between this goroutine's
+		// ResolveAll mutation phase and a sibling goroutine's contract
+		// pass walking AllEdges. See SetDeferResolve.
+		idx.pendingContractReg = contractReg
+	} else {
+		reporter.Report("resolving references", 0, 0)
+		// Resolve cross-file references.
+		idx.resolver.ResolveAll()
 
-	reporter.Report("inferring interfaces", 0, 0)
-	// Infer structural interface satisfaction.
-	idx.resolver.InferImplements()
+		reporter.Report("inferring interfaces", 0, 0)
+		// Infer structural interface satisfaction.
+		idx.resolver.InferImplements()
 
-	// Semantic enrichment (SCIP, go/types, LSP).
-	if idx.semanticMgr != nil && idx.semanticMgr.Enabled() && idx.semanticMgr.HasProviders() {
-		reporter.Report("semantic enrichment", 0, 0)
-		roots := map[string]string{"default": absRoot}
-		results, err := idx.semanticMgr.EnrichAll(idx.graph, roots)
-		if err != nil {
-			idx.logger.Warn("semantic enrichment failed", zap.Error(err))
-		} else if len(results) > 0 {
-			for _, r := range results {
-				idx.logger.Info("semantic enrichment result",
-					zap.String("provider", r.Provider),
-					zap.String("language", r.Language),
-					zap.Int("confirmed", r.EdgesConfirmed),
-					zap.Int("added", r.EdgesAdded),
-					zap.Int("refuted", r.EdgesRefuted),
-					zap.Float64("coverage", r.CoveragePercent),
-				)
+		// Semantic enrichment (SCIP, go/types, LSP).
+		if idx.semanticMgr != nil && idx.semanticMgr.Enabled() && idx.semanticMgr.HasProviders() {
+			reporter.Report("semantic enrichment", 0, 0)
+			roots := map[string]string{"default": absRoot}
+			results, err := idx.semanticMgr.EnrichAll(idx.graph, roots)
+			if err != nil {
+				idx.logger.Warn("semantic enrichment failed", zap.Error(err))
+			} else if len(results) > 0 {
+				for _, r := range results {
+					idx.logger.Info("semantic enrichment result",
+						zap.String("provider", r.Provider),
+						zap.String("language", r.Language),
+						zap.Int("confirmed", r.EdgesConfirmed),
+						zap.Int("added", r.EdgesAdded),
+						zap.Int("refuted", r.EdgesRefuted),
+						zap.Float64("coverage", r.CoveragePercent),
+					)
+				}
 			}
 		}
 	}
@@ -674,14 +740,16 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (*IndexResult, er
 	// Build search index.
 	idx.buildSearchIndex()
 
-	// Contracts were already extracted inline during parse (per file,
-	// per worker). Here we just finish up: run the go.mod extractor
-	// (not associated with any file node) and commit contract nodes /
-	// provides/consumes edges from the merged registry.
-	reporter.Report("extracting contracts", 0, 0)
-	idx.extractGoModContracts(contractReg)
-	idx.extractDIContracts(contractReg)
-	idx.commitContracts(contractReg)
+	if !idx.deferResolve {
+		// Contracts were already extracted inline during parse (per file,
+		// per worker). Here we just finish up: run the go.mod extractor
+		// (not associated with any file node) and commit contract nodes /
+		// provides/consumes edges from the merged registry.
+		reporter.Report("extracting contracts", 0, 0)
+		idx.extractGoModContracts(contractReg)
+		idx.extractDIContracts(contractReg)
+		idx.commitContracts(contractReg)
+	}
 
 	// Auto-upgrade to Bleve if above threshold. Run in the background
 	// so the foreground IndexCtx returns immediately — populating
