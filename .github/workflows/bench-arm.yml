@@ -42,7 +42,7 @@ jobs:
       - name: Compare with main (PR only)
         if: github.event_name == 'pull_request'
         run: |
-          go install golang.org/x/perf/cmd/benchstat@latest
+          go install golang.org/x/perf/cmd/benchstat@v0.0.0-20260409210113-8e83ce0f7b1c
           # Download baseline from main branch artifact if available
           echo "Benchmark results uploaded. Compare manually with benchstat."
 
