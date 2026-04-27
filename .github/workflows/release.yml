@@ -20,7 +20,7 @@ jobs:
     outputs:
       hashes: ${{ steps.hash.outputs.hashes }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           # goreleaser reads the tag list to build the changelog. Without
           # full history the changelog section will be empty or wrong.
@@ -30,7 +30,7 @@ jobs:
       # container) so keyless OIDC signing can use the runner's identity
       # token directly — no need to plumb ACTIONS_ID_TOKEN_REQUEST_* vars
       # through `docker run`.
-      - uses: sigstore/cosign-installer@v4.1.0
+      - uses: sigstore/cosign-installer@ba7bc0a3fef59531c69a25acd34668d6d3fe6f22 # v4.1.0
         with:
           cosign-release: v2.4.1
 
@@ -93,12 +93,12 @@ jobs:
       # artifacts. Append .sig + .pem files to the same release so
       # verification instructions in README point at a single URL set.
       - name: Upload signatures to release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
         with:
           files: |
             dist/*.sig
             dist/*.pem
-          # softprops/action-gh-release@v3 appends to an existing release
+          # softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3 appends to an existing release
           # when the tag already exists (it does — goreleaser made it a
           # moment ago). Never fail_on_unmatched_files here — a failed
           # signing step should surface as a signing error, not as a
@@ -128,7 +128,7 @@ jobs:
       actions: read
       id-token: write
       contents: write
-    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@f7dd8c54c2067bafc12ca7a55595d5ee9b75204a # v2.1.0
     with:
       base64-subjects: ${{ needs.release.outputs.hashes }}
       upload-assets: true
@@ -142,7 +142,7 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Download release assets
         env:
@@ -156,7 +156,7 @@ jobs:
             --pattern '*.apk'
 
       - name: VirusTotal scan + update release body
-        uses: crazy-max/ghaction-virustotal@v5
+        uses: crazy-max/ghaction-virustotal@936d8c5c00afe97d3d9a1af26d017cfdf26800a2 # v5
         with:
           vt_api_key: ${{ secrets.VT_API_KEY }}
           files: |
