@@ -210,6 +210,7 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 	var valueIdents []goDeferredValueIdent
 	var fieldValSels []goDeferredValueSel
 	var fieldValIdents []goDeferredValueIdent
+	var observabilityEvents []goObservabilityEvent
 	// writes buffers selector LHS of assignment / inc / dec
 	// statements. Emitted in the post-pass once funcRanges and tenv
 	// are settled so each EdgeWrites is attributed to its enclosing
@@ -249,13 +250,21 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 
 		case m.Captures["callm.expr"] != nil:
 			expr := m.Captures["callm.expr"]
+			method := m.Captures["callm.method"].Text
 			calls = append(calls, goDeferredCall{
-				method:     m.Captures["callm.method"].Text,
+				method:     method,
 				receiver:   m.Captures["callm.receiver"].Text,
 				line:       expr.StartLine + 1,
 				isSelector: true,
 				spawn:      isGoroutineSpawn(expr.Node),
 			})
+			if name, ok := detectGoLogEvent(expr.Node, method, src); ok {
+				observabilityEvents = append(observabilityEvents, goObservabilityEvent{
+					method: method,
+					name:   name,
+					line:   expr.StartLine + 1,
+				})
+			}
 
 		case m.Captures["var.def"] != nil:
 			e.emitVar(m, filePath, fileID, result, tenv)
@@ -451,6 +460,11 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 		result.Edges = append(result.Edges, edge)
 		emitGoSpawnEdge(c, callerID, target, filePath, result)
 	}
+
+	// --- Observability events ---
+	emitGoObservabilityEvents(observabilityEvents,
+		func(line int) string { return findEnclosingFunc(funcRanges, line) },
+		filePath, result)
 
 	// --- Composite literals (instantiations) ---
 	for _, r := range instantiates {

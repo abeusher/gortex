@@ -574,6 +574,39 @@ func (idx *Indexer) applyCoverageDomains(relPath, lang string, src []byte, resul
 	if idx.config.Coverage.IsEnabled("fixtures") {
 		applyFixtureClassification(relPath, lang, result)
 	}
+	if !idx.config.Coverage.IsEnabled("observability") {
+		stripObservabilityArtifacts(result)
+	}
+}
+
+// stripObservabilityArtifacts drops KindEvent nodes and EdgeEmits
+// edges when the observability coverage domain is gated off. Used
+// for the same reason as the function-shape and type-shape strips:
+// the language extractor always emits, and the indexer prunes
+// per-file before applyRepoPrefix so the gate stays a pure-config
+// dial without parser plumbing.
+func stripObservabilityArtifacts(result *parser.ExtractionResult) {
+	stripped := make(map[string]struct{})
+	keptNodes := result.Nodes[:0]
+	for _, n := range result.Nodes {
+		if n.Kind == graph.KindEvent {
+			stripped[n.ID] = struct{}{}
+			continue
+		}
+		keptNodes = append(keptNodes, n)
+	}
+	result.Nodes = keptNodes
+	keptEdges := result.Edges[:0]
+	for _, e := range result.Edges {
+		if e.Kind == graph.EdgeEmits {
+			continue
+		}
+		if _, ok := stripped[e.To]; ok {
+			continue
+		}
+		keptEdges = append(keptEdges, e)
+	}
+	result.Edges = keptEdges
 }
 
 // applyFixtureClassification reclassifies the language extractor's
