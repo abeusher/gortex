@@ -104,6 +104,25 @@ const qGoAll = `
       (selector_expression
         operand: (_) @fieldsel.receiver
         field: (field_identifier) @fieldsel.method))) @fieldsel.elem
+
+  ; Assignment LHS selector. EdgeWrites from the enclosing function
+  ; to the field. Covers plain "s.field = x" and "s.field += x".
+  (assignment_statement
+    left: (expression_list
+      (selector_expression
+        operand: (_) @assign.receiver
+        field: (field_identifier) @assign.field))) @assign.def
+
+  ; Inc/dec selector statements: s.field++ / s.field-- both write.
+  (inc_statement
+    (selector_expression
+      operand: (_) @incsel.receiver
+      field: (field_identifier) @incsel.field)) @incsel.def
+
+  (dec_statement
+    (selector_expression
+      operand: (_) @decsel.receiver
+      field: (field_identifier) @decsel.field)) @decsel.def
 ]
 `
 
@@ -186,6 +205,12 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 	var valueIdents []goDeferredValueIdent
 	var fieldValSels []goDeferredValueSel
 	var fieldValIdents []goDeferredValueIdent
+	// writes buffers selector LHS of assignment / inc / dec
+	// statements. Emitted in the post-pass once funcRanges and tenv
+	// are settled so each EdgeWrites is attributed to its enclosing
+	// function and (when known) carries the receiver type for the
+	// resolver to land on the right field node.
+	var writes []goDeferredValueSel
 
 	parser.EachMatch(e.qAll, root, src, func(m parser.QueryResult) {
 		switch {
@@ -304,6 +329,33 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 			fieldValIdents = append(fieldValIdents, goDeferredValueIdent{
 				name: m.Captures["fieldval.value"].Text,
 				line: elem.StartLine + 1,
+			})
+
+		case m.Captures["assign.def"] != nil:
+			def := m.Captures["assign.def"]
+			writes = append(writes, goDeferredValueSel{
+				field:    m.Captures["assign.field"].Text,
+				receiver: m.Captures["assign.receiver"].Text,
+				line:     def.StartLine + 1,
+				kind:     graph.EdgeWrites,
+			})
+
+		case m.Captures["incsel.def"] != nil:
+			def := m.Captures["incsel.def"]
+			writes = append(writes, goDeferredValueSel{
+				field:    m.Captures["incsel.field"].Text,
+				receiver: m.Captures["incsel.receiver"].Text,
+				line:     def.StartLine + 1,
+				kind:     graph.EdgeWrites,
+			})
+
+		case m.Captures["decsel.def"] != nil:
+			def := m.Captures["decsel.def"]
+			writes = append(writes, goDeferredValueSel{
+				field:    m.Captures["decsel.field"].Text,
+				receiver: m.Captures["decsel.receiver"].Text,
+				line:     def.StartLine + 1,
+				kind:     graph.EdgeWrites,
 			})
 
 		case m.Captures["fieldsel.elem"] != nil:
@@ -442,6 +494,26 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 		result.Edges = append(result.Edges, edge)
 	}
 
+	// Assignment / inc / dec selector LHS — EdgeWrites from the
+	// enclosing function to the assigned field. Same resolution path
+	// as the value-side selectors: the resolver lands on the field
+	// node when we know the receiver's type, otherwise the edge stays
+	// unresolved::*.field for downstream cleanup.
+	for _, v := range writes {
+		callerID := findEnclosingFunc(funcRanges, v.line)
+		if callerID == "" {
+			callerID = filePath
+		}
+		edge := &graph.Edge{
+			From: callerID, To: "unresolved::*." + v.field,
+			Kind: v.kind, FilePath: filePath, Line: v.line,
+		}
+		if recvType, ok := tenv[v.receiver]; ok {
+			edge.Meta = map[string]any{"receiver_type": recvType}
+		}
+		result.Edges = append(result.Edges, edge)
+	}
+
 	return result, nil
 }
 
@@ -537,12 +609,16 @@ func (e *GoExtractor) emitTypeDecl(m parser.QueryResult, filePath, fileID string
 		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
 		Language: "go",
 	}
+	isStruct := false
 	if body != nil && body.Node != nil && body.Node.Type() == "interface_type" {
 		node.Kind = graph.KindInterface
 		node.Meta = map[string]any{"methods": extractInterfaceMethods(body.Node, src)}
 	} else {
 		node.Kind = graph.KindType
 		node.Meta = map[string]any{}
+		if body != nil && body.Node != nil && body.Node.Type() == "struct_type" {
+			isStruct = true
+		}
 	}
 	if doc := ExtractDocAbove(src, def.StartLine, DocLangSlashSlash); doc != "" {
 		node.Meta["doc"] = doc
@@ -552,6 +628,146 @@ func (e *GoExtractor) emitTypeDecl(m parser.QueryResult, filePath, fileID string
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
 	})
+	if isStruct {
+		emitGoStructFields(body.Node, src, id, name, filePath, fileID, result)
+	}
+}
+
+// emitGoStructFields walks a struct_type node's field_declaration list
+// and emits one KindField node per declared field. Each field gets a
+// MemberOf edge to its owner type and a Defines edge from the file.
+// Embedded fields (anonymous struct/interface inclusion) emit a single
+// field node named after the embedded type.
+func emitGoStructFields(structNode *sitter.Node, src []byte, ownerID, ownerName, filePath, fileID string, result *parser.ExtractionResult) {
+	if structNode == nil {
+		return
+	}
+	var fieldList *sitter.Node
+	for i := 0; i < int(structNode.ChildCount()); i++ {
+		c := structNode.Child(i)
+		if c != nil && c.Type() == "field_declaration_list" {
+			fieldList = c
+			break
+		}
+	}
+	if fieldList == nil {
+		return
+	}
+	for i := 0; i < int(fieldList.NamedChildCount()); i++ {
+		decl := fieldList.NamedChild(i)
+		if decl == nil || decl.Type() != "field_declaration" {
+			continue
+		}
+		// Walk the field_declaration's children once: collect
+		// field_identifier names and the trailing type node. The
+		// grammar exposes both via ChildByFieldName, but real-world
+		// trees contain a mix of named/positional children for
+		// embedded vs explicit fields, so a manual walk is the
+		// reliable form.
+		var nameNodes []*sitter.Node
+		var typeNode *sitter.Node
+		for j := 0; j < int(decl.NamedChildCount()); j++ {
+			c := decl.NamedChild(j)
+			if c == nil {
+				continue
+			}
+			switch c.Type() {
+			case "field_identifier":
+				nameNodes = append(nameNodes, c)
+			case "type_identifier", "qualified_type", "pointer_type",
+				"generic_type", "slice_type", "array_type", "map_type",
+				"channel_type", "function_type", "interface_type",
+				"struct_type":
+				if typeNode == nil {
+					typeNode = c
+				}
+			}
+		}
+		var fieldType string
+		if typeNode != nil {
+			// Keep the verbatim type text — primitives ("string",
+			// "int", "[]byte", etc.) are valid field types and
+			// agents want to see them. normalizeGoTypeName drops
+			// primitives because it's tuned for receiver-type
+			// resolution; field metadata has different needs.
+			fieldType = strings.TrimSpace(typeNode.Content(src))
+		}
+		if len(nameNodes) > 0 {
+			for _, nm := range nameNodes {
+				emitGoFieldNode(decl, nm, nm.Content(src), fieldType, ownerID, ownerName, filePath, fileID, src, result)
+			}
+			continue
+		}
+		// Embedded field: type itself is the field name.
+		if typeNode != nil {
+			if fieldName := embeddedFieldName(typeNode, src); fieldName != "" {
+				emitGoFieldNode(decl, typeNode, fieldName, fieldType, ownerID, ownerName, filePath, fileID, src, result)
+			}
+		}
+	}
+}
+
+func emitGoFieldNode(decl, anchor *sitter.Node, fieldName, fieldType, ownerID, ownerName, filePath, fileID string, src []byte, result *parser.ExtractionResult) {
+	id := filePath + "::" + ownerName + "." + fieldName
+	startLine := int(anchor.StartPoint().Row) + 1
+	endLine := int(decl.EndPoint().Row) + 1
+	meta := map[string]any{
+		"receiver":   ownerName,
+		"visibility": VisibilityByCase(fieldName),
+	}
+	if fieldType != "" {
+		meta["field_type"] = fieldType
+	}
+	if doc := ExtractDocAbove(src, int(anchor.StartPoint().Row), DocLangSlashSlash); doc != "" {
+		meta["doc"] = doc
+	}
+	result.Nodes = append(result.Nodes, &graph.Node{
+		ID: id, Kind: graph.KindField, Name: fieldName,
+		FilePath: filePath, StartLine: startLine, EndLine: endLine,
+		Language: "go", Meta: meta,
+	})
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: startLine,
+	})
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: id, To: ownerID, Kind: graph.EdgeMemberOf, FilePath: filePath, Line: startLine,
+	})
+}
+
+// embeddedFieldName returns the trailing identifier of a Go embedded
+// field type. Strips one leading `*` for pointer-embedded fields and
+// drops the package qualifier. Returns "" when no identifier is found.
+func embeddedFieldName(typeNode *sitter.Node, src []byte) string {
+	if typeNode == nil {
+		return ""
+	}
+	switch typeNode.Type() {
+	case "type_identifier":
+		return typeNode.Content(src)
+	case "pointer_type":
+		// Recurse into the pointed-to type.
+		for i := 0; i < int(typeNode.NamedChildCount()); i++ {
+			if n := embeddedFieldName(typeNode.NamedChild(i), src); n != "" {
+				return n
+			}
+		}
+	case "qualified_type":
+		// pkg.Foo — take the trailing identifier.
+		for i := int(typeNode.NamedChildCount()) - 1; i >= 0; i-- {
+			c := typeNode.NamedChild(i)
+			if c != nil && c.Type() == "type_identifier" {
+				return c.Content(src)
+			}
+		}
+	case "generic_type":
+		// Foo[T] — name is the inner type_identifier.
+		for i := 0; i < int(typeNode.NamedChildCount()); i++ {
+			if n := embeddedFieldName(typeNode.NamedChild(i), src); n != "" {
+				return n
+			}
+		}
+	}
+	return ""
 }
 
 func (e *GoExtractor) emitTypeAlias(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool) {

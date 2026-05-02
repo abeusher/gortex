@@ -572,3 +572,171 @@ func edgesOfKind(edges []*graph.Edge, kind graph.EdgeKind) []*graph.Edge {
 	}
 	return out
 }
+
+func TestGoExtractor_StructFieldNodes(t *testing.T) {
+	src := []byte(`package main
+
+// User holds the basics.
+type User struct {
+	// Name is the public name.
+	Name string
+	age  int
+	*Base
+	pkg.Embedded
+}
+
+type Base struct{}
+`)
+	e := NewGoExtractor()
+	result, err := e.Extract("user.go", src)
+	require.NoError(t, err)
+
+	byID := map[string]*graph.Node{}
+	for _, n := range result.Nodes {
+		byID[n.ID] = n
+	}
+
+	name := byID["user.go::User.Name"]
+	require.NotNil(t, name)
+	assert.Equal(t, graph.KindField, name.Kind)
+	assert.Equal(t, "public", name.Meta["visibility"])
+	assert.Equal(t, "string", name.Meta["field_type"])
+	assert.Equal(t, "Name is the public name.", name.Meta["doc"])
+
+	age := byID["user.go::User.age"]
+	require.NotNil(t, age)
+	assert.Equal(t, "package", age.Meta["visibility"])
+	assert.Equal(t, "int", age.Meta["field_type"])
+
+	// Embedded pointer field — name is "Base".
+	base := byID["user.go::User.Base"]
+	require.NotNil(t, base, "embedded pointer field Base missing")
+
+	// Qualified embedded field — name is "Embedded".
+	emb := byID["user.go::User.Embedded"]
+	require.NotNil(t, emb, "qualified embedded field Embedded missing")
+
+	// MemberOf edges should hop field → owner type.
+	memberOf := edgesOfKind(result.Edges, graph.EdgeMemberOf)
+	hasNameToUser := false
+	for _, edge := range memberOf {
+		if edge.From == "user.go::User.Name" && edge.To == "user.go::User" {
+			hasNameToUser = true
+		}
+	}
+	if !hasNameToUser {
+		t.Fatalf("missing MemberOf edge User.Name → User")
+	}
+}
+
+func TestGoExtractor_FieldWrites(t *testing.T) {
+	src := []byte(`package main
+
+type Server struct {
+	port int
+	addr string
+}
+
+func (s *Server) SetPort(p int) {
+	s.port = p
+	s.addr += "x"
+	s.port++
+}
+`)
+	e := NewGoExtractor()
+	result, err := e.Extract("server.go", src)
+	require.NoError(t, err)
+
+	writes := edgesOfKind(result.Edges, graph.EdgeWrites)
+	if len(writes) < 3 {
+		t.Fatalf("expected ≥3 EdgeWrites (one per LHS selector), got %d", len(writes))
+	}
+	// All writes should originate from SetPort.
+	for _, w := range writes {
+		if w.From != "server.go::Server.SetPort" {
+			t.Errorf("unexpected EdgeWrites source %q (want SetPort)", w.From)
+		}
+	}
+	// Writes target the unresolved field path; the resolver
+	// post-pass lands them on the field node.
+	hasPort, hasAddr := false, false
+	for _, w := range writes {
+		if w.To == "unresolved::*.port" {
+			hasPort = true
+		}
+		if w.To == "unresolved::*.addr" {
+			hasAddr = true
+		}
+	}
+	if !hasPort {
+		t.Fatalf("expected EdgeWrites → unresolved::*.port")
+	}
+	if !hasAddr {
+		t.Fatalf("expected EdgeWrites → unresolved::*.addr")
+	}
+}
+
+func TestGoExtractor_FieldWrites_TrackedReceiver(t *testing.T) {
+	src := []byte(`package main
+
+type Cfg struct{ port int }
+
+func main() {
+	c := Cfg{port: 8080}
+	c.port = 9090
+}
+`)
+	e := NewGoExtractor()
+	result, err := e.Extract("main.go", src)
+	require.NoError(t, err)
+
+	writes := edgesOfKind(result.Edges, graph.EdgeWrites)
+	require.GreaterOrEqual(t, len(writes), 1)
+	hasReceiverType := false
+	for _, w := range writes {
+		if rt, _ := w.Meta["receiver_type"].(string); rt == "Cfg" {
+			hasReceiverType = true
+		}
+	}
+	if !hasReceiverType {
+		t.Fatalf("expected EdgeWrites with receiver_type=Cfg when receiver is tenv-tracked")
+	}
+}
+
+func TestGoExtractor_FieldWrites_ResolveAfterIndex(t *testing.T) {
+	// Verifies the extractor + indexer + resolver chain: a write to
+	// `c.port` lands on the field node when the receiver type is
+	// known to the type env.
+	src := []byte(`package main
+
+type Cfg struct{ port int }
+
+func main() {
+	c := Cfg{port: 8080}
+	c.port = 9090
+}
+`)
+	e := NewGoExtractor()
+	result, err := e.Extract("main.go", src)
+	require.NoError(t, err)
+
+	// Field node should exist.
+	var fieldID string
+	for _, n := range result.Nodes {
+		if n.Kind == graph.KindField && n.Name == "port" {
+			fieldID = n.ID
+		}
+	}
+	if fieldID != "main.go::Cfg.port" {
+		t.Fatalf("expected field node main.go::Cfg.port, got %q", fieldID)
+	}
+
+	// Write edge should be unresolved at extraction time and carry
+	// receiver_type=Cfg (set from tenv).
+	writes := edgesOfKind(result.Edges, graph.EdgeWrites)
+	require.Len(t, writes, 1)
+	if rt, _ := writes[0].Meta["receiver_type"].(string); rt != "Cfg" {
+		t.Fatalf("expected receiver_type=Cfg, got %q", rt)
+	}
+	assert.Equal(t, "unresolved::*.port", writes[0].To)
+}

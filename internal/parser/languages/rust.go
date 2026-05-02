@@ -590,13 +590,23 @@ func (e *RustExtractor) emitField(m parser.QueryResult, filePath string, src []b
 	fieldName := m.Captures["field.name"].Text
 	structID := filePath + "::" + structName
 	fieldID := structID + "." + fieldName
+	meta := map[string]any{
+		"receiver":   structName,
+		"visibility": rustVisibility(def.Node, src),
+	}
+	if t := def.Node.ChildByFieldName("type"); t != nil {
+		meta["field_type"] = strings.TrimSpace(t.Content(src))
+	}
+	if doc := ExtractDocAbove(src, def.StartLine, DocLangSlashSlash); doc != "" {
+		meta["doc"] = doc
+	}
 	result.Nodes = append(result.Nodes, &graph.Node{
-		ID: fieldID, Kind: graph.KindVariable, Name: fieldName,
+		ID: fieldID, Kind: graph.KindField, Name: fieldName,
 		FilePath:  filePath,
 		StartLine: def.StartLine + 1,
 		EndLine:   def.EndLine + 1,
 		Language:  "rust",
-		Meta:      map[string]any{"receiver": structName, "kind": "struct_field"},
+		Meta:      meta,
 	})
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: fieldID, To: structID, Kind: graph.EdgeMemberOf,

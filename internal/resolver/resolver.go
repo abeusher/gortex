@@ -293,6 +293,16 @@ func (r *Resolver) resolveEdge(e *graph.Edge, stats *ResolveStats) (oldTo string
 		// the full import path + symbol so we don't have to guess a
 		// receiver type.
 		r.resolveExtern(e, strings.TrimPrefix(target, "extern::"), stats)
+	case strings.HasPrefix(target, "*.") && (e.Kind == graph.EdgeWrites || e.Kind == graph.EdgeReads):
+		// Field write/read: prefer a KindField candidate whose
+		// receiver matches the edge's receiver_type hint. Falls back
+		// to the method-resolution path when no field candidate
+		// lands — gives degraded-but-useful behaviour for graphs
+		// where the field-node pass hasn't caught up yet.
+		fieldName := strings.TrimPrefix(target, "*.")
+		if !r.resolveFieldRef(e, fieldName, stats) {
+			r.resolveMethodCall(e, fieldName, stats)
+		}
 	case strings.HasPrefix(target, "*."):
 		// Method call or method-value reference (e.g. h.handleHealth)
 		r.resolveMethodCall(e, strings.TrimPrefix(target, "*."), stats)
@@ -564,6 +574,70 @@ func (r *Resolver) resolveTypeOrFunc(e *graph.Edge, name string, stats *ResolveS
 	}
 
 	stats.Unresolved++
+}
+
+// resolveFieldRef lands an EdgeWrites/EdgeReads edge on a KindField
+// node when the receiver type is known. Returns true when a field
+// candidate was picked — caller falls back to method resolution
+// otherwise (handles cases where the extractor labelled the edge as a
+// write but the runtime target is actually a method/property).
+func (r *Resolver) resolveFieldRef(e *graph.Edge, fieldName string, stats *ResolveStats) bool {
+	receiverType := edgeReceiverType(e)
+	candidates := r.graph.FindNodesByName(fieldName)
+	if len(candidates) == 0 {
+		return false
+	}
+	callerDir := filepath.Dir(e.FilePath)
+
+	// Pass 1: same-directory + exact-receiver-type field.
+	if receiverType != "" {
+		for _, c := range candidates {
+			if c.Kind == graph.KindField &&
+				filepath.Dir(c.FilePath) == callerDir &&
+				nodeReceiverType(c) == receiverType {
+				e.To = c.ID
+				e.Confidence = 0.95
+				stats.Resolved++
+				return true
+			}
+		}
+		// Pass 2: exact-receiver-type field, any directory.
+		for _, c := range candidates {
+			if c.Kind == graph.KindField && nodeReceiverType(c) == receiverType {
+				e.To = c.ID
+				e.Confidence = 0.85
+				stats.Resolved++
+				return true
+			}
+		}
+	}
+
+	// Pass 3: caller is a method on type T, prefer a same-T field.
+	if callerNode := r.graph.GetNode(e.From); callerNode != nil && callerNode.Kind == graph.KindMethod {
+		callerRecv := nodeReceiverType(callerNode)
+		if callerRecv != "" {
+			for _, c := range candidates {
+				if c.Kind == graph.KindField && nodeReceiverType(c) == callerRecv {
+					e.To = c.ID
+					e.Confidence = 0.85
+					stats.Resolved++
+					return true
+				}
+			}
+		}
+	}
+
+	// Pass 4: same-directory field of any owner type — last resort
+	// before falling through to method resolution.
+	for _, c := range candidates {
+		if c.Kind == graph.KindField && filepath.Dir(c.FilePath) == callerDir {
+			e.To = c.ID
+			e.Confidence = 0.6
+			stats.Resolved++
+			return true
+		}
+	}
+	return false
 }
 
 func (r *Resolver) resolveMethodCall(e *graph.Edge, methodName string, stats *ResolveStats) {

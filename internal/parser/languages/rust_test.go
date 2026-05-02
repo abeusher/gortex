@@ -77,7 +77,7 @@ func TestRsExtractor_StructFields(t *testing.T) {
 
 	fields := map[string]bool{}
 	for _, n := range result.Nodes {
-		if n.Kind == graph.KindVariable && n.Meta != nil && n.Meta["kind"] == "struct_field" {
+		if n.Kind == graph.KindField {
 			fields[n.Name] = true
 		}
 	}

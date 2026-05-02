@@ -51,6 +51,20 @@ const (
 	// layout — false positives are an acknowledged tradeoff (see
 	// spec-graph-detail.md §4.4 for the heuristic catalogue).
 	EdgeTests EdgeKind = "tests"
+	// EdgeReads / EdgeWrites split EdgeReferences for value-side uses
+	// of variables and fields. LHS of an assignment / op= / ++ / --
+	// emits EdgeWrites; every other identifier or selector use emits
+	// EdgeReads. EdgeReferences is reserved for type references
+	// (`var x SomeType` references the type SomeType) so the resolver
+	// can keep distinguishing the two by target node kind.
+	//
+	// Together with KindField, these let agents ask "which functions
+	// write to this field" — impossible with the previous "any use is
+	// a reference" model. Implemented per-language as the Go/TS/
+	// Python (priority wave) and Rust/Java (second wave) extractors
+	// learn to walk assignment AST nodes.
+	EdgeReads  EdgeKind = "reads"
+	EdgeWrites EdgeKind = "writes"
 )
 
 type Edge struct {

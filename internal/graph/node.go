@@ -12,12 +12,22 @@ const (
 	KindVariable  NodeKind = "variable"
 	KindImport    NodeKind = "import"
 	KindContract  NodeKind = "contract"
+	// KindField represents a struct field, class property, or record
+	// field — anything addressable as `owner.field`. ID convention:
+	// `<file>::<owner>.<field>`. EdgeMemberOf links the field to its
+	// owning type. Languages that already emitted class properties as
+	// KindVariable (TypeScript, PHP) keep doing so for backwards
+	// compatibility — KindField is reserved for languages that
+	// previously emitted only type-ref edges from fields (Go, Rust,
+	// Java, C#).
+	KindField NodeKind = "field"
 )
 
 var validNodeKinds = map[NodeKind]bool{
 	KindFile: true, KindPackage: true, KindFunction: true,
 	KindMethod: true, KindType: true, KindInterface: true,
 	KindVariable: true, KindImport: true, KindContract: true,
+	KindField: true,
 }
 
 type Node struct {

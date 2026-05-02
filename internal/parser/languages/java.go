@@ -594,10 +594,21 @@ func (e *JavaExtractor) emitField(m parser.QueryResult, filePath, fileID string,
 		return
 	}
 	seen[id] = true
+	meta := map[string]any{
+		"receiver":   className,
+		"visibility": javaVisibility(def.Node, src, VisibilityPackage),
+	}
+	if t := def.Node.ChildByFieldName("type"); t != nil {
+		meta["field_type"] = strings.TrimSpace(t.Content(src))
+	}
+	if doc := ExtractDocAbove(src, def.StartLine, DocLangBlockStar); doc != "" {
+		meta["doc"] = doc
+	}
 	result.Nodes = append(result.Nodes, &graph.Node{
-		ID: id, Kind: graph.KindVariable, Name: name,
+		ID: id, Kind: graph.KindField, Name: name,
 		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
 		Language: "java",
+		Meta:     meta,
 	})
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,

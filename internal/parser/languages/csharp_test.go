@@ -110,8 +110,8 @@ public struct Point {
 	assert.Contains(t, names, "Point")
 
 	// Struct fields should be extracted.
-	vars := nodesOfKind(result.Nodes, graph.KindVariable)
-	assert.Len(t, vars, 2)
+	fields := nodesOfKind(result.Nodes, graph.KindField)
+	assert.Len(t, fields, 2)
 
 	memberEdges := edgesOfKind(result.Edges, graph.EdgeMemberOf)
 	assert.Len(t, memberEdges, 2)

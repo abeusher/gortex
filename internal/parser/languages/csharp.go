@@ -500,10 +500,21 @@ func (e *CSharpExtractor) emitField(m parser.QueryResult, filePath, fileID strin
 		return
 	}
 	seen[id] = true
+	meta := map[string]any{
+		"receiver":   owner.name,
+		"visibility": csharpVisibility(def.Node, src, VisibilityPrivate),
+	}
+	if t := def.Node.ChildByFieldName("type"); t != nil {
+		meta["field_type"] = strings.TrimSpace(t.Content(src))
+	}
+	if doc := extractCSharpDoc(src, def.StartLine); doc != "" {
+		meta["doc"] = doc
+	}
 	result.Nodes = append(result.Nodes, &graph.Node{
-		ID: id, Kind: graph.KindVariable, Name: name,
+		ID: id, Kind: graph.KindField, Name: name,
 		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
 		Language: "csharp",
+		Meta:     meta,
 	})
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
@@ -526,10 +537,22 @@ func (e *CSharpExtractor) emitProperty(m parser.QueryResult, filePath, fileID st
 		return
 	}
 	seen[id] = true
+	meta := map[string]any{
+		"receiver":   owner.name,
+		"visibility": csharpVisibility(def.Node, src, VisibilityPrivate),
+		"kind":       "property",
+	}
+	if t := def.Node.ChildByFieldName("type"); t != nil {
+		meta["field_type"] = strings.TrimSpace(t.Content(src))
+	}
+	if doc := extractCSharpDoc(src, def.StartLine); doc != "" {
+		meta["doc"] = doc
+	}
 	result.Nodes = append(result.Nodes, &graph.Node{
-		ID: id, Kind: graph.KindVariable, Name: name,
+		ID: id, Kind: graph.KindField, Name: name,
 		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
 		Language: "csharp",
+		Meta:     meta,
 	})
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
