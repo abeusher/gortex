@@ -843,9 +843,11 @@ func (e *GoExtractor) emitTypeDecl(m parser.QueryResult, filePath, fileID string
 		Language: "go",
 	}
 	isStruct := false
+	isInterface := false
 	if body != nil && body.Node != nil && body.Node.Type() == "interface_type" {
 		node.Kind = graph.KindInterface
 		node.Meta = map[string]any{"methods": extractInterfaceMethods(body.Node, src)}
+		isInterface = true
 	} else {
 		node.Kind = graph.KindType
 		node.Meta = map[string]any{}
@@ -864,6 +866,51 @@ func (e *GoExtractor) emitTypeDecl(m parser.QueryResult, filePath, fileID string
 	if isStruct {
 		emitGoStructFields(body.Node, src, id, name, filePath, fileID, result)
 	}
+	if isInterface {
+		for _, embed := range extractEmbeddedInterfaceTypes(body.Node, src) {
+			result.Edges = append(result.Edges, &graph.Edge{
+				From:     id,
+				To:       "unresolved::" + embed,
+				Kind:     graph.EdgeComposes,
+				FilePath: filePath,
+				Line:     def.StartLine + 1,
+				Origin:   graph.OriginASTInferred,
+			})
+		}
+	}
+	// Newtype `type X Y` where Y is a named type produces an
+	// EdgeExtends so blast-radius walks catch the dependency. Struct
+	// and interface bodies don't get an extends edge — their member
+	// fields/methods carry the reference set instead.
+	if !isStruct && body != nil && body.Node != nil {
+		if isExtendsNewtypeBody(body.Node.Type()) {
+			if target := canonicalizeGoTypeRef(body.Text); target != "" {
+				result.Edges = append(result.Edges, &graph.Edge{
+					From:     id,
+					To:       "unresolved::" + target,
+					Kind:     graph.EdgeExtends,
+					FilePath: filePath,
+					Line:     def.StartLine + 1,
+					Origin:   graph.OriginASTInferred,
+				})
+			}
+		}
+	}
+}
+
+// isExtendsNewtypeBody reports whether a type_spec body's AST node
+// is a named-type reference that should produce an EdgeExtends edge.
+// Composite anonymous bodies (struct_type / interface_type / map_type
+// / func_type) are excluded — their member set carries the
+// references; emitting an extends edge to "anonymous" provides no
+// additional signal.
+func isExtendsNewtypeBody(t string) bool {
+	switch t {
+	case "type_identifier", "qualified_type", "pointer_type",
+		"slice_type", "array_type", "channel_type", "generic_type":
+		return true
+	}
+	return false
 }
 
 // emitGoStructFields walks a struct_type node's field_declaration list
@@ -935,6 +982,20 @@ func emitGoStructFields(structNode *sitter.Node, src []byte, ownerID, ownerName,
 		if typeNode != nil {
 			if fieldName := embeddedFieldName(typeNode, src); fieldName != "" {
 				emitGoFieldNode(decl, typeNode, fieldName, fieldType, ownerID, ownerName, filePath, fileID, src, result)
+				// Composition signal: the owning type embeds another
+				// type. Distinct from EdgeExtends (newtype) and from
+				// the field's MemberOf — gives blast-radius walks
+				// "what types are composed into X" in one hop.
+				if target := canonicalizeGoTypeRef(fieldType); target != "" {
+					result.Edges = append(result.Edges, &graph.Edge{
+						From:     ownerID,
+						To:       "unresolved::" + target,
+						Kind:     graph.EdgeComposes,
+						FilePath: filePath,
+						Line:     int(typeNode.StartPoint().Row) + 1,
+						Origin:   graph.OriginASTInferred,
+					})
+				}
 			}
 		}
 	}
@@ -1015,7 +1076,12 @@ func (e *GoExtractor) emitTypeAlias(m parser.QueryResult, filePath, fileID strin
 		ID: id, Kind: graph.KindType, Name: name,
 		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
 		Language: "go",
-		Meta:     map[string]any{},
+		Meta: map[string]any{
+			// Mark this node as an alias so consumers can scope queries
+			// without inspecting the edge set. Newtypes get no flag —
+			// the absence is the signal.
+			"alias": true,
+		},
 	}
 	if doc := ExtractDocAbove(src, def.StartLine, DocLangSlashSlash); doc != "" {
 		node.Meta["doc"] = doc
@@ -1025,6 +1091,22 @@ func (e *GoExtractor) emitTypeAlias(m parser.QueryResult, filePath, fileID strin
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
 	})
+	// EdgeAliases captures the `type X = Y` relationship distinctly
+	// from EdgeExtends (newtype). Renaming Y is a no-op for X's
+	// callers in the alias case but breaks promoted method sets in
+	// the newtype case — agents need to distinguish.
+	if aliasType, ok := m.Captures["alias.type"]; ok && aliasType != nil {
+		if target := canonicalizeGoTypeRef(aliasType.Text); target != "" {
+			result.Edges = append(result.Edges, &graph.Edge{
+				From:     id,
+				To:       "unresolved::" + target,
+				Kind:     graph.EdgeAliases,
+				FilePath: filePath,
+				Line:     def.StartLine + 1,
+				Origin:   graph.OriginASTInferred,
+			})
+		}
+	}
 }
 
 // emitImport records an import edge and populates the alias→path map
@@ -1324,6 +1406,47 @@ func extractInterfaceMethods(ifaceNode *sitter.Node, src []byte) []string {
 		}
 	}
 	return methods
+}
+
+// extractEmbeddedInterfaceTypes walks the children of an
+// interface_type node and returns the canonicalised names of
+// embedded interface references. The Go grammar wraps embedded
+// interfaces and type-set elements inside `type_elem` nodes; older
+// grammar versions (and gofmt edge cases) sometimes inline the bare
+// type_identifier / qualified_type directly. Both shapes are
+// accepted so EdgeComposes is emitted regardless of which the
+// grammar produces.
+func extractEmbeddedInterfaceTypes(ifaceNode *sitter.Node, src []byte) []string {
+	var out []string
+	visit := func(n *sitter.Node) {
+		if n == nil {
+			return
+		}
+		switch n.Type() {
+		case "type_identifier", "qualified_type", "generic_type":
+			if t := canonicalizeGoTypeRef(n.Content(src)); t != "" {
+				out = append(out, t)
+			}
+		}
+	}
+	for i := 0; i < int(ifaceNode.NamedChildCount()); i++ {
+		child := ifaceNode.NamedChild(i)
+		if child == nil {
+			continue
+		}
+		switch child.Type() {
+		case "type_elem":
+			// Modern grammar: each embedded type is one type_elem
+			// child. The named child of type_elem is the type
+			// reference itself.
+			for j := 0; j < int(child.NamedChildCount()); j++ {
+				visit(child.NamedChild(j))
+			}
+		case "type_identifier", "qualified_type", "generic_type":
+			visit(child)
+		}
+	}
+	return out
 }
 
 func captureText(c *parser.CapturedNode) string {

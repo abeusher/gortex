@@ -540,6 +540,27 @@ func (idx *Indexer) applyCoverageDomains(relPath, lang string, src []byte, resul
 	if !idx.config.Coverage.IsEnabled("function_shape") {
 		stripFunctionShape(result)
 	}
+	if !idx.config.Coverage.IsEnabled("type_shape") {
+		stripTypeShape(result)
+	}
+}
+
+// stripTypeShape removes the alias / composition edges introduced
+// by the type_shape coverage domain (EdgeAliases, EdgeComposes).
+// EdgeExtends is left in place — it's an existing edge kind whose
+// newtype-derived emissions fall under the spec's "EdgeExtends
+// continues to mean newtype / inheritance / interface extension"
+// guarantee, not a new domain signal.
+func stripTypeShape(result *parser.ExtractionResult) {
+	keptEdges := result.Edges[:0]
+	for _, e := range result.Edges {
+		switch e.Kind {
+		case graph.EdgeAliases, graph.EdgeComposes:
+			continue
+		}
+		keptEdges = append(keptEdges, e)
+	}
+	result.Edges = keptEdges
 }
 
 // stripFunctionShape removes the param/closure/generic_param nodes
