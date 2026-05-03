@@ -3,6 +3,7 @@ package indexer
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -14,20 +15,20 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/zzet/gortex/internal/codegen"
+	"github.com/zzet/gortex/internal/codeowners"
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/contracts"
 	"github.com/zzet/gortex/internal/embedding"
 	"github.com/zzet/gortex/internal/excludes"
+	"github.com/zzet/gortex/internal/fixtures"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/licenses"
+	"github.com/zzet/gortex/internal/modules"
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/progress"
 	"github.com/zzet/gortex/internal/resolver"
 	"github.com/zzet/gortex/internal/search"
-	"github.com/zzet/gortex/internal/codegen"
-	"github.com/zzet/gortex/internal/codeowners"
-	"github.com/zzet/gortex/internal/fixtures"
-	"github.com/zzet/gortex/internal/licenses"
-	"github.com/zzet/gortex/internal/modules"
 	"github.com/zzet/gortex/internal/semantic"
 	"github.com/zzet/gortex/internal/todos"
 )
@@ -2485,27 +2486,62 @@ func (idx *Indexer) extractExternalModules() {
 	if !idx.config.Coverage.IsEnabled("modules") {
 		return
 	}
-	goModPath := filepath.Join(idx.rootPath, "go.mod")
-	src, err := os.ReadFile(goModPath)
+	// Walk known manifest formats at the repo root. Each manifest
+	// produces an independent Spec list and gets its own synthetic
+	// file node — the file→module edge stays scoped to the
+	// originating manifest so cross-ecosystem queries (e.g. "what
+	// does package.json declare") don't bleed into go.mod's
+	// answer.
+	manifests := []struct {
+		path           string
+		parse          func([]byte) []modules.Spec
+		ownPathFromSrc func([]byte) string
+	}{
+		{
+			path:           "go.mod",
+			parse:          modules.ParseGoMod,
+			ownPathFromSrc: readGoModModulePath,
+		},
+		{
+			path:           "package.json",
+			parse:          modules.ParsePackageJSON,
+			ownPathFromSrc: readPackageJSONOwnName,
+		},
+	}
+
+	for _, m := range manifests {
+		idx.extractOneModuleManifest(m.path, m.parse, m.ownPathFromSrc)
+	}
+}
+
+// extractOneModuleManifest reads a single manifest file from the
+// repo root, parses it via the supplied parser, and writes the
+// resulting nodes/edges + import-link edges into the graph. Used
+// from extractExternalModules's per-manifest dispatch.
+func (idx *Indexer) extractOneModuleManifest(relPath string, parse func([]byte) []modules.Spec, ownPathFromSrc func([]byte) string) {
+	manifestAbs := filepath.Join(idx.rootPath, relPath)
+	src, err := os.ReadFile(manifestAbs)
 	if err != nil {
 		return
 	}
-	relPath := "go.mod"
-	specs := modules.ParseGoMod(src)
+	specs := parse(src)
 	nodes, edges := modules.BuildGraphArtifacts(relPath, specs)
 	if len(nodes) == 0 && len(edges) == 0 {
 		return
 	}
-	// Synthetic file node for go.mod — it isn't represented through
-	// the language-extractor pipeline (no extractor is registered for
-	// the .mod extension), so the EdgeDependsOnModule edges would
-	// otherwise dangle from a missing source endpoint.
+	// Synthetic file node for the manifest — it isn't represented
+	// through the language-extractor pipeline (no extractor is
+	// registered for the .mod extension; package.json may have one
+	// but the JSON walker doesn't emit a synthetic file node we
+	// can reuse), so the EdgeDependsOnModule edges would otherwise
+	// dangle from a missing source endpoint after applyRepoPrefix
+	// runs in multi-repo mode.
 	manifestNode := &graph.Node{
 		ID:       relPath,
 		Kind:     graph.KindFile,
 		Name:     filepath.Base(relPath),
 		FilePath: relPath,
-		Language: "go",
+		Language: manifestLanguage(relPath),
 	}
 	allNodes := append([]*graph.Node{manifestNode}, nodes...)
 	idx.applyRepoPrefix(allNodes, edges)
@@ -2518,12 +2554,43 @@ func (idx *Indexer) extractExternalModules() {
 
 	// Connect each KindImport node to its matching module via
 	// longest-prefix path resolution. Repo-internal imports (the
-	// indexed module's own path) are filtered inside LinkImports.
-	// The own-module path is read straight from go.mod's `module`
-	// directive — when missing, the filter is a no-op which is
-	// safe (no own-module imports to match against).
-	ownModulePath := readGoModModulePath(src)
+	// own-module path) are filtered inside LinkImports — when the
+	// manifest doesn't expose an own-name, the filter is a no-op
+	// which is safe (no own-module imports to match against).
+	var ownModulePath string
+	if ownPathFromSrc != nil {
+		ownModulePath = ownPathFromSrc(src)
+	}
 	modules.LinkImports(idx.graph, specs, ownModulePath)
+}
+
+// manifestLanguage returns the language tag stamped on a manifest's
+// synthetic file node. Used purely for Brief listings — the kind
+// field carries the structural type.
+func manifestLanguage(relPath string) string {
+	switch filepath.Base(relPath) {
+	case "go.mod":
+		return "go"
+	case "package.json":
+		return "json"
+	}
+	return ""
+}
+
+// readPackageJSONOwnName extracts the manifest's `name` field — the
+// npm equivalent of go.mod's `module` directive. Returns "" on
+// missing or malformed JSON; LinkImports treats "" as "no own-
+// module filter", which is safe because internal-package matches
+// (e.g. workspaces) won't accidentally collide with external deps
+// at the longest-prefix scan.
+func readPackageJSONOwnName(src []byte) string {
+	var manifest struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(src, &manifest); err != nil {
+		return ""
+	}
+	return manifest.Name
 }
 
 // readGoModModulePath extracts the `module ` directive value from

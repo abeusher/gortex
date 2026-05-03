@@ -126,6 +126,81 @@ func TestBuildGraphArtifacts(t *testing.T) {
 	}
 }
 
+func TestParsePackageJSON_AllBlocks(t *testing.T) {
+	src := []byte(`{
+  "name": "my-app",
+  "version": "1.0.0",
+  "dependencies": {
+    "react": "^18.2.0",
+    "lodash": "4.17.21"
+  },
+  "devDependencies": {
+    "vitest": "^1.0.0"
+  },
+  "peerDependencies": {
+    "next": ">=13.0.0"
+  },
+  "optionalDependencies": {
+    "fsevents": "^2.3.0"
+  }
+}`)
+	specs := ParsePackageJSON(src)
+	if len(specs) != 5 {
+		t.Fatalf("expected 5 specs, got %d: %+v", len(specs), specs)
+	}
+
+	got := map[string]Spec{}
+	for _, s := range specs {
+		got[s.Path] = s
+		if s.Ecosystem != "npm" {
+			t.Errorf("ecosystem = %q for %q", s.Ecosystem, s.Path)
+		}
+	}
+	if got["react"].Version != "^18.2.0" {
+		t.Errorf("react version = %q", got["react"].Version)
+	}
+	if got["react"].Indirect {
+		t.Errorf("react should NOT be indirect (production dep)")
+	}
+	if !got["vitest"].Indirect || got["vitest"].Replace != "dev" {
+		t.Errorf("vitest should be dev-indirect: %+v", got["vitest"])
+	}
+	if got["next"].Replace != "peer" {
+		t.Errorf("next.Replace = %q", got["next"].Replace)
+	}
+	if got["fsevents"].Replace != "optional" {
+		t.Errorf("fsevents.Replace = %q", got["fsevents"].Replace)
+	}
+}
+
+func TestParsePackageJSON_Empty(t *testing.T) {
+	if got := ParsePackageJSON(nil); got != nil {
+		t.Errorf("nil input → nil specs")
+	}
+	if got := ParsePackageJSON([]byte("{}")); len(got) != 0 {
+		t.Errorf("empty manifest → empty specs")
+	}
+}
+
+func TestParsePackageJSON_Malformed(t *testing.T) {
+	if got := ParsePackageJSON([]byte("not json")); got != nil {
+		t.Errorf("malformed input → nil")
+	}
+}
+
+func TestParsePackageJSON_StableOrder(t *testing.T) {
+	// JSON map iteration is randomised — our packageJSONBlock
+	// helper sorts within each block to keep tests deterministic.
+	src := []byte(`{"dependencies": {"zoo": "1.0", "alpha": "2.0", "beta": "3.0"}}`)
+	specs := ParsePackageJSON(src)
+	if len(specs) != 3 {
+		t.Fatalf("expected 3, got %d", len(specs))
+	}
+	if specs[0].Path != "alpha" || specs[1].Path != "beta" || specs[2].Path != "zoo" {
+		t.Errorf("not alphabetically sorted: %+v", specs)
+	}
+}
+
 func TestLinkImports_LongestPrefix(t *testing.T) {
 	g := graph.New()
 	// Two import nodes — one for an exact match, one for a sub-package.

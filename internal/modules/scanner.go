@@ -12,6 +12,7 @@ package modules
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -122,6 +123,68 @@ func ParseGoMod(source []byte) []Spec {
 		}
 	}
 	return specs
+}
+
+// ParsePackageJSON walks an npm-style package.json file's
+// dependency blocks (`dependencies`, `devDependencies`,
+// `peerDependencies`, `optionalDependencies`) and returns one
+// Spec per declared package. The Indirect flag is repurposed for
+// devDependencies/peerDependencies/optionalDependencies — they
+// aren't "indirect" in the same Go-module sense, but the flag
+// lets agents scope to "production-only" deps without a separate
+// axis. The exact source block lives on Replace as a tag string
+// (not the most semantically clean home, but it avoids growing
+// the Spec struct for an ecosystem-specific field) — production
+// deps get an empty Replace.
+//
+// Version strings are kept verbatim — npm semver ranges
+// (`^1.2.0`, `~3.4.1`, `>=2 <3`) are not normalised, since
+// resolved-versions belong in the lockfile, not package.json.
+// A future package-lock.json / pnpm-lock.yaml extractor will
+// supersede the version string with the resolved one.
+func ParsePackageJSON(source []byte) []Spec {
+	if len(source) == 0 {
+		return nil
+	}
+	var manifest struct {
+		Dependencies         map[string]string `json:"dependencies"`
+		DevDependencies      map[string]string `json:"devDependencies"`
+		PeerDependencies     map[string]string `json:"peerDependencies"`
+		OptionalDependencies map[string]string `json:"optionalDependencies"`
+	}
+	if err := json.Unmarshal(source, &manifest); err != nil {
+		return nil
+	}
+	var specs []Spec
+	specs = append(specs, packageJSONBlock(manifest.Dependencies, "")...)
+	specs = append(specs, packageJSONBlock(manifest.DevDependencies, "dev")...)
+	specs = append(specs, packageJSONBlock(manifest.PeerDependencies, "peer")...)
+	specs = append(specs, packageJSONBlock(manifest.OptionalDependencies, "optional")...)
+	return specs
+}
+
+func packageJSONBlock(deps map[string]string, kind string) []Spec {
+	if len(deps) == 0 {
+		return nil
+	}
+	out := make([]Spec, 0, len(deps))
+	for name, version := range deps {
+		out = append(out, Spec{
+			Ecosystem: "npm",
+			Path:      name,
+			Version:   version,
+			Indirect:  kind != "",
+			Replace:   kind, // dev/peer/optional, "" for production
+		})
+	}
+	// Stable order per block — JSON map iteration is randomised, and
+	// downstream consumers (BuildGraphArtifacts dedup, prefix-sort
+	// in LinkImports) tolerate any order, but tests want
+	// determinism.
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].Path < out[j].Path
+	})
+	return out
 }
 
 // parseReplace extracts the from/to module paths from a replace
