@@ -13,6 +13,7 @@ import (
 	"bufio"
 	"bytes"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -214,6 +215,89 @@ func BuildGraphArtifacts(filePath string, specs []Spec) ([]*graph.Node, []*graph
 		})
 	}
 	return nodes, edges
+}
+
+// LinkImports walks every KindImport node in the graph and emits
+// an EdgeDependsOnModule edge to the matching module node from the
+// given Spec list. Matching is by longest path prefix — an import
+// of `github.com/foo/bar/sub` resolves to the spec for
+// `github.com/foo/bar` when no exact match exists. Returns the
+// number of edges emitted.
+//
+// Imports of repo-internal packages (the indexed module's own
+// path) are deliberately skipped — they aren't external
+// dependencies. Multi-version imports (Go's `module/v2` shape)
+// match the longest spec; a manifest declaring both `bar` and
+// `bar/v2` will resolve `import bar/v2/sub` to the v2 spec.
+func LinkImports(g *graph.Graph, specs []Spec, ownModulePath string) int {
+	if g == nil || len(specs) == 0 {
+		return 0
+	}
+	// Index specs by path for quick longest-prefix lookup. When two
+	// specs share a path (shouldn't happen in a well-formed go.mod,
+	// but guard against duplicates) the first wins — graph node
+	// dedup later handles any concrete conflict.
+	specByPath := make(map[string]Spec, len(specs))
+	paths := make([]string, 0, len(specs))
+	for _, s := range specs {
+		if _, ok := specByPath[s.Path]; ok {
+			continue
+		}
+		specByPath[s.Path] = s
+		paths = append(paths, s.Path)
+	}
+	// Sort longest first so the prefix scan picks the most specific
+	// match without an O(n²) probe.
+	sort.Slice(paths, func(i, j int) bool {
+		return len(paths[i]) > len(paths[j])
+	})
+
+	emitted := 0
+	for _, n := range g.AllNodes() {
+		if n.Kind != graph.KindImport {
+			continue
+		}
+		importPath, _ := n.Meta["path"].(string)
+		if importPath == "" {
+			continue
+		}
+		if ownModulePath != "" && (importPath == ownModulePath ||
+			strings.HasPrefix(importPath, ownModulePath+"/")) {
+			continue
+		}
+		matched := matchLongestPrefix(importPath, paths)
+		if matched == "" {
+			continue
+		}
+		spec := specByPath[matched]
+		moduleID := ModuleNodeID(spec.Ecosystem, spec.Path, spec.Version)
+		g.AddEdge(&graph.Edge{
+			From:     n.ID,
+			To:       moduleID,
+			Kind:     graph.EdgeDependsOnModule,
+			FilePath: n.FilePath,
+			Line:     n.StartLine,
+			Origin:   graph.OriginASTResolved,
+		})
+		emitted++
+	}
+	return emitted
+}
+
+// matchLongestPrefix returns the longest path from candidates that
+// matches importPath as either an exact match or a directory
+// prefix. Candidates must already be sorted by descending length;
+// the first hit wins.
+func matchLongestPrefix(importPath string, candidates []string) string {
+	for _, p := range candidates {
+		if importPath == p {
+			return p
+		}
+		if strings.HasPrefix(importPath, p+"/") {
+			return p
+		}
+	}
+	return ""
 }
 
 // shortName returns the last meaningful segment of a module path —

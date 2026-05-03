@@ -126,6 +126,95 @@ func TestBuildGraphArtifacts(t *testing.T) {
 	}
 }
 
+func TestLinkImports_LongestPrefix(t *testing.T) {
+	g := graph.New()
+	// Two import nodes — one for an exact match, one for a sub-package.
+	g.AddNode(&graph.Node{
+		ID:       "pkg/a.go::import::github.com/spf13/cobra",
+		Kind:     graph.KindImport,
+		FilePath: "pkg/a.go",
+		Meta:     map[string]any{"path": "github.com/spf13/cobra"},
+	})
+	g.AddNode(&graph.Node{
+		ID:       "pkg/b.go::import::github.com/spf13/cobra/doc",
+		Kind:     graph.KindImport,
+		FilePath: "pkg/b.go",
+		Meta:     map[string]any{"path": "github.com/spf13/cobra/doc"},
+	})
+	g.AddNode(&graph.Node{
+		ID:       "pkg/c.go::import::own/internal/foo",
+		Kind:     graph.KindImport,
+		FilePath: "pkg/c.go",
+		Meta:     map[string]any{"path": "own/internal/foo"},
+	})
+
+	specs := []Spec{
+		{Ecosystem: "go", Path: "github.com/spf13/cobra", Version: "v1.0.0"},
+		{Ecosystem: "go", Path: "go.uber.org/zap", Version: "v1.27.1"},
+	}
+
+	emitted := LinkImports(g, specs, "own")
+	if emitted != 2 {
+		t.Errorf("expected 2 edges (cobra exact + cobra/doc prefix; own/internal skipped), got %d", emitted)
+	}
+
+	wantTo := "module::go:github.com/spf13/cobra@v1.0.0"
+	hits := 0
+	for _, e := range g.AllEdges() {
+		if e.Kind == graph.EdgeDependsOnModule && e.To == wantTo {
+			hits++
+		}
+	}
+	if hits != 2 {
+		t.Errorf("expected 2 edges to %q, got %d", wantTo, hits)
+	}
+}
+
+func TestLinkImports_PrefersLongerSpecForVersionedImports(t *testing.T) {
+	g := graph.New()
+	g.AddNode(&graph.Node{
+		ID:       "f::import::github.com/foo/bar/v2/sub",
+		Kind:     graph.KindImport,
+		FilePath: "f.go",
+		Meta:     map[string]any{"path": "github.com/foo/bar/v2/sub"},
+	})
+
+	// Both v1 and v2 exist — the longest match wins.
+	specs := []Spec{
+		{Ecosystem: "go", Path: "github.com/foo/bar", Version: "v1.0.0"},
+		{Ecosystem: "go", Path: "github.com/foo/bar/v2", Version: "v2.1.0"},
+	}
+
+	if got := LinkImports(g, specs, ""); got != 1 {
+		t.Fatalf("expected 1 edge, got %d", got)
+	}
+	for _, e := range g.AllEdges() {
+		if e.Kind == graph.EdgeDependsOnModule {
+			if e.To != "module::go:github.com/foo/bar/v2@v2.1.0" {
+				t.Errorf("wrong module target: %q (longest spec should win)", e.To)
+			}
+		}
+	}
+}
+
+func TestLinkImports_SkipsWhenNoMatch(t *testing.T) {
+	g := graph.New()
+	g.AddNode(&graph.Node{
+		ID:       "f::import::stdlib",
+		Kind:     graph.KindImport,
+		FilePath: "f.go",
+		Meta:     map[string]any{"path": "fmt"},
+	})
+
+	specs := []Spec{
+		{Ecosystem: "go", Path: "github.com/foo/bar"},
+	}
+
+	if got := LinkImports(g, specs, ""); got != 0 {
+		t.Errorf("stdlib import shouldn't match external module, got %d edges", got)
+	}
+}
+
 func TestShortName(t *testing.T) {
 	cases := []struct {
 		in, want string

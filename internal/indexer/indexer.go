@@ -2515,6 +2515,30 @@ func (idx *Indexer) extractExternalModules() {
 	for _, e := range edges {
 		idx.graph.AddEdge(e)
 	}
+
+	// Connect each KindImport node to its matching module via
+	// longest-prefix path resolution. Repo-internal imports (the
+	// indexed module's own path) are filtered inside LinkImports.
+	// The own-module path is read straight from go.mod's `module`
+	// directive — when missing, the filter is a no-op which is
+	// safe (no own-module imports to match against).
+	ownModulePath := readGoModModulePath(src)
+	modules.LinkImports(idx.graph, specs, ownModulePath)
+}
+
+// readGoModModulePath extracts the `module ` directive value from
+// go.mod source. Mirrors the inline parse in coverage.ReadModulePath
+// — we keep both copies tiny rather than introducing a one-import
+// shared helper that would force a layering compromise (coverage
+// shouldn't depend on indexer; indexer shouldn't depend on coverage).
+func readGoModModulePath(src []byte) string {
+	for _, line := range strings.Split(string(src), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "module ") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "module "))
+		}
+	}
+	return ""
 }
 
 // extractGoModContracts runs the go.mod-specific extractor once against
