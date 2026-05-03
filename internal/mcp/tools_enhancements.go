@@ -108,8 +108,8 @@ func (s *Server) registerEnhancementTools() {
 	// analyze — unified graph analysis tool (dead_code, hotspots, cycles, would_create_cycle)
 	s.mcpServer.AddTool(
 		mcp.NewTool("analyze",
-			mcp.WithDescription("Unified graph analysis. kind=dead_code: symbols with zero incoming edges. kind=hotspots: high-complexity symbols by fan-in/out. kind=cycles: circular dependency chains. kind=would_create_cycle: check if a new edge would form a cycle (requires from_id, to_id). kind=todos: list KindTodo nodes with optional tag/assignee/ticket/has_assignee filters. kind=blame: run `git blame` against the indexed repo and stamp meta.last_authored on every symbol-level node. kind=coverage: parse a Go cover.out profile (path via `profile` arg) and stamp meta.coverage_pct on every executable symbol. kind=stale_code: list symbols whose meta.last_authored is older than the threshold (requires blame-enriched graph). kind=ownership: group blame metadata by author email — symbol count, files touched, oldest/newest timestamps; supports path_prefix scoping (requires blame-enriched graph)."),
-			mcp.WithString("kind", mcp.Required(), mcp.Description("Analysis kind: dead_code | hotspots | cycles | would_create_cycle | todos | blame | coverage | stale_code | ownership")),
+			mcp.WithDescription("Unified graph analysis. kind=dead_code: symbols with zero incoming edges. kind=hotspots: high-complexity symbols by fan-in/out. kind=cycles: circular dependency chains. kind=would_create_cycle: check if a new edge would form a cycle (requires from_id, to_id). kind=todos: list KindTodo nodes with optional tag/assignee/ticket/has_assignee filters. kind=blame: run `git blame` against the indexed repo and stamp meta.last_authored on every symbol-level node. kind=coverage: parse a Go cover.out profile (path via `profile` arg) and stamp meta.coverage_pct on every executable symbol. kind=stale_code: list symbols whose meta.last_authored is older than the threshold (requires blame-enriched graph). kind=ownership: group blame metadata by author email — symbol count, files touched, oldest/newest timestamps; supports path_prefix scoping (requires blame-enriched graph). kind=coverage_gaps: list symbols whose meta.coverage_pct falls in [min_pct, max_pct) — sorted ascending so the most undertested code surfaces first (requires coverage-enriched graph)."),
+			mcp.WithString("kind", mcp.Required(), mcp.Description("Analysis kind: dead_code | hotspots | cycles | would_create_cycle | todos | blame | coverage | stale_code | ownership | coverage_gaps")),
 			mcp.WithBoolean("compact", mcp.Description("One-line-per-result text output")),
 			mcp.WithString("format", mcp.Description("Output format: json (default) or gcx (GCX1 compact wire format, per-kind hand-tuned encoder)")),
 			mcp.WithBoolean("include_variables", mcp.Description("(dead_code) Include variable nodes (default false — usually false positives without data-flow analysis)")),
@@ -122,7 +122,9 @@ func (s *Server) registerEnhancementTools() {
 			mcp.WithString("email", mcp.Description("(stale_code) Filter to a single author email")),
 			mcp.WithString("kinds", mcp.Description("(stale_code, ownership) Comma-separated kinds — default function,method; pass 'all' for every blame-eligible kind")),
 			mcp.WithNumber("min_symbols", mcp.Description("(ownership) Drop authors with fewer than this many symbols — default 1")),
-			mcp.WithString("path_prefix", mcp.Description("(ownership) Scope to nodes under this file-path prefix — e.g. 'internal/auth/'")),
+			mcp.WithString("path_prefix", mcp.Description("(ownership, coverage_gaps) Scope to nodes under this file-path prefix — e.g. 'internal/auth/'")),
+			mcp.WithNumber("min_pct", mcp.Description("(coverage_gaps) Lower-inclusive coverage threshold — default 0")),
+			mcp.WithNumber("max_pct", mcp.Description("(coverage_gaps) Upper-exclusive coverage threshold — default 100, i.e. anything not fully covered")),
 			mcp.WithString("tag", mcp.Description("(todos) Filter by tag — TODO / FIXME / HACK / XXX / NOTE — case-insensitive")),
 			mcp.WithString("assignee", mcp.Description("(todos) Filter by exact assignee — case-sensitive")),
 			mcp.WithString("ticket", mcp.Description("(todos) Filter by exact ticket reference — e.g. PROJ-42")),
@@ -618,8 +620,10 @@ func (s *Server) handleAnalyze(ctx context.Context, req mcp.CallToolRequest) (*m
 		return s.handleAnalyzeStaleCode(ctx, req)
 	case "ownership":
 		return s.handleAnalyzeOwnership(ctx, req)
+	case "coverage_gaps":
+		return s.handleAnalyzeCoverageGaps(ctx, req)
 	default:
-		return mcp.NewToolResultError("unknown analyze kind: " + kind + " (expected: dead_code, hotspots, cycles, would_create_cycle, todos, blame, coverage, stale_code, ownership)"), nil
+		return mcp.NewToolResultError("unknown analyze kind: " + kind + " (expected: dead_code, hotspots, cycles, would_create_cycle, todos, blame, coverage, stale_code, ownership, coverage_gaps)"), nil
 	}
 }
 
@@ -1036,6 +1040,131 @@ func tsFromMeta(raw any) int64 {
 		return int64(v)
 	}
 	return 0
+}
+
+// handleAnalyzeCoverageGaps lists symbols whose meta.coverage_pct
+// falls inside [min_pct, max_pct) — the half-open interval lets
+// "everything below 50%" be expressed as max_pct=50 without
+// dragging in fully-uncovered nodes that callers might want to
+// distinguish via a separate query. Requires a coverage-enriched
+// graph (analyze kind=coverage or `gortex enrich coverage`).
+//
+// Symbols without coverage_pct are silently skipped — a node
+// could be unmeasured because the profile didn't cover it (real
+// gap) or because it's a non-executable kind (no signal at all).
+// Lumping the two together would be misleading, and the
+// distinction lives in the static dead_code analyzer rather than
+// here.
+//
+// Filters:
+//
+//   - max_pct: upper exclusive bound (default 100 — i.e. anything
+//     not fully covered).
+//   - min_pct: lower inclusive bound (default 0 — i.e. include
+//     fully-uncovered too). Combine with max_pct to scope to a
+//     coverage band: "20-50% coverage" is min_pct=20 max_pct=50.
+//   - kinds: same shared kind filter as stale_code/ownership;
+//     default function/method.
+//   - path_prefix: scope to a directory subtree.
+//
+// Sorted ascending by coverage_pct so the most-undertested
+// symbols surface first.
+func (s *Server) handleAnalyzeCoverageGaps(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+	maxPct := 100.0
+	if v, ok := args["max_pct"].(float64); ok && v > 0 {
+		maxPct = v
+	}
+	minPct := 0.0
+	if v, ok := args["min_pct"].(float64); ok && v >= 0 {
+		minPct = v
+	}
+	pathPrefix := strings.TrimSpace(stringArg(args, "path_prefix"))
+
+	allowedKinds := map[graph.NodeKind]struct{}{
+		graph.KindFunction: {},
+		graph.KindMethod:   {},
+	}
+	if k := strings.TrimSpace(stringArg(args, "kinds")); k != "" {
+		allowedKinds = parseAnalyzeKindsFilter(k)
+	}
+
+	type gapRow struct {
+		ID      string  `json:"id"`
+		File    string  `json:"file"`
+		Line    int     `json:"line"`
+		Pct     float64 `json:"coverage_pct"`
+		NumStmt int     `json:"num_stmt"`
+		Hit     int     `json:"hit"`
+	}
+	var rows []gapRow
+	for _, n := range s.graph.AllNodes() {
+		if _, ok := allowedKinds[n.Kind]; !ok {
+			continue
+		}
+		if pathPrefix != "" && !strings.HasPrefix(n.FilePath, pathPrefix) {
+			continue
+		}
+		pct, ok := n.Meta["coverage_pct"].(float64)
+		if !ok {
+			continue
+		}
+		if pct < minPct || pct >= maxPct {
+			continue
+		}
+		row := gapRow{
+			ID:   n.ID,
+			File: n.FilePath,
+			Line: n.StartLine,
+			Pct:  pct,
+		}
+		if cov, ok := n.Meta["coverage"].(map[string]any); ok {
+			if v, ok := cov["num_stmt"].(int); ok {
+				row.NumStmt = v
+			} else if f, ok := cov["num_stmt"].(float64); ok {
+				row.NumStmt = int(f)
+			}
+			if v, ok := cov["hit"].(int); ok {
+				row.Hit = v
+			} else if f, ok := cov["hit"].(float64); ok {
+				row.Hit = int(f)
+			}
+		}
+		rows = append(rows, row)
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].Pct != rows[j].Pct {
+			return rows[i].Pct < rows[j].Pct
+		}
+		// Tie-break by symbol size — bigger gaps surface above
+		// smaller ones at the same percentage. NumStmt may be 0
+		// when meta.coverage didn't decode cleanly; the secondary
+		// fallback to file:line keeps the order stable.
+		if rows[i].NumStmt != rows[j].NumStmt {
+			return rows[i].NumStmt > rows[j].NumStmt
+		}
+		if rows[i].File != rows[j].File {
+			return rows[i].File < rows[j].File
+		}
+		return rows[i].Line < rows[j].Line
+	})
+
+	if isCompact(req) {
+		var b strings.Builder
+		for _, r := range rows {
+			fmt.Fprintf(&b, "%5.1f%% %s:%d  %s\n", r.Pct, r.File, r.Line, r.ID)
+		}
+		if len(rows) == 0 {
+			b.WriteString("no coverage gaps matched\n")
+		}
+		return mcp.NewToolResultText(b.String()), nil
+	}
+	return mcp.NewToolResultJSON(map[string]any{
+		"gaps":    rows,
+		"total":   len(rows),
+		"min_pct": minPct,
+		"max_pct": maxPct,
+	})
 }
 
 // handleAnalyzeBlame runs `git blame -p` against the indexed
