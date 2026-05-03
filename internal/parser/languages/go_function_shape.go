@@ -33,7 +33,80 @@ func emitGoFunctionShape(ownerID string, defNode *sitter.Node, paramsCap, result
 	emitGoGenericParamNodes(ownerID, defNode, src, filePath, declLine, result)
 	if body := goFuncBody(defNode); body != nil {
 		emitGoClosureNodes(ownerID, body, src, filePath, result)
+		emitGoChannelOps(ownerID, body, src, filePath, result)
 	}
+}
+
+// emitGoChannelOps walks a function body and emits EdgeSends /
+// EdgeRecvs edges from the enclosing function to the channel
+// variable for each `ch <- v` send statement and `<-ch` receive
+// expression. Channel names resolve through the existing
+// unresolved-target convention so the resolver can later patch
+// them to the variable's actual node when in-scope.
+//
+// v1 limitations:
+//
+//   - Receives inside larger expressions (`x := <-ch` is fine,
+//     but `f(<-ch + 1)` only flags the immediate `<-ch` operand).
+//   - Range-over-channel (`for v := range ch`) doesn't currently
+//     emit a recv edge. The grammar wraps it in for_statement
+//     rather than unary_expression.
+//   - `select` statement cases are walked normally (their bodies
+//     contain send_statement / unary_expression children).
+//   - Closure bodies are skipped — closures are walked separately
+//     by emitGoClosureNodes; their channel ops attribute to the
+//     closure node when re-attribution lands as a follow-up.
+//     Today they attribute to the enclosing function, matching
+//     the same v1 limitation as call edges in closures.
+func emitGoChannelOps(ownerID string, body *sitter.Node, src []byte, filePath string, result *parser.ExtractionResult) {
+	if body == nil {
+		return
+	}
+	walkGoNodes(body, func(n *sitter.Node) bool {
+		switch n.Type() {
+		case "func_literal":
+			// Don't recurse into nested closures — handled
+			// elsewhere. Same convention as emitGoClosureNodes.
+			return false
+		case "send_statement":
+			channel := n.ChildByFieldName("channel")
+			if channel != nil {
+				name := strings.TrimSpace(channel.Content(src))
+				if name != "" {
+					result.Edges = append(result.Edges, &graph.Edge{
+						From:     ownerID,
+						To:       "unresolved::" + name,
+						Kind:     graph.EdgeSends,
+						FilePath: filePath,
+						Line:     int(n.StartPoint().Row) + 1,
+						Origin:   graph.OriginASTInferred,
+					})
+				}
+			}
+		case "unary_expression":
+			// Receive operations have operator "<-" and an
+			// operand pointing at the channel.
+			op := n.ChildByFieldName("operator")
+			if op == nil || op.Content(src) != "<-" {
+				return true
+			}
+			operand := n.ChildByFieldName("operand")
+			if operand != nil {
+				name := strings.TrimSpace(operand.Content(src))
+				if name != "" {
+					result.Edges = append(result.Edges, &graph.Edge{
+						From:     ownerID,
+						To:       "unresolved::" + name,
+						Kind:     graph.EdgeRecvs,
+						FilePath: filePath,
+						Line:     int(n.StartPoint().Row) + 1,
+						Origin:   graph.OriginASTInferred,
+					})
+				}
+			}
+		}
+		return true
+	})
 }
 
 // emitGoParamNodes walks a parameter_list and emits one KindParam

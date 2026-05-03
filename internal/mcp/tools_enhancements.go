@@ -110,7 +110,7 @@ func (s *Server) registerEnhancementTools() {
 	s.mcpServer.AddTool(
 		mcp.NewTool("analyze",
 			mcp.WithDescription("Unified graph analysis. kind=dead_code: symbols with zero incoming edges. kind=hotspots: high-complexity symbols by fan-in/out. kind=cycles: circular dependency chains. kind=would_create_cycle: check if a new edge would form a cycle (requires from_id, to_id). kind=todos: list KindTodo nodes with optional tag/assignee/ticket/has_assignee filters. kind=blame: run `git blame` against the indexed repo and stamp meta.last_authored on every symbol-level node. kind=coverage: parse a Go cover.out profile (path via `profile` arg) and stamp meta.coverage_pct on every executable symbol. kind=stale_code: list symbols whose meta.last_authored is older than the threshold (requires blame-enriched graph). kind=ownership: group blame metadata by author email — symbol count, files touched, oldest/newest timestamps; supports path_prefix scoping (requires blame-enriched graph). kind=coverage_gaps: list symbols whose meta.coverage_pct falls in [min_pct, max_pct) — sorted ascending so the most undertested code surfaces first (requires coverage-enriched graph)."),
-			mcp.WithString("kind", mcp.Required(), mcp.Description("Analysis kind: dead_code | hotspots | cycles | would_create_cycle | todos | blame | coverage | stale_code | ownership | coverage_gaps | stale_flags | releases | cgo_users | wasm_users | orphan_tables")),
+			mcp.WithString("kind", mcp.Required(), mcp.Description("Analysis kind: dead_code | hotspots | cycles | would_create_cycle | todos | blame | coverage | stale_code | ownership | coverage_gaps | stale_flags | releases | cgo_users | wasm_users | orphan_tables | unreferenced_tables | coverage_summary")),
 			mcp.WithBoolean("compact", mcp.Description("One-line-per-result text output")),
 			mcp.WithString("format", mcp.Description("Output format: json (default) or gcx (GCX1 compact wire format, per-kind hand-tuned encoder)")),
 			mcp.WithBoolean("include_variables", mcp.Description("(dead_code) Include variable nodes (default false — usually false positives without data-flow analysis)")),
@@ -634,8 +634,12 @@ func (s *Server) handleAnalyze(ctx context.Context, req mcp.CallToolRequest) (*m
 		return s.handleAnalyzeInteropUsers(ctx, req, "uses_wasm_bindgen", "wasm_users")
 	case "orphan_tables":
 		return s.handleAnalyzeOrphanTables(ctx, req)
+	case "unreferenced_tables":
+		return s.handleAnalyzeUnreferencedTables(ctx, req)
+	case "coverage_summary":
+		return s.handleAnalyzeCoverageSummary(ctx, req)
 	default:
-		return mcp.NewToolResultError("unknown analyze kind: " + kind + " (expected: dead_code, hotspots, cycles, would_create_cycle, todos, blame, coverage, stale_code, ownership, coverage_gaps, stale_flags, releases, cgo_users, wasm_users, orphan_tables)"), nil
+		return mcp.NewToolResultError("unknown analyze kind: " + kind + " (expected: dead_code, hotspots, cycles, would_create_cycle, todos, blame, coverage, stale_code, ownership, coverage_gaps, stale_flags, releases, cgo_users, wasm_users, orphan_tables, unreferenced_tables, coverage_summary)"), nil
 	}
 }
 
@@ -1417,6 +1421,188 @@ func (s *Server) handleAnalyzeOrphanTables(_ context.Context, req mcp.CallToolRe
 		"orphans": rows,
 		"total":   len(rows),
 	})
+}
+
+// handleAnalyzeUnreferencedTables is the inverse of
+// orphan_tables: tables that have an incoming EdgeProvides from
+// a migration but zero EdgeQueries call sites. Useful for
+// "which migrations created tables we don't read or write" —
+// dead schema candidates, cleanup signals after a feature
+// removal, or tables that exist only for downstream replication.
+//
+// Returns one row per unreferenced table with the canonical id,
+// table name, schema, dialect, and the count of providers
+// (typically 1, but a table can appear in multiple migrations).
+// Sorted alphabetically by id for diff-able output — there's no
+// natural priority ordering for this list the way query_count
+// gives orphan_tables.
+func (s *Server) handleAnalyzeUnreferencedTables(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	type unrefRow struct {
+		ID            string `json:"id"`
+		Table         string `json:"table"`
+		Schema        string `json:"schema,omitempty"`
+		Dialect       string `json:"dialect"`
+		ProviderCount int    `json:"provider_count"`
+	}
+	var rows []unrefRow
+	for _, n := range s.graph.AllNodes() {
+		if n.Kind != graph.KindTable {
+			continue
+		}
+		providerCount := 0
+		queryCount := 0
+		for _, e := range s.graph.GetInEdges(n.ID) {
+			switch e.Kind {
+			case graph.EdgeProvides:
+				providerCount++
+			case graph.EdgeQueries:
+				queryCount++
+			}
+		}
+		if providerCount == 0 || queryCount > 0 {
+			continue
+		}
+		dialect, _ := n.Meta["dialect"].(string)
+		schema, _ := n.Meta["schema"].(string)
+		table, _ := n.Meta["table"].(string)
+		if table == "" {
+			table = n.Name
+		}
+		rows = append(rows, unrefRow{
+			ID:            n.ID,
+			Table:         table,
+			Schema:        schema,
+			Dialect:       dialect,
+			ProviderCount: providerCount,
+		})
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		return rows[i].ID < rows[j].ID
+	})
+
+	if isCompact(req) {
+		var b strings.Builder
+		for _, r := range rows {
+			fmt.Fprintln(&b, r.ID)
+		}
+		if len(rows) == 0 {
+			b.WriteString("no unreferenced tables\n")
+		}
+		return mcp.NewToolResultText(b.String()), nil
+	}
+	return mcp.NewToolResultJSON(map[string]any{
+		"unreferenced": rows,
+		"total":        len(rows),
+	})
+}
+
+// handleAnalyzeCoverageSummary aggregates meta.coverage_pct per
+// directory. Complements coverage_gaps (per-symbol view) with a
+// package-level rollup useful for cleanup planning ("which
+// directory needs the most test attention"). Each row carries
+// the directory path, total measured symbols, average coverage,
+// fully-covered count, fully-uncovered count, and partial count
+// — the breakdown helps distinguish "package needs more
+// branches tested" from "package has no tests at all".
+//
+// Sorted ascending by avg_pct so worst packages surface first.
+// Filters mirror coverage_gaps: kinds (default function/method),
+// path_prefix scoping.
+func (s *Server) handleAnalyzeCoverageSummary(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+	pathPrefix := strings.TrimSpace(stringArg(args, "path_prefix"))
+
+	allowedKinds := map[graph.NodeKind]struct{}{
+		graph.KindFunction: {},
+		graph.KindMethod:   {},
+	}
+	if k := strings.TrimSpace(stringArg(args, "kinds")); k != "" {
+		allowedKinds = parseAnalyzeKindsFilter(k)
+	}
+
+	type dirStats struct {
+		Dir         string  `json:"dir"`
+		Symbols     int     `json:"symbols"`
+		AvgPct      float64 `json:"avg_pct"`
+		Covered     int     `json:"covered"`
+		Partial     int     `json:"partial"`
+		Uncovered   int     `json:"uncovered"`
+
+		sumPct float64 // running sum, hidden from JSON
+	}
+	byDir := map[string]*dirStats{}
+
+	for _, n := range s.graph.AllNodes() {
+		if _, ok := allowedKinds[n.Kind]; !ok {
+			continue
+		}
+		if pathPrefix != "" && !strings.HasPrefix(n.FilePath, pathPrefix) {
+			continue
+		}
+		pct, ok := n.Meta["coverage_pct"].(float64)
+		if !ok {
+			continue
+		}
+		dir := filepath.Dir(n.FilePath)
+		ds, ok := byDir[dir]
+		if !ok {
+			ds = &dirStats{Dir: dir}
+			byDir[dir] = ds
+		}
+		ds.Symbols++
+		ds.sumPct += pct
+		switch {
+		case pct >= 100:
+			ds.Covered++
+		case pct == 0:
+			ds.Uncovered++
+		default:
+			ds.Partial++
+		}
+	}
+
+	rows := make([]*dirStats, 0, len(byDir))
+	for _, s := range byDir {
+		if s.Symbols == 0 {
+			continue
+		}
+		s.AvgPct = roundTwoDecimal(s.sumPct / float64(s.Symbols))
+		s.sumPct = 0
+		rows = append(rows, s)
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].AvgPct != rows[j].AvgPct {
+			return rows[i].AvgPct < rows[j].AvgPct
+		}
+		return rows[i].Dir < rows[j].Dir
+	})
+
+	if isCompact(req) {
+		var b strings.Builder
+		for _, r := range rows {
+			fmt.Fprintf(&b, "%5.1f%% %3d sym (%d cov / %d part / %d unc)  %s\n",
+				r.AvgPct, r.Symbols, r.Covered, r.Partial, r.Uncovered, r.Dir)
+		}
+		if len(rows) == 0 {
+			b.WriteString("no coverage data\n")
+		}
+		return mcp.NewToolResultText(b.String()), nil
+	}
+	return mcp.NewToolResultJSON(map[string]any{
+		"directories": rows,
+		"total":       len(rows),
+	})
+}
+
+// roundTwoDecimal rounds to 2 decimal places, mirroring the
+// coverage package's roundTwo. Local helper rather than an import
+// dependency on internal/coverage so the mcp tool stays
+// self-contained.
+func roundTwoDecimal(v float64) float64 {
+	if v < 0 {
+		return v
+	}
+	return float64(int64(v*100+0.5)) / 100
 }
 
 // handleAnalyzeInteropUsers lists every file with the named
