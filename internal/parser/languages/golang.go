@@ -504,7 +504,11 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 		filePath, result)
 
 	// --- SQL queries ---
-	emitGoSQLEvents(sqlEvents,
+	// Dialect inference uses the same imports map the call walker
+	// already builds. When the file imports a recognised SQL
+	// driver, KindTable nodes get db::<dialect>::... IDs; otherwise
+	// they fall back to db::generic::...
+	emitGoSQLEvents(sqlEvents, inferGoSQLDialect(imports),
 		func(line int) string { return findEnclosingFunc(funcRanges, line) },
 		filePath, result)
 

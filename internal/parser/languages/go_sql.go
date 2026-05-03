@@ -89,13 +89,90 @@ func detectGoSQLCall(callExpr *sitter.Node, method string, src []byte) ([]sql.Ta
 	return nil, false
 }
 
+// goSQLDriverDialects maps Go SQL driver import paths to the
+// dialect tag stamped on KindTable nodes when the file uses them.
+// The map is intentionally narrow — only widely-used drivers are
+// recognised; everything else falls through to the generic
+// dialect, matching the spec's "best-effort, default-off" stance
+// for SQL extraction. Entries match by exact path or by prefix
+// (the imports map carries the literal import path so a `pgx/v5`
+// suffix still resolves to postgres via prefix-stripped lookup).
+var goSQLDriverDialects = map[string]string{
+	// Postgres
+	"github.com/lib/pq":               "postgres",
+	"github.com/jackc/pgx":            "postgres",
+	"github.com/jackc/pgx/v4":         "postgres",
+	"github.com/jackc/pgx/v5":         "postgres",
+	"github.com/jackc/pgconn":         "postgres",
+	"github.com/jackc/pgxpool":        "postgres",
+	// MySQL / MariaDB
+	"github.com/go-sql-driver/mysql": "mysql",
+	"github.com/go-mysql-org/go-mysql": "mysql",
+	// SQLite
+	"github.com/mattn/go-sqlite3":    "sqlite",
+	"github.com/glebarez/go-sqlite":  "sqlite",
+	"modernc.org/sqlite":             "sqlite",
+	// SQL Server
+	"github.com/microsoft/go-mssqldb": "mssql",
+	"github.com/denisenkom/go-mssqldb": "mssql",
+}
+
+// inferGoSQLDialect picks the most likely SQL dialect for a Go
+// file given its import map. Returns "generic" when no driver
+// import is recognised. Multiple drivers in one file is rare in
+// practice; when it happens we pick the first match in iteration
+// order — agents can disambiguate via the import edges if the
+// dialect tag matters and is wrong.
+func inferGoSQLDialect(imports map[string]string) string {
+	for _, path := range imports {
+		if dialect, ok := goSQLDriverDialects[path]; ok {
+			return dialect
+		}
+		// Prefix-stripped lookup for major-version suffixes
+		// (`pgx/v6`, `pgx/v7` future-proofing). Walk parent
+		// directories until a match or the path runs out.
+		p := path
+		for {
+			i := lastSegmentSlash(p)
+			if i < 0 {
+				break
+			}
+			p = p[:i]
+			if dialect, ok := goSQLDriverDialects[p]; ok {
+				return dialect
+			}
+		}
+	}
+	return "generic"
+}
+
+// lastSegmentSlash returns the index of the last `/` in s, or -1
+// when s contains no slash. Cheaper than strings.LastIndex when
+// inlined in the dialect-resolution hot loop.
+func lastSegmentSlash(s string) int {
+	for i := len(s) - 1; i >= 0; i-- {
+		if s[i] == '/' {
+			return i
+		}
+	}
+	return -1
+}
+
 // emitGoSQLEvents turns deferred SQL records into KindTable nodes
 // plus EdgeQueries edges. Tables share IDs across files in a repo
 // — the same `users` table referenced from multiple call sites
-// produces a single node that every caller links to.
-func emitGoSQLEvents(events []goSQLEvent, callerLookup func(line int) string, filePath string, result *parser.ExtractionResult) {
+// produces a single node that every caller links to. The dialect
+// argument is inferred per-file from the import map; when two
+// files in the same repo use different drivers and both reference
+// "users", they produce distinct nodes (db::postgres::users vs
+// db::mysql::users) — the right behaviour for repos that span
+// dialects.
+func emitGoSQLEvents(events []goSQLEvent, dialect string, callerLookup func(line int) string, filePath string, result *parser.ExtractionResult) {
 	if len(events) == 0 {
 		return
+	}
+	if dialect == "" {
+		dialect = "generic"
 	}
 	seenNodes := make(map[string]struct{})
 	for _, e := range events {
@@ -104,12 +181,12 @@ func emitGoSQLEvents(events []goSQLEvent, callerLookup func(line int) string, fi
 			continue
 		}
 		for _, ref := range e.tables {
-			tableID := sql.TableNodeID("generic", ref.Schema, ref.Table)
+			tableID := sql.TableNodeID(dialect, ref.Schema, ref.Table)
 			if _, ok := seenNodes[tableID]; !ok {
 				seenNodes[tableID] = struct{}{}
 				meta := map[string]any{
 					"table":   ref.Table,
-					"dialect": "generic",
+					"dialect": dialect,
 				}
 				if ref.Schema != "" {
 					meta["schema"] = ref.Schema

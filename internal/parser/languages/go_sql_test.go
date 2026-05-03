@@ -106,6 +106,90 @@ func Run(db *DB) {
 	}
 }
 
+func TestGoSQL_DialectInferredFromPostgresImport(t *testing.T) {
+	src := `package foo
+
+import (
+	_ "github.com/lib/pq"
+	"database/sql"
+)
+
+func Run(db *sql.DB) {
+	_, _ = db.Query("SELECT * FROM users")
+}
+`
+	fix := runGoExtract(t, src)
+	tables := fix.nodesByKind[graph.KindTable]
+	if len(tables) != 1 {
+		t.Fatalf("expected 1 table, got %d", len(tables))
+	}
+	if tables[0].ID != "db::postgres::users" {
+		t.Errorf("expected postgres dialect on ID, got %q", tables[0].ID)
+	}
+	if d, _ := tables[0].Meta["dialect"].(string); d != "postgres" {
+		t.Errorf("dialect meta = %q", d)
+	}
+}
+
+func TestGoSQL_DialectInferredFromMysqlImport(t *testing.T) {
+	src := `package foo
+
+import (
+	_ "github.com/go-sql-driver/mysql"
+	"database/sql"
+)
+
+func Run(db *sql.DB) {
+	_, _ = db.Query("SELECT * FROM orders")
+}
+`
+	fix := runGoExtract(t, src)
+	tables := fix.nodesByKind[graph.KindTable]
+	if len(tables) != 1 || tables[0].ID != "db::mysql::orders" {
+		t.Errorf("expected mysql dialect, got %+v", tables)
+	}
+}
+
+func TestGoSQL_DialectInferredFromPgxV5(t *testing.T) {
+	// Major-version-suffix imports (pgx/v5) resolve via the
+	// prefix-stripped lookup.
+	src := `package foo
+
+import (
+	"github.com/jackc/pgx/v5"
+)
+
+type Pool struct{}
+func (p *Pool) Query(q string) (any, error) { return nil, nil }
+
+func Run(p *Pool) {
+	_, _ = p.Query("SELECT * FROM users")
+}
+`
+	fix := runGoExtract(t, src)
+	tables := fix.nodesByKind[graph.KindTable]
+	if len(tables) != 1 || tables[0].ID != "db::postgres::users" {
+		t.Errorf("expected postgres (pgx/v5 prefix-stripped to pgx), got %+v", tables)
+	}
+}
+
+func TestGoSQL_NoDriverFallsBackToGeneric(t *testing.T) {
+	src := `package foo
+
+type DB struct{}
+func (d *DB) Query(q string) (any, error) { return nil, nil }
+
+func Run(db *DB) {
+	_, _ = db.Query("SELECT * FROM users")
+}
+`
+	fix := runGoExtract(t, src)
+	tables := fix.nodesByKind[graph.KindTable]
+	if len(tables) != 1 || tables[0].ID != "db::generic::users" {
+		t.Errorf("expected generic dialect fallback, got %+v", tables)
+	}
+}
+
 func TestGoSQL_DedupedAcrossCallSites(t *testing.T) {
 	src := `package foo
 
