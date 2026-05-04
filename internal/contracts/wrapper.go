@@ -3,6 +3,7 @@ package contracts
 import (
 	"fmt"
 	"regexp"
+	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
 )
@@ -107,6 +108,13 @@ func InlineWrappers(reg *Registry, g *graph.Graph, read SourceReader) []Contract
 						Meta:        meta,
 						Confidence:  0.8,
 					}
+					// Run schema enrichment on the caller's body so
+					// the inlined contract carries request_type /
+					// response_type / query_params just like a
+					// regex-detected consumer contract would. Without
+					// this the dashboard shows "not declared on this
+					// side" for every wrapper-routed call site.
+					enrichInlinedWrapperContract(&c, g, caller, src)
 					reg.Add(c)
 					commitInlinedContractToGraph(g, c)
 					added = append(added, c)
@@ -126,6 +134,30 @@ func InlineWrappers(reg *Registry, g *graph.Graph, read SourceReader) []Contract
 // wrapperInfo is the minimal record carried through BFS passes.
 type wrapperInfo struct {
 	SymbolID string
+}
+
+// enrichInlinedWrapperContract runs the schema enrichment pipeline
+// against the caller's body so inlined wrapper consumer contracts
+// carry the same request_type / response_type / query_params facts
+// that natively-detected consumer contracts do.
+//
+// Mirrors the enrichment chain HTTPExtractor.extract runs after
+// matching a regex pattern: lines + fileNodes + lang + tree feed
+// EnrichHTTPContractWithTree, which dispatches to the per-language
+// schema_enrich_*.go detectors and (for Go) the AST overlay.
+func enrichInlinedWrapperContract(c *Contract, g *graph.Graph, caller *graph.Node, src []byte) {
+	if c == nil || caller == nil || len(src) == 0 {
+		return
+	}
+	lang := caller.Language
+	if lang == "" {
+		return
+	}
+	lines := strings.Split(string(src), "\n")
+	fileNodes := g.GetFileNodes(caller.FilePath)
+	tree := ParseTreeForLang(lang, src)
+	defer tree.Release()
+	EnrichHTTPContractWithTree(c, lines, fileNodes, lang, tree)
 }
 
 // seedWrappers finds the initial set of wrappers: consumer HTTP
