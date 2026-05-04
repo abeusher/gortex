@@ -25,6 +25,10 @@ func TestMatcher_Builtin(t *testing.T) {
 		{"README.md", false},
 		{"tmp.tmp", true},
 		{"deep/nested/file.swp", true},
+		{".Makefile.swpx", true},
+		{"src/.foo.swo", true},
+		{"src/.foo.swn", true},
+		{"backup~", true},
 	}
 	for _, tc := range cases {
 		if got := m.MatchRel(tc.path); got != tc.want {

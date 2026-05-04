@@ -28,6 +28,7 @@ func init() {
 	gob.Register([]string{})
 	gob.Register([]int{})
 	gob.Register([]map[string]string{})
+	gob.Register([]map[string]any{})
 }
 
 // snapshotRepo carries the per-repo metadata needed to reconcile a

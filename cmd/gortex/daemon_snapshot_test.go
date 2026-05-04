@@ -210,6 +210,56 @@ func TestSnapshotRoundTrip_NodeMetaWithGenericTypes(t *testing.T) {
 	assert.Equal(t, []int{200, 404, 500}, sc)
 }
 
+// TestSnapshotRoundTrip_ContractMetaWithSliceOfMaps guards the gob
+// registration of []map[string]any. The HTTP schema enricher writes a
+// response_envelope value of that shape into Contract.Meta; without the
+// Register call, saveSnapshot aborts on the first such contract with
+// "type not registered for interface: []map[string]interface {}" and the
+// snapshot file never lands.
+func TestSnapshotRoundTrip_ContractMetaWithSliceOfMaps(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "snap.gob.gz")
+	t.Setenv("GORTEX_DAEMON_SNAPSHOT", path)
+
+	orig := graph.New()
+	snapContracts := []snapshotContract{{
+		ID:         "repo/api.go::POST /tasks",
+		Type:       "http",
+		Role:       "provider",
+		SymbolID:   "repo/api.go::CreateTask",
+		FilePath:   "repo/api.go",
+		Line:       42,
+		RepoPrefix: "repo",
+		Meta: map[string]any{
+			"path": "/tasks",
+			"response_envelope": []map[string]any{
+				{"name": "id", "type": "string"},
+				{"name": "items", "type": "Task", "repeated": true},
+			},
+		},
+	}}
+
+	saveSnapshot(orig, nil, snapContracts, "v-test", zap.NewNop())
+
+	info, err := os.Stat(path)
+	require.NoError(t, err, "snapshot file must exist — encode must not have aborted on []map[string]any")
+	require.Greater(t, info.Size(), int64(0))
+
+	restored := graph.New()
+	result, err := loadSnapshot(restored, zap.NewNop())
+	require.NoError(t, err)
+	require.True(t, result.Loaded)
+
+	cs, ok := result.Contracts["repo"]
+	require.True(t, ok, "contracts for repo prefix must round-trip")
+	require.Len(t, cs, 1)
+	env, ok := cs[0].Meta["response_envelope"].([]map[string]any)
+	require.True(t, ok, "response_envelope must keep its []map[string]any type, got %T", cs[0].Meta["response_envelope"])
+	require.Len(t, env, 2)
+	assert.Equal(t, "id", env[0]["name"])
+	assert.Equal(t, true, env[1]["repeated"])
+}
+
 func TestLoadSnapshot_MissingFile_NotAnError(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("GORTEX_DAEMON_SNAPSHOT", filepath.Join(dir, "nope.gob.gz"))

@@ -13,6 +13,30 @@ import (
 	"pgregory.net/rapid"
 )
 
+// TestDefaultGlobalConfigPath_HonorsHomeChange guards the regression
+// where DefaultGlobalConfigPath cached its result with sync.Once. Whichever
+// caller fired first pinned the path for the rest of the process — any
+// test that later set HOME via t.Setenv silently kept writing into the
+// developer's real ~/.config/gortex/config.yaml. The function must
+// re-resolve HOME on every call.
+func TestDefaultGlobalConfigPath_HonorsHomeChange(t *testing.T) {
+	homeA := t.TempDir()
+	t.Setenv("HOME", homeA)
+	gotA := DefaultGlobalConfigPath()
+	wantA := filepath.Join(homeA, ".config", "gortex", "config.yaml")
+	if gotA != wantA {
+		t.Fatalf("first call: got %s, want %s", gotA, wantA)
+	}
+
+	homeB := t.TempDir()
+	t.Setenv("HOME", homeB)
+	gotB := DefaultGlobalConfigPath()
+	wantB := filepath.Join(homeB, ".config", "gortex", "config.yaml")
+	if gotB != wantB {
+		t.Fatalf("after HOME change: got %s, want %s — path appears cached", gotB, wantB)
+	}
+}
+
 func TestLoadGlobal_FileNotExist(t *testing.T) {
 	gc, err := LoadGlobal("/tmp/nonexistent-gortex-test/config.yaml")
 	require.NoError(t, err)

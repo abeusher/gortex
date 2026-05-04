@@ -16,6 +16,7 @@ func init() {
 	gob.Register([]string{})
 	gob.Register([]int{})
 	gob.Register([]map[string]string{})
+	gob.Register([]map[string]any{})
 }
 
 const (

@@ -41,5 +41,13 @@ var Builtin = []string{
 	".dart_tool/", // Dart/Flutter build cache
 	".pub-cache/", // Dart global pub cache, occasionally vendored
 	"*.tmp",
+	// Editor scratch/backup files. Vim cycles swap suffixes backward
+	// through the alphabet (.swp → .swo → .swn → ...); neovim writes a
+	// .swpx auxiliary alongside .swp on some platforms.
 	"*.swp",
+	"*.swo",
+	"*.swn",
+	"*.swm",
+	"*.swpx",
+	"*~",
 }

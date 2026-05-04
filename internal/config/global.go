@@ -11,12 +11,10 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// globalConfigPath is the default path for the global config file.
-// It can be overridden for testing via SetGlobalConfigPath.
 var (
-	globalConfigPath     string
-	globalConfigPathOnce sync.Once
-	globalConfigMu       sync.Mutex
+	// globalConfigMu serialises Save() so concurrent writers can't
+	// truncate each other's payload.
+	globalConfigMu sync.Mutex
 
 	// projectNameRe matches valid project names: alphanumeric, hyphens, underscores.
 	projectNameRe = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
@@ -61,15 +59,18 @@ type GlobalConfig struct {
 }
 
 // DefaultGlobalConfigPath returns the default path: ~/.config/gortex/config.yaml.
+//
+// Resolved fresh on every call so HOME changes (notably t.Setenv in tests)
+// take effect. A previous version cached this with sync.Once, which made
+// the first caller win for the lifetime of the process — any subsequent
+// test that flipped HOME silently ended up writing into the developer's
+// real config.
 func DefaultGlobalConfigPath() string {
-	globalConfigPathOnce.Do(func() {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			home = "."
-		}
-		globalConfigPath = filepath.Join(home, ".config", "gortex", "config.yaml")
-	})
-	return globalConfigPath
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home = "."
+	}
+	return filepath.Join(home, ".config", "gortex", "config.yaml")
 }
 
 // LoadGlobal reads the global config from ~/.config/gortex/config.yaml.
