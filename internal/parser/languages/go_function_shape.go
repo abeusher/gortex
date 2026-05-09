@@ -34,7 +34,57 @@ func emitGoFunctionShape(ownerID string, defNode *sitter.Node, paramsCap, result
 	if body := goFuncBody(defNode); body != nil {
 		emitGoClosureNodes(ownerID, body, src, filePath, result)
 		emitGoChannelOps(ownerID, body, src, filePath, result)
+		// CPG-lite intra-procedural dataflow: emits EdgeValueFlow,
+		// EdgeArgOf, and EdgeReturnsTo placeholders. Inter-procedural
+		// targets are lifted by the indexer's
+		// MaterializeDataflowParams pass once the call resolver
+		// has landed every callee.
+		paramsByName := goParamNamesFromCapture(paramsCap, src)
+		emitGoDataflow(ownerID, body, paramsByName, src, filePath, result)
 	}
+}
+
+// goParamNamesFromCapture returns a name → declared-type map for
+// the parameters captured by the function/method shape query. The
+// type isn't load-bearing for dataflow today (only the name set is)
+// but is kept on the map so future improvements can use it for
+// argument-binding precision without changing the call signature.
+func goParamNamesFromCapture(paramsCap *parser.CapturedNode, src []byte) map[string]string {
+	out := map[string]string{}
+	if paramsCap == nil || paramsCap.Node == nil {
+		return out
+	}
+	list := paramsCap.Node
+	for i := 0; i < int(list.NamedChildCount()); i++ {
+		decl := list.NamedChild(i)
+		if decl == nil {
+			continue
+		}
+		t := decl.Type()
+		if t != "parameter_declaration" && t != "variadic_parameter_declaration" {
+			continue
+		}
+		typeNode := decl.ChildByFieldName("type")
+		typeText := ""
+		if typeNode != nil {
+			typeText = strings.TrimSpace(typeNode.Content(src))
+		}
+		for j := 0; j < int(decl.NamedChildCount()); j++ {
+			c := decl.NamedChild(j)
+			if c == nil || c == typeNode {
+				continue
+			}
+			if c.Type() != "identifier" {
+				continue
+			}
+			name := c.Content(src)
+			if name == "" || name == "_" {
+				continue
+			}
+			out[name] = typeText
+		}
+	}
+	return out
 }
 
 // emitGoChannelOps walks a function body and emits EdgeSends /

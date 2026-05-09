@@ -404,6 +404,7 @@ func NewServer(engine *query.Engine, g *graph.Graph, idx *indexer.Indexer, watch
 	s.registerEnhancementTools()
 	s.registerLSPTools()
 	s.registerDiagnosticsTools()
+	s.registerDataflowTools()
 	s.registerResources()
 	s.registerPrompts()
 

@@ -118,6 +118,16 @@ The `analyze` MCP tool is a unified dispatcher. Supported `kind` values:
 | Manually tracking API routes/services | `contracts` (default `action: "list"`) — lists HTTP, gRPC, GraphQL, topic, WebSocket, env, OpenAPI; filter by `repo`, `project`, or `ref` |
 | Guessing if APIs match across repos   | `contracts` with `action: "check"` — detects orphan providers/consumers and mismatches; scope with `repo` / `project` / `ref` |
 
+### CPG-lite Dataflow
+
+The `flow_between` and `taint_paths` MCP tools answer **"where does this value flow?"** by walking three new edge kinds — `value_flow` (intra-procedural), `arg_of` (caller arg → callee param), and `returns_to` (callee → assignment). The Go extractor builds these at index time and the resolver post-pass lifts inter-procedural placeholders to actual param node IDs.
+
+| Instead of...                         | You MUST use...                          |
+|---------------------------------------|------------------------------------------|
+| Hand-tracing a value through helper functions | `flow_between` — ranked dataflow paths between two symbol IDs; pass `max_depth` (default 8) and `max_paths` (default 10); supports `format: "gcx"` |
+| Grepping for sources / sinks         | `taint_paths` — pattern-driven sweep returning every flow from a matching source to a matching sink. Pattern syntax: bare token = case-insensitive substring on name; `exact:Foo` = exact match; `path:dir/` = file-path prefix; `kind:method` = node-kind filter; combine clauses with spaces (AND). Sinks expand functions to their params automatically. |
+| Reading callers to verify a refactor | `flow_between` from the changed return symbol to a downstream consumer's param to find every consumer site, including those reached through helper functions. |
+
 ### Config Hygiene
 
 | Instead of...                         | You MUST use...                          |
@@ -159,4 +169,5 @@ The `analyze` MCP tool is a unified dispatcher. Supported `kind` values:
 - Calls / structure: `calls`, `imports`, `defines`, `implements`, `extends`, `references`, `member_of`, `instantiates`, `provides`, `consumes`, `composes`, `aliases`, `typed_as`, `returns`, `captures`, `param_of`
 - Concurrency: `spawns` (goroutine/async/promise), `sends` / `recvs` (channels)
 - Mutation: `reads` / `writes` (fields), `reads_config` / `writes_config`
+- Dataflow (CPG-lite, `flow_between` / `taint_paths`): `value_flow` (intra-procedural assignment / return / range), `arg_of` (caller arg → callee param), `returns_to` (callee → assignment LHS)
 - Metadata: `annotated` (decorators), `emits` (events), `throws` (errors), `queries` (SQL), `reads_col` / `writes_col`, `toggles_flag`, `depends_on_module`, `matches` (fixtures), `generated_by`, `tests` (test → tested symbol), `covered_by`, `owns` (CODEOWNERS), `authored`, `licensed_as`

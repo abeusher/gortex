@@ -43,6 +43,7 @@ var alwaysAllow = []string{
 	"verify_change", "check_guards", "prefetch_context",
 	"analyze", "diff_context", "index_health", "get_symbol_history",
 	"scaffold", "batch_edit", "contracts", "feedback",
+	"flow_between", "taint_paths",
 }
 
 // globalStoragePaths returns candidate paths for Kilo Code's MCP

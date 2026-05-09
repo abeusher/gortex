@@ -136,9 +136,27 @@ func TestInstructionsBody_AdvertisesKeyTools(t *testing.T) {
 	for _, token := range []string{
 		"search_symbols", "smart_context", "get_editing_context",
 		"contracts", "find_usages", "graph_stats",
+		// CPG-lite dataflow surface — landed with I1.
+		"flow_between", "taint_paths",
+		"value_flow", "arg_of", "returns_to",
 	} {
 		if !strings.Contains(InstructionsBody, token) {
 			t.Errorf("InstructionsBody no longer mentions %q — a doc regression would ship to every adapter", token)
+		}
+	}
+}
+
+// TestGlobalInstructionsBody_AdvertisesKeyTools mirrors the smoke
+// test above for the global block written by `gortex install` into
+// ~/.claude/CLAUDE.md. It's the per-machine surface and gets the
+// shorter dataflow callout — verify both tool names ship.
+func TestGlobalInstructionsBody_AdvertisesKeyTools(t *testing.T) {
+	for _, token := range []string{
+		"search_symbols", "smart_context", "get_editing_context",
+		"flow_between", "taint_paths",
+	} {
+		if !strings.Contains(GlobalInstructionsBody, token) {
+			t.Errorf("GlobalInstructionsBody no longer mentions %q", token)
 		}
 	}
 }

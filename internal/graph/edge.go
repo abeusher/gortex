@@ -180,6 +180,47 @@ const (
 	// the file's SPDX-License-Identifier header, falling back to the
 	// repo-level LICENSE file.
 	EdgeLicensedAs EdgeKind = "licensed_as"
+	// CPG-lite dataflow primitives. Together they form the data-
+	// dependence layer Gortex layers on top of the call graph: agents
+	// can answer "where does this value flow?" with a single graph
+	// walk instead of hand-tracing source.
+	//
+	// Local-binding ID convention. For language extractors that emit
+	// dataflow without materialising a graph node per local variable,
+	// edges target a synthetic ID of the form:
+	//
+	//   <ownerID>#local:<name>@<line>
+	//
+	// where ownerID is the enclosing function/method/closure node.
+	// These IDs are valid edge endpoints — BFS traverses them — but
+	// no graph node is created, keeping search results free of
+	// every transient binding in every function body.
+	//
+	// EdgeValueFlow links a value-producing position to a value-
+	// consuming position within the same function/method/closure
+	// body. Captures intra-procedural data-dependence: assignment
+	// LHS↔RHS, range source↔induction var, return value↔function
+	// symbol. Both endpoints are inside the same enclosing
+	// function so the edge is fully resolved at extraction time.
+	// Origin: ast_resolved by construction.
+	EdgeValueFlow EdgeKind = "value_flow"
+	// EdgeArgOf links an argument expression at a call site to the
+	// callee's parameter — the inter-procedural binding produced
+	// by passing a value across a function boundary. Direction:
+	// caller-side argument source → callee parameter. The
+	// resolver lifts the unresolved callee target the same way
+	// EdgeCalls is lifted; a follow-up indexer pass rewrites the
+	// edge target from the callee function ID to the param node ID
+	// at the recorded position (Meta["arg_position"]).
+	EdgeArgOf EdgeKind = "arg_of"
+	// EdgeReturnsTo links a callee function/method to the receiving
+	// binding at a call site (`x := f(...)` produces returns_to(f, x)).
+	// Direction: callee → assignment LHS. Stored at extraction time
+	// with From = enclosing-caller ID and Meta["returns_to_call"] +
+	// Meta["call_line"] as a placeholder; a follow-up indexer pass
+	// rewrites From to the resolved callee ID by joining against the
+	// EdgeCalls edge from the same caller+line.
+	EdgeReturnsTo EdgeKind = "returns_to"
 )
 
 type Edge struct {
@@ -277,7 +318,13 @@ func DefaultOriginFor(kind EdgeKind, confidence float64, semanticSource string) 
 		// the AST-resolved tier.
 		EdgeParamOf, EdgeAliases, EdgeComposes, EdgeOverrides, EdgeLicensedAs,
 		EdgeOwns, EdgeAuthored, EdgeGeneratedBy, EdgeDependsOnModule,
-		EdgeCaptures:
+		EdgeCaptures,
+		// Dataflow edges. EdgeValueFlow is intra-procedural and
+		// fully resolved at extraction. EdgeArgOf / EdgeReturnsTo
+		// inherit ast_resolved once the post-resolution pass has
+		// landed both ends; the dispatcher here just stamps the
+		// default tier so freshly emitted edges classify cleanly.
+		EdgeValueFlow, EdgeArgOf, EdgeReturnsTo:
 		return OriginASTResolved
 	}
 	// Resolution-derived edges fall back to confidence score.
@@ -302,7 +349,8 @@ func ConfidenceLabelFor(kind EdgeKind, confidence float64) string {
 		EdgeProvides, EdgeConsumes, EdgeMatches,
 		EdgeParamOf, EdgeAliases, EdgeComposes, EdgeOverrides, EdgeLicensedAs,
 		EdgeOwns, EdgeAuthored, EdgeGeneratedBy, EdgeDependsOnModule,
-		EdgeCaptures:
+		EdgeCaptures,
+		EdgeValueFlow, EdgeArgOf, EdgeReturnsTo:
 		return "EXTRACTED"
 	}
 	// Resolution-derived edges: classify by confidence score.

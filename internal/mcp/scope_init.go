@@ -105,6 +105,13 @@ var defaultToolScopes = map[string]ToolScope{
 	// to fan-out once the UX is reviewed.
 	"analyze":   ScopeRepo,
 	"contracts": ScopeRepo,
+
+	// CPG-lite dataflow primitives. Both walk the active graph by
+	// node ID / name pattern; like analyze + contracts, they take
+	// per-call scope hints today and can upgrade to fan-out once
+	// cross-repo dataflow joins land.
+	"flow_between": ScopeRepo,
+	"taint_paths":  ScopeRepo,
 }
 
 // applyDefaultToolScopes registers the canonical scope for every

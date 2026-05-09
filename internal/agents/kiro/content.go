@@ -82,6 +82,13 @@ Gortex is running as an MCP server. It indexes this repository into an in-memory
 | Reading a diff without graph context  | ` + "`diff_context`" + ` — enriches git diff with callers, callees, community, risk |
 | Guessing what context you need next   | ` + "`prefetch_context`" + ` — predicts needed symbols from task + recent activity |
 
+### Dataflow (CPG-lite)
+
+| Instead of...                         | Use...                                   |
+|---------------------------------------|------------------------------------------|
+| Hand-tracing a value through helpers  | ` + "`flow_between(source_id, sink_id, max_depth=8)`" + ` — ranked dataflow paths over ` + "`value_flow`" + ` ∪ ` + "`arg_of`" + ` ∪ ` + "`returns_to`" + ` |
+| Grepping for sources / sinks          | ` + "`taint_paths(source_pattern, sink_pattern)`" + ` — pattern sweep. Patterns: bare = name substring; ` + "`exact:Foo`" + `; ` + "`path:dir/`" + `; ` + "`kind:method`" + `. Sinks auto-expand functions to params. |
+
 ### Multi-Repo Management
 
 | Instead of...                         | Use...                                   |

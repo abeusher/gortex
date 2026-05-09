@@ -190,6 +190,12 @@ Quick reference for all Gortex MCP tools and the knowledge graph schema.
 | verify_change | Checks proposed signature changes against all callers and interface implementors |
 | check_guards | Evaluates project guard rules (.gortex.yaml) against changed symbols |
 
+### Dataflow (CPG-lite)
+| Tool | What it gives you |
+|------|-------------------|
+| flow_between | Ranked dataflow paths between two symbol IDs. Walks ` + "`value_flow`" + ` (intra-procedural) ∪ ` + "`arg_of`" + ` (caller arg → callee param) ∪ ` + "`returns_to`" + ` (callee → assignment). Pass ` + "`max_depth`" + ` (default 8) and ` + "`max_paths`" + ` (default 10). |
+| taint_paths | Pattern-driven dataflow sweep — every flow from a matching source to a matching sink. Patterns: bare token = name substring; ` + "`exact:Foo`" + `; ` + "`path:dir/`" + `; ` + "`kind:method`" + ` (clauses combine with AND). Sinks expand functions to their params automatically. |
+
 ### Code Quality
 | Tool | What it gives you |
 |------|-------------------|
@@ -263,6 +269,7 @@ Quick reference for all Gortex MCP tools and the knowledge graph schema.
 - Calls / structure: calls, imports, defines, implements, extends, references, member_of, instantiates, provides, consumes, composes, aliases, typed_as, returns, captures, param_of
 - Concurrency: spawns (goroutine/async/promise), sends / recvs (channels)
 - Mutation: reads / writes (fields), reads_config / writes_config
+- Dataflow (CPG-lite, ` + "`flow_between`" + ` / ` + "`taint_paths`" + `): value_flow (intra-procedural assignment / return / range), arg_of (caller arg → callee param), returns_to (callee → assignment LHS)
 - Metadata: annotated (decorators), emits (events), throws (errors), queries (SQL), reads_col / writes_col, toggles_flag, depends_on_module, matches (fixtures), generated_by, tests (test → tested symbol), covered_by, owns (CODEOWNERS), authored, licensed_as
 `
 
@@ -314,7 +321,9 @@ const commandDebug = `# Debugging with Gortex
 | Symptom                 | Gortex Approach |
 | ----------------------- | --------------- |
 | Error message           | search_symbols for error-related names -> get_callers on throw sites; analyze kind=error_surface to map who throws what |
-| Wrong return value      | get_call_chain on the function -> trace callees for data flow |
+| Wrong return value      | get_call_chain on the function -> trace callees for data flow; flow_between({source_id, sink_id}) when you suspect the wrong value flows through helpers |
+| Trace bad value to its origin | flow_between({source_id: producer, sink_id: consumer}) — ranked dataflow paths over value_flow / arg_of / returns_to. Faster than reading source for "where did this value come from?" |
+| Find every taint into a sink | taint_paths({source_pattern: "name:Source", sink_pattern: "name:Sink"}) — every flow from any matching source to any matching sink (functions auto-expand to their params on the sink side) |
 | Intermittent failure    | get_editing_context -> look for external calls, async deps; analyze kind=goroutine_spawns to find unowned background work |
 | Channel deadlock        | analyze kind=channel_ops -> channels with sends but no receivers (or vice versa) |
 | Performance issue       | find_usages -> find symbols with many callers (hot paths) |
@@ -344,8 +353,10 @@ const commandImpact = `# Impact Analysis with Gortex
 9. get_test_targets({ids: ["<id1>", "<id2>"]})                      -> Tests to re-run (includes cross-repo)
 10. analyze({kind: "coverage_gaps", path_prefix: "<dir>/"})         -> Undertested code in the change area — extra-risky refactor zones
 11. check_guards({ids: ["<id1>"]})                                  -> Project guard rules from .gortex.yaml
-12. detect_changes({scope: "staged"})                               -> Pre-commit scope check
-13. diff_context({scope: "staged"})                                 -> Graph-enriched diff for review
+12. flow_between({source_id, sink_id})                              -> Ranked dataflow paths between two symbols — catches consumers reached through helpers that get_dependents misses
+13. taint_paths({source_pattern, sink_pattern})                     -> Pattern-driven dataflow sweep — every flow from a matching source to a matching sink
+14. detect_changes({scope: "staged"})                               -> Pre-commit scope check
+15. diff_context({scope: "staged"})                                 -> Graph-enriched diff for review
 ` + "```" + `
 
 ## Understanding Output

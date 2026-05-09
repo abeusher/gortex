@@ -97,6 +97,8 @@ func findAndCallHandler(srv *Server, name string, ctx context.Context, req mcpli
 		"winnow_symbols":        srv.handleWinnowSymbols,
 		"edit_file":             srv.handleEditFile,
 		"write_file":            srv.handleWriteFile,
+		"flow_between":          srv.handleFlowBetween,
+		"taint_paths":           srv.handleTaintPaths,
 	}
 	h, ok := handlers[name]
 	if !ok {

@@ -1401,6 +1401,12 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 
 	if resolve {
 		idx.resolver.ResolveFile(graphPath)
+		// CPG-lite dataflow placeholders for this file: inter-
+		// procedural callees may have just been lifted by
+		// ResolveFile, so re-run the dataflow materialisation pass
+		// to keep arg_of / returns_to edges in sync with the
+		// freshly resolved EdgeCalls graph.
+		idx.materializeDataflowParams()
 	}
 
 	// Update mtime for this file (uses raw relPath for disk-based tracking).
@@ -1420,6 +1426,12 @@ func (idx *Indexer) ResolveAll() {
 	idx.resolver.ResolveAll()
 	idx.resolver.InferImplements()
 	idx.resolver.InferOverrides()
+	// CPG-lite dataflow rewriting must run after the call resolver
+	// has lifted unresolved:: targets; arg_of edges then point at
+	// real function/method nodes whose param nodes can be found,
+	// and returns_to placeholders join cleanly against the
+	// now-resolved EdgeCalls edge at the same caller+line.
+	idx.materializeDataflowParams()
 }
 
 // EvictFile removes all nodes and edges belonging to filePath.
