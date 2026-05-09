@@ -200,6 +200,8 @@ func (s *Server) registerEnhancementTools() {
 		mcp.NewTool("index_health",
 			mcp.WithDescription("Reports the health and completeness of the Gortex index: parse failures, stale files, language coverage, and health score."),
 			mcp.WithBoolean("compact", mcp.Description("Single-line summary output")),
+			mcp.WithString("format", mcp.Description("Output format: json (default), gcx (GCX1 compact wire format), or toon")),
+			mcp.WithNumber("max_bytes", mcp.Description("Cap the marshaled response at this many bytes; truncation metadata rides on the response.")),
 		),
 		s.handleIndexHealth,
 	)

@@ -20,6 +20,8 @@ func (s *Server) registerWorkspaceTools() {
 				"Lists every project in the active workspace. Workspace-scope tool: do not pass `repo`. "+
 					"In workspace mode returns the auto-discovered, non-excluded children. "+
 					"In single-project mode returns the one bound project as a degenerate one-member workspace."),
+			mcp.WithString("format", mcp.Description("Output format: json (default), gcx (GCX1 compact wire format), or toon")),
+			mcp.WithNumber("max_bytes", mcp.Description("Cap the marshaled response at this many bytes; truncation metadata rides on the response.")),
 		),
 		s.handleListRepos,
 	)
@@ -29,6 +31,8 @@ func (s *Server) registerWorkspaceTools() {
 			mcp.WithDescription(
 				"Returns workspace identity: bind mode, root directory, marker contents, the auto-discovered member set, and any unknown marker keys. "+
 					"Workspace-scope tool: do not pass `repo`."),
+			mcp.WithString("format", mcp.Description("Output format: json (default), gcx (GCX1 compact wire format), or toon")),
+			mcp.WithNumber("max_bytes", mcp.Description("Cap the marshaled response at this many bytes; truncation metadata rides on the response.")),
 		),
 		s.handleWorkspaceInfo,
 	)

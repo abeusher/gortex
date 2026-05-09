@@ -195,7 +195,21 @@ func (s *Server) respondJSONOrTOON(ctx context.Context, req mcp.CallToolRequest,
 			payload, _ = applyBudget(payload, budget)
 		}
 	}
-	if s.isTOON(ctx, req) {
+	// TOON is the right fallback whenever the caller (or the
+	// per-session default) asked for a compact format. That covers
+	// two cases:
+	//
+	//  1. Explicit `format=toon` — return TOON.
+	//  2. Session default is gcx but this tool does not have a
+	//     hand-tuned GCX encoder (status-shape tools like graph_stats
+	//     / index_health / list_repos go through this path). Falling
+	//     back to TOON instead of JSON keeps the response compact —
+	//     ~10–15% smaller than JSON for typical payloads — without
+	//     forcing every status tool to ship a bespoke GCX encoder.
+	//
+	// Plain JSON is still the answer when neither toon nor gcx was
+	// requested (unknown clients, explicit `format=json`).
+	if s.isTOON(ctx, req) || s.isGCX(ctx, req) {
 		return returnTOON(payload)
 	}
 	return mcp.NewToolResultJSON(payload)
@@ -625,6 +639,8 @@ func (s *Server) registerCoreTools() {
 	s.mcpServer.AddTool(
 		mcp.NewTool("get_repo_outline",
 			mcp.WithDescription("Narrative single-call overview of the indexed codebase: primary languages, top communities, load-bearing hotspots, most-imported files, and entry points. Use at session start (or when onboarding to an unfamiliar repo) instead of assembling this from graph_stats + analyze + manual inspection. Output stays under ~1k tokens."),
+			mcp.WithString("format", mcp.Description("Output format: json (default), gcx (GCX1 compact wire format), or toon")),
+			mcp.WithNumber("max_bytes", mcp.Description("Cap the marshaled response at this many bytes; truncation metadata rides on the response.")),
 		),
 		s.handleGetRepoOutline,
 	)
@@ -632,6 +648,8 @@ func (s *Server) registerCoreTools() {
 	s.mcpServer.AddTool(
 		mcp.NewTool("graph_stats",
 			mcp.WithDescription("Returns a compact summary of the indexed codebase: node/edge counts by kind and language. Call at session start to orient Claude in an unfamiliar repo."),
+			mcp.WithString("format", mcp.Description("Output format: json (default), gcx (GCX1 compact wire format), or toon")),
+			mcp.WithNumber("max_bytes", mcp.Description("Cap the marshaled response at this many bytes; truncation metadata rides on the response.")),
 		),
 		s.handleGraphStats,
 	)

@@ -44,6 +44,8 @@ func (s *Server) registerMultiRepoTools() {
 	s.mcpServer.AddTool(
 		mcp.NewTool("get_active_project",
 			mcp.WithDescription("Return the current active project name and its list of member repositories."),
+			mcp.WithString("format", mcp.Description("Output format: json (default), gcx (GCX1 compact wire format), or toon")),
+			mcp.WithNumber("max_bytes", mcp.Description("Cap the marshaled response at this many bytes; truncation metadata rides on the response.")),
 		),
 		s.handleGetActiveProject,
 	)

@@ -23,6 +23,8 @@ func (s *Server) registerAnalysisTools() {
 		mcp.NewTool("get_processes",
 			mcp.WithDescription("Returns discovered execution flows — named chains of function calls starting from entry points. Without id: list all processes. With id: full step-by-step call chain for that process."),
 			mcp.WithString("id", mcp.Description("Optional process ID (e.g. process-0). When set, returns the full step-by-step call chain for that process instead of the list.")),
+			mcp.WithString("format", mcp.Description("Output format: json (default), gcx (GCX1 compact wire format), or toon")),
+			mcp.WithNumber("max_bytes", mcp.Description("Cap the marshaled response at this many bytes; truncation metadata rides on the response.")),
 		),
 		s.handleGetProcesses,
 	)
