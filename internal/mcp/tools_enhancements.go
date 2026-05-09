@@ -90,6 +90,7 @@ func (s *Server) registerEnhancementTools() {
 			mcp.WithDescription("Evaluates project-specific guard rules against a set of changed symbols. Reports co-change and boundary violations."),
 			mcp.WithString("ids", mcp.Required(), mcp.Description("Comma-separated list of changed symbol IDs")),
 			mcp.WithBoolean("compact", mcp.Description("One-line-per-rule text output")),
+			mcp.WithString("format", mcp.Description("Output format: json (default) or gcx (GCX1 compact wire format)")),
 		),
 		s.handleCheckGuards,
 	)
@@ -102,6 +103,7 @@ func (s *Server) registerEnhancementTools() {
 			mcp.WithString("recent_symbols", mcp.Description("Comma-separated list of recently viewed symbol IDs")),
 			mcp.WithBoolean("include_source", mcp.Description("Include source code for top 5 candidates")),
 			mcp.WithBoolean("compact", mcp.Description("One-line-per-symbol text output")),
+			mcp.WithString("format", mcp.Description("Output format: json (default) or gcx (GCX1 compact wire format)")),
 		),
 		s.handlePrefetchContext,
 	)
@@ -240,6 +242,7 @@ func (s *Server) registerEnhancementTools() {
 			mcp.WithString("tool_source", mcp.Description("Which tool produced the context: smart_context or prefetch_context (default: smart_context). For query: filter by source or 'all'")),
 			mcp.WithNumber("top_n", mcp.Description("(query) Number of top symbols to return per category (default: 10)")),
 			mcp.WithBoolean("compact", mcp.Description("(query) One-line-per-symbol text output")),
+			mcp.WithString("format", mcp.Description("(query) Output format: json (default) or gcx (GCX1 compact wire format)")),
 		),
 		s.handleFeedback,
 	)
@@ -319,6 +322,9 @@ func (s *Server) handleCheckGuards(ctx context.Context, req mcp.CallToolRequest)
 	}
 
 	if len(s.guardRules) == 0 {
+		if s.isGCX(ctx, req) {
+			return gcxResponse(encodeCheckGuards(nil, true))
+		}
 		return mcp.NewToolResultJSON(map[string]any{
 			"violations": []any{},
 			"message":    "no guard rules configured",
@@ -336,6 +342,10 @@ func (s *Server) handleCheckGuards(ctx context.Context, req mcp.CallToolRequest)
 			b.WriteString("no guard rule violations\n")
 		}
 		return mcp.NewToolResultText(b.String()), nil
+	}
+
+	if s.isGCX(ctx, req) {
+		return gcxResponse(encodeCheckGuards(violations, false))
 	}
 
 	return mcp.NewToolResultJSON(map[string]any{
@@ -585,6 +595,10 @@ func (s *Server) handlePrefetchContext(ctx context.Context, req mcp.CallToolRequ
 			fmt.Fprintf(&b, "... truncated (%d total)\n", totalCount)
 		}
 		return mcp.NewToolResultText(b.String()), nil
+	}
+
+	if s.isGCX(ctx, req) {
+		return gcxResponse(encodePrefetchContext(candidates, totalCount, truncated, includeSource))
 	}
 
 	return mcp.NewToolResultJSON(map[string]any{
@@ -3175,13 +3189,17 @@ func (s *Server) handleRecordFeedback(ctx context.Context, req mcp.CallToolReque
 
 func (s *Server) handleQueryFeedback(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	if s.feedback == nil || !s.feedback.HasData() {
-		return mcp.NewToolResultJSON(map[string]any{
+		empty := map[string]any{
 			"total_entries": 0,
-			"accuracy":      0,
+			"accuracy":      0.0,
 			"most_useful":   []any{},
 			"most_missed":   []any{},
 			"most_demoted":  []any{},
-		})
+		}
+		if s.isGCX(ctx, req) {
+			return gcxResponse(encodeFeedbackQuery(empty))
+		}
+		return mcp.NewToolResultJSON(empty)
 	}
 
 	topN := 10
@@ -3198,6 +3216,10 @@ func (s *Server) handleQueryFeedback(ctx context.Context, req mcp.CallToolReques
 		fmt.Fprintf(&sb, "Feedback: %v entries, %.0f%% accuracy\n",
 			stats["total_entries"], stats["accuracy"].(float64)*100)
 		return mcp.NewToolResultText(sb.String()), nil
+	}
+
+	if s.isGCX(ctx, req) {
+		return gcxResponse(encodeFeedbackQuery(stats))
 	}
 
 	return mcp.NewToolResultJSON(stats)

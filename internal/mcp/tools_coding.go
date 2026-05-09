@@ -41,6 +41,7 @@ func (s *Server) registerCodingTools() {
 		mcp.NewTool("explain_change_impact",
 			mcp.WithDescription("Given a list of symbols you plan to modify, returns risk-tiered blast radius: d=1 will break, d=2 likely affected, d=3 needs testing. Includes affected processes and communities."),
 			mcp.WithString("ids", mcp.Required(), mcp.Description("Comma-separated list of symbol IDs to modify")),
+			mcp.WithString("format", mcp.Description("Output format: json (default) or gcx (GCX1 compact wire format)")),
 		),
 		s.handleEnhancedChangeImpact,
 	)

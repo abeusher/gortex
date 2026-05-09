@@ -307,6 +307,14 @@ func (s *Server) handleEnhancedChangeImpact(ctx context.Context, req mcp.CallToo
 		}
 	}
 
+	if s.isGCX(ctx, req) {
+		// encodeChangeImpact reads the same map shape we'd return as
+		// JSON; routing through it keeps a single source of truth for
+		// field names and avoids divergence on the next analyzer
+		// addition.
+		return gcxResponse(encodeChangeImpact(result))
+	}
+
 	return mcp.NewToolResultJSON(result)
 }
 

@@ -54,6 +54,45 @@ func TestRouter_LocalFastPath(t *testing.T) {
 	}
 }
 
+// TestRouter_LocalFastPath_CtxPropagates: callLocal must forward the
+// caller's ctx verbatim. A previous regression replaced ctx with
+// context.Background() inside callLocal, which silently dropped every
+// per-session value attached upstream — most visibly the
+// `mcp.WithSessionID` value the daemon dispatcher uses to route a
+// tool call to the right per-session state. With ctx lost, the
+// session-default wire-format negotiation (claude-code → gcx) saw an
+// empty session ID and fell through to JSON. This test pins the
+// invariant: whatever ctx the caller passes, the local executor sees.
+func TestRouter_LocalFastPath_CtxPropagates(t *testing.T) {
+	type ctxKey struct{}
+	cfg := &ServersConfig{
+		Server: []ServerEntry{
+			{Slug: "local", URL: "unix:///tmp/local.sock", Default: true},
+		},
+	}
+	var seen string
+	r := NewRouter(RouterConfig{
+		Servers:   cfg,
+		Rosters:   NewWorkspaceRosterCache(time.Minute),
+		LocalSlug: "local",
+		LocalExecute: func(ctx context.Context, _ string, _ []byte) ([]byte, int, error) {
+			if v, ok := ctx.Value(ctxKey{}).(string); ok {
+				seen = v
+			}
+			return []byte(`{}`), 200, nil
+		},
+		Logger: zap.NewNop(),
+	})
+	want := "session-marker"
+	ctx := context.WithValue(context.Background(), ctxKey{}, want)
+	if _, _, err := r.RouteToolCall(ctx, "search_symbols", []byte(`{}`), RouteContext{}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if seen != want {
+		t.Fatalf("local executor saw ctx value %q, want %q — ctx was discarded", seen, want)
+	}
+}
+
 // TestRouter_ProxyToRemote: when the scope override targets a slug
 // that is NOT the localSlug, the router must proxy to the upstream
 // server's POST /v1/tools/<name>. The upstream is a httptest server

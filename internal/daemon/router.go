@@ -155,12 +155,17 @@ func (r *Router) RouteToolCall(ctx context.Context, toolName string, body []byte
 }
 
 // callLocal invokes the local executor or returns an error if the
-// router was constructed without one.
-func (r *Router) callLocal(_ context.Context, toolName string, body []byte) ([]byte, int, error) {
+// router was constructed without one. The caller's ctx is forwarded
+// verbatim so per-session values attached upstream (notably
+// `mcp.WithSessionID`) reach the tool handler — discarding ctx here
+// would let local-fast-path tool calls run under context.Background
+// and lose every per-session signal (client name → default wire
+// format, in-flight cancellation, deadlines, etc.).
+func (r *Router) callLocal(ctx context.Context, toolName string, body []byte) ([]byte, int, error) {
 	if r.localExecute == nil {
 		return nil, 0, fmt.Errorf("%w: no local executor wired", ErrRouteUnresolved)
 	}
-	return r.localExecute(context.Background(), toolName, body)
+	return r.localExecute(ctx, toolName, body)
 }
 
 // clientFor returns the ServerClient for the given entry, building

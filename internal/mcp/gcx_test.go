@@ -7,6 +7,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	wire "github.com/gortexhq/gcx-go"
+	"github.com/zzet/gortex/internal/analysis"
 	"github.com/zzet/gortex/internal/contracts"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/query"
@@ -455,4 +456,192 @@ func TestRequestedFormat_CoversCompactAndFormatArgs(t *testing.T) {
 	require.Equal(t, wire.FormatGCX, f)
 	require.Equal(t, wire.FormatText, wire.ParseFormat("compact"))
 	require.Equal(t, wire.FormatJSON, wire.ParseFormat(""))
+}
+
+func TestEncodePrefetchContext_RoundTrip(t *testing.T) {
+	n := newTestNode("a.go::Foo", "Foo", graph.KindFunction, "a.go", 10)
+	cands := []prefetchCandidate{{
+		Node:            n,
+		ID:              n.ID,
+		Kind:            string(n.Kind),
+		FilePath:        n.FilePath,
+		StartLine:       n.StartLine,
+		Reason:          "matches task keyword",
+		Confidence:      0.825,
+		SearchRelevance: 0.9,
+		GraphProximity:  0.5,
+		CommunityBonus:  0.0,
+	}}
+	payload, err := encodePrefetchContext(cands, 1, false, false)
+	require.NoError(t, err)
+	dec := wire.NewDecoder(strings.NewReader(string(payload)))
+	h, err := dec.Header()
+	require.NoError(t, err)
+	require.Equal(t, "prefetch_context", h.Tool)
+	require.Equal(t, "1", h.Meta["total"])
+	require.Equal(t, "false", h.Meta["truncated"])
+	rows, err := dec.All()
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	require.Equal(t, "a.go::Foo", rows[0]["id"])
+	require.Equal(t, "matches task keyword", rows[0]["reason"])
+	require.Equal(t, "0.825", rows[0]["confidence"])
+}
+
+// TestEncodePrefetchContext_IncludeSourceAddsField pins the schema
+// flip when include_source is set — the encoder must add a `source`
+// column rather than emit it as a meta field, so a decoder iterating
+// rows sees the source inline.
+func TestEncodePrefetchContext_IncludeSourceAddsField(t *testing.T) {
+	n := newTestNode("a.go::Foo", "Foo", graph.KindFunction, "a.go", 10)
+	cands := []prefetchCandidate{{
+		Node:      n,
+		ID:        n.ID,
+		Kind:      string(n.Kind),
+		FilePath:  n.FilePath,
+		StartLine: n.StartLine,
+		Source:    "func Foo() {}\n",
+	}}
+	payload, err := encodePrefetchContext(cands, 1, false, true)
+	require.NoError(t, err)
+	dec := wire.NewDecoder(strings.NewReader(string(payload)))
+	h, _ := dec.Header()
+	require.Contains(t, h.Fields, "source")
+	rows, _ := dec.All()
+	require.Equal(t, "func Foo() {}\n", rows[0]["source"])
+}
+
+func TestEncodeChangeImpact_SummaryAndEntries(t *testing.T) {
+	result := map[string]any{
+		"risk":                 analysis.RiskHigh,
+		"summary":              "high blast radius",
+		"total_affected":       2,
+		"cross_repo_impact":    false,
+		"affected_processes":   []string{"checkout", "billing"},
+		"affected_communities": []string{"core"},
+		"test_files":           []string{"foo_test.go"},
+		"by_depth": map[int][]analysis.ImpactEntry{
+			1: {{ID: "a.go::Foo", Name: "Foo", Kind: "function", FilePath: "a.go", Line: 10, EdgeConfidence: 0.95, ConfidenceLabel: "EXTRACTED"}},
+			2: {{ID: "b.go::Bar", Name: "Bar", Kind: "method", FilePath: "b.go", Line: 22}},
+		},
+		"cross_community_warning": "",
+		"community_note":          "change is community-local",
+	}
+	payload, err := encodeChangeImpact(result)
+	require.NoError(t, err)
+	dec := wire.NewDecoder(strings.NewReader(string(payload)))
+
+	// Section 1 — summary.
+	h, _ := dec.Header()
+	require.Equal(t, "explain_change_impact.summary", h.Tool)
+	rows, _ := dec.All()
+	require.Len(t, rows, 1)
+	require.Equal(t, string(analysis.RiskHigh), rows[0]["risk"])
+	require.Equal(t, "checkout,billing", rows[0]["processes"])
+
+	// Section 2 — entries.
+	h, err = dec.NextSection()
+	require.NoError(t, err)
+	require.Equal(t, "explain_change_impact.entries", h.Tool)
+	rows, _ = dec.All()
+	require.Len(t, rows, 2)
+	require.Equal(t, "1", rows[0]["depth"])
+	require.Equal(t, "a.go::Foo", rows[0]["id"])
+	require.Equal(t, "2", rows[1]["depth"])
+}
+
+// TestEncodeChangeImpact_ContractsSection emits the contract-impact
+// counters when the JSON path attaches `contract_impact`. Skipping
+// this section when the field is absent is also pinned here.
+func TestEncodeChangeImpact_ContractsSection(t *testing.T) {
+	result := map[string]any{
+		"risk":           analysis.RiskMedium,
+		"summary":        "ok",
+		"total_affected": 0,
+		"by_depth":       map[int][]analysis.ImpactEntry{},
+		"contract_impact": &contractImpact{
+			Affected: []contractImpactEntry{{ContractID: "x"}},
+			Breaking: 1,
+			Warning:  2,
+			Info:     3,
+		},
+	}
+	payload, err := encodeChangeImpact(result)
+	require.NoError(t, err)
+	dec := wire.NewDecoder(strings.NewReader(string(payload)))
+	// Read summary, then advance past entries to reach contracts.
+	_, _ = dec.Header()
+	_, _ = dec.All()
+	_, err = dec.NextSection() // entries
+	require.NoError(t, err)
+	_, _ = dec.All()
+	h, err := dec.NextSection() // contracts
+	require.NoError(t, err)
+	require.Equal(t, "explain_change_impact.contracts", h.Tool)
+	rows, _ := dec.All()
+	require.Len(t, rows, 1)
+	require.Equal(t, "1", rows[0]["breaking"])
+	require.Equal(t, "1", rows[0]["affected"])
+}
+
+func TestEncodeCheckGuards_RowsAndMeta(t *testing.T) {
+	violations := []analysis.GuardViolation{
+		{RuleName: "no_cross_layer", Kind: "boundary", Description: "mcp imports daemon"},
+	}
+	payload, err := encodeCheckGuards(violations, false)
+	require.NoError(t, err)
+	dec := wire.NewDecoder(strings.NewReader(string(payload)))
+	h, _ := dec.Header()
+	require.Equal(t, "check_guards", h.Tool)
+	require.Equal(t, "1", h.Meta["total"])
+	rows, _ := dec.All()
+	require.Len(t, rows, 1)
+	require.Equal(t, "no_cross_layer", rows[0]["rule_name"])
+	// Description is a row value (tab-delimited) so it can carry
+	// spaces; pin that here so a future schema rev can't accidentally
+	// move it into meta.
+	require.Equal(t, "mcp imports daemon", rows[0]["description"])
+
+	// No-rules path: status is a single-token meta flag (the wire
+	// header parser splits on raw spaces, so multi-word values would
+	// corrupt the header).
+	payload, err = encodeCheckGuards(nil, true)
+	require.NoError(t, err)
+	dec = wire.NewDecoder(strings.NewReader(string(payload)))
+	h, err = dec.Header()
+	require.NoError(t, err)
+	require.Equal(t, "0", h.Meta["total"])
+	require.Equal(t, "no_rules_configured", h.Meta["status"])
+}
+
+func TestEncodeFeedbackQuery_AllSectionsEmittedEvenWhenEmpty(t *testing.T) {
+	stats := map[string]any{
+		"total_entries": 5,
+		"accuracy":      0.8,
+		"most_useful":   []any{},
+		"most_missed":   []any{},
+		"most_demoted":  []any{},
+	}
+	payload, err := encodeFeedbackQuery(stats)
+	require.NoError(t, err)
+	dec := wire.NewDecoder(strings.NewReader(string(payload)))
+	tools := []string{}
+	h, err := dec.Header()
+	require.NoError(t, err)
+	tools = append(tools, h.Tool)
+	_, _ = dec.All()
+	for {
+		h, err := dec.NextSection()
+		if err != nil {
+			break
+		}
+		tools = append(tools, h.Tool)
+		_, _ = dec.All()
+	}
+	require.Equal(t, []string{
+		"feedback.summary",
+		"feedback.most_useful",
+		"feedback.most_missed",
+		"feedback.most_demoted",
+	}, tools)
 }

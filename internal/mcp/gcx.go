@@ -3,6 +3,7 @@ package mcp
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 
 	wire "github.com/gortexhq/gcx-go"
+	"github.com/zzet/gortex/internal/analysis"
 	"github.com/zzet/gortex/internal/contracts"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/query"
@@ -930,6 +932,254 @@ func encodeSmartContext(result map[string]any) ([]byte, error) {
 		}
 	}
 
+	return buf.Bytes(), nil
+}
+
+// --------------------------------------------------------------------
+// prefetch_context, explain_change_impact, check_guards, feedback.query
+// --------------------------------------------------------------------
+
+// encodePrefetchContext emits one row per ranked candidate with the
+// per-axis score contributions inlined (search/proximity/community)
+// so consumers can recover the attribution without a nested object.
+// Source — when include_source was set on the request — rides as the
+// last field, escaped via the wire encoder so newlines stay one row.
+func encodePrefetchContext(candidates []prefetchCandidate, total int, truncated bool, includeSource bool) ([]byte, error) {
+	fields := []string{"id", "kind", "name", "path", "line", "confidence", "search", "proximity", "community", "reason"}
+	if includeSource {
+		fields = append(fields, "source")
+	}
+	var buf bytes.Buffer
+	enc := newGCX(&buf, "prefetch_context",
+		fields,
+		"total", fmt.Sprintf("%d", total),
+		"truncated", boolString(truncated),
+	)
+	if err := enc.WriteComment(fmt.Sprintf("%d candidate(s)", len(candidates))); err != nil {
+		return nil, err
+	}
+	for _, c := range candidates {
+		row := []any{
+			c.ID,
+			c.Kind,
+			nodeShort(c.Node),
+			c.FilePath,
+			c.StartLine,
+			roundFloat(c.Confidence),
+			roundFloat(c.SearchRelevance),
+			roundFloat(c.GraphProximity),
+			roundFloat(c.CommunityBonus),
+			c.Reason,
+		}
+		if includeSource {
+			row = append(row, c.Source)
+		}
+		if err := enc.WriteRow(row...); err != nil {
+			return nil, err
+		}
+	}
+	return buf.Bytes(), enc.Close()
+}
+
+// encodeChangeImpact emits a multi-section envelope for the
+// explain_change_impact tool. Section layout:
+//
+//   - explain_change_impact.summary (one row): risk, total, communities/processes
+//     joined with `,` so the section stays one row regardless of fan-out.
+//   - explain_change_impact.entries (one row per affected symbol): the
+//     by_depth + by_repo maps are flattened into a single table — `repo`
+//     is empty unless the change crosses repos.
+//   - explain_change_impact.contracts (one row when contract_impact is set):
+//     breaking/warning/info counters + the validate-pass risk upgrade flag.
+func encodeChangeImpact(result map[string]any) ([]byte, error) {
+	var buf bytes.Buffer
+
+	risk, _ := result["risk"].(analysis.RiskLevel)
+	summaryStr, _ := result["summary"].(string)
+	totalAffected, _ := result["total_affected"].(int)
+	crossRepo, _ := result["cross_repo_impact"].(bool)
+	processes, _ := result["affected_processes"].([]string)
+	communities, _ := result["affected_communities"].([]string)
+	testFiles, _ := result["test_files"].([]string)
+	warning, _ := result["cross_community_warning"].(string)
+	communityNote, _ := result["community_note"].(string)
+	contractRiskUpgrade, _ := result["contract_risk_upgrade"].(string)
+
+	sumEnc := newGCX(&buf, "explain_change_impact.summary",
+		[]string{"risk", "summary", "total_affected", "cross_repo", "processes", "communities", "test_files", "warning", "note", "risk_upgrade"},
+	)
+	if err := sumEnc.WriteRow(
+		string(risk),
+		summaryStr,
+		totalAffected,
+		boolString(crossRepo),
+		strings.Join(processes, ","),
+		strings.Join(communities, ","),
+		strings.Join(testFiles, ","),
+		warning,
+		communityNote,
+		contractRiskUpgrade,
+	); err != nil {
+		return nil, err
+	}
+	if err := sumEnc.Close(); err != nil {
+		return nil, err
+	}
+
+	// Flatten by_depth (and by_repo when cross-repo) into a single
+	// rows section. We carry depth + repo so consumers can regroup.
+	entryFields := []string{"depth", "repo", "id", "name", "kind", "path", "line", "edge_confidence", "confidence_label"}
+	entryEnc := newGCX(&buf, "explain_change_impact.entries", entryFields)
+	totalRows := 0
+	if byDepth, ok := result["by_depth"].(map[int][]analysis.ImpactEntry); ok {
+		// Sort depths so output is deterministic.
+		depths := make([]int, 0, len(byDepth))
+		for d := range byDepth {
+			depths = append(depths, d)
+		}
+		sort.Ints(depths)
+		for _, d := range depths {
+			for _, e := range byDepth[d] {
+				if err := entryEnc.WriteRow(
+					d,
+					e.RepoPrefix,
+					e.ID,
+					e.Name,
+					e.Kind,
+					e.FilePath,
+					e.Line,
+					roundFloat(e.EdgeConfidence),
+					e.ConfidenceLabel,
+				); err != nil {
+					return nil, err
+				}
+				totalRows++
+			}
+		}
+	}
+	if err := entryEnc.Close(); err != nil {
+		return nil, err
+	}
+
+	if ci, ok := result["contract_impact"].(*contractImpact); ok && ci != nil {
+		ciEnc := newGCX(&buf, "explain_change_impact.contracts",
+			[]string{"breaking", "warning", "info", "affected"},
+		)
+		if err := ciEnc.WriteRow(ci.Breaking, ci.Warning, ci.Info, len(ci.Affected)); err != nil {
+			return nil, err
+		}
+		if err := ciEnc.Close(); err != nil {
+			return nil, err
+		}
+	}
+	return buf.Bytes(), nil
+}
+
+// encodeCheckGuards emits one row per guard violation. The empty case
+// (no rules / no violations) still produces a valid envelope so agents
+// can rely on the GCX1 header to differentiate from an error payload —
+// the meta `status=no_rules_configured` flag carries the "no rules"
+// hint as a single token (the decoder splits the header on raw spaces,
+// so multi-word meta values must stay tokenised).
+func encodeCheckGuards(violations []analysis.GuardViolation, noRulesConfigured bool) ([]byte, error) {
+	var buf bytes.Buffer
+	meta := []string{"total", fmt.Sprintf("%d", len(violations))}
+	if noRulesConfigured {
+		meta = append(meta, "status", "no_rules_configured")
+	}
+	enc := newGCX(&buf, "check_guards",
+		[]string{"rule_name", "kind", "description"},
+		meta...,
+	)
+	for _, v := range violations {
+		if err := enc.WriteRow(v.RuleName, v.Kind, v.Description); err != nil {
+			return nil, err
+		}
+	}
+	return buf.Bytes(), enc.Close()
+}
+
+// encodeFeedbackQuery emits a multi-section envelope:
+//
+//   - feedback.summary (one row): total_entries, accuracy
+//   - feedback.most_useful, feedback.most_missed, feedback.most_demoted
+//     (one row per ranked symbol): id, score, count
+//
+// Empty lists still emit their section so consumers can iterate without
+// branching on existence — the meta count is the source of truth.
+func encodeFeedbackQuery(stats map[string]any) ([]byte, error) {
+	var buf bytes.Buffer
+
+	totalEntries := 0
+	if v, ok := stats["total_entries"].(int); ok {
+		totalEntries = v
+	}
+	accuracy := 0.0
+	if v, ok := stats["accuracy"].(float64); ok {
+		accuracy = v
+	}
+	sumEnc := newGCX(&buf, "feedback.summary",
+		[]string{"total_entries", "accuracy"},
+	)
+	if err := sumEnc.WriteRow(totalEntries, roundFloat(accuracy)); err != nil {
+		return nil, err
+	}
+	if err := sumEnc.Close(); err != nil {
+		return nil, err
+	}
+
+	emit := func(section string, key string) error {
+		enc := newGCX(&buf, section,
+			[]string{"id", "score", "count"},
+		)
+		// AggregatedStats produces an unexported `ranked` slice we
+		// can only see through reflection. Coerce via JSON shape:
+		// the published schema is {id, score, count}, so we read
+		// it through a generic any-decoder.
+		rows, _ := stats[key].([]any)
+		if rows == nil {
+			// Strongly-typed path — re-marshal whatever AggregatedStats
+			// returned and decode into a slice of {id, score, count}.
+			if raw, err := json.Marshal(stats[key]); err == nil {
+				var coerced []struct {
+					ID    string  `json:"id"`
+					Score float64 `json:"score"`
+					Count int     `json:"count"`
+				}
+				_ = json.Unmarshal(raw, &coerced)
+				for _, r := range coerced {
+					if err := enc.WriteRow(r.ID, roundFloat(r.Score), r.Count); err != nil {
+						return err
+					}
+				}
+				return enc.Close()
+			}
+		}
+		for _, row := range rows {
+			m, _ := row.(map[string]any)
+			id, _ := m["id"].(string)
+			score, _ := m["score"].(float64)
+			count := 0
+			if v, ok := m["count"].(int); ok {
+				count = v
+			} else if v, ok := m["count"].(float64); ok {
+				count = int(v)
+			}
+			if err := enc.WriteRow(id, roundFloat(score), count); err != nil {
+				return err
+			}
+		}
+		return enc.Close()
+	}
+	if err := emit("feedback.most_useful", "most_useful"); err != nil {
+		return nil, err
+	}
+	if err := emit("feedback.most_missed", "most_missed"); err != nil {
+		return nil, err
+	}
+	if err := emit("feedback.most_demoted", "most_demoted"); err != nil {
+		return nil, err
+	}
 	return buf.Bytes(), nil
 }
 
