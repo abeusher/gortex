@@ -198,6 +198,16 @@ Quick reference for all Gortex MCP tools and the knowledge graph schema.
 | flow_between | Ranked dataflow paths between two symbol IDs. Walks ` + "`value_flow`" + ` (intra-procedural) ∪ ` + "`arg_of`" + ` (caller arg → callee param) ∪ ` + "`returns_to`" + ` (callee → assignment). Pass ` + "`max_depth`" + ` (default 8) and ` + "`max_paths`" + ` (default 10). |
 | taint_paths | Pattern-driven dataflow sweep — every flow from a matching source to a matching sink. Patterns: bare token = name substring; ` + "`exact:Foo`" + `; ` + "`path:dir/`" + `; ` + "`kind:method`" + ` (clauses combine with AND). Sinks expand functions to their params automatically. |
 
+### Diagnostics & Code Actions
+| Tool | What it gives you |
+|------|-------------------|
+| subscribe_diagnostics | Opt the session into push ` + "`notifications/diagnostics`" + ` from every running language server. Initial state replays as ` + "`initial_replay: true`" + `; thereafter only delta-changed files are pushed (sha256-suppressed). ` + "`min_severity`" + ` (1=error, 2=warning, 3=info, 4=hint) and ` + "`path_prefix`" + ` filters scope what reaches the session. Eliminates the poll-after-edit loop. |
+| unsubscribe_diagnostics | Opt out of push notifications. Idempotent; fires automatically on session disconnect, so explicit calls are only needed when narrowing scope. |
+| get_diagnostics | Latest stored ` + "`publishDiagnostics`" + ` for a file (the polling form). Pass ` + "`wait: true`" + ` + ` + "`timeout_ms`" + ` to block on the first publish — useful right after ` + "`didOpen`" + ` when no event has fired yet. |
+| get_code_actions | LSP code actions for a file (and optional range). Returns the menu of fixes / refactors / source actions the language server offers. |
+| apply_code_action | Apply a single CodeAction → WorkspaceEdit on disk. Atomic temp+rename; supports both legacy ` + "`changes`" + ` and modern ` + "`documentChanges`" + ` shapes; UTF-16 column math correctly maps LSP positions onto the byte offset in the source. |
+| fix_all_in_file | One-shot ` + "`source.fixAll`" + ` over an entire file. Bundles every server-suggested fix in a single round-trip. |
+
 ### Code Quality
 | Tool | What it gives you |
 |------|-------------------|

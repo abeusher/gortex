@@ -142,6 +142,10 @@ func TestInstructionsBody_AdvertisesKeyTools(t *testing.T) {
 		// Infrastructure-as-graph surface (K8s / Kustomize / Dockerfile).
 		"k8s_resources", "images", "kustomize",
 		"uses_env", "configures", "mounts", "exposes", "depends_on",
+		// Push diagnostics + code actions surface.
+		"subscribe_diagnostics", "unsubscribe_diagnostics",
+		"get_diagnostics", "get_code_actions", "apply_code_action",
+		"fix_all_in_file", "notifications/diagnostics",
 	} {
 		if !strings.Contains(InstructionsBody, token) {
 			t.Errorf("InstructionsBody no longer mentions %q — a doc regression would ship to every adapter", token)

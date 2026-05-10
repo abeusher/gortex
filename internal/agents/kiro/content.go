@@ -62,6 +62,16 @@ Gortex is running as an MCP server. It indexes this repository into an in-memory
 | Manually checking team conventions    | ` + "`check_guards`" + ` — evaluates guard rules from .gortex.yaml |
 | Wondering if a new dep creates a cycle| ` + "`analyze`" + ` with ` + "`kind: \"would_create_cycle\"`" + ` — checks before you add it |
 
+### Diagnostics and Code Actions
+
+| Instead of...                            | Use...                                   |
+|------------------------------------------|------------------------------------------|
+| Polling for diagnostics after every edit | ` + "`subscribe_diagnostics`" + ` — opt into push ` + "`notifications/diagnostics`" + `. Initial state replays as ` + "`initial_replay: true`" + `; thereafter delta-changed files only. ` + "`min_severity`" + ` / ` + "`path_prefix`" + ` filters scope the stream. |
+| Manual diagnostics fetch                 | ` + "`get_diagnostics`" + ` — last stored ` + "`publishDiagnostics`" + ` for a file; ` + "`wait`" + ` + ` + "`timeout_ms`" + ` block until the first publish. |
+| Forgetting to opt out                    | ` + "`unsubscribe_diagnostics`" + ` — idempotent; auto-fires on session disconnect. |
+| Hand-applying compiler suggestions       | ` + "`get_code_actions`" + ` then ` + "`apply_code_action`" + ` (atomic temp+rename, both ` + "`changes`" + ` and ` + "`documentChanges`" + `). |
+| Walking a file to apply every fix        | ` + "`fix_all_in_file`" + ` — one-shot ` + "`source.fixAll`" + ` for the whole file. |
+
 ### Code Quality and Analysis
 
 | Instead of...                         | Use...                                   |

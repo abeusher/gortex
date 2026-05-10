@@ -58,6 +58,18 @@ Order of preference: **gcx > toon > json**. For known clients (claude-code, curs
 | Manually checking team conventions    | `check_guards` — evaluates guard rules from .gortex.yaml |
 | Wondering if a new dep creates a cycle| `analyze` with `kind: "would_create_cycle"` — checks before you add it |
 
+### Diagnostics and Code Actions
+
+Wired to every running language server (gopls, tsserver, pyright, rust-analyzer, clangd, jdtls, kotlin-language-server, omnisharp, ruby-lsp, phpactor, lua-language-server, sourcekit-lsp, haskell-language-server, elixir-ls, ocamllsp, zls, terraform-ls, yaml-language-server, json-language-server, bash-language-server). One unified surface across all of them:
+
+| Instead of...                           | You MUST use...                          |
+|-----------------------------------------|------------------------------------------|
+| Polling for diagnostics after every edit | `subscribe_diagnostics` — opt the session into push `notifications/diagnostics`. Initial state replays immediately as `initial_replay: true`; thereafter only delta-changed files are pushed (hash-suppressed). Filter with `min_severity` (1=error, 2=warning, 3=info, 4=hint) or `path_prefix` (absolute prefix). |
+| Manual diagnostics fetch                | `get_diagnostics` — latest stored `publishDiagnostics` for a file. Pass `wait: true` + `timeout_ms` to block on the first publish (e.g. right after a fresh `didOpen`). |
+| Forgetting to opt back out              | `unsubscribe_diagnostics` — idempotent, fires automatically on session disconnect. |
+| Hand-applying compiler suggestions      | `get_code_actions` for a file (and optional range), then `apply_code_action` on the chosen one. Atomic temp+rename, both legacy `changes` and modern `documentChanges`, UTF-16 column math. |
+| Walking the whole file to apply every fix | `fix_all_in_file` — runs `source.fixAll` over the whole file in one round-trip. |
+
 ### Code Quality and Analysis
 
 The `analyze` MCP tool is a unified dispatcher. Supported `kind` values:
