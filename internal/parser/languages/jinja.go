@@ -4,88 +4,82 @@ import (
 	"regexp"
 	"strings"
 
+	jinjaforest "github.com/alexaandru/go-sitter-forest/jinja"
+
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/parser"
+	"github.com/zzet/gortex/internal/parser/forest"
 )
 
-// Jinja2 wraps control flow in `{% ... %}` and expressions in
-// `{{ ... }}`. The extractor captures `{% block name %}` and
-// `{% macro name(args) %}` as function nodes, and the family of
-// `extends`, `include`, `import`, `from ... import ...` tags as
-// import edges. Block and macro bodies are closed by matching
-// `{% endblock %}` / `{% endmacro %}` which we find by keyword scan.
+// Jinja2 migration: forest's walker (per-language map for
+// `macro_statement`) catches `{% macro %}` definitions. Block
+// definitions and the family of import tags (`extends` / `include`
+// / `import` / `from … import`) stay regex.
 var (
 	jinjaBlockRe      = regexp.MustCompile(`(?m)\{%\s*block\s+([A-Za-z_][\w]*)`)
-	jinjaMacroRe      = regexp.MustCompile(`(?m)\{%\s*macro\s+([A-Za-z_][\w]*)\s*\(`)
 	jinjaExtendsRe    = regexp.MustCompile(`(?m)\{%\s*extends\s+['"]([^'"]+)['"]`)
 	jinjaIncludeRe    = regexp.MustCompile(`(?m)\{%\s*include\s+['"]([^'"]+)['"]`)
 	jinjaImportRe     = regexp.MustCompile(`(?m)\{%\s*import\s+['"]([^'"]+)['"]`)
 	jinjaFromImportRe = regexp.MustCompile(`(?m)\{%\s*from\s+['"]([^'"]+)['"]\s+import`)
 )
 
-// JinjaExtractor extracts Jinja2 templates using regex.
-type JinjaExtractor struct{}
+type JinjaExtractor struct {
+	forest *forest.Extractor
+}
 
-func NewJinjaExtractor() *JinjaExtractor { return &JinjaExtractor{} }
+func NewJinjaExtractor() *JinjaExtractor {
+	return &JinjaExtractor{
+		forest: forest.New("jinja", []string{".jinja", ".jinja2", ".j2"}, jinjaforest.GetLanguage, jinjaforest.GetQuery),
+	}
+}
 
 func (e *JinjaExtractor) Language() string     { return "jinja" }
 func (e *JinjaExtractor) Extensions() []string { return []string{".jinja", ".jinja2", ".j2"} }
 
 func (e *JinjaExtractor) Extract(filePath string, src []byte) (*parser.ExtractionResult, error) {
-	lines := strings.Split(string(src), "\n")
-	result := &parser.ExtractionResult{}
-
-	fileNode := &graph.Node{
-		ID: filePath, Kind: graph.KindFile, Name: filePath,
-		FilePath: filePath, StartLine: 1, EndLine: len(lines),
-		Language: "jinja",
+	res, err := e.forest.Extract(filePath, src)
+	if err != nil {
+		return nil, err
 	}
-	result.Nodes = append(result.Nodes, fileNode)
+	lines := strings.Split(string(src), "\n")
+	_ = lines
 
 	seen := make(map[string]bool)
-	add := func(name string, kind graph.NodeKind, start, end int) {
-		if name == "" {
-			return
-		}
-		id := filePath + "::" + name
-		if seen[id] {
-			return
-		}
-		seen[id] = true
-		result.Nodes = append(result.Nodes, &graph.Node{
-			ID: id, Kind: kind, Name: name,
-			FilePath: filePath, StartLine: start, EndLine: end,
-			Language: "jinja",
-		})
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileNode.ID, To: id, Kind: graph.EdgeDefines,
-			FilePath: filePath, Line: start,
-		})
+	for _, n := range res.Nodes {
+		seen[n.ID] = true
 	}
 
 	for _, m := range jinjaBlockRe.FindAllSubmatchIndex(src, -1) {
 		name := string(src[m[2]:m[3]])
+		id := filePath + "::" + name
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
 		line := lineAt(src, m[0])
-		add(name, graph.KindFunction, line, findKeywordBlockEnd(lines, line, "{% endblock"))
-	}
-	for _, m := range jinjaMacroRe.FindAllSubmatchIndex(src, -1) {
-		name := string(src[m[2]:m[3]])
-		line := lineAt(src, m[0])
-		add(name, graph.KindFunction, line, findKeywordBlockEnd(lines, line, "{% endmacro"))
+		res.Nodes = append(res.Nodes, &graph.Node{
+			ID: id, Kind: graph.KindFunction, Name: name,
+			FilePath: filePath, StartLine: line, EndLine: line,
+			Language: "jinja",
+		})
+		res.Edges = append(res.Edges, &graph.Edge{
+			From: filePath, To: id, Kind: graph.EdgeDefines,
+			FilePath: filePath, Line: line,
+		})
 	}
 
 	for _, re := range []*regexp.Regexp{jinjaExtendsRe, jinjaIncludeRe, jinjaImportRe, jinjaFromImportRe} {
 		for _, m := range re.FindAllSubmatchIndex(src, -1) {
 			mod := string(src[m[2]:m[3]])
 			line := lineAt(src, m[0])
-			result.Edges = append(result.Edges, &graph.Edge{
-				From: fileNode.ID, To: "unresolved::import::" + mod,
+			res.Edges = append(res.Edges, &graph.Edge{
+				From: filePath, To: "unresolved::import::" + mod,
 				Kind: graph.EdgeImports, FilePath: filePath, Line: line,
 			})
 		}
 	}
 
-	return result, nil
+	return res, nil
 }
 
 var _ parser.Extractor = (*JinjaExtractor)(nil)

@@ -235,6 +235,47 @@ require (
 
 require (
 	github.com/RoaringBitmap/roaring/v2 v2.18.0 // indirect
+	github.com/alexaandru/go-sitter-forest/ada v1.9.0 // indirect
+	github.com/alexaandru/go-sitter-forest/al v1.9.14 // indirect
+	github.com/alexaandru/go-sitter-forest/apex v1.9.8 // indirect
+	github.com/alexaandru/go-sitter-forest/blade v1.9.3 // indirect
+	github.com/alexaandru/go-sitter-forest/clojure v1.9.1 // indirect
+	github.com/alexaandru/go-sitter-forest/cmake v1.9.5 // indirect
+	github.com/alexaandru/go-sitter-forest/cobol v1.9.1 // indirect
+	github.com/alexaandru/go-sitter-forest/crystal v1.9.29 // indirect
+	github.com/alexaandru/go-sitter-forest/d v1.9.0 // indirect
+	github.com/alexaandru/go-sitter-forest/elisp v1.9.0 // indirect
+	github.com/alexaandru/go-sitter-forest/erlang v1.9.7 // indirect
+	github.com/alexaandru/go-sitter-forest/fortran v1.9.13 // indirect
+	github.com/alexaandru/go-sitter-forest/fsharp v1.9.3 // indirect
+	github.com/alexaandru/go-sitter-forest/gdscript v1.9.6 // indirect
+	github.com/alexaandru/go-sitter-forest/gleam v1.9.9 // indirect
+	github.com/alexaandru/go-sitter-forest/groovy v1.9.4 // indirect
+	github.com/alexaandru/go-sitter-forest/hare v1.9.0 // indirect
+	github.com/alexaandru/go-sitter-forest/haskell v1.9.2 // indirect
+	github.com/alexaandru/go-sitter-forest/jinja v1.9.6 // indirect
+	github.com/alexaandru/go-sitter-forest/julia v1.9.10 // indirect
+	github.com/alexaandru/go-sitter-forest/liquid v1.9.3 // indirect
+	github.com/alexaandru/go-sitter-forest/matlab v1.9.4 // indirect
+	github.com/alexaandru/go-sitter-forest/move v1.9.3 // indirect
+	github.com/alexaandru/go-sitter-forest/nim v1.9.1 // indirect
+	github.com/alexaandru/go-sitter-forest/nix v1.9.4 // indirect
+	github.com/alexaandru/go-sitter-forest/objc v1.9.1 // indirect
+	github.com/alexaandru/go-sitter-forest/odin v1.9.2 // indirect
+	github.com/alexaandru/go-sitter-forest/pascal v1.9.2 // indirect
+	github.com/alexaandru/go-sitter-forest/perl v1.9.9 // indirect
+	github.com/alexaandru/go-sitter-forest/powershell v1.9.5 // indirect
+	github.com/alexaandru/go-sitter-forest/pug v1.9.1 // indirect
+	github.com/alexaandru/go-sitter-forest/r v1.9.6 // indirect
+	github.com/alexaandru/go-sitter-forest/racket v1.9.1 // indirect
+	github.com/alexaandru/go-sitter-forest/rescript v1.9.1 // indirect
+	github.com/alexaandru/go-sitter-forest/solidity v1.9.3 // indirect
+	github.com/alexaandru/go-sitter-forest/tact v1.9.5 // indirect
+	github.com/alexaandru/go-sitter-forest/tcl v1.9.4 // indirect
+	github.com/alexaandru/go-sitter-forest/twig v1.9.0 // indirect
+	github.com/alexaandru/go-sitter-forest/vala v1.9.0 // indirect
+	github.com/alexaandru/go-sitter-forest/vim v1.9.4 // indirect
+	github.com/alexaandru/go-sitter-forest/zig v1.9.4 // indirect
 	github.com/atotto/clipboard v0.1.4 // indirect
 	github.com/aymanbagabas/go-osc52/v2 v2.0.1 // indirect
 	github.com/bits-and-blooms/bitset v1.24.4 // indirect

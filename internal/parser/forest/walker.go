@@ -29,7 +29,7 @@ func (e *Extractor) extractByWalker(
 		if n == nil {
 			return
 		}
-		if kind := classifyKind(n.Type()); kind != "" {
+		if kind := classifyKind(e.language, n.Type()); kind != "" {
 			if name := nodeName(n, src); name != "" {
 				e.emitWalkerNode(filePath, fileNode, kind, name, n, seen, result)
 			}
@@ -68,15 +68,29 @@ func (e *Extractor) emitWalkerNode(
 	})
 }
 
-// classifyKind maps a tree-sitter node kind name to a graph.NodeKind
-// using suffix matching on the conventional tree-sitter rule names.
-// Returns "" for nodes we don't extract at signature-only depth.
+// classifyKind maps a tree-sitter node kind name to a graph.NodeKind.
+// The dispatch is two-tier:
 //
-// The order matters: longer / more specific suffixes are checked
-// before generic ones. "function_declaration" beats "_declaration".
-func classifyKind(t string) graph.NodeKind {
+//  1. Per-language overrides — `languageKindMap[language][nodeKind]`
+//     handles grammars whose rule names don't match the conventional
+//     `*_definition` / `*_declaration` suffixes (Erlang's
+//     `fun_decl` / `function_clause`, Haskell's `function` /
+//     `signature`, Crystal's `class_def` / `method_def`, etc.).
+//     Researched once per grammar via the dump_kinds_test helper.
+//  2. Generic suffix matching — covers the long tail of grammars that
+//     follow the standard `*_definition` / `*_declaration` /
+//     `*_specifier` convention.
+//
+// Order matters within suffix matching: longer / more specific
+// patterns checked first ("function_declaration" beats "_declaration").
+func classifyKind(language, t string) graph.NodeKind {
 	if t == "" {
 		return ""
+	}
+	if perLang, ok := languageKindMap[language]; ok {
+		if k, ok := perLang[t]; ok {
+			return k
+		}
 	}
 
 	// Methods first — `method_*` is more specific than `function_*`,
@@ -114,6 +128,133 @@ func classifyKind(t string) graph.NodeKind {
 	return ""
 }
 
+// languageKindMap holds per-language node-kind → graph.NodeKind
+// overrides. Add a row when a grammar's rule names diverge from the
+// conventional `*_definition` / `*_declaration` patterns and the
+// generic walker emits zero definitions on real source. Run the
+// dump_kinds_test helper for that language to find the right names.
+var languageKindMap = map[string]map[string]graph.NodeKind{
+	"erlang": {
+		"fun_decl": graph.KindFunction,
+		// `-module(name)` is a `module_attribute` and the name lives
+		// inside an `atom` child the generic nodeName helper doesn't
+		// recognise — leave it to the regex idiom layer in
+		// erlang.go.
+	},
+	"haskell": {
+		"function":     graph.KindFunction,
+		"signature":    graph.KindFunction,
+		"data_type":    graph.KindType,
+		"newtype":      graph.KindType,
+		"type_synonym": graph.KindType,
+		// Upstream tree-sitter-haskell ships the rule name as
+		// `type_synomym` — typo and all. Match both spellings so
+		// we don't depend on the grammar fixing it.
+		"type_synomym": graph.KindType,
+		"class":        graph.KindInterface,
+		"instance":     graph.KindType,
+	},
+	"crystal": {
+		"class_def":  graph.KindType,
+		"module_def": graph.KindType,
+		"struct_def": graph.KindType,
+		"method_def": graph.KindMethod,
+	},
+	"nim": {
+		"proc_declaration": graph.KindFunction,
+		"func_declaration": graph.KindFunction,
+		"type_declaration": graph.KindType,
+		// object_declaration / enum_declaration nest inside
+		// type_declaration; emit on the outer wrapper to avoid
+		// duplicate nodes.
+	},
+	"ada": {
+		"function_specification":  graph.KindFunction,
+		"procedure_specification": graph.KindFunction,
+	},
+	"fortran": {
+		"function":           graph.KindFunction,
+		"function_statement": graph.KindFunction,
+		"module":             graph.KindPackage,
+		"module_statement":   graph.KindPackage,
+	},
+	"perl": {
+		"function":                         graph.KindFunction,
+		"subroutine_declaration_statement": graph.KindFunction,
+	},
+	"powershell": {
+		"function_statement": graph.KindFunction,
+		"class_statement":    graph.KindType,
+	},
+	"odin": {
+		"procedure_declaration": graph.KindFunction,
+		"struct_declaration":    graph.KindType,
+		"package_declaration":   graph.KindPackage,
+	},
+	"cmake": {
+		"function_def": graph.KindFunction,
+		"macro_def":    graph.KindFunction,
+	},
+	"apex": {
+		"class_declaration":   graph.KindType,
+		"method_declaration":  graph.KindMethod,
+		"trigger_declaration": graph.KindFunction,
+	},
+	"solidity": {
+		"contract_declaration":  graph.KindType,
+		"interface_declaration": graph.KindInterface,
+		"modifier_definition":   graph.KindFunction,
+		"event_definition":      graph.KindFunction,
+		"enum_declaration":      graph.KindType,
+		"struct_declaration":    graph.KindType,
+		// function_definition already covered by the generic
+		// `*_definition` suffix in classifyKind.
+	},
+	"tact": {
+		"trait":            graph.KindInterface,
+		"contract":         graph.KindType,
+		"init_function":    graph.KindFunction,
+		"receive_function": graph.KindFunction,
+		"storage_function": graph.KindFunction,
+	},
+	"fsharp": {
+		"function_or_value_defn": graph.KindFunction,
+		"named_module":           graph.KindPackage,
+		"record_type_defn":       graph.KindType,
+		// type_definition handled by generic suffix.
+	},
+	"gdscript": {
+		"class_name_statement": graph.KindType,
+	},
+	"jinja": {
+		"macro_statement": graph.KindFunction,
+	},
+	"twig": {
+		"macro_statement": graph.KindFunction,
+	},
+	"rescript": {
+		"let_declaration":    graph.KindFunction,
+		"module_declaration": graph.KindPackage,
+		"type_declaration":   graph.KindType,
+	},
+	"objc": {
+		"class_interface":          graph.KindType,
+		"class_implementation":     graph.KindType,
+		"method_declaration":       graph.KindMethod,
+		"method_definition":        graph.KindMethod,
+		"implementation_definition": graph.KindFunction,
+	},
+	"al": {
+		"codeunit_declaration": graph.KindType,
+		"table_declaration":    graph.KindType,
+		"page_declaration":     graph.KindType,
+		"procedure":            graph.KindMethod,
+		// AL's `procedure` node holds the name in an `identifier`
+		// child, but the test fixtures use `attributed_procedure`
+		// wrappers; both routes converge on the same identifier.
+	},
+}
+
 func hasAnySuffix(s string, suffixes ...string) bool {
 	for _, suf := range suffixes {
 		if s == suf || strings.HasSuffix(s, suf) {
@@ -124,21 +265,53 @@ func hasAnySuffix(s string, suffixes ...string) bool {
 }
 
 // nodeName tries the conventional `name:` field first, then falls
-// back to the first identifier-like child. Returns "" if neither is
-// present (anonymous functions, unnamed structs).
+// back to the first identifier-like child within a depth-3 search.
+// Returns "" if neither is present (anonymous functions / unnamed
+// structs).
+//
+// Three levels of recursion catches the common "wrapper holds the
+// name in a typed sub-node" pattern: Erlang `fun_decl ▶
+// function_clause ▶ atom`, Nim `proc_declaration ▶
+// symbol_declaration ▶ exported_symbol ▶ identifier`. Going
+// deeper would risk returning a parameter name when the
+// function-name capture is missing entirely.
+//
+// "Identifier-like" covers the conventional names plus a few
+// language-specific tokens that grammars use for the same role:
+// `constant` (Ruby/Crystal class names), `atom` (Erlang),
+// `variable` (Haskell binding names), `lower_case_identifier`
+// and `upper_case_identifier` (Elm).
 func nodeName(n *sitter.Node, src []byte) string {
 	if name := n.ChildByFieldName("name"); name != nil {
 		return strings.TrimSpace(name.Content(src))
+	}
+	return findFirstNameIn(n, src, 3)
+}
+
+func findFirstNameIn(n *sitter.Node, src []byte, depth int) string {
+	if n == nil || depth < 0 {
+		return ""
 	}
 	for i := 0; i < int(n.NamedChildCount()); i++ {
 		c := n.NamedChild(i)
 		if c == nil {
 			continue
 		}
-		t := c.Type()
-		if strings.Contains(t, "identifier") || t == "name" || t == "type_identifier" {
+		if isIdentifierKind(c.Type()) {
 			return strings.TrimSpace(c.Content(src))
+		}
+		if name := findFirstNameIn(c, src, depth-1); name != "" {
+			return name
 		}
 	}
 	return ""
+}
+
+func isIdentifierKind(t string) bool {
+	return strings.Contains(t, "identifier") ||
+		t == "name" ||
+		t == "type_identifier" ||
+		t == "constant" ||
+		t == "variable" ||
+		t == "atom"
 }

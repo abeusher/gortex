@@ -2,99 +2,60 @@ package languages
 
 import (
 	"regexp"
-	"strings"
+
+	rforest "github.com/alexaandru/go-sitter-forest/r"
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/parser"
+	"github.com/zzet/gortex/internal/parser/forest"
 )
 
+// R extractor uses forest's tree-sitter grammar (with bundled
+// tags.scm) for definitions and call edges, then layers regex passes
+// for the R-specific idioms tags.scm doesn't categorize: `library()`
+// / `require()` / `source()` calls become EdgeImports rather than
+// EdgeCalls. Top-level assignments are also rescued by regex —
+// tags.scm captures functions but doesn't always tag plain value
+// bindings as variables.
 var (
-	rFuncAssignRe = regexp.MustCompile(`(?m)^(\w[\w.]*)\s*<-\s*function\s*\(`)
-	rFuncEqRe     = regexp.MustCompile(`(?m)^(\w[\w.]*)\s*=\s*function\s*\(`)
-	rVarAssignRe  = regexp.MustCompile(`(?m)^(\w[\w.]*)\s*<-\s*\S`)
-	rVarEqRe      = regexp.MustCompile(`(?m)^(\w[\w.]*)\s*=\s*\S`)
-	rLibraryRe    = regexp.MustCompile(`(?m)\blibrary\(\s*"?'?(\w+)"?'?\s*\)`)
-	rRequireRe    = regexp.MustCompile(`(?m)\brequire\(\s*"?'?(\w+)"?'?\s*\)`)
-	rSourceRe     = regexp.MustCompile(`(?m)\bsource\(\s*["']([^"']+)["']\s*\)`)
-	rCallRe       = regexp.MustCompile(`\b(\w[\w.]*)\s*\(`)
+	rLibraryRe   = regexp.MustCompile(`(?m)\blibrary\(\s*"?'?(\w+)"?'?\s*\)`)
+	rRequireRe   = regexp.MustCompile(`(?m)\brequire\(\s*"?'?(\w+)"?'?\s*\)`)
+	rSourceRe    = regexp.MustCompile(`(?m)\bsource\(\s*["']([^"']+)["']\s*\)`)
+	rVarAssignRe = regexp.MustCompile(`(?m)^(\w[\w.]*)\s*(?:<-|=)\s*(?:[^f]|f[^u]|fu[^n])`)
 )
 
-// RExtractor extracts R source files using regex.
-type RExtractor struct{}
+// RExtractor extracts R source via forest + regex idiom layer.
+type RExtractor struct {
+	forest *forest.Extractor
+}
 
-func NewRExtractor() *RExtractor { return &RExtractor{} }
+func NewRExtractor() *RExtractor {
+	return &RExtractor{
+		forest: forest.New("r", []string{".R", ".r", ".Rmd"}, rforest.GetLanguage, rforest.GetQuery),
+	}
+}
 
 func (e *RExtractor) Language() string     { return "r" }
 func (e *RExtractor) Extensions() []string { return []string{".R", ".r", ".Rmd"} }
 
 func (e *RExtractor) Extract(filePath string, src []byte) (*parser.ExtractionResult, error) {
-	lines := strings.Split(string(src), "\n")
-	result := &parser.ExtractionResult{}
-
-	fileNode := &graph.Node{
-		ID: filePath, Kind: graph.KindFile, Name: filePath,
-		FilePath: filePath, StartLine: 1, EndLine: len(lines),
-		Language: "r",
+	res, err := e.forest.Extract(filePath, src)
+	if err != nil {
+		return nil, err
 	}
-	result.Nodes = append(result.Nodes, fileNode)
 
 	seen := make(map[string]bool)
-
-	// Functions: name <- function( and name = function(
-	for _, re := range []*regexp.Regexp{rFuncAssignRe, rFuncEqRe} {
-		for _, m := range re.FindAllSubmatchIndex(src, -1) {
-			name := string(src[m[2]:m[3]])
-			line := lineAt(src, m[0])
-			endLine := findBlockEnd(lines, line)
-			id := filePath + "::" + name
-			if seen[id] {
-				continue
-			}
-			seen[id] = true
-			result.Nodes = append(result.Nodes, &graph.Node{
-				ID: id, Kind: graph.KindFunction, Name: name,
-				FilePath: filePath, StartLine: line, EndLine: endLine,
-				Language: "r",
-			})
-			result.Edges = append(result.Edges, &graph.Edge{
-				From: fileNode.ID, To: id, Kind: graph.EdgeDefines,
-				FilePath: filePath, Line: line,
-			})
-		}
+	for _, n := range res.Nodes {
+		seen[n.ID] = true
 	}
 
-	// Variables: top-level assignments (not function assignments)
-	for _, re := range []*regexp.Regexp{rVarAssignRe, rVarEqRe} {
-		for _, m := range re.FindAllSubmatchIndex(src, -1) {
-			name := string(src[m[2]:m[3]])
-			if isRKeyword(name) {
-				continue
-			}
-			line := lineAt(src, m[0])
-			id := filePath + "::" + name
-			if seen[id] {
-				continue
-			}
-			seen[id] = true
-			result.Nodes = append(result.Nodes, &graph.Node{
-				ID: id, Kind: graph.KindVariable, Name: name,
-				FilePath: filePath, StartLine: line, EndLine: line,
-				Language: "r",
-			})
-			result.Edges = append(result.Edges, &graph.Edge{
-				From: fileNode.ID, To: id, Kind: graph.EdgeDefines,
-				FilePath: filePath, Line: line,
-			})
-		}
-	}
-
-	// Imports: library(), require(), source()
+	// Idiom imports: library(X) / require(X) / source("X.R").
 	for _, re := range []*regexp.Regexp{rLibraryRe, rRequireRe} {
 		for _, m := range re.FindAllSubmatchIndex(src, -1) {
 			mod := string(src[m[2]:m[3]])
 			line := lineAt(src, m[0])
-			result.Edges = append(result.Edges, &graph.Edge{
-				From: fileNode.ID, To: "unresolved::import::" + mod,
+			res.Edges = append(res.Edges, &graph.Edge{
+				From: filePath, To: "unresolved::import::" + mod,
 				Kind: graph.EdgeImports, FilePath: filePath, Line: line,
 			})
 		}
@@ -102,31 +63,38 @@ func (e *RExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRes
 	for _, m := range rSourceRe.FindAllSubmatchIndex(src, -1) {
 		path := string(src[m[2]:m[3]])
 		line := lineAt(src, m[0])
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileNode.ID, To: "unresolved::import::" + path,
+		res.Edges = append(res.Edges, &graph.Edge{
+			From: filePath, To: "unresolved::import::" + path,
 			Kind: graph.EdgeImports, FilePath: filePath, Line: line,
 		})
 	}
 
-	// Call sites inside functions
-	funcRanges := buildFuncRanges(result)
-	for _, m := range rCallRe.FindAllSubmatchIndex(src, -1) {
+	// Top-level value bindings (`name <- value` / `name = value`)
+	// that aren't function assignments — tags.scm typically only
+	// captures the function-binding shape.
+	for _, m := range rVarAssignRe.FindAllSubmatchIndex(src, -1) {
 		name := string(src[m[2]:m[3]])
-		if isRKeyword(name) || name == "function" {
+		if isRKeyword(name) {
 			continue
 		}
 		line := lineAt(src, m[0])
-		callerID := findEnclosingFunc(funcRanges, line)
-		if callerID == "" || strings.HasSuffix(callerID, "::"+name) {
+		id := filePath + "::" + name
+		if seen[id] {
 			continue
 		}
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: callerID, To: "unresolved::" + name,
-			Kind: graph.EdgeCalls, FilePath: filePath, Line: line,
+		seen[id] = true
+		res.Nodes = append(res.Nodes, &graph.Node{
+			ID: id, Kind: graph.KindVariable, Name: name,
+			FilePath: filePath, StartLine: line, EndLine: line,
+			Language: "r",
+		})
+		res.Edges = append(res.Edges, &graph.Edge{
+			From: filePath, To: id, Kind: graph.EdgeDefines,
+			FilePath: filePath, Line: line,
 		})
 	}
 
-	return result, nil
+	return res, nil
 }
 
 func isRKeyword(s string) bool {
