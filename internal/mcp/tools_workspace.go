@@ -55,18 +55,23 @@ func (s *Server) handleListRepos(ctx context.Context, req mcp.CallToolRequest) (
 		return errResult, nil
 	}
 
+	return s.respondJSONOrTOON(ctx, req, s.buildListReposPayload())
+}
+
+// buildListReposPayload returns the same data the `list_repos` tool
+// emits. Shared with the `gortex://repos` resource.
+func (s *Server) buildListReposPayload() map[string]any {
 	bind := s.bind
 	out := map[string]any{}
 	if bind == nil {
 		out["mode"] = "unbound"
 		out["repos"] = []string{}
-		return s.respondJSONOrTOON(ctx, req, out)
+		return out
 	}
-
 	out["mode"] = bind.Mode.String()
 	out["root"] = bind.Root
 	out["repos"] = bind.MemberNames()
-	return s.respondJSONOrTOON(ctx, req, out)
+	return out
 }
 
 // handleWorkspaceInfo implements `workspace_info`. Returns enough
@@ -77,13 +82,18 @@ func (s *Server) handleWorkspaceInfo(ctx context.Context, req mcp.CallToolReques
 	if _, errResult := s.ResolveToolScope("workspace_info", req.GetArguments()["repo"]); errResult != nil {
 		return errResult, nil
 	}
+	return s.respondJSONOrTOON(ctx, req, s.buildWorkspaceInfoPayload())
+}
 
+// buildWorkspaceInfoPayload returns the same data the `workspace_info`
+// tool emits. Shared with the `gortex://workspace` resource.
+func (s *Server) buildWorkspaceInfoPayload() map[string]any {
 	bind := s.bind
 	if bind == nil {
-		return s.respondJSONOrTOON(ctx, req, map[string]any{
+		return map[string]any{
 			"mode":  "unbound",
 			"repos": []map[string]string{},
-		})
+		}
 	}
 
 	members := make([]map[string]string, 0, len(bind.Members))
@@ -103,7 +113,7 @@ func (s *Server) handleWorkspaceInfo(ctx context.Context, req mcp.CallToolReques
 	}
 	sort.Strings(unknownKeys)
 
-	return s.respondJSONOrTOON(ctx, req, map[string]any{
+	return map[string]any{
 		"mode":             bind.Mode.String(),
 		"root":             bind.Root,
 		"marker":           workspace.MarkerFile,
@@ -111,5 +121,5 @@ func (s *Server) handleWorkspaceInfo(ctx context.Context, req mcp.CallToolReques
 		"unknown_keys":     unknownKeys,
 		"members":          members,
 		"isolation_bounds": bind.Root,
-	})
+	}
 }

@@ -123,7 +123,7 @@ func (e *PythonExtractor) Extract(filePath string, src []byte) (*parser.Extracti
 			e.emitImport(m, filePath, fileID, src, result, imports)
 
 		case m.Captures["importfrom.def"] != nil:
-			e.emitImportFrom(m, filePath, fileID, result)
+			e.emitImportFrom(m, filePath, fileID, src, result, imports)
 
 		case m.Captures["callattr.expr"] != nil:
 			expr := m.Captures["callattr.expr"]
@@ -206,11 +206,24 @@ func (e *PythonExtractor) Extract(filePath string, src []byte) (*parser.Extracti
 			continue
 		}
 
-		// Plain call.
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: callerID, To: "unresolved::" + c.name,
-			Kind: graph.EdgeCalls, FilePath: filePath, Line: c.line,
-		})
+		// Plain call. When the call name itself is bound by a
+		// `from X import Y [as Z]` (or `import X as Y`) statement,
+		// route the edge through the same module-attributed
+		// extern stub the attribute-call branch uses — that's
+		// what makes `from numpy import array; array(...)` and
+		// `import numpy as np; np.array(...)` both attribute to
+		// numpy after the resolver post-pass.
+		if importPath, ok := lookupPyImport(c.name, imports); ok {
+			result.Edges = append(result.Edges, &graph.Edge{
+				From: callerID, To: "unresolved::extern::" + importPath + "::" + c.name,
+				Kind: graph.EdgeCalls, FilePath: filePath, Line: c.line,
+			})
+		} else {
+			result.Edges = append(result.Edges, &graph.Edge{
+				From: callerID, To: "unresolved::" + c.name,
+				Kind: graph.EdgeCalls, FilePath: filePath, Line: c.line,
+			})
+		}
 
 		// FastAPI dependency injection: Depends(target) — emit a direct
 		// edge from the enclosing function to the first identifier
@@ -591,13 +604,61 @@ func (e *PythonExtractor) emitImport(m parser.QueryResult, filePath, fileID stri
 	}
 }
 
-func (e *PythonExtractor) emitImportFrom(m parser.QueryResult, filePath, fileID string, result *parser.ExtractionResult) {
+// emitImportFrom handles `from X import Y`, `from X import Y as Z`, and
+// `from X import Y, Z`. Each imported name is registered in the per-
+// file alias map so attribute-style calls (`Y(...)`) — and any later
+// `Z(...)` aliases — resolve through `lookupPyImport` to the right
+// dotted module path. Without this, every `from`-imported name fell
+// through to the bare-call branch and never attributed to its module.
+func (e *PythonExtractor) emitImportFrom(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, imports map[string]string) {
 	mod := m.Captures["import.module"]
 	pyEmitImportNode(filePath, fileID, mod.Text, "", mod.StartLine+1, result)
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: fileID, To: "unresolved::import::" + mod.Text,
 		Kind: graph.EdgeImports, FilePath: filePath, Line: mod.StartLine + 1,
 	})
+
+	def, ok := m.Captures["importfrom.def"]
+	if !ok || def.Node == nil {
+		return
+	}
+	stmt := def.Node
+	// Walk the statement's named children. The module is the first
+	// `dotted_name` (already captured); subsequent `dotted_name`
+	// children are imported names. `aliased_import` children carry
+	// the optional `as <alias>`. `wildcard_import` (`from X import *`)
+	// is intentionally skipped — there's no specific name to bind.
+	moduleSeen := false
+	for i := 0; i < int(stmt.NamedChildCount()); i++ {
+		child := stmt.NamedChild(i)
+		switch child.Type() {
+		case "dotted_name":
+			if !moduleSeen {
+				moduleSeen = true
+				continue
+			}
+			name := child.Content(src)
+			if name == "" {
+				continue
+			}
+			imports[name] = mod.Text + "." + name
+		case "aliased_import":
+			var importedName, alias string
+			for j := 0; j < int(child.NamedChildCount()); j++ {
+				cc := child.NamedChild(j)
+				switch cc.Type() {
+				case "dotted_name":
+					importedName = cc.Content(src)
+				case "identifier":
+					alias = cc.Content(src)
+				}
+			}
+			if importedName == "" || alias == "" {
+				continue
+			}
+			imports[alias] = mod.Text + "." + importedName
+		}
+	}
 }
 
 // pyEmitImportNode appends a KindImport node + Defines edge for a

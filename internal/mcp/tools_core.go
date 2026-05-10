@@ -1105,6 +1105,13 @@ func (s *Server) handleGetCluster(ctx context.Context, req mcp.CallToolRequest) 
 }
 
 func (s *Server) handleGraphStats(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	return s.respondJSONOrTOON(ctx, req, s.buildGraphStatsPayload(ctx))
+}
+
+// buildGraphStatsPayload returns the same data the `graph_stats` tool
+// emits. Shared with the `gortex://stats` resource so both surfaces
+// stay byte-for-byte equal.
+func (s *Server) buildGraphStatsPayload(ctx context.Context) map[string]any {
 	stats := s.engine.Stats()
 	result := map[string]any{
 		"total_nodes": stats.TotalNodes,
@@ -1113,21 +1120,16 @@ func (s *Server) handleGraphStats(ctx context.Context, req mcp.CallToolRequest) 
 		"by_language": stats.ByLanguage,
 	}
 
-	// Include per-repo stats when in multi-repo mode.
 	if s.multiIndexer != nil && s.multiIndexer.IsMultiRepo() {
 		result["per_repo"] = s.graph.RepoStats()
 	}
 
-	// Include session-level token savings. Per-session when the caller
-	// has a session ID (daemon path); shared default for embedded/stdio.
 	result["token_savings"] = s.tokenStatsFor(ctx).snapshot()
 
-	// Include cumulative cross-session savings when a persistent store is wired.
 	if cs := s.cumulativeSavingsSnapshot(); cs != nil {
 		result["cumulative_savings"] = cs
 	}
 
-	// Include semantic enrichment stats.
 	if s.semanticMgr != nil && s.semanticMgr.Enabled() {
 		result["semantic"] = map[string]any{
 			"enabled":   true,
@@ -1135,5 +1137,5 @@ func (s *Server) handleGraphStats(ctx context.Context, req mcp.CallToolRequest) 
 		}
 	}
 
-	return s.respondJSONOrTOON(ctx, req, result)
+	return result
 }

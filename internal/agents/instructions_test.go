@@ -150,6 +150,12 @@ func TestInstructionsBody_AdvertisesKeyTools(t *testing.T) {
 		"search_ast", "error-not-wrapped", "sql-string-concat",
 		"weak-crypto", "panic-in-library", "hardcoded-secret",
 		"min_fan_in_of_enclosing_func",
+		// MCP resources surface (bootstrap + analyzer rollups).
+		"gortex://stats", "gortex://index-health", "gortex://workspace",
+		"gortex://repos", "gortex://active-project",
+		"gortex://report", "gortex://god-nodes", "gortex://surprises",
+		"gortex://audit", "gortex://questions",
+		"notifications/resources/updated",
 	} {
 		if !strings.Contains(InstructionsBody, token) {
 			t.Errorf("InstructionsBody no longer mentions %q — a doc regression would ship to every adapter", token)
@@ -170,6 +176,10 @@ func TestGlobalInstructionsBody_AdvertisesKeyTools(t *testing.T) {
 		"k8s_resources", "images", "kustomize",
 		// Structural code search — also in the per-machine block.
 		"search_ast", "error-not-wrapped",
+		// MCP resources surface (bootstrap + analyzer rollups).
+		"gortex://stats", "gortex://index-health", "gortex://active-project",
+		"gortex://report", "gortex://god-nodes",
+		"notifications/resources/updated",
 	} {
 		if !strings.Contains(GlobalInstructionsBody, token) {
 			t.Errorf("GlobalInstructionsBody no longer mentions %q", token)

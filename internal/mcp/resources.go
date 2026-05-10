@@ -21,12 +21,14 @@ func (s *Server) registerResources() {
 		s.handleResourceSession,
 	)
 
-	// Static resource: graph stats (session start orientation).
+	// Static resource: graph stats (session start orientation). Same
+	// payload as the `graph_stats` tool — kept as a tool too for
+	// back-compat with clients that don't speak resources.
 	s.mcpServer.AddResource(
 		mcp.NewResource(
 			"gortex://stats",
 			"Graph Statistics",
-			mcp.WithResourceDescription("Node/edge counts by kind and language. Read at session start to orient in the codebase."),
+			mcp.WithResourceDescription("Node/edge counts by kind and language, plus per-repo / token-savings / semantic-provider rollups. Read at session start to orient in the codebase. Updates push as `notifications/resources/updated` after each graph re-warm."),
 			mcp.WithMIMEType("application/json"),
 		),
 		s.handleResourceStats,
@@ -42,6 +44,15 @@ func (s *Server) registerResources() {
 		),
 		s.handleResourceSchema,
 	)
+
+	// Bootstrap-state resources: read-only, no args, every session
+	// hits these at startup. Same payloads as the corresponding
+	// tools; tools stay registered for back-compat.
+	s.registerBootstrapResources()
+
+	// Analyzer-backed rollup resources: long-form summaries whose
+	// only "argument" is the current state of the indexed code.
+	s.registerAnalyzerResources()
 
 	// Template resources: communities and processes (dynamic, parameterized).
 	s.mcpServer.AddResourceTemplate(
@@ -85,15 +96,20 @@ func (s *Server) registerResources() {
 	)
 }
 
-func (s *Server) handleResourceStats(_ context.Context, req mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
-	stats := s.engine.Stats()
-	data, err := json.Marshal(stats)
+func (s *Server) handleResourceStats(ctx context.Context, req mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+	return jsonResource(req.Params.URI, s.buildGraphStatsPayload(ctx))
+}
+
+// jsonResource marshals payload as JSON and wraps it in the single-entry
+// ResourceContents slice every read-resource handler returns.
+func jsonResource(uri string, payload any) ([]mcp.ResourceContents, error) {
+	data, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
 	}
 	return []mcp.ResourceContents{
 		mcp.TextResourceContents{
-			URI:      req.Params.URI,
+			URI:      uri,
 			MIMEType: "application/json",
 			Text:     string(data),
 		},

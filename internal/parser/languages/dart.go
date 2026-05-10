@@ -53,11 +53,13 @@ func (e *DartExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 	// Top-level variables.
 	e.extractTopLevelVariables(root, src, filePath, fileNode, result, seen)
 
-	// Imports.
-	e.extractImports(root, src, filePath, fileNode, result)
+	// Imports — also returns the alias map (`import 'pkg:foo/bar.dart'
+	// as f;` → "f" → "package:foo/bar.dart") so the call walker can
+	// attribute alias-prefixed calls (`f.method()`) to the right URI.
+	imports := e.extractImports(root, src, filePath, fileNode, result)
 
 	// Call sites.
-	e.extractCalls(root, src, filePath, result)
+	e.extractCalls(root, src, filePath, result, imports)
 
 	return result, nil
 }
@@ -353,17 +355,22 @@ func (e *DartExtractor) extractTopLevelVariables(
 	}
 }
 
-// extractImports finds import_or_export nodes and extracts the URI.
+// extractImports walks `import_or_export` nodes, emits the import
+// edge, and returns the per-file alias map captured from `as
+// <alias>` clauses. The map is consumed by `extractCalls` so calls
+// like `f.method(args)` (where `f` was bound by `import '…' as f;`)
+// attribute to the originating URI rather than landing as the
+// unresolved-method fallback.
 func (e *DartExtractor) extractImports(
 	root *sitter.Node, src []byte, filePath string, fileNode *graph.Node,
 	result *parser.ExtractionResult,
-) {
+) map[string]string {
+	imports := map[string]string{}
 	walkNodes(root, func(node *sitter.Node) {
 		if node.Type() != "import_or_export" {
 			return
 		}
 
-		// Extract URI from the import text.
 		text := node.Content(src)
 		uri := extractDartImportURI(text)
 		if uri == "" {
@@ -375,25 +382,51 @@ func (e *DartExtractor) extractImports(
 			From: fileNode.ID, To: "unresolved::import::" + uri,
 			Kind: graph.EdgeImports, FilePath: filePath, Line: startLine,
 		})
+
+		if alias := extractDartImportAlias(text); alias != "" {
+			// Re-binding the same alias to two different URIs in
+			// one file would be a Dart compile error; keep
+			// last-write-wins so a freshly-edited file with a
+			// half-typed import doesn't poison earlier state.
+			imports[alias] = uri
+		}
 	})
+	return imports
 }
 
-// extractCalls finds function/method call sites.
-// In Dart's tree-sitter grammar, calls appear as:
+// extractCalls finds function/method call sites and emits EdgeCalls
+// edges to the resolver-stub target.
 //
-//	expression_statement: identifier selector(argument_part) ...
-//	e.g. print('hello') → identifier "print", selector "(…)" with argument_part
+// Dart's tree-sitter grammar exposes both a flat `bareCall()` and a
+// chained `fl.runApp()` as siblings under the surrounding scope:
 //
-// We detect an identifier followed by a selector sibling that contains an argument_part.
+//	bareCall():
+//	  identifier "bareCall"
+//	  selector
+//	    argument_part(...)
 //
-// NOTE: receiver attribution is not yet wired here. Dart uses
-// `import 'pkg:foo/bar.dart' as f;` aliases; a proper `f.method()`
-// extern edge would need a query-based rewrite of this walker to
-// distinguish selector calls from plain calls. Tracked by roadmap
-// item A22 (parse-time import attribution — remaining language).
+//	fl.runApp():
+//	  identifier "fl"
+//	  selector
+//	    unconditional_assignable_selector
+//	      "."
+//	      identifier "runApp"
+//	  selector
+//	    argument_part(...)
+//
+// We anchor on the leading identifier (the one that is NOT itself a
+// child of a selector / unconditional_assignable_selector) and scan
+// forward through `selector` siblings, collecting `.method`
+// segments until a selector with `argument_part` confirms the
+// call. The trailing-most identifier is the call name; the leading
+// identifier is the receiver. When the receiver matches an import
+// alias the edge attributes to `unresolved::extern::<uri>::<name>`
+// so the resolver-side module-attribution pass can land it on a
+// KindModule; otherwise we fall back to the legacy name-only stub.
 func (e *DartExtractor) extractCalls(
 	root *sitter.Node, src []byte, filePath string,
 	result *parser.ExtractionResult,
+	imports map[string]string,
 ) {
 	funcRanges := buildFuncRanges(result)
 
@@ -401,43 +434,81 @@ func (e *DartExtractor) extractCalls(
 		if node.Type() != "identifier" {
 			return
 		}
-
-		// Check if next sibling is a selector containing argument_part,
-		// or directly an argument_part/arguments.
-		next := node.NextSibling()
-		if next == nil {
-			return
+		// Skip identifiers that live inside a selector chain; the
+		// chain is reconstructed once from the leading identifier
+		// below. Without this guard we would emit duplicate
+		// edges (one per identifier in the chain).
+		if p := node.Parent(); p != nil {
+			switch p.Type() {
+			case "unconditional_assignable_selector",
+				"conditional_assignable_selector",
+				"selector":
+				return
+			}
 		}
 
+		methodChain := []string{node.Content(src)}
 		isCall := false
-		switch next.Type() {
-		case "selector":
-			// selector may contain argument_part (direct call) like print(...)
-			for j := 0; j < int(next.ChildCount()); j++ {
-				if next.Child(j).Type() == "argument_part" {
+		for sib := node.NextSibling(); sib != nil && !isCall; sib = sib.NextSibling() {
+			if sib.Type() != "selector" {
+				break
+			}
+			for j := 0; j < int(sib.ChildCount()); j++ {
+				child := sib.Child(j)
+				switch child.Type() {
+				case "argument_part", "arguments":
 					isCall = true
-					break
+				case "unconditional_assignable_selector",
+					"conditional_assignable_selector":
+					if id := firstIdentifierChild(child); id != nil {
+						methodChain = append(methodChain, id.Content(src))
+					}
 				}
 			}
-		case "argument_part", "arguments":
-			isCall = true
 		}
-
 		if !isCall {
 			return
 		}
 
-		name := node.Content(src)
 		line := int(node.StartPoint().Row) + 1
 		callerID := findEnclosingFunc(funcRanges, line)
 		if callerID == "" {
 			return
 		}
+
+		callName := methodChain[len(methodChain)-1]
+		leadingReceiver := ""
+		if len(methodChain) > 1 {
+			leadingReceiver = methodChain[0]
+		}
+
+		target := "unresolved::*." + callName
+		if leadingReceiver != "" {
+			if uri, ok := imports[leadingReceiver]; ok {
+				target = "unresolved::extern::" + uri + "::" + callName
+			}
+		}
 		result.Edges = append(result.Edges, &graph.Edge{
-			From: callerID, To: "unresolved::*." + name,
+			From: callerID, To: target,
 			Kind: graph.EdgeCalls, FilePath: filePath, Line: line,
 		})
 	})
+}
+
+// firstIdentifierChild returns the first direct child of node whose
+// type is "identifier", or nil. Used to pull the method name out of
+// a Dart selector wrapper.
+func firstIdentifierChild(node *sitter.Node) *sitter.Node {
+	if node == nil {
+		return nil
+	}
+	for i := 0; i < int(node.ChildCount()); i++ {
+		c := node.Child(i)
+		if c != nil && c.Type() == "identifier" {
+			return c
+		}
+	}
+	return nil
 }
 
 // --- helpers ---
@@ -562,6 +633,47 @@ func (e *DartExtractor) findEnclosingType(ranges []dartTypeRange, line int) (str
 		return "", false
 	}
 	return best, true
+}
+
+// extractDartImportAlias pulls the prefix bound by ` as <ident>`
+// from an `import_or_export` statement's text. Returns empty when
+// the import has no alias clause. The Dart grammar guarantees
+// `as <ident>` follows the URI; we scan the suffix after the
+// closing quote so we don't confuse `as` inside the URI itself
+// (e.g. `package:as_a_string/...`).
+func extractDartImportAlias(text string) string {
+	closing := -1
+	for _, q := range []byte{'\'', '"'} {
+		start := strings.IndexByte(text, q)
+		if start < 0 {
+			continue
+		}
+		end := strings.IndexByte(text[start+1:], q)
+		if end < 0 {
+			continue
+		}
+		closing = start + 1 + end
+		break
+	}
+	if closing < 0 || closing+1 >= len(text) {
+		return ""
+	}
+	rest := text[closing+1:]
+	idx := strings.Index(rest, " as ")
+	if idx < 0 {
+		return ""
+	}
+	tail := strings.TrimLeft(rest[idx+len(" as "):], " \t")
+	end := 0
+	for end < len(tail) {
+		c := tail[end]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '$' {
+			end++
+			continue
+		}
+		break
+	}
+	return tail[:end]
 }
 
 // extractDartImportURI extracts the URI string from an import/export statement text.

@@ -120,6 +120,11 @@ type Server struct {
 	// SetLSPDiagnosticsBroadcasting; nil until then.
 	diagBroadcaster *diagnosticsBroadcaster
 
+	// resourcesNotifier overrides the live mcpServer when pushing
+	// `notifications/resources/updated`. Test-only: production code
+	// leaves it nil so the live server is used.
+	resourcesNotifier resourcesUpdatedNotifier
+
 	// bind is the active two-entry-point handshake result.
 	// nil when no handshake has been performed (legacy callers, tests
 	// that construct the server directly). Tool handlers consult it
@@ -469,6 +474,12 @@ func NewServer(engine *query.Engine, g *graph.Graph, idx *indexer.Indexer, watch
 	s := &Server{
 		mcpServer: server.NewMCPServer("gortex", Version,
 			server.WithToolCapabilities(false),
+			// subscribe=true lets clients call `resources/subscribe`
+			// for bootstrap URIs and receive
+			// `notifications/resources/updated` after each graph
+			// re-warm. listChanged=false because the resource set is
+			// static for the server's lifetime.
+			server.WithResourceCapabilities(true, false),
 			server.WithRecovery(),
 		),
 		engine:     engine,
@@ -761,12 +772,20 @@ func (s *Server) ResolveToolScope(toolName string, repo any) (*ScopedRepos, *mcp
 	return ResolveScopedRepos(scope, s.bind, repo)
 }
 
-// RunAnalysis performs community detection and process discovery on the current graph.
+// RunAnalysis performs community detection and process discovery on
+// the current graph, then pushes a `notifications/resources/updated`
+// for every bootstrap resource so subscribed clients can refresh
+// without polling.
 func (s *Server) RunAnalysis() {
 	s.analysisMu.Lock()
-	defer s.analysisMu.Unlock()
 	s.communities = analysis.DetectCommunities(s.graph)
 	s.processes = analysis.DiscoverProcesses(s.graph)
+	s.analysisMu.Unlock()
+
+	// Bootstrap-resource payloads (graph_stats, index_health, etc.)
+	// can change after re-warm even when the analysis itself didn't
+	// — node counts move on every reindex. Fire updates regardless.
+	s.notifyBootstrapResourcesUpdated()
 }
 
 func (s *Server) getCommunities() *analysis.CommunityResult {

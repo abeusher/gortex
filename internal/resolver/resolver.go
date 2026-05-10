@@ -205,6 +205,12 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 		}
 	}
 
+	// Module attribution for ecosystems without a CGO type-checker
+	// path (Python, Dart, …). Runs serially on the post-resolution
+	// graph so it sees the final `external::*` set after the
+	// dep-module bridge has had its chance.
+	r.attributeNonGoModuleImports()
+
 	total := &ResolveStats{}
 	for i := range perWorkerStats {
 		total.Resolved += perWorkerStats[i].Resolved

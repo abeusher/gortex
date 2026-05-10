@@ -150,6 +150,12 @@ Knobs you can pull when you need something different:
 - **Sparse fieldsets** — pass ` + "`fields: \"id,line\"`" + ` (comma-separated) to drop columns at the row level. Pure size win, no priority drops.
 - **Limit defaults** — most tools default to 20–50 rows; raise ` + "`limit`" + ` only when a single page is too small. Pagination is preferred over a giant ` + "`limit`" + `.
 
+### MCP Resources
+
+Bootstrap-state tools (` + "`graph_stats`" + ` / ` + "`index_health`" + ` / ` + "`workspace_info`" + ` / ` + "`list_repos`" + ` / ` + "`get_active_project`" + `) are also exposed as MCP resources at ` + "`gortex://stats`" + ` / ` + "`gortex://index-health`" + ` / ` + "`gortex://workspace`" + ` / ` + "`gortex://repos`" + ` / ` + "`gortex://active-project`" + `. Subscribe via ` + "`resources/subscribe`" + ` to receive ` + "`notifications/resources/updated`" + ` after each graph re-warm — no polling. Tools stay registered for clients that don't speak resources.
+
+Analyzer rollups (read-only summaries of the current indexed state): ` + "`gortex://report`" + ` (orientation), ` + "`gortex://god-nodes`" + ` (top hotspots), ` + "`gortex://surprises`" + ` (cycles + dead code + hubs), ` + "`gortex://audit`" + ` (CLAUDE.md drift), ` + "`gortex://questions`" + ` (TODOs).
+
 ### Session Start
 
 The SessionStart hook injects daemon status (tracked repos, cwd coverage, ready/warmup state). If you see "daemon is not running" — run ` + "`gortex daemon start --detach`" + ` and re-run the task. If you see "cwd is not covered by any tracked repo" — graph tools won't be available for that directory.
@@ -316,6 +322,32 @@ The ` + "`flow_between`" + ` and ` + "`taint_paths`" + ` MCP tools answer **"whe
 | Scoping a query to one repo           | Pass ` + "`repo`" + ` param to ` + "`search_symbols`" + `, ` + "`find_usages`" + `, etc. |
 | Scoping a query to a project          | Pass ` + "`project`" + ` param to any query tool |
 | Filtering by reference tag            | Pass ` + "`ref`" + ` param to any query tool |
+
+### MCP Resources
+
+Bootstrap-state tools are also exposed as MCP resources (read-only, URI-addressable, no args). Subscribe via ` + "`resources/subscribe`" + ` once and receive ` + "`notifications/resources/updated`" + ` after each graph re-warm — no polling. Tools stay registered for back-compat with clients that don't speak resources; both surfaces share builder helpers so payloads match byte-for-byte.
+
+| Resource URI                                              | Same payload as tool          |
+|-----------------------------------------------------------|-------------------------------|
+| ` + "`gortex://stats`" + `                                          | ` + "`graph_stats`" + `                 |
+| ` + "`gortex://index-health`" + `                                   | ` + "`index_health`" + `                |
+| ` + "`gortex://workspace`" + `                                      | ` + "`workspace_info`" + `              |
+| ` + "`gortex://repos`" + `                                          | ` + "`list_repos`" + `                  |
+| ` + "`gortex://active-project`" + `                                 | ` + "`get_active_project`" + `          |
+| ` + "`gortex://schema`" + `                                         | (graph schema reference)      |
+| ` + "`gortex://session`" + `                                        | (recent activity replay)      |
+| ` + "`gortex://communities`" + ` / ` + "`gortex://community/{id}`" + `        | community detection rollups |
+| ` + "`gortex://processes`" + ` / ` + "`gortex://process/{id}`" + `            | process discovery rollups   |
+
+Analyzer-backed rollups (read-only summaries; the only "argument" is the current state of the indexed code):
+
+| Resource URI            | Synthesises                                              |
+|-------------------------|----------------------------------------------------------|
+| ` + "`gortex://report`" + `       | High-level orientation: graph size, top languages/kinds, hotspot count, dead-code count, todo count |
+| ` + "`gortex://god-nodes`" + `    | Top 20 hotspots (subset of ` + "`analyze kind:hotspots`" + `) |
+| ` + "`gortex://surprises`" + `    | Cycles + dead code + cross-community call hubs           |
+| ` + "`gortex://audit`" + `        | ` + "`audit_agent_config`" + ` with discovery defaults             |
+| ` + "`gortex://questions`" + `    | TODO/FIXME rollup grouped by tag and assignee            |
 
 ## Session start (Gortex)
 

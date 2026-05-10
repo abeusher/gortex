@@ -2365,6 +2365,29 @@ func (s *Server) handleIndexHealth(ctx context.Context, req mcp.CallToolRequest)
 	if s.indexer == nil {
 		return mcp.NewToolResultError("no indexer available"), nil
 	}
+	result := s.buildIndexHealthPayload()
+
+	if isCompact(req) {
+		stale, _ := result["stale_files"].([]string)
+		failures, _ := result["parse_failures"].(map[string]string)
+		line := fmt.Sprintf("health=%.1f%% nodes=%d stale=%d failures=%d",
+			result["health_score"], result["node_count"], len(stale), len(failures))
+		if _, ok := result["recommendation"]; ok {
+			line += " [needs re-index]"
+		}
+		return mcp.NewToolResultText(line + "\n"), nil
+	}
+
+	return s.respondJSONOrTOON(ctx, req, result)
+}
+
+// buildIndexHealthPayload returns the same data the `index_health`
+// tool emits. Shared with the `gortex://index-health` resource.
+// Returns nil when no indexer is wired.
+func (s *Server) buildIndexHealthPayload() map[string]any {
+	if s.indexer == nil {
+		return nil
+	}
 
 	totalDetected := s.indexer.TotalDetected()
 	parseErrors := s.indexer.ParseErrors()
@@ -2383,13 +2406,11 @@ func (s *Server) handleIndexHealth(ctx context.Context, req mcp.CallToolRequest)
 		successfullyIndexed = 0
 	}
 
-	// Compute health score
 	var healthScore float64
 	if totalDetected > 0 {
 		healthScore = math.Round(float64(successfullyIndexed)/float64(totalDetected)*1000) / 10
 	}
 
-	// Find stale files
 	var staleFiles []string
 	mtimes := s.indexer.FileMtimes()
 	for relPath := range mtimes {
@@ -2398,7 +2419,6 @@ func (s *Server) handleIndexHealth(ctx context.Context, req mcp.CallToolRequest)
 		}
 	}
 
-	// Language coverage from graph stats
 	stats := s.graph.Stats()
 	langCoverage := make(map[string]bool)
 	for lang := range stats.ByLanguage {
@@ -2411,19 +2431,9 @@ func (s *Server) handleIndexHealth(ctx context.Context, req mcp.CallToolRequest)
 		lastIndexStr = lastIndexTime.Format("2006-01-02T15:04:05Z07:00")
 	}
 
-	// Recommendation if health < 80%
 	var recommendation string
 	if healthScore < 80 {
 		recommendation = "Health score below 80%. Run index_repository with path \".\" to re-index the codebase."
-	}
-
-	if isCompact(req) {
-		line := fmt.Sprintf("health=%.1f%% nodes=%d stale=%d failures=%d",
-			healthScore, stats.TotalNodes, len(staleFiles), len(parseErrors))
-		if recommendation != "" {
-			line += " [needs re-index]"
-		}
-		return mcp.NewToolResultText(line + "\n"), nil
 	}
 
 	result := map[string]any{
@@ -2445,7 +2455,7 @@ func (s *Server) handleIndexHealth(ctx context.Context, req mcp.CallToolRequest)
 		result["recommendation"] = recommendation
 	}
 
-	return s.respondJSONOrTOON(ctx, req, result)
+	return result
 }
 
 // ---------------------------------------------------------------------------

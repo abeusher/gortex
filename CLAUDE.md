@@ -178,6 +178,32 @@ The `flow_between` and `taint_paths` MCP tools answer **"where does this value f
 | Scoping a query to a project          | Pass `project` param to any query tool |
 | Filtering by reference tag            | Pass `ref` param to any query tool |
 
+### MCP Resources
+
+Bootstrap-state tools are also exposed as MCP resources (read-only, URI-addressable, no args). Clients that speak resources can `resources/subscribe` once and receive `notifications/resources/updated` after each graph re-warm — no polling. The tool form stays for back-compat with clients that don't speak resources.
+
+| Resource URI                   | Same payload as tool      |
+|--------------------------------|---------------------------|
+| `gortex://stats`               | `graph_stats`             |
+| `gortex://index-health`        | `index_health`            |
+| `gortex://workspace`           | `workspace_info`          |
+| `gortex://repos`               | `list_repos`              |
+| `gortex://active-project`      | `get_active_project`      |
+| `gortex://schema`              | (graph schema reference)  |
+| `gortex://session`             | (recent activity replay)  |
+| `gortex://communities` / `gortex://community/{id}` | community detection rollups |
+| `gortex://processes` / `gortex://process/{id}`     | process discovery rollups   |
+
+Analyzer-backed rollups (read-only summaries; the only "argument" is the current state of the indexed code):
+
+| Resource URI            | Synthesises                                              |
+|-------------------------|----------------------------------------------------------|
+| `gortex://report`       | High-level orientation: graph size, top languages/kinds, hotspot count, dead-code count, todo count |
+| `gortex://god-nodes`    | Top 20 hotspots (subset of `analyze kind:hotspots`)      |
+| `gortex://surprises`    | Cycles + dead code + cross-community call hubs           |
+| `gortex://audit`        | `audit_agent_config` with discovery defaults             |
+| `gortex://questions`    | TODO / FIXME / XXX / HACK / QUESTION rollup grouped by tag and assignee |
+
 ## Session start
 
 1. Call `graph_stats` to confirm Gortex is running and get repo orientation. In multi-repo mode, check `per_repo` stats.

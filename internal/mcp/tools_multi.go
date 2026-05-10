@@ -191,11 +191,17 @@ func (s *Server) handleSetActiveProject(ctx context.Context, req mcp.CallToolReq
 
 // handleGetActiveProject returns the current active project name and its repo list.
 func (s *Server) handleGetActiveProject(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	return s.respondJSONOrTOON(ctx, req, s.buildActiveProjectPayload())
+}
+
+// buildActiveProjectPayload returns the same data the `get_active_project`
+// tool emits. Shared with the `gortex://active-project` resource.
+func (s *Server) buildActiveProjectPayload() map[string]any {
 	if s.configManager == nil {
-		return s.respondJSONOrTOON(ctx, req, map[string]any{
+		return map[string]any{
 			"project": "",
 			"repos":   []any{},
-		})
+		}
 	}
 
 	gc := s.configManager.Global()
@@ -209,26 +215,24 @@ func (s *Server) handleGetActiveProject(ctx context.Context, req mcp.CallToolReq
 	}
 
 	if project == "" {
-		// No active project — return top-level repos.
 		result["repos"] = buildRepoList(gc.Repos)
-	} else {
-		repos, resolveErr := gc.ResolveRepos(project)
-		if resolveErr != nil {
-			// Common after the workspace bind drops to "unbound"
-			// while a stale active_project still points at a
-			// project the workspace no longer discovers. Fall back
-			// to the workspace-level repo list and record the drift
-			// in `note` so the caller can offer a fix without the
-			// surface being a hard error.
-			result["project"] = ""
-			result["repos"] = buildRepoList(gc.Repos)
-			result["note"] = fmt.Sprintf("active_project %q not found in current workspace; returning top-level repos", project)
-		} else {
-			result["repos"] = buildRepoList(repos)
-		}
+		return result
 	}
 
-	return s.respondJSONOrTOON(ctx, req, result)
+	repos, resolveErr := gc.ResolveRepos(project)
+	if resolveErr != nil {
+		// Common after the workspace bind drops to "unbound"
+		// while a stale active_project still points at a project
+		// the workspace no longer discovers. Fall back to the
+		// workspace-level repo list and record the drift in `note`.
+		result["project"] = ""
+		result["repos"] = buildRepoList(gc.Repos)
+		result["note"] = fmt.Sprintf("active_project %q not found in current workspace; returning top-level repos", project)
+		return result
+	}
+
+	result["repos"] = buildRepoList(repos)
+	return result
 }
 
 // resolveRepoPrefix resolves a path-or-prefix string to a repo prefix by
