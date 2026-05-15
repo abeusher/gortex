@@ -25,6 +25,7 @@ func (s *Server) registerCodingTools() {
 			mcp.WithString("detail", mcp.Description("brief or full (default: brief)")),
 			mcp.WithString("format", mcp.Description("Output format: json (default), gcx (GCX1 compact wire format), or toon")),
 			mcp.WithNumber("max_bytes", mcp.Description("Cap the marshaled response at this many bytes. The longest list is trimmed; truncation metadata rides on the response. Omit for no cap.")),
+			mcp.WithNumber("max_tokens", mcp.Description(tokenBudgetParamDescription)),
 			mcp.WithString("if_none_match", mcp.Description("ETag from a previous response — returns not_modified if content unchanged")),
 			mcp.WithBoolean("compress_bodies", mcp.Description("Also return a source_compressed view of the whole file with every function/method body replaced by a `{ /* N lines elided */ }` stub. Signatures, imports, types, and comments are preserved verbatim. Roughly 60-70% fewer tokens than raw source. Composable with format:\"gcx\". Default: false.")),
 		),

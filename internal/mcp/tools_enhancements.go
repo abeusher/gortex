@@ -7,21 +7,21 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"time"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/zzet/gortex/internal/analysis"
 	"github.com/zzet/gortex/internal/audit"
 	"github.com/zzet/gortex/internal/blame"
-	"github.com/zzet/gortex/internal/coverage"
-	"github.com/zzet/gortex/internal/releases"
 	"github.com/zzet/gortex/internal/contracts"
+	"github.com/zzet/gortex/internal/coverage"
 	"github.com/zzet/gortex/internal/excludes"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/persistence"
 	"github.com/zzet/gortex/internal/query"
+	"github.com/zzet/gortex/internal/releases"
 	"github.com/zzet/gortex/internal/tokens"
 	"go.uber.org/zap"
 )
@@ -106,11 +106,11 @@ func (s *Server) registerEnhancementTools() {
 			mcp.WithNumber("limit", mcp.Description("Max candidates to return (default: 10)")),
 			mcp.WithString("cursor", mcp.Description("Opaque pagination cursor from a previous `next_cursor` to fetch the next page.")),
 			mcp.WithBoolean("paginate", mcp.Description("When true, the server caps each page at the project default budget and returns `next_cursor` for any tail.")),
-			mcp.WithNumber("max_bytes", mcp.Description("Cap the marshaled response at this many bytes. The longest list is trimmed; truncation metadata rides on the response.")),
 			mcp.WithString("fields", mcp.Description("Comma-separated list of fields to keep on each candidate (e.g. \"id,confidence,reason\").")),
 			mcp.WithBoolean("compact", mcp.Description("One-line-per-symbol text output")),
 			mcp.WithString("format", mcp.Description("Output format: json (default), gcx (GCX1 compact wire format), or toon")),
 			mcp.WithNumber("max_bytes", mcp.Description("Cap the marshaled response at this many bytes. The longest list is trimmed; truncation metadata rides on the response. Omit for no cap.")),
+			mcp.WithNumber("max_tokens", mcp.Description(tokenBudgetParamDescription)),
 		),
 		s.handlePrefetchContext,
 	)
@@ -889,10 +889,10 @@ func (s *Server) handleAnalyzeCoverage(ctx context.Context, req mcp.CallToolRequ
 	modulePath := coverage.ReadModulePath(root)
 	count := coverage.EnrichGraph(s.graph, segments, modulePath)
 	return s.respondJSONOrTOON(ctx, req, map[string]any{
-		"enriched":     count,
-		"segments":     len(segments),
-		"profile":      profileArg,
-		"module_path":  modulePath,
+		"enriched":    count,
+		"segments":    len(segments),
+		"profile":     profileArg,
+		"module_path": modulePath,
 	})
 }
 
@@ -1020,14 +1020,14 @@ func parseAnalyzeKindsFilter(arg string) map[graph.NodeKind]struct{} {
 		}
 		if k == "all" {
 			return map[graph.NodeKind]struct{}{
-				graph.KindFunction:    {},
-				graph.KindMethod:      {},
-				graph.KindType:        {},
-				graph.KindInterface:   {},
-				graph.KindField:       {},
-				graph.KindVariable:    {},
-				graph.KindConstant:    {},
-				graph.KindEnumMember:  {},
+				graph.KindFunction:   {},
+				graph.KindMethod:     {},
+				graph.KindType:       {},
+				graph.KindInterface:  {},
+				graph.KindField:      {},
+				graph.KindVariable:   {},
+				graph.KindConstant:   {},
+				graph.KindEnumMember: {},
 			}
 		}
 		out[graph.NodeKind(k)] = struct{}{}
@@ -1072,12 +1072,12 @@ func (s *Server) handleAnalyzeOwnership(ctx context.Context, req mcp.CallToolReq
 	}
 
 	type ownerStats struct {
-		Email     string `json:"email"`
-		Symbols   int    `json:"symbols"`
-		Files     int    `json:"files"`
-		OldestTS  int64  `json:"oldest_timestamp"`
-		NewestTS  int64  `json:"newest_timestamp"`
-		fileSet   map[string]struct{}
+		Email    string `json:"email"`
+		Symbols  int    `json:"symbols"`
+		Files    int    `json:"files"`
+		OldestTS int64  `json:"oldest_timestamp"`
+		NewestTS int64  `json:"newest_timestamp"`
+		fileSet  map[string]struct{}
 	}
 	byEmail := map[string]*ownerStats{}
 
@@ -1328,12 +1328,12 @@ func (s *Server) handleAnalyzeStaleFlags(ctx context.Context, req mcp.CallToolRe
 	cutoffSec := time.Now().Add(-time.Duration(olderThanDays*24) * time.Hour).Unix()
 
 	type staleFlag struct {
-		ID            string `json:"id"`
-		Name          string `json:"name"`
-		Provider      string `json:"provider"`
-		Callers       int    `json:"callers"`
-		NewestCallTS  int64  `json:"newest_call_timestamp"`
-		AgeDays       int    `json:"age_days"`
+		ID           string `json:"id"`
+		Name         string `json:"name"`
+		Provider     string `json:"provider"`
+		Callers      int    `json:"callers"`
+		NewestCallTS int64  `json:"newest_call_timestamp"`
+		AgeDays      int    `json:"age_days"`
 	}
 	var rows []staleFlag
 	unscored := 0
@@ -1630,12 +1630,12 @@ func (s *Server) handleAnalyzeCoverageSummary(ctx context.Context, req mcp.CallT
 	}
 
 	type dirStats struct {
-		Dir         string  `json:"dir"`
-		Symbols     int     `json:"symbols"`
-		AvgPct      float64 `json:"avg_pct"`
-		Covered     int     `json:"covered"`
-		Partial     int     `json:"partial"`
-		Uncovered   int     `json:"uncovered"`
+		Dir       string  `json:"dir"`
+		Symbols   int     `json:"symbols"`
+		AvgPct    float64 `json:"avg_pct"`
+		Covered   int     `json:"covered"`
+		Partial   int     `json:"partial"`
+		Uncovered int     `json:"uncovered"`
 
 		sumPct float64 // running sum, hidden from JSON
 	}

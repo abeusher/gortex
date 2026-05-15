@@ -52,7 +52,7 @@ For Homebrew, package managers (`.deb` / `.rpm` / `.apk`), direct binary downloa
 - **Token savings tracking** — per-call `tokens_saved` field on source-reading tools + session-level metrics in `graph_stats` (calls counted, tokens returned, tokens saved, efficiency ratio)
 - **GCX1 compact wire format** — published, round-trippable text format for MCP tool responses. Opt-in per call via `format: "gcx"` on every list-shaped tool (~17). Auto-served as the default for known clients (Claude Code, Cursor, VS Code, Zed, Aider, Kilo Code, OpenCode, OpenClaw, Codex) when no `format` is passed; explicit `format` always wins. **Median −27.4% tiktoken savings** vs JSON across a 20-case benchmark (best case −38.3%), 100% round-trip integrity. Spec: [`docs/wire-format.md`](docs/wire-format.md). Standalone MIT-licensed reference implementations: Go ([`github.com/gortexhq/gcx-go`](https://github.com/gortexhq/gcx-go)) and TypeScript ([`github.com/gortexhq/gcx-ts`](https://github.com/gortexhq/gcx-ts), npm [`@gortex/wire`](https://www.npmjs.com/package/@gortex/wire)). Reproducible harness: [`bench/wire-format/`](bench/wire-format/)
 - **TOON fallback wire format** — second-tier compact text (~10–15% smaller than JSON, lossy but human-friendly) on every list-shaped tool for clients that don't yet speak GCX. Pass `format: "toon"`
-- **Budget-by-default MCP responses** — list-shaped tools cap each page at the project default budget and return `next_cursor` for the tail. Pagination, sparse fieldsets, and graceful degradation built in
+- **Budget-by-default MCP responses** — list-shaped tools cap each page at the project default budget and return `next_cursor` for the tail. Pagination, sparse fieldsets, and graceful degradation built in. Per-call caps via `max_bytes` *and* `max_tokens` (composable — tighter wins; ~3.5 bytes/token heuristic calibrated across JSON / TOON / GCX1). Truncation rides on the response as `_truncated_by_budget` / `_truncated_by_tokens` / `_max_returned_<list>` markers (JSON) or a `# truncated_by_budget=true` / `# max_tokens=N truncated_by_tokens=true` comment (GCX)
 - **16 MCP resources** — bootstrap state (`gortex://stats`, `gortex://workspace`, `gortex://repos`, `gortex://active-project`, `gortex://schema`, `gortex://session`, `gortex://index-health`), community / process rollups (`gortex://communities`, `gortex://community/{id}`, `gortex://processes`, `gortex://process/{id}`), and analyzer-backed summaries (`gortex://report`, `gortex://god-nodes`, `gortex://surprises`, `gortex://audit`, `gortex://questions`). Read-only, URI-addressable, push `notifications/resources/updated` after each graph re-warm — no polling
 - **Framework graph layer** — handler→route edges from HTTP / gRPC / GraphQL / WebSocket / Phoenix / Kafka topic registrations; ORM model→table edges across GORM, SQLAlchemy, Django, ActiveRecord, JPA, TypeORM, Ecto; component-tree edges for JSX/TSX and Phoenix HEEx. Surfaced via `analyze` `kind: "routes" / "models" / "components"`
 - **Infrastructure graph layer** — first-class `KindResource` (Kubernetes Deployments, Services, Ingresses, ConfigMaps, Secrets, CronJobs), `KindKustomization` (overlay tree), and `KindImage` (Dockerfile FROM targets and K8s `container.image`) with `depends_on` / `configures` / `mounts` / `exposes` / `uses_env` edges. Cross-references with code-side `os.Getenv` calls automatically. Surfaced via `analyze` `kind: "k8s_resources" / "kustomize" / "images"`
@@ -332,8 +332,8 @@ All query commands support `--format text|json|dot` (DOT output for Graphviz vis
 | `search_symbols` | Find symbols by name (replaces Grep). Accepts `repo`, `project`, `ref` params |
 | `winnow_symbols` | Structured constraint-chain retrieval — `kind`, `language`, `community`, `path_prefix`, `min_fan_in`, `min_fan_out`, `min_churn`, `text_match` with per-axis score contributions |
 | `get_symbol` | Symbol location and signature (replaces Read). Accepts `repo`, `project`, `ref` params |
-| `get_file_summary` | All symbols and imports in a file. Accepts `repo`, `project`, `ref` params |
-| `get_editing_context` | **Primary pre-edit tool** — symbols, signatures, callers, callees |
+| `get_file_summary` | All symbols and imports in a file. Accepts `repo`, `project`, `ref`, `max_bytes` / `max_tokens` budget caps |
+| `get_editing_context` | **Primary pre-edit tool** — symbols, signatures, callers, callees. Accepts `max_bytes` / `max_tokens` budget caps |
 | `get_repo_outline` | Narrative single-call repo overview — top languages, communities, hotspots, most-imported files, entry points |
 | `plan_turn` | Opening-move router — returns ranked next calls with pre-filled args for a task description (~200 tokens) |
 
@@ -342,9 +342,9 @@ All query commands support `--format text|json|dot` (DOT output for Graphviz vis
 |------|-------------|
 | `get_dependencies` | What a symbol depends on |
 | `get_dependents` | What depends on a symbol (blast radius) |
-| `get_call_chain` | Forward call graph |
+| `get_call_chain` | Forward call graph. Accepts `max_bytes` / `max_tokens` budget caps |
 | `get_callers` | Reverse call graph |
-| `find_usages` | Every reference to a symbol |
+| `find_usages` | Every reference to a symbol. Accepts `max_bytes` / `max_tokens` budget caps |
 | `find_implementations` | Types implementing an interface |
 | `find_overrides` | Methods that override (children) or are overridden by (parents) a method — backed by `EdgeOverrides` |
 | `get_class_hierarchy` | Multi-hop inheritance subgraph around a type, interface, or method — walks `EdgeExtends` + `EdgeImplements` + `EdgeComposes` (type nodes) and `EdgeOverrides` (method nodes); `direction` ∈ up / down / both, `include_methods` pulls members + their override chain |
@@ -427,7 +427,7 @@ Wired across every running language server (gopls, tsserver, pyright, rust-analy
 | `scaffold` | Generate code, registration wiring, and test stubs from an example symbol |
 | `batch_edit` | Apply multiple edits in dependency order, re-index between steps |
 | `diff_context` | Git diff enriched with callers, callees, community, processes, per-file risk |
-| `prefetch_context` | Predict needed symbols from task description and recent activity |
+| `prefetch_context` | Predict needed symbols from task description and recent activity. Accepts `max_bytes` / `max_tokens` budget caps |
 
 ### Multi-Repo Management
 | Tool | Description |

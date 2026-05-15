@@ -196,10 +196,14 @@ func returnTOON(payload any) (*mcp.CallToolResult, error) {
 func (s *Server) respondJSONOrTOON(ctx context.Context, req mcp.CallToolRequest, payload any) (*mcp.CallToolResult, error) {
 	payload = applyFieldsFilter(payload, parseFields(req.GetString("fields", "")))
 	if budget := effectiveBudget(req); budget > 0 {
+		var trimmed bool
 		if shape, ok := degradeShapes[req.Params.Name]; ok {
-			payload, _ = applyDegradation(payload, shape, budget)
+			payload, trimmed = applyDegradation(payload, shape, budget)
 		} else {
-			payload, _ = applyBudget(payload, budget)
+			payload, trimmed = applyBudget(payload, budget)
+		}
+		if trimmed {
+			payload = decorateTokenBudgetJSON(payload, req)
 		}
 	}
 	// TOON is the right fallback whenever the caller (or the
@@ -590,6 +594,7 @@ func (s *Server) registerCoreTools() {
 			mcp.WithBoolean("compact", mcp.Description("One-line-per-symbol text output (saves 50-70% tokens)")),
 			mcp.WithString("format", mcp.Description("Output format: json (default), gcx (GCX1 compact wire format), or toon")),
 			mcp.WithNumber("max_bytes", mcp.Description("Cap the marshaled response at this many bytes. The longest list is trimmed; truncation metadata rides on the response. Omit for no cap.")),
+			mcp.WithNumber("max_tokens", mcp.Description(tokenBudgetParamDescription)),
 			mcp.WithString("repo", mcp.Description("Filter results to a specific repository prefix")),
 			mcp.WithString("project", mcp.Description("Filter results to repositories in a specific project")),
 			mcp.WithString("ref", mcp.Description("Filter results to repositories with a specific reference tag")),
@@ -635,6 +640,7 @@ func (s *Server) registerCoreTools() {
 			mcp.WithBoolean("compact", mcp.Description("One-line-per-symbol text output (saves 50-70% tokens)")),
 			mcp.WithString("format", mcp.Description("Output format: json (default), gcx (GCX1 compact wire format), or toon")),
 			mcp.WithNumber("max_bytes", mcp.Description("Cap the marshaled response at this many bytes. The longest list is trimmed; truncation metadata rides on the response. Omit for no cap.")),
+			mcp.WithNumber("max_tokens", mcp.Description(tokenBudgetParamDescription)),
 			mcp.WithString("repo", mcp.Description("Filter results to a specific repository prefix")),
 			mcp.WithString("project", mcp.Description("Filter results to repositories in a specific project")),
 			mcp.WithString("ref", mcp.Description("Filter results to repositories with a specific reference tag")),
@@ -703,6 +709,7 @@ func (s *Server) registerCoreTools() {
 			mcp.WithBoolean("compact", mcp.Description("One-line-per-symbol text output (saves 50-70% tokens)")),
 			mcp.WithString("format", mcp.Description("Output format: json (default), gcx (GCX1 compact wire format), or toon")),
 			mcp.WithNumber("max_bytes", mcp.Description("Cap the marshaled response at this many bytes. The longest list is trimmed; truncation metadata rides on the response. Omit for no cap.")),
+			mcp.WithNumber("max_tokens", mcp.Description(tokenBudgetParamDescription)),
 			mcp.WithString("repo", mcp.Description("Filter results to a specific repository prefix")),
 			mcp.WithString("project", mcp.Description("Filter results to repositories in a specific project")),
 			mcp.WithString("ref", mcp.Description("Filter results to repositories with a specific reference tag")),

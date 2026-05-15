@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -26,6 +27,79 @@ import (
 // re-measuring the harness threshold; "no spill" beats "more rows"
 // because spilled output forces a cold re-read for the agent.
 const defaultMaxBytes = 40_000
+
+// avgBytesPerToken is the calibration constant used to translate the
+// `max_tokens` parameter into an effective byte cap. Empirically:
+//
+//   - dense JSON / TOON rows (`{"id":"...","kind":"function",...}`)
+//     tokenise at ~3.0–3.4 chars per BPE token on cl100k_base. The
+//     punctuation density (quotes, colons, braces) drags the ratio
+//     down vs. natural English.
+//   - GCX1 rows (`id\tkind\tname\t...`) tokenise at ~4.0–4.5 chars
+//     per token because tabs collapse into single tokens and the
+//     identifier-heavy payload tokenises more efficiently than JSON.
+//   - smart_context / get_editing_context source-bearing payloads
+//     average ~3.6 chars per token because the source lines push
+//     the ratio toward English text.
+//
+// 3.5 is the safe midpoint: it slightly UNDER-counts tokens for JSON
+// (so the resulting byte cap is tighter than strictly necessary —
+// erring on the side of "fits the budget") and approximately matches
+// the GCX row case. Token estimation is necessarily imperfect across
+// model tokenisers; the budget guard's job is to ride a safe margin,
+// not to count exactly. A caller who needs precise token-counting
+// should run their own tokenizer post-hoc.
+const avgBytesPerToken = 3.5
+
+// tokenBudgetParamDescription is the canonical description string
+// for the `max_tokens` parameter wired onto every list-shaped tool.
+// Centralised so the wording stays consistent across the registry.
+const tokenBudgetParamDescription = "Cap the marshaled response at approximately this many tokens (3.5 bytes/token heuristic; composable with max_bytes — tighter wins). Use when you have a token budget instead of a byte budget. Omit for no cap; pass 0 to opt out explicitly."
+
+// tokensToBytes converts a token budget into a byte cap using the
+// avgBytesPerToken ratio. Returns 0 for non-positive inputs so
+// `max_tokens: 0` is honoured as "opt out" with the same semantics
+// as `max_bytes: 0`.
+func tokensToBytes(maxTokens int) int {
+	if maxTokens <= 0 {
+		return 0
+	}
+	return int(float64(maxTokens) * avgBytesPerToken)
+}
+
+// bytesToTokens is the inverse of tokensToBytes. Used to render a
+// human-readable token-equivalent on the truncation meta so callers
+// see "kept ~N tokens" alongside the raw byte cap. Returns 0 for
+// non-positive inputs.
+func bytesToTokens(byteCount int) int {
+	if byteCount <= 0 {
+		return 0
+	}
+	return int(float64(byteCount) / avgBytesPerToken)
+}
+
+// numArgInt extracts an integer arg from the request arguments map.
+// JSON numbers arrive as float64; some test harnesses pass int.
+// Returns (value, present). When the arg is the wrong type, returns
+// (0, true) so callers can distinguish "absent" from "malformed
+// zero" — important because a zero value is meaningful here (it is
+// the opt-out signal for both max_bytes and max_tokens).
+func numArgInt(args map[string]any, key string) (int, bool) {
+	raw, ok := args[key]
+	if !ok {
+		return 0, false
+	}
+	switch n := raw.(type) {
+	case float64:
+		return int(n), true
+	case int:
+		return n, true
+	case int64:
+		return int(n), true
+	default:
+		return 0, true
+	}
+}
 
 // budgetTruncatedKey is the meta flag appended to a payload trimmed
 // by applyBudget so callers can branch on truncation without scanning
@@ -371,14 +445,16 @@ func trimGCXBytes(payload []byte, maxBytes int) ([]byte, bool) {
 	return out, true
 }
 
-// effectiveBudget resolves the per-call budget. Budget-by-default —
-// every list-shaped tool runs through graceful degradation so the
+// effectiveBudget resolves the per-call byte budget. Budget-by-default
+// — every list-shaped tool runs through graceful degradation so the
 // agent gets a usable in-band response instead of a transport spill
 // that the model learns to route around. Resolution order:
 //
-//   - `max_bytes` set explicitly: that value is the cap. Pass 0 to
-//     opt OUT of budgeting entirely (rare — for tasks that genuinely
-//     need every row, like security audits / exhaustive enumeration).
+//   - `max_bytes` and / or `max_tokens` set explicitly: the tighter
+//     cap wins. `max_tokens` is converted via tokensToBytes and then
+//     min-merged with `max_bytes`. Passing 0 (or negative) on either
+//     axis opts OUT of that axis; opting out of one axis still
+//     respects the other. Opting out of both yields no cap.
 //   - `paginate: true`: shorthand for "I'll follow next_cursor; cap
 //     each page at the project default". Same effective budget as
 //     the default, but advertises the caller's iteration intent.
@@ -386,25 +462,187 @@ func trimGCXBytes(payload []byte, maxBytes int) ([]byte, bool) {
 //     case rather than the routine outcome on real-world payloads.
 //
 // The opt-out is intentional friction: agents that need exhaustive
-// data can pass `max_bytes: 0`, but the default prefers a partial,
-// inline answer over a spilled file the agent has to re-read.
+// data can pass `max_bytes: 0` (or `max_tokens: 0`), but the default
+// prefers a partial, inline answer over a spilled file the agent has
+// to re-read.
 func effectiveBudget(req mcp.CallToolRequest) int {
 	args := req.GetArguments()
-	if raw, present := args["max_bytes"]; present {
-		if n, ok := raw.(float64); ok {
-			if n <= 0 {
-				return 0 // explicit opt-out
-			}
-			return int(n)
-		}
-		if n, ok := raw.(int); ok {
-			if n <= 0 {
-				return 0
-			}
-			return n
-		}
+	rawBytes, bytesPresent := numArgInt(args, "max_bytes")
+	rawTokens, tokensPresent := numArgInt(args, "max_tokens")
+
+	if !bytesPresent && !tokensPresent {
+		return defaultMaxBytes
 	}
-	return defaultMaxBytes
+
+	// Per-axis opt-out: a non-positive value means "skip THIS axis".
+	bytesOptOut := bytesPresent && rawBytes <= 0
+	tokensOptOut := tokensPresent && rawTokens <= 0
+
+	// Both axes opted out → no cap.
+	if bytesPresent && tokensPresent && bytesOptOut && tokensOptOut {
+		return 0
+	}
+	// Only one axis present and it opted out → no cap.
+	if bytesPresent && !tokensPresent && bytesOptOut {
+		return 0
+	}
+	if tokensPresent && !bytesPresent && tokensOptOut {
+		return 0
+	}
+
+	tokensBytes := tokensToBytes(rawTokens) // 0 when token axis absent or opt-out
+
+	switch {
+	case bytesPresent && tokensPresent:
+		switch {
+		case bytesOptOut:
+			return tokensBytes
+		case tokensOptOut:
+			return rawBytes
+		case rawBytes < tokensBytes:
+			return rawBytes
+		default:
+			return tokensBytes
+		}
+	case bytesPresent:
+		return rawBytes
+	default: // tokensPresent
+		return tokensBytes
+	}
+}
+
+// budgetSource describes which arg drove the resolved byte cap. Used
+// purely to decorate truncation metadata — the cap value itself is
+// already returned by effectiveBudget. "none" means no cap was
+// applied (default budget or explicit opt-out); the other values
+// match the parameter name that won the min-merge.
+type budgetSource string
+
+const (
+	budgetSourceNone    budgetSource = "none"
+	budgetSourceBytes   budgetSource = "max_bytes"
+	budgetSourceTokens  budgetSource = "max_tokens"
+	budgetSourceDefault budgetSource = "default"
+)
+
+// resolveBudgetSource reports which axis was the tighter constraint
+// for this request. Mirrors effectiveBudget's resolution order but
+// returns the *origin* rather than the value. When max_tokens drove
+// the cap, callers can surface that in truncation meta so the agent
+// sees "trimmed because of your max_tokens=N" instead of a generic
+// "too big" hint. Returns budgetSourceDefault when no caller arg was
+// present and the project default applied.
+func resolveBudgetSource(req mcp.CallToolRequest) (budgetSource, int) {
+	args := req.GetArguments()
+	rawBytes, bytesPresent := numArgInt(args, "max_bytes")
+	rawTokens, tokensPresent := numArgInt(args, "max_tokens")
+
+	if !bytesPresent && !tokensPresent {
+		return budgetSourceDefault, 0
+	}
+
+	bytesOptOut := bytesPresent && rawBytes <= 0
+	tokensOptOut := tokensPresent && rawTokens <= 0
+
+	if bytesPresent && tokensPresent && bytesOptOut && tokensOptOut {
+		return budgetSourceNone, 0
+	}
+	if bytesPresent && !tokensPresent && bytesOptOut {
+		return budgetSourceNone, 0
+	}
+	if tokensPresent && !bytesPresent && tokensOptOut {
+		return budgetSourceNone, 0
+	}
+
+	tokensBytes := tokensToBytes(rawTokens)
+	switch {
+	case bytesPresent && tokensPresent:
+		switch {
+		case bytesOptOut:
+			return budgetSourceTokens, rawTokens
+		case tokensOptOut:
+			return budgetSourceBytes, rawBytes
+		case rawBytes < tokensBytes:
+			return budgetSourceBytes, rawBytes
+		default:
+			return budgetSourceTokens, rawTokens
+		}
+	case bytesPresent:
+		return budgetSourceBytes, rawBytes
+	default:
+		return budgetSourceTokens, rawTokens
+	}
+}
+
+// decorateTokenBudgetJSON folds caller-supplied max_tokens info into
+// a payload's truncation metadata. Only mutates when (a) max_tokens
+// was supplied and (b) the budget guard actually fired — under both
+// conditions a `_max_tokens` and (when tokens drove the cap) a
+// `_truncated_by_tokens` marker ride alongside the existing
+// `_truncated_by_budget` flag. Callers without max_tokens see the
+// unchanged byte-only meta.
+//
+// Best-effort: payload that isn't a map[string]any is returned
+// untouched (no shape to decorate).
+func decorateTokenBudgetJSON(payload any, req mcp.CallToolRequest) any {
+	if payload == nil {
+		return payload
+	}
+	m, ok := payload.(map[string]any)
+	if !ok {
+		return payload
+	}
+	// Only decorate when the budget actually fired.
+	flag, hasFlag := m[budgetTruncatedKey].(bool)
+	if !hasFlag || !flag {
+		return payload
+	}
+	source, value := resolveBudgetSource(req)
+	if source == budgetSourceTokens && value > 0 {
+		m["_max_tokens"] = value
+		m["_truncated_by_tokens"] = true
+		return m
+	}
+	// Even when bytes drove the cap, surface a tokens-equivalent if
+	// max_tokens was supplied so the agent can see what fraction of
+	// its token budget was actually used.
+	if rawTokens, present := numArgInt(req.GetArguments(), "max_tokens"); present && rawTokens > 0 {
+		m["_max_tokens"] = rawTokens
+	}
+	return m
+}
+
+// decorateTokenBudgetGCX appends a trailing comment to a GCX payload
+// recording the max_tokens annotation. Only fires when max_tokens
+// was supplied AND the payload already shows the byte-trim
+// `# truncated_by_budget=true` marker — otherwise we'd spam every
+// response with budget metadata. The decoder (@gortex/wire, gcx-go)
+// treats trailing comments as no-ops, so the appended line is
+// non-invasive.
+func decorateTokenBudgetGCX(payload []byte, req mcp.CallToolRequest) []byte {
+	if len(payload) == 0 {
+		return payload
+	}
+	// Only decorate when the GCX trim path already fired.
+	if !bytes.Contains(payload, []byte("# truncated_by_budget=true")) {
+		return payload
+	}
+	rawTokens, present := numArgInt(req.GetArguments(), "max_tokens")
+	if !present || rawTokens <= 0 {
+		return payload
+	}
+	source, _ := resolveBudgetSource(req)
+	extra := fmt.Sprintf("# max_tokens=%d", rawTokens)
+	if source == budgetSourceTokens {
+		extra += " truncated_by_tokens=true"
+	}
+	extra += "\n"
+	// Avoid duplicate decoration on retries that re-trim an already-
+	// trimmed payload (cheap idempotency).
+	if bytes.Contains(payload, []byte(fmt.Sprintf("max_tokens=%d", rawTokens))) {
+		return payload
+	}
+	return append(payload, []byte(extra)...)
 }
 
 // DegradeShape registers a per-tool graceful-degradation policy.

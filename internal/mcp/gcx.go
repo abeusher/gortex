@@ -58,8 +58,11 @@ func (s *Server) gcxResponseWithBudget(req mcp.CallToolRequest) func([]byte, err
 			return mcp.NewToolResultError(fmt.Sprintf("wire encode failed: %v", err)), nil
 		}
 		if budget > 0 {
-			if trimmed, _ := trimGCXBytes(payload, budget); trimmed != nil {
+			if trimmed, didTrim := trimGCXBytes(payload, budget); trimmed != nil {
 				payload = trimmed
+				if didTrim {
+					payload = decorateTokenBudgetGCX(payload, req)
+				}
 			}
 		}
 		return mcp.NewToolResultText(string(payload)), nil

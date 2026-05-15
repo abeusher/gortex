@@ -32,9 +32,9 @@ func TestApplyBudget_TrimsLongestSlice(t *testing.T) {
 	rows := make([]any, 200)
 	for i := range rows {
 		rows[i] = map[string]any{
-			"id":    "row-" + strings.Repeat("x", 40),
-			"line":  i,
-			"meta":  strings.Repeat("padding-", 10),
+			"id":   "row-" + strings.Repeat("x", 40),
+			"line": i,
+			"meta": strings.Repeat("padding-", 10),
 		}
 	}
 	payload := map[string]any{
@@ -276,4 +276,300 @@ func TestApplyOffsetLimit_WindowAndCursor(t *testing.T) {
 	page, next = applyOffsetLimit(rows, 100, 4)
 	assert.Len(t, page, 0)
 	assert.Empty(t, next)
+}
+
+// TestTokensToBytes_RoundTrip pins the token→byte→token round-trip
+// inside ±1 of the calibration ratio. Token estimation is inherently
+// lossy across tokenisers; this test guards the conversion math
+// itself, not the model-specific accuracy.
+func TestTokensToBytes_RoundTrip(t *testing.T) {
+	for _, tokens := range []int{1, 50, 1000, 10000} {
+		bytes := tokensToBytes(tokens)
+		assert.Equal(t, int(float64(tokens)*avgBytesPerToken), bytes)
+		// Reverse direction should land within ±1 because of int cast.
+		recovered := bytesToTokens(bytes)
+		assert.InDelta(t, tokens, recovered, 1, "round-trip drifted for tokens=%d", tokens)
+	}
+	// Non-positive inputs collapse to 0 (opt-out semantics).
+	assert.Equal(t, 0, tokensToBytes(0))
+	assert.Equal(t, 0, tokensToBytes(-1))
+	assert.Equal(t, 0, bytesToTokens(0))
+	assert.Equal(t, 0, bytesToTokens(-1))
+}
+
+// TestEffectiveBudget_MaxTokensAlone covers the new token-only path:
+// passing max_tokens with no max_bytes derives a byte cap via the
+// avgBytesPerToken ratio. Opt-out (0 / negative) on tokens-only also
+// returns 0 cap, matching the bytes-only semantics.
+func TestEffectiveBudget_MaxTokensAlone(t *testing.T) {
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"max_tokens": float64(1000)}
+	assert.Equal(t, tokensToBytes(1000), effectiveBudget(req))
+
+	// int-typed token arg.
+	req.Params.Arguments = map[string]any{"max_tokens": 2000}
+	assert.Equal(t, tokensToBytes(2000), effectiveBudget(req))
+
+	// Opt-out.
+	req.Params.Arguments = map[string]any{"max_tokens": float64(0)}
+	assert.Equal(t, 0, effectiveBudget(req))
+
+	req.Params.Arguments = map[string]any{"max_tokens": float64(-1)}
+	assert.Equal(t, 0, effectiveBudget(req))
+}
+
+// TestEffectiveBudget_BothAxesTighterWins is the central
+// composition rule: when both max_bytes and max_tokens are
+// supplied with positive values, the cap is the smaller of the two.
+// This is the "tighter wins" contract documented in effectiveBudget.
+func TestEffectiveBudget_BothAxesTighterWins(t *testing.T) {
+	req := mcp.CallToolRequest{}
+
+	// max_tokens implies fewer bytes (tokens × 3.5) — tokens drives.
+	req.Params.Arguments = map[string]any{
+		"max_bytes":  float64(100_000),
+		"max_tokens": float64(100), // ~350 bytes
+	}
+	assert.Equal(t, tokensToBytes(100), effectiveBudget(req))
+
+	// max_bytes is tighter — bytes drives.
+	req.Params.Arguments = map[string]any{
+		"max_bytes":  float64(500),
+		"max_tokens": float64(10000), // ~35000 bytes
+	}
+	assert.Equal(t, 500, effectiveBudget(req))
+
+	// Equal numeric values, tokens still expands via ratio so bytes
+	// will be tighter.
+	req.Params.Arguments = map[string]any{
+		"max_bytes":  float64(1000),
+		"max_tokens": float64(1000), // ~3500 bytes
+	}
+	assert.Equal(t, 1000, effectiveBudget(req))
+}
+
+// TestEffectiveBudget_PerAxisOptOut verifies per-axis opt-out: when
+// one axis is 0 (opt-out) and the other is positive, the positive
+// one still applies. Only when BOTH are opt-out does the request
+// fall through to "no cap."
+func TestEffectiveBudget_PerAxisOptOut(t *testing.T) {
+	req := mcp.CallToolRequest{}
+
+	// bytes opt-out, tokens positive → tokens drives.
+	req.Params.Arguments = map[string]any{
+		"max_bytes":  float64(0),
+		"max_tokens": float64(500),
+	}
+	assert.Equal(t, tokensToBytes(500), effectiveBudget(req))
+
+	// tokens opt-out, bytes positive → bytes drives.
+	req.Params.Arguments = map[string]any{
+		"max_bytes":  float64(2000),
+		"max_tokens": float64(0),
+	}
+	assert.Equal(t, 2000, effectiveBudget(req))
+
+	// Both opt-out → no cap.
+	req.Params.Arguments = map[string]any{
+		"max_bytes":  float64(0),
+		"max_tokens": float64(0),
+	}
+	assert.Equal(t, 0, effectiveBudget(req))
+}
+
+// TestResolveBudgetSource_AttributesTighterAxis confirms which axis
+// gets credit for the cap — used by decorateTokenBudgetJSON /
+// decorateTokenBudgetGCX to render the correct truncation hint.
+func TestResolveBudgetSource_AttributesTighterAxis(t *testing.T) {
+	req := mcp.CallToolRequest{}
+
+	// No args → default.
+	req.Params.Arguments = map[string]any{}
+	src, _ := resolveBudgetSource(req)
+	assert.Equal(t, budgetSourceDefault, src)
+
+	// Tokens alone.
+	req.Params.Arguments = map[string]any{"max_tokens": float64(500)}
+	src, val := resolveBudgetSource(req)
+	assert.Equal(t, budgetSourceTokens, src)
+	assert.Equal(t, 500, val)
+
+	// Bytes alone.
+	req.Params.Arguments = map[string]any{"max_bytes": float64(5000)}
+	src, val = resolveBudgetSource(req)
+	assert.Equal(t, budgetSourceBytes, src)
+	assert.Equal(t, 5000, val)
+
+	// Both — tokens is tighter (100 tokens ≈ 350 bytes < 5000 bytes).
+	req.Params.Arguments = map[string]any{
+		"max_bytes":  float64(5000),
+		"max_tokens": float64(100),
+	}
+	src, val = resolveBudgetSource(req)
+	assert.Equal(t, budgetSourceTokens, src)
+	assert.Equal(t, 100, val)
+
+	// Both — bytes is tighter.
+	req.Params.Arguments = map[string]any{
+		"max_bytes":  float64(500),
+		"max_tokens": float64(10000),
+	}
+	src, val = resolveBudgetSource(req)
+	assert.Equal(t, budgetSourceBytes, src)
+	assert.Equal(t, 500, val)
+
+	// Per-axis opt-out: bytes 0, tokens positive → tokens wins.
+	req.Params.Arguments = map[string]any{
+		"max_bytes":  float64(0),
+		"max_tokens": float64(500),
+	}
+	src, val = resolveBudgetSource(req)
+	assert.Equal(t, budgetSourceTokens, src)
+	assert.Equal(t, 500, val)
+
+	// Both opt-out.
+	req.Params.Arguments = map[string]any{
+		"max_bytes":  float64(0),
+		"max_tokens": float64(0),
+	}
+	src, _ = resolveBudgetSource(req)
+	assert.Equal(t, budgetSourceNone, src)
+}
+
+// TestDecorateTokenBudgetJSON_AddsMarkerWhenTokensDriven pins the
+// decoration contract: when max_tokens drove the budget AND the
+// trim guard fired, the resulting payload carries _max_tokens and
+// _truncated_by_tokens markers alongside the existing
+// _truncated_by_budget flag.
+func TestDecorateTokenBudgetJSON_AddsMarkerWhenTokensDriven(t *testing.T) {
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"max_tokens": float64(100)}
+
+	// Simulate a trimmed payload — applyBudget's contract is that
+	// `_truncated_by_budget=true` rides on every trim.
+	trimmed := map[string]any{
+		"results":                 []any{},
+		budgetTruncatedKey:        true,
+		"_max_returned_results":   0,
+		"_original_count_results": 50,
+	}
+	out := decorateTokenBudgetJSON(trimmed, req).(map[string]any)
+	assert.Equal(t, 100, out["_max_tokens"])
+	assert.Equal(t, true, out["_truncated_by_tokens"])
+}
+
+// TestDecorateTokenBudgetJSON_NoMarkerWhenBytesDriven verifies the
+// decoration only fires for tokens-driven trims. When max_bytes is
+// the tighter axis, the response should not falsely claim "tokens
+// caused this" — but it WILL still surface the user's max_tokens
+// value (without `_truncated_by_tokens`) so the agent sees how its
+// token budget compared.
+func TestDecorateTokenBudgetJSON_NoMarkerWhenBytesDriven(t *testing.T) {
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{
+		"max_bytes":  float64(500),
+		"max_tokens": float64(10000), // ~35000 bytes — bytes is tighter
+	}
+
+	trimmed := map[string]any{
+		"results":                 []any{},
+		budgetTruncatedKey:        true,
+		"_max_returned_results":   0,
+		"_original_count_results": 100,
+	}
+	out := decorateTokenBudgetJSON(trimmed, req).(map[string]any)
+	// Bytes drove the trim, so no _truncated_by_tokens.
+	assert.NotContains(t, out, "_truncated_by_tokens")
+	// But the requested max_tokens still rides for caller visibility.
+	assert.Equal(t, 10000, out["_max_tokens"])
+}
+
+// TestDecorateTokenBudgetJSON_NoOpWhenNotTrimmed: a payload without
+// the truncation flag must not gain token-budget metadata. We must
+// never decorate untrimmed responses — that would spam every
+// response with budget meta.
+func TestDecorateTokenBudgetJSON_NoOpWhenNotTrimmed(t *testing.T) {
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"max_tokens": float64(100)}
+
+	untrimmed := map[string]any{
+		"results": []any{map[string]any{"id": "a"}},
+		"total":   1,
+	}
+	out := decorateTokenBudgetJSON(untrimmed, req).(map[string]any)
+	assert.NotContains(t, out, "_max_tokens")
+	assert.NotContains(t, out, "_truncated_by_tokens")
+}
+
+// TestDecorateTokenBudgetJSON_NoOpWhenNoTokensArg: even on a trimmed
+// payload, no decoration happens unless the caller actually passed
+// max_tokens. Otherwise we'd inject a misleading marker.
+func TestDecorateTokenBudgetJSON_NoOpWhenNoTokensArg(t *testing.T) {
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"max_bytes": float64(500)}
+
+	trimmed := map[string]any{
+		"results":                 []any{},
+		budgetTruncatedKey:        true,
+		"_max_returned_results":   0,
+		"_original_count_results": 100,
+	}
+	out := decorateTokenBudgetJSON(trimmed, req).(map[string]any)
+	assert.NotContains(t, out, "_max_tokens")
+	assert.NotContains(t, out, "_truncated_by_tokens")
+}
+
+// TestDecorateTokenBudgetGCX_AddsCommentWhenTrimmed exercises the
+// GCX decoration path: a payload carrying the trim comment from
+// trimGCXBytes gets a sibling `# max_tokens=N truncated_by_tokens=true`
+// line appended. Decoders treat the second comment as a no-op.
+func TestDecorateTokenBudgetGCX_AddsCommentWhenTrimmed(t *testing.T) {
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"max_tokens": float64(250)}
+
+	payload := []byte("GCX1 tool=test fields=a\nrow\n# truncated_by_budget=true original_rows=10 kept_rows=2\n")
+	out := decorateTokenBudgetGCX(payload, req)
+
+	assert.Contains(t, string(out), "max_tokens=250")
+	assert.Contains(t, string(out), "truncated_by_tokens=true")
+}
+
+// TestDecorateTokenBudgetGCX_NoOpWithoutTrimComment confirms we only
+// decorate when the GCX trim path already fired — without the
+// canonical `# truncated_by_budget=true` line, we leave the payload
+// alone (caller didn't actually exceed the budget).
+func TestDecorateTokenBudgetGCX_NoOpWithoutTrimComment(t *testing.T) {
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"max_tokens": float64(250)}
+
+	payload := []byte("GCX1 tool=test fields=a\nrow\n")
+	out := decorateTokenBudgetGCX(payload, req)
+	assert.Equal(t, string(payload), string(out))
+}
+
+// TestDecorateTokenBudgetGCX_NoOpWithoutTokensArg: no max_tokens →
+// no decoration, even on a trimmed payload.
+func TestDecorateTokenBudgetGCX_NoOpWithoutTokensArg(t *testing.T) {
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"max_bytes": float64(500)}
+
+	payload := []byte("GCX1 tool=test fields=a\nrow\n# truncated_by_budget=true original_rows=10 kept_rows=2\n")
+	out := decorateTokenBudgetGCX(payload, req)
+	assert.Equal(t, string(payload), string(out))
+}
+
+// TestDecorateTokenBudgetGCX_IdempotentDecoration guards against the
+// rare case where a payload passes through the decorator twice
+// (e.g. a retry path) — the comment should only appear once so
+// the response stays well-formed.
+func TestDecorateTokenBudgetGCX_IdempotentDecoration(t *testing.T) {
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"max_tokens": float64(250)}
+
+	payload := []byte("GCX1 tool=test fields=a\nrow\n# truncated_by_budget=true original_rows=10 kept_rows=2\n")
+	once := decorateTokenBudgetGCX(payload, req)
+	twice := decorateTokenBudgetGCX(once, req)
+	assert.Equal(t, string(once), string(twice), "decorator must be idempotent")
+	// Exactly one max_tokens comment.
+	assert.Equal(t, 1, strings.Count(string(twice), "max_tokens=250"))
 }
