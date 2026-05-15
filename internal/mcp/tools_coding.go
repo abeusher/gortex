@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/zzet/gortex/internal/elide"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/tokens"
@@ -25,6 +26,7 @@ func (s *Server) registerCodingTools() {
 			mcp.WithString("format", mcp.Description("Output format: json (default), gcx (GCX1 compact wire format), or toon")),
 			mcp.WithNumber("max_bytes", mcp.Description("Cap the marshaled response at this many bytes. The longest list is trimmed; truncation metadata rides on the response. Omit for no cap.")),
 			mcp.WithString("if_none_match", mcp.Description("ETag from a previous response — returns not_modified if content unchanged")),
+			mcp.WithBoolean("compress_bodies", mcp.Description("Also return a source_compressed view of the whole file with every function/method body replaced by a `{ /* N lines elided */ }` stub. Signatures, imports, types, and comments are preserved verbatim. Roughly 60-70% fewer tokens than raw source. Composable with format:\"gcx\". Default: false.")),
 		),
 		s.handleGetEditingContext,
 	)
@@ -56,6 +58,7 @@ func (s *Server) registerCodingTools() {
 			mcp.WithString("if_none_match", mcp.Description("ETag from a previous response — returns not_modified if content unchanged")),
 			mcp.WithString("format", mcp.Description("Output format: json (default), gcx (GCX1 compact wire format), or toon")),
 			mcp.WithNumber("max_bytes", mcp.Description("Cap the marshaled response at this many bytes. The longest list is trimmed; truncation metadata rides on the response. Omit for no cap.")),
+			mcp.WithBoolean("compress_bodies", mcp.Description("Replace function/method bodies in the returned source with a `{ /* N lines elided */ }` stub. Signatures, doc-comments, and structure stay intact. ~30-40% of original tokens. Useful when you only need the surface signature of the symbol, not its implementation. Default: false.")),
 		),
 		s.handleGetSymbolSource,
 	)
@@ -107,6 +110,17 @@ func (s *Server) registerCodingTools() {
 			mcp.WithString("new_source", mcp.Required(), mcp.Description("Replacement source fragment")),
 		),
 		s.handleEditSymbol,
+	)
+
+	s.addTool(
+		mcp.NewTool("read_file",
+			mcp.WithDescription("Reads a whole file by path and returns its content. Use sparingly — prefer get_symbol_source / get_editing_context for code. Useful when you need a non-indexed file (config, fixture, raw markdown) or when you genuinely need the full body. With compress_bodies=true, every function/method body is replaced by a `{ /* N lines elided */ }` stub — signatures + structure preserved, ~30-40% of original tokens. Composable with format:\"gcx\"."),
+			mcp.WithString("path", mcp.Required(), mcp.Description("Absolute path, or repo-prefixed / repo-root-relative path")),
+			mcp.WithBoolean("compress_bodies", mcp.Description("Replace function/method bodies with elided stubs (default: false)")),
+			mcp.WithNumber("max_bytes", mcp.Description("Cap the marshaled response at this many bytes; truncation flag rides on the response. Omit for no cap.")),
+			mcp.WithString("if_none_match", mcp.Description("ETag from a previous response — returns not_modified if content unchanged")),
+		),
+		s.handleReadFile,
 	)
 
 	s.addTool(
@@ -298,8 +312,50 @@ func (s *Server) handleGetEditingContext(ctx context.Context, req mcp.CallToolRe
 		}
 	}
 
+	// Optional: full-file compressed view. When compress_bodies=true,
+	// emit a `source_compressed` field carrying the whole file
+	// through the tree-sitter elider so the agent gets signatures +
+	// structure in one call without paying the cost of raw bodies.
+	// Failures (no grammar, parse error) are swallowed — the caller
+	// still gets the structural sections that fired above.
+	var sourceCompressed string
+	if req.GetBool("compress_bodies", false) {
+		var language string
+		if out.File != nil {
+			if lang, ok := out.File["language"].(string); ok {
+				language = lang
+			}
+		}
+		if language != "" && elide.IsSupported(language) {
+			// Use the first non-file node to find the on-disk path.
+			var fileBytes []byte
+			for _, n := range sg.Nodes {
+				if n.Kind == graph.KindFile {
+					if absPath, rerr := s.resolveNodePath(n); rerr == nil {
+						if content, ok := s.overlayContentFor(ctx, absPath); ok {
+							fileBytes = []byte(content)
+						} else if b, ferr := os.ReadFile(absPath); ferr == nil {
+							fileBytes = b
+						}
+					}
+					break
+				}
+			}
+			if len(fileBytes) > 0 {
+				if compressed, cerr := elide.Compress(fileBytes, language); cerr == nil {
+					sourceCompressed = string(compressed)
+				}
+			}
+		}
+	}
+
 	// ETag conditional fetch.
 	etag := computeETag(out)
+	if sourceCompressed != "" {
+		// Fold the compressed view into the etag so a flag flip
+		// invalidates the cached entry on the caller side.
+		etag = computeETag([2]any{out, sourceCompressed})
+	}
 	if ifNoneMatch := req.GetString("if_none_match", ""); ifNoneMatch != "" && ifNoneMatch == etag {
 		return notModifiedResult(etag), nil
 	}
@@ -316,6 +372,10 @@ func (s *Server) handleGetEditingContext(ctx context.Context, req mcp.CallToolRe
 		"called_by": out.CalledBy,
 		"calls":     out.Calls,
 		"etag":      etag,
+	}
+	if sourceCompressed != "" {
+		result["source_compressed"] = sourceCompressed
+		result["bodies_elided"] = true
 	}
 	if s.isTOON(ctx, req) {
 		return returnTOON(result)
@@ -489,6 +549,15 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 		return mcp.NewToolResultError(fmt.Sprintf("could not read source: %v", err)), nil
 	}
 
+	compressBodies := req.GetBool("compress_bodies", false)
+	bodiesElided := false
+	if compressBodies && elide.IsSupported(node.Language) {
+		if out, eerr := elide.CompressString(source, node.Language); eerr == nil && out != source {
+			source = out
+			bodiesElided = true
+		}
+	}
+
 	// Server-side accounting only — the savings value isn't returned to
 	// the caller (agents don't act on it and it burns tokens in every
 	// response). Aggregated stats remain available via the `savings` tool.
@@ -508,6 +577,9 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 	}
 	if sig, ok := node.Meta["signature"]; ok {
 		result["signature"] = sig
+	}
+	if bodiesElided {
+		result["bodies_elided"] = true
 	}
 
 	// ETag conditional fetch.

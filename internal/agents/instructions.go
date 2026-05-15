@@ -85,10 +85,11 @@ If ` + "`ask`" + ` isn't in ` + "`tools/list`" + `, gortex was built without ` +
 
 | Instead of...                         | You MUST use...                          |
 |---------------------------------------|------------------------------------------|
-| ` + "`Read`" + ` whole file for one function    | ` + "`get_symbol_source`" + ` (80% fewer tokens)   |
-| ` + "`Read`" + ` to understand a file           | ` + "`get_file_summary`" + ` / ` + "`get_editing_context`" + ` |
+| ` + "`Read`" + ` whole file for one function    | ` + "`get_symbol_source`" + ` (80% fewer tokens; add ` + "`compress_bodies: true`" + ` when you only need the surface signature) |
+| ` + "`Read`" + ` to understand a file           | ` + "`get_file_summary`" + ` / ` + "`get_editing_context`" + ` (the latter emits ` + "`source_compressed`" + ` when ` + "`compress_bodies: true`" + `) |
 | ` + "`Read`" + ` to check a signature           | ` + "`get_symbol`" + ` (signature in ` + "`meta.signature`" + `) |
 | ` + "`Read`" + ` to trace calls                 | ` + "`get_call_chain`" + ` / ` + "`get_callers`" + `         |
+| ` + "`Read`" + ` on a non-indexed / raw file    | ` + "`read_file`" + ` (atomic, honours editor-buffer overlays; ` + "`compress_bodies: true`" + ` elides function bodies for ~30-40% of original tokens) |
 
 ### Editing and Refactoring
 
@@ -155,6 +156,20 @@ For list-shaped responses (` + "`search_symbols`" + `, ` + "`find_usages`" + `, 
 
 Explicit ` + "`format`" + ` arg always overrides the session default in either direction.
 
+### Token Economy (content compression)
+
+` + "`compress_bodies: true`" + ` is an orthogonal axis: GCX1 shrinks the response *shape*; ` + "`compress_bodies`" + ` shrinks the response *content*. **Compose them** for stacked savings.
+
+The flag replaces every function/method body in the returned source with a ` + "`{ /* N lines elided */ }`" + ` stub (Python: ` + "`...  # N lines elided`" + `, Ruby: ` + "`# N lines elided`" + `, Elixir: ` + "`do\\n  # N lines elided\\nend`" + `). Signatures, doc-comments, imports, top-level constants/types, and structure stay intact. A 200-line file lands at ≤ 60 lines (~30-40% of original tokens). Wired in 16 languages: go, typescript, tsx, javascript, python, rust, java, c, cpp, csharp, kotlin, scala, php, ruby, bash, elixir.
+
+| Instead of...                                          | You MUST use...                          |
+|--------------------------------------------------------|------------------------------------------|
+| Reading a whole 2k-line file to learn the surface      | ` + "`read_file`" + ` with ` + "`compress_bodies: true`" + ` |
+| Pulling a class's full source to see its method shapes | ` + "`get_symbol_source`" + ` with ` + "`compress_bodies: true`" + ` |
+| Calling ` + "`get_editing_context`" + ` then fetching every neighbour's source for signatures | ` + "`get_editing_context`" + ` with ` + "`compress_bodies: true`" + ` — emits ` + "`source_compressed`" + ` alongside the structural sections |
+
+When the language has no grammar binding or tree-sitter can't parse the input, the flag is a no-op — raw source comes back and the response's ` + "`bodies_elided`" + ` flag stays absent. Safe to set unconditionally.
+
 ### Pagination, sparse fieldsets, and graceful degradation
 
 Every list-shaped tool runs through a per-response budget by default — the agent harness's spill-to-disk fallback is a true edge case, not the routine outcome on real-world payloads. When a response would exceed the budget, the server runs a priority-aware cascade:
@@ -209,13 +224,14 @@ If ` + "`ask`" + ` isn't in ` + "`tools/list`" + `, gortex was built without ` +
 
 | Instead of...                         | You MUST use...                          |
 |---------------------------------------|------------------------------------------|
-| ` + "`Read`" + ` a whole file for one function  | ` + "`get_symbol_source`" + ` with ` + "`id: \"path/to/file.go::SymbolName\"`" + ` (80% fewer tokens) — use ` + "`get_file_summary`" + ` first if you don't know the symbol name |
+| ` + "`Read`" + ` a whole file for one function  | ` + "`get_symbol_source`" + ` with ` + "`id: \"path/to/file.go::SymbolName\"`" + ` (80% fewer tokens; add ` + "`compress_bodies: true`" + ` to drop the implementation body and keep only the signature) — use ` + "`get_file_summary`" + ` first if you don't know the symbol name |
 | ` + "`Read`" + ` to find a function             | ` + "`get_symbol`" + ` or ` + "`get_editing_context`" + `    |
 | Multiple ` + "`get_symbol`" + ` calls           | ` + "`batch_symbols`" + ` (one call for N symbols) |
 | ` + "`Grep`" + ` for references                 | ` + "`find_usages`" + ` (zero false positives)     |
 | ` + "`Grep`" + ` to find a symbol by name       | ` + "`search_symbols`" + ` (BM25 + camelCase-aware)|
 | Filtering ` + "`search_symbols`" + ` by hand    | ` + "`winnow_symbols`" + ` — structured constraint chain (kind, language, community, path_prefix, min_fan_in, min_churn) with per-axis score contributions |
-| ` + "`Read`" + ` to understand a file           | ` + "`get_file_summary`" + ` or ` + "`get_editing_context`" + ` |
+| ` + "`Read`" + ` to understand a file           | ` + "`get_file_summary`" + ` or ` + "`get_editing_context`" + ` (pass ` + "`compress_bodies: true`" + ` to ` + "`get_editing_context`" + ` to also receive a ` + "`source_compressed`" + ` view of the file) |
+| ` + "`Read`" + ` on a non-indexed / raw file    | ` + "`read_file`" + ` (honours editor-buffer overlays, etag-aware; ` + "`compress_bodies: true`" + ` elides function bodies for ~30-40% of original tokens) |
 | ` + "`Read`" + ` multiple files to trace calls  | ` + "`get_call_chain`" + ` / ` + "`get_callers`" + `         |
 | Walking up/down an inheritance chain  | ` + "`get_class_hierarchy`" + ` — multi-hop EdgeExtends + EdgeImplements + EdgeComposes (type nodes) and EdgeOverrides (method nodes); ` + "`direction`" + ` ∈ up/down/both, ` + "`include_methods`" + ` pulls members + their override chain |
 | Guessing an import path               | ` + "`find_import_path`" + `                       |
@@ -232,6 +248,20 @@ Order of preference: **gcx > toon > json**. For known clients (claude-code, curs
 | GCX-blind tooling needing tabular text| Pass ` + "`format: \"toon\"`" + ` — TOON is the second-tier fallback (lossy but ~10–15% smaller than JSON) |
 | Parsing compact text output           | Use ` + "`@gortex/wire`" + ` (npm) or the Go ` + "`github.com/gortexhq/gcx-go`" + ` package (MIT) — both decode GCX back to structured rows |
 | Reading ` + "`compact: true`" + ` output        | Prefer ` + "`format: \"gcx\"`" + ` — lossy text is being phased out; GCX is round-trippable and tokenizer-optimised |
+
+### Token Economy (content compression)
+
+` + "`compress_bodies: true`" + ` is orthogonal to GCX1 — GCX1 compresses the response *shape*, ` + "`compress_bodies`" + ` compresses the response *content*. **Compose them** for stacked savings.
+
+When set on ` + "`get_symbol_source`" + ` / ` + "`get_editing_context`" + ` / ` + "`read_file`" + `, every function/method body in the returned source is replaced by a ` + "`{ /* N lines elided */ }`" + ` stub (Python: ` + "`...  # N lines elided`" + `; Ruby: ` + "`# N lines elided`" + `; Elixir: ` + "`do\\n  # N lines elided\\nend`" + `). Signatures, doc-comments, imports, top-level constants/types, and structure stay intact. A 200-line file lands at ≤ 60 lines (~30-40% of original tokens). Wired in 16 languages: go, typescript, tsx, javascript, python, rust, java, c, cpp, csharp, kotlin, scala, php, ruby, bash, elixir.
+
+| Instead of...                                          | You MUST use...                          |
+|--------------------------------------------------------|------------------------------------------|
+| Reading a whole 2k-line file just to learn its surface | ` + "`read_file`" + ` with ` + "`compress_bodies: true`" + ` |
+| Pulling a class's full source for method signatures    | ` + "`get_symbol_source`" + ` with ` + "`compress_bodies: true`" + ` |
+| Calling ` + "`get_editing_context`" + ` then fetching every neighbour's source for signatures | ` + "`get_editing_context`" + ` with ` + "`compress_bodies: true`" + ` — emits ` + "`source_compressed`" + ` alongside the structural sections |
+
+When the language has no grammar binding or tree-sitter can't parse the input, the flag is a no-op — raw source comes back and the response's ` + "`bodies_elided`" + ` flag stays absent. Safe to set unconditionally.
 
 ### Pagination, sparse fieldsets, and opt-in budget
 

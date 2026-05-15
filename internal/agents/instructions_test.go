@@ -150,6 +150,10 @@ func TestInstructionsBody_AdvertisesKeyTools(t *testing.T) {
 		"search_ast", "error-not-wrapped", "sql-string-concat",
 		"weak-crypto", "panic-in-library", "hardcoded-secret",
 		"min_fan_in_of_enclosing_func",
+		// Content compression (K9): the read_file tool and the
+		// compress_bodies flag — the load-bearing tokens an agent
+		// needs to discover the surface-only read mode.
+		"read_file", "compress_bodies", "source_compressed",
 		// MCP resources surface (bootstrap + analyzer rollups).
 		"gortex://stats", "gortex://index-health", "gortex://workspace",
 		"gortex://repos", "gortex://active-project",
@@ -176,6 +180,9 @@ func TestGlobalInstructionsBody_AdvertisesKeyTools(t *testing.T) {
 		"k8s_resources", "images", "kustomize",
 		// Structural code search — also in the per-machine block.
 		"search_ast", "error-not-wrapped",
+		// Content compression (K9): same load-bearing tokens as the
+		// per-project block.
+		"read_file", "compress_bodies", "source_compressed",
 		// MCP resources surface (bootstrap + analyzer rollups).
 		"gortex://stats", "gortex://index-health", "gortex://active-project",
 		"gortex://report", "gortex://god-nodes",

@@ -86,6 +86,20 @@ Order of preference: **gcx > toon > json**. For known clients (claude-code, curs
 | Parsing compact text output           | Use `@gortex/wire` (npm) or the Go `github.com/gortexhq/gcx-go` package (MIT) — both decode GCX back to structured rows |
 | Reading `compact: true` output        | Prefer `format: "gcx"` — lossy text is being phased out; GCX is round-trippable and tokenizer-optimised |
 
+### Token Economy (content compression)
+
+GCX1 shrinks the response *shape*; `compress_bodies` shrinks the response *content*. Composable — pass both for stacked savings.
+
+`compress_bodies: true` replaces every function/method body with a `{ /* N lines elided */ }` stub while keeping signatures, doc-comments, imports, top-level constants, types, and structure intact. ~30-40% of original tokens; a 200-line file lands at ≤ 60 lines. Wired in 14 languages: go, typescript, tsx, javascript, python, rust, java, c, cpp, csharp, kotlin, scala, php, ruby, bash, elixir.
+
+| Instead of...                                          | You MUST use...                          |
+|--------------------------------------------------------|------------------------------------------|
+| Reading a whole 2k-line file for its surface           | `read_file` with `compress_bodies: true` |
+| Pulling the source of a class to learn its method signatures | `get_symbol_source` with `compress_bodies: true` |
+| Calling get_editing_context then get_symbol_source on neighbours just to see signatures | `get_editing_context` with `compress_bodies: true` — emits a `source_compressed` payload alongside the structural sections |
+
+When the language has no grammar binding or tree-sitter can't parse the file, the flag is a no-op — raw source is returned unchanged and the response's `bodies_elided` flag stays absent.
+
 ### Impact Analysis and Safety
 
 | Instead of...                         | You MUST use...                          |

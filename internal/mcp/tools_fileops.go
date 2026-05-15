@@ -11,6 +11,7 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 
 	"github.com/zzet/gortex/internal/agents"
+	"github.com/zzet/gortex/internal/elide"
 	"github.com/zzet/gortex/internal/graph"
 )
 
@@ -447,4 +448,123 @@ func matchLocationsHint(fileStr, oldString string) string {
 		suffix = ", ..."
 	}
 	return fmt.Sprintf(" (first match lines %s%s)", strings.Join(parts, ", "), suffix)
+}
+
+// handleReadFile returns the full content of a file as a string,
+// optionally rewritten through the tree-sitter elider when
+// compress_bodies=true. Path resolution shares the same rules as
+// edit_file / write_file (absolute, repo-prefixed, or
+// single-repo-root-relative); the file does not need to be indexed.
+func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	rawPath, err := req.RequireString("path")
+	if err != nil {
+		return mcp.NewToolResultError("path is required"), nil
+	}
+	absPath, relPath, resolveErr := s.resolveFilePath(rawPath)
+	if resolveErr != nil {
+		return mcp.NewToolResultError(resolveErr.Error()), nil
+	}
+	info, statErr := os.Stat(absPath)
+	if statErr != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("could not stat file: %v", statErr)), nil
+	}
+	if info.IsDir() {
+		return mcp.NewToolResultError(fmt.Sprintf("path %q is a directory", rawPath)), nil
+	}
+	// Honour the editor-buffer overlay if one is active for this path.
+	var content []byte
+	if buf, ok := s.overlayContentFor(ctx, absPath); ok {
+		content = []byte(buf)
+	} else {
+		b, rerr := os.ReadFile(absPath)
+		if rerr != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("could not read file: %v", rerr)), nil
+		}
+		content = b
+	}
+
+	originalBytes := len(content)
+	bodiesElided := false
+	language := s.detectLanguageForPath(ctx, absPath, relPath)
+	if req.GetBool("compress_bodies", false) && language != "" && elide.IsSupported(language) {
+		if out, eerr := elide.Compress(content, language); eerr == nil && len(out) != len(content) {
+			content = out
+			bodiesElided = true
+		}
+	}
+
+	// Record the access for frecency credit on any node defined in
+	// this file. read_file is a heavy access (full file), so we
+	// credit every defined symbol — keeps the "agent is working in
+	// this area" signal aligned with how the agent burned its
+	// budget.
+	s.sessionFor(ctx).recordFile(relPath)
+	if sg := s.engineFor(ctx).GetFileSymbols(relPath); sg != nil {
+		for _, n := range sg.Nodes {
+			if n == nil || n.Kind == graph.KindFile {
+				continue
+			}
+			s.frecency.Record(n.ID)
+		}
+	}
+
+	result := map[string]any{
+		"path":           relPath,
+		"language":       language,
+		"bytes":          len(content),
+		"original_bytes": originalBytes,
+		"content":        string(content),
+	}
+	if bodiesElided {
+		result["bodies_elided"] = true
+	}
+
+	etag := computeETag(result)
+	if ifNoneMatch := req.GetString("if_none_match", ""); ifNoneMatch != "" && ifNoneMatch == etag {
+		return notModifiedResult(etag), nil
+	}
+	result["etag"] = etag
+
+	if s.isTOON(ctx, req) {
+		return returnTOON(result)
+	}
+	return s.respondJSONOrTOON(ctx, req, result)
+}
+
+// detectLanguageForPath resolves the language code for a file. Prefers
+// the indexed file node's Node.Language (canonical: same code the
+// extractor stamped at index time). Falls back to the parser
+// Registry's extension-based detection so unindexed files (or files
+// outside any tracked repo) still get a language tag.
+func (s *Server) detectLanguageForPath(ctx context.Context, absPath, relPath string) string {
+	// Try the indexed file node first.
+	if sg := s.engineFor(ctx).GetFileSymbols(relPath); sg != nil {
+		for _, n := range sg.Nodes {
+			if n != nil && n.Kind == graph.KindFile && n.Language != "" {
+				return n.Language
+			}
+		}
+	}
+	// Fall back to the parser registry from whichever indexer owns
+	// the file. In multi-repo mode, every indexer holds the same
+	// registry instance; in single-repo mode we ask the lone indexer.
+	if s.multiIndexer != nil {
+		for _, prefix := range s.multiIndexer.RepoPrefixes() {
+			if idx := s.multiIndexer.GetIndexer(prefix); idx != nil {
+				if reg := idx.Registry(); reg != nil {
+					if lang, ok := reg.DetectLanguage(absPath); ok {
+						return lang
+					}
+				}
+			}
+		}
+	}
+	if s.indexer != nil {
+		if reg := s.indexer.Registry(); reg != nil {
+			if lang, ok := reg.DetectLanguage(absPath); ok {
+				return lang
+			}
+		}
+	}
+	return ""
 }
