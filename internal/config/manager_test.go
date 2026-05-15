@@ -184,6 +184,64 @@ exclude:
 	assert.Contains(t, got, ".git/", "builtin still at the head")
 }
 
+func TestEffectiveExclude_RespectsRepoGitignoreByDefault(t *testing.T) {
+	cm, err := NewConfigManager("/tmp/nonexistent-gortex-test-cm/config.yaml")
+	require.NoError(t, err)
+
+	repoDir := t.TempDir()
+	gitignore := `# repo .gitignore
+data/raw/
+*.tmp.local
+# blank line below
+
+testdata/large/
+`
+	require.NoError(t, os.WriteFile(filepath.Join(repoDir, ".gitignore"), []byte(gitignore), 0644))
+	// No `.gortex.yaml` — gitignore reading still kicks in because the
+	// path is cached on LoadWorkspaceConfig regardless.
+	cm.LoadWorkspaceConfig("gi-repo", repoDir)
+
+	got := cm.EffectiveExclude("gi-repo")
+	assert.Contains(t, got, "data/raw/", "repo .gitignore entries must be layered in by default")
+	assert.Contains(t, got, "*.tmp.local")
+	assert.Contains(t, got, "testdata/large/")
+	for _, p := range got {
+		assert.NotEqual(t, "", p, "no empty patterns")
+		assert.NotEqual(t, "#", p[:1], "no comment lines")
+	}
+}
+
+func TestEffectiveExclude_RespectGitignoreFalseOptsOut(t *testing.T) {
+	cm, err := NewConfigManager("/tmp/nonexistent-gortex-test-cm/config.yaml")
+	require.NoError(t, err)
+
+	repoDir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(repoDir, ".gitignore"), []byte("ignored/\n"), 0644))
+	wsContent := `
+respect_gitignore: false
+exclude:
+  - "ws-only/**"
+`
+	require.NoError(t, os.WriteFile(filepath.Join(repoDir, ".gortex.yaml"), []byte(wsContent), 0644))
+	cm.LoadWorkspaceConfig("opt-out-repo", repoDir)
+
+	got := cm.EffectiveExclude("opt-out-repo")
+	assert.NotContains(t, got, "ignored/", "respect_gitignore=false must skip .gitignore layer")
+	assert.Contains(t, got, "ws-only/**", "workspace exclude still applies")
+}
+
+func TestEffectiveExclude_NoGitignoreFileNoOp(t *testing.T) {
+	cm, err := NewConfigManager("/tmp/nonexistent-gortex-test-cm/config.yaml")
+	require.NoError(t, err)
+
+	repoDir := t.TempDir()
+	cm.LoadWorkspaceConfig("no-gi", repoDir)
+
+	got := cm.EffectiveExclude("no-gi")
+	// Absent .gitignore must not error; output is just the builtin baseline.
+	assert.Equal(t, excludes.Builtin, got)
+}
+
 func TestEffectiveGuardRules_WorkspaceOverridesGlobal(t *testing.T) {
 	cm, err := NewConfigManager("/tmp/nonexistent-gortex-test-cm/config.yaml")
 	require.NoError(t, err)

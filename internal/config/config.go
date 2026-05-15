@@ -200,6 +200,14 @@ type Config struct {
 	// re-include something an outer layer excluded.
 	Exclude []string `mapstructure:"exclude" yaml:"exclude,omitempty"`
 
+	// RespectGitignore controls whether the repo's `.gitignore` file is
+	// read and its patterns added to the effective exclude list. Default
+	// is true (respect .gitignore); set `respect_gitignore: false` in
+	// `.gortex.yaml` to opt out for repos that rely on indexing
+	// otherwise-ignored generated code or vendored sources. Pointer so
+	// the loader can distinguish "explicitly false" from "absent".
+	RespectGitignore *bool `mapstructure:"respect_gitignore" yaml:"respect_gitignore,omitempty"`
+
 	// Workspace is the hard-boundary slug this repo belongs to.
 	// Top-level `workspace: <slug>` in `.gortex.yaml`. Empty → defaults
 	// to the repo name (resolved by the indexer; see

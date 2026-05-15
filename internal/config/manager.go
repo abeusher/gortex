@@ -18,8 +18,14 @@ import (
 type ConfigManager struct {
 	global    *GlobalConfig
 	workspace map[string]*Config // repoPrefix → workspace config
-	mu        sync.RWMutex
-	logger    *zap.Logger
+	// workspacePaths tracks the absolute filesystem root for each
+	// repoPrefix. Needed by EffectiveExclude to locate the repo's own
+	// `.gitignore` file. Populated by LoadWorkspaceConfig regardless of
+	// whether `.gortex.yaml` exists, so a repo without workspace config
+	// still gets gitignore-respecting behaviour.
+	workspacePaths map[string]string
+	mu             sync.RWMutex
+	logger         *zap.Logger
 }
 
 // NewConfigManager creates a ConfigManager by loading the GlobalConfig
@@ -38,9 +44,10 @@ func NewConfigManager(globalPath string) (*ConfigManager, error) {
 	}
 
 	return &ConfigManager{
-		global:    gc,
-		workspace: make(map[string]*Config),
-		logger:    zap.NewNop(),
+		global:         gc,
+		workspace:      make(map[string]*Config),
+		workspacePaths: make(map[string]string),
+		logger:         zap.NewNop(),
 	}, nil
 }
 
@@ -82,6 +89,7 @@ func (cm *ConfigManager) Reload() error {
 	// Drop workspace cache so stale per-repo overrides don't linger;
 	// they'll be reloaded on the next LoadWorkspaceConfig call.
 	cm.workspace = make(map[string]*Config)
+	cm.workspacePaths = make(map[string]string)
 	cm.mu.Unlock()
 	return nil
 }
@@ -91,6 +99,14 @@ func (cm *ConfigManager) Reload() error {
 // no entry is cached (global defaults will apply). If the file is
 // malformed, a warning is logged and no entry is cached.
 func (cm *ConfigManager) LoadWorkspaceConfig(repoPrefix, repoPath string) {
+	// Remember the path even when `.gortex.yaml` is absent so the
+	// effective-exclude layer can still find the repo's `.gitignore`.
+	if repoPath != "" {
+		cm.mu.Lock()
+		cm.workspacePaths[repoPrefix] = repoPath
+		cm.mu.Unlock()
+	}
+
 	configPath := filepath.Join(repoPath, ".gortex.yaml")
 
 	data, err := os.ReadFile(configPath)
@@ -169,18 +185,31 @@ func (cm *ConfigManager) GetRepoConfig(repoPrefix string) *Config {
 // layered in precedence order (later layers can re-include via !pattern):
 //
 //  1. Builtin baseline (excludes.Builtin)
-//  2. Global Exclude from ~/.config/gortex/config.yaml
-//  3. Matching RepoEntry.Exclude (first match in Repos, then Projects)
-//  4. Workspace .gortex.yaml top-level Exclude
-//  5. Legacy workspace Index.Exclude / Watch.Exclude (deprecated)
+//  2. Repo's own `.gitignore` (read from disk; opt out with
+//     `respect_gitignore: false` in `.gortex.yaml`)
+//  3. Global Exclude from ~/.config/gortex/config.yaml
+//  4. Matching RepoEntry.Exclude (first match in Repos, then Projects)
+//  5. Workspace .gortex.yaml top-level Exclude
+//  6. Legacy workspace Index.Exclude / Watch.Exclude (deprecated)
 func (cm *ConfigManager) EffectiveExclude(repoPrefix string) []string {
 	cm.mu.RLock()
 	gc := cm.global
 	ws := cm.workspace[repoPrefix]
+	repoPath := cm.workspacePaths[repoPrefix]
 	cm.mu.RUnlock()
 
 	out := make([]string, 0, 32)
 	out = append(out, excludes.Builtin...)
+
+	// Layer 2: repo `.gitignore`, unless the workspace config explicitly
+	// opts out. Reading happens on every EffectiveExclude call — the
+	// file is tiny and the function isn't on a hot path; refreshing
+	// every read keeps mid-session edits to `.gitignore` picked up
+	// without needing to wire cache invalidation.
+	if shouldRespectGitignore(ws) && repoPath != "" {
+		out = append(out, loadRepoGitignore(repoPath)...)
+	}
+
 	if gc != nil {
 		out = append(out, gc.Exclude...)
 		if entry := gc.FindRepoByPrefix(repoPrefix); entry != nil {
@@ -197,6 +226,18 @@ func (cm *ConfigManager) EffectiveExclude(repoPrefix string) []string {
 		}
 	}
 	return out
+}
+
+// shouldRespectGitignore returns true when the repo's `.gitignore`
+// should be folded into the effective exclude list. Absence of a
+// workspace config or absence of an explicit `respect_gitignore` setting
+// both default to true; only an explicit `respect_gitignore: false`
+// disables the layer.
+func shouldRespectGitignore(ws *Config) bool {
+	if ws == nil || ws.RespectGitignore == nil {
+		return true
+	}
+	return *ws.RespectGitignore
 }
 
 // EffectiveGuardRules returns the effective guard rules for a repo.
