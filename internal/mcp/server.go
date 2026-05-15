@@ -201,6 +201,20 @@ func (s *Server) ReleaseSession(id string) {
 	if s.diagBroadcaster != nil {
 		s.diagBroadcaster.unsubscribe(id)
 	}
+	// Editor-overlay sessions are pinned to the MCP session that
+	// registered them. When the MCP session ends — for any reason —
+	// the overlay must die immediately. Holding overlay state past
+	// the disconnect would (a) leak unsaved buffer content into the
+	// daemon's address space indefinitely and (b) let a future
+	// connection that learns or guesses the same session ID re-
+	// attach to abandoned buffers; that's a credential / data-leak
+	// vector we don't want. The TTL is a fail-safe for "client
+	// crashed and we never observed the disconnect"; this is the
+	// fast path that closes the window when we DO observe it.
+	if s.overlays != nil {
+		s.overlays.Drop(id)
+	}
+	s.overlayCacheInvalidate(id)
 }
 
 // sessionState tracks recent agent activity for context recovery after compaction.

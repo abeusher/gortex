@@ -2,10 +2,49 @@ package daemon
 
 import (
 	"errors"
+	"os"
 	"sort"
 	"sync"
 	"time"
 )
+
+// DefaultOverlayIdleTTL is the default per-session idle expiry for
+// editor-buffer overlays. Raised from the original 5-minute draft to
+// 30 minutes after field feedback: realistic coding sessions
+// (deliberation, debugger pauses, IDE refactor wizards) commonly
+// exceed five minutes without producing a Push, and the read-time
+// LastUsed bump in SnapshotFor already keeps the session alive for
+// any tool call. Thirty minutes is comfortably above typical
+// inactivity gaps and well below the point where a forgotten
+// disconnected client would meaningfully pin memory.
+const DefaultOverlayIdleTTL = 30 * time.Minute
+
+// OverlayIdleTTLFromEnv resolves the idle-TTL setting that
+// `gortex server` / `gortex daemon` should construct their
+// OverlayManager with. Precedence:
+//
+//  1. Caller-supplied override (non-zero).
+//  2. `GORTEX_OVERLAY_IDLE_TTL` env var, parsed by time.ParseDuration
+//     ("30m", "1h", "45s", etc.).
+//  3. DefaultOverlayIdleTTL.
+//
+// A negative parse result clamps to 0 (which means "no expiry" —
+// useful only for tests). Garbage env values fall back to the
+// default; we deliberately don't fail startup over a typo'd duration.
+func OverlayIdleTTLFromEnv(override time.Duration) time.Duration {
+	if override > 0 {
+		return override
+	}
+	if raw := os.Getenv("GORTEX_OVERLAY_IDLE_TTL"); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil {
+			if d < 0 {
+				d = 0
+			}
+			return d
+		}
+	}
+	return DefaultOverlayIdleTTL
+}
 
 // OverlayFile is one editor-buffer override pushed by an MCP client.
 // The daemon (or a remote graph service over the gateway) merges
@@ -157,6 +196,77 @@ func (m *OverlayManager) FileCount(sessionID string) int {
 	return len(sess.files)
 }
 
+// Touch refreshes a session's idle timer without altering its overlay
+// files. Called by the MCP `overlay_keepalive` tool so an editor can
+// explicitly extend the lease without re-pushing buffer content.
+// Returns ErrSessionNotFound when the session doesn't exist so the
+// keepalive tool can surface "session lost; please re-register".
+func (m *OverlayManager) Touch(sessionID string) error {
+	if m == nil {
+		return ErrSessionNotFound
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sess, ok := m.sessions[sessionID]
+	if !ok {
+		return ErrSessionNotFound
+	}
+	sess.LastUsed = time.Now()
+	return nil
+}
+
+// IdleTTL returns the configured idle expiry duration. Exposed so the
+// overlay_list tool can compute and surface an `expires_at` hint to
+// editor extensions that want to schedule a keepalive proactively.
+// Zero means "no expiry" (test-mode).
+func (m *OverlayManager) IdleTTL() time.Duration {
+	if m == nil {
+		return 0
+	}
+	return m.idleTTL
+}
+
+// SessionStatus is the per-session liveness snapshot reported through
+// overlay_list. Callers compare `IdleSeconds` to `IdleTTLSeconds` to
+// decide when to push a keepalive; `ExpiresAt` (RFC3339) is the
+// concrete wall-clock instant the janitor would reap the session if
+// no further activity arrived.
+type SessionStatus struct {
+	WorkspaceID    string
+	Created        time.Time
+	LastUsed       time.Time
+	IdleSeconds    float64
+	IdleTTLSeconds float64
+	ExpiresAt      time.Time // zero when idleTTL <= 0
+}
+
+// StatusFor returns liveness metadata for a session without touching
+// LastUsed (unlike SnapshotFor, which is a read-with-bump). Used by
+// overlay_list to render expiry hints without resetting the timer
+// every time the editor polls.
+func (m *OverlayManager) StatusFor(sessionID string) (SessionStatus, error) {
+	if m == nil {
+		return SessionStatus{}, ErrSessionNotFound
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	sess, ok := m.sessions[sessionID]
+	if !ok {
+		return SessionStatus{}, ErrSessionNotFound
+	}
+	st := SessionStatus{
+		WorkspaceID:    sess.WorkspaceID,
+		Created:        sess.Created,
+		LastUsed:       sess.LastUsed,
+		IdleSeconds:    time.Since(sess.LastUsed).Seconds(),
+		IdleTTLSeconds: m.idleTTL.Seconds(),
+	}
+	if m.idleTTL > 0 {
+		st.ExpiresAt = sess.LastUsed.Add(m.idleTTL)
+	}
+	return st, nil
+}
+
 // SnapshotFor returns the overlay files for a session in a stable,
 // path-sorted order along with the workspace slug captured at register
 // time. Returns ErrSessionNotFound when the session doesn't exist. The
@@ -171,12 +281,20 @@ func (m *OverlayManager) SnapshotFor(sessionID string) (workspace string, files 
 	if m == nil {
 		return "", nil, ErrSessionNotFound
 	}
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	// Promoted to write lock so we can refresh LastUsed alongside
+	// the snapshot copy: every tool-call view-build flows through
+	// here, and that activity must reset the idle timer. Without
+	// this, a session that only queries (no further Push) would
+	// trip the TTL while in active use. The cost is one extra
+	// mutex promotion per overlay-active tool call — negligible
+	// against the parse work the view builder is about to do.
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	sess, ok := m.sessions[sessionID]
 	if !ok {
 		return "", nil, ErrSessionNotFound
 	}
+	sess.LastUsed = time.Now()
 	out := make([]OverlayFile, 0, len(sess.files))
 	for _, f := range sess.files {
 		out = append(out, f)

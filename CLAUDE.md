@@ -253,7 +253,11 @@ Editor extensions push in-flight (unsaved) buffers as **overlays**. Gortex compo
 
 **HTTP transport.** `gortex server` exposes the same surface at `POST /v1/overlay/sessions` (optional `session_id` binds an overlay to a known MCP session), `PUT /v1/overlay/sessions/{id}/files`, `DELETE /v1/overlay/sessions/{id}/files`, `GET /v1/overlay/sessions/{id}/files`, `DELETE /v1/overlay/sessions/{id}`. The `/v1/tools/<name>` HTTP entry point reads the active session from `Mcp-Session-Id` (preferred), `X-Gortex-Overlay-Session`, or `?session_id=` (test fallback).
 
-**Sessions auto-expire** after 5 minutes of inactivity, so a crashed extension never leaks unsaved buffers indefinitely.
+**Lifecycle and lease.** The overlay is **bound to the MCP session that registered it.** When the MCP session ends — for any reason (clean disconnect, dropped TCP, daemon proxy teardown) — the overlay is dropped synchronously. That closes the "abandoned buffer pinned in the daemon, reachable by anyone who learns the session ID" attack surface that a pure-TTL lifecycle would expose.
+
+The idle TTL is a fail-safe for the case where the daemon never observes the disconnect (e.g. the process was killed -9 mid-stream). Default **30 minutes**, configurable via `GORTEX_OVERLAY_IDLE_TTL` (`30m` / `1h` / `45s` / `0` to disable for tests). Every tool call against a live overlay session refreshes the idle timer (`SnapshotFor` bumps `LastUsed`), so an editor that's actively querying never trips the TTL. The MCP `overlay_keepalive` tool exists for genuine idle gaps (debugger pause, IDE wizard) — it bumps the timer without re-pushing content. `overlay_list` returns `expires_at` / `idle_seconds` / `idle_ttl_seconds` so the extension can schedule keepalives proactively.
+
+If a tools/call references a stale (reaped) session ID, the call falls through to base — no error, no corruption, no content leak. The next `overlay_push` self-heals (auto-registers the session); `overlay_keepalive` / `overlay_delete` surface explicit "session has been dropped" errors so the editor can take corrective action.
 
 ### MCP Resources
 

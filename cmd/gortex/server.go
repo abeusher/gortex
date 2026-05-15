@@ -362,14 +362,15 @@ func runServer(_ *cobra.Command, _ []string) error {
 	// an MCP client to push, query, and tear down between turns;
 	// short enough that a crashed client doesn't leak buffers
 	// indefinitely.
-	overlays := daemon.NewOverlayManager(5 * time.Minute)
+	// Editor-overlay manager. Idle TTL resolution:
+	//   GORTEX_OVERLAY_IDLE_TTL env var > daemon.DefaultOverlayIdleTTL.
+	// Tests can disable expiry by setting GORTEX_OVERLAY_IDLE_TTL=0.
+	// Most relevant security guarantee: when the MCP session ends,
+	// Server.ReleaseSession drops the overlay immediately, so the
+	// TTL is a fail-safe for missed disconnects rather than the
+	// primary cleanup path.
+	overlays := daemon.NewOverlayManager(daemon.OverlayIdleTTLFromEnv(0))
 	serverHandler.SetOverlayManager(overlays)
-	// Wire the same manager into the MCP server so the `tools/call`
-	// middleware can apply per-session overlays to the in-memory
-	// graph for the duration of each tool call, and so the
-	// overlay_register / overlay_push / overlay_list / overlay_delete
-	// / overlay_drop MCP tools become live for editor extensions
-	// speaking MCP rather than the parallel /v1/overlay/* HTTP API.
 	srv.SetOverlayManager(overlays)
 
 	// Wire the multi-server router. When `~/.gortex/servers.toml` is

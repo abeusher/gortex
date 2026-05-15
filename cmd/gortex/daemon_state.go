@@ -289,14 +289,12 @@ func buildDaemonState(logger *zap.Logger) (*daemonState, error) {
 	gortexmcp.Version = version
 	srv := gortexmcp.NewServer(eng, g, idx, nil, logger, cfg.Guards.Rules, multiOpts...)
 
-	// Editor-overlay manager for live-buffer indexing. The MCP
-	// dispatcher binds the inbound MCP session ID to an overlay
-	// session at every `tools/call`; the tool handler middleware
-	// applies the overlay's editor buffers to the in-memory graph
-	// for the duration of the call. 5-minute idle TTL: long enough
-	// for an editor's keystroke→tool-call loop, short enough that a
-	// crashed extension doesn't leak unsaved buffers forever.
-	overlays := daemon.NewOverlayManager(5 * time.Minute)
+	// Editor-overlay manager. Idle TTL resolved via
+	// GORTEX_OVERLAY_IDLE_TTL > daemon.DefaultOverlayIdleTTL (30m).
+	// Server.ReleaseSession (called on MCP-client disconnect) drops
+	// the overlay synchronously, so the TTL is only the fallback
+	// path for missed disconnects.
+	overlays := daemon.NewOverlayManager(daemon.OverlayIdleTTLFromEnv(0))
 	srv.SetOverlayManager(overlays)
 
 	// Semantic manager, feedback, savings — same wiring as runServe.

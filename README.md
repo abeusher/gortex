@@ -451,9 +451,10 @@ Editor extensions push in-flight (unsaved) buffers as **overlays**. Gortex compo
 | `overlay_list` | List every overlay attached to the session — path / size / deleted / base_sha |
 | `overlay_delete` | Remove one overlay from the session |
 | `overlay_drop` | Tear down the session and discard every overlay |
+| `overlay_keepalive` | Refresh the session's idle timer without re-pushing buffer content; cheap option for debugger / wizard pauses |
 | `compare_with_overlay` | Run `find_usages` / `get_callers` / `get_call_chain` / `get_dependencies` / `get_dependents` against base AND overlay; returns added / removed / common ID sets |
 
-HTTP transport mirrors the surface at `/v1/overlay/sessions/*`; the `/v1/tools/<name>` entry point reads the overlay session from `Mcp-Session-Id` (preferred), `X-Gortex-Overlay-Session`, or `?session_id=`. Sessions auto-expire after 5 minutes of inactivity.
+HTTP transport mirrors the surface at `/v1/overlay/sessions/*`; the `/v1/tools/<name>` entry point reads the overlay session from `Mcp-Session-Id` (preferred), `X-Gortex-Overlay-Session`, or `?session_id=`. **Overlays are bound to their MCP session** — when the session ends the overlay is dropped synchronously, so abandoned buffers never linger. Idle TTL is a fail-safe (default 30 min, configurable via `GORTEX_OVERLAY_IDLE_TTL`); every tool call against a live overlay refreshes it.
 
 ## MCP Resources (16)
 

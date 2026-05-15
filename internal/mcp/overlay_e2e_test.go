@@ -454,6 +454,90 @@ func Caller() {
 	require.Contains(t, body, "caller.go")
 }
 
+// TestOverlay_DroppedOnMCPSessionRelease is the security-critical
+// guarantee: when an MCP session ends, its overlay must die
+// immediately so no future connection that learns or guesses the
+// same session ID can re-attach to abandoned buffers. The TTL is a
+// fail-safe; ReleaseSession is the fast path.
+func TestOverlay_DroppedOnMCPSessionRelease(t *testing.T) {
+	srv, _, targetFile, _ := setupOverlayServer(t)
+	sessID := "secure-bind"
+	require.NoError(t, srv.OverlayManager().RegisterWithID(sessID, ""))
+	require.NoError(t, srv.OverlayManager().Push(sessID, daemon.OverlayFile{
+		Path:    targetFile,
+		Content: "package main\n\nfunc Target() {}\n\nfunc Secret() {}\n",
+	}, nil))
+	require.True(t, srv.OverlayManager().Has(sessID))
+
+	srv.ReleaseSession(sessID)
+	require.False(t, srv.OverlayManager().Has(sessID),
+		"MCP session release must drop the overlay synchronously")
+
+	// A subsequent tools/call carrying the (now-stale) session ID
+	// must fall through to base — NOT re-attach to abandoned state.
+	ctx := WithSessionID(context.Background(), sessID)
+	res := callToolByName(t, srv, ctx, "get_file_summary", map[string]any{
+		"path": filepath.Base(targetFile),
+	})
+	require.NotContains(t, toolText(res), "Secret",
+		"a tools/call after MCP session release must not see the dropped overlay")
+}
+
+// TestOverlay_KeepaliveExtendsLease exercises the MCP keepalive
+// tool: an editor that's paused (on a breakpoint, in a long
+// refactor wizard) can extend the lease without re-pushing buffer
+// content.
+func TestOverlay_KeepaliveExtendsLease(t *testing.T) {
+	srv, _, targetFile, _ := setupOverlayServer(t)
+	sessID := "keepalive-test"
+	require.NoError(t, srv.OverlayManager().RegisterWithID(sessID, ""))
+	require.NoError(t, srv.OverlayManager().Push(sessID, daemon.OverlayFile{
+		Path:    targetFile,
+		Content: "package main\n\nfunc Target() {}\n",
+	}, nil))
+
+	ctx := WithSessionID(context.Background(), sessID)
+	res := callToolByName(t, srv, ctx, "overlay_keepalive", map[string]any{})
+	require.False(t, res.IsError, "overlay_keepalive: %s", toolText(res))
+	body := toolText(res)
+	require.Contains(t, body, `"session_id":"keepalive-test"`)
+	require.Contains(t, body, `"idle_seconds"`)
+	require.Contains(t, body, `"idle_ttl_seconds"`)
+}
+
+// TestOverlay_KeepaliveOnMissingSessionReturnsError: keepalive on
+// an unknown / reaped session surfaces a clear "session has been
+// dropped" error so the editor knows to overlay_register and re-push.
+func TestOverlay_KeepaliveOnMissingSessionReturnsError(t *testing.T) {
+	srv, _, _, _ := setupOverlayServer(t)
+	ctx := WithSessionID(context.Background(), "ghost-session")
+	res := callToolByName(t, srv, ctx, "overlay_keepalive", map[string]any{})
+	require.True(t, res.IsError, "missing session must surface as a structured error")
+	require.Contains(t, toolText(res), "dropped or never registered")
+}
+
+// TestOverlay_ListExposesExpiryMetadata: overlay_list reports the
+// per-session liveness fields so editor extensions can schedule
+// the next keepalive proactively.
+func TestOverlay_ListExposesExpiryMetadata(t *testing.T) {
+	srv, _, targetFile, _ := setupOverlayServer(t)
+	sessID := "expires-test"
+	require.NoError(t, srv.OverlayManager().RegisterWithID(sessID, ""))
+	require.NoError(t, srv.OverlayManager().Push(sessID, daemon.OverlayFile{
+		Path:    targetFile,
+		Content: "package main\n\nfunc Target() {}\n",
+	}, nil))
+
+	ctx := WithSessionID(context.Background(), sessID)
+	res := callToolByName(t, srv, ctx, "overlay_list", map[string]any{})
+	require.False(t, res.IsError)
+	body := toolText(res)
+	require.Contains(t, body, `"expires_at"`)
+	require.Contains(t, body, `"last_used_at"`)
+	require.Contains(t, body, `"idle_seconds"`)
+	require.Contains(t, body, `"idle_ttl_seconds"`)
+}
+
 // baseNodeIDs returns a sorted slice of every node ID in the base
 // graph. Used to verify the shadow-graph design's load-bearing
 // invariant: base is never mutated during overlay processing.

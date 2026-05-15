@@ -385,7 +385,11 @@ Editor extensions push in-flight (unsaved) buffers as **overlays**. Gortex compo
 | Tearing down an overlay session       | ` + "`overlay_drop`" + ` — discards every overlay attached to the session in one call |
 | Previewing impact of an unsaved edit  | ` + "`compare_with_overlay`" + ` with ` + "`kind: find_usages / get_callers / get_call_chain / get_dependencies / get_dependents`" + ` — runs the query against base and overlay simultaneously, returns added / removed / common ID sets |
 
-Pass an editor-captured git blob SHA as ` + "`base_sha`" + ` on ` + "`overlay_push`" + ` to enable drift detection: when the next tool call needs that path, Gortex compares ` + "`base_sha`" + ` to the on-disk hash and returns ` + "`overlay base SHA mismatch`" + ` if they disagree, so the client knows to re-read and resubmit. Push with ` + "`deleted: true`" + ` to model a tombstone — the file's symbols vanish from the shadow view (but are untouched in base). Sessions auto-expire after 5 minutes of inactivity. HTTP transport mirrors the surface at ` + "`/v1/overlay/sessions/*`" + `; the ` + "`/v1/tools/<name>`" + ` entry reads the active session from ` + "`Mcp-Session-Id`" + ` / ` + "`X-Gortex-Overlay-Session`" + ` / ` + "`?session_id=`" + `.
+Pass an editor-captured git blob SHA as ` + "`base_sha`" + ` on ` + "`overlay_push`" + ` to enable drift detection: when the next tool call needs that path, Gortex compares ` + "`base_sha`" + ` to the on-disk hash and returns ` + "`overlay base SHA mismatch`" + ` if they disagree, so the client knows to re-read and resubmit. Push with ` + "`deleted: true`" + ` to model a tombstone — the file's symbols vanish from the shadow view (but are untouched in base).
+
+**Lifecycle.** Overlays are bound to the MCP session that registered them — when the MCP session ends, the overlay is dropped synchronously. Idle TTL (default 30 min, configurable via ` + "`GORTEX_OVERLAY_IDLE_TTL`" + `) is a fail-safe for missed disconnects; every tool call against a live overlay refreshes it. Use ` + "`overlay_keepalive`" + ` for genuine idle gaps without re-pushing content. ` + "`overlay_list`" + ` returns ` + "`expires_at`" + ` / ` + "`idle_seconds`" + ` so extensions can schedule keepalives proactively.
+
+HTTP transport mirrors the surface at ` + "`/v1/overlay/sessions/*`" + `; the ` + "`/v1/tools/<name>`" + ` entry reads the active session from ` + "`Mcp-Session-Id`" + ` / ` + "`X-Gortex-Overlay-Session`" + ` / ` + "`?session_id=`" + `.
 
 ### MCP Resources
 

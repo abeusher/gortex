@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 
@@ -59,6 +61,12 @@ func (s *Server) registerOverlayTools() {
 			mcp.WithDescription("Tear down the calling MCP session's overlay entirely. Equivalent to calling overlay_delete on every attached path. The session remains live; a subsequent overlay_register / overlay_push starts a fresh overlay."),
 		),
 		s.handleOverlayDrop,
+	)
+	s.mcpServer.AddTool(
+		mcp.NewTool("overlay_keepalive",
+			mcp.WithDescription("Refresh the calling MCP session's overlay idle timer without changing any overlay content. Cheaper than re-pushing buffer content when the editor needs to extend the lease (e.g. the user is debugging or paused on a breakpoint and won't push for a while). Returns the resulting expires_at / idle_seconds so the editor can schedule the next keepalive. The MCP session disconnect path already drops the overlay synchronously, so keepalive is only needed for genuine idle gaps below the disconnect-detection threshold."),
+		),
+		s.handleOverlayKeepalive,
 	)
 
 	// compare_with_overlay runs a query against both base and the
@@ -148,6 +156,9 @@ func (s *Server) handleOverlayPush(ctx context.Context, req mcp.CallToolRequest)
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 	}
+	// Invalidate the cached parsed-overlay layer for this session so
+	// the next tools/call re-parses with the fresh buffer state.
+	s.overlayCacheInvalidate(id)
 	return mcp.NewToolResultText(jsonOK(map[string]any{
 		"path":         overlay.Path,
 		"content_size": len(overlay.Content),
@@ -161,18 +172,30 @@ func (s *Server) handleOverlayList(ctx context.Context, _ mcp.CallToolRequest) (
 	if errRes != nil {
 		return errRes, nil
 	}
-	ws, files, err := s.overlays.SnapshotFor(id)
-	if err != nil {
-		if errors.Is(err, daemon.ErrSessionNotFound) {
+	// StatusFor + Files (rather than SnapshotFor) so listing the
+	// overlay doesn't accidentally bump LastUsed. Polling
+	// overlay_list every second should NOT extend the lease;
+	// otherwise a misconfigured editor could keep a dropped MCP
+	// session's overlay alive forever just by polling.
+	status, statusErr := s.overlays.StatusFor(id)
+	if statusErr != nil {
+		if errors.Is(statusErr, daemon.ErrSessionNotFound) {
 			return mcp.NewToolResultText(jsonOK(map[string]any{
 				"session_id":   id,
 				"workspace_id": "",
 				"count":        0,
 				"files":        []any{},
+				"expired":      true,
 			})), nil
 		}
-		return mcp.NewToolResultError(err.Error()), nil
+		return mcp.NewToolResultError(statusErr.Error()), nil
 	}
+	rawFiles, _ := s.overlays.Files(id)
+	files := make([]daemon.OverlayFile, 0, len(rawFiles))
+	for _, f := range rawFiles {
+		files = append(files, f)
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
 	out := make([]map[string]any, 0, len(files))
 	for _, f := range files {
 		out = append(out, map[string]any{
@@ -182,12 +205,20 @@ func (s *Server) handleOverlayList(ctx context.Context, _ mcp.CallToolRequest) (
 			"base_sha":     f.BaseSHA,
 		})
 	}
-	return mcp.NewToolResultText(jsonOK(map[string]any{
-		"session_id":   id,
-		"workspace_id": ws,
-		"count":        len(out),
-		"files":        out,
-	})), nil
+	resp := map[string]any{
+		"session_id":       id,
+		"workspace_id":     status.WorkspaceID,
+		"count":            len(out),
+		"files":            out,
+		"created_at":       status.Created.UTC().Format(time.RFC3339),
+		"last_used_at":     status.LastUsed.UTC().Format(time.RFC3339),
+		"idle_seconds":     status.IdleSeconds,
+		"idle_ttl_seconds": status.IdleTTLSeconds,
+	}
+	if !status.ExpiresAt.IsZero() {
+		resp["expires_at"] = status.ExpiresAt.UTC().Format(time.RFC3339)
+	}
+	return mcp.NewToolResultText(jsonOK(resp)), nil
 }
 
 func (s *Server) handleOverlayDelete(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -205,6 +236,7 @@ func (s *Server) handleOverlayDelete(ctx context.Context, req mcp.CallToolReques
 		}
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+	s.overlayCacheInvalidate(id)
 	return mcp.NewToolResultText(jsonOK(map[string]any{
 		"path": path,
 		"ok":   true,
@@ -217,10 +249,46 @@ func (s *Server) handleOverlayDrop(ctx context.Context, _ mcp.CallToolRequest) (
 		return errRes, nil
 	}
 	s.overlays.Drop(id)
+	s.overlayCacheInvalidate(id)
 	return mcp.NewToolResultText(jsonOK(map[string]any{
 		"session_id": id,
 		"ok":         true,
 	})), nil
+}
+
+// handleOverlayKeepalive refreshes the session's idle timer and
+// returns fresh expires_at / idle_seconds metadata. Returns an
+// explicit "session expired" error when the daemon already reaped
+// the session (or never knew about it) — the editor must
+// overlay_register + re-push to recover.
+func (s *Server) handleOverlayKeepalive(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	id, errRes := s.overlaySessionID(ctx)
+	if errRes != nil {
+		return errRes, nil
+	}
+	if err := s.overlays.Touch(id); err != nil {
+		if errors.Is(err, daemon.ErrSessionNotFound) {
+			return mcp.NewToolResultError("overlay session has been dropped or never registered — call overlay_register before pushing"), nil
+		}
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	status, statusErr := s.overlays.StatusFor(id)
+	if statusErr != nil {
+		// Race: session was dropped between Touch and StatusFor —
+		// extremely unlikely, but surface honestly.
+		return mcp.NewToolResultError(statusErr.Error()), nil
+	}
+	resp := map[string]any{
+		"session_id":       id,
+		"workspace_id":     status.WorkspaceID,
+		"last_used_at":     status.LastUsed.UTC().Format(time.RFC3339),
+		"idle_seconds":     status.IdleSeconds,
+		"idle_ttl_seconds": status.IdleTTLSeconds,
+	}
+	if !status.ExpiresAt.IsZero() {
+		resp["expires_at"] = status.ExpiresAt.UTC().Format(time.RFC3339)
+	}
+	return mcp.NewToolResultText(jsonOK(resp)), nil
 }
 
 // jsonOK marshals v to a compact JSON string. Tool handlers use it to
