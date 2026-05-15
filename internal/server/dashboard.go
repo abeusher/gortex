@@ -206,7 +206,23 @@ func (h *Handler) handleRepos(w http.ResponseWriter, _ *http.Request) {
 // --- /v1/overlay/* ---
 
 // handleOverlayRegister handles POST /v1/overlay/sessions.
-// Body: {"workspace_id": "<slug>"}. Response: {"session_id": "..."}.
+//
+// Body (all fields optional): {
+//
+//	"workspace_id": "<slug>",
+//	"session_id":   "<explicit-id>"   // bind to a known MCP session
+//
+// }
+//
+// When `session_id` is supplied, the session is registered under that
+// ID instead of a freshly minted one — this is how an MCP client binds
+// its overlay session to its MCP session ID, so subsequent tools/call
+// frames from the same MCP session automatically see the overlay
+// (the MCP tool middleware reads SessionIDFromContext and resolves the
+// overlay by that ID). Idempotent: registering twice with the same
+// (id, workspace) tuple is a no-op; mismatched workspaces return 409.
+//
+// Response: {"session_id": "...", "workspace_id": "..."}.
 func (h *Handler) handleOverlayRegister(w http.ResponseWriter, r *http.Request) {
 	if h.overlays == nil {
 		http.Error(w, "overlay support not enabled on this server", http.StatusServiceUnavailable)
@@ -214,6 +230,7 @@ func (h *Handler) handleOverlayRegister(w http.ResponseWriter, r *http.Request) 
 	}
 	var body struct {
 		WorkspaceID string `json:"workspace_id"`
+		SessionID   string `json:"session_id"`
 	}
 	if r.ContentLength > 0 {
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -221,7 +238,19 @@ func (h *Handler) handleOverlayRegister(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 	}
-	id := h.overlays.Register(body.WorkspaceID)
+	id := body.SessionID
+	if id == "" {
+		id = h.overlays.Register(body.WorkspaceID)
+	} else {
+		if err := h.overlays.RegisterWithID(id, body.WorkspaceID); err != nil {
+			if errors.Is(err, daemon.ErrSessionExists) {
+				http.Error(w, err.Error(), http.StatusConflict)
+				return
+			}
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
 	WriteJSON(w, http.StatusCreated, map[string]any{
 		"session_id":   id,
 		"workspace_id": body.WorkspaceID,

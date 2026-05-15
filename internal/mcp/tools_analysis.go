@@ -11,7 +11,7 @@ import (
 )
 
 func (s *Server) registerAnalysisTools() {
-	s.mcpServer.AddTool(
+	s.addTool(
 		mcp.NewTool("get_communities",
 			mcp.WithDescription("Returns functional clusters discovered by community detection. Without id: list all communities with summaries. With id: full details of a specific community (members, files, cohesion)."),
 			mcp.WithString("id", mcp.Description("Optional community ID (e.g. community-0). When set, returns full details of that community instead of the list.")),
@@ -19,7 +19,7 @@ func (s *Server) registerAnalysisTools() {
 		s.handleGetCommunities,
 	)
 
-	s.mcpServer.AddTool(
+	s.addTool(
 		mcp.NewTool("get_processes",
 			mcp.WithDescription("Returns discovered execution flows — named chains of function calls starting from entry points. Without id: list all processes. With id: full step-by-step call chain for that process."),
 			mcp.WithString("id", mcp.Description("Optional process ID (e.g. process-0). When set, returns the full step-by-step call chain for that process instead of the list.")),
@@ -29,7 +29,7 @@ func (s *Server) registerAnalysisTools() {
 		s.handleGetProcesses,
 	)
 
-	s.mcpServer.AddTool(
+	s.addTool(
 		mcp.NewTool("detect_changes",
 			mcp.WithDescription("Maps uncommitted git changes to symbols in the graph and runs blast radius analysis. The key pre-commit review tool."),
 			mcp.WithString("scope", mcp.Description("unstaged (default), staged, all, or compare")),

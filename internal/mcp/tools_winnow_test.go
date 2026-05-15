@@ -75,7 +75,7 @@ func TestWinnowSymbols_FilterByKindAndPath(t *testing.T) {
 		PathPrefix: []string{"svc/"},
 		Limit:      10,
 	}
-	rows := srv.winnowSymbols(c, nil)
+	rows := srv.winnowSymbols(context.Background(), c, nil)
 	require.NotEmpty(t, rows)
 	for _, r := range rows {
 		assert.Equal(t, graph.KindFunction, r.Node.Kind)
@@ -88,7 +88,7 @@ func TestWinnowSymbols_LanguageFilterExcludesOthers(t *testing.T) {
 	srv := buildWinnowGraph(t)
 
 	c := winnowConstraints{Language: "typescript", Limit: 10}
-	rows := srv.winnowSymbols(c, nil)
+	rows := srv.winnowSymbols(context.Background(), c, nil)
 	require.Len(t, rows, 1)
 	assert.Equal(t, "web/api.ts::fetchUser", rows[0].Node.ID)
 }
@@ -99,7 +99,7 @@ func TestWinnowSymbols_MinFanInDropsLeaves(t *testing.T) {
 	// validateToken has fan_in=3 (2 calls + 1 reference); Login has 1;
 	// Logout + HandleUser + fetchUser have 0.
 	c := winnowConstraints{MinFanIn: 2, Limit: 10}
-	rows := srv.winnowSymbols(c, nil)
+	rows := srv.winnowSymbols(context.Background(), c, nil)
 	require.Len(t, rows, 1)
 	assert.Equal(t, "svc/auth.go::validateToken", rows[0].Node.ID)
 	assert.Equal(t, 3, rows[0].FanIn)
@@ -109,7 +109,7 @@ func TestWinnowSymbols_RankingByFanIn(t *testing.T) {
 	srv := buildWinnowGraph(t)
 
 	c := winnowConstraints{Kinds: []graph.NodeKind{graph.KindFunction}, Language: "go", Limit: 10}
-	rows := srv.winnowSymbols(c, nil)
+	rows := srv.winnowSymbols(context.Background(), c, nil)
 	require.NotEmpty(t, rows)
 
 	// validateToken should top the list because fan_in dominates when no
@@ -123,8 +123,8 @@ func TestWinnowSymbols_RankingByFanIn(t *testing.T) {
 func TestWinnowSymbols_CommunityFilterByIDAndLabel(t *testing.T) {
 	srv := buildWinnowGraph(t)
 
-	byID := srv.winnowSymbols(winnowConstraints{Community: "community-0", Limit: 10}, nil)
-	byLabel := srv.winnowSymbols(winnowConstraints{Community: "authz", Limit: 10}, nil)
+	byID := srv.winnowSymbols(context.Background(), winnowConstraints{Community: "community-0", Limit: 10}, nil)
+	byLabel := srv.winnowSymbols(context.Background(), winnowConstraints{Community: "authz", Limit: 10}, nil)
 
 	require.Equal(t, len(byID), len(byLabel))
 	require.Greater(t, len(byID), 0)
@@ -143,7 +143,7 @@ func TestWinnowSymbols_ChurnFilter(t *testing.T) {
 	srv.symHistory.Record("svc/auth.go::Logout", false)
 
 	c := winnowConstraints{MinChurn: 2, Limit: 10}
-	rows := srv.winnowSymbols(c, nil)
+	rows := srv.winnowSymbols(context.Background(), c, nil)
 	require.Len(t, rows, 1)
 	assert.Equal(t, "svc/auth.go::Login", rows[0].Node.ID)
 	assert.Equal(t, 2, rows[0].Churn)

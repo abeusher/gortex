@@ -272,7 +272,7 @@ func pathToFileURI(absPath string) string {
 // `subscribe_diagnostics` opts the calling session into push
 // notifications; `unsubscribe_diagnostics` opts it back out.
 func (s *Server) registerDiagnosticsTools() {
-	s.mcpServer.AddTool(
+	s.addTool(
 		mcp.NewTool("subscribe_diagnostics",
 			mcp.WithDescription("Opt the current MCP session into `notifications/diagnostics` push events. Once subscribed, every LSP `textDocument/publishDiagnostics` matching your filter is forwarded to your session as an MCP notification with `{uri, path, server, diagnostics}` payload. The current diagnostic state of every matching file is replayed immediately as `initial_replay: true` so you don't have to wait for the next edit. Optional `min_severity` (1=error, 2=warning, 3=info, 4=hint; default 0=all) and `path_prefix` (absolute path prefix; default empty=all files) restrict which payloads reach this session. Resubscribing overwrites the previous filter and re-replays the current state. Pair with `unsubscribe_diagnostics` to opt back out."),
 			mcp.WithNumber("min_severity", mcp.Description("Drop diagnostics whose LSP severity number exceeds this value. 1=error, 2=warning, 3=info, 4=hint. 0 (default) keeps everything.")),
@@ -280,7 +280,7 @@ func (s *Server) registerDiagnosticsTools() {
 		),
 		s.handleSubscribeDiagnostics,
 	)
-	s.mcpServer.AddTool(
+	s.addTool(
 		mcp.NewTool("unsubscribe_diagnostics",
 			mcp.WithDescription("Opt the current MCP session out of `notifications/diagnostics` push events. Idempotent."),
 		),

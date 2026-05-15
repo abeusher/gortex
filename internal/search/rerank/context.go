@@ -11,10 +11,13 @@ import (
 // All fields are optional; signals must gracefully degrade when a
 // data source is absent. The zero value is a valid Context.
 type Context struct {
-	// Graph is the indexed knowledge graph. Required for any signal
-	// that reads node metadata or walks edges (FanIn, FanOut,
-	// MinHash). When nil, those signals contribute 0.
-	Graph *graph.Graph
+	// Graph is the indexed knowledge graph reader. Required for any
+	// signal that reads node metadata or walks edges (FanIn, FanOut,
+	// MinHash). When nil, those signals contribute 0. Held as the
+	// `graph.Reader` interface so the editor-overlay path can pass
+	// an `*OverlaidView` here and have rerank signals score against
+	// the overlay's shadow graph just like base.
+	Graph graph.Reader
 
 	// CommunityOf maps a node ID to its detected community ID. When
 	// nil, the community signal contributes 0.

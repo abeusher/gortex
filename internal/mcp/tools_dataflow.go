@@ -24,7 +24,7 @@ import (
 // Both tools accept format=gcx for the GCX1 wire format; the
 // per-tool encoders live in this file alongside the handlers.
 func (s *Server) registerDataflowTools() {
-	s.mcpServer.AddTool(
+	s.addTool(
 		mcp.NewTool("flow_between",
 			mcp.WithDescription("Returns ranked dataflow paths between two symbols. Walks EdgeValueFlow / EdgeArgOf / EdgeReturnsTo forward from source to sink — the CPG-lite primitive that answers \"where does this value flow?\". Pairs with taint_paths for pattern-driven sweeps."),
 			mcp.WithString("source_id", mcp.Required(), mcp.Description("Source symbol node ID — typically a function, method, or parameter")),
@@ -37,7 +37,7 @@ func (s *Server) registerDataflowTools() {
 		s.handleFlowBetween,
 	)
 
-	s.mcpServer.AddTool(
+	s.addTool(
 		mcp.NewTool("taint_paths",
 			mcp.WithDescription("Pattern-driven dataflow sweep — resolves every symbol matching `source_pattern` and `sink_pattern`, then walks the dataflow graph to find paths between each pair. Use for security-style queries (\"every flow from os.Getenv to db.Query\") and architectural audits. Pattern syntax: bare token = case-insensitive substring on symbol name; `exact:Foo` = exact name; `path:dir/` = file-path prefix; `kind:method` = restrict node kind. Combine clauses with spaces."),
 			mcp.WithString("source_pattern", mcp.Required(), mcp.Description("Source pattern — see description for syntax")),

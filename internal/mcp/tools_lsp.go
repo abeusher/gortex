@@ -27,7 +27,7 @@ import (
 // for that language — callers get a structured "no_lsp_for" error
 // payload instead of a hard failure.
 func (s *Server) registerLSPTools() {
-	s.mcpServer.AddTool(
+	s.addTool(
 		mcp.NewTool("get_diagnostics",
 			mcp.WithDescription("Returns the most recent LSP diagnostics for a file. The file is auto-opened on the server if it isn't already, and the call optionally waits for the next publishDiagnostics burst."),
 			mcp.WithString("path", mcp.Required(), mcp.Description("Repo-relative or absolute file path")),
@@ -39,7 +39,7 @@ func (s *Server) registerLSPTools() {
 		s.handleGetDiagnostics,
 	)
 
-	s.mcpServer.AddTool(
+	s.addTool(
 		mcp.NewTool("get_code_actions",
 			mcp.WithDescription("Returns LSP code actions (quickfix / organizeImports / refactor.* / source.*) available at a file location. Pass `only` to restrict the kinds returned."),
 			mcp.WithString("path", mcp.Required(), mcp.Description("Repo-relative or absolute file path")),
@@ -54,7 +54,7 @@ func (s *Server) registerLSPTools() {
 		s.handleGetCodeActions,
 	)
 
-	s.mcpServer.AddTool(
+	s.addTool(
 		mcp.NewTool("apply_code_action",
 			mcp.WithDescription("Applies a single LSP code action to disk. Pass the action's `index` from a previous get_code_actions call, plus the same `path`/`start_line`/`only` tuple to re-resolve the action list."),
 			mcp.WithString("path", mcp.Required(), mcp.Description("Repo-relative or absolute file path")),
@@ -69,7 +69,7 @@ func (s *Server) registerLSPTools() {
 		s.handleApplyCodeAction,
 	)
 
-	s.mcpServer.AddTool(
+	s.addTool(
 		mcp.NewTool("fix_all_in_file",
 			mcp.WithDescription("Loops codeAction → apply → re-collect-diagnostics until convergence. Defaults to {quickfix, source.organizeImports}; pass `kinds` to override. Returns iteration count, total actions applied, files touched, and final diagnostics."),
 			mcp.WithString("path", mcp.Required(), mcp.Description("Repo-relative or absolute file path")),

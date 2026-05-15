@@ -47,7 +47,7 @@ func (s *Server) WinnowForEval(query string, extras map[string]any, limit int) [
 			}
 		}
 	}
-	results := s.winnowSymbols(c, nil)
+	results := s.winnowSymbols(context.Background(), c, nil)
 	out := make([]string, 0, len(results))
 	for _, r := range results {
 		out = append(out, r.Node.ID)
@@ -128,7 +128,7 @@ func (s *Server) handleWinnowSymbols(ctx context.Context, req mcp.CallToolReques
 		return mcp.NewToolResultError(filterErr.Error()), nil
 	}
 
-	results := s.winnowSymbols(c, allowed)
+	results := s.winnowSymbols(ctx, c, allowed)
 	total := len(results)
 	offset := decodeCursor(req.GetString("cursor", ""))
 	if offset > total {
@@ -146,7 +146,7 @@ func (s *Server) handleWinnowSymbols(ctx context.Context, req mcp.CallToolReques
 
 	if s.isGCX(ctx, req) {
 		var weights map[string]float64
-		if pipeline := s.engine.Rerank(); pipeline != nil {
+		if pipeline := s.engineFor(ctx).Rerank(); pipeline != nil {
 			weights = pipeline.Weights()
 		}
 		return s.gcxResponseWithBudget(req)(encodeWinnowSymbols(results, total, c.Limit, weights))
@@ -226,21 +226,25 @@ func parseWinnowConstraints(req mcp.CallToolRequest) (winnowConstraints, error) 
 
 // winnowSymbols applies the constraint chain and returns ranked results. It
 // is package-internal so tests can exercise the filter/rank logic without
-// the MCP request plumbing.
-func (s *Server) winnowSymbols(c winnowConstraints, allowed map[string]bool) []winnowResult {
+// the MCP request plumbing. The ctx parameter scopes graph reads to the
+// caller's overlay view (when any) so winnow honours editor-buffer state
+// just like search_symbols.
+func (s *Server) winnowSymbols(ctx context.Context, c winnowConstraints, allowed map[string]bool) []winnowResult {
+	eng := s.engineFor(ctx)
+	reader := s.readerFor(ctx)
 	var candidates []*graph.Node
 	textScores := make(map[string]float64)
 
-	if c.TextMatch != "" && s.engine != nil {
+	if c.TextMatch != "" && eng != nil {
 		// Pull a wider slice so structural filters have headroom.
 		width := c.Limit*10 + 50
-		nodes := s.engine.SearchSymbols(c.TextMatch, width)
+		nodes := eng.SearchSymbols(c.TextMatch, width)
 		for rank, n := range nodes {
 			textScores[n.ID] = 1.0 / float64(rank+1)
 			candidates = append(candidates, n)
 		}
 	} else {
-		candidates = s.graph.AllNodes()
+		candidates = reader.AllNodes()
 	}
 
 	candidates = filterNodes(candidates, allowed)
@@ -257,7 +261,7 @@ func (s *Server) winnowSymbols(c winnowConstraints, allowed map[string]bool) []w
 
 	candidates = applyWinnowPrefilter(candidates, c)
 
-	fanIn, fanOut := computeFanInOut(s.graph, candidates)
+	fanIn, fanOut := computeFanInOut(reader, candidates)
 
 	var nodeToComm map[string]string
 	var labelToID map[string]string
@@ -308,7 +312,7 @@ func (s *Server) winnowSymbols(c winnowConstraints, allowed map[string]bool) []w
 	// pre-filtering above (kind / path / community / min-counts) stays
 	// intact — winnow is a constraint chain that hands its kept rows
 	// to the pipeline for ranking.
-	pipeline := s.engine.Rerank()
+	pipeline := eng.Rerank()
 	if pipeline != nil && len(rows) > 0 {
 		cands := make([]*rerank.Candidate, len(rows))
 		idxByID := make(map[string]int, len(rows))
@@ -336,7 +340,7 @@ func (s *Server) winnowSymbols(c winnowConstraints, allowed map[string]bool) []w
 			cands[i] = &rerank.Candidate{Node: r.Node, TextRank: tr, VectorRank: -1}
 			idxByID[r.Node.ID] = i
 		}
-		rctx := s.buildRerankContext(context.Background(), c.TextMatch)
+		rctx := s.buildRerankContext(ctx, c.TextMatch)
 		pipeline.Rerank(c.TextMatch, cands, rctx)
 
 		ordered := make([]winnowResult, 0, len(cands))
@@ -466,7 +470,7 @@ func applyWinnowPrefilter(nodes []*graph.Node, c winnowConstraints) []*graph.Nod
 // computeFanInOut walks incoming and outgoing edges for each candidate and
 // counts fan-in (calls + references) and fan-out (calls). Scoped to the
 // candidate set so cost scales with |candidates|, not total graph size.
-func computeFanInOut(g *graph.Graph, nodes []*graph.Node) (map[string]int, map[string]int) {
+func computeFanInOut(g graph.Reader, nodes []*graph.Node) (map[string]int, map[string]int) {
 	fanIn := make(map[string]int, len(nodes))
 	fanOut := make(map[string]int, len(nodes))
 	if g == nil {

@@ -160,8 +160,8 @@ func expandSearchTerms(ctx context.Context, s *Server, query string) []string {
 // primaryCount is the size of the original-query BM25 result before
 // merging; useful for diagnostic / debug surfaces that want to show
 // how many candidates expansion contributed.
-func fetchAndMergeBM25(s *Server, original string, expanded []string, fetchLimit int, scope query.QueryOptions) (merged []*graph.Node, primaryCount int) {
-	primary := s.engine.SearchSymbolsScoped(original, fetchLimit, scope)
+func fetchAndMergeBM25(eng *query.Engine, original string, expanded []string, fetchLimit int, scope query.QueryOptions) (merged []*graph.Node, primaryCount int) {
+	primary := eng.SearchSymbolsScoped(original, fetchLimit, scope)
 	primaryCount = len(primary)
 	if len(expanded) == 0 {
 		return primary, primaryCount
@@ -180,7 +180,7 @@ func fetchAndMergeBM25(s *Server, original string, expanded []string, fetchLimit
 		if term == "" {
 			continue
 		}
-		extra := s.engine.SearchSymbolsScoped(term, fetchLimit, scope)
+		extra := eng.SearchSymbolsScoped(term, fetchLimit, scope)
 		for _, n := range extra {
 			if seen[n.ID] {
 				continue
@@ -245,11 +245,11 @@ const verifyCallersPerCand = 3
 // each with name + truncated signature. The query depth is 1 (direct
 // callers only) and the brief detail level keeps memory pressure low.
 // Returns nil for non-callable kinds or when GetCallers yields nothing.
-func topCallersForVerify(s *Server, n *graph.Node) []llm.CallerInfo {
+func topCallersForVerify(eng *query.Engine, n *graph.Node) []llm.CallerInfo {
 	if n.Kind != graph.KindFunction && n.Kind != graph.KindMethod {
 		return nil
 	}
-	sg := s.engine.GetCallers(n.ID, query.QueryOptions{
+	sg := eng.GetCallers(n.ID, query.QueryOptions{
 		Depth:  1,
 		Limit:  verifyCallersPerCand + 4, // over-fetch a little: self + non-callers get filtered
 		Detail: "brief",
@@ -369,7 +369,7 @@ func verifyWithLLM(ctx context.Context, s *Server, query string, nodes []*graph.
 			Name:      n.Name,
 			Signature: sig,
 			Body:      extractBodyForVerify(s, n),
-			Callers:   topCallersForVerify(s, n),
+			Callers:   topCallersForVerify(s.engineFor(ctx), n),
 		}
 		idx[n.ID] = n
 		dbg.Considered[i] = n.ID

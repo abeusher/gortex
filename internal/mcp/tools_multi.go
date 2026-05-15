@@ -16,7 +16,7 @@ import (
 // registerMultiRepoTools registers MCP tools for multi-repo management:
 // track_repository, untrack_repository, set_active_project, get_active_project.
 func (s *Server) registerMultiRepoTools() {
-	s.mcpServer.AddTool(
+	s.addTool(
 		mcp.NewTool("track_repository",
 			mcp.WithDescription("Add a repository to the tracked workspace at runtime. Indexes immediately and persists to config."),
 			mcp.WithString("path", mcp.Required(), mcp.Description("Absolute path to repository")),
@@ -25,7 +25,7 @@ func (s *Server) registerMultiRepoTools() {
 		s.handleTrackRepository,
 	)
 
-	s.mcpServer.AddTool(
+	s.addTool(
 		mcp.NewTool("untrack_repository",
 			mcp.WithDescription("Remove a repository from the tracked workspace at runtime. Evicts nodes/edges and persists to config."),
 			mcp.WithString("path", mcp.Required(), mcp.Description("Path or repo prefix to remove")),
@@ -33,7 +33,7 @@ func (s *Server) registerMultiRepoTools() {
 		s.handleUntrackRepository,
 	)
 
-	s.mcpServer.AddTool(
+	s.addTool(
 		mcp.NewTool("set_active_project",
 			mcp.WithDescription("Switch the active project scope. Persists to config and re-scopes all subsequent queries."),
 			mcp.WithString("project", mcp.Required(), mcp.Description("Project name to activate")),
@@ -41,7 +41,7 @@ func (s *Server) registerMultiRepoTools() {
 		s.handleSetActiveProject,
 	)
 
-	s.mcpServer.AddTool(
+	s.addTool(
 		mcp.NewTool("get_active_project",
 			mcp.WithDescription("Return the current active project name and its list of member repositories."),
 			mcp.WithString("format", mcp.Description("Output format: json (default), gcx (GCX1 compact wire format), or toon")),

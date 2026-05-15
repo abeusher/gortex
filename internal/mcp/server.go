@@ -16,6 +16,7 @@ import (
 	"github.com/zzet/gortex/internal/analysis"
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/contracts"
+	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/llm"
@@ -147,6 +148,28 @@ type Server struct {
 	// Populated by registerToolWithScope as tools are added; consulted
 	// by ResolveToolScope before each handler runs.
 	toolScopes *scopeRegistry
+
+	// overlays is the optional editor-overlay manager. When non-nil,
+	// every `tools/call` whose session carries overlay buffers is
+	// wrapped (via s.addTool → wrapToolHandler) with the per-request
+	// shadow-graph middleware that builds an OverlaidView over the
+	// immutable base graph. Wired post-construction by
+	// SetOverlayManager.
+	overlays *daemon.OverlayManager
+
+	// overlayLayerCache memoises per-session parsed overlay layers
+	// keyed by (sessionID, content-hash sum). Cache hits avoid the
+	// per-request re-parse when an editor pushes the same buffer to a
+	// long sequence of tool calls. Entries are dropped on overlay
+	// session Drop / Push / Delete via overlayCacheInvalidate.
+	overlayLayerCache   sync.Map // map[string]*overlayLayerCacheEntry; key = layerCacheKey
+	overlayLayerBuildMu sync.Mutex
+
+	// registerOverlayToolsOnce gates the overlay MCP tool family
+	// (overlay_register / overlay_push / overlay_list /
+	// overlay_delete / overlay_drop / compare_with_overlay) so a
+	// second SetOverlayManager call doesn't double-register them.
+	registerOverlayToolsOnce sync.Once
 }
 
 // sessionFor returns the session-scoped state for the current request.
@@ -178,6 +201,20 @@ func (s *Server) ReleaseSession(id string) {
 	if s.diagBroadcaster != nil {
 		s.diagBroadcaster.unsubscribe(id)
 	}
+	// Editor-overlay sessions are pinned to the MCP session that
+	// registered them. When the MCP session ends — for any reason —
+	// the overlay must die immediately. Holding overlay state past
+	// the disconnect would (a) leak unsaved buffer content into the
+	// daemon's address space indefinitely and (b) let a future
+	// connection that learns or guesses the same session ID re-
+	// attach to abandoned buffers; that's a credential / data-leak
+	// vector we don't want. The TTL is a fail-safe for "client
+	// crashed and we never observed the disconnect"; this is the
+	// fast path that closes the window when we DO observe it.
+	if s.overlays != nil {
+		s.overlays.Drop(id)
+	}
+	s.overlayCacheInvalidate(id)
 }
 
 // sessionState tracks recent agent activity for context recovery after compaction.
@@ -1069,6 +1106,22 @@ func (s *Server) ServeStdio() error {
 // This is used by the eval-server to wire tool dispatch into an HTTP handler.
 func (s *Server) MCPServer() *server.MCPServer {
 	return s.mcpServer
+}
+
+// addTool registers a tool whose handler is wrapped with the overlay
+// apply/revert middleware (see overlay.go::wrapToolHandler). Every
+// tool added through this helper picks up overlay-aware behaviour
+// transparently — graph-walking tools see the editor-buffer view,
+// source-reading tools see overlay content. Tools registered the old
+// way (s.mcpServer.AddTool) still work but bypass the middleware.
+//
+// Routing every internal registration through this helper means both
+// the daemon-dispatched path (HandleMessage) and the in-process HTTP
+// path (Handler.CallToolStrict) get identical overlay semantics — the
+// latter bypasses mcp-go's Hooks, so handler-level wrapping is the
+// only place that covers both transports.
+func (s *Server) addTool(tool mcp.Tool, handler server.ToolHandlerFunc) {
+	s.mcpServer.AddTool(tool, s.wrapToolHandler(handler))
 }
 
 // SetContractRegistry sets an explicit contract registry override for the MCP

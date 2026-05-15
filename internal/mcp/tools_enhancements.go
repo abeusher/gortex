@@ -75,7 +75,7 @@ func (s *Server) ensureFresh(filePaths []string) []string {
 
 func (s *Server) registerEnhancementTools() {
 	// verify_change
-	s.mcpServer.AddTool(
+	s.addTool(
 		mcp.NewTool("verify_change",
 			mcp.WithDescription("Given proposed signature changes, checks all callers and interface implementors for contract violations. Use before refactoring to catch breaking changes."),
 			mcp.WithString("changes", mcp.Required(), mcp.Description("JSON array of {symbol_id, new_signature} objects")),
@@ -85,7 +85,7 @@ func (s *Server) registerEnhancementTools() {
 	)
 
 	// check_guards
-	s.mcpServer.AddTool(
+	s.addTool(
 		mcp.NewTool("check_guards",
 			mcp.WithDescription("Evaluates project-specific guard rules against a set of changed symbols. Reports co-change and boundary violations."),
 			mcp.WithString("ids", mcp.Required(), mcp.Description("Comma-separated list of changed symbol IDs")),
@@ -97,7 +97,7 @@ func (s *Server) registerEnhancementTools() {
 	)
 
 	// prefetch_context
-	s.mcpServer.AddTool(
+	s.addTool(
 		mcp.NewTool("prefetch_context",
 			mcp.WithDescription("Predicts what context you will need next based on recent activity and a task description. Returns ranked symbols with relevance reasons."),
 			mcp.WithString("task", mcp.Description("Natural language task description")),
@@ -116,7 +116,7 @@ func (s *Server) registerEnhancementTools() {
 	)
 
 	// analyze — unified graph analysis tool (dead_code, hotspots, cycles, would_create_cycle)
-	s.mcpServer.AddTool(
+	s.addTool(
 		mcp.NewTool("analyze",
 			mcp.WithDescription("Unified graph analysis. kind=dead_code: symbols with zero incoming edges. kind=hotspots: high-complexity symbols by fan-in/out. kind=cycles: circular dependency chains. kind=would_create_cycle: check if a new edge would form a cycle (requires from_id, to_id). kind=todos: list KindTodo nodes with optional tag/assignee/ticket/has_assignee filters. kind=blame: run `git blame` against the indexed repo and stamp meta.last_authored on every symbol-level node. kind=coverage: parse a Go cover.out profile (path via `profile` arg) and stamp meta.coverage_pct on every executable symbol. kind=stale_code: list symbols whose meta.last_authored is older than the threshold (requires blame-enriched graph). kind=ownership: group blame metadata by author email — symbol count, files touched, oldest/newest timestamps; supports path_prefix scoping (requires blame-enriched graph). kind=coverage_gaps: list symbols whose meta.coverage_pct falls in [min_pct, max_pct) — sorted ascending so the most undertested code surfaces first (requires coverage-enriched graph)."),
 			mcp.WithString("kind", mcp.Required(), mcp.Description("Analysis kind: dead_code | hotspots | cycles | would_create_cycle | todos | blame | coverage | stale_code | ownership | coverage_gaps | stale_flags | releases | cgo_users | wasm_users | orphan_tables | unreferenced_tables | coverage_summary | channel_ops | goroutine_spawns | field_writers | annotation_users | config_readers | event_emitters | pubsub | string_emitters | error_surface | external_calls | routes | models | components | k8s_resources | images | kustomize | cross_repo | dbt_models")),
@@ -151,7 +151,7 @@ func (s *Server) registerEnhancementTools() {
 	)
 
 	// winnow_symbols — multi-axis constraint-chain retrieval
-	s.mcpServer.AddTool(
+	s.addTool(
 		mcp.NewTool("winnow_symbols",
 			mcp.WithDescription("Structured constraint-chain retrieval. Combines BM25 text matching with structural filters (kind, language, fan-in/out, community, path prefix, churn, test classification) and returns a ranked list with per-axis score contributions. Use when search_symbols' free-text-only query is too coarse — e.g. 'methods in the auth community with fan-in >= 5 touching handlers/' or 'production functions only, no tests'."),
 			mcp.WithString("kind", mcp.Description("Comma-separated node kinds to keep (function, method, type, interface, variable, contract)")),
@@ -180,7 +180,7 @@ func (s *Server) registerEnhancementTools() {
 	)
 
 	// scaffold
-	s.mcpServer.AddTool(
+	s.addTool(
 		mcp.NewTool("scaffold",
 			mcp.WithDescription("Generates code scaffolding from an existing symbol pattern, including registration wiring and test stubs."),
 			mcp.WithString("id", mcp.Required(), mcp.Description("Symbol ID to use as the pattern example")),
@@ -192,7 +192,7 @@ func (s *Server) registerEnhancementTools() {
 	)
 
 	// diff_context
-	s.mcpServer.AddTool(
+	s.addTool(
 		mcp.NewTool("diff_context",
 			mcp.WithDescription("Returns graph-enriched context for symbols affected by a git diff: source, callers, callees, community, processes, and per-file risk."),
 			mcp.WithString("scope", mcp.Description("unstaged (default), staged, all, or compare")),
@@ -203,7 +203,7 @@ func (s *Server) registerEnhancementTools() {
 	)
 
 	// index_health
-	s.mcpServer.AddTool(
+	s.addTool(
 		mcp.NewTool("index_health",
 			mcp.WithDescription("Reports the health and completeness of the Gortex index: parse failures, stale files, language coverage, and health score."),
 			mcp.WithBoolean("compact", mcp.Description("Single-line summary output")),
@@ -214,7 +214,7 @@ func (s *Server) registerEnhancementTools() {
 	)
 
 	// get_symbol_history
-	s.mcpServer.AddTool(
+	s.addTool(
 		mcp.NewTool("get_symbol_history",
 			mcp.WithDescription("Returns symbols modified during the current session with modification counts. Flags churning symbols (modified 3+ times)."),
 			mcp.WithString("id", mcp.Description("Specific symbol ID (omit for all)")),
@@ -224,7 +224,7 @@ func (s *Server) registerEnhancementTools() {
 	)
 
 	// batch_edit
-	s.mcpServer.AddTool(
+	s.addTool(
 		mcp.NewTool("batch_edit",
 			mcp.WithDescription("Applies multiple symbol edits in dependency order. Re-indexes after each edit. Stops on failure and reports status."),
 			mcp.WithString("edits", mcp.Required(), mcp.Description("JSON array of {id, old_source, new_source} objects")),
@@ -235,7 +235,7 @@ func (s *Server) registerEnhancementTools() {
 	)
 
 	// contracts — unified contracts tool (list + check + validate)
-	s.mcpServer.AddTool(
+	s.addTool(
 		mcp.NewTool("contracts",
 			mcp.WithDescription("API contracts tool. action=list (default): lists detected contracts (HTTP, gRPC, GraphQL, topics, WebSocket, env, OpenAPI). action=check: detects orphan providers/consumers across repos. action=validate: diffs provider↔consumer request/response shapes and flags breaking/warning/info issues.\n\nDEFAULT SCOPE for list: auto-scopes to the active project's repos and hides dependency-origin contracts (type=dependency, vendored paths like vendor/, node_modules/). The response reports other_repos (count of contracts filtered out of scope) and dependencies_skipped (count of dep contracts hidden). To widen scope, pass repo=<prefix>, project=<name>, ref=<tag>, or all_repos=true. To include dependency contracts, pass include_deps=true."),
 			mcp.WithString("action", mcp.Description("list (default), check, or validate")),
@@ -259,7 +259,7 @@ func (s *Server) registerEnhancementTools() {
 	)
 
 	// feedback — unified feedback tool (record + query)
-	s.mcpServer.AddTool(
+	s.addTool(
 		mcp.NewTool("feedback",
 			mcp.WithDescription("Agent learning feedback. action=record: report which symbols from smart_context/prefetch_context were useful, not_needed, or missing (improves future context). action=query: aggregated stats — most useful, most missed, accuracy."),
 			mcp.WithString("action", mcp.Required(), mcp.Description("record or query")),
@@ -276,7 +276,7 @@ func (s *Server) registerEnhancementTools() {
 	)
 
 	// export_context
-	s.mcpServer.AddTool(
+	s.addTool(
 		mcp.NewTool("export_context",
 			mcp.WithDescription("Generates a portable context briefing for a task as self-contained markdown or JSON. Use for sharing context outside MCP — paste into Slack, PRs, docs, or non-MCP AI tools."),
 			mcp.WithString("task", mcp.Required(), mcp.Description("Natural language task description")),
@@ -289,7 +289,7 @@ func (s *Server) registerEnhancementTools() {
 	)
 
 	// audit_agent_config
-	s.mcpServer.AddTool(
+	s.addTool(
 		mcp.NewTool("audit_agent_config",
 			mcp.WithDescription("Scans agent config files (CLAUDE.md, AGENTS.md, .cursor/rules, .github/copilot-instructions.md, etc.) for stale symbol references, dead file paths, and bloat — validated against the Gortex graph."),
 			mcp.WithString("files", mcp.Description("Optional comma-separated file paths to audit (relative to repo root). If omitted, auto-discovers known agent config files.")),
@@ -457,7 +457,7 @@ func (s *Server) handlePrefetchContext(ctx context.Context, req mcp.CallToolRequ
 
 	// 1. BM25 search on task description (weight 0.4)
 	if task != "" {
-		searchResults := s.scopedNodeSlice(ctx, s.engine.SearchSymbols(task, 30))
+		searchResults := s.scopedNodeSlice(ctx, s.engineFor(ctx).SearchSymbols(task, 30))
 		maxScore := 1.0
 		for i, n := range searchResults {
 			if n.Kind == graph.KindFile || n.Kind == graph.KindImport {
@@ -493,7 +493,7 @@ func (s *Server) handlePrefetchContext(ctx context.Context, req mcp.CallToolRequ
 			}
 		}
 		// Get neighbors at depth 1-2
-		sg := s.engine.GetDependencies(rid, query.QueryOptions{Depth: 2, Limit: 30, Detail: "brief"})
+		sg := s.engineFor(ctx).GetDependencies(rid, query.QueryOptions{Depth: 2, Limit: 30, Detail: "brief"})
 		for _, n := range sg.Nodes {
 			if n.Kind == graph.KindFile || n.Kind == graph.KindImport {
 				continue
@@ -514,7 +514,7 @@ func (s *Server) handlePrefetchContext(ctx context.Context, req mcp.CallToolRequ
 			}
 		}
 		// Also check dependents (callers)
-		callers := s.engine.GetCallers(rid, query.QueryOptions{Depth: 1, Limit: 20, Detail: "brief"})
+		callers := s.engineFor(ctx).GetCallers(rid, query.QueryOptions{Depth: 1, Limit: 20, Detail: "brief"})
 		for _, n := range callers.Nodes {
 			if n.ID == rid || n.Kind == graph.KindFile || n.Kind == graph.KindImport {
 				continue
@@ -2253,7 +2253,7 @@ func (s *Server) handleDiffContext(ctx context.Context, req mcp.CallToolRequest)
 		}
 
 		// Callers (depth 1)
-		callers := s.engine.GetCallers(cs.ID, query.QueryOptions{Depth: 1, Limit: 10, Detail: "brief"})
+		callers := s.engineFor(ctx).GetCallers(cs.ID, query.QueryOptions{Depth: 1, Limit: 10, Detail: "brief"})
 		for _, cn := range callers.Nodes {
 			if cn.ID != cs.ID {
 				info.Callers = append(info.Callers, cn.ID)
@@ -2261,7 +2261,7 @@ func (s *Server) handleDiffContext(ctx context.Context, req mcp.CallToolRequest)
 		}
 
 		// Callees (depth 1)
-		callees := s.engine.GetCallChain(cs.ID, query.QueryOptions{Depth: 1, Limit: 10, Detail: "brief"})
+		callees := s.engineFor(ctx).GetCallChain(cs.ID, query.QueryOptions{Depth: 1, Limit: 10, Detail: "brief"})
 		for _, cn := range callees.Nodes {
 			if cn.ID != cs.ID {
 				info.Callees = append(info.Callees, cn.ID)
@@ -2604,7 +2604,7 @@ func (s *Server) handleBatchEdit(ctx context.Context, req mcp.CallToolRequest) (
 
 	var ordered []editWithOrder
 	for _, edit := range edits {
-		node := s.engine.GetSymbol(edit.SymbolID)
+		node := s.engineFor(ctx).GetSymbol(edit.SymbolID)
 		order := 50 // default middle priority
 		filePath := ""
 		if node != nil {
@@ -2619,7 +2619,7 @@ func (s *Server) handleBatchEdit(ctx context.Context, req mcp.CallToolRequest) (
 						continue
 					}
 					// Check if other calls this symbol
-					callers := s.engine.GetCallers(edit.SymbolID, query.QueryOptions{Depth: 1, Limit: 100, Detail: "brief"})
+					callers := s.engineFor(ctx).GetCallers(edit.SymbolID, query.QueryOptions{Depth: 1, Limit: 100, Detail: "brief"})
 					for _, cn := range callers.Nodes {
 						if cn.ID == other.SymbolID {
 							order = 10 // this is a dependency — edit first
@@ -2684,7 +2684,7 @@ func (s *Server) handleBatchEdit(ctx context.Context, req mcp.CallToolRequest) (
 			continue
 		}
 
-		node := s.engine.GetSymbol(o.edit.SymbolID)
+		node := s.engineFor(ctx).GetSymbol(o.edit.SymbolID)
 		if node == nil {
 			results = append(results, batchEditResult{
 				SymbolID: o.edit.SymbolID,

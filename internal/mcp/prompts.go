@@ -41,7 +41,7 @@ func (s *Server) registerPrompts() {
 	)
 }
 
-func (s *Server) handlePromptPreCommit(_ context.Context, req mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+func (s *Server) handlePromptPreCommit(ctx context.Context, req mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
 	scope := req.Params.Arguments["scope"]
 	if scope == "" {
 		scope = "all"
@@ -101,7 +101,7 @@ func (s *Server) handlePromptPreCommit(_ context.Context, req mcp.GetPromptReque
 		}
 	}
 
-	testFiles := s.findTestFiles(symbolIDs)
+	testFiles := s.findTestFiles(ctx, symbolIDs)
 	if len(testFiles) > 0 {
 		b.WriteString("\n### Tests to Run\n")
 		for file, names := range testFiles {
@@ -259,7 +259,7 @@ func (s *Server) handlePromptSafeToChange(ctx context.Context, req mcp.GetPrompt
 	// — the prompt must not reveal cross-workspace symbols.
 	var validIDs, notFound []string
 	for _, id := range ids {
-		if n := s.engine.GetSymbol(id); n != nil && s.nodeInSessionScope(ctx, n) {
+		if n := s.engineFor(ctx).GetSymbol(id); n != nil && s.nodeInSessionScope(ctx, n) {
 			validIDs = append(validIDs, id)
 		} else {
 			notFound = append(notFound, id)
@@ -303,20 +303,20 @@ func (s *Server) handlePromptSafeToChange(ctx context.Context, req mcp.GetPrompt
 
 	b.WriteString("### Edit Order\n")
 	for _, id := range validIDs {
-		node := s.engine.GetSymbol(id)
+		node := s.engineFor(ctx).GetSymbol(id)
 		if node == nil {
 			continue
 		}
 		fmt.Fprintf(&b, "1. `%s` — definition\n", node.FilePath)
 
 		if node.Kind == graph.KindInterface {
-			impls := s.scopedNodeSlice(ctx, s.engine.FindImplementations(id))
+			impls := s.scopedNodeSlice(ctx, s.engineFor(ctx).FindImplementations(id))
 			for _, impl := range impls {
 				fmt.Fprintf(&b, "2. `%s` — implements %s\n", impl.FilePath, node.Name)
 			}
 		}
 
-		dependents := s.engine.GetDependents(id, query.QueryOptions{Depth: 2, Limit: 20, Detail: "brief", WorkspaceID: sessWS})
+		dependents := s.engineFor(ctx).GetDependents(id, query.QueryOptions{Depth: 2, Limit: 20, Detail: "brief", WorkspaceID: sessWS})
 		depFiles := make(map[string]bool)
 		for _, dn := range dependents.Nodes {
 			if dn.Kind != graph.KindFile && dn.FilePath != node.FilePath && !isTestFile(dn.FilePath) && !depFiles[dn.FilePath] {
@@ -326,7 +326,7 @@ func (s *Server) handlePromptSafeToChange(ctx context.Context, req mcp.GetPrompt
 		}
 	}
 
-	testFiles := s.findTestFiles(validIDs)
+	testFiles := s.findTestFiles(ctx, validIDs)
 	if len(testFiles) > 0 {
 		b.WriteString("\n### Tests to Verify\n")
 		for file := range testFiles {
@@ -347,10 +347,13 @@ func (s *Server) handlePromptSafeToChange(ctx context.Context, req mcp.GetPrompt
 }
 
 // findTestFiles traces callers of the given symbols and returns test files with function names.
-func (s *Server) findTestFiles(symbolIDs []string) map[string][]string {
+// ctx scopes graph reads to the caller's overlay view (when present)
+// so an editor's unsaved test edits surface in the impact summary.
+func (s *Server) findTestFiles(ctx context.Context, symbolIDs []string) map[string][]string {
+	eng := s.engineFor(ctx)
 	testFiles := make(map[string]map[string]bool)
 	for _, id := range symbolIDs {
-		callers := s.engine.GetCallers(id, query.QueryOptions{Depth: 3, Limit: 50, Detail: "brief"})
+		callers := eng.GetCallers(id, query.QueryOptions{Depth: 3, Limit: 50, Detail: "brief"})
 		for _, cn := range callers.Nodes {
 			if isTestFile(cn.FilePath) {
 				if testFiles[cn.FilePath] == nil {
@@ -388,7 +391,7 @@ func (s *Server) findTopReferenced(ctx context.Context, limit int) []refEntry {
 			continue
 		}
 		count := 0
-		for _, e := range s.engine.GetInEdges(n.ID) {
+		for _, e := range s.engineFor(ctx).GetInEdges(n.ID) {
 			if e.Kind == graph.EdgeCalls || e.Kind == graph.EdgeReferences {
 				count++
 			}

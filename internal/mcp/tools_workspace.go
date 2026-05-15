@@ -14,7 +14,7 @@ import (
 // discover what `repo` values are legal before issuing any
 // scope: repo or scope: fan-out call.
 func (s *Server) registerWorkspaceTools() {
-	s.mcpServer.AddTool(
+	s.addTool(
 		mcp.NewTool("list_repos",
 			mcp.WithDescription(
 				"Lists every project in the active workspace. Workspace-scope tool: do not pass `repo`. "+
@@ -26,7 +26,7 @@ func (s *Server) registerWorkspaceTools() {
 		s.handleListRepos,
 	)
 
-	s.mcpServer.AddTool(
+	s.addTool(
 		mcp.NewTool("workspace_info",
 			mcp.WithDescription(
 				"Returns workspace identity: bind mode, root directory, marker contents, the auto-discovered member set, and any unknown marker keys. "+

@@ -15,11 +15,38 @@ import (
 type SearchProvider func() search.Backend
 
 // Engine provides higher-level query operations over the graph.
+//
+// The graph is held as a `graph.Reader` rather than a concrete
+// `*graph.Graph` so the same engine instance can serve both base-
+// graph queries and overlay-aware queries (an `*graph.OverlaidView`
+// also implements `graph.Reader`). `WithReader` returns a shallow
+// clone that swaps the reader; the MCP overlay middleware uses it
+// to scope a tool call to the calling session's shadow view without
+// constructing a fresh Engine per request.
 type Engine struct {
-	g              *graph.Graph
+	g              graph.Reader
 	searchProvider SearchProvider
 	rerank         *rerank.Pipeline
 }
+
+// WithReader returns a shallow clone of the engine that reads
+// through r instead of the original graph. The search provider and
+// rerank pipeline are shared with the source engine. Pass the
+// base graph reader to undo a previous swap.
+func (e *Engine) WithReader(r graph.Reader) *Engine {
+	if e == nil {
+		return nil
+	}
+	clone := *e
+	clone.g = r
+	return &clone
+}
+
+// Reader returns the engine's currently-bound graph reader. Tool
+// handlers that need to walk the same view the engine sees use this
+// to keep their direct-graph reads consistent with the engine's
+// internal walks.
+func (e *Engine) Reader() graph.Reader { return e.g }
 
 // NewEngine creates a query engine wrapping the given graph. The
 // default 11-signal rerank.Pipeline is wired in; callers wanting a

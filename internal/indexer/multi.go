@@ -963,6 +963,18 @@ func (mi *MultiIndexer) GetIndexer(repoPrefix string) *Indexer {
 	return mi.indexers[repoPrefix]
 }
 
+// IndexerForFile routes an absolute path to the per-repo Indexer that
+// owns it. Returns (nil, "") when no tracked repo contains the path.
+// Used by the MCP overlay middleware to find the right Indexer for a
+// pushed file when constructing the per-request overlay layer.
+func (mi *MultiIndexer) IndexerForFile(absPath string) (*Indexer, string) {
+	prefix := mi.RepoForFile(absPath)
+	if prefix == "" {
+		return nil, ""
+	}
+	return mi.GetIndexer(prefix), prefix
+}
+
 // ResolveFilePath takes a repo-prefixed relative path (e.g. "ade/internal/foo.go")
 // and returns the absolute filesystem path by looking up the repo's root directory.
 // Returns empty string if the repo prefix is not found.

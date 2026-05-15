@@ -15,6 +15,7 @@ import (
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/contracts"
+	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/embedding"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
@@ -287,6 +288,14 @@ func buildDaemonState(logger *zap.Logger) (*daemonState, error) {
 	eng.ApplyRerankWeights(cfg.Search.Weights)
 	gortexmcp.Version = version
 	srv := gortexmcp.NewServer(eng, g, idx, nil, logger, cfg.Guards.Rules, multiOpts...)
+
+	// Editor-overlay manager. Idle TTL resolved via
+	// GORTEX_OVERLAY_IDLE_TTL > daemon.DefaultOverlayIdleTTL (30m).
+	// Server.ReleaseSession (called on MCP-client disconnect) drops
+	// the overlay synchronously, so the TTL is only the fallback
+	// path for missed disconnects.
+	overlays := daemon.NewOverlayManager(daemon.OverlayIdleTTLFromEnv(0))
+	srv.SetOverlayManager(overlays)
 
 	// Semantic manager, feedback, savings — same wiring as runServe.
 	if semMgr := idx.SemanticManager(); semMgr != nil {

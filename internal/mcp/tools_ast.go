@@ -34,7 +34,7 @@ import (
 //   - `excludes_tests` defaulting to true for detectors so test
 //     fixtures don't drown real findings.
 func (s *Server) registerASTTools() {
-	s.mcpServer.AddTool(
+	s.addTool(
 		mcp.NewTool("search_ast",
 			mcp.WithDescription(buildSearchASTDescription()),
 			mcp.WithString("pattern", mcp.Description("Tree-sitter S-expression query. Capture nodes with `@name`, anchor the match span with `@match`. Predicates: `(#eq? @x \"literal\")`, `(#match? @x \"regex\")`. Mutually exclusive with `detector`.")),

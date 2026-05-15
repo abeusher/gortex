@@ -316,6 +316,13 @@ func (idx *Indexer) Graph() *graph.Graph { return idx.graph }
 // Search returns the search backend.
 func (idx *Indexer) Search() search.Backend { return idx.search }
 
+// Registry returns the parser registry shared across this indexer.
+// Exposed for the editor-overlay middleware: the overlay layer-build
+// pass parses each pushed buffer through the same per-language
+// extractor the indexer uses, ensuring overlay-derived nodes match
+// base-derived nodes byte-for-byte for the same input.
+func (idx *Indexer) Registry() *parser.Registry { return idx.registry }
+
 // ContractRegistry returns the contract registry populated during indexing.
 func (idx *Indexer) ContractRegistry() *contracts.Registry { return idx.contractRegistry }
 

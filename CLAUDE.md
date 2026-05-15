@@ -229,6 +229,36 @@ The `find_clones` MCP tool surfaces near-duplicate ("clone") function/method clu
 | Scoping a query to a project          | Pass `project` param to any query tool |
 | Filtering by reference tag            | Pass `ref` param to any query tool |
 
+### Live Editor Buffers (Shadow-Graph Overlay Sessions)
+
+Editor extensions push in-flight (unsaved) buffers as **overlays**. Gortex composes a per-request **shadow view** (`graph.OverlaidView`) on top of the immutable base graph and threads it through the tool dispatch context. Every subsequent `tools/call` from the same MCP session reads through the shadow view — graph-walking tools (`find_usages`, `get_call_chain`, `get_file_summary`, `analyze`, …) and source-reading tools (`get_symbol_source`, `get_editing_context`, …) all see the editor-buffer state.
+
+**Load-bearing invariant: the base graph is never mutated by overlay flow.** The overlay layer is built per request, parsed once per (session, content-hash) tuple, and discarded with the request. Consequences:
+
+- **Multi-tenant safe.** Sessions A1, A2 (same user) and B (different user) can run concurrently against the same daemon; each sees its own view. The file watcher's reindex passes mutate base but the in-flight shadow view captured a stable base snapshot at request start.
+- **Non-destructive.** Cross-file edges from non-overlaid files INTO overlaid file symbols (`Caller→Target`) survive overlay processing because base's edges are intact. The in-place-mutation approach (which Gortex briefly experimented with internally) lost those edges.
+- **Diffable.** `compare_with_overlay` runs a query against both base and overlay and returns the delta — proving the two views are simultaneously available.
+
+| Instead of...                         | You MUST use...                          |
+|---------------------------------------|------------------------------------------|
+| Asking the user to save before a query | `overlay_register` then `overlay_push` — pushes one editor buffer; subsequent tool calls see the overlay layered on top of base |
+| Listing what an extension has staged   | `overlay_list` — every path / size / deleted flag / base SHA for the current session |
+| Cancelling a single overlay           | `overlay_delete` with `path` — saved-buffer view returns for that path on the next tool call |
+| Tearing down an overlay session       | `overlay_drop` — discards every overlay attached to the session, in one call |
+| Previewing impact of an unsaved edit  | `compare_with_overlay` with `kind: find_usages / get_callers / get_call_chain / get_dependencies / get_dependents` — runs the query against base and overlay simultaneously, returns added / removed / common ID sets |
+
+**Drift detection.** Pass an editor-captured git blob SHA as `base_sha` on `overlay_push`. When the next tool call needs that path, Gortex compares it to the on-disk hash; if they disagree (a sibling tool, a git operation, or another editor saved over the file) the tool call returns a structured `overlay base SHA mismatch` error so the client knows to re-read the file and resubmit a fresh overlay.
+
+**Deletion overlays.** Push with `deleted: true` to model "this file is going away" — the symbols inside it vanish from the shadow view (but are untouched in base), so the user can preview the impact of a delete without staging it.
+
+**HTTP transport.** `gortex server` exposes the same surface at `POST /v1/overlay/sessions` (optional `session_id` binds an overlay to a known MCP session), `PUT /v1/overlay/sessions/{id}/files`, `DELETE /v1/overlay/sessions/{id}/files`, `GET /v1/overlay/sessions/{id}/files`, `DELETE /v1/overlay/sessions/{id}`. The `/v1/tools/<name>` HTTP entry point reads the active session from `Mcp-Session-Id` (preferred), `X-Gortex-Overlay-Session`, or `?session_id=` (test fallback).
+
+**Lifecycle and lease.** The overlay is **bound to the MCP session that registered it.** When the MCP session ends — for any reason (clean disconnect, dropped TCP, daemon proxy teardown) — the overlay is dropped synchronously. That closes the "abandoned buffer pinned in the daemon, reachable by anyone who learns the session ID" attack surface that a pure-TTL lifecycle would expose.
+
+The idle TTL is a fail-safe for the case where the daemon never observes the disconnect (e.g. the process was killed -9 mid-stream). Default **30 minutes**, configurable via `GORTEX_OVERLAY_IDLE_TTL` (`30m` / `1h` / `45s` / `0` to disable for tests). Every tool call against a live overlay session refreshes the idle timer (`SnapshotFor` bumps `LastUsed`), so an editor that's actively querying never trips the TTL. The MCP `overlay_keepalive` tool exists for genuine idle gaps (debugger pause, IDE wizard) — it bumps the timer without re-pushing content. `overlay_list` returns `expires_at` / `idle_seconds` / `idle_ttl_seconds` so the extension can schedule keepalives proactively.
+
+If a tools/call references a stale (reaped) session ID, the call falls through to base — no error, no corruption, no content leak. The next `overlay_push` self-heals (auto-registers the session); `overlay_keepalive` / `overlay_delete` surface explicit "session has been dropped" errors so the editor can take corrective action.
+
 ### MCP Resources
 
 Bootstrap-state tools are also exposed as MCP resources (read-only, URI-addressable, no args). Clients that speak resources can `resources/subscribe` once and receive `notifications/resources/updated` after each graph re-warm — no polling. The tool form stays for back-compat with clients that don't speak resources.

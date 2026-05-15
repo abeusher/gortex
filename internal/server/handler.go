@@ -21,6 +21,7 @@ import (
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/graph"
+	gortexmcp "github.com/zzet/gortex/internal/mcp"
 	"github.com/zzet/gortex/internal/server/hub"
 	"go.uber.org/zap"
 )
@@ -362,7 +363,27 @@ func (h *Handler) handleToolCall(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
-	result, err := tool.Handler(r.Context(), mcpReq)
+	// Overlay session binding for the HTTP transport. The standard
+	// `Mcp-Session-Id` header (set by mcp-go's Streamable HTTP
+	// client) is preferred; a gortex-specific
+	// `X-Gortex-Overlay-Session` header takes precedence when
+	// callers want to scope an overlay to a session ID that differs
+	// from their MCP transport session (e.g. a CI harness that
+	// orchestrates several overlay scopes from one connection). A
+	// `?session_id=` query parameter is the final fallback so curl /
+	// integration tests can attach overlays without setting HTTP
+	// headers. The session ID flows through gortexmcp.WithSessionID
+	// so the MCP overlay middleware (overlay.go::wrapToolHandler)
+	// finds the right overlay snapshot.
+	ctx := r.Context()
+	if sid := firstNonEmpty(
+		r.Header.Get("X-Gortex-Overlay-Session"),
+		r.Header.Get("Mcp-Session-Id"),
+		r.URL.Query().Get("session_id"),
+	); sid != "" {
+		ctx = gortexmcp.WithSessionID(ctx, sid)
+	}
+	result, err := tool.Handler(ctx, mcpReq)
 	if err != nil {
 		h.logger.Error("tool call failed",
 			zap.String("tool", toolName),

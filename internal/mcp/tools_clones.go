@@ -19,7 +19,7 @@ import (
 // MinHash + LSH clone-detection pass (see internal/clones and the
 // indexer's detectClonesAndEmitEdges).
 func (s *Server) registerCloneTools() {
-	s.mcpServer.AddTool(
+	s.addTool(
 		mcp.NewTool("find_clones",
 			mcp.WithDescription("Surfaces near-duplicate ('clone') function/method clusters from the EdgeSimilarTo graph layer. Each cluster is a connected component of bodies whose MinHash + LSH estimated Jaccard similarity crossed the index-time threshold — catches copy-paste and renamed-variable (Type-1/Type-2) clones. Every member is flagged is_dead (zero incoming calls/refs), so dead_only=true yields the Gortex-unique \"dead duplicates of live code\" diagnostic: dead functions that are near-copies of code still in use."),
 			mcp.WithNumber("min_similarity", mcp.Description("Only report clone pairs at or above this estimated Jaccard similarity (0..1). Default 0 — every recorded EdgeSimilarTo edge.")),

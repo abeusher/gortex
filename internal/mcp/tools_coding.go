@@ -17,7 +17,7 @@ import (
 )
 
 func (s *Server) registerCodingTools() {
-	s.mcpServer.AddTool(
+	s.addTool(
 		mcp.NewTool("get_editing_context",
 			mcp.WithDescription("The primary tool to call before editing any file. Returns all symbols defined in the file, their signatures, direct dependencies, and immediate callers — everything needed to code without reading raw source lines."),
 			mcp.WithString("path", mcp.Required(), mcp.Description("Relative file path")),
@@ -29,7 +29,7 @@ func (s *Server) registerCodingTools() {
 		s.handleGetEditingContext,
 	)
 
-	s.mcpServer.AddTool(
+	s.addTool(
 		mcp.NewTool("find_import_path",
 			mcp.WithDescription("Given a symbol name you want to use in a file, returns the correct import path. Use instead of reading files or guessing package paths."),
 			mcp.WithString("name", mcp.Required(), mcp.Description("Name of the symbol to import")),
@@ -38,7 +38,7 @@ func (s *Server) registerCodingTools() {
 		s.handleFindImportPath,
 	)
 
-	s.mcpServer.AddTool(
+	s.addTool(
 		mcp.NewTool("explain_change_impact",
 			mcp.WithDescription("Given a list of symbols you plan to modify, returns risk-tiered blast radius: d=1 will break, d=2 likely affected, d=3 needs testing. Includes affected processes and communities."),
 			mcp.WithString("ids", mcp.Required(), mcp.Description("Comma-separated list of symbol IDs to modify")),
@@ -48,7 +48,7 @@ func (s *Server) registerCodingTools() {
 		s.handleEnhancedChangeImpact,
 	)
 
-	s.mcpServer.AddTool(
+	s.addTool(
 		mcp.NewTool("get_symbol_source",
 			mcp.WithDescription("Returns the source code of a specific symbol (function, method, type) without reading the entire file. Use instead of Read when you know which symbol you need — saves 70-80% of tokens compared to reading the whole file."),
 			mcp.WithString("id", mcp.Required(), mcp.Description("Symbol node ID (e.g. pkg/server.go::HandleRequest)")),
@@ -60,7 +60,7 @@ func (s *Server) registerCodingTools() {
 		s.handleGetSymbolSource,
 	)
 
-	s.mcpServer.AddTool(
+	s.addTool(
 		mcp.NewTool("batch_symbols",
 			mcp.WithDescription("Returns signatures, source code, callers, and callees for multiple symbols in one call. Use instead of calling get_symbol_source or get_symbol multiple times — saves 60% round-trip overhead."),
 			mcp.WithString("ids", mcp.Required(), mcp.Description("Comma-separated list of symbol IDs")),
@@ -73,7 +73,7 @@ func (s *Server) registerCodingTools() {
 		s.handleBatchSymbols,
 	)
 
-	s.mcpServer.AddTool(
+	s.addTool(
 		mcp.NewTool("get_test_targets",
 			mcp.WithDescription("Given changed symbol IDs, traces the call graph to find test files and test functions that exercise those symbols. Use after editing to know exactly which tests to run — no guessing, no running the entire suite."),
 			mcp.WithString("ids", mcp.Required(), mcp.Description("Comma-separated list of changed symbol IDs")),
@@ -82,7 +82,7 @@ func (s *Server) registerCodingTools() {
 		s.handleGetTestTargets,
 	)
 
-	s.mcpServer.AddTool(
+	s.addTool(
 		mcp.NewTool("suggest_pattern",
 			mcp.WithDescription("Given an existing symbol as an example, extracts the structural pattern for creating similar code. Returns the example source, sibling symbols with the same pattern, registration/wiring code, test patterns, and files to edit. Use when adding a new function/handler/extractor that follows an existing convention."),
 			mcp.WithString("id", mcp.Required(), mcp.Description("Symbol ID to use as the pattern example")),
@@ -90,7 +90,7 @@ func (s *Server) registerCodingTools() {
 		s.handleSuggestPattern,
 	)
 
-	s.mcpServer.AddTool(
+	s.addTool(
 		mcp.NewTool("get_edit_plan",
 			mcp.WithDescription("Given symbols you plan to change, returns a dependency-ordered list of files and symbols to edit — definitions first, then implementations, then callers, then tests. Eliminates manual dependency reasoning. Use before any multi-file refactor."),
 			mcp.WithString("ids", mcp.Required(), mcp.Description("Comma-separated list of symbol IDs to change")),
@@ -99,7 +99,7 @@ func (s *Server) registerCodingTools() {
 		s.handleGetEditPlan,
 	)
 
-	s.mcpServer.AddTool(
+	s.addTool(
 		mcp.NewTool("edit_symbol",
 			mcp.WithDescription("Edit a symbol's source code directly by ID — no Read needed. Gortex resolves the file and line range, finds the old_source fragment, replaces it with new_source, and writes the file. Eliminates the Read→Edit roundtrip for ~80% of edits."),
 			mcp.WithString("id", mcp.Required(), mcp.Description("Symbol ID (e.g. server.go::NewServer)")),
@@ -109,7 +109,7 @@ func (s *Server) registerCodingTools() {
 		s.handleEditSymbol,
 	)
 
-	s.mcpServer.AddTool(
+	s.addTool(
 		mcp.NewTool("edit_file",
 			mcp.WithDescription("Edit any file (markdown, config, spec, template, source) by exact string replacement — no Read needed. Accepts absolute paths or paths relative to the indexed repo root. Writes atomically (temp+rename) and re-indexes the file so the graph stays fresh. Pass dry_run=true to validate the replacement without writing. Complements edit_symbol for non-code files that have no symbol ID."),
 			mcp.WithString("path", mcp.Required(), mcp.Description("Absolute path, or repo-prefixed / repo-root-relative path")),
@@ -121,7 +121,7 @@ func (s *Server) registerCodingTools() {
 		s.handleEditFile,
 	)
 
-	s.mcpServer.AddTool(
+	s.addTool(
 		mcp.NewTool("write_file",
 			mcp.WithDescription("Create a new file or overwrite an existing one with the given content — no Read needed. Accepts absolute paths or paths relative to the indexed repo root. Writes atomically (temp+rename) and re-indexes the file so the graph stays fresh. Pass dry_run=true to report what would happen without writing. Use for new docs, configs, specs, scaffolded files; prefer edit_symbol or edit_file when a symbol/string target exists."),
 			mcp.WithString("path", mcp.Required(), mcp.Description("Absolute path, or repo-prefixed / repo-root-relative path")),
@@ -131,7 +131,7 @@ func (s *Server) registerCodingTools() {
 		s.handleWriteFile,
 	)
 
-	s.mcpServer.AddTool(
+	s.addTool(
 		mcp.NewTool("rename_symbol",
 			mcp.WithDescription("Generates coordinated multi-file edit instructions for renaming a symbol. Returns {file, line, old_text, new_text, confidence} for every reference. Use dry_run to preview, then apply edits with the Edit tool."),
 			mcp.WithString("id", mcp.Required(), mcp.Description("Symbol ID to rename (e.g. auth/token.go::validateToken)")),
@@ -140,7 +140,7 @@ func (s *Server) registerCodingTools() {
 		s.handleRenameSymbol,
 	)
 
-	s.mcpServer.AddTool(
+	s.addTool(
 		mcp.NewTool("smart_context",
 			mcp.WithDescription("Assembles the minimal context needed for a task in one call. Searches for relevant symbols, gets their source and relationships, finds patterns to follow, and builds an edit plan. Replaces an entire exploration phase of 5-10 tool calls."),
 			mcp.WithString("task", mcp.Required(), mcp.Description("Natural language description of what you want to do (e.g. 'add a new MCP tool called list_files')")),
@@ -154,7 +154,7 @@ func (s *Server) registerCodingTools() {
 		s.handleSmartContext,
 	)
 
-	s.mcpServer.AddTool(
+	s.addTool(
 		mcp.NewTool("plan_turn",
 			mcp.WithDescription("Opening-move router. Returns a short ranked list of recommended tool calls (with pre-filled args) for a task — 'what should I call first?'. Use before smart_context when you want a cheaper routing decision; call smart_context directly when you're committed to exploring."),
 			mcp.WithString("task", mcp.Required(), mcp.Description("Natural-language description of the task")),
@@ -163,7 +163,7 @@ func (s *Server) registerCodingTools() {
 		s.handlePlanTurn,
 	)
 
-	s.mcpServer.AddTool(
+	s.addTool(
 		mcp.NewTool("get_untested_symbols",
 			mcp.WithDescription("Returns functions and methods in non-test files that no test file reaches via the call graph — the inverse of get_test_targets. Ranked by fan_in descending so the most-used untested symbols surface first. Use to prioritize where to add test coverage."),
 			mcp.WithNumber("limit", mcp.Description("Max entries returned (default: 50)")),
@@ -173,7 +173,7 @@ func (s *Server) registerCodingTools() {
 		s.handleGetUntestedSymbols,
 	)
 
-	s.mcpServer.AddTool(
+	s.addTool(
 		mcp.NewTool("get_recent_changes",
 			mcp.WithDescription("Returns files and symbols that changed since the last call (watch mode only). Use to re-orient after the user edits files outside of Claude Code's view, without re-reading anything."),
 			mcp.WithString("since", mcp.Description("ISO 8601 timestamp (omit for all changes since index)")),
@@ -200,7 +200,7 @@ func (s *Server) handleGetEditingContext(ctx context.Context, req mcp.CallToolRe
 	s.ensureFresh([]string{fp})
 
 	s.sessionFor(ctx).recordFile(fp)
-	sg := s.engine.GetFileSymbols(fp)
+	sg := s.engineFor(ctx).GetFileSymbols(fp)
 	if len(sg.Nodes) == 0 {
 		return mcp.NewToolResultError("no symbols found for file: " + fp), nil
 	}
@@ -264,7 +264,7 @@ func (s *Server) handleGetEditingContext(ctx context.Context, req mcp.CallToolRe
 	callerSeen := make(map[string]bool)
 	for _, n := range sg.Nodes {
 		if n.Kind == graph.KindFunction || n.Kind == graph.KindMethod {
-			callers := s.engine.GetCallers(n.ID, query.QueryOptions{Depth: 1, Limit: 20, Detail: "brief", WorkspaceID: sessWS})
+			callers := s.engineFor(ctx).GetCallers(n.ID, query.QueryOptions{Depth: 1, Limit: 20, Detail: "brief", WorkspaceID: sessWS})
 			for _, cn := range callers.Nodes {
 				if cn.FilePath != fp && !callerSeen[cn.ID] {
 					callerSeen[cn.ID] = true
@@ -283,7 +283,7 @@ func (s *Server) handleGetEditingContext(ctx context.Context, req mcp.CallToolRe
 	callSeen := make(map[string]bool)
 	for _, n := range sg.Nodes {
 		if n.Kind == graph.KindFunction || n.Kind == graph.KindMethod {
-			chain := s.engine.GetCallChain(n.ID, query.QueryOptions{Depth: 1, Limit: 20, Detail: "brief", WorkspaceID: sessWS})
+			chain := s.engineFor(ctx).GetCallChain(n.ID, query.QueryOptions{Depth: 1, Limit: 20, Detail: "brief", WorkspaceID: sessWS})
 			for _, cn := range chain.Nodes {
 				if cn.FilePath != fp && !callSeen[cn.ID] {
 					callSeen[cn.ID] = true
@@ -333,7 +333,7 @@ func (s *Server) handleFindImportPath(ctx context.Context, req mcp.CallToolReque
 		return mcp.NewToolResultError("path is required"), nil
 	}
 
-	candidates := s.scopedNodeSlice(ctx, s.engine.FindSymbols(symbolName))
+	candidates := s.scopedNodeSlice(ctx, s.engineFor(ctx).FindSymbols(symbolName))
 	if len(candidates) == 0 {
 		return mcp.NewToolResultError("symbol not found: " + symbolName), nil
 	}
@@ -361,7 +361,7 @@ func (s *Server) handleFindImportPath(ctx context.Context, req mcp.CallToolReque
 
 	// Check if already imported.
 	alreadyImported := false
-	fileSymbols := s.engine.GetFileSymbols(targetFile)
+	fileSymbols := s.engineFor(ctx).GetFileSymbols(targetFile)
 	if len(fileSymbols.Nodes) > 0 && !s.nodeInSessionScope(ctx, fileSymbols.Nodes[0]) {
 		fileSymbols = nil
 	}
@@ -442,7 +442,7 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 		s.ensureFresh([]string{parts[0]})
 	}
 
-	node := s.engine.GetSymbol(id)
+	node := s.engineFor(ctx).GetSymbol(id)
 	if node == nil {
 		return mcp.NewToolResultError("symbol not found: " + id), nil
 	}
@@ -484,7 +484,7 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 		return mcp.NewToolResultError(resolveErr.Error()), nil
 	}
 
-	source, startLine, totalFileChars, err := readLines(absPath, node.StartLine, node.EndLine, contextLines)
+	source, startLine, totalFileChars, err := s.readLinesForCtx(ctx, absPath, node.StartLine, node.EndLine, contextLines)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("could not read source: %v", err)), nil
 	}
@@ -530,6 +530,10 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 // readLines reads lines from a file, with optional context lines above/below.
 // Returns the source text, the first line number, the total file size in characters
 // (for token savings estimation), and any error.
+//
+// Disk path only — used by helpers that have no MCP request context.
+// Production handlers should call (*Server).readLinesForCtx so the
+// editor-buffer overlay is honoured when active.
 func readLines(path string, startLine, endLine, contextLines int) (string, int, int, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -562,6 +566,53 @@ func readLines(path string, startLine, endLine, contextLines int) (string, int, 
 	return strings.Join(lines, "\n"), from, totalChars, nil
 }
 
+// readLinesForCtx is the overlay-aware counterpart to readLines.
+// When ctx carries an editor-overlay view AND the path is covered by
+// the overlay, the buffer content is used instead of reading from
+// disk — so get_symbol_source / get_editing_context / smart_context
+// return the editor's unsaved view of the file. Falls back to
+// readLines transparently when no overlay applies.
+func (s *Server) readLinesForCtx(ctx context.Context, absPath string, startLine, endLine, contextLines int) (string, int, int, error) {
+	content, ok := s.overlayContentFor(ctx, absPath)
+	if !ok {
+		return readLines(absPath, startLine, endLine, contextLines)
+	}
+	return extractLinesFromContent(content, startLine, endLine, contextLines)
+}
+
+// extractLinesFromContent applies the same line-slicing logic readLines
+// uses to an in-memory buffer. Kept separate from readLines so the
+// disk path stays a single os.Open / Scanner loop.
+func extractLinesFromContent(content string, startLine, endLine, contextLines int) (string, int, int, error) {
+	from := startLine - contextLines
+	if from < 1 {
+		from = 1
+	}
+	to := endLine + contextLines
+
+	lines := strings.Split(content, "\n")
+	totalChars := 0
+	for _, l := range lines {
+		totalChars += len(l) + 1
+	}
+	if totalChars > 0 {
+		// strings.Split adds a phantom trailing entry when the
+		// content ends with a newline; account for the over-count by
+		// trimming one byte (matches readLines which counts the
+		// trailing \n only when Scanner produced a line for it).
+		totalChars--
+	}
+
+	var picked []string
+	for i, l := range lines {
+		lineNum := i + 1
+		if lineNum >= from && lineNum <= to {
+			picked = append(picked, l)
+		}
+	}
+	return strings.Join(picked, "\n"), from, totalChars, nil
+}
+
 func (s *Server) handleBatchSymbols(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	idsStr, err := req.RequireString("ids")
 	if err != nil {
@@ -584,7 +635,7 @@ func (s *Server) handleBatchSymbols(ctx context.Context, req mcp.CallToolRequest
 
 	var results []map[string]any
 	for _, id := range ids {
-		node := s.engine.GetSymbol(id)
+		node := s.engineFor(ctx).GetSymbol(id)
 		// A node outside the session's workspace is reported as a
 		// miss — identical to a genuinely absent ID so the boundary
 		// stays opaque.
@@ -610,7 +661,7 @@ func (s *Server) handleBatchSymbols(ctx context.Context, req mcp.CallToolRequest
 
 		// Callers (depth 1).
 		if node.Kind == graph.KindFunction || node.Kind == graph.KindMethod {
-			callers := s.engine.GetCallers(node.ID, query.QueryOptions{Depth: 1, Limit: 10, Detail: "brief", WorkspaceID: sessWS})
+			callers := s.engineFor(ctx).GetCallers(node.ID, query.QueryOptions{Depth: 1, Limit: 10, Detail: "brief", WorkspaceID: sessWS})
 			var callerIDs []string
 			for _, cn := range callers.Nodes {
 				if cn.ID != node.ID {
@@ -622,7 +673,7 @@ func (s *Server) handleBatchSymbols(ctx context.Context, req mcp.CallToolRequest
 			}
 
 			// Callees (depth 1).
-			callees := s.engine.GetCallChain(node.ID, query.QueryOptions{Depth: 1, Limit: 10, Detail: "brief", WorkspaceID: sessWS})
+			callees := s.engineFor(ctx).GetCallChain(node.ID, query.QueryOptions{Depth: 1, Limit: 10, Detail: "brief", WorkspaceID: sessWS})
 			var calleeIDs []string
 			for _, cn := range callees.Nodes {
 				if cn.ID != node.ID {
@@ -637,7 +688,7 @@ func (s *Server) handleBatchSymbols(ctx context.Context, req mcp.CallToolRequest
 		// Source code (optional).
 		if includeSource && node.StartLine > 0 && node.EndLine > 0 {
 			if absPath, err := s.resolveNodePath(node); err == nil {
-				if source, fromLine, totalFileChars, err := readLines(absPath, node.StartLine, node.EndLine, contextLines); err == nil {
+				if source, fromLine, totalFileChars, err := s.readLinesForCtx(ctx, absPath, node.StartLine, node.EndLine, contextLines); err == nil {
 					entry["source"] = source
 					entry["from_line"] = fromLine
 					returned := tokens.CountInt64(source)
@@ -730,7 +781,7 @@ func (s *Server) handleGetTestTargets(ctx context.Context, req mcp.CallToolReque
 	coveredSymbols := make(map[string]bool)
 
 	for _, id := range ids {
-		node := s.engine.GetSymbol(id)
+		node := s.engineFor(ctx).GetSymbol(id)
 		if node == nil {
 			continue
 		}
@@ -740,7 +791,7 @@ func (s *Server) handleGetTestTargets(ctx context.Context, req mcp.CallToolReque
 		// inverse-edge walk is one hop instead of the BFS-on-EdgeCalls
 		// that this tool used to do, and it's exact (no isTestFile
 		// post-filter needed).
-		if testers := s.engine.GetTesters(id); len(testers) > 0 {
+		if testers := s.engineFor(ctx).GetTesters(id); len(testers) > 0 {
 			for _, tn := range testers {
 				if tn == nil {
 					continue
@@ -758,7 +809,7 @@ func (s *Server) handleGetTestTargets(ctx context.Context, req mcp.CallToolReque
 
 		// Fallback for graphs that haven't been re-indexed since the
 		// EdgeTests pass shipped, or for indirect coverage (depth > 1).
-		callers := s.engine.GetCallers(id, query.QueryOptions{Depth: depth, Limit: 100, Detail: "brief"})
+		callers := s.engineFor(ctx).GetCallers(id, query.QueryOptions{Depth: depth, Limit: 100, Detail: "brief"})
 		for _, cn := range callers.Nodes {
 			if !isTestFile(cn.FilePath) {
 				continue
@@ -832,7 +883,7 @@ func (s *Server) handleSuggestPattern(ctx context.Context, req mcp.CallToolReque
 		return mcp.NewToolResultError("id is required"), nil
 	}
 
-	node := s.engine.GetSymbol(exampleID)
+	node := s.engineFor(ctx).GetSymbol(exampleID)
 	if node == nil {
 		return mcp.NewToolResultError("symbol not found: " + exampleID), nil
 	}
@@ -849,7 +900,7 @@ func (s *Server) handleSuggestPattern(ctx context.Context, req mcp.CallToolReque
 	// 1. Get the example source.
 	if node.StartLine > 0 && node.EndLine > 0 {
 		if absPath, err := s.resolveNodePath(node); err == nil {
-			if source, _, _, err := readLines(absPath, node.StartLine, node.EndLine, 0); err == nil {
+			if source, _, _, err := s.readLinesForCtx(ctx, absPath, node.StartLine, node.EndLine, 0); err == nil {
 				result["example_source"] = source
 			}
 		}
@@ -859,7 +910,7 @@ func (s *Server) handleSuggestPattern(ctx context.Context, req mcp.CallToolReque
 	}
 
 	// 2. Find siblings — same kind, same file, similar naming pattern.
-	fileSymbols := s.engine.GetFileSymbols(node.FilePath)
+	fileSymbols := s.engineFor(ctx).GetFileSymbols(node.FilePath)
 	if len(fileSymbols.Nodes) > 0 && !s.nodeInSessionScope(ctx, fileSymbols.Nodes[0]) {
 		fileSymbols = &query.SubGraph{}
 	}
@@ -882,7 +933,7 @@ func (s *Server) handleSuggestPattern(ctx context.Context, req mcp.CallToolReque
 	result["siblings_count"] = len(fileSymbols.Nodes) - 1 // exclude file node
 
 	// 3. Find how the example is wired/registered (callers at depth 1).
-	callers := s.engine.GetCallers(exampleID, query.QueryOptions{Depth: 1, Limit: 10, Detail: "brief"})
+	callers := s.engineFor(ctx).GetCallers(exampleID, query.QueryOptions{Depth: 1, Limit: 10, Detail: "brief"})
 	var registration []map[string]any
 	for _, cn := range callers.Nodes {
 		if cn.ID == exampleID {
@@ -897,7 +948,7 @@ func (s *Server) handleSuggestPattern(ctx context.Context, req mcp.CallToolReque
 		// Get the registration source (the caller function that wires this symbol).
 		if cn.StartLine > 0 && cn.EndLine > 0 {
 			if absPath, err := s.resolveNodePath(cn); err == nil {
-				if source, _, _, err := readLines(absPath, cn.StartLine, cn.EndLine, 0); err == nil {
+				if source, _, _, err := s.readLinesForCtx(ctx, absPath, cn.StartLine, cn.EndLine, 0); err == nil {
 					entry["source"] = source
 				}
 			}
@@ -910,7 +961,7 @@ func (s *Server) handleSuggestPattern(ctx context.Context, req mcp.CallToolReque
 	var testPatterns []map[string]any
 	if prefix != "" {
 		// Search for test functions that match the example name.
-		testSearch := s.scopedNodeSlice(ctx, s.engine.SearchSymbols(node.Name, 20))
+		testSearch := s.scopedNodeSlice(ctx, s.engineFor(ctx).SearchSymbols(node.Name, 20))
 		for _, tn := range testSearch {
 			if !isTestFile(tn.FilePath) {
 				continue
@@ -927,7 +978,7 @@ func (s *Server) handleSuggestPattern(ctx context.Context, req mcp.CallToolReque
 			// Get test source.
 			if tn.StartLine > 0 && tn.EndLine > 0 {
 				if absPath, err := s.resolveNodePath(tn); err == nil {
-					if source, _, _, err := readLines(absPath, tn.StartLine, tn.EndLine, 0); err == nil {
+					if source, _, _, err := s.readLinesForCtx(ctx, absPath, tn.StartLine, tn.EndLine, 0); err == nil {
 						entry["source"] = source
 					}
 				}
@@ -1015,7 +1066,7 @@ func (s *Server) handleGetEditPlan(ctx context.Context, req mcp.CallToolRequest)
 
 	// Order 0: The changed symbols themselves (definitions).
 	for _, id := range ids {
-		node := s.engine.GetSymbol(id)
+		node := s.engineFor(ctx).GetSymbol(id)
 		if node == nil {
 			continue
 		}
@@ -1024,7 +1075,7 @@ func (s *Server) handleGetEditPlan(ctx context.Context, req mcp.CallToolRequest)
 
 		// Check if symbol is an interface — implementations need updating.
 		if node.Kind == graph.KindInterface {
-			impls := s.scopedNodeSlice(ctx, s.engine.FindImplementations(id))
+			impls := s.scopedNodeSlice(ctx, s.engineFor(ctx).FindImplementations(id))
 			for _, impl := range impls {
 				addFile(impl.FilePath, impl.Name, "implements "+node.Name+" — must conform to changes", 1)
 			}
@@ -1032,10 +1083,10 @@ func (s *Server) handleGetEditPlan(ctx context.Context, req mcp.CallToolRequest)
 
 		// Check MemberOf — if changing a type, its methods may need updating.
 		if node.Kind == graph.KindType || node.Kind == graph.KindInterface {
-			inEdges := s.engine.GetInEdges(id)
+			inEdges := s.engineFor(ctx).GetInEdges(id)
 			for _, e := range inEdges {
 				if e.Kind == graph.EdgeMemberOf {
-					memberNode := s.engine.GetSymbol(e.From)
+					memberNode := s.engineFor(ctx).GetSymbol(e.From)
 					if memberNode != nil {
 						addFile(memberNode.FilePath, memberNode.Name, "member of "+node.Name, 1)
 					}
@@ -1046,7 +1097,7 @@ func (s *Server) handleGetEditPlan(ctx context.Context, req mcp.CallToolRequest)
 
 	// Order 2-N: Dependents at increasing depth (callers/importers).
 	for _, id := range ids {
-		dependents := s.engine.GetDependents(id, query.QueryOptions{Depth: depth, Limit: 100, Detail: "brief"})
+		dependents := s.engineFor(ctx).GetDependents(id, query.QueryOptions{Depth: depth, Limit: 100, Detail: "brief"})
 		for _, dn := range dependents.Nodes {
 			if dn.Kind == graph.KindFile {
 				continue
@@ -1152,7 +1203,7 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 		if len(kw) < 3 {
 			continue
 		}
-		matches := s.scopedNodeSlice(ctx, s.engine.SearchSymbols(kw, 10))
+		matches := s.scopedNodeSlice(ctx, s.engineFor(ctx).SearchSymbols(kw, 10))
 		for _, m := range matches {
 			if m.Kind == graph.KindFile || m.Kind == graph.KindImport {
 				continue
@@ -1168,10 +1219,10 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 	var entryNode *graph.Node
 	if entryPoint != "" {
 		// Try as symbol ID first.
-		entryNode = s.engine.GetSymbol(entryPoint)
+		entryNode = s.engineFor(ctx).GetSymbol(entryPoint)
 		if entryNode == nil {
 			// Try as file path — get the most important symbol in the file.
-			fileSym := s.engine.GetFileSymbols(entryPoint)
+			fileSym := s.engineFor(ctx).GetFileSymbols(entryPoint)
 			if len(fileSym.Nodes) > 0 && !s.nodeInSessionScope(ctx, fileSym.Nodes[0]) {
 				fileSym = &query.SubGraph{}
 			}
@@ -1226,7 +1277,7 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 			if seen[missedID] {
 				continue
 			}
-			missedNode := s.graph.GetNode(missedID)
+			missedNode := s.readerFor(ctx).GetNode(missedID)
 			if missedNode == nil {
 				continue
 			}
@@ -1271,7 +1322,7 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 			(sym.Kind == graph.KindFunction || sym.Kind == graph.KindMethod) &&
 			sym.StartLine > 0 && sym.EndLine > 0 {
 			if absPath, err := s.resolveNodePath(sym); err == nil {
-				if source, _, totalFileChars, err := readLines(absPath, sym.StartLine, sym.EndLine, 0); err == nil {
+				if source, _, totalFileChars, err := s.readLinesForCtx(ctx, absPath, sym.StartLine, sym.EndLine, 0); err == nil {
 					entry["source"] = source
 					sourcesEmbedded++
 					returned := tokens.CountInt64(source)
@@ -1290,13 +1341,13 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 		crossSeen := make(map[string]bool)
 		for _, sym := range relevantSymbols {
 			// Check outgoing edges for cross-repo references.
-			outEdges := s.engine.GetOutEdges(sym.ID)
+			outEdges := s.engineFor(ctx).GetOutEdges(sym.ID)
 			for _, e := range outEdges {
 				if !e.CrossRepo || crossSeen[e.To] {
 					continue
 				}
 				crossSeen[e.To] = true
-				targetNode := s.engine.GetSymbol(e.To)
+				targetNode := s.engineFor(ctx).GetSymbol(e.To)
 				if targetNode == nil {
 					continue
 				}
@@ -1322,7 +1373,7 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 	// 6. If we have an entry point, get its pattern (registration, siblings, tests).
 	if entryNode != nil {
 		// File context: imports and structure.
-		fileCtx := s.engine.GetFileSymbols(entryNode.FilePath)
+		fileCtx := s.engineFor(ctx).GetFileSymbols(entryNode.FilePath)
 		if len(fileCtx.Nodes) > 0 && !s.nodeInSessionScope(ctx, fileCtx.Nodes[0]) {
 			fileCtx = &query.SubGraph{}
 		}
@@ -1335,7 +1386,7 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 		result["entry_file_symbols"] = fileSymbols
 
 		// Callers and callees.
-		callers := s.engine.GetCallers(entryNode.ID, query.QueryOptions{Depth: 1, Limit: 5, Detail: "brief"})
+		callers := s.engineFor(ctx).GetCallers(entryNode.ID, query.QueryOptions{Depth: 1, Limit: 5, Detail: "brief"})
 		var callerIDs []string
 		for _, cn := range callers.Nodes {
 			if cn.ID != entryNode.ID {
@@ -1346,7 +1397,7 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 			result["callers"] = callerIDs
 		}
 
-		callees := s.engine.GetCallChain(entryNode.ID, query.QueryOptions{Depth: 1, Limit: 5, Detail: "brief"})
+		callees := s.engineFor(ctx).GetCallChain(entryNode.ID, query.QueryOptions{Depth: 1, Limit: 5, Detail: "brief"})
 		var calleeIDs []string
 		for _, cn := range callees.Nodes {
 			if cn.ID != entryNode.ID {
@@ -1362,7 +1413,7 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 	var testFiles []string
 	testSeen := make(map[string]bool)
 	for _, sym := range relevantSymbols {
-		callers := s.engine.GetCallers(sym.ID, query.QueryOptions{Depth: 2, Limit: 20, Detail: "brief"})
+		callers := s.engineFor(ctx).GetCallers(sym.ID, query.QueryOptions{Depth: 2, Limit: 20, Detail: "brief"})
 		for _, cn := range callers.Nodes {
 			if isTestFile(cn.FilePath) && !testSeen[cn.FilePath] {
 				testSeen[cn.FilePath] = true
@@ -1456,7 +1507,7 @@ func (s *Server) handleRenameSymbol(ctx context.Context, req mcp.CallToolRequest
 		return mcp.NewToolResultError("new_name is required"), nil
 	}
 
-	node := s.engine.GetSymbol(id)
+	node := s.engineFor(ctx).GetSymbol(id)
 	if node == nil {
 		return mcp.NewToolResultError("symbol not found: " + id), nil
 	}
@@ -1507,7 +1558,7 @@ func (s *Server) handleRenameSymbol(ctx context.Context, req mcp.CallToolRequest
 	}
 
 	// 2. All graph usages (calls, references, instantiates).
-	usages := s.engine.FindUsages(id)
+	usages := s.engineFor(ctx).FindUsages(id)
 	for _, edge := range usages.Edges {
 		if edge.Line == 0 {
 			continue
@@ -1534,12 +1585,12 @@ func (s *Server) handleRenameSymbol(ctx context.Context, req mcp.CallToolRequest
 
 	// 3. MemberOf edges — if renaming a type, its methods' receiver annotations may reference it.
 	if node.Kind == graph.KindType || node.Kind == graph.KindInterface {
-		inEdges := s.engine.GetInEdges(id)
+		inEdges := s.engineFor(ctx).GetInEdges(id)
 		for _, edge := range inEdges {
 			if edge.Kind != graph.EdgeMemberOf {
 				continue
 			}
-			memberNode := s.engine.GetSymbol(edge.From)
+			memberNode := s.engineFor(ctx).GetSymbol(edge.From)
 			if memberNode == nil {
 				continue
 			}
@@ -1628,7 +1679,7 @@ func (s *Server) handleEditSymbol(ctx context.Context, req mcp.CallToolRequest) 
 		return mcp.NewToolResultError("old_source and new_source are identical"), nil
 	}
 
-	node := s.engine.GetSymbol(id)
+	node := s.engineFor(ctx).GetSymbol(id)
 	if node == nil {
 		return mcp.NewToolResultError("symbol not found: " + id), nil
 	}

@@ -171,7 +171,7 @@ func TestFetchAndMergeBM25_DedupesAcrossTerms(t *testing.T) {
 
 	// Merging with the same term as an "expansion" must produce the
 	// same list, not duplicates.
-	merged, primaryCount := fetchAndMergeBM25(srv, "helper", []string{"helper"}, 20, scope)
+	merged, primaryCount := fetchAndMergeBM25(srv.engine, "helper", []string{"helper"}, 20, scope)
 	assert.Equal(t, len(primary), primaryCount)
 	assert.Equal(t, idsOf(primary), idsOf(merged))
 }
@@ -183,7 +183,7 @@ func TestFetchAndMergeBM25_AppendsNewMatches(t *testing.T) {
 	scope := query.QueryOptions{}
 
 	primary := srv.engine.SearchSymbolsScoped("helper", 20, scope)
-	merged, primaryCount := fetchAndMergeBM25(srv, "helper", []string{"main"}, 20, scope)
+	merged, primaryCount := fetchAndMergeBM25(srv.engine, "helper", []string{"main"}, 20, scope)
 	assert.Equal(t, len(primary), primaryCount)
 
 	primaryIDs := idsOf(primary)
