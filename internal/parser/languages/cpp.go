@@ -71,10 +71,15 @@ func (e *CppExtractor) Extensions() []string { return []string{".cpp", ".cc", ".
 
 // --- Deferred call buffer ----------------------------------------
 
+// cppDeferredCall buffers a call site discovered during the
+// per-match walk so the post-pass can attribute it to the enclosing
+// function once funcRanges is built. argTypes carries the C++ ADL
+// hint set populated by extractCppCallArgTypes.
 type cppDeferredCall struct {
 	name     string
 	line     int
 	isMember bool
+	argTypes []string
 }
 
 func (e *CppExtractor) Extract(filePath string, src []byte) (*parser.ExtractionResult, error) {
@@ -114,7 +119,7 @@ func (e *CppExtractor) Extract(filePath string, src []byte) (*parser.ExtractionR
 			e.emitEnum(m, filePath, fileID, result, seen)
 
 		case m.Captures["func.def"] != nil:
-			e.emitFunction(m, filePath, fileID, result, seen)
+			e.emitFunction(m, filePath, fileID, src, result, seen)
 
 		case m.Captures["include.def"] != nil:
 			e.emitInclude(m, filePath, fileID, result)
@@ -125,13 +130,15 @@ func (e *CppExtractor) Extract(filePath string, src []byte) (*parser.ExtractionR
 				name:     m.Captures["callm.method"].Text,
 				line:     expr.StartLine + 1,
 				isMember: true,
+				argTypes: extractCppCallArgTypes(expr.Node, src),
 			})
 
 		case m.Captures["call.expr"] != nil:
 			expr := m.Captures["call.expr"]
 			calls = append(calls, cppDeferredCall{
-				name: m.Captures["call.name"].Text,
-				line: expr.StartLine + 1,
+				name:     m.Captures["call.name"].Text,
+				line:     expr.StartLine + 1,
+				argTypes: extractCppCallArgTypes(expr.Node, src),
 			})
 		}
 	})
@@ -143,17 +150,21 @@ func (e *CppExtractor) Extract(filePath string, src []byte) (*parser.ExtractionR
 		if callerID == "" {
 			continue
 		}
-		if c.isMember {
-			result.Edges = append(result.Edges, &graph.Edge{
-				From: callerID, To: "unresolved::*." + c.name,
-				Kind: graph.EdgeCalls, FilePath: filePath, Line: c.line,
-			})
-			continue
-		}
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: callerID, To: "unresolved::" + c.name,
+		edge := &graph.Edge{
 			Kind: graph.EdgeCalls, FilePath: filePath, Line: c.line,
-		})
+			From: callerID,
+		}
+		if c.isMember {
+			edge.To = "unresolved::*." + c.name
+		} else {
+			edge.To = "unresolved::" + c.name
+		}
+		if len(c.argTypes) > 0 {
+			edge.Meta = map[string]any{
+				"scope_arg_types": strings.Join(c.argTypes, ","),
+			}
+		}
+		result.Edges = append(result.Edges, edge)
 	}
 
 	return result, nil
@@ -187,10 +198,17 @@ func (e *CppExtractor) emitClass(m parser.QueryResult, filePath, fileID string, 
 		return
 	}
 	seen[classID] = true
+	meta := map[string]any{}
+	if ns := enclosingCppNamespace(def.Node, src); ns != "" {
+		meta["scope_ns"] = ns
+	}
+	if parent := extractCppParentClass(def.Node, src); parent != "" {
+		meta["scope_parent"] = parent
+	}
 	result.Nodes = append(result.Nodes, &graph.Node{
 		ID: classID, Kind: graph.KindType, Name: className,
 		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
-		Language: "cpp",
+		Language: "cpp", Meta: meta,
 	})
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: fileID, To: classID, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
@@ -247,11 +265,15 @@ func (e *CppExtractor) addMethodFromNode(funcNode *sitter.Node, src []byte, file
 	// Mark line so the function_definition dispatcher skips this.
 	seen[filePath+"::_method_L"+fmt.Sprint(startLine)] = true
 
+	meta := map[string]any{"receiver": className, "scope_class": className}
+	if ns := enclosingCppNamespace(funcNode, src); ns != "" {
+		meta["scope_ns"] = ns
+	}
 	result.Nodes = append(result.Nodes, &graph.Node{
 		ID: id, Kind: graph.KindMethod, Name: methodName,
 		FilePath: filePath, StartLine: startLine, EndLine: endLine,
 		Language: "cpp",
-		Meta:     map[string]any{"receiver": className},
+		Meta:     meta,
 	})
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: startLine,
@@ -301,7 +323,7 @@ func (e *CppExtractor) emitEnum(m parser.QueryResult, filePath, fileID string, r
 // claimed by the class-body walk (seen "_method_L<line>"), this is a
 // class method with a bare identifier declarator that was emitted
 // through addMethodFromNode — skip the duplicate.
-func (e *CppExtractor) emitFunction(m parser.QueryResult, filePath, fileID string, result *parser.ExtractionResult, seen map[string]bool) {
+func (e *CppExtractor) emitFunction(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool) {
 	name := m.Captures["func.name"].Text
 	def := m.Captures["func.def"]
 	startLine := def.StartLine + 1
@@ -317,10 +339,14 @@ func (e *CppExtractor) emitFunction(m parser.QueryResult, filePath, fileID strin
 		return
 	}
 	seen[id] = true
+	meta := map[string]any{}
+	if ns := enclosingCppNamespace(def.Node, src); ns != "" {
+		meta["scope_ns"] = ns
+	}
 	result.Nodes = append(result.Nodes, &graph.Node{
 		ID: id, Kind: graph.KindFunction, Name: name,
 		FilePath: filePath, StartLine: startLine, EndLine: def.EndLine + 1,
-		Language: "cpp",
+		Language: "cpp", Meta: meta,
 	})
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: startLine,
@@ -372,4 +398,127 @@ func lastIdentifier(node *sitter.Node, src []byte) string {
 		}
 	}
 	return name
+}
+
+// enclosingCppNamespace walks node up through the tree-sitter AST
+// looking for namespace_definition ancestors and concatenates their
+// names with "::" (so `namespace a { namespace b { void foo() {} } }`
+// produces "a::b"). Anonymous namespaces are skipped — a function
+// inside one still belongs to the surrounding namespace for ADL.
+//
+// Stamped onto every function / method / type node so the resolver's
+// scope-based static resolver can prefer same-namespace candidates
+// before falling back to directory-locality.
+func enclosingCppNamespace(node *sitter.Node, src []byte) string {
+	if node == nil {
+		return ""
+	}
+	var parts []string
+	for p := node.Parent(); p != nil; p = p.Parent() {
+		if p.Type() != "namespace_definition" {
+			continue
+		}
+		nameNode := p.ChildByFieldName("name")
+		if nameNode == nil {
+			continue
+		}
+		name := strings.TrimSpace(nameNode.Content(src))
+		if name == "" {
+			continue
+		}
+		parts = append([]string{name}, parts...)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.Join(parts, "::")
+}
+
+// extractCppParentClass returns the name of the direct base class for
+// a C++ class_specifier, or "" if the class has no base. Used by the
+// scope-based static resolver to walk the inheritance chain when
+// resolving `super`-style calls (C++ doesn't have a literal `super`
+// keyword, but Base::method() qualifications follow the same chain).
+func extractCppParentClass(classNode *sitter.Node, src []byte) string {
+	if classNode == nil {
+		return ""
+	}
+	for i := 0; i < int(classNode.NamedChildCount()); i++ {
+		child := classNode.NamedChild(i)
+		if child.Type() != "base_class_clause" {
+			continue
+		}
+		for j := 0; j < int(child.NamedChildCount()); j++ {
+			sub := child.NamedChild(j)
+			switch sub.Type() {
+			case "type_identifier", "qualified_identifier":
+				return strings.TrimSpace(sub.Content(src))
+			}
+		}
+	}
+	return ""
+}
+
+// extractCppCallArgTypes returns the type-name hints harvested from a
+// C++ call_expression's argument list, used to seed Argument-Dependent
+// Lookup. We restrict the harvest to the cases where the argument
+// type is structurally unambiguous from the call site alone:
+//
+//   - `new Type(...)`  → "Type"
+//   - `Type{...}`      → "Type" (compound literal / temporary)
+//   - `Type(arg)`      → "Type" (functional cast / explicit ctor)
+//
+// Anything else (bare variables, method-chain returns, expressions)
+// is skipped — ADL is best-effort here, and a partial type list is
+// strictly better than guessing. The resolver treats an empty hint
+// set as "no ADL evidence" and falls through to the regular cascade.
+func extractCppCallArgTypes(callNode *sitter.Node, src []byte) []string {
+	if callNode == nil {
+		return nil
+	}
+	args := callNode.ChildByFieldName("arguments")
+	if args == nil {
+		return nil
+	}
+	var out []string
+	for i := 0; i < int(args.NamedChildCount()); i++ {
+		arg := args.NamedChild(i)
+		typeName := cppArgTypeHint(arg, src)
+		if typeName == "" {
+			continue
+		}
+		out = append(out, typeName)
+	}
+	return out
+}
+
+func cppArgTypeHint(arg *sitter.Node, src []byte) string {
+	if arg == nil {
+		return ""
+	}
+	switch arg.Type() {
+	case "new_expression":
+		if t := arg.ChildByFieldName("type"); t != nil {
+			return strings.TrimSpace(t.Content(src))
+		}
+	case "compound_literal_expression":
+		if t := arg.ChildByFieldName("type"); t != nil {
+			return strings.TrimSpace(t.Content(src))
+		}
+	case "call_expression":
+		// Functional-cast `Type(arg)`: the function position is a
+		// type_identifier or qualified_identifier whose text is the
+		// type itself. Distinguishes from regular method calls by
+		// checking that the function position resolves to a type
+		// name (proper-cased, single-segment) — heuristic but safe
+		// because the resolver treats ADL hints as evidence, not
+		// truth.
+		if f := arg.ChildByFieldName("function"); f != nil {
+			switch f.Type() {
+			case "type_identifier", "qualified_identifier":
+				return strings.TrimSpace(f.Content(src))
+			}
+		}
+	}
+	return ""
 }

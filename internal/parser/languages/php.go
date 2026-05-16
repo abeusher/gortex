@@ -161,6 +161,9 @@ func (e *PHPExtractor) extractClass(
 	if doc := ExtractDocAbove(src, int(node.StartPoint().Row), DocLangBlockStar); doc != "" {
 		meta["doc"] = doc
 	}
+	if parent := extractPhpParentClass(node, src); parent != "" {
+		meta["scope_parent"] = parent
+	}
 	result.Nodes = append(result.Nodes, &graph.Node{
 		ID: id, Kind: graph.KindType, Name: className,
 		FilePath: filePath, StartLine: startLine, EndLine: endLine,
@@ -307,8 +310,9 @@ func (e *PHPExtractor) extractMethod(
 	}
 	seen[id] = true
 	meta := map[string]any{
-		"receiver":   className,
-		"visibility": phpMemberVisibility(node, src),
+		"receiver":    className,
+		"scope_class": className,
+		"visibility":  phpMemberVisibility(node, src),
 	}
 	if doc := ExtractDocAbove(src, int(node.StartPoint().Row), DocLangBlockStar); doc != "" {
 		meta["doc"] = doc
@@ -423,10 +427,27 @@ func (e *PHPExtractor) extractCallSites(
 		if nameNode != nil {
 			name := nameNode.Content(src)
 			line := int(node.StartPoint().Row) + 1
-			result.Edges = append(result.Edges, &graph.Edge{
+			edge := &graph.Edge{
 				From: callerID, To: "unresolved::*." + name,
 				Kind: graph.EdgeCalls, FilePath: filePath, Line: line,
-			})
+			}
+			// PHP scope tagging for the static resolver: a
+			// `parent::foo()` / `self::foo()` / `static::foo()`
+			// scoped_call_expression names its scope under the
+			// `scope` field. Stamping it on the edge lets the
+			// resolver walk the inheritance chain (`parent`) or
+			// pin to the enclosing class (`self` / `static`).
+			if node.Type() == "scoped_call_expression" {
+				if scope := node.ChildByFieldName("scope"); scope != nil {
+					switch strings.ToLower(scope.Content(src)) {
+					case "parent":
+						edge.Meta = map[string]any{"scope_kind": "parent"}
+					case "self", "static":
+						edge.Meta = map[string]any{"scope_kind": "self"}
+					}
+				}
+			}
+			result.Edges = append(result.Edges, edge)
 		}
 	}
 
@@ -995,6 +1016,35 @@ func emitAttributeEdges(attrs []phpAttribute, fromID, filePath string, fallbackL
 			},
 		})
 	}
+}
+
+// extractPhpParentClass returns the immediate base class for a PHP
+// class_declaration, or "" when the class has no `extends` clause.
+// PHP supports single inheritance, so the `base_clause` child holds
+// exactly one name. Used by the scope-based static resolver to
+// answer `parent::method()` calls.
+func extractPhpParentClass(classNode *sitter.Node, src []byte) string {
+	if classNode == nil {
+		return ""
+	}
+	for i := 0; i < int(classNode.NamedChildCount()); i++ {
+		child := classNode.NamedChild(i)
+		if child.Type() != "base_clause" {
+			continue
+		}
+		for j := 0; j < int(child.NamedChildCount()); j++ {
+			sub := child.NamedChild(j)
+			switch sub.Type() {
+			case "name", "qualified_name":
+				text := strings.TrimSpace(sub.Content(src))
+				if i := strings.LastIndex(text, `\`); i >= 0 {
+					text = text[i+1:]
+				}
+				return text
+			}
+		}
+	}
+	return ""
 }
 
 // phpMemberVisibility returns the access modifier for a PHP class

@@ -693,6 +693,24 @@ func (r *Resolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *Re
 		return
 	}
 
+	// Per-language scope-based static resolver. Consulted before the
+	// generic locality cascade so C file-static / C++ namespace +
+	// ADL / Java enclosing-class / PHP namespace + parent::/self::
+	// rules can land a precise binding when their evidence is strong.
+	// Returns nil when no language-specific rule applies; the cascade
+	// below then runs unchanged.
+	if pick := r.preferScopeCandidate(e, funcName, candidates); pick != nil {
+		e.To = pick.ID
+		e.Origin = graph.OriginASTResolved
+		e.Confidence = 0.92
+		if e.Meta == nil {
+			e.Meta = map[string]any{}
+		}
+		e.Meta["resolution"] = "scope"
+		stats.Resolved++
+		return
+	}
+
 	// Prefer same-package (same directory) match.
 	callerDir := filepath.Dir(e.FilePath)
 	for _, c := range candidates {
@@ -896,6 +914,22 @@ func (r *Resolver) resolveMethodCall(e *graph.Edge, methodName string, stats *Re
 	// guess. The filter is conservative — when the index is missing or
 	// would empty the list, the original candidates pass through.
 	candidates := r.filterByReachability(e.FilePath, rawCandidates)
+
+	// Per-language scope rule lands binding when its evidence is
+	// strong (C static / C++ namespace + ADL / Java enclosing class /
+	// PHP parent::/self::/namespace). Empty return falls through to
+	// the existing receiver-type cascade unchanged.
+	if pick := r.preferScopeCandidate(e, methodName, candidates); pick != nil {
+		e.To = pick.ID
+		e.Origin = graph.OriginASTResolved
+		e.Confidence = 0.92
+		if e.Meta == nil {
+			e.Meta = map[string]any{}
+		}
+		e.Meta["resolution"] = "scope"
+		stats.Resolved++
+		return
+	}
 
 	callerDir := filepath.Dir(e.FilePath)
 	receiverType := edgeReceiverType(e)

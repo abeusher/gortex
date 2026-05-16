@@ -285,6 +285,12 @@ func (e *JavaExtractor) emitClass(m parser.QueryResult, filePath, fileID string,
 	if doc := ExtractDocAbove(src, def.StartLine, DocLangBlockStar); doc != "" {
 		meta["doc"] = doc
 	}
+	// Direct superclass — populated for the scope-based static
+	// resolver's super-method walk. `superclass` field is the Java
+	// tree-sitter name for `extends X`.
+	if parent := extractJavaParentClass(def.Node, src); parent != "" {
+		meta["scope_parent"] = parent
+	}
 	result.Nodes = append(result.Nodes, &graph.Node{
 		ID: id, Kind: graph.KindType, Name: name,
 		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
@@ -442,8 +448,9 @@ func (e *JavaExtractor) emitMethod(m parser.QueryResult, filePath, fileID string
 			FilePath: filePath, StartLine: startLine1, EndLine: def.EndLine + 1,
 			Language: "java",
 			Meta: map[string]any{
-				"receiver":   className,
-				"visibility": javaVisibility(def.Node, src, VisibilityPackage),
+				"receiver":    className,
+				"scope_class": className,
+				"visibility":  javaVisibility(def.Node, src, VisibilityPackage),
 			},
 		}
 		if def.Node != nil {
@@ -883,6 +890,38 @@ func extractJavaMethodReturnType(methodNode *sitter.Node, src []byte) string {
 			}
 		case "array_type":
 			return normalizeJavaTypeName(child.Content(src))
+		}
+	}
+	return ""
+}
+
+// extractJavaParentClass returns the direct superclass of a Java
+// class_declaration, or "" when the class has no `extends` clause.
+// Used by the scope-based static resolver to walk the inheritance
+// chain when an unqualified call inside the class doesn't bind to a
+// method on the class itself.
+func extractJavaParentClass(classNode *sitter.Node, src []byte) string {
+	if classNode == nil {
+		return ""
+	}
+	sup := classNode.ChildByFieldName("superclass")
+	if sup == nil {
+		return ""
+	}
+	for i := 0; i < int(sup.NamedChildCount()); i++ {
+		child := sup.NamedChild(i)
+		switch child.Type() {
+		case "type_identifier", "generic_type", "scoped_type_identifier":
+			text := strings.TrimSpace(child.Content(src))
+			// Strip generic parameters for the lookup key — the
+			// scope resolver matches against the class's plain name.
+			if i := strings.IndexAny(text, "<"); i > 0 {
+				text = text[:i]
+			}
+			if i := strings.LastIndex(text, "."); i > 0 {
+				text = text[i+1:]
+			}
+			return text
 		}
 	}
 	return ""

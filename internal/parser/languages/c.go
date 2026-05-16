@@ -183,12 +183,20 @@ func (e *CExtractor) emitFunction(m parser.QueryResult, filePath, fileID string,
 		return
 	}
 	seen[id] = true
+	meta := map[string]any{
+		"signature": strings.TrimSpace(extractCSignature(def.Node, src)),
+	}
+	// File-local-static linkage detection. A C function declared
+	// `static` has translation-unit scope; the scope-aware resolver
+	// uses this stamp to prefer a same-file static candidate over a
+	// global candidate of the same name. Mirrors `resolver.MetaScopeStatic`.
+	if isCStaticFunction(def.Node, src) {
+		meta["scope_static"] = true
+	}
 	result.Nodes = append(result.Nodes, &graph.Node{
 		ID: id, Kind: graph.KindFunction, Name: name,
 		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
-		Language: "c", Meta: map[string]any{
-			"signature": strings.TrimSpace(extractCSignature(def.Node, src)),
-		},
+		Language: "c", Meta: meta,
 	})
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
@@ -264,4 +272,27 @@ func extractCSignature(node *sitter.Node, src []byte) string {
 		return strings.TrimSpace(fullText[:idx])
 	}
 	return fullText
+}
+
+// isCStaticFunction reports whether the function_definition node was
+// declared with C's `static` storage-class specifier (file-local
+// linkage). Scans the declaration prefix before the parameter list —
+// that's where `static` legally appears. Tolerates leading attributes
+// and inline / extern keywords that may bracket `static`.
+func isCStaticFunction(node *sitter.Node, src []byte) bool {
+	if node == nil {
+		return false
+	}
+	full := node.Content(src)
+	paren := strings.IndexByte(full, '(')
+	if paren < 0 {
+		return false
+	}
+	prefix := full[:paren]
+	for _, word := range strings.Fields(prefix) {
+		if word == "static" {
+			return true
+		}
+	}
+	return false
 }
