@@ -323,7 +323,7 @@ gortex query stats                      Show graph statistics
 
 All query commands support `--format text|json|dot` (DOT output for Graphviz visualization).
 
-## MCP Tools (69)
+## MCP Tools (75)
 
 ### Core Navigation
 | Tool | Description |
@@ -455,6 +455,17 @@ Editor extensions push in-flight (unsaved) buffers as **overlays**. Gortex compo
 | `compare_with_overlay` | Run `find_usages` / `get_callers` / `get_call_chain` / `get_dependencies` / `get_dependents` against base AND overlay; returns added / removed / common ID sets |
 
 HTTP transport mirrors the surface at `/v1/overlay/sessions/*`; the `/v1/tools/<name>` entry point reads the overlay session from `Mcp-Session-Id` (preferred), `X-Gortex-Overlay-Session`, or `?session_id=`. **Overlays are bound to their MCP session** — when the session ends the overlay is dropped synchronously, so abandoned buffers never linger. Idle TTL is a fail-safe (default 30 min, configurable via `GORTEX_OVERLAY_IDLE_TTL`); every tool call against a live overlay refreshes it.
+
+### Speculative Execution (Simulation Sessions)
+
+Built on the same shadow-graph substrate, `preview_edit` and `simulate_chain` answer **"what would change if I applied this WorkspaceEdit?"** without ever touching disk or mutating the base graph. The input is a standard LSP `WorkspaceEdit` (`changes` / `documentChanges`), so any agent that already produces WorkspaceEdits for code actions can speculate on them directly. Per-step impact: touched files, added / removed / renamed symbols (non-trivial-signature rename heuristic), broken callers, broken interface implementors, blast-radius rollup, suggested test targets, and (when an LSP is configured) round-trip diagnostics restored to the on-disk state at simulation end.
+
+| Tool | Description |
+|------|-------------|
+| `preview_edit` | Single-shot WorkspaceEdit → impact report. Optional `diagnostics: false` skips the LSP round-trip. `inherit_overlay: true` layers on top of the caller's current overlay. |
+| `simulate_chain` | Ordered sequence of WorkspaceEdits applied in order with per-step impact + cumulative rollup + per-step diagnostics delta. `stop_on_error: true` (default) aborts on the first new ERROR-severity diagnostic. `keep: true` promotes the final simulated state into a real overlay session bound to the caller — the response carries `overlay_session_id` for follow-up commit / discard / `compare_with_overlay`. |
+
+**First-of-segment:** no graph-intel competitor has predictive impact + WorkspaceEdit-driven simulation + diagnostics round-trip in one MCP surface.
 
 ## MCP Resources (16)
 

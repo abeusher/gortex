@@ -421,6 +421,21 @@ Pass an editor-captured git blob SHA as ` + "`base_sha`" + ` on ` + "`overlay_pu
 
 HTTP transport mirrors the surface at ` + "`/v1/overlay/sessions/*`" + `; the ` + "`/v1/tools/<name>`" + ` entry reads the active session from ` + "`Mcp-Session-Id`" + ` / ` + "`X-Gortex-Overlay-Session`" + ` / ` + "`?session_id=`" + `.
 
+### Speculative Execution (Simulation Sessions)
+
+Built on the same shadow-graph substrate, ` + "`preview_edit`" + ` and ` + "`simulate_chain`" + ` answer **"what would change if I applied this WorkspaceEdit?"** — graph diff, broken callers/implementors, blast-radius impact, suggested test targets, and (when an LSP is configured) round-trip diagnostics — all without ever mutating the base graph or writing to disk. The input is a standard LSP ` + "`WorkspaceEdit`" + ` (` + "`{changes}`" + ` or ` + "`{documentChanges}`" + `), so any agent that already produces WorkspaceEdits for code actions can speculate on them directly.
+
+| Instead of...                                       | You MUST use...                          |
+|-----------------------------------------------------|------------------------------------------|
+| Writing the file then running tests to see breakage | ` + "`preview_edit`" + ` with ` + "`workspace_edit: <LSP WorkspaceEdit JSON>`" + ` — single-shot impact report (touched files, broken callers, broken implementors, impact rollup, test targets, optional LSP diagnostics). Disk untouched. |
+| Sequencing multiple speculative edits manually      | ` + "`simulate_chain`" + ` with ` + "`steps: [<WorkspaceEdit>, ...]`" + ` — applies steps in order, returns per-step impact + cumulative rollup + per-step diagnostics delta. Pass ` + "`stop_on_error: true`" + ` (default) to abort on the first new ERROR-severity diagnostic. |
+| Discarding the simulation when it actually worked   | ` + "`simulate_chain`" + ` with ` + "`keep: true`" + ` — promotes the final simulated state into a real overlay session bound to the calling MCP session; the response carries ` + "`overlay_session_id`" + `. From there, the editor can commit, ` + "`overlay_drop`" + `, or ` + "`compare_with_overlay`" + ` further. |
+| Speculating on top of unsaved buffer state          | Either tool with ` + "`inherit_overlay: true`" + ` — layers the simulation on top of the calling session's existing overlay instead of pristine base. |
+
+**Rename heuristic.** When a base symbol disappears from the overlay and exactly one overlay symbol matches its kind + non-trivial signature (after name stripping), the simulator pairs them as a ` + "`symbols_renamed`" + ` entry rather than flagging the change as ` + "`symbols_removed`" + ` + ` + "`symbols_added`" + `. Trivial signatures (parameterless void functions) are intentionally NOT paired — too many false positives. ` + "`Encode(payload []byte) []byte`" + ` → ` + "`Marshal(payload []byte) []byte`" + ` surfaces as a rename; a wholesale rewrite surfaces as removed + added.
+
+**Diagnostics restoration.** The diagnostics pass opens each touched file on the relevant LSP server, sends a ` + "`didChange`" + ` with the simulated content, waits for ` + "`publishDiagnostics`" + `, then sends a second ` + "`didChange`" + ` restoring the on-disk bytes — so concurrent sessions on the same daemon never observe the simulated state as authoritative. Set ` + "`diagnostics: false`" + ` to skip the LSP round-trip when only the graph delta matters.
+
 ### MCP Resources
 
 Bootstrap-state tools are also exposed as MCP resources (read-only, URI-addressable, no args). Subscribe via ` + "`resources/subscribe`" + ` once and receive ` + "`notifications/resources/updated`" + ` after each graph re-warm — no polling. Tools stay registered for back-compat with clients that don't speak resources; both surfaces share builder helpers so payloads match byte-for-byte.

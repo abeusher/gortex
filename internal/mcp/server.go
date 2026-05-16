@@ -580,6 +580,7 @@ func NewServer(engine *query.Engine, g *graph.Graph, idx *indexer.Indexer, watch
 	s.registerDataflowTools()
 	s.registerASTTools()
 	s.registerCloneTools()
+	s.registerSimulationTools()
 	s.registerResources()
 	s.registerPrompts()
 

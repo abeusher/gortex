@@ -658,6 +658,22 @@ func (p *Provider) closeDocument(absPath string) error {
 	})
 }
 
+// PushSimulatedContent sends a textDocument/didChange carrying
+// `newText` as a full-text replacement, so the LSP server re-analyses
+// the file as if it contained that buffer without anything ever
+// touching disk. Used by the simulation engine (preview_edit /
+// simulate_chain) to round-trip diagnostics for hypothetical edits.
+// The caller is responsible for restoring the original on-disk
+// content with a second PushSimulatedContent at simulation
+// completion — otherwise other sessions that share this Provider
+// will read diagnostics that reflect the simulated state instead of
+// the saved file. EnsureFileOpen must be called first so the server
+// has the document in its open-documents set; calling on an unopened
+// path returns the underlying transport error.
+func (p *Provider) PushSimulatedContent(absPath, newText string) error {
+	return p.changeDocument(absPath, newText)
+}
+
 // LastDiagnostics returns the most recent diagnostics published for a
 // file. Returns nil + false when the server has not (yet) emitted
 // diagnostics for that path.
