@@ -49,6 +49,7 @@ Selected via `llm.provider` in `.gortex.yaml` or `~/.config/gortex/config.yaml`.
 - **Speculative execution** (`preview_edit`, `simulate_chain`) takes an LSP `WorkspaceEdit` and returns the graph diff + broken callers/implementors + impact rollup + suggested tests + (optional) LSP diagnostics — disk untouched. `simulate_chain` with `keep: true` promotes the final state into a real overlay.
 - **MCP 2026 Streamable HTTP** at `POST /mcp` — `gortex server` always mounts it; `gortex daemon --http-addr <addr>` opts the daemon in (non-localhost binds require `--http-auth-token`).
 - **Session memory** (`save_note`, `query_notes`, `distill_session`) persists agent-authored notes per repo, auto-linked to symbols mentioned in the body. Notes survive daemon restarts and context compactions, scoped to the session's workspace.
+- **Development memories** (`store_memory`, `query_memories`, `surface_memories`) — cross-session, symbol-linked durable knowledge that compounds the longer a team uses Gortex. Memories carry `kind` (invariant / constraint / convention / gotcha / decision / incident / reference), `importance` (1..5), `confidence` (0..1), and are surfaced *proactively* by `surface_memories` when their anchor symbols / files enter the agent's working set.
 
 ## MANDATORY: Session memory — save, recall, distill
 
@@ -66,6 +67,30 @@ What to save vs. skip:
 
 Useful tags: `decision`, `bug`, `follow-up`, `gotcha`, `invariant`. `decision`-tagged notes are surfaced in their own section by `distill_session`.
 
+## MANDATORY: Development memories — store, query, surface
+
+`save_note` is a **per-session scratchpad**; `store_memory` is the **workspace-wide durable knowledge base**. The two are complementary, not redundant:
+
+| | `save_note` (session) | `store_memory` (cross-session) |
+|---|---|---|
+| Scope | session_id | workspace-wide |
+| Lifetime | survives compaction | survives daemon restarts, agent changes, team rotation |
+| Audience | future-you in this session | every future agent in this workspace |
+| Surfacing | `distill_session` (manual) | `surface_memories` (proactive, ranked) |
+| Right when | "remember this for the next 30 min" | "every agent touching `Bar` should know this" |
+
+Three triggers — not suggestions:
+
+1. **At task start, after `smart_context`** — **call** `surface_memories task:"<task>" symbol_ids:"<top hits from smart_context>"`. Returns memories ranked by anchor symbol overlap, file overlap, task-keyword hits, importance, pinning, recency, and confidence. Memories prefixed with `match_reasons:["symbol:pkg/foo.go::Bar"]` are direct evidence the memory applies to your working set. If `surface_memories` returns nothing, don't probe further.
+2. **When you discover a durable fact worth teaching the team** — **call** `store_memory kind:"<invariant|gotcha|convention|decision|constraint|incident>" body:"<what+why>" symbol_ids:"pkg/foo.go::Bar" importance:5`. Pin (`pinned:true`) anything load-bearing. Set `kind` honestly: `invariant` means "violating this breaks the system", `gotcha` means "an agent will get this wrong without warning". Title (`title:"..."`) the memory if the body is long — it becomes the headline.
+3. **When a memory is no longer true** — **call** `store_memory id:"<new>" supersedes:"<old-id>" body:"<corrected fact>"`. The old memory stays in the store (for audit) but is hidden from `surface_memories` by default. Don't delete unless the original was wrong; supersession preserves history.
+
+What to store vs. skip:
+- **Store:** invariants ("Bar must hold the lock"), conventions ("this package never uses gob"), incident learnings ("once, doing X under Y crashed prod"), API contracts not enforced by types, debugging traps, cross-cutting decisions with non-obvious rationale.
+- **Skip:** anything derivable from the code (the graph already knows), session-local play-by-play (use `save_note`), CLAUDE.md content (it's already loaded), one-off observations with no actionable consequence.
+
+Useful kinds and tags: `invariant`, `constraint`, `convention`, `gotcha`, `decision`, `incident`, `reference`. Tag liberally — `query_memories tag:"<x>"` is the primary lookup path when you don't know the anchor symbol.
+
 ## Required workflow (every task on this repo)
 
 These are not suggestions — run each step at the trigger.
@@ -74,9 +99,10 @@ These are not suggestions — run each step at the trigger.
 2. If `total_nodes` is 0, **call** `index_repository` with `"."` before anything else.
 3. In multi-repo mode, **call** `get_active_project` to see scope; use `set_active_project` to switch.
 4. For every new task, **call** `smart_context` with the task description before reading any file.
-5. Before editing a file, **call** `get_editing_context` on it first.
-6. Before changing any function signature, **call** `verify_change` to catch broken callers and interface implementors (cross-repo).
-7. For any refactor, **call** `get_edit_plan` for the dependency-ordered file list, then **`batch_edit`** to apply atomically.
-8. After every edit, **call** `check_guards` (team conventions) then `get_test_targets` (includes cross-repo tests).
-9. Before committing, **call** `detect_changes` for scope and `diff_context` for graph-enriched review.
-10. When the task is done, **call** `feedback action: "record"` to score which `smart_context` suggestions were useful / not needed / missing. This is required — it improves future context quality.
+5. Immediately after `smart_context`, **call** `surface_memories task:"<task>" symbol_ids:"<top hits>"` to pick up any cross-session invariants / gotchas / decisions anchored to your working set. Skipping this re-derives knowledge other agents have already recorded.
+6. Before editing a file, **call** `get_editing_context` on it first.
+7. Before changing any function signature, **call** `verify_change` to catch broken callers and interface implementors (cross-repo).
+8. For any refactor, **call** `get_edit_plan` for the dependency-ordered file list, then **`batch_edit`** to apply atomically.
+9. After every edit, **call** `check_guards` (team conventions) then `get_test_targets` (includes cross-repo tests).
+10. Before committing, **call** `detect_changes` for scope and `diff_context` for graph-enriched review.
+11. When the task is done, **call** `feedback action: "record"` to score which `smart_context` suggestions were useful / not needed / missing. This is required — it improves future context quality. If the task surfaced a durable invariant / decision / gotcha worth teaching the team, **also call** `store_memory` so the next agent inherits the lesson.

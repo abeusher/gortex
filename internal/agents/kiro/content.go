@@ -145,17 +145,29 @@ Gortex remembers code; this triplet remembers **why you made a call**. Notes per
 
 Save: decisions, non-obvious constraints, follow-ups, bug reproductions, surprising findings, partial-progress hand-offs. Skip: play-by-play of what you just did (the diff says it), patterns derivable from the graph, anything already in the steering docs. Canonical tags: ` + "`decision`" + `, ` + "`bug`" + `, ` + "`follow-up`" + `, ` + "`gotcha`" + `, ` + "`invariant`" + `.
 
+### Development Memories (store_memory / query_memories / surface_memories)
+
+` + "`save_note`" + ` is a **per-session scratchpad**; ` + "`store_memory`" + ` is the **workspace-wide durable knowledge base** — entries outlive sessions, agents, and teammates so every future agent in the workspace inherits them.
+
+| Trigger                                                  | Use                                                                            |
+|----------------------------------------------------------|--------------------------------------------------------------------------------|
+| Immediately after ` + "`smart_context`" + ` (every new task)            | ` + "`surface_memories task:\"<task>\" symbol_ids:\"<top hits>\"`" + ` — memories ranked by anchor overlap, importance, pinning, recency. Each hit carries ` + "`match_reasons`" + `. |
+| You discover a durable invariant / gotcha / decision worth teaching the team | ` + "`store_memory kind:\"<invariant|gotcha|convention|decision>\" body:\"<what+why>\" symbol_ids:\"<id>\" importance:5`" + ` — pin load-bearing memories. |
+| A memory is no longer true                                | ` + "`store_memory body:\"<corrected>\" supersedes:\"<old-id>\"`" + ` — preserves audit trail; old memory hidden by default. |
+
+Store: invariants, conventions, incident learnings, API contracts not enforced by types, debugging traps, cross-cutting decisions. Skip: anything derivable from code, session-local play-by-play (use ` + "`save_note`" + `), steering-doc content.
+
 ## Session workflow
 
 1. Call ` + "`graph_stats`" + ` to confirm Gortex is running. If ` + "`total_nodes`" + ` is 0, call ` + "`index_repository`" + ` with path ` + "`\".\"`" + `.
 2. Call ` + "`distill_session`" + ` to recover prior session memory for this workspace.
 3. In multi-repo mode, call ` + "`get_active_project`" + ` to check scope. Use ` + "`set_active_project`" + ` to switch if needed.
-4. For a new task, call ` + "`smart_context`" + ` with the task description.
-5. Before editing any file, call ` + "`get_editing_context`" + ` first. If you've touched the symbol before, also call ` + "`query_notes symbol_id:\"<id>\"`" + `.
+4. For a new task, call ` + "`smart_context`" + ` with the task description. Immediately after, call ` + "`surface_memories`" + ` with the same task description and the top symbol hits.
+5. Before editing any file, call ` + "`get_editing_context`" + ` first. If you've touched the symbol before, also call ` + "`query_notes symbol_id:\"<id>\"`" + ` and ` + "`query_memories symbol_id:\"<id>\"`" + `.
 6. Before changing a function signature, call ` + "`verify_change`" + ` to catch contract violations — checks callers across all repos.
 7. Before any refactor, call ` + "`get_edit_plan`" + ` for dependency-ordered file list. Use ` + "`batch_edit`" + ` to apply atomically.
 8. After editing, call ` + "`check_guards`" + ` to verify team conventions, then ` + "`get_test_targets`" + ` for tests to run (includes cross-repo test files).
-9. After making a meaningful decision or hitting a non-obvious constraint, call ` + "`save_note`" + ` so the next session can recover it.
+9. After making a meaningful decision or hitting a non-obvious constraint, call ` + "`save_note`" + ` so the next session can recover it. If the discovery is workspace-wide and worth teaching the team, call ` + "`store_memory`" + ` instead — that compounds across sessions.
 10. Before committing, call ` + "`detect_changes`" + ` to verify scope. Use ` + "`diff_context`" + ` for graph-enriched review.
 `
 
@@ -342,4 +354,5 @@ var AutoApproveTools = []string{
 	"scaffold", "batch_edit",
 	"contracts", "feedback",
 	"save_note", "query_notes", "distill_session",
+	"store_memory", "query_memories", "surface_memories",
 }

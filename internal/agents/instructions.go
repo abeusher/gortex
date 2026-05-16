@@ -206,6 +206,18 @@ Gortex remembers code; this triplet remembers **why you made a call**. Notes per
 
 **Save:** decisions, non-obvious constraints, follow-ups, bug reproductions, surprising graph findings, partial-progress hand-offs. **Skip:** play-by-play (the diff says it), patterns derivable from the graph, anything already in CLAUDE.md. Canonical tags: ` + "`decision`" + `, ` + "`bug`" + `, ` + "`follow-up`" + `, ` + "`gotcha`" + `, ` + "`invariant`" + ` — ` + "`decision`" + ` gets its own section in ` + "`distill_session`" + `.
 
+### Development Memories (store_memory / query_memories / surface_memories)
+
+` + "`save_note`" + ` is a **per-session scratchpad**; ` + "`store_memory`" + ` is the **workspace-wide durable knowledge base**. Memories outlive sessions, agents, and teammates — every future agent in the workspace inherits them.
+
+| Trigger                                                  | You MUST call                                                                 |
+|----------------------------------------------------------|-------------------------------------------------------------------------------|
+| Immediately after ` + "`smart_context`" + ` (every new task)            | ` + "`surface_memories task:\"<task>\" symbol_ids:\"<top hits>\"`" + ` — ranked memories anchored to your working set. Each hit carries ` + "`match_reasons`" + ` so you know *why* it surfaced. |
+| You discover a durable invariant / gotcha / decision worth teaching the team | ` + "`store_memory kind:\"<invariant|gotcha|convention|decision|constraint|incident>\" body:\"<what+why>\" symbol_ids:\"<id>\" importance:5`" + ` — pin load-bearing memories. |
+| You discover a memory is no longer true                  | ` + "`store_memory body:\"<corrected>\" supersedes:\"<old-id>\"`" + ` — preserves audit trail; the old memory is hidden from ` + "`surface_memories`" + ` by default. |
+
+**Store:** invariants (violating them breaks the system), conventions (this package never X), incident learnings, API contracts not enforced by types, debugging traps, cross-cutting decisions. **Skip:** anything derivable from code, session-local play-by-play (use ` + "`save_note`" + ` instead), CLAUDE.md content. Canonical kinds: ` + "`invariant`" + `, ` + "`constraint`" + `, ` + "`convention`" + `, ` + "`gotcha`" + `, ` + "`decision`" + `, ` + "`incident`" + `, ` + "`reference`" + `.
+
 ### Session Start
 
 The SessionStart hook injects daemon status (tracked repos, cwd coverage, ready/warmup state). If you see "daemon is not running" — run ` + "`gortex daemon start --detach`" + ` and re-run the task. If you see "cwd is not covered by any tracked repo" — graph tools won't be available for that directory.
@@ -473,6 +485,21 @@ Canonical tags: ` + "`decision`" + `, ` + "`bug`" + `, ` + "`follow-up`" + `, ` 
 
 ` + "`save_note`" + ` also accepts ` + "`id`" + ` (switches to update mode), ` + "`links`" + ` (comma-separated symbol IDs to attach explicitly), ` + "`no_autolink: true`" + ` (when the body intentionally mentions identifiers that should not be linked), and ` + "`file_path`" + ` (when the note is about a file, not a symbol). ` + "`distill_session`" + ` accepts ` + "`max_symbols`" + ` / ` + "`max_files`" + ` / ` + "`max_tags`" + ` / ` + "`max_recent`" + ` / ` + "`excerpt_chars`" + ` to tune digest size; default fits in ~1k tokens.
 
+### Development Memories (store_memory / query_memories / surface_memories)
+
+` + "`save_note`" + ` is a **per-session scratchpad**; ` + "`store_memory`" + ` is the **workspace-wide durable knowledge base**. Memories outlive sessions, agents, and teammates: every future agent in this workspace inherits them. Memories carry ` + "`kind`" + ` (` + "`invariant`" + ` / ` + "`constraint`" + ` / ` + "`convention`" + ` / ` + "`gotcha`" + ` / ` + "`decision`" + ` / ` + "`incident`" + ` / ` + "`reference`" + `), ` + "`importance`" + ` (1..5), ` + "`confidence`" + ` (0..1), and ` + "`supersedes`" + ` for evolution. Use these on every meaningful task — the memory store compounds the longer your team uses Gortex.
+
+| Trigger                                                  | You MUST call                                                                 |
+|----------------------------------------------------------|-------------------------------------------------------------------------------|
+| Immediately after ` + "`smart_context`" + ` (every new task)            | ` + "`surface_memories task:\"<task>\" symbol_ids:\"<top hits>\"`" + ` — returns memories ranked by anchor symbol overlap, file overlap, keyword hits, importance, pinning, recency, and confidence. Each hit carries ` + "`match_reasons`" + ` so you know *why* it surfaced. |
+| You discover a durable invariant / gotcha / decision worth teaching the team | ` + "`store_memory kind:\"<kind>\" body:\"<what+why>\" symbol_ids:\"<id>\" importance:5`" + ` — pin (` + "`pinned:true`" + `) anything load-bearing. ` + "`title:\"<one-liner>\"`" + ` becomes the headline. |
+| Before editing a symbol with a known history             | ` + "`query_memories symbol_id:\"<id>\"`" + ` — all memories anchored or auto-linked to that symbol. |
+| A memory is no longer true                                | ` + "`store_memory body:\"<corrected>\" supersedes:\"<old-id>\"`" + ` — old entry stays in the store (audit), hidden from ` + "`surface_memories`" + ` by default. Don't delete unless the original was wrong. |
+| Browsing all wisdom anchored to a file                    | ` + "`query_memories file_path:\"<path>\"`" + ` or ` + "`query_memories kind:\"invariant\"`" + ` to filter by kind. |
+
+**Store:** invariants ("Bar must hold the lock"), conventions ("this package never uses gob"), incident learnings, API contracts not enforced by types, debugging traps, cross-cutting decisions with non-obvious rationale.
+**Skip:** anything derivable from the code (the graph already knows), session-local play-by-play (use ` + "`save_note`" + ` instead), CLAUDE.md / AGENTS.md content (already loaded), one-off observations with no actionable consequence.
+
 ### MCP Resources
 
 Bootstrap-state tools are also exposed as MCP resources (read-only, URI-addressable, no args). Subscribe via ` + "`resources/subscribe`" + ` once and receive ` + "`notifications/resources/updated`" + ` after each graph re-warm — no polling. Tools stay registered for back-compat with clients that don't speak resources; both surfaces share builder helpers so payloads match byte-for-byte.
@@ -505,8 +532,8 @@ Analyzer-backed rollups (read-only summaries; the only "argument" is the current
 2. If ` + "`total_nodes`" + ` is 0, call ` + "`index_repository`" + ` with path ` + "`\".\"`" + `.
 3. Call ` + "`distill_session`" + ` to recover prior session memory for this workspace — decisions, pinned notes, recent excerpts. Use the digest to seed your mental model before reading any file.
 4. In multi-repo mode, call ` + "`get_active_project`" + ` to check scope. Use ` + "`set_active_project`" + ` to switch if needed.
-5. For a new task, call ` + "`smart_context`" + ` with the task description.
-6. For every file you are about to edit, call ` + "`get_editing_context`" + ` first. If you've touched the symbol before, also call ` + "`query_notes symbol_id:\"<id>\"`" + ` to surface prior notes.
+5. For a new task, call ` + "`smart_context`" + ` with the task description. Immediately after, call ` + "`surface_memories task:\"<task>\" symbol_ids:\"<top hits>\"`" + ` to pick up any cross-session invariants / gotchas / decisions anchored to your working set.
+6. For every file you are about to edit, call ` + "`get_editing_context`" + ` first. If you've touched the symbol before, also call ` + "`query_notes symbol_id:\"<id>\"`" + ` and ` + "`query_memories symbol_id:\"<id>\"`" + ` to surface prior notes and durable memories.
 7. Before changing a function signature, call ` + "`verify_change`" + ` to catch contract violations — checks callers across all repos.
 8. Before any refactor, call ` + "`get_edit_plan`" + ` for dependency-ordered file list. Use ` + "`batch_edit`" + ` to apply atomically.
 9. After editing, call ` + "`check_guards`" + ` to verify team conventions, then ` + "`get_test_targets`" + ` for tests to run (includes cross-repo test files).

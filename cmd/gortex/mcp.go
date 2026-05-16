@@ -387,6 +387,11 @@ func runMCP(cmd *cobra.Command, args []string) error {
 	// query_notes / distill_session. Persisted alongside feedback so
 	// notes survive daemon restarts and compactions.
 	srv.InitNotes(mcpCacheDir, mcpIndex)
+	// Memories: cross-session development-memory store backing
+	// store_memory / query_memories / surface_memories. Shares the
+	// per-repo cache directory with notes; entries are workspace-wide
+	// and durable across sessions, compounding team knowledge.
+	srv.InitMemories(mcpCacheDir, mcpIndex)
 	// Combo tracker persists (query → chosen symbol) associations per repo
 	// so the next time the agent asks the same thing, the previously-picked
 	// symbol floats to the top of search results.

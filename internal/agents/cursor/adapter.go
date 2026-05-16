@@ -133,6 +133,12 @@ You **MUST** prefer Gortex graph queries over text search and whole-file opens o
 - **At session start**, call **distill_session** to recover decisions, pinned notes, and recent excerpts saved in prior sessions in this workspace.
 - **At every decision point** (picking an approach, rejecting an alternative, spotting a non-obvious constraint), call **save_note** with ` + "`tags:\"decision\"`" + ` and mention affected symbol IDs in the body — they auto-link.
 - **Before editing a symbol you've touched before**, call **query_notes** with ` + "`symbol_id:\"<id>\"`" + ` to surface prior warnings and decisions.
+
+**MANDATORY: development memories (cross-session)**
+
+- **Immediately after smart_context** on every task, call **surface_memories** with ` + "`task:\"<task>\"`" + ` and ` + "`symbol_ids:\"<top hits>\"`" + ` — returns memories ranked by anchor overlap, importance, pinning, recency.
+- **When you find a durable invariant, gotcha, or decision worth teaching the team**, call **store_memory** with ` + "`kind:\"<invariant|gotcha|convention|decision>\"`" + `, ` + "`symbol_ids:\"<id>\"`" + `, ` + "`importance:5`" + `. Pin load-bearing memories. Use ` + "`supersedes:\"<old-id>\"`" + ` when newer knowledge replaces older.
+- Memories are workspace-wide and outlive sessions, agents, and teammates — every future agent inherits them.
 `
 
 func (a *Adapter) Apply(env agents.Env, opts agents.ApplyOpts) (*agents.Result, error) {
