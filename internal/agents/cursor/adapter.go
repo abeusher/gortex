@@ -127,6 +127,12 @@ You **MUST** prefer Gortex graph queries over text search and whole-file opens o
 - **Always** start a new chat with **graph_stats** (or **index_health**) to confirm the daemon/index and orient in multi-repo workspaces.
 - **Use** **search_symbols**, **get_symbol_source**, **get_file_summary**, **get_call_chain**, **find_usages**, and **smart_context** instead of opening whole files or guessing with text search.
 - Before any signature or API change, **run** **verify_change**; for test selection **run** **get_test_targets**.
+
+**MANDATORY: session memory**
+
+- **At session start**, call **distill_session** to recover decisions, pinned notes, and recent excerpts saved in prior sessions in this workspace.
+- **At every decision point** (picking an approach, rejecting an alternative, spotting a non-obvious constraint), call **save_note** with ` + "`tags:\"decision\"`" + ` and mention affected symbol IDs in the body — they auto-link.
+- **Before editing a symbol you've touched before**, call **query_notes** with ` + "`symbol_id:\"<id>\"`" + ` to surface prior warnings and decisions.
 `
 
 func (a *Adapter) Apply(env agents.Env, opts agents.ApplyOpts) (*agents.Result, error) {

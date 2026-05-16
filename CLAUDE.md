@@ -48,6 +48,23 @@ Selected via `llm.provider` in `.gortex.yaml` or `~/.config/gortex/config.yaml`.
 - **Overlay sessions** (`overlay_push`, `overlay_list`, `overlay_drop`, `compare_with_overlay`) let editor extensions push unsaved buffers as a per-session shadow graph — every subsequent tool call reads through it without mutating base. Bound to the MCP session lifecycle; idle TTL via `GORTEX_OVERLAY_IDLE_TTL` (default 30m).
 - **Speculative execution** (`preview_edit`, `simulate_chain`) takes an LSP `WorkspaceEdit` and returns the graph diff + broken callers/implementors + impact rollup + suggested tests + (optional) LSP diagnostics — disk untouched. `simulate_chain` with `keep: true` promotes the final state into a real overlay.
 - **MCP 2026 Streamable HTTP** at `POST /mcp` — `gortex server` always mounts it; `gortex daemon --http-addr <addr>` opts the daemon in (non-localhost binds require `--http-auth-token`).
+- **Session memory** (`save_note`, `query_notes`, `distill_session`) persists agent-authored notes per repo, auto-linked to symbols mentioned in the body. Notes survive daemon restarts and context compactions, scoped to the session's workspace.
+
+## MANDATORY: Session memory — save, recall, distill
+
+The `save_note` / `query_notes` / `distill_session` triplet is the agent's durable scratchpad. The graph remembers code; these tools remember **why you made a call**. Without them, every compaction erases hard-won context.
+
+Three triggers — not suggestions:
+
+1. **After a context compaction (or at session start in a touched repo)** — **call** `distill_session` first thing. Returns top symbols, pinned notes, decisions, and recent excerpts from prior sessions in this workspace. Use the digest to seed your mental model before reading any file.
+2. **At every decision point** — **call** `save_note tags:"decision" body:"<what+why>"` when you pick an approach, reject an alternative, discover a non-obvious constraint, or commit to an invariant. Mention the affected symbol/file by ID (`pkg/foo.go::Bar`) so the auto-linker attaches the note to the graph. Pin (`pinned:true`) anything that should survive the store cap.
+3. **Before editing a symbol you've touched before** — **call** `query_notes symbol_id:"<id>"`. Prior decisions, bug-fix notes, or "do not change this without …" warnings ride on the symbol's note list and you should see them before re-deriving (or worse, reverting) past work.
+
+What to save vs. skip:
+- **Save:** decisions ("chose X over Y because Z"), non-obvious constraints, follow-ups ("revisit when …"), bug reproductions, surprising graph findings, partial-progress hand-offs.
+- **Skip:** play-by-play of what you just did (the diff says it), code patterns derivable from the graph, anything already in CLAUDE.md.
+
+Useful tags: `decision`, `bug`, `follow-up`, `gotcha`, `invariant`. `decision`-tagged notes are surfaced in their own section by `distill_session`.
 
 ## Required workflow (every task on this repo)
 

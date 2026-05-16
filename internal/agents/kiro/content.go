@@ -133,16 +133,30 @@ You **MUST** prefer Gortex graph queries over file reads on every task in this r
 | Scoping a query to a project          | Pass ` + "`project`" + ` param to any query tool |
 | Filtering by reference tag            | Pass ` + "`ref`" + ` param to any query tool |
 
+### Session Memory (save_note / query_notes / distill_session)
+
+Gortex remembers code; this triplet remembers **why you made a call**. Notes persist per-repo across daemon restarts and context compactions, are scoped to the session's workspace, and are auto-linked to symbols mentioned in the body.
+
+| Trigger                                                  | Use                                                                            |
+|----------------------------------------------------------|--------------------------------------------------------------------------------|
+| Session start in a touched repo (after a compaction or on a fresh run) | ` + "`distill_session`" + ` — returns top symbols, pinned notes, decisions, recent excerpts. Seed your mental model before reading any file. |
+| Making a decision, rejecting an alternative, hitting a non-obvious constraint, committing to an invariant | ` + "`save_note tags:\"decision\" body:\"<what+why>\"`" + ` — mention symbol IDs (` + "`pkg/foo.go::Bar`" + `) in the body for auto-linking; pin (` + "`pinned:true`" + `) anything load-bearing. |
+| Before editing a symbol you've touched before            | ` + "`query_notes symbol_id:\"<id>\"`" + ` — surfaces prior decisions and warnings attached to that symbol. |
+
+Save: decisions, non-obvious constraints, follow-ups, bug reproductions, surprising findings, partial-progress hand-offs. Skip: play-by-play of what you just did (the diff says it), patterns derivable from the graph, anything already in the steering docs. Canonical tags: ` + "`decision`" + `, ` + "`bug`" + `, ` + "`follow-up`" + `, ` + "`gotcha`" + `, ` + "`invariant`" + `.
+
 ## Session workflow
 
 1. Call ` + "`graph_stats`" + ` to confirm Gortex is running. If ` + "`total_nodes`" + ` is 0, call ` + "`index_repository`" + ` with path ` + "`\".\"`" + `.
-2. In multi-repo mode, call ` + "`get_active_project`" + ` to check scope. Use ` + "`set_active_project`" + ` to switch if needed.
-3. For a new task, call ` + "`smart_context`" + ` with the task description.
-4. Before editing any file, call ` + "`get_editing_context`" + ` first.
-5. Before changing a function signature, call ` + "`verify_change`" + ` to catch contract violations — checks callers across all repos.
-6. Before any refactor, call ` + "`get_edit_plan`" + ` for dependency-ordered file list. Use ` + "`batch_edit`" + ` to apply atomically.
-7. After editing, call ` + "`check_guards`" + ` to verify team conventions, then ` + "`get_test_targets`" + ` for tests to run (includes cross-repo test files).
-8. Before committing, call ` + "`detect_changes`" + ` to verify scope. Use ` + "`diff_context`" + ` for graph-enriched review.
+2. Call ` + "`distill_session`" + ` to recover prior session memory for this workspace.
+3. In multi-repo mode, call ` + "`get_active_project`" + ` to check scope. Use ` + "`set_active_project`" + ` to switch if needed.
+4. For a new task, call ` + "`smart_context`" + ` with the task description.
+5. Before editing any file, call ` + "`get_editing_context`" + ` first. If you've touched the symbol before, also call ` + "`query_notes symbol_id:\"<id>\"`" + `.
+6. Before changing a function signature, call ` + "`verify_change`" + ` to catch contract violations — checks callers across all repos.
+7. Before any refactor, call ` + "`get_edit_plan`" + ` for dependency-ordered file list. Use ` + "`batch_edit`" + ` to apply atomically.
+8. After editing, call ` + "`check_guards`" + ` to verify team conventions, then ` + "`get_test_targets`" + ` for tests to run (includes cross-repo test files).
+9. After making a meaningful decision or hitting a non-obvious constraint, call ` + "`save_note`" + ` so the next session can recover it.
+10. Before committing, call ` + "`detect_changes`" + ` to verify scope. Use ` + "`diff_context`" + ` for graph-enriched review.
 `
 
 const steeringExplore = `---
@@ -327,4 +341,5 @@ var AutoApproveTools = []string{
 	"diff_context", "index_health", "get_symbol_history",
 	"scaffold", "batch_edit",
 	"contracts", "feedback",
+	"save_note", "query_notes", "distill_session",
 }

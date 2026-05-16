@@ -116,6 +116,7 @@ type Server struct {
 	contractRegistry *contracts.Registry
 	semanticMgr      *semantic.Manager
 	feedback         *feedbackManager
+	notes            *notesManager
 	combo            *comboManager
 	frecency         *frecencyTracker
 
@@ -581,6 +582,7 @@ func NewServer(engine *query.Engine, g *graph.Graph, idx *indexer.Indexer, watch
 	s.registerASTTools()
 	s.registerCloneTools()
 	s.registerSimulationTools()
+	s.registerNotesTools()
 	s.registerResources()
 	s.registerPrompts()
 
@@ -651,6 +653,15 @@ func (s *Server) SetupLLM(cfg llm.Config) {
 // Call after NewServer with the cache directory and primary repo path.
 func (s *Server) InitFeedback(cacheDir, repoPath string) {
 	s.feedback = newFeedbackManager(cacheDir, repoPath)
+}
+
+// InitNotes initializes the session-memory manager used by the
+// save_note / query_notes / distill_session tools. Call after
+// NewServer with the cache directory and primary repo path.
+// Empty arguments yield an in-memory-only manager (still wired
+// to the tools, just doesn't flush to disk).
+func (s *Server) InitNotes(cacheDir, repoPath string) {
+	s.notes = newNotesManager(cacheDir, repoPath)
 }
 
 // WorkspaceScope returns the default workspace slug filter applied

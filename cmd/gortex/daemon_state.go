@@ -387,6 +387,7 @@ func buildDaemonState(logger *zap.Logger) (*daemonState, error) {
 		srv.SetLSPDiagnosticsBroadcasting()
 	}
 	srv.InitFeedback("", "")
+	srv.InitNotes("", "")
 	srv.InitCombo("", "", gortexmcp.ModeAI)
 	srv.InitFrecency("", "", gortexmcp.ModeAI)
 

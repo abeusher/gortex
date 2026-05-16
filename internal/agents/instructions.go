@@ -194,9 +194,23 @@ Bootstrap-state tools (` + "`graph_stats`" + ` / ` + "`index_health`" + ` / ` + 
 
 Analyzer rollups (read-only summaries of the current indexed state): ` + "`gortex://report`" + ` (orientation), ` + "`gortex://god-nodes`" + ` (top hotspots), ` + "`gortex://surprises`" + ` (cycles + dead code + hubs), ` + "`gortex://audit`" + ` (CLAUDE.md drift), ` + "`gortex://questions`" + ` (TODOs).
 
+### Session Memory (save_note / query_notes / distill_session)
+
+Gortex remembers code; this triplet remembers **why you made a call**. Notes persist per-repo across daemon restarts and context compactions, scoped to the session's workspace, auto-linked to symbols mentioned in the body.
+
+| Trigger                                                  | You MUST call                                                                 |
+|----------------------------------------------------------|-------------------------------------------------------------------------------|
+| Session start in a touched repo (after a compaction or on a fresh run) | ` + "`distill_session`" + ` — top symbols, pinned notes, decisions, recent excerpts. Seed your mental model before reading any file. |
+| Making a decision, rejecting an alternative, hitting a non-obvious constraint, committing to an invariant | ` + "`save_note tags:\"decision\" body:\"<what+why>\"`" + ` — mention symbol IDs in the body for auto-linking; pin (` + "`pinned:true`" + `) anything load-bearing. |
+| Before editing a symbol you've touched before            | ` + "`query_notes symbol_id:\"<id>\"`" + ` — prior decisions and warnings ride on each symbol. |
+
+**Save:** decisions, non-obvious constraints, follow-ups, bug reproductions, surprising graph findings, partial-progress hand-offs. **Skip:** play-by-play (the diff says it), patterns derivable from the graph, anything already in CLAUDE.md. Canonical tags: ` + "`decision`" + `, ` + "`bug`" + `, ` + "`follow-up`" + `, ` + "`gotcha`" + `, ` + "`invariant`" + ` — ` + "`decision`" + ` gets its own section in ` + "`distill_session`" + `.
+
 ### Session Start
 
 The SessionStart hook injects daemon status (tracked repos, cwd coverage, ready/warmup state). If you see "daemon is not running" — run ` + "`gortex daemon start --detach`" + ` and re-run the task. If you see "cwd is not covered by any tracked repo" — graph tools won't be available for that directory.
+
+Once the daemon is up, **call** ` + "`distill_session`" + ` next — surfaces decisions / pinned notes / recent excerpts saved in prior sessions in this workspace so a context compaction or a fresh process doesn't erase what was already learned.
 `
 
 // InstructionsBody is the shared rule block every adapter writes to
@@ -440,6 +454,25 @@ Built on the same shadow-graph substrate, ` + "`preview_edit`" + ` and ` + "`sim
 
 **Diagnostics restoration.** The diagnostics pass opens each touched file on the relevant LSP server, sends a ` + "`didChange`" + ` with the simulated content, waits for ` + "`publishDiagnostics`" + `, then sends a second ` + "`didChange`" + ` restoring the on-disk bytes — so concurrent sessions on the same daemon never observe the simulated state as authoritative. Set ` + "`diagnostics: false`" + ` to skip the LSP round-trip when only the graph delta matters.
 
+### Session Memory (save_note / query_notes / distill_session)
+
+Gortex remembers code; this triplet remembers **why you made a call**. Notes persist per-repo across daemon restarts and context compactions, are scoped to the session's workspace, and are auto-linked to symbols mentioned in the body (` + "`pkg/foo.go::Bar`" + ` IDs resolve directly; bare identifiers resolve via the graph's name index, ambiguous names dropped for precision). Use these on every meaningful task — not "optional."
+
+| Trigger                                                  | You MUST call                                                                 |
+|----------------------------------------------------------|-------------------------------------------------------------------------------|
+| At session start in any touched repo (after a compaction or on a fresh run) | ` + "`distill_session`" + ` — returns top symbols, pinned notes, decisions, recent excerpts from prior sessions. Seed your mental model with this before reading any file. |
+| You make a decision, reject an alternative, find a non-obvious constraint, or commit to an invariant | ` + "`save_note tags:\"decision\" body:\"<what+why>\"`" + ` — mention affected symbol IDs in the body for auto-linking; pin (` + "`pinned:true`" + `) anything load-bearing. |
+| Before editing a symbol you've touched before            | ` + "`query_notes symbol_id:\"<id>\"`" + ` — surfaces prior decisions, gotchas, "do not change this without …" warnings attached to that symbol. |
+| Mid-task discovery worth a follow-up                     | ` + "`save_note tags:\"follow-up\" body:\"<what to revisit and why>\"`" + ` — keeps the lead alive after compaction. |
+| Looking for what was tried in this area before           | ` + "`query_notes text:\"<keyword>\"`" + ` or ` + "`query_notes file_path:\"<path>\"`" + ` — full filter set: symbol_id, file_path, tag, text, session_id (` + "`all`" + ` for cross-session), since (RFC-3339), pinned_only. |
+
+**What to save:** decisions, non-obvious constraints, follow-ups ("revisit when …"), bug reproductions, surprising graph findings, partial-progress hand-offs.
+**What to skip:** play-by-play of what you just did (the diff says it), code patterns derivable from the graph, anything already in CLAUDE.md / AGENTS.md.
+
+Canonical tags: ` + "`decision`" + `, ` + "`bug`" + `, ` + "`follow-up`" + `, ` + "`gotcha`" + `, ` + "`invariant`" + `. The ` + "`decision`" + ` tag gets its own section in ` + "`distill_session`" + `.
+
+` + "`save_note`" + ` also accepts ` + "`id`" + ` (switches to update mode), ` + "`links`" + ` (comma-separated symbol IDs to attach explicitly), ` + "`no_autolink: true`" + ` (when the body intentionally mentions identifiers that should not be linked), and ` + "`file_path`" + ` (when the note is about a file, not a symbol). ` + "`distill_session`" + ` accepts ` + "`max_symbols`" + ` / ` + "`max_files`" + ` / ` + "`max_tags`" + ` / ` + "`max_recent`" + ` / ` + "`excerpt_chars`" + ` to tune digest size; default fits in ~1k tokens.
+
 ### MCP Resources
 
 Bootstrap-state tools are also exposed as MCP resources (read-only, URI-addressable, no args). Subscribe via ` + "`resources/subscribe`" + ` once and receive ` + "`notifications/resources/updated`" + ` after each graph re-warm — no polling. Tools stay registered for back-compat with clients that don't speak resources; both surfaces share builder helpers so payloads match byte-for-byte.
@@ -470,13 +503,15 @@ Analyzer-backed rollups (read-only summaries; the only "argument" is the current
 
 1. Call ` + "`graph_stats`" + ` to confirm Gortex is running and get repo orientation.
 2. If ` + "`total_nodes`" + ` is 0, call ` + "`index_repository`" + ` with path ` + "`\".\"`" + `.
-3. In multi-repo mode, call ` + "`get_active_project`" + ` to check scope. Use ` + "`set_active_project`" + ` to switch if needed.
-4. For a new task, call ` + "`smart_context`" + ` with the task description.
-5. For every file you are about to edit, call ` + "`get_editing_context`" + ` first.
-6. Before changing a function signature, call ` + "`verify_change`" + ` to catch contract violations — checks callers across all repos.
-7. Before any refactor, call ` + "`get_edit_plan`" + ` for dependency-ordered file list. Use ` + "`batch_edit`" + ` to apply atomically.
-8. After editing, call ` + "`check_guards`" + ` to verify team conventions, then ` + "`get_test_targets`" + ` for tests to run (includes cross-repo test files).
-9. Before committing, call ` + "`detect_changes`" + ` to verify scope. Use ` + "`diff_context`" + ` for graph-enriched review.
+3. Call ` + "`distill_session`" + ` to recover prior session memory for this workspace — decisions, pinned notes, recent excerpts. Use the digest to seed your mental model before reading any file.
+4. In multi-repo mode, call ` + "`get_active_project`" + ` to check scope. Use ` + "`set_active_project`" + ` to switch if needed.
+5. For a new task, call ` + "`smart_context`" + ` with the task description.
+6. For every file you are about to edit, call ` + "`get_editing_context`" + ` first. If you've touched the symbol before, also call ` + "`query_notes symbol_id:\"<id>\"`" + ` to surface prior notes.
+7. Before changing a function signature, call ` + "`verify_change`" + ` to catch contract violations — checks callers across all repos.
+8. Before any refactor, call ` + "`get_edit_plan`" + ` for dependency-ordered file list. Use ` + "`batch_edit`" + ` to apply atomically.
+9. After editing, call ` + "`check_guards`" + ` to verify team conventions, then ` + "`get_test_targets`" + ` for tests to run (includes cross-repo test files).
+10. After making a meaningful decision or hitting a non-obvious constraint, call ` + "`save_note tags:\"decision\" body:\"<what+why>\"`" + ` so the next session can recover it.
+11. Before committing, call ` + "`detect_changes`" + ` to verify scope. Use ` + "`diff_context`" + ` for graph-enriched review.
 
 ## Graph Schema (Gortex)
 

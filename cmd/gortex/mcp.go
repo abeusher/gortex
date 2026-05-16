@@ -383,6 +383,10 @@ func runMCP(cmd *cobra.Command, args []string) error {
 
 	// Initialize feedback persistence for cross-session context learning.
 	srv.InitFeedback(mcpCacheDir, mcpIndex)
+	// Notes: per-repo session memory store backing save_note /
+	// query_notes / distill_session. Persisted alongside feedback so
+	// notes survive daemon restarts and compactions.
+	srv.InitNotes(mcpCacheDir, mcpIndex)
 	// Combo tracker persists (query → chosen symbol) associations per repo
 	// so the next time the agent asks the same thing, the previously-picked
 	// symbol floats to the top of search results.
