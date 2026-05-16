@@ -3,7 +3,9 @@ package indexer
 import (
 	"fmt"
 	"os"
+	"sort"
 	"sync"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -22,6 +24,14 @@ type MultiWatcher struct {
 	events      chan GraphChangeEvent
 	done        chan struct{}
 	mu          sync.Mutex
+
+	// symbolChangeCb is the OnSymbolChange callback registered by the
+	// MCP server (or any other consumer). It's fanned out to every
+	// per-repo Watcher and re-applied at AddRepo time so newly-tracked
+	// repos pick it up without a second registration call. Guarded by
+	// callbackMu so registration and per-repo apply don't race.
+	callbackMu     sync.Mutex
+	symbolChangeCb SymbolChangeCallback
 }
 
 // NewMultiWatcher creates a MultiWatcher that watches all configured repos.
@@ -211,6 +221,65 @@ func (mw *MultiWatcher) Events() <-chan GraphChangeEvent {
 	return mw.events
 }
 
+// History returns the union of per-repo histories, sorted newest-first.
+// Implements the same surface as Watcher.History so the MCP server can
+// consume either a single Watcher or a MultiWatcher through the same
+// interface and `get_recent_changes` lights up under the daemon.
+func (mw *MultiWatcher) History() []GraphChangeEvent {
+	mw.mu.Lock()
+	watchers := make([]*Watcher, 0, len(mw.watchers))
+	for _, w := range mw.watchers {
+		watchers = append(watchers, w)
+	}
+	mw.mu.Unlock()
+
+	var out []GraphChangeEvent
+	for _, w := range watchers {
+		out = append(out, w.History()...)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Timestamp.After(out[j].Timestamp) })
+	return out
+}
+
+// HistorySince returns the union of per-repo events strictly after the
+// given timestamp, sorted newest-first.
+func (mw *MultiWatcher) HistorySince(since time.Time) []GraphChangeEvent {
+	mw.mu.Lock()
+	watchers := make([]*Watcher, 0, len(mw.watchers))
+	for _, w := range mw.watchers {
+		watchers = append(watchers, w)
+	}
+	mw.mu.Unlock()
+
+	var out []GraphChangeEvent
+	for _, w := range watchers {
+		out = append(out, w.HistorySince(since)...)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Timestamp.After(out[j].Timestamp) })
+	return out
+}
+
+// OnSymbolChange registers the callback against every current per-repo
+// Watcher and stores it so AddRepo applies it to future watchers too.
+// Replaces any previously registered callback (matches Watcher.OnSymbolChange
+// semantics).
+func (mw *MultiWatcher) OnSymbolChange(cb SymbolChangeCallback) {
+	mw.callbackMu.Lock()
+	mw.symbolChangeCb = cb
+	mw.callbackMu.Unlock()
+
+	mw.mu.Lock()
+	watchers := make([]*Watcher, 0, len(mw.watchers))
+	for _, w := range mw.watchers {
+		watchers = append(watchers, w)
+	}
+	mw.mu.Unlock()
+
+	for _, w := range watchers {
+		w.OnSymbolChange(cb)
+	}
+}
+
 // AddRepo creates and starts a watcher for a newly tracked repo.
 func (mw *MultiWatcher) AddRepo(repoPrefix string, cfg config.WatchConfig) error {
 	mw.mu.Lock()
@@ -249,6 +318,17 @@ func (mw *MultiWatcher) AddRepo(repoPrefix string, cfg config.WatchConfig) error
 			}
 		}
 	}
+
+	// Apply any previously-registered symbol-change callback so a repo
+	// added at runtime contributes to get_symbol_history just like the
+	// repos created at MultiWatcher construction time.
+	mw.callbackMu.Lock()
+	cb := mw.symbolChangeCb
+	mw.callbackMu.Unlock()
+	if cb != nil {
+		w.OnSymbolChange(cb)
+	}
+
 	go mw.forwardEvents(repoPrefix, w)
 	return nil
 }

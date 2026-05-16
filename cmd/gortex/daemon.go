@@ -282,6 +282,14 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		logger.Info("daemon: warmup starting")
 		mw := warmupDaemonState(state, logger)
 		controller.AttachWatcher(mw)
+		// Wire the daemon's MultiWatcher into the per-server history
+		// surface so `get_recent_changes` and `get_symbol_history` see
+		// real events under the daemon. Without this the tools always
+		// reported "watch mode is not active" even though MultiWatcher
+		// was actively re-indexing changed files.
+		if state.mcpServer != nil && mw != nil {
+			state.mcpServer.SetWatcher(mw)
+		}
 		// Community detection and process discovery only run when a
 		// repo is tracked or indexed via MCP — a daemon coming up off
 		// a snapshot never triggers them. Fire once here so

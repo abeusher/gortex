@@ -82,7 +82,7 @@ type Server struct {
 	engine        *query.Engine
 	graph         *graph.Graph
 	indexer       *indexer.Indexer
-	watcher       *indexer.Watcher
+	watcher       watcherHistory
 	multiIndexer  *indexer.MultiIndexer
 	configManager *config.ConfigManager
 	activeProject string
@@ -551,7 +551,6 @@ func NewServer(engine *query.Engine, g *graph.Graph, idx *indexer.Indexer, watch
 		engine:     engine,
 		graph:      g,
 		indexer:    idx,
-		watcher:    watcher,
 		logger:     logger,
 		session:    newSessionState(),
 		tokenStats: &tokenStats{},
@@ -561,6 +560,15 @@ func NewServer(engine *query.Engine, g *graph.Graph, idx *indexer.Indexer, watch
 		sessions:   newSessionMap(),
 		guardRules: guardRules,
 		toolScopes: newScopeRegistry(),
+	}
+
+	// Assign the watcher only when the caller actually supplied one.
+	// Storing a typed-nil *indexer.Watcher in the watcherHistory
+	// interface field would produce a non-nil interface wrapping a
+	// nil pointer — `s.watcher == nil` checks in handlers would then
+	// pass through to method calls and panic.
+	if watcher != nil {
+		s.watcher = watcher
 	}
 
 	// Apply multi-repo options if provided.
@@ -1188,9 +1196,23 @@ func (s *Server) SemanticManager() *semantic.Manager {
 	return s.semanticMgr
 }
 
+// watcherHistory is the subset of indexer.Watcher / indexer.MultiWatcher
+// the MCP server consumes. Defined as an interface so the server can
+// accept either a single-repo Watcher (legacy `gortex mcp --watch` path)
+// or a MultiWatcher (daemon path) through one SetWatcher call. The two
+// concrete types already expose the same surface; this interface just
+// names it.
+type watcherHistory interface {
+	History() []indexer.GraphChangeEvent
+	HistorySince(since time.Time) []indexer.GraphChangeEvent
+	OnSymbolChange(cb indexer.SymbolChangeCallback)
+}
+
 // SetWatcher sets the watcher after background initialization and registers
 // a symbol change callback to record modifications in symbolHistory.
-func (s *Server) SetWatcher(w *indexer.Watcher) {
+// Accepts either a single-repo *indexer.Watcher or a multi-repo
+// *indexer.MultiWatcher — both satisfy watcherHistory.
+func (s *Server) SetWatcher(w watcherHistory) {
 	s.watcher = w
 
 	// Register callback to track symbol modifications for get_symbol_history.

@@ -3,6 +3,8 @@ package indexer
 import (
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -257,4 +259,147 @@ func TestMultiWatcher_EventsChannel(t *testing.T) {
 
 	ch := mw.Events()
 	assert.NotNil(t, ch)
+}
+
+// TestMultiWatcher_HistoryUnionAcrossRepos exercises the History /
+// HistorySince surface MCP's get_recent_changes consumes. The
+// MultiWatcher must merge per-repo histories newest-first so an agent
+// gets a unified change feed for the whole workspace.
+func TestMultiWatcher_HistoryUnionAcrossRepos(t *testing.T) {
+	mw, mi, repoADir, repoBDir := setupMultiWatcherTest(t)
+	require.NoError(t, mw.Start())
+	defer func() { _ = mw.Stop() }()
+
+	before := time.Now()
+
+	writeFile(t, filepath.Join(repoADir, "main.go"), `package main
+func ChangedA() {}
+`)
+	_ = waitForMultiEvent(t, mw, 3*time.Second)
+
+	writeFile(t, filepath.Join(repoBDir, "main.go"), `package main
+func ChangedB() {}
+`)
+	_ = waitForMultiEvent(t, mw, 3*time.Second)
+
+	// Allow per-watcher history to settle (history is appended on the
+	// same goroutine that emits the channel event so it's visible by
+	// the time the event surfaces, but be conservative).
+	time.Sleep(50 * time.Millisecond)
+
+	hist := mw.History()
+	require.NotEmpty(t, hist, "history should contain both repo edits")
+
+	// At minimum: one event per repo from each modify burst.
+	repoSeen := map[string]bool{}
+	for _, ev := range hist {
+		if strings.HasPrefix(ev.FilePath, repoADir) {
+			repoSeen["a"] = true
+		}
+		if strings.HasPrefix(ev.FilePath, repoBDir) {
+			repoSeen["b"] = true
+		}
+	}
+	assert.True(t, repoSeen["a"], "history must include repo-a event")
+	assert.True(t, repoSeen["b"], "history must include repo-b event")
+
+	// Newest-first ordering.
+	for i := 1; i < len(hist); i++ {
+		assert.False(t, hist[i].Timestamp.After(hist[i-1].Timestamp),
+			"history must be sorted newest-first")
+	}
+
+	// HistorySince filters by timestamp; everything we observed is
+	// after `before`.
+	since := mw.HistorySince(before)
+	assert.Equal(t, len(hist), len(since),
+		"HistorySince(before-everything) should equal History()")
+
+	// A future cutoff yields nothing.
+	future := mw.HistorySince(time.Now().Add(time.Hour))
+	assert.Empty(t, future)
+
+	_ = mi // silence unused
+}
+
+// TestMultiWatcher_OnSymbolChangeFanout exercises the OnSymbolChange
+// surface MCP's symbolHistory consumes. The callback must:
+//   - fan out to every per-repo Watcher present at registration time
+//   - be applied to repos added at runtime via AddRepo
+//
+// Per-Watcher emits relative paths (e.g. "main.go") so we count
+// invocations per per-Watcher rather than match absolute prefixes.
+func TestMultiWatcher_OnSymbolChangeFanout(t *testing.T) {
+	mw, mi, repoADir, repoBDir := setupMultiWatcherTest(t)
+	require.NoError(t, mw.Start())
+	defer func() { _ = mw.Stop() }()
+
+	var mu sync.Mutex
+	var hits int
+	mw.OnSymbolChange(func(filePath string, oldSymbols, newSymbols []*graph.Node) {
+		mu.Lock()
+		hits++
+		mu.Unlock()
+	})
+
+	// Verify both registration-time watchers got the callback wired.
+	mw.mu.Lock()
+	wA := mw.watchers["repo-a"]
+	wB := mw.watchers["repo-b"]
+	mw.mu.Unlock()
+	require.NotNil(t, wA)
+	require.NotNil(t, wB)
+	wA.symbolChangeCbMu.RLock()
+	require.NotNil(t, wA.symbolChangeCb, "repo-a watcher must have callback after MultiWatcher.OnSymbolChange")
+	wA.symbolChangeCbMu.RUnlock()
+	wB.symbolChangeCbMu.RLock()
+	require.NotNil(t, wB.symbolChangeCb, "repo-b watcher must have callback after MultiWatcher.OnSymbolChange")
+	wB.symbolChangeCbMu.RUnlock()
+
+	// Modify the two existing repos.
+	writeFile(t, filepath.Join(repoADir, "main.go"), `package main
+func ChangedA() {}
+`)
+	_ = waitForMultiEvent(t, mw, 3*time.Second)
+
+	writeFile(t, filepath.Join(repoBDir, "main.go"), `package main
+func ChangedB() {}
+`)
+	_ = waitForMultiEvent(t, mw, 3*time.Second)
+
+	// Add a repo at runtime and modify it — the callback must apply
+	// without a second OnSymbolChange call.
+	newRepoDir := filepath.Join(t.TempDir(), "repo-c")
+	require.NoError(t, os.MkdirAll(newRepoDir, 0o755))
+	writeFile(t, filepath.Join(newRepoDir, "main.go"), `package main
+func HelloC() {}
+`)
+	_, err := mi.TrackRepo(config.RepoEntry{Path: newRepoDir, Name: "repo-c"})
+	require.NoError(t, err)
+	require.NoError(t, mw.AddRepo("repo-c", config.WatchConfig{
+		Enabled: true, DebounceMs: 50,
+	}))
+
+	// Verify AddRepo wired the callback onto the new repo's per-Watcher.
+	mw.mu.Lock()
+	wC := mw.watchers["repo-c"]
+	mw.mu.Unlock()
+	require.NotNil(t, wC)
+	wC.symbolChangeCbMu.RLock()
+	require.NotNil(t, wC.symbolChangeCb,
+		"AddRepo must propagate the symbol-change callback to the new per-Watcher")
+	wC.symbolChangeCbMu.RUnlock()
+
+	writeFile(t, filepath.Join(newRepoDir, "main.go"), `package main
+func ChangedC() {}
+`)
+	_ = waitForMultiEvent(t, mw, 3*time.Second)
+
+	// Allow callbacks to settle.
+	time.Sleep(100 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.GreaterOrEqual(t, hits, 3,
+		"callback should fire at least once per modify across the 3 repos (got %d)", hits)
 }
