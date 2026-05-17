@@ -630,6 +630,18 @@ func encodeAnalyze(kind string, payload any) ([]byte, error) {
 			}
 		}
 		return buf.Bytes(), enc.Close()
+	case "unsafe_patterns":
+		items, _ := payload.([]unsafePatternItem)
+		enc := newGCX(&buf, "analyze.unsafe_patterns",
+			[]string{"detector", "severity", "language", "file", "line", "symbol", "text"},
+			"count", fmt.Sprintf("%d", len(items)),
+		)
+		for _, it := range items {
+			if err := enc.WriteRow(it.Detector, it.Severity, it.Language, it.File, it.Line, it.Symbol, it.Text); err != nil {
+				return nil, err
+			}
+		}
+		return buf.Bytes(), enc.Close()
 	default:
 		// Fall back to generic so analyze variants without a hand-tuned
 		// encoder still produce valid GCX instead of failing.
@@ -783,6 +795,18 @@ type crossRepoItem struct {
 	Kind     string
 	Count    int
 	Samples  string
+}
+
+// unsafePatternItem is one row of `analyze kind=unsafe_patterns`:
+// a single match from one of the bundled unsafe-pattern detectors.
+type unsafePatternItem struct {
+	Detector string
+	Severity string
+	Language string
+	File     string
+	Line     int
+	Symbol   string
+	Text     string
 }
 
 // --------------------------------------------------------------------

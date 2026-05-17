@@ -298,6 +298,12 @@ func TestListDetectors_TenBundled(t *testing.T) {
 		"empty-catch":                 false,
 		"java-string-equality":        false,
 		"python-mutable-default-arg":  false,
+		"unsafe-rust-unwrap":          false,
+		"unsafe-rust-panic-macro":     false,
+		"unsafe-rust-assert-macro":    false,
+		"unsafe-rust-block":           false,
+		"unsafe-python-assert":        false,
+		"unsafe-js-throw":             false,
 	}
 	for _, n := range names {
 		if _, ok := want[n]; ok {
@@ -307,6 +313,129 @@ func TestListDetectors_TenBundled(t *testing.T) {
 	for n, present := range want {
 		assert.True(t, present, "detector %q should be registered", n)
 	}
+}
+
+func TestDetector_UnsafeRustUnwrap_Fires(t *testing.T) {
+	src := `fn run(s: &str) {
+    let n: i32 = s.parse().unwrap();
+    let _v = std::fs::read("x").expect("missing");
+    let _ = s.parse::<i32>().unwrap_or_else(|_| 0);
+    let _ = match s.parse::<i32>() { Ok(v) => v, Err(_) => 0 };
+}
+`
+	res := runDetector(t, "unsafe-rust-unwrap", "rust", "lib.rs", src)
+	require.Equal(t, 3, res.Total, ".unwrap(), .expect(), .unwrap_or_else() must fire; the match arm must not")
+	assert.Equal(t, "warning", res.Matches[0].Severity)
+}
+
+func TestDetector_UnsafeRustUnwrap_DoesNotFireOnUnrelatedMethods(t *testing.T) {
+	src := `fn run() {
+    let v: Vec<i32> = Vec::new();
+    let _ = v.iter().count();
+    let _ = v.len();
+}
+`
+	res := runDetector(t, "unsafe-rust-unwrap", "rust", "lib.rs", src)
+	assert.Equal(t, 0, res.Total)
+}
+
+func TestDetector_UnsafeRustPanicMacro_Fires(t *testing.T) {
+	src := `fn run(n: i32) {
+    if n < 0 {
+        panic!("negative");
+    }
+    if n == 0 {
+        todo!("zero handling");
+    }
+    if n > 100 {
+        unreachable!();
+    }
+    if n == 1 {
+        unimplemented!();
+    }
+    println!("ok"); // must not match
+}
+`
+	res := runDetector(t, "unsafe-rust-panic-macro", "rust", "lib.rs", src)
+	require.Equal(t, 4, res.Total, "panic!, todo!, unreachable!, unimplemented! must fire; println! must not")
+}
+
+func TestDetector_UnsafeRustAssertMacro_Fires(t *testing.T) {
+	src := `fn run(a: i32, b: i32) {
+    assert!(a > 0);
+    assert_eq!(a, b);
+    assert_ne!(a, -1);
+    debug_assert!(a < 1_000);
+    debug_assert_eq!(a, b);
+    debug_assert_ne!(a, -2);
+    let _ = format!("{a}"); // must not match
+}
+`
+	res := runDetector(t, "unsafe-rust-assert-macro", "rust", "lib.rs", src)
+	require.Equal(t, 6, res.Total, "all six assert/debug_assert variants must fire")
+	assert.Equal(t, "info", res.Matches[0].Severity)
+}
+
+func TestDetector_UnsafeRustBlock_Fires(t *testing.T) {
+	src := `unsafe fn raw() {}
+
+fn safe() {
+    unsafe {
+        let _ = 0;
+    }
+}
+
+fn also_safe() {
+    let _ = 1; // no match
+}
+`
+	res := runDetector(t, "unsafe-rust-block", "rust", "lib.rs", src)
+	require.Equal(t, 2, res.Total, "unsafe fn and unsafe { } must each fire once")
+}
+
+func TestDetector_UnsafePythonAssert_Fires(t *testing.T) {
+	src := `def run(x):
+    assert x > 0
+    if x < 0:
+        raise ValueError("neg")
+    return x + 1
+`
+	res := runDetector(t, "unsafe-python-assert", "python", "lib.py", src)
+	require.Equal(t, 1, res.Total)
+	assert.Equal(t, "warning", res.Matches[0].Severity)
+}
+
+func TestDetector_UnsafePythonAssert_SkipsTestFiles(t *testing.T) {
+	src := `def test_run():
+    assert 1 + 1 == 2
+`
+	res := runDetector(t, "unsafe-python-assert", "python", "test_run.py", src)
+	assert.Equal(t, 0, res.Total, "test_*.py must be excluded by default")
+}
+
+func TestDetector_UnsafeJSThrow_Fires(t *testing.T) {
+	src := `function run(x) {
+  if (x < 0) {
+    throw new Error("neg");
+  }
+  return x;
+}
+`
+	res := runDetector(t, "unsafe-js-throw", "javascript", "lib.js", src)
+	require.Equal(t, 1, res.Total)
+	assert.Equal(t, "info", res.Matches[0].Severity)
+}
+
+func TestDetector_UnsafeJSThrow_TypeScript(t *testing.T) {
+	src := `function run(x: number): number {
+  if (x < 0) {
+    throw new Error("neg");
+  }
+  return x;
+}
+`
+	res := runDetector(t, "unsafe-js-throw", "typescript", "lib.ts", src)
+	require.Equal(t, 1, res.Total)
 }
 
 func TestRawPattern_GoCallExpression(t *testing.T) {

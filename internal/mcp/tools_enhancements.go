@@ -118,8 +118,8 @@ func (s *Server) registerEnhancementTools() {
 	// analyze — unified graph analysis tool (dead_code, hotspots, cycles, would_create_cycle)
 	s.addTool(
 		mcp.NewTool("analyze",
-			mcp.WithDescription("Unified graph analysis. kind=dead_code: symbols with zero incoming edges. kind=hotspots: high-complexity symbols by fan-in/out. kind=cycles: circular dependency chains. kind=would_create_cycle: check if a new edge would form a cycle (requires from_id, to_id). kind=todos: list KindTodo nodes with optional tag/assignee/ticket/has_assignee filters. kind=blame: run `git blame` against the indexed repo and stamp meta.last_authored on every symbol-level node. kind=coverage: parse a Go cover.out profile (path via `profile` arg) and stamp meta.coverage_pct on every executable symbol. kind=stale_code: list symbols whose meta.last_authored is older than the threshold (requires blame-enriched graph). kind=ownership: group blame metadata by author email — symbol count, files touched, oldest/newest timestamps; supports path_prefix scoping (requires blame-enriched graph). kind=coverage_gaps: list symbols whose meta.coverage_pct falls in [min_pct, max_pct) — sorted ascending so the most undertested code surfaces first (requires coverage-enriched graph)."),
-			mcp.WithString("kind", mcp.Required(), mcp.Description("Analysis kind: dead_code | hotspots | cycles | would_create_cycle | todos | blame | coverage | stale_code | ownership | coverage_gaps | stale_flags | releases | cgo_users | wasm_users | orphan_tables | unreferenced_tables | coverage_summary | channel_ops | goroutine_spawns | field_writers | annotation_users | config_readers | event_emitters | pubsub | string_emitters | error_surface | log_events | sql_rebuild | external_calls | routes | models | components | k8s_resources | images | kustomize | cross_repo | dbt_models")),
+			mcp.WithDescription("Unified graph analysis. kind=dead_code: symbols with zero incoming edges. kind=hotspots: high-complexity symbols by fan-in/out. kind=cycles: circular dependency chains. kind=would_create_cycle: check if a new edge would form a cycle (requires from_id, to_id). kind=todos: list KindTodo nodes with optional tag/assignee/ticket/has_assignee filters. kind=blame: run `git blame` against the indexed repo and stamp meta.last_authored on every symbol-level node. kind=coverage: parse a Go cover.out profile (path via `profile` arg) and stamp meta.coverage_pct on every executable symbol. kind=stale_code: list symbols whose meta.last_authored is older than the threshold (requires blame-enriched graph). kind=ownership: group blame metadata by author email — symbol count, files touched, oldest/newest timestamps; supports path_prefix scoping (requires blame-enriched graph). kind=coverage_gaps: list symbols whose meta.coverage_pct falls in [min_pct, max_pct) — sorted ascending so the most undertested code surfaces first (requires coverage-enriched graph). kind=unsafe_patterns: bundled scan for panic-prone / undefined-behaviour primitives across every supported language — Go panic, Rust .unwrap/.expect/panic!/todo!/unimplemented!/unreachable!/assert!/unsafe blocks, Python assert, JS/TS throw — aggregated into one row-per-site response with a per-detector summary. Filters: language, detector, severity, path_prefix, limit, exclude_tests."),
+			mcp.WithString("kind", mcp.Required(), mcp.Description("Analysis kind: dead_code | hotspots | cycles | would_create_cycle | todos | blame | coverage | stale_code | ownership | coverage_gaps | stale_flags | releases | cgo_users | wasm_users | orphan_tables | unreferenced_tables | coverage_summary | channel_ops | goroutine_spawns | field_writers | race_writes | unclosed_channels | unsafe_patterns | annotation_users | config_readers | event_emitters | pubsub | string_emitters | error_surface | log_events | sql_rebuild | external_calls | routes | models | components | k8s_resources | images | kustomize | cross_repo | dbt_models")),
 			mcp.WithString("framework", mcp.Description("(dbt_models) Filter to one transformation framework — dbt or sqlmesh")),
 			mcp.WithString("materialized", mcp.Description("(dbt_models) Substring match on the model materialization — table, view, incremental, …")),
 			mcp.WithBoolean("compact", mcp.Description("One-line-per-result text output")),
@@ -145,7 +145,11 @@ func (s *Server) registerEnhancementTools() {
 			mcp.WithBoolean("has_assignee", mcp.Description("(todos) Keep only TODOs that have an assignee set")),
 			mcp.WithString("repo", mcp.Description("(cross_repo) Scope to repo-boundary dependencies touching this repository prefix on either side")),
 			mcp.WithString("base_kind", mcp.Description("(cross_repo) Scope to one base relation — calls, implements, or extends")),
-			mcp.WithNumber("limit", mcp.Description("(cross_repo, error_surface) Cap the number of rows returned — default 200")),
+			mcp.WithNumber("limit", mcp.Description("(cross_repo, error_surface, unsafe_patterns) Cap the number of rows returned — default 200")),
+			mcp.WithString("language", mcp.Description("(unsafe_patterns) Comma-separated subset of languages to keep — rust, python, javascript, typescript, go")),
+			mcp.WithString("detector", mcp.Description("(unsafe_patterns) Comma-separated subset of bundled detector names — panic-in-library, unsafe-rust-unwrap, unsafe-rust-panic-macro, unsafe-rust-assert-macro, unsafe-rust-block, unsafe-python-assert, unsafe-js-throw")),
+			mcp.WithString("severity", mcp.Description("(unsafe_patterns) Comma-separated subset of severity labels to keep — error, warning, info")),
+			mcp.WithBoolean("exclude_tests", mcp.Description("(unsafe_patterns) Override the per-detector default (defaults to true — test-only matches are dropped)")),
 		),
 		s.handleAnalyze,
 	)
@@ -674,7 +678,7 @@ func (s *Server) handlePrefetchContext(ctx context.Context, req mcp.CallToolRequ
 func (s *Server) handleAnalyze(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	kind, err := req.RequireString("kind")
 	if err != nil {
-		return mcp.NewToolResultError("kind is required (one of: dead_code, hotspots, cycles, would_create_cycle, todos, blame, coverage, stale_code, ownership, coverage_gaps, stale_flags, releases, cgo_users, wasm_users, orphan_tables, unreferenced_tables, coverage_summary, channel_ops, goroutine_spawns, field_writers, race_writes, unclosed_channels, annotation_users, config_readers, event_emitters, pubsub, string_emitters, error_surface, log_events, sql_rebuild, external_calls, routes, models, components, k8s_resources, images, kustomize, cross_repo)"), nil
+		return mcp.NewToolResultError("kind is required (one of: dead_code, hotspots, cycles, would_create_cycle, todos, blame, coverage, stale_code, ownership, coverage_gaps, stale_flags, releases, cgo_users, wasm_users, orphan_tables, unreferenced_tables, coverage_summary, channel_ops, goroutine_spawns, field_writers, race_writes, unclosed_channels, unsafe_patterns, annotation_users, config_readers, event_emitters, pubsub, string_emitters, error_surface, log_events, sql_rebuild, external_calls, routes, models, components, k8s_resources, images, kustomize, cross_repo)"), nil
 	}
 	switch kind {
 	case "dead_code":
@@ -721,6 +725,8 @@ func (s *Server) handleAnalyze(ctx context.Context, req mcp.CallToolRequest) (*m
 		return s.handleAnalyzeRaceWrites(ctx, req)
 	case "unclosed_channels":
 		return s.handleAnalyzeUnclosedChannels(ctx, req)
+	case "unsafe_patterns":
+		return s.handleAnalyzeUnsafePatterns(ctx, req)
 	case "annotation_users":
 		return s.handleAnalyzeAnnotationUsers(ctx, req)
 	case "config_readers":
@@ -756,7 +762,7 @@ func (s *Server) handleAnalyze(ctx context.Context, req mcp.CallToolRequest) (*m
 	case "dbt_models":
 		return s.handleAnalyzeDbtModels(ctx, req)
 	default:
-		return mcp.NewToolResultError("unknown analyze kind: " + kind + " (expected: dead_code, hotspots, cycles, would_create_cycle, todos, blame, coverage, stale_code, ownership, coverage_gaps, stale_flags, releases, cgo_users, wasm_users, orphan_tables, unreferenced_tables, coverage_summary, channel_ops, goroutine_spawns, field_writers, race_writes, unclosed_channels, annotation_users, config_readers, event_emitters, pubsub, string_emitters, error_surface, log_events, sql_rebuild, external_calls, routes, models, components, k8s_resources, images, kustomize, cross_repo, dbt_models)"), nil
+		return mcp.NewToolResultError("unknown analyze kind: " + kind + " (expected: dead_code, hotspots, cycles, would_create_cycle, todos, blame, coverage, stale_code, ownership, coverage_gaps, stale_flags, releases, cgo_users, wasm_users, orphan_tables, unreferenced_tables, coverage_summary, channel_ops, goroutine_spawns, field_writers, race_writes, unclosed_channels, unsafe_patterns, annotation_users, config_readers, event_emitters, pubsub, string_emitters, error_surface, log_events, sql_rebuild, external_calls, routes, models, components, k8s_resources, images, kustomize, cross_repo, dbt_models)"), nil
 	}
 }
 

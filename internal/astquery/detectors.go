@@ -33,6 +33,32 @@ func init() {
 	RegisterDetector(detectorEmptyCatch())
 	RegisterDetector(detectorJavaStringEquality())
 	RegisterDetector(detectorPythonMutableDefault())
+	RegisterDetector(detectorRustUnwrap())
+	RegisterDetector(detectorRustPanicMacro())
+	RegisterDetector(detectorRustAssertMacro())
+	RegisterDetector(detectorRustUnsafeBlock())
+	RegisterDetector(detectorPythonAssert())
+	RegisterDetector(detectorJSThrowInProd())
+}
+
+// UnsafePatternDetectors lists the detector names bundled by
+// `analyze kind=unsafe_patterns`. The set is authoritative —
+// `handleAnalyzeUnsafePatterns` iterates this slice to fan out the
+// engine. Keeping the list here (next to the registrations) means a
+// single edit adds a rule to both the bundle and the search_ast
+// surface.
+var UnsafePatternDetectors = []string{
+	// Go — already in the panic-in-library detector.
+	"panic-in-library",
+	// Rust.
+	"unsafe-rust-unwrap",
+	"unsafe-rust-panic-macro",
+	"unsafe-rust-assert-macro",
+	"unsafe-rust-block",
+	// Python.
+	"unsafe-python-assert",
+	// JavaScript / TypeScript.
+	"unsafe-js-throw",
 }
 
 // 1. error-not-wrapped (Go) -------------------------------------------------
@@ -408,5 +434,146 @@ func detectorPythonMutableDefault() *Detector {
    value: [(list) (dictionary) (set)]) @match)
 `,
 		},
+	}
+}
+
+// 11. unsafe-rust-unwrap (Rust) ---------------------------------------------
+//
+// A `.unwrap()` / `.expect()` (or `_err` / `_or_else` variant) call on
+// a `Result` / `Option`. Reaches for panic on the failure path —
+// production code should propagate the error with `?` or handle the
+// `None` / `Err` branch explicitly. Test code legitimately uses
+// `.unwrap()` to assert preconditions, so the detector defaults to
+// ExcludeTests.
+func detectorRustUnwrap() *Detector {
+	return &Detector{
+		Name:        "unsafe-rust-unwrap",
+		Description: "Rust `.unwrap()` / `.expect()` / `.unwrap_or_else()` / `.unwrap_err()` / `.expect_err()` in non-test source — panics on the failure path. Propagate with `?` or handle the `None` / `Err` branch explicitly.",
+		Severity:    "warning",
+		Languages: map[string]string{
+			"rust": `
+((call_expression
+   function: (field_expression
+     field: (field_identifier) @method)) @match
+ (#match? @method "^(unwrap|expect|unwrap_or_else|unwrap_err|expect_err)$"))
+`,
+		},
+		ExcludeTests: true,
+	}
+}
+
+// 12. unsafe-rust-panic-macro (Rust) ----------------------------------------
+//
+// `panic!()`, `todo!()`, `unimplemented!()`, `unreachable!()`. All
+// macro-invocation forms that abort on hit. `todo!` and
+// `unimplemented!` are the strongest signal of incomplete code
+// leaking into a non-test build.
+func detectorRustPanicMacro() *Detector {
+	return &Detector{
+		Name:        "unsafe-rust-panic-macro",
+		Description: "Rust `panic!` / `todo!` / `unimplemented!` / `unreachable!` macro invocation outside tests. `todo!` and `unimplemented!` mark incomplete code paths; `panic!` aborts the process on hit.",
+		Severity:    "warning",
+		Languages: map[string]string{
+			"rust": `
+((macro_invocation
+   macro: (identifier) @name) @match
+ (#match? @name "^(panic|todo|unimplemented|unreachable)$"))
+`,
+		},
+		ExcludeTests: true,
+	}
+}
+
+// 13. unsafe-rust-assert-macro (Rust) ---------------------------------------
+//
+// `assert!`, `assert_eq!`, `assert_ne!`, `debug_assert!`,
+// `debug_assert_eq!`, `debug_assert_ne!`. `assert!` family panics
+// in release builds; `debug_assert!` family is compiled out under
+// `--release` — both are surprising to find in production code.
+// Listed separately from `panic!` so an agent can keep `panic!`
+// noise tight while still surfacing the `assert!` discussion.
+func detectorRustAssertMacro() *Detector {
+	return &Detector{
+		Name:        "unsafe-rust-assert-macro",
+		Description: "Rust `assert!` / `assert_eq!` / `assert_ne!` (and `debug_assert*` variants) outside tests. Plain `assert!` panics in release; `debug_assert!` is silently compiled out — both are usually a sign that an invariant should be a proper `Result` / typed error instead.",
+		Severity:    "info",
+		Languages: map[string]string{
+			"rust": `
+((macro_invocation
+   macro: (identifier) @name) @match
+ (#match? @name "^(assert|assert_eq|assert_ne|debug_assert|debug_assert_eq|debug_assert_ne)$"))
+`,
+		},
+		ExcludeTests: true,
+	}
+}
+
+// 14. unsafe-rust-block (Rust) ----------------------------------------------
+//
+// `unsafe { … }` block or an `unsafe fn` declaration. Every
+// `unsafe` site is a hand-audit boundary; surfacing them lets a
+// reviewer enumerate the full set without a manual grep that
+// false-positives on `unsafe` substrings in comments / strings.
+func detectorRustUnsafeBlock() *Detector {
+	return &Detector{
+		Name:        "unsafe-rust-block",
+		Description: "Rust `unsafe { … }` block or `unsafe fn` declaration. Every `unsafe` site is a hand-audit boundary — soundness obligations cannot be checked by the compiler.",
+		Severity:    "warning",
+		Languages: map[string]string{
+			"rust": `
+[
+  (unsafe_block) @match
+  ((function_item
+     (function_modifiers) @mods) @match
+   (#match? @mods "unsafe"))
+]
+`,
+		},
+		ExcludeTests: true,
+	}
+}
+
+// 15. unsafe-python-assert (Python) -----------------------------------------
+//
+// A Python `assert` statement in non-test code. Python's `-O` /
+// `PYTHONOPTIMIZE` flag strips every `assert` at bytecode-compile
+// time — so a production invariant guarded by `assert` silently
+// disappears under optimised deployment. The fix is an explicit
+// `if not cond: raise <ConcreteError>`.
+func detectorPythonAssert() *Detector {
+	return &Detector{
+		Name:        "unsafe-python-assert",
+		Description: "Python `assert` statement in non-test source. The `-O` / `PYTHONOPTIMIZE` flag strips every assert at bytecode-compile time, so production invariants guarded by assert silently disappear. Use `if not cond: raise <ConcreteError>` instead.",
+		Severity:    "warning",
+		Languages: map[string]string{
+			"python": `
+(assert_statement) @match
+`,
+		},
+		ExcludeTests: true,
+	}
+}
+
+// 16. unsafe-js-throw (JavaScript / TypeScript) -----------------------------
+//
+// `throw <expr>` in non-test source. Throws inside async / Promise
+// chains skip every synchronous handler; throwing non-Error values
+// breaks every consumer relying on `.message` / `.stack`. The
+// detector flags every `throw_statement` and leaves the
+// production-vs-error-handling judgement to the reviewer.
+func detectorJSThrowInProd() *Detector {
+	return &Detector{
+		Name:        "unsafe-js-throw",
+		Description: "JavaScript / TypeScript `throw` statement in non-test source. Throwing inside async / Promise chains skips every synchronous handler; throwing non-Error values breaks consumers relying on `.message` / `.stack`. Review every site.",
+		Severity:    "info",
+		Languages: map[string]string{
+			"javascript": `
+(throw_statement) @match
+`,
+			"typescript": `
+(throw_statement) @match
+`,
+		},
+		ExcludeTests: true,
 	}
 }
