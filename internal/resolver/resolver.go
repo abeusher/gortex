@@ -197,6 +197,7 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 						edge:       e,
 						oldTo:      oldTo,
 						newTo:      clone.To,
+						kind:       clone.Kind,
 						crossRepo:  clone.CrossRepo,
 						confidence: clone.Confidence,
 						origin:     clone.Origin,
@@ -220,6 +221,7 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 	for i := range perWorkerJobs {
 		for _, j := range perWorkerJobs[i] {
 			j.edge.To = j.newTo
+			j.edge.Kind = j.kind
 			j.edge.CrossRepo = j.crossRepo
 			j.edge.Confidence = j.confidence
 			j.edge.Origin = j.origin
@@ -376,13 +378,19 @@ func (r *Resolver) ResolveFile(filePath string) *ResolveStats {
 // racing with: (a) other workers reading neighbouring edges' fields
 // during bucket maintenance, or (b) the serial post-pass that reads
 // each edge's To via keyOf. Once the worker phase completes, the
-// resolved fields (To, CrossRepo, Confidence, Origin, Meta) are
+// resolved fields (To, Kind, CrossRepo, Confidence, Origin, Meta) are
 // copied onto the real edge and graph.ReindexEdge is called — both
 // serially.
+//
+// Kind is propagated because resolveEdge may promote it after
+// resolution (e.g. `*.foo` with EdgeReads that lands on a method gets
+// promoted to EdgeReferences so get_callers / find_usages surface the
+// method-value reference).
 type reindexJob struct {
 	edge       *graph.Edge
 	oldTo      string
 	newTo      string
+	kind       graph.EdgeKind
 	crossRepo  bool
 	confidence float64
 	origin     string
@@ -472,9 +480,21 @@ func (r *Resolver) resolveEdge(e *graph.Edge, stats *ResolveStats) (oldTo string
 		// to the method-resolution path when no field candidate
 		// lands — gives degraded-but-useful behaviour for graphs
 		// where the field-node pass hasn't caught up yet.
+		//
+		// When the fallback resolves to a method, the extractor's
+		// EdgeReads label was a placeholder for "selector used as a
+		// value" (e.g. `mux.HandleFunc("/p", h.foo)` — h.foo passed,
+		// not called). Promote to EdgeReferences so find_usages and
+		// get_callers surface the method-value reference. Writes stay
+		// as EdgeWrites: assigning a func value to a method-typed
+		// field slot is still a write semantically.
 		fieldName := strings.TrimPrefix(target, "*.")
 		if !r.resolveFieldRef(e, fieldName, stats) {
+			before := e.To
 			r.resolveMethodCall(e, fieldName, stats)
+			if e.Kind == graph.EdgeReads && e.To != before {
+				e.Kind = graph.EdgeReferences
+			}
 		}
 	case strings.HasPrefix(target, "*."):
 		// Method call or method-value reference (e.g. h.handleHealth)

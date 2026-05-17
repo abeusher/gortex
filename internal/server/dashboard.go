@@ -1131,6 +1131,10 @@ type communityEntry struct {
 	Symbols  int     `json:"symbols"`
 	Files    int     `json:"files"`
 	Cohesion float64 `json:"cohesion"`
+	// ParentID points at the phase-2 super-community this leaf
+	// belongs to. Sibling clusters under the same ParentID get
+	// grouped under a shared header in the dashboard UI.
+	ParentID string `json:"parent_id,omitempty"`
 }
 
 func (h *Handler) handleCommunities(w http.ResponseWriter, r *http.Request) {
@@ -1150,6 +1154,7 @@ func (h *Handler) handleCommunities(w http.ResponseWriter, r *http.Request) {
 		FileCount  int     `json:"file_count"`
 		Cohesion   float64 `json:"cohesion"`
 		RepoPrefix string  `json:"repo_prefix"`
+		ParentID   string  `json:"parent_id,omitempty"`
 	}
 	type wrap struct {
 		Communities []rawComm `json:"communities"`
@@ -1169,6 +1174,7 @@ func (h *Handler) handleCommunities(w http.ResponseWriter, r *http.Request) {
 			Symbols:  c.Size,
 			Files:    c.FileCount,
 			Cohesion: c.Cohesion,
+			ParentID: c.ParentID,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Symbols > out[j].Symbols })

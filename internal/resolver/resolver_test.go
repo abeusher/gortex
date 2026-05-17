@@ -361,6 +361,76 @@ func TestResolveMethodCall_NoMeta(t *testing.T) {
 	assert.Equal(t, "pkg/b.go::Server.Start", callEdge.To)
 }
 
+// Regression: a method passed as a *value* (e.g. `mux.HandleFunc("/p", h.foo)`)
+// is captured by the Go extractor as `unresolved::*.foo` with kind=EdgeReads.
+// Before the fix the resolver would re-target the edge to the method but
+// leave the kind as EdgeReads, hiding it from both get_callers and
+// find_usages. The fix promotes the kind to EdgeReferences when the
+// field-then-method fallback lands on a method — so HTTP handlers,
+// command tables, callback maps all become visible.
+func TestResolveAll_MethodValuePromotesReadToReferences(t *testing.T) {
+	g := graph.New()
+	g.AddNode(&graph.Node{
+		ID: "pkg/routes.go::RegisterRoutes", Kind: graph.KindFunction, Name: "RegisterRoutes",
+		FilePath: "pkg/routes.go", Language: "go",
+	})
+	g.AddNode(&graph.Node{
+		ID: "pkg/handler.go::Handler.HandleHealth", Kind: graph.KindMethod, Name: "HandleHealth",
+		FilePath: "pkg/handler.go", Language: "go",
+		Meta: map[string]any{"receiver": "Handler"},
+	})
+
+	// Mirror what the Go extractor emits for `h.HandleHealth` in arg position.
+	edge := &graph.Edge{
+		From: "pkg/routes.go::RegisterRoutes", To: "unresolved::*.HandleHealth",
+		Kind: graph.EdgeReads, FilePath: "pkg/routes.go", Line: 42,
+		Meta: map[string]any{"receiver_type": "Handler"},
+	}
+	g.AddEdge(edge)
+
+	r := New(g)
+	stats := r.ResolveAll()
+
+	assert.Equal(t, 1, stats.Resolved, "method-value reference should resolve")
+	assert.Equal(t, "pkg/handler.go::Handler.HandleHealth", edge.To,
+		"edge should point at the real method")
+	assert.Equal(t, graph.EdgeReferences, edge.Kind,
+		"kind should be promoted Reads→References so get_callers/find_usages surface it")
+}
+
+// Regression guard: a *real* field read should stay as EdgeReads even after
+// the method-value promotion path was added. We add a struct field named
+// `count` and a same-named method on a different type, and make sure the
+// field-typed receiver picks the field (not the method) and keeps EdgeReads.
+func TestResolveAll_FieldReadStaysAsReads(t *testing.T) {
+	g := graph.New()
+	g.AddNode(&graph.Node{
+		ID: "pkg/a.go::Caller", Kind: graph.KindFunction, Name: "Caller",
+		FilePath: "pkg/a.go", Language: "go",
+	})
+	// The actual field we want resolution to pick.
+	g.AddNode(&graph.Node{
+		ID: "pkg/types.go::Counter.count", Kind: graph.KindField, Name: "count",
+		FilePath: "pkg/types.go", Language: "go",
+		Meta: map[string]any{"receiver": "Counter"},
+	})
+
+	edge := &graph.Edge{
+		From: "pkg/a.go::Caller", To: "unresolved::*.count",
+		Kind: graph.EdgeReads, FilePath: "pkg/a.go", Line: 7,
+		Meta: map[string]any{"receiver_type": "Counter"},
+	}
+	g.AddEdge(edge)
+
+	r := New(g)
+	stats := r.ResolveAll()
+
+	assert.Equal(t, 1, stats.Resolved)
+	assert.Equal(t, "pkg/types.go::Counter.count", edge.To)
+	assert.Equal(t, graph.EdgeReads, edge.Kind,
+		"field-typed resolution must NOT be promoted — only method-typed fallback should be")
+}
+
 func TestResolveFile(t *testing.T) {
 	g := graph.New()
 	g.AddNode(&graph.Node{ID: "a.go", Kind: graph.KindFile, Name: "a.go", FilePath: "a.go", Language: "go"})

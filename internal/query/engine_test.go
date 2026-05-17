@@ -123,6 +123,31 @@ func TestGetCallers(t *testing.T) {
 	assert.Contains(t, ids, "pkg/db.go::Connect")
 }
 
+// Regression: methods wired in by reference (e.g. HTTP handler registration
+// like `mux.HandleFunc("/p", h.foo)`) carry an EdgeReferences edge from the
+// registration site to the method — they're never reached by a direct
+// EdgeCalls. Before the fix GetCallers ignored EdgeReferences and these
+// methods looked dead in the graph.
+func TestGetCallers_IncludesMethodValueReferences(t *testing.T) {
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "routes.go::Register", Kind: graph.KindFunction, Name: "Register", FilePath: "routes.go", Language: "go"})
+	g.AddNode(&graph.Node{
+		ID: "handler.go::Handler.HandleHealth", Kind: graph.KindMethod, Name: "HandleHealth",
+		FilePath: "handler.go", Language: "go", Meta: map[string]any{"receiver": "Handler"},
+	})
+	// `mux.HandleFunc("/health", h.HandleHealth)` after the resolver:
+	g.AddEdge(&graph.Edge{
+		From: "routes.go::Register", To: "handler.go::Handler.HandleHealth",
+		Kind: graph.EdgeReferences, FilePath: "routes.go", Line: 12,
+	})
+
+	e := NewEngine(g)
+	sg := e.GetCallers("handler.go::Handler.HandleHealth", QueryOptions{Depth: 1, Limit: 50})
+	ids := nodeIDs(sg.Nodes)
+	assert.Contains(t, ids, "routes.go::Register",
+		"method-value registration site should surface as a caller via EdgeReferences")
+}
+
 func TestFindImplementations(t *testing.T) {
 	e := NewEngine(buildTestGraph())
 

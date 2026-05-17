@@ -76,6 +76,7 @@ func (s *Server) handleGetCommunities(ctx context.Context, req mcp.CallToolReque
 		FileCount  int     `json:"file_count"`
 		Cohesion   float64 `json:"cohesion"`
 		RepoPrefix string  `json:"repo_prefix"`
+		ParentID   string  `json:"parent_id,omitempty"`
 	}
 	var summaries []summary
 	for _, c := range comms.Communities {
@@ -86,6 +87,7 @@ func (s *Server) handleGetCommunities(ctx context.Context, req mcp.CallToolReque
 			FileCount:  len(c.Files),
 			Cohesion:   c.Cohesion,
 			RepoPrefix: majorityRepoPrefix(c.Members),
+			ParentID:   c.ParentID,
 		})
 	}
 	return s.respondJSONOrTOON(ctx, req, map[string]any{

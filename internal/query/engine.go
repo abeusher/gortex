@@ -175,11 +175,19 @@ func (e *Engine) GetCallChain(funcID string, opts QueryOptions) *SubGraph {
 	return e.bfs(funcID, opts, true, []graph.EdgeKind{graph.EdgeCalls, graph.EdgeMatches})
 }
 
-// GetCallers returns all callers of a function. Traverses EdgeCalls and
-// EdgeMatches in reverse: a provider handler's callers include every
-// consumer (possibly in another repo) that resolves to it via the matcher.
+// GetCallers returns all callers of a function. Traverses EdgeCalls,
+// EdgeMatches, and EdgeReferences in reverse:
+//   - EdgeCalls: direct `foo()` invocations.
+//   - EdgeMatches: cross-service producer/consumer pairing from the matcher
+//     (HTTP / gRPC / topic) — a provider handler's callers include every
+//     consumer (possibly in another repo) that resolves to it.
+//   - EdgeReferences: method-value references (`mux.HandleFunc("/p", h.foo)`,
+//     command tables, callback maps, `defer x.Cleanup`). The handler isn't
+//     called *at this site*, but it's wired in here — semantically a caller.
+//     Without this kind, every routing-style codebase looks like its handlers
+//     have zero callers.
 func (e *Engine) GetCallers(funcID string, opts QueryOptions) *SubGraph {
-	return e.bfs(funcID, opts, false, []graph.EdgeKind{graph.EdgeCalls, graph.EdgeMatches})
+	return e.bfs(funcID, opts, false, []graph.EdgeKind{graph.EdgeCalls, graph.EdgeMatches, graph.EdgeReferences})
 }
 
 // GetTesters returns the test functions that exercise a symbol via
