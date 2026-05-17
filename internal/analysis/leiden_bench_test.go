@@ -80,7 +80,7 @@ func loadCachedGraph() (*graph.Graph, error) {
 	if err != nil {
 		return nil, fmt.Errorf("fetch %s: %w", url, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("status %d from %s", resp.StatusCode, url)
 	}

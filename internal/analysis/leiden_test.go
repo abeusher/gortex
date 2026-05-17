@@ -45,33 +45,23 @@ func TestLeidenReachableNodes(t *testing.T) {
 	g := buildTestGraph()
 	res := DetectCommunitiesLeiden(g)
 
-	allNodes := make(map[string]bool)
+	// Count graph-relevant nodes — singletons (no in/out edges) are
+	// intentionally dropped from the result's NodeToComm map.
+	expected := 0
 	for _, n := range g.AllNodes() {
 		if n.Kind == graph.KindFile || n.Kind == graph.KindImport {
 			continue
 		}
-		// Singleton communities are intentionally dropped in our
-		// renumbering — only count nodes that have at least one
-		// graph-relevant edge.
-		hasEdge := false
 		for _, e := range g.AllEdges() {
 			if (e.From == n.ID || e.To == n.ID) && edgeWeight(e.Kind) > 0 {
-				hasEdge = true
+				expected++
 				break
 			}
 		}
-		if hasEdge {
-			allNodes[n.ID] = true
-		}
 	}
 
-	for nid := range allNodes {
-		if _, ok := res.NodeToComm[nid]; !ok {
-			// OK if the node ended up alone — singleton communities
-			// are dropped. Verify by checking it's not paired with
-			// anyone significant.
-			continue
-		}
+	if len(res.NodeToComm) < expected {
+		t.Fatalf("leiden lost nodes: NodeToComm has %d entries, expected at least %d graph-relevant nodes", len(res.NodeToComm), expected)
 	}
 }
 

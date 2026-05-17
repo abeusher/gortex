@@ -374,7 +374,7 @@ func TestLoadSnapshot_SmallStaleEdgeDrops_StaysLoaded(t *testing.T) {
 		orig.AddNode(&graph.Node{
 			ID:   fmt.Sprintf("/abs/a.go::S%d", i), // stale abs-path: dropped on load
 			Kind: graph.KindFunction, Name: fmt.Sprintf("S%d", i),
-			FilePath: fmt.Sprintf("/abs/a.go"),
+			FilePath: "/abs/a.go",
 		})
 		orig.AddEdge(&graph.Edge{
 			From: "a.go::S0", To: fmt.Sprintf("/abs/a.go::S%d", i), Kind: graph.EdgeCalls,
