@@ -1418,5 +1418,51 @@ func (s *Server) buildGraphStatsPayload(ctx context.Context) map[string]any {
 		}
 	}
 
+	if ns := s.notificationsStatus(); ns != nil {
+		result["notifications"] = ns
+	}
+
 	return result
+}
+
+// notificationsStatus reports each push-notification channel's live
+// subscriber count and last-published payload. nil when no broadcaster
+// is wired (single-shot CLI modes). Consumed by graph_stats /
+// gortex://stats so a debugging client can see who is subscribed and
+// what the broadcasters last sent without standing up its own
+// subscriber.
+func (s *Server) notificationsStatus() map[string]any {
+	out := map[string]any{}
+	if s.diagBroadcaster != nil {
+		out["diagnostics"] = map[string]any{
+			"subscribers": s.diagBroadcaster.subscriberCount(),
+		}
+	}
+	if s.readinessBroadcaster != nil {
+		row := map[string]any{
+			"subscribers": s.readinessBroadcaster.subscriberCount(),
+		}
+		if snap := s.readinessBroadcaster.snapshot(); snap != nil {
+			row["last_state"] = snap
+		}
+		out["workspace_readiness"] = row
+	}
+	if s.healthBroadcaster != nil {
+		row := map[string]any{
+			"subscribers": s.healthBroadcaster.subscriberCount(),
+		}
+		if snap := s.healthBroadcaster.snapshot(); snap != nil {
+			row["last_snapshot"] = snap
+		}
+		out["daemon_health"] = row
+	}
+	if s.staleRefsBroadcaster != nil {
+		out["stale_refs"] = map[string]any{
+			"subscribers": s.staleRefsBroadcaster.subscriberCount(),
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }

@@ -126,6 +126,23 @@ type Server struct {
 	// SetLSPDiagnosticsBroadcasting; nil until then.
 	diagBroadcaster *diagnosticsBroadcaster
 
+	// readinessBroadcaster fans `notifications/workspace_readiness`
+	// at each warmup phase transition + re-index completion. Eagerly
+	// constructed in NewServer; the publisher (daemon entrypoint)
+	// calls Server.PublishReadiness at each phase.
+	readinessBroadcaster *readinessBroadcaster
+
+	// healthBroadcaster fans `notifications/daemon_health` on a
+	// periodic ticker. Eagerly constructed in NewServer; the daemon
+	// entrypoint wires the snapshot fn via AttachHealthSnapshot.
+	healthBroadcaster *healthBroadcaster
+
+	// staleRefsBroadcaster fans `notifications/stale_refs` per session
+	// when the watcher reports symbol churn in a file the session has
+	// touched. Eagerly constructed in NewServer; wired to the
+	// watcher's symbol-change callback via SetWatcher.
+	staleRefsBroadcaster *staleRefsBroadcaster
+
 	// llmService is the optional LLM service backing the `ask` MCP tool
 	// and the `search_symbols` assist modes. nil until SetLLMService is
 	// called by the daemon entrypoint. The service wraps whichever
@@ -202,6 +219,15 @@ func (s *Server) ReleaseSession(id string) {
 	}
 	if s.diagBroadcaster != nil {
 		s.diagBroadcaster.unsubscribe(id)
+	}
+	if s.readinessBroadcaster != nil {
+		s.readinessBroadcaster.unsubscribe(id)
+	}
+	if s.healthBroadcaster != nil {
+		s.healthBroadcaster.unsubscribe(id)
+	}
+	if s.staleRefsBroadcaster != nil {
+		s.staleRefsBroadcaster.unsubscribe(id)
 	}
 	// Editor-overlay sessions are pinned to the MCP session that
 	// registered them. When the MCP session ends — for any reason —
@@ -581,12 +607,25 @@ func NewServer(engine *query.Engine, g *graph.Graph, idx *indexer.Indexer, watch
 		s.scopeProject = o.ScopeProject
 	}
 
+	// Proactive-notification broadcasters. Constructed up-front so
+	// subscribe handlers can register listeners as soon as the first
+	// session connects; the *publishers* are wired by the daemon
+	// entrypoint (PublishReadiness at warmup phases,
+	// AttachHealthSnapshot for the periodic ticker) and by
+	// SetWatcher (stale_refs hooks into the symbol-change callback).
+	s.readinessBroadcaster = newReadinessBroadcaster(s.mcpServer, logger)
+	s.healthBroadcaster = newHealthBroadcaster(s.mcpServer, nil, logger)
+	s.staleRefsBroadcaster = newStaleRefsBroadcaster(s.mcpServer, s.sessions, s.session, logger)
+
 	s.registerCoreTools()
 	s.registerCodingTools()
 	s.registerAnalysisTools()
 	s.registerEnhancementTools()
 	s.registerLSPTools()
 	s.registerDiagnosticsTools()
+	s.registerReadinessTools()
+	s.registerHealthTools()
+	s.registerStaleRefsTools()
 	s.registerDataflowTools()
 	s.registerASTTools()
 	s.registerCloneTools()
@@ -1215,8 +1254,16 @@ type watcherHistory interface {
 func (s *Server) SetWatcher(w watcherHistory) {
 	s.watcher = w
 
-	// Register callback to track symbol modifications for get_symbol_history.
+	// Register callback to track symbol modifications for
+	// get_symbol_history AND fan stale_refs notifications to any
+	// subscribed sessions whose working set intersects the change.
 	w.OnSymbolChange(func(filePath string, oldSymbols, newSymbols []*graph.Node) {
+		// stale_refs broadcaster runs first so a slow notification
+		// path (e.g. a clogged session channel) can't delay the
+		// in-process symbol history bookkeeping below.
+		if s.staleRefsBroadcaster != nil {
+			s.staleRefsBroadcaster.handleSymbolChange(filePath, oldSymbols, newSymbols)
+		}
 		oldMap := make(map[string]string, len(oldSymbols)) // ID → signature
 		for _, n := range oldSymbols {
 			sig, _ := n.Meta["signature"].(string)

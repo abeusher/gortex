@@ -265,7 +265,7 @@ func runMCP(cmd *cobra.Command, args []string) error {
 
 		idx.SetSemanticManager(semMgr)
 
-		// Resolve-time LSP hot path (N5). Mirrors the daemon wiring
+		// Resolve-time LSP hot path. Mirrors the daemon wiring
 		// so `gortex mcp` users get the same precision boost on
 		// TS/JS/JSX/TSX edges as daemon-tracked clients.
 		if !isFalsyEnv("GORTEX_LSP_RESOLVER") {

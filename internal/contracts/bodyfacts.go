@@ -7,9 +7,9 @@ import (
 )
 
 // Origin labels the confidence with which a Binding was derived.
-// Mirrors the tier vocabulary in spec-semantic.md so the dashboard
-// and downstream consumers see a single set of labels regardless of
-// which subsystem populated the binding.
+// Shared vocabulary so the dashboard and downstream consumers see a
+// single set of labels regardless of which subsystem populated the
+// binding.
 type Origin string
 
 const (

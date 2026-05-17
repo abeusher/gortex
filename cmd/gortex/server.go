@@ -278,7 +278,7 @@ func runServer(_ *cobra.Command, _ []string) error {
 
 		idx.SetSemanticManager(semMgr)
 
-		// Resolve-time LSP hot path (N5). Same wiring as daemon/mcp.
+		// Resolve-time LSP hot path. Same wiring as daemon/mcp.
 		if !isFalsyEnv("GORTEX_LSP_RESOLVER") {
 			serverResolverLSPRegistry = lsp.NewResolverHelperRegistry()
 			serverResolverLSPRouter = lspRouter

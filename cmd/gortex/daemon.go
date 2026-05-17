@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -229,6 +230,57 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 	// its heap to anything on localhost.
 	startPProfIfEnabled(logger)
 
+	// Wire the daemon-health snapshot fn into the MCP server's
+	// healthBroadcaster. Captures the live controller, daemon
+	// server (for session count), and multi indexer so every periodic
+	// tick reflects current state. Stopped in the deferred shutdown
+	// below so the ticker goroutine doesn't outlive the process.
+	daemonStart := time.Now()
+	if state.mcpServer != nil {
+		srvCapture := srv
+		stateCapture := state
+		controllerCapture := controller
+		state.mcpServer.AttachHealthSnapshot(func() map[string]any {
+			out := map[string]any{
+				"uptime_seconds": int64(time.Since(daemonStart).Seconds()),
+				"ready":          controllerCapture.IsReady(),
+				"warmup_seconds": int64(0),
+			}
+			if st, statusErr := controllerCapture.Status(context.Background()); statusErr == nil {
+				out["warmup_seconds"] = st.WarmupSeconds
+				out["tracked_repos"] = len(st.TrackedRepos)
+				out["alloc_bytes"] = st.Runtime.Alloc
+				out["sys_bytes"] = st.Runtime.Sys
+				out["heap_inuse_bytes"] = st.Runtime.HeapInuse
+				out["num_goroutine"] = st.Runtime.NumGoroutine
+				out["num_gc"] = st.Runtime.NumGC
+				if st.LSPRouter != nil {
+					out["lsp_alive"] = len(st.LSPRouter.ActiveProviders)
+					out["lsp_specs_registered"] = len(st.LSPRouter.EnabledSpecs)
+				}
+			}
+			if sessions := srvCapture.Sessions(); sessions != nil {
+				out["sessions"] = sessions.Count()
+			}
+			if stateCapture.graph != nil {
+				out["graph_nodes"] = stateCapture.graph.NodeCount()
+				out["graph_edges"] = stateCapture.graph.EdgeCount()
+			}
+			return out
+		})
+	}
+	defer func() {
+		if state.mcpServer != nil {
+			state.mcpServer.StopHealthBroadcaster()
+		}
+	}()
+
+	// Initial workspace_readiness phase — the snapshot has been
+	// loaded but warmup hasn't started yet.
+	publishReadinessPhase(state, "snapshot_loaded", false, map[string]any{
+		"snapshot_repos": len(state.snapshotRepos),
+	})
+
 	// Periodic snapshots — 10 minute interval, gated on warmup-complete.
 	// On a crash we lose at most one interval's worth of work, which is
 	// acceptable given snapshot writes are atomic (tmp → rename) and can
@@ -302,6 +354,10 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		elapsed := time.Since(start)
 		controller.MarkReady(elapsed)
 		logger.Info("daemon: ready", zap.Duration("warmup", elapsed))
+		publishReadinessPhase(state, "ready", true, map[string]any{
+			"warmup_seconds": int64(elapsed.Seconds()),
+			"warmup_ms":      elapsed.Milliseconds(),
+		})
 	}()
 
 	return srv.Serve()

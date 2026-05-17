@@ -59,7 +59,7 @@ type daemonState struct {
 	// reads it from here.
 
 	// resolverLSPRegistry composes per-repo ResolverHelpers consulted
-	// by the cross-file resolver's hot path (N5). Populated as repos
+	// by the cross-file resolver's hot path. Populated as repos
 	// are tracked so each tsserver instance is scoped to its owning
 	// workspace. nil when the resolve-time LSP path is disabled
 	// (GORTEX_LSP_RESOLVER=0) or when semantic enrichment is off.
@@ -174,7 +174,7 @@ func buildDaemonState(logger *zap.Logger) (*daemonState, error) {
 
 	idx := indexer.New(g, reg, cfg.Index, logger)
 
-	// Locals carrying N5 hot-path wiring out of the optional
+	// Locals carrying resolve-time LSP wiring out of the optional
 	// semantic-enrichment block so the daemonState constructor
 	// below sees them whether or not the block ran.
 	var (
@@ -252,7 +252,7 @@ func buildDaemonState(logger *zap.Logger) (*daemonState, error) {
 
 		idx.SetSemanticManager(semMgr)
 
-		// Resolve-time LSP hot path (N5). The resolver consults this
+		// Resolve-time LSP hot path. The resolver consults this
 		// registry for TS/JS/JSX/TSX edges before falling back to AST
 		// heuristics. The registry holds per-repo ResolverHelpers
 		// (built lazily from the same router that backs the enricher
@@ -325,8 +325,8 @@ func buildDaemonState(logger *zap.Logger) (*daemonState, error) {
 		// Propagate the resolve-time LSP helper so every per-repo
 		// Indexer constructed by the MultiIndexer's warmup /
 		// TrackRepoCtx / ReconcileRepoCtx paths participates in the
-		// N5 hot path (and so the global post-pass resolver in
-		// RunDeferredPassesAll picks up LSP precision too).
+		// resolve-time LSP path (and so the global post-pass resolver
+		// in RunDeferredPassesAll picks up LSP precision too).
 		if resolverLSPRegistry != nil {
 			mi.SetResolverLSPHelper(resolverLSPRegistry)
 
@@ -564,6 +564,10 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger) *indexer.MultiWat
 		zap.String("phase", "parallel_parse"),
 		zap.Int("repos", len(repos)),
 		zap.Int("workers", workers))
+	publishReadinessPhase(state, "parallel_parse", false, map[string]any{
+		"tracked_repos": len(repos),
+		"workers":       workers,
+	})
 	phaseStart := time.Now()
 
 	jobs := make(chan config.RepoEntry, len(repos))
@@ -613,16 +617,24 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger) *indexer.MultiWat
 	logger.Info("daemon: warmup phase done",
 		zap.String("phase", "parallel_parse"),
 		zap.Duration("elapsed", time.Since(phaseStart)))
+	publishReadinessPhase(state, "parallel_parse_done", false, map[string]any{
+		"tracked_repos": len(repos),
+		"elapsed_ms":    time.Since(phaseStart).Milliseconds(),
+	})
 
 	// Drain deferred per-repo passes (ResolveAll / semantic enrich /
 	// contract extract+commit) serially across the indexers the parallel
 	// loop populated. Must run before RunGlobalResolve so cross-repo
 	// resolution sees fully-lifted per-repo placeholder edges.
 	phaseStart = time.Now()
+	publishReadinessPhase(state, "deferred_passes_all", false, nil)
 	state.multiIndexer.RunDeferredPassesAll(ctx)
 	logger.Info("daemon: warmup phase done",
 		zap.String("phase", "deferred_passes_all"),
 		zap.Duration("elapsed", time.Since(phaseStart)))
+	publishReadinessPhase(state, "deferred_passes_all_done", false, map[string]any{
+		"elapsed_ms": time.Since(phaseStart).Milliseconds(),
+	})
 
 	// Rehydrate per-repo contract registries from the snapshot. Only
 	// target indexers whose registry is still nil — a non-nil registry
@@ -684,10 +696,14 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger) *indexer.MultiWat
 	// against). After resolution, contract bridge edges may have
 	// changed too, so ReconcileContractEdges runs again.
 	phaseStart = time.Now()
+	publishReadinessPhase(state, "global_resolve", false, nil)
 	state.multiIndexer.RunGlobalResolve()
 	logger.Info("daemon: warmup phase done",
 		zap.String("phase", "global_resolve"),
 		zap.Duration("elapsed", time.Since(phaseStart)))
+	publishReadinessPhase(state, "global_resolve_done", false, map[string]any{
+		"elapsed_ms": time.Since(phaseStart).Milliseconds(),
+	})
 
 	// Finish the batch: turn off the per-repo skip flag and run the
 	// graph-wide derivation passes once. RunGlobalResolve above just
@@ -695,10 +711,14 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger) *indexer.MultiWat
 	// derivation here picks up cross-repo test→subject pairs that
 	// were unresolved during the per-repo loop.
 	phaseStart = time.Now()
+	publishReadinessPhase(state, "end_batch", false, nil)
 	state.multiIndexer.EndBatch()
 	logger.Info("daemon: warmup phase done",
 		zap.String("phase", "end_batch"),
 		zap.Duration("elapsed", time.Since(phaseStart)))
+	publishReadinessPhase(state, "end_batch_done", false, map[string]any{
+		"elapsed_ms": time.Since(phaseStart).Milliseconds(),
+	})
 
 	watchCfgs := make(map[string]config.WatchConfig)
 	for prefix := range state.multiIndexer.AllMetadata() {
@@ -714,7 +734,21 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger) *indexer.MultiWat
 		return nil
 	}
 	logger.Info("daemon: watching", zap.Int("repos", len(watchCfgs)))
+	publishReadinessPhase(state, "watcher_started", false, map[string]any{
+		"watched_repos": len(watchCfgs),
+	})
 	return mw
+}
+
+// publishReadinessPhase forwards a workspace_readiness phase
+// transition to the MCP server's readiness broadcaster. Safe to
+// call when the server isn't wired (single-process modes that
+// bypass the daemon).
+func publishReadinessPhase(state *daemonState, phase string, ready bool, extra map[string]any) {
+	if state == nil || state.mcpServer == nil {
+		return
+	}
+	state.mcpServer.PublishReadiness(phase, ready, extra)
 }
 
 // priorMtimesForEntry finds the snapshotted FileMtimes map for a
