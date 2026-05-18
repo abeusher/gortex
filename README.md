@@ -1,23 +1,45 @@
+<div align="center">
+   
 # Gortex
+
+### Code intelligence engine that indexes repositories into an in-memory knowledge graph  
+
+#### and exposes it via CLI, MCP Server, and web UI.
+
+---
 
 [![CI](https://github.com/zzet/gortex/actions/workflows/ci.yml/badge.svg)](https://github.com/zzet/gortex/actions/workflows/ci.yml)
 [![Go Report Card](https://goreportcard.com/badge/github.com/zzet/gortex)](https://goreportcard.com/report/github.com/zzet/gortex)
 [![Latest release](https://img.shields.io/github/v/release/zzet/gortex?logo=github&sort=semver)](https://github.com/zzet/gortex/releases/latest)
 [![Go Reference](https://pkg.go.dev/badge/github.com/zzet/gortex.svg)](https://pkg.go.dev/github.com/zzet/gortex)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/zzet/gortex/badge)](https://scorecard.dev/viewer/?uri=github.com/zzet/gortex)
+
 [![Sigstore signed](https://img.shields.io/badge/sigstore-signed-66D4FF?logo=sigstore&logoColor=white)](docs/installation.md#verifying-releases-supply-chain-security)
 [![SLSA 3](https://img.shields.io/badge/SLSA-Level%203-green)](https://slsa.dev/spec/v1.0/levels#build-l3)
-[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/zzet/gortex/badge)](https://scorecard.dev/viewer/?uri=github.com/zzet/gortex)
 [![VirusTotal](https://img.shields.io/badge/VirusTotal-0%2F91-brightgreen?logo=virustotal)](https://www.virustotal.com/gui/url/00e1094b39c9bd7db4d5a179b1d56173f85c915075057fd3cc64bfbb9b735b11/detection)
 
+[![macOS](https://img.shields.io/badge/macOS-supported-blue.svg)](#)
+[![Linux](https://img.shields.io/badge/Linux-supported-blue.svg)](#)
 
+[![Claude Code](https://img.shields.io/badge/Claude_Code-supported-blueviolet.svg)](#)
+[![Cursor](https://img.shields.io/badge/Cursor-supported-blueviolet.svg)](#)
+[![Codex CLI](https://img.shields.io/badge/Codex_CLI-supported-blueviolet.svg)](#)
+[![opencode](https://img.shields.io/badge/opencode-supported-blueviolet.svg)](#)
+[![Kiro](https://img.shields.io/badge/Kiro-supported-blueviolet.svg)](#)
 
-Code intelligence engine that indexes repositories into an in-memory knowledge graph and exposes it via CLI, MCP Server, and web UI.
+Drastically reduce tokens usage (**up to 50× fewer tokens per response**, check [benchmarks](BENCHMARK.md) or reproduce yourself.
 
-Built for 15 AI coding agents (Claude Code, Kiro, Cursor, Windsurf, VS Code / Copilot, Continue.dev, Cline, OpenCode, Antigravity, Codex CLI, Gemini CLI, Zed, Aider, Kilo Code, OpenClaw) — one `smart_context` call replaces 5-10 file reads, cutting token usage by ~94%.
+</div>
 
-See [docs/agents.md](docs/agents.md) for the adapter matrix, per-agent schema notes, and the `gortex init --agents=<csv>` CLI contract.
+Built for 15 AI coding agents (Claude Code, Kiro, Cursor, Windsurf, VS Code (and [VS Code Plugin](https://marketplace.visualstudio.com/items?itemName=Gortex.gortex)) / Copilot, Continue.dev, Cline, OpenCode, Antigravity, Codex CLI, Gemini CLI, Zed, Aider, Kilo Code, OpenClaw). See [docs/agents.md](docs/agents.md) for the adapter matrix, per-agent schema notes, and the `gortex init --agents=<csv>` CLI contract.
+
+<details>
+
+<summary>Gortex Web UI — force-directed knowledge graph visualization</summary>
 
 ![Gortex Web UI — force-directed knowledge graph visualization](assets/graph.png)
+
+</details>
 
 ## Installation
 
