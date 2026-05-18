@@ -11,6 +11,13 @@ For each fixture case the harness captures, for JSON and GCX:
 - **Bytes** — raw UTF-8 byte length.
 - **tiktoken (cl100k_base)** — LLM-relevant token count via
   `github.com/pkoukk/tiktoken-go` (same loader Gortex uses at runtime).
+  Matches Claude 3 / Opus 4 / Sonnet 4 / Haiku 4.5 / GPT-4o budgets.
+- **Claude Opus 4.7 input tokens** — second column populated either
+  by scaling cl100k_base (×1.35 empirical inflation factor, the
+  default; labeled `estimated`) or by calling Anthropic's
+  `messages/count_tokens` endpoint with `--use-api` (requires
+  `ANTHROPIC_API_KEY`; results cached to `opus47-counts.json` for
+  deterministic reruns; labeled `exact`).
 - **gzip** — gzip-compressed byte length, fair comparison when the
   transport would compress anyway.
 - **Round-trip integrity** — encode → decode → re-marshal, compare to
@@ -32,6 +39,15 @@ Flags:
   `./bench/wire-format/cases`).
 - `-out FILE` — output scorecard markdown path (default stdout).
 - `-json FILE` — emit raw per-case metrics as JSON too.
+- `-tokenizer cl100k|opus47|both` — which token-cost column(s) to
+  render (default `both`).
+- `-use-api` — call Anthropic `count_tokens` for exact Opus 4.7
+  numbers (requires `ANTHROPIC_API_KEY`; degrades to the scalar
+  on network failure with a single warning).
+- `-opus47-cache PATH` — exact-count sidecar (default
+  `bench/wire-format/opus47-counts.json`).
+- `-opus47-model NAME` — model id passed to the API
+  (default `claude-opus-4-20250514`).
 
 ## Fixture format
 
@@ -50,10 +66,11 @@ specified tool and scores the two outputs.
 
 ## Target
 
-GCX1 targets **≥20 % tiktoken savings vs JSON on the median case**
+GCX1 targets **≥20 % token savings vs JSON on the median case**
 with **100 % round-trip integrity**. Current baseline (20 cases):
 
-- **Median token savings: −27.4 %**
+- **Median token savings (cl100k_base): −27.4 %**
+- **Median token savings (Opus 4.7, scalar): −27.3 %**
 - **Median byte savings:  −26.8 %**
 - **Round-trip integrity: 20/20**
 

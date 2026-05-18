@@ -424,7 +424,36 @@ re-hydrate by `JSON.parse` on such cells.
 
 ## Benchmark
 
-See `bench/wire-format/`. The harness scores bytes, tiktoken tokens,
-gzip bytes, and round-trip integrity across 20 representative tool
+See `bench/wire-format/`. The harness scores bytes, tokens, gzip
+bytes, and round-trip integrity across 20 representative tool
 responses and emits a markdown scorecard. Rerun after any change to
-the upstream `gcx-go` module or `internal/mcp/gcx.go` to catch regressions.
+the upstream `gcx-go` module or `internal/mcp/gcx.go` to catch
+regressions.
+
+### Dual tokenizer scorecard
+
+The scorecard renders one or two tables depending on `--tokenizer`:
+
+- `cl100k` — tiktoken `cl100k_base` only. The historical default;
+  matches Claude 3 / Opus 4 / Sonnet 4 / Haiku 4.5 / GPT-4o token
+  budgets.
+- `opus47` — Claude Opus 4.7 input-token counts only.
+- `both` (default) — stacks the two tables so the same fixtures show
+  up under each tokenizer.
+
+The Opus 4.7 column has two data sources:
+
+1. **Scalar estimate (default, offline).** Each cl100k_base count is
+   multiplied by an empirical inflation factor (~1.35×) and labeled
+   `estimated` in the table footer. Per-fixture variance runs
+   28-42%; the median across the 20-case suite is honest.
+2. **Exact counts via Anthropic's `messages/count_tokens` API**
+   (`--use-api`). Requires `ANTHROPIC_API_KEY`. Successful calls
+   populate `bench/wire-format/opus47-counts.json` so subsequent
+   runs are deterministic without re-hitting the API. Network
+   failures degrade gracefully to the scalar with a single warning
+   on stderr.
+
+The headline median token-savings figure stays around −27% under
+both tokenizers — the wire format's advantage compounds with the
+tokenizer change rather than being amplified by it.

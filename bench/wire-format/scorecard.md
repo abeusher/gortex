@@ -1,5 +1,7 @@
 # GCX1 wire-format benchmark scorecard
 
+## tiktoken cl100k_base (Claude 3 / Opus 4 / Sonnet 4 / Haiku 4.5 / GPT-4o family)
+
 | case | tool | bytes (json) | bytes (gcx) | Δ% | tokens (json) | tokens (gcx) | Δ% | gzip (json) | gzip (gcx) | Δ% | round-trip |
 |------|------|-------------:|------------:|---:|--------------:|-------------:|---:|------------:|-----------:|---:|:---------:|
 | 01_search_symbols_small | search_symbols | 720 | 522 | −27.5% | 181 | 125 | −30.9% | 219 | 227 | +3.7% | ✓ |
@@ -23,4 +25,31 @@
 | 19_get_editing_context | get_editing_context | 927 | 708 | −23.6% | 233 | 171 | −26.6% | 329 | 318 | −3.3% | ✓ |
 | 20_get_repo_outline | get_repo_outline | 784 | 690 | −12.0% | 237 | 224 | −5.5% | 358 | 363 | +1.4% | ✓ |
 
-**Summary:** 20/20 cases. Median token savings: −27.4%. Median byte savings: −26.8%. Round-trip integrity: 20/20.
+**Summary (cl100k_base):** 20/20 cases. Median token savings: −27.4%. Median byte savings: −26.8%. Round-trip integrity: 20/20.
+
+## Claude Opus 4.7 (estimated (×1.35 scalar over cl100k_base))
+
+| case | tool | tokens (json) | tokens (gcx) | Δ% | source |
+|------|------|--------------:|-------------:|---:|:------:|
+| 01_search_symbols_small | search_symbols | 244 | 169 | −30.7% | est. |
+| 02_search_symbols_large | search_symbols | 1442 | 1002 | −30.5% | est. |
+| 03_get_symbol_source_small | get_symbol_source | 347 | 344 | −0.9% | est. |
+| 04_get_symbol_source_large | get_symbol_source | 721 | 718 | −0.4% | est. |
+| 05_batch_symbols | batch_symbols | 452 | 325 | −28.1% | est. |
+| 06_find_usages_small | find_usages | 452 | 344 | −23.9% | est. |
+| 07_find_usages_large | find_usages | 768 | 474 | −38.3% | est. |
+| 08_get_file_summary | get_file_summary | 765 | 582 | −23.9% | est. |
+| 09_analyze_hotspots | analyze_hotspots | 683 | 429 | −37.2% | est. |
+| 10_analyze_dead_code | analyze_dead_code | 389 | 267 | −31.4% | est. |
+| 11_contracts_list | contracts | 783 | 625 | −20.2% | est. |
+| 12_get_callers_medium | get_callers | 1013 | 718 | −29.1% | est. |
+| 13_smart_context | smart_context | 636 | 404 | −36.5% | est. |
+| 14_get_dependents_small | get_dependents | 444 | 323 | −27.3% | est. |
+| 15_get_test_targets | get_test_targets | 420 | 354 | −15.7% | est. |
+| 16_find_implementations | find_implementations | 302 | 212 | −29.8% | est. |
+| 17_find_cycles | analyze_cycles | 117 | 122 | +4.3% | est. |
+| 18_graph_stats | graph_stats | 219 | 235 | +7.3% | est. |
+| 19_get_editing_context | get_editing_context | 315 | 231 | −26.7% | est. |
+| 20_get_repo_outline | get_repo_outline | 320 | 302 | −5.6% | est. |
+
+**Summary (Opus 4.7):** 20/20 cases. Median token savings: −27.3%. Exact rows: 0/20 (rest estimated via ×1.35 scalar).
