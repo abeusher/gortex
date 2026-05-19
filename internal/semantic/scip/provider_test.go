@@ -172,6 +172,46 @@ func TestEnrichFromIndex(t *testing.T) {
 	}
 }
 
+// TestEnrichFromIndex_DefinitionsOnly verifies the C# / .NET coverage
+// helper fast path: definitions are mapped (coverage counted) but the
+// reference-edge pass is skipped, so no edge is confirmed or added.
+func TestEnrichFromIndex_DefinitionsOnly(t *testing.T) {
+	p := NewProvider("scip-dotnet", nil, []string{"csharp"}, 120, zap.NewNop()).
+		WithDefinitionsOnly()
+
+	g := graph.New()
+	g.AddNode(&graph.Node{
+		ID: "M.cs::Foo", Kind: graph.KindMethod, Name: "Foo",
+		FilePath: "M.cs", StartLine: 10, EndLine: 20, Language: "csharp",
+	})
+	g.AddNode(&graph.Node{
+		ID: "M.cs::Bar", Kind: graph.KindMethod, Name: "Bar",
+		FilePath: "M.cs", StartLine: 22, EndLine: 30, Language: "csharp",
+	})
+	g.AddEdge(&graph.Edge{
+		From: "M.cs::Bar", To: "M.cs::Foo", Kind: graph.EdgeCalls,
+		Confidence: 0.7, ConfidenceLabel: "INFERRED",
+	})
+
+	index := &SCIPIndex{Documents: []SCIPDocument{{
+		RelativePath: "M.cs",
+		Occurrences: []SCIPOccurrence{
+			{Range: []int32{9, 5, 9, 8}, Symbol: "M.Foo()", SymbolRoles: 1},
+			{Range: []int32{21, 5, 21, 8}, Symbol: "M.Bar()", SymbolRoles: 1},
+			{Range: []int32{24, 2, 24, 5}, Symbol: "M.Foo()", SymbolRoles: 0}, // reference
+		},
+	}}}
+
+	result := p.enrichFromIndex(g, index, "/tmp/repo")
+	assert.Greater(t, result.SymbolsCovered, 0, "definitions must still be mapped")
+	assert.Equal(t, 0, result.EdgesConfirmed, "reference pass must be skipped")
+	assert.Equal(t, 0, result.EdgesAdded, "reference pass must be skipped")
+
+	edges := g.GetOutEdges("M.cs::Bar")
+	require.NotEmpty(t, edges)
+	assert.Equal(t, 0.7, edges[0].Confidence, "INFERRED edge must stay unconfirmed")
+}
+
 func TestExtractSymbolName(t *testing.T) {
 	tests := []struct {
 		symbol string

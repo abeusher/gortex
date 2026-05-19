@@ -22,6 +22,12 @@ type Provider struct {
 	languages []string
 	timeout   time.Duration
 	logger    *zap.Logger
+	// definitionsOnly runs the fast path: ingest only definition
+	// occurrences (the symbol map + coverage) and skip the expensive
+	// reference-edge pass. Used for the C# / .NET coverage helper,
+	// where compiler-grade symbol coverage is wanted without paying
+	// for full reference resolution.
+	definitionsOnly bool
 }
 
 // NewProvider creates a SCIP provider for the given command and languages.
@@ -36,6 +42,14 @@ func NewProvider(command string, args []string, languages []string, timeoutSec i
 		timeout:   time.Duration(timeoutSec) * time.Second,
 		logger:    logger,
 	}
+}
+
+// WithDefinitionsOnly enables the definitions-only fast path: the
+// provider ingests only definition occurrences (symbol map + coverage)
+// and skips the reference-edge pass. Builder-style.
+func (p *Provider) WithDefinitionsOnly() *Provider {
+	p.definitionsOnly = true
+	return p
 }
 
 func (p *Provider) Name() string        { return "scip-" + p.languages[0] }
@@ -174,6 +188,16 @@ func (p *Provider) enrichFromIndex(g *graph.Graph, index *SCIPIndex, repoRoot st
 
 	if result.SymbolsTotal > 0 {
 		result.CoveragePercent = float64(result.SymbolsCovered) / float64(result.SymbolsTotal) * 100
+	}
+
+	// Definitions-only fast path: the symbol map + coverage are done;
+	// skip the per-reference node lookup and edge resolution.
+	if p.definitionsOnly {
+		if p.logger != nil {
+			p.logger.Debug("scip: definitions-only fast path; skipping reference pass",
+				zap.Int("symbols_covered", result.SymbolsCovered))
+		}
+		return result
 	}
 
 	// Phase 2: Process reference occurrences — confirm/add edges.

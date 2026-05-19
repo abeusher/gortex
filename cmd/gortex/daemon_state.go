@@ -211,6 +211,7 @@ func buildDaemonState(logger *zap.Logger) (*daemonState, error) {
 				Command:   pc.Command,
 				Args:      pc.Args,
 				Env:       pc.Env,
+				Mode:      pc.Mode,
 				Daemon:    pc.Daemon,
 				Priority:  pc.Priority,
 				Enabled:   pc.Enabled,
@@ -236,7 +237,13 @@ func buildDaemonState(logger *zap.Logger) (*daemonState, error) {
 			}
 			switch {
 			case strings.HasPrefix(pc.Name, "scip-") && pc.Command != "":
-				semMgr.RegisterProvider(scip.NewProvider(pc.Command, pc.Args, pc.Languages, semCfg.TimeoutSeconds, logger))
+				scipProv := scip.NewProvider(pc.Command, pc.Args, pc.Languages, semCfg.TimeoutSeconds, logger)
+				// `mode: definitions` selects the definitions-only fast
+				// path — the C# / .NET coverage-helper use case.
+				if pc.Mode == "definitions" {
+					scipProv = scipProv.WithDefinitionsOnly()
+				}
+				semMgr.RegisterProvider(scipProv)
 			case lsp.SpecByName(pc.Name) != nil:
 				// Apply any command / args / env overrides from
 				// .gortex.yaml — this is how a user pins a JRE or
