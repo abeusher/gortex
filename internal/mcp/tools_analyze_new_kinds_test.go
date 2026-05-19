@@ -132,3 +132,49 @@ func TestSymbolNamesInFile(t *testing.T) {
 	// setupTestServer indexes a main.go containing main + helper.
 	require.NotEmpty(t, srv.symbolNamesInFile("main.go"))
 }
+
+// --- edge_audit ------------------------------------------------------------
+
+func TestAnalyzeEdgeAudit_Buckets(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	g := srv.graph
+
+	// An interface with no implementor.
+	g.AddNode(&graph.Node{ID: "z.go::Orphan", Kind: graph.KindInterface, Name: "Orphan"})
+	// An interface with an implementor — must NOT be flagged.
+	g.AddNode(&graph.Node{ID: "z.go::Used", Kind: graph.KindInterface, Name: "Used"})
+	g.AddNode(&graph.Node{ID: "z.go::Impl", Kind: graph.KindType, Name: "Impl"})
+	g.AddEdge(&graph.Edge{From: "z.go::Impl", To: "z.go::Used", Kind: graph.EdgeImplements})
+	// A function reached only from a test file, via a text-matched edge.
+	g.AddNode(&graph.Node{ID: "z.go::Helper", Kind: graph.KindFunction, Name: "Helper", FilePath: "z.go"})
+	g.AddNode(&graph.Node{ID: "z_test.go::TestZ", Kind: graph.KindFunction, Name: "TestZ", FilePath: "z_test.go"})
+	g.AddEdge(&graph.Edge{
+		From: "z_test.go::TestZ", To: "z.go::Helper",
+		Kind: graph.EdgeCalls, Origin: graph.OriginTextMatched,
+	})
+
+	out := callAnalyze(t, srv, "edge_audit", map[string]any{})
+	require.Contains(t, out, "edge_tiers")
+	require.Contains(t, out, "summary")
+
+	ui := out["unimplemented_interfaces"].(map[string]any)
+	require.GreaterOrEqual(t, ui["count"].(float64), float64(1))
+	require.NotContains(t, sampleStrings(ui), "z.go::Used")
+
+	to := out["test_only_targets"].(map[string]any)
+	require.Contains(t, sampleStrings(to), "z.go::Helper")
+
+	wc := out["weak_call_edges"].(map[string]any)
+	require.GreaterOrEqual(t, wc["count"].(float64), float64(1))
+}
+
+func sampleStrings(bucket map[string]any) []string {
+	raw, _ := bucket["sample"].([]any)
+	out := make([]string, 0, len(raw))
+	for _, v := range raw {
+		if s, ok := v.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
+}
