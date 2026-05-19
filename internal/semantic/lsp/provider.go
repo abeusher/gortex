@@ -23,8 +23,11 @@ type Provider struct {
 	args    []string
 	// env carries extra KEY=VALUE entries for the server subprocess,
 	// from a .gortex.yaml override (e.g. JAVA_HOME for jdtls).
-	env         []string
-	languages   []string
+	env []string
+	// workspaceFolders are additional roots advertised to the server's
+	// initialize request alongside the primary workspace root.
+	workspaceFolders []string
+	languages        []string
 	daemon      bool
 	maxParallel int
 	logger      *zap.Logger
@@ -431,8 +434,9 @@ func (p *Provider) ensureClient(workspaceRoot string) error {
 		})
 
 	initParams := InitializeParams{
-		ProcessID: os.Getpid(),
-		RootURI:   pathToURI(workspaceRoot),
+		ProcessID:        os.Getpid(),
+		RootURI:          pathToURI(workspaceRoot),
+		WorkspaceFolders: buildWorkspaceFolders(workspaceRoot, p.workspaceFolders),
 		Capabilities: ClientCapabilities{
 			Workspace: &WorkspaceClientCapabilities{
 				ApplyEdit: true,
@@ -1272,6 +1276,34 @@ func (p *Provider) subtypes(item TypeHierarchyItem) ([]TypeHierarchyItem, error)
 func pathToURI(path string) string {
 	absPath, _ := filepath.Abs(path)
 	return "file://" + absPath
+}
+
+// buildWorkspaceFolders returns the LSP workspaceFolders list — the
+// primary root followed by any additional roots. It returns nil when
+// there are no additional roots so rootUri-only servers are unaffected
+// (the field is omitempty).
+func buildWorkspaceFolders(primary string, additional []string) []WorkspaceFolder {
+	if len(additional) == 0 {
+		return nil
+	}
+	folders := make([]WorkspaceFolder, 0, len(additional)+1)
+	folders = append(folders, WorkspaceFolder{
+		URI:  pathToURI(primary),
+		Name: filepath.Base(primary),
+	})
+	for _, f := range additional {
+		if f == "" {
+			continue
+		}
+		if abs, err := filepath.Abs(f); err == nil {
+			f = abs
+		}
+		folders = append(folders, WorkspaceFolder{
+			URI:  pathToURI(f),
+			Name: filepath.Base(f),
+		})
+	}
+	return folders
 }
 
 // uriToPath converts a file:// URI to a repo-relative path.

@@ -42,6 +42,11 @@ type Router struct {
 	defaultWorkspace string
 	logger           *zap.Logger
 
+	// additionalWorkspaceFolders are extra directory roots advertised
+	// to every LSP server's initialize request (alongside the primary
+	// root) so a server can resolve cross-package imports.
+	additionalWorkspaceFolders []string
+
 	mu        sync.Mutex
 	providers map[providerKey]*routedProvider // (spec.Name, workspace) → cached provider
 	enabled   map[string]*ServerSpec          // spec.Name → spec marked enabled by config (no spawn until For/ForSpec)
@@ -251,6 +256,14 @@ func (r *Router) WithIdleTimeout(d time.Duration) *Router {
 	return r
 }
 
+// WithAdditionalWorkspaceFolders sets extra directory roots advertised
+// to every LSP server's initialize request alongside the primary
+// workspace root, enabling cross-package resolution. Builder-style.
+func (r *Router) WithAdditionalWorkspaceFolders(folders []string) *Router {
+	r.additionalWorkspaceFolders = folders
+	return r
+}
+
 // WithReaperInterval starts a background reaper that calls Reap() at
 // the given cadence. Idempotent — calling twice replaces the previous
 // reaper. A zero duration disables reaping.
@@ -331,6 +344,7 @@ func (r *Router) ForSpecWorkspace(spec *ServerSpec, workspace string) (*Provider
 
 	// Spawn outside the lock — initialize() blocks on stdio I/O.
 	p := NewProviderFromSpec(spec, r.logger)
+	p.workspaceFolders = r.additionalWorkspaceFolders
 	if err := p.EnsureClient(workspace); err != nil {
 		return nil, fmt.Errorf("spawn %s: %w", spec.Name, err)
 	}

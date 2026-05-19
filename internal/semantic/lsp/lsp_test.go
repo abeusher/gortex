@@ -77,6 +77,27 @@ func TestLSP_NewClient_FailsForBadCommand(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestBuildWorkspaceFolders(t *testing.T) {
+	// No additional roots → nil, so rootUri-only servers are unaffected.
+	require.Nil(t, buildWorkspaceFolders("/repo", nil))
+	require.Nil(t, buildWorkspaceFolders("/repo", []string{}))
+
+	folders := buildWorkspaceFolders("/repo/app", []string{"/repo/shared", "/repo/types"})
+	require.Len(t, folders, 3) // primary + 2 additional
+	require.Equal(t, "app", folders[0].Name)
+	require.Equal(t, "shared", folders[1].Name)
+	require.Equal(t, "types", folders[2].Name)
+	for _, f := range folders {
+		require.Contains(t, f.URI, "file://")
+	}
+}
+
+func TestRouter_WithAdditionalWorkspaceFolders(t *testing.T) {
+	r := NewRouter(t.TempDir(), zap.NewNop()).
+		WithAdditionalWorkspaceFolders([]string{"/extra/pkg"})
+	require.Equal(t, []string{"/extra/pkg"}, r.additionalWorkspaceFolders)
+}
+
 // ---------------------------------------------------------------------------
 // Client framing / request-response round-trip via io.Pipe pairs.
 // These tests exercise the JSON-RPC plumbing without requiring a real LSP

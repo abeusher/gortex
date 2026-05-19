@@ -5,9 +5,19 @@ package lsp
 
 // InitializeParams is sent as the first request to the server.
 type InitializeParams struct {
-	ProcessID    int                `json:"processId"`
-	RootURI      string             `json:"rootUri"`
-	Capabilities ClientCapabilities `json:"capabilities"`
+	ProcessID int    `json:"processId"`
+	RootURI   string `json:"rootUri"`
+	// WorkspaceFolders carries the primary root plus any additional
+	// roots for cross-package resolution. Omitted when empty so
+	// servers that only understand rootUri keep working.
+	WorkspaceFolders []WorkspaceFolder  `json:"workspaceFolders,omitempty"`
+	Capabilities     ClientCapabilities `json:"capabilities"`
+}
+
+// WorkspaceFolder is one root in a multi-folder LSP workspace.
+type WorkspaceFolder struct {
+	URI  string `json:"uri"`
+	Name string `json:"name"`
 }
 
 // ClientCapabilities declares what the client supports.

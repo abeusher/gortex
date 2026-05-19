@@ -78,6 +78,13 @@ type SemanticConfig struct {
 	WatchDebounceMs   int                      `mapstructure:"watch_debounce_ms" yaml:"watch_debounce_ms,omitempty"`
 	RefuteUnconfirmed bool                     `mapstructure:"refute_unconfirmed" yaml:"refute_unconfirmed,omitempty"`
 	Providers         []SemanticProviderConfig `mapstructure:"providers" yaml:"providers,omitempty"`
+	// AdditionalWorkspaceFolders are extra directory roots passed to
+	// every LSP server's `initialize` request as workspace folders.
+	// This is how cross-package resolution works for a TypeScript (or
+	// any) project that imports from a sibling package living outside
+	// the indexed repo root — the language server is told to treat
+	// those folders as part of the same workspace.
+	AdditionalWorkspaceFolders []string `mapstructure:"additional_workspace_folders" yaml:"additional_workspace_folders,omitempty"`
 	// SkipEmbed lists (language, kind) combinations that should be
 	// indexed for graph queries but *not* embedded into the vector
 	// search. Design tokens (CSS custom properties), terraform

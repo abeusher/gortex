@@ -226,7 +226,8 @@ func buildDaemonState(logger *zap.Logger) (*daemonState, error) {
 		lspRouter := lsp.NewRouter(lspWorkspace, logger).
 			WithIdleTimeout(10 * time.Minute).
 			WithReaperInterval(time.Minute).
-			WithMaxAlive(6)
+			WithMaxAlive(6).
+			WithAdditionalWorkspaceFolders(cfg.Semantic.AdditionalWorkspaceFolders)
 		semMgr.SetLSPRouter(lspRouter)
 
 		for _, pc := range semCfg.Providers {
