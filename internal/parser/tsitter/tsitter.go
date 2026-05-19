@@ -230,6 +230,18 @@ func (p *Parser) Close() {
 // void return; callers trust build-time grammar selection.
 func (p *Parser) SetLanguage(lang *Language) { _ = p.inner.SetLanguage(lang) }
 
+// Reset clears all retained parse state so the parser is safe to reuse
+// for an unrelated document. It MUST be called before returning a
+// parser to a pool: after a cancelled or timed-out parse the underlying
+// C parser is left halted mid-parse, and a subsequent Parse on the same
+// parser would otherwise resume the stale parse instead of starting
+// fresh. Reset does not clear the bound language.
+func (p *Parser) Reset() {
+	if p != nil && p.inner != nil {
+		p.inner.Reset()
+	}
+}
+
 // ParseCtx parses src under ctx's deadline, returning a *Tree the
 // caller must Close. Cancellation is polled via a ProgressCallback;
 // exact-to-the-byte interruption isn't guaranteed — tree-sitter calls

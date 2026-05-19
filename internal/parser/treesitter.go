@@ -12,11 +12,39 @@ import (
 
 const parseTimeout = 5 * time.Second
 
-// NB: a sync.Pool of *Parser was attempted under the smacker bindings
-// and tripped cross-call state bugs. The official bindings expose a
-// clean Reset(), but until we audit whether grammar switches behave
-// correctly, stay on fresh-per-call parsers — cold indexing throughput
-// was never parser-alloc-bound after we precompiled queries.
+// parserPool reuses *sitter.Parser instances across ParseFile calls so
+// each indexer worker amortises one parser allocation instead of
+// allocating + freeing a C-side TSParser per file.
+//
+// A *Parser pool was attempted once under the legacy smacker bindings
+// and tripped cross-call state bugs. The official tree-sitter bindings
+// fixed that: SetLanguage safely re-binds the grammar on every checkout
+// (verified — grammar switches reset the lexer), and Reset() drops the
+// halt flag and old-tree references left behind by a cancelled or
+// timed-out parse. putParser always calls Reset() before returning a
+// parser, so a checked-out parser is guaranteed to start a fresh parse.
+var parserPool = sync.Pool{
+	New: func() any { return sitter.NewParser() },
+}
+
+// getParser checks a parser out of the pool and binds lang to it.
+func getParser(lang *sitter.Language) *sitter.Parser {
+	p := parserPool.Get().(*sitter.Parser)
+	p.SetLanguage(lang)
+	return p
+}
+
+// putParser resets a parser's retained parse state and returns it to
+// the pool. Reset is mandatory after a cancelled / timed-out parse:
+// the underlying C parser is otherwise left halted mid-parse and the
+// next Parse would resume the stale parse rather than start fresh.
+func putParser(p *sitter.Parser) {
+	if p == nil {
+		return
+	}
+	p.Reset()
+	parserPool.Put(p)
+}
 
 // CapturedNode holds information about a single captured tree-sitter node.
 type CapturedNode struct {
@@ -36,9 +64,8 @@ type QueryResult struct {
 // ParseFile parses source bytes with the given language and returns the tree.
 // The caller must call tree.Close() when done.
 func ParseFile(src []byte, lang *sitter.Language) (*sitter.Tree, error) {
-	parser := sitter.NewParser()
-	defer parser.Close()
-	parser.SetLanguage(lang)
+	parser := getParser(lang)
+	defer putParser(parser)
 
 	ctx, cancel := context.WithTimeout(context.Background(), parseTimeout)
 	defer cancel()
