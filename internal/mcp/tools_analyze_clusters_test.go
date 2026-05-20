@@ -102,7 +102,20 @@ func TestClusters_DefaultMinSize(t *testing.T) {
 func TestClusters_AlgorithmEchoed(t *testing.T) {
 	s := newClustersTestServer(t)
 	out := callAnalyzeClusters(t, s, map[string]any{})
-	assert.Equal(t, "louvain", out["algorithm"])
+	assert.Equal(t, "leiden", out["algorithm"])
+
+	// The algorithm argument selects the detector and is echoed back.
+	for _, algo := range []string{"louvain", "spectral"} {
+		out := callAnalyzeClusters(t, s, map[string]any{"algorithm": algo})
+		assert.Equal(t, algo, out["algorithm"], "algorithm %q must be echoed", algo)
+	}
+
+	// An unknown algorithm is a clean error.
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"algorithm": "bogus"}
+	res, err := s.handleAnalyzeClusters(context.Background(), req)
+	require.NoError(t, err)
+	require.True(t, res.IsError, "unknown algorithm must return an error")
 }
 
 func TestClusters_DensityCorrect(t *testing.T) {
@@ -161,7 +174,7 @@ func TestClusters_EmptyCommunities(t *testing.T) {
 	out := callAnalyzeClusters(t, s, map[string]any{})
 	clusters, _ := out["clusters"].([]any)
 	assert.Empty(t, clusters)
-	assert.Equal(t, "louvain", out["algorithm"])
+	assert.Equal(t, "leiden", out["algorithm"])
 }
 
 func TestClusters_IntegrationViaDispatch(t *testing.T) {

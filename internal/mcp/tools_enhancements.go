@@ -165,6 +165,8 @@ func (s *Server) registerEnhancementTools() {
 			mcp.WithString("roll_up", mcp.Description("(health_score) Aggregate per-symbol scores up to a coarser scope — 'file' (per-file average + per-grade counts) or 'repo' (per-repo). Omit for per-symbol rows.")),
 			mcp.WithString("ids", mcp.Description("(impact) Comma-separated symbol IDs — score only these, the blast radius of changing specific symbols.")),
 			mcp.WithString("name", mcp.Description("(named) The query bundle to run. Omit to list every available bundle.")),
+			mcp.WithString("algorithm", mcp.Description("(clusters) Community-detection algorithm — leiden (default), louvain, or spectral (recursive Fiedler-vector bisection).")),
+			mcp.WithNumber("min_size", mcp.Description("(clusters) Drop clusters with fewer than this many members — default 3.")),
 		),
 		s.handleAnalyze,
 	)

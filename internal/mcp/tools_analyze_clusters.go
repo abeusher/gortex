@@ -19,26 +19,43 @@ import (
 // mix, and a hub identifier.
 //
 // "Offline clustering" in the spec refers to k-means / DBSCAN over
-// embeddings. Per-node embeddings aren't a public API of the
-// indexer today, so the analyzer falls back to the call-graph
-// Louvain communities the daemon already computes — these ARE
+// embeddings. Per-node embeddings aren't a public API of the indexer
+// today, so the analyzer clusters the call graph instead — these ARE
 // offline clusters with strong topology-grounded labels, and they
 // serve the downstream "show me the conceptual areas of this
-// codebase" use case the L12 spec listed. The wire response carries
-// `algorithm: "louvain"` so callers know which mechanism produced
-// the rows.
+// codebase" use case the L12 spec listed.
+//
+// The `algorithm` argument selects the mechanism: leiden (default,
+// the cached modularity communities), louvain (the legacy modularity
+// detector), or spectral (recursive Fiedler-vector bisection — pairs
+// better with similarity edges where modularity's resolution limit
+// blurs boundaries). The wire response echoes the algorithm used.
 func (s *Server) handleAnalyzeClusters(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	minSize := max(req.GetInt("min_size", 3), 1)
 	limit := max(req.GetInt("limit", 50), 1)
 	pathPrefix := strings.TrimSpace(req.GetString("path_prefix", ""))
+	algorithm := strings.ToLower(strings.TrimSpace(req.GetString("algorithm", "leiden")))
 
-	cr := s.getCommunities()
+	var cr *analysis.CommunityResult
+	switch algorithm {
+	case "", "leiden":
+		algorithm = "leiden"
+		cr = s.getCommunities()
+	case "louvain":
+		cr = analysis.DetectCommunitiesLouvain(s.graph)
+	case "spectral":
+		cr = analysis.SpectralClusters(s.graph)
+	default:
+		return mcp.NewToolResultError("analyze clusters: unknown algorithm " + algorithm +
+			" (expected: leiden, louvain, spectral)"), nil
+	}
+
 	if cr == nil || len(cr.Communities) == 0 {
 		return s.respondJSONOrTOON(ctx, req, map[string]any{
 			"clusters":  []map[string]any{},
 			"total":     0,
-			"algorithm": "louvain",
-			"note":      "community detection has not yet run on this graph; clusters list is empty",
+			"algorithm": algorithm,
+			"note":      "no communities detected on this graph",
 		})
 	}
 
@@ -151,7 +168,7 @@ func (s *Server) handleAnalyzeClusters(ctx context.Context, req mcp.CallToolRequ
 		"clusters":  rows,
 		"total":     len(rows),
 		"truncated": truncated,
-		"algorithm": "louvain",
+		"algorithm": algorithm,
 	})
 }
 
