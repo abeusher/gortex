@@ -160,6 +160,37 @@ func TestEdgeSanityViolated(t *testing.T) {
 	assert.False(t, nilResult.EdgeSanityViolated(), "nil result must not trip the check")
 }
 
+func TestGrepText(t *testing.T) {
+	dir := setupTestDir(t)
+	g := graph.New()
+	idx := newTestIndexer(g)
+	_, err := idx.Index(dir)
+	require.NoError(t, err)
+
+	// A literal present in main.go.
+	hits := idx.GrepText("func helper", 0)
+	require.NotEmpty(t, hits, "func helper should be found")
+	found := false
+	for _, h := range hits {
+		if h.Path == "main.go" {
+			found = true
+		}
+	}
+	assert.True(t, found, "func helper should be located in main.go")
+
+	// A literal present nowhere.
+	assert.Empty(t, idx.GrepText("nonexistent_zzz_literal", 0))
+
+	// After an incremental reindex the warm cache is rebuilt, so a
+	// freshly added literal is visible.
+	bumpMtime(t, filepath.Join(dir, "main.go"),
+		"package main\n\nfunc main() {}\n\nfunc BrandNew() {}\n")
+	_, err = idx.IncrementalReindex(dir)
+	require.NoError(t, err)
+	assert.NotEmpty(t, idx.GrepText("func BrandNew", 0),
+		"GrepText must reflect content added by an incremental reindex")
+}
+
 func TestIndex_EdgeSanityHolds(t *testing.T) {
 	// A real index of even a tiny repo produces edges, so the
 	// edge-sanity check passes — guards the invariant against false

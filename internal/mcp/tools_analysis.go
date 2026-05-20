@@ -46,6 +46,16 @@ func (s *Server) registerAnalysisTools() {
 		),
 		s.handleSuggestQueries,
 	)
+
+	s.addTool(
+		mcp.NewTool("search_text",
+			mcp.WithDescription("Trigram-accelerated literal code search across the indexed repository — the alt grep backbone. Returns matching file/line/text rows. A trigram index narrows the candidate files, so a repo-wide substring search costs roughly the size of the matching files, not the whole tree. Use for literal-string lookups; use search_symbols for symbol-name / concept queries."),
+			mcp.WithString("query", mcp.Description("Literal substring to search for (case-sensitive).")),
+			mcp.WithNumber("limit", mcp.Description("Max matching lines to return (default 100, capped at 1000).")),
+			mcp.WithString("format", mcp.Description("Output format: json (default), gcx (GCX1 compact wire format), or toon")),
+		),
+		s.handleSearchText,
+	)
 }
 
 func (s *Server) handleGetCommunities(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {

@@ -35,6 +35,7 @@ import (
 	"github.com/zzet/gortex/internal/reach"
 	"github.com/zzet/gortex/internal/resolver"
 	"github.com/zzet/gortex/internal/search"
+	"github.com/zzet/gortex/internal/search/trigram"
 	"github.com/zzet/gortex/internal/semantic"
 	gortexsql "github.com/zzet/gortex/internal/sql"
 	"github.com/zzet/gortex/internal/todos"
@@ -117,6 +118,16 @@ type Indexer struct {
 	parsePool   *crashpool.Pool
 	parseQuar   *crashpool.Quarantine
 	parsePoolMu sync.Mutex
+
+	// Trigram code-search index, lazily built on first GrepText call
+	// and rebuilt only when indexGen advances past the build it was
+	// made from. indexGen is bumped by every full or incremental
+	// index, so a burst of searches between reindexes hits a warm
+	// index.
+	indexGen        atomic.Uint64
+	trigramSearcher *trigram.Searcher
+	trigramGen      uint64
+	trigramMu       sync.Mutex
 
 	// repoPrefix is set in multi-repo mode to prefix all file paths and node IDs.
 	// When empty, the indexer operates in single-repo mode (backward compatible).
@@ -1752,6 +1763,7 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (*IndexResult, er
 	if idx.merkleEnabled() {
 		idx.saveMerkleBaseline(absRoot, files)
 	}
+	idx.indexGen.Add(1) // invalidate the trigram search cache
 
 	nodes, edges := idx.repoNodeEdgeCount()
 	result := &IndexResult{
@@ -2405,6 +2417,7 @@ func (idx *Indexer) IncrementalReindex(root string) (*IndexResult, error) {
 	// Re-extract contracts only if stale files were re-indexed.
 	if len(staleFiles) > 0 || len(deletedFiles) > 0 {
 		idx.extractContracts()
+		idx.indexGen.Add(1) // files changed — invalidate the trigram cache
 	}
 
 	nodes, edges := idx.repoNodeEdgeCount()
