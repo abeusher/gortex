@@ -2545,7 +2545,7 @@ func (s *Server) buildIndexHealthPayload() map[string]any {
 	// wholesale (a broken grammar, an aborted reindex). Even a single
 	// one-function file yields containment edges, so this only trips on
 	// a real regression.
-	edgesOK := !(totalDetected > 0 && stats.TotalNodes > 0 && stats.TotalEdges == 0)
+	edgesOK := totalDetected <= 0 || stats.TotalNodes <= 0 || stats.TotalEdges != 0
 	if !edgesOK {
 		msg := "Index has files and symbol nodes but zero edges — edge extraction failed. Re-index with index_repository path \".\"; if it persists the language grammar may be broken."
 		if recommendation == "" {
