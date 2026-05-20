@@ -27,6 +27,7 @@ import (
 	"github.com/zzet/gortex/internal/excludes"
 	"github.com/zzet/gortex/internal/fixtures"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/intern"
 	"github.com/zzet/gortex/internal/licenses"
 	"github.com/zzet/gortex/internal/modules"
 	"github.com/zzet/gortex/internal/parser"
@@ -1309,17 +1310,34 @@ func (idx *Indexer) applyRepoPrefix(nodes []*graph.Node, edges []*graph.Edge) {
 	}
 	prefix := idx.repoPrefix + "/"
 	const unresolvedMarker = "unresolved::"
+	// Intern every minted string. A node ID is referenced once on the
+	// node and again on every edge endpoint that points at it; a file
+	// path recurs on every node and edge in that file. Without
+	// interning each reference is a distinct `prefix + s` allocation —
+	// interning collapses them to one shared backing array, and edge
+	// endpoints end up sharing storage with the node ID they name.
 	for _, n := range nodes {
-		n.ID = prefix + n.ID
-		n.FilePath = prefix + n.FilePath
+		n.ID = intern.String(prefix + n.ID)
+		n.FilePath = intern.String(prefix + n.FilePath)
 		n.RepoPrefix = idx.repoPrefix
+		// Name and Language are low-cardinality and recur across
+		// thousands of nodes — method/function names like String, New,
+		// Get… and the ~20 distinct languages. Interning collapses
+		// each to a single backing array; it also shrinks the byName
+		// secondary index, whose keys are these same strings.
+		n.Name = intern.String(n.Name)
+		n.Language = intern.String(n.Language)
 	}
 	for _, e := range edges {
-		e.From = prefix + e.From
-		if !strings.HasPrefix(e.To, unresolvedMarker) {
-			e.To = prefix + e.To
+		e.From = intern.String(prefix + e.From)
+		if strings.HasPrefix(e.To, unresolvedMarker) {
+			// Unresolved targets carry no prefix, but many edges name
+			// the same unresolved symbol — still worth interning.
+			e.To = intern.String(e.To)
+		} else {
+			e.To = intern.String(prefix + e.To)
 		}
-		e.FilePath = prefix + e.FilePath
+		e.FilePath = intern.String(prefix + e.FilePath)
 	}
 }
 

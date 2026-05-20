@@ -49,6 +49,61 @@ func keyOf(e *Edge) edgeKey {
 	return edgeKey{From: e.From, To: e.To, Kind: e.Kind, FilePath: e.FilePath, Line: e.Line}
 }
 
+// edgeHash is the stored form of an edge's logical identity. A full
+// edgeKey carries four strings plus an int — 72 bytes as a map key or
+// sidecar element. Collapsing it to a 128-bit hash shrinks the
+// outEdgeIdx / inEdgeIdx maps and the outEdgeKeys / inEdgeKeys sidecars
+// by ~4.5×, the single largest line item in cold-warmup resident
+// memory. 128 bits keeps a collision between any two distinct edges in
+// a graph of realistic size out of reach (~1e-25 at 10M edges), so the
+// indexes stay unique-key maps — the dedup and swap-with-last logic is
+// byte-for-byte the same as the edgeKey version, only the key type
+// changes.
+type edgeHash struct{ lo, hi uint64 }
+
+const fnvOffset64 = 1469598103934665603
+const fnvPrime64 = 1099511628211
+
+// hashEdgeKey computes the 128-bit identity hash of an edge key. Each
+// 64-bit half is an independent FNV-1a pass: distinct seeds plus a
+// reversed field order decorrelate the halves so the pair behaves as a
+// 128-bit value rather than two views of the same 64-bit hash.
+func hashEdgeKey(k edgeKey) edgeHash {
+	return edgeHash{
+		lo: fnv1aEdge(fnvOffset64, k, false),
+		hi: fnv1aEdge(0x9e3779b97f4a7c15, k, true),
+	}
+}
+
+// fnv1aEdge folds every edgeKey field into one FNV-1a 64-bit hash. A
+// 0xff separator after each string keeps "ab"+"c" distinct from
+// "a"+"bc"; reversed==true walks the string fields back-to-front.
+func fnv1aEdge(seed uint64, k edgeKey, reversed bool) uint64 {
+	h := seed
+	mix := func(s string) {
+		for i := 0; i < len(s); i++ {
+			h ^= uint64(s[i])
+			h *= fnvPrime64
+		}
+		h ^= 0xff
+		h *= fnvPrime64
+	}
+	if reversed {
+		mix(k.FilePath)
+		mix(string(k.Kind))
+		mix(k.To)
+		mix(k.From)
+	} else {
+		mix(k.From)
+		mix(k.To)
+		mix(string(k.Kind))
+		mix(k.FilePath)
+	}
+	h ^= uint64(k.Line)
+	h *= fnvPrime64
+	return h
+}
+
 // shard is a fragment of the graph's data. Each shard holds the node
 // metadata for the subset of IDs that hash to it, plus the outgoing
 // edges whose source ID is in this shard and the incoming edges whose
@@ -85,14 +140,14 @@ type shard struct {
 	// Sidecar position indexes — see comment on shard. Reads are
 	// unchanged (callers still iterate the slices); only writes
 	// consult these maps.
-	byFileIdx  map[string]map[string]int  // filePath   → id  → position
-	byNameIdx  map[string]map[string]int  // name       → id  → position
-	byRepoIdx  map[string]map[string]int  // repoPrefix → id  → position
-	outEdgeIdx map[string]map[edgeKey]int // fromID     → key → position
-	inEdgeIdx  map[string]map[edgeKey]int // toID       → key → position
+	byFileIdx  map[string]map[string]int   // filePath   → id   → position
+	byNameIdx  map[string]map[string]int   // name       → id   → position
+	byRepoIdx  map[string]map[string]int   // repoPrefix → id   → position
+	outEdgeIdx map[string]map[edgeHash]int // fromID     → hash → position
+	inEdgeIdx  map[string]map[edgeHash]int // toID       → hash → position
 
 	// Reverse-index slices that remember each entry's insertion-time
-	// edgeKey, parallel to outEdges / inEdges. Required because keyOf
+	// edgeHash, parallel to outEdges / inEdges. Required because keyOf
 	// is computed from live Edge fields (To, From, ...) — and the
 	// resolver mutates Edge.To when retargeting an unresolved edge.
 	// During swap-with-last in removeEdgeFromBucket, computing
@@ -101,10 +156,10 @@ type shard struct {
 	// under, leaving a stale sidecar position pointing past the slice
 	// (panic: "index out of range [42] with length 41" in
 	// addEdgeToBucket on the next insert that collided with the stale
-	// key). Storing the original key here makes the swap update
+	// key). Storing the original hash here makes the swap update
 	// independent of live Edge state.
-	outEdgeKeys map[string][]edgeKey // fromID → position → key
-	inEdgeKeys  map[string][]edgeKey // toID   → position → key
+	outEdgeKeys map[string][]edgeHash // fromID → position → hash
+	inEdgeKeys  map[string][]edgeHash // toID   → position → hash
 
 	// Running per-repo memory totals maintained under the shard's
 	// existing write lock. Reading them out of RepoMemoryEstimate is
@@ -132,10 +187,10 @@ func newShard() *shard {
 		byFileIdx:     make(map[string]map[string]int),
 		byNameIdx:     make(map[string]map[string]int),
 		byRepoIdx:     make(map[string]map[string]int),
-		outEdgeIdx:    make(map[string]map[edgeKey]int),
-		inEdgeIdx:     make(map[string]map[edgeKey]int),
-		outEdgeKeys:   make(map[string][]edgeKey),
-		inEdgeKeys:    make(map[string][]edgeKey),
+		outEdgeIdx:    make(map[string]map[edgeHash]int),
+		inEdgeIdx:     make(map[string]map[edgeHash]int),
+		outEdgeKeys:   make(map[string][]edgeHash),
+		inEdgeKeys:    make(map[string][]edgeHash),
 		repoNodeBytes: make(map[string]uint64),
 		repoNodeCount: make(map[string]int),
 		repoEdgeBytes: make(map[string]uint64),
@@ -265,30 +320,30 @@ func removeNodeFromBucket(bucket map[string][]*Node, idx map[string]map[string]i
 // keys is the parallel slice that remembers each slot's insertion-time
 // edgeKey so removeEdgeFromBucket can update sidecars without
 // recomputing keyOf on a possibly-mutated swapped Edge.
-func addEdgeToBucket(bucket map[string][]*Edge, keys map[string][]edgeKey, idx map[string]map[edgeKey]int, key string, e *Edge) bool {
-	k := keyOf(e)
+func addEdgeToBucket(bucket map[string][]*Edge, keys map[string][]edgeHash, idx map[string]map[edgeHash]int, key string, e *Edge) bool {
+	h := hashEdgeKey(keyOf(e))
 	if inner, ok := idx[key]; ok {
-		if pos, exists := inner[k]; exists {
+		if pos, exists := inner[h]; exists {
 			bucket[key][pos] = e
-			// keys[key][pos] already equals k — same logical identity.
+			// keys[key][pos] already equals h — same logical identity.
 			return false
 		}
 	}
 	pos := len(bucket[key])
 	bucket[key] = append(bucket[key], e)
-	keys[key] = append(keys[key], k)
+	keys[key] = append(keys[key], h)
 	inner, ok := idx[key]
 	if !ok {
-		inner = make(map[edgeKey]int)
+		inner = make(map[edgeHash]int)
 		idx[key] = inner
 	}
-	inner[k] = pos
+	inner[h] = pos
 	return true
 }
 
 // removeEdgeFromBucket removes the entry with key k from bucket[key]
 // using swap-with-last, maintaining the sidecar. No-op when absent.
-func removeEdgeFromBucket(bucket map[string][]*Edge, keys map[string][]edgeKey, idx map[string]map[edgeKey]int, key string, k edgeKey) bool {
+func removeEdgeFromBucket(bucket map[string][]*Edge, keys map[string][]edgeHash, idx map[string]map[edgeHash]int, key string, k edgeHash) bool {
 	inner, ok := idx[key]
 	if !ok {
 		return false
@@ -302,12 +357,12 @@ func removeEdgeFromBucket(bucket map[string][]*Edge, keys map[string][]edgeKey, 
 	last := len(slice) - 1
 	if pos != last {
 		slice[pos] = slice[last]
-		// Use the swapped slot's STORED insertion-time key, not
-		// keyOf(swapped). The Edge's To may have been mutated by the
-		// resolver between insertion and now, in which case keyOf
-		// would yield a different key than the sidecar entry that
-		// actually points at this slot — leaking a stale "last"
-		// position that later panics in addEdgeToBucket.
+		// Use the swapped slot's STORED insertion-time hash, not
+		// hashEdgeKey(keyOf(swapped)). The Edge's To may have been
+		// mutated by the resolver between insertion and now, in which
+		// case keyOf would yield a different hash than the sidecar
+		// entry that actually points at this slot — leaking a stale
+		// "last" position that later panics in addEdgeToBucket.
 		swappedKey := keySlice[last]
 		keySlice[pos] = swappedKey
 		inner[swappedKey] = pos
@@ -660,8 +715,8 @@ func (g *Graph) ReindexEdge(e *Edge, oldTo string) {
 
 	// Old identity uses oldTo; the current edge struct already has the
 	// new To set, so we reconstruct the key before mutation.
-	oldKey := edgeKey{From: e.From, To: oldTo, Kind: e.Kind, FilePath: e.FilePath, Line: e.Line}
-	newKey := keyOf(e)
+	oldKey := hashEdgeKey(edgeKey{From: e.From, To: oldTo, Kind: e.Kind, FilePath: e.FilePath, Line: e.Line})
+	newKey := hashEdgeKey(keyOf(e))
 
 	sFrom := g.shardFor(e.From)
 	// outEdges slot position doesn't move — only the key under which
