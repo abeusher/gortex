@@ -25,20 +25,20 @@ const (
 // stored explicitly, queries by symbol stay O(notes) without
 // re-tokenising every body on every call.
 type NoteEntry struct {
-	ID         string
-	Timestamp  time.Time
-	UpdatedAt  time.Time
-	SessionID  string   // MCP session that created the note ("" for shared/embedded session)
-	ClientName string   // MCP clientInfo.name at create time (claude-code / cursor / ...)
-	Body       string   // free-form text the agent wrote
-	SymbolID   string   // primary attached symbol (optional)
-	FilePath   string   // primary attached file (optional)
-	RepoPrefix string   // repo prefix derived from session scope or attached symbol/file
-	WorkspaceID string  // workspace boundary; queries scope by this
-	ProjectID  string   // project sub-boundary
-	Tags       []string // free-form labels — "decision", "bug", "todo", ...
-	AutoLinks  []string // symbol IDs referenced by the body (auto-detected + explicit links)
-	Pinned     bool     // pinned notes are never evicted by the cap
+	ID          string
+	Timestamp   time.Time
+	UpdatedAt   time.Time
+	SessionID   string   // MCP session that created the note ("" for shared/embedded session)
+	ClientName  string   // MCP clientInfo.name at create time (claude-code / cursor / ...)
+	Body        string   // free-form text the agent wrote
+	SymbolID    string   // primary attached symbol (optional)
+	FilePath    string   // primary attached file (optional)
+	RepoPrefix  string   // repo prefix derived from session scope or attached symbol/file
+	WorkspaceID string   // workspace boundary; queries scope by this
+	ProjectID   string   // project sub-boundary
+	Tags        []string // free-form labels — "decision", "bug", "todo", ...
+	AutoLinks   []string // symbol IDs referenced by the body (auto-detected + explicit links)
+	Pinned      bool     // pinned notes are never evicted by the cap
 }
 
 // NoteStore is the persisted shape: a versioned, repo-scoped list of
