@@ -1,6 +1,6 @@
 # Gortex benchmarks
 
-This document aggregates the three reproducible benchmark surfaces
+This document aggregates the five reproducible benchmark surfaces
 gortex ships:
 
 - **Reference-repo perf** — cold-index, search p95, impact p95/p99,
@@ -14,6 +14,11 @@ gortex ships:
   JSON, scored against both the `cl100k_base` tokenizer (Claude 3 /
   Opus 4 / Sonnet 4 / Haiku 4.5 / GPT-4o family) and the Claude
   Opus 4.7 tokenizer.
+- **Daemon-mode MCP-tool latency** — p50/p95/p99 of the core MCP
+  tools through the production dispatch path.
+- **`search_symbols` retrieval recall** — R@1/5/20, MRR, and
+  per-tier recall of the retrieval rankers over a curated query
+  fixture.
 
 Every section below carries: the headline number, the published
 table, a "How to reproduce" block, and a link to the canonical
@@ -178,6 +183,50 @@ gortex bench daemon-latency --tools graph_stats,search_symbols
 Substrate: `bench/daemon-latency/` ([README](bench/daemon-latency/README.md)).
 Raw metrics land at `bench/results/daemon-latency.{md,json,csv}`
 when `--out-dir` is set.
+
+---
+
+## 5. search_symbols retrieval recall
+
+**Last updated: 2026-05-20** · fixture: `bench/fixtures/retrieval.yaml`
+(`gortex-seed-v2`, 156 cases) · operator hardware: Apple M3 Max
+
+Recall@K of the retrieval rankers over a hand-curated query fixture,
+tiered exact / concept / multi_hop. Recall is any-hit set-level
+recall against strict gold labels — a paraphrased-but-correct hit
+that misses the gold ID scores as a miss, so these are lower bounds
+versus an LLM-judged setup.
+
+| ranker  | R@1   | R@5   | R@20  | MRR   | p95 latency |
+|---------|------:|------:|------:|------:|------------:|
+| bm25    | 44.2% | 53.8% | 69.2% | 0.493 | 22.7ms      |
+| winnow  | 37.8% | 54.5% | 67.3% | 0.452 | 30.8ms      |
+| ripgrep |  0.0% | 17.3% | 29.5% | 0.061 | 162.2ms     |
+
+Per-tier R@5 (bm25): exact **93.7%** · concept 25.4% · multi_hop 30.0%.
+
+**Headline**: the `search_symbols` text path (`bm25`) lands
+**R@5 = 53.8%** / **R@20 = 69.2%**, and **93.7%** on exact
+symbol-name queries — 3.1× ripgrep's R@5 floor. The graph-aware
+`winnow` constraint chain edges it at R@5 (54.5%). The `semantic`
+and `rrf` rankers require `--embeddings` and are omitted here; the
+`graph` ranker scores only graph-traversal fixtures.
+
+### How to reproduce
+
+```sh
+# Against the gortex repo itself
+gortex eval recall --fixture bench/fixtures/retrieval.yaml --format markdown
+
+# Add the semantic + RRF rankers (local GloVe embedder)
+gortex eval recall --embeddings
+
+# Standardized benches (CoIR / SWE-ContextBench / ContextBench)
+gortex eval stdbench --bench coir --dataset <path>
+```
+
+Substrate: `internal/eval/recall/` + `cmd/gortex/eval_recall.go`. The
+standardized-benchmark loaders live in `internal/eval/stdbench/`.
 
 ---
 
