@@ -79,16 +79,18 @@ type IndexError struct {
 
 // Indexer walks a repository and populates the graph.
 type Indexer struct {
-	graph       *graph.Graph
-	registry    *parser.Registry
-	resolver    *resolver.Resolver
-	search      search.Backend
-	config      config.IndexConfig
-	transforms  *transformPipeline
-	excludes    *excludes.Matcher
-	excludeOnce sync.Once
-	rootPath    string
-	logger      *zap.Logger
+	graph         *graph.Graph
+	registry      *parser.Registry
+	resolver      *resolver.Resolver
+	search        search.Backend
+	config        config.IndexConfig
+	transforms    *transformPipeline
+	excludes      *excludes.Matcher
+	excludeOnce   sync.Once
+	dirIgnore     *excludes.Hierarchical
+	dirIgnoreOnce sync.Once
+	rootPath      string
+	logger        *zap.Logger
 
 	// repoPrefix is set in multi-repo mode to prefix all file paths and node IDs.
 	// When empty, the indexer operates in single-repo mode (backward compatible).
@@ -1324,7 +1326,7 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (*IndexResult, er
 			return nil
 		}
 		if d.IsDir() {
-			if idx.shouldExclude(path, absRoot) {
+			if idx.shouldExclude(path, absRoot, true) {
 				return filepath.SkipDir
 			}
 			return nil
@@ -1333,7 +1335,7 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (*IndexResult, er
 		if !ok {
 			return nil
 		}
-		if idx.shouldExclude(path, absRoot) {
+		if idx.shouldExclude(path, absRoot, false) {
 			return nil
 		}
 		if maxSize > 0 {
@@ -2112,16 +2114,32 @@ func (idx *Indexer) buildSearchIndex() {
 		zap.Int("dimensions", dims))
 }
 
+// dirIgnoreFiles are the per-directory ignore-file basenames honored by
+// the index walk, sibling to .gitignore. Patterns in each file are
+// scoped to the directory that contains it.
+var dirIgnoreFiles = []string{".gortexignore"}
+
 // shouldExclude reports whether a path is excluded by the effective
-// ignore list. The matcher is built lazily from idx.config.Exclude,
+// ignore list. The flat matcher is built lazily from idx.config.Exclude,
 // which is populated by ConfigManager.GetRepoConfig with the full
-// layered list (builtin + global + RepoEntry + workspace).
-func (idx *Indexer) shouldExclude(path, root string) bool {
-	m := idx.excludeMatcher()
-	if m == nil {
-		return false
+// layered list (builtin + global + RepoEntry + workspace). A path is
+// also excluded by any per-directory ignore file (dirIgnoreFiles)
+// present in one of its ancestor directories. isDir lets a trailing-
+// slash pattern prune a directory subtree instead of only its files.
+func (idx *Indexer) shouldExclude(path, root string, isDir bool) bool {
+	if m := idx.excludeMatcher(); m != nil && m.MatchAbsDir(path, root, isDir) {
+		return true
 	}
-	return m.MatchAbs(path, root)
+	return idx.dirIgnoreMatcher(root).Match(path, isDir)
+}
+
+// dirIgnoreMatcher returns the per-directory ignore matcher, built lazily
+// against the repo root the index walk is anchored at.
+func (idx *Indexer) dirIgnoreMatcher(root string) *excludes.Hierarchical {
+	idx.dirIgnoreOnce.Do(func() {
+		idx.dirIgnore = excludes.NewHierarchical(root, dirIgnoreFiles...)
+	})
+	return idx.dirIgnore
 }
 
 func (idx *Indexer) excludeMatcher() *excludes.Matcher {
@@ -2194,7 +2212,7 @@ func (idx *Indexer) IncrementalReindex(root string) (*IndexResult, error) {
 			return nil
 		}
 		if d.IsDir() {
-			if idx.shouldExclude(path, absRoot) {
+			if idx.shouldExclude(path, absRoot, true) {
 				return filepath.SkipDir
 			}
 			return nil
@@ -2202,7 +2220,7 @@ func (idx *Indexer) IncrementalReindex(root string) (*IndexResult, error) {
 		if _, ok := idx.effectiveLanguage(path); !ok {
 			return nil
 		}
-		if idx.shouldExclude(path, absRoot) {
+		if idx.shouldExclude(path, absRoot, false) {
 			return nil
 		}
 

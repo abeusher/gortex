@@ -58,12 +58,25 @@ func (m *Matcher) MatchRel(relPath string) bool {
 // MatchAbs reports whether an absolute path under root is excluded.
 // Returns false if path is not under root.
 func (m *Matcher) MatchAbs(absPath, root string) bool {
+	return m.MatchAbsDir(absPath, root, false)
+}
+
+// MatchAbsDir reports whether an absolute path under root is excluded.
+// When isDir is true the path is treated as a directory, so a pattern
+// written with a trailing slash (e.g. "build/") matches the directory
+// itself — letting the caller prune the whole subtree instead of
+// descending it and re-testing every file. Returns false if path is
+// not under root.
+func (m *Matcher) MatchAbsDir(absPath, root string, isDir bool) bool {
 	if m == nil || m.ign == nil {
 		return false
 	}
 	rel, err := filepath.Rel(root, absPath)
 	if err != nil {
 		return false
+	}
+	if isDir {
+		rel += "/"
 	}
 	return m.MatchRel(rel)
 }
