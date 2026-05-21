@@ -78,6 +78,19 @@ func Scan(source []byte, tags []string, maxText int) []Finding {
 		return nil
 	}
 
+	// Raw (un-escaped) tag list for a cheap substring pre-filter. The
+	// gating regex is anchored with `^\s*`, which defeats Go regexp's
+	// literal-prefix scan — without a pre-filter the full backtracking
+	// VM runs on every line of every file, including the ~99.99% with
+	// no marker at all. A line the regex can match must contain a tag
+	// verbatim, so rejecting tagless lines first drops zero true hits.
+	rawTags := make([]string, 0, len(tags))
+	for _, t := range tags {
+		if t = strings.TrimSpace(t); t != "" {
+			rawTags = append(rawTags, t)
+		}
+	}
+
 	var findings []Finding
 	bufPtr := scanBufPool.Get().(*[]byte)
 	defer scanBufPool.Put(bufPtr)
@@ -87,6 +100,9 @@ func Scan(source []byte, tags []string, maxText int) []Finding {
 	for scanner.Scan() {
 		lineNum++
 		line := scanner.Text()
+		if !containsAnyTag(line, rawTags) {
+			continue
+		}
 		match := tagPattern.FindStringSubmatch(line)
 		if match == nil {
 			continue
@@ -111,6 +127,20 @@ func Scan(source []byte, tags []string, maxText int) []Finding {
 		})
 	}
 	return findings
+}
+
+// containsAnyTag reports whether line contains any configured tag as a
+// verbatim substring — the cheap pre-filter that lets Scan skip the
+// regexp VM for lines that cannot possibly match. strings.Contains is
+// a SIMD memchr scan, orders of magnitude cheaper than the backtracking
+// engine the anchored gating pattern would otherwise run per line.
+func containsAnyTag(line string, tags []string) bool {
+	for _, t := range tags {
+		if strings.Contains(line, t) {
+			return true
+		}
+	}
+	return false
 }
 
 // buildTagPattern constructs the per-line regex from the configured

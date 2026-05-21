@@ -96,6 +96,11 @@ func ParseFile(src []byte, lang *sitter.Language) (*sitter.Tree, error) {
 // CGO compile that dominated large-repo indexing.
 type PreparedQuery struct {
 	q *sitter.Query
+	// names maps a capture index to its name, cached at compile time.
+	// ts.Query.CaptureNameForId crosses CGO and allocates a fresh
+	// string per call; a query firing thousands of times per file made
+	// that roughly one allocation per capture across the whole index.
+	names []string
 }
 
 // NewPreparedQuery compiles a tree-sitter query pattern for the given
@@ -106,7 +111,17 @@ func NewPreparedQuery(pattern string, lang *sitter.Language) (*PreparedQuery, er
 	if err != nil {
 		return nil, fmt.Errorf("tree-sitter query compile: %w", err)
 	}
-	return &PreparedQuery{q: q}, nil
+	return &PreparedQuery{q: q, names: q.Inner().CaptureNames()}, nil
+}
+
+// captureName resolves a capture index to its name from the cached
+// slice, falling back to the CGO accessor only for an index outside
+// the cached range (e.g. a PreparedQuery built without the cache).
+func (pq *PreparedQuery) captureName(id uint32) string {
+	if int(id) < len(pq.names) {
+		return pq.names[id]
+	}
+	return pq.q.CaptureNameForId(id)
 }
 
 // MustPreparedQuery is NewPreparedQuery that panics on compile error.
@@ -149,7 +164,7 @@ func RunQuery(pattern string, lang *sitter.Language, node *sitter.Node, src []by
 		return nil, fmt.Errorf("tree-sitter query compile: %w", err)
 	}
 	defer q.Close()
-	return runQuery(q, node, src), nil
+	return runQuery(&PreparedQuery{q: q, names: q.Inner().CaptureNames()}, node, src), nil
 }
 
 // RunPrepared executes a precompiled query against a node and returns
@@ -158,20 +173,20 @@ func RunPrepared(pq *PreparedQuery, node *sitter.Node, src []byte) []QueryResult
 	if pq == nil || pq.q == nil {
 		return nil
 	}
-	return runQuery(pq.q, node, src)
+	return runQuery(pq, node, src)
 }
 
 // runQuery is the hot iterator: it drives the cursor, copies captures
 // out of the cursor's reusable buffer before calling Next() again, and
 // assembles QueryResult values the extractors expect.
-func runQuery(q *sitter.Query, node *sitter.Node, src []byte) []QueryResult {
+func runQuery(pq *PreparedQuery, node *sitter.Node, src []byte) []QueryResult {
 	if node == nil || node.Inner() == nil {
 		return nil
 	}
 	cursor := getCursor()
 	defer putCursor(cursor)
 
-	iter := cursor.Matches(q.Inner(), node.Inner(), src)
+	iter := cursor.Matches(pq.q.Inner(), node.Inner(), src)
 	var results []QueryResult
 	for {
 		match := iter.Next()
@@ -186,7 +201,7 @@ func runQuery(q *sitter.Query, node *sitter.Node, src []byte) []QueryResult {
 			// c.Node is a value; copying it detaches from the cursor's
 			// per-match buffer so the pointer stays valid after Next().
 			nodeCopy := c.Node
-			name := q.CaptureNameForId(c.Index)
+			name := pq.captureName(c.Index)
 			sp := nodeCopy.StartPosition()
 			ep := nodeCopy.EndPosition()
 			qr.Captures[name] = &CapturedNode{
@@ -195,7 +210,7 @@ func runQuery(q *sitter.Query, node *sitter.Node, src []byte) []QueryResult {
 				EndLine:   int(ep.Row),
 				StartCol:  int(sp.Column),
 				EndCol:    int(ep.Column),
-				Node:      sitter.WrapNode(nodeCopy),
+				Node:      node.WrapVal(nodeCopy),
 			}
 		}
 		results = append(results, qr)
@@ -231,7 +246,7 @@ func EachMatch(pq *PreparedQuery, node *sitter.Node, src []byte, fn func(QueryRe
 		qr := QueryResult{Captures: make(map[string]*CapturedNode, len(match.Captures))}
 		for _, c := range match.Captures {
 			nodeCopy := c.Node
-			name := pq.q.CaptureNameForId(c.Index)
+			name := pq.captureName(c.Index)
 			sp := nodeCopy.StartPosition()
 			ep := nodeCopy.EndPosition()
 			qr.Captures[name] = &CapturedNode{
@@ -240,7 +255,7 @@ func EachMatch(pq *PreparedQuery, node *sitter.Node, src []byte, fn func(QueryRe
 				EndLine:   int(ep.Row),
 				StartCol:  int(sp.Column),
 				EndCol:    int(ep.Column),
-				Node:      sitter.WrapNode(nodeCopy),
+				Node:      node.WrapVal(nodeCopy),
 			}
 		}
 		fn(qr)

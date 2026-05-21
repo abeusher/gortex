@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"unsafe"
 
 	ts "github.com/tree-sitter/go-tree-sitter"
@@ -50,10 +51,26 @@ type Node struct {
 	inner ts.Node
 	// set true when constructed; distinguishes the zero value from a real node.
 	valid bool
+	// langKey is the stable C-pointer identity of this node's language,
+	// propagated from the root through every navigation step so Type()
+	// can resolve the node kind from a per-language table with no CGO
+	// call and no allocation. Nil means "not stamped" — Type() then
+	// derives the language, which is slower but still correct.
+	langKey unsafe.Pointer
 }
 
-// WrapNode wraps a value Node from the new API into our shim.
-func WrapNode(n ts.Node) *Node { return &Node{inner: n, valid: true} }
+// WrapNode wraps a value Node from the new API into our shim. It derives
+// the language key eagerly so navigation from the result stays alloc-free.
+func WrapNode(n ts.Node) *Node {
+	return &Node{inner: n, valid: true, langKey: unsafe.Pointer(n.Language().Inner)}
+}
+
+// WrapVal wraps a ts.Node reached from n (e.g. a query capture),
+// carrying n's language key so Type() on the result and its descendants
+// needs neither CGO nor allocation.
+func (n *Node) WrapVal(c ts.Node) *Node {
+	return &Node{inner: c, valid: true, langKey: n.langKey}
+}
 
 // SetInner overwrites the receiver's wrapped ts.Node and marks it
 // valid. Lets callers reuse a *Node out of a pool / backing slice
@@ -65,12 +82,14 @@ func (n *Node) SetInner(inner ts.Node) {
 	n.valid = true
 }
 
-// wrapPtr wraps a nullable *ts.Node, returning nil for nil input.
-func wrapPtr(n *ts.Node) *Node {
-	if n == nil {
+// wrap wraps a nullable *ts.Node reached by navigating from n, carrying
+// n's language key so Type() stays allocation-free across a tree walk.
+// Returns nil for nil input.
+func (n *Node) wrap(c *ts.Node) *Node {
+	if c == nil {
 		return nil
 	}
-	return &Node{inner: *n, valid: true}
+	return &Node{inner: *c, valid: true, langKey: n.langKey}
 }
 
 // Inner returns a pointer to the underlying ts.Node. Internal use by
@@ -83,7 +102,49 @@ func (n *Node) Inner() *ts.Node {
 }
 
 // Type returns the node kind string ("identifier", "function_declaration", …).
-func (n *Node) Type() string { return n.inner.Kind() }
+func (n *Node) Type() string { return internedKind(n.inner, n.langKey) }
+
+// kindTables memoises per-language node-kind name tables. tree-sitter
+// node kinds are a small fixed set (NodeKindCount — typically <300),
+// but ts.Node.Kind() crosses CGO and allocates a fresh Go string on
+// every call; a single index walks millions of nodes, and profiling
+// put node-kind GoString conversions at ~22% of all allocations. The
+// table turns Type() into a slice index — zero CGO, zero allocation —
+// after a one-time build per language.
+//
+// Keyed by the C TSLanguage pointer (stable per registered grammar);
+// sync.Map because indexing runs many languages concurrently.
+var kindTables sync.Map // unsafe.Pointer(*C.TSLanguage) -> []string
+
+// internedKind returns a node's type name from the per-language table,
+// building it on first use. Equivalent to ts.Node.Kind() because
+// ts_node_type is itself ts_language_symbol_name(language, symbol).
+// Falls back to the allocating Kind() only for an out-of-range symbol
+// id, which a well-formed grammar never produces.
+func internedKind(n ts.Node, key unsafe.Pointer) string {
+	// key is the node's language identity, stamped at wrap time. A nil
+	// key means the node was built on a path that didn't stamp it —
+	// derive it the slow way so Type() still returns the right answer.
+	if key == nil {
+		key = unsafe.Pointer(n.Language().Inner)
+	}
+	id := n.KindId()
+	v, ok := kindTables.Load(key)
+	if !ok {
+		lang := n.Language()
+		cnt := lang.NodeKindCount()
+		names := make([]string, cnt)
+		for i := uint32(0); i < cnt; i++ {
+			names[i] = lang.NodeKindForId(uint16(i))
+		}
+		v, _ = kindTables.LoadOrStore(key, names)
+	}
+	names := v.([]string)
+	if int(id) < len(names) {
+		return names[id]
+	}
+	return n.Kind()
+}
 
 // Content returns the UTF-8 text of the node as a slice of src.
 func (n *Node) Content(src []byte) string { return n.inner.Utf8Text(src) }
@@ -111,7 +172,7 @@ func (n *Node) Child(i int) *Node {
 	if i < 0 {
 		return nil
 	}
-	return wrapPtr(n.inner.Child(uint(i)))
+	return n.wrap(n.inner.Child(uint(i)))
 }
 
 // NamedChild returns the i-th named child or nil.
@@ -119,12 +180,12 @@ func (n *Node) NamedChild(i int) *Node {
 	if i < 0 {
 		return nil
 	}
-	return wrapPtr(n.inner.NamedChild(uint(i)))
+	return n.wrap(n.inner.NamedChild(uint(i)))
 }
 
 // ChildByFieldName returns the first child with the given field name or nil.
 func (n *Node) ChildByFieldName(name string) *Node {
-	return wrapPtr(n.inner.ChildByFieldName(name))
+	return n.wrap(n.inner.ChildByFieldName(name))
 }
 
 // FieldNameForChild returns the field name of the i-th child, or "" if none.
@@ -136,19 +197,19 @@ func (n *Node) FieldNameForChild(i int) string {
 }
 
 // Parent returns the parent node or nil for the root.
-func (n *Node) Parent() *Node { return wrapPtr(n.inner.Parent()) }
+func (n *Node) Parent() *Node { return n.wrap(n.inner.Parent()) }
 
 // NextSibling returns the next sibling (named or anonymous) or nil.
-func (n *Node) NextSibling() *Node { return wrapPtr(n.inner.NextSibling()) }
+func (n *Node) NextSibling() *Node { return n.wrap(n.inner.NextSibling()) }
 
 // PrevSibling returns the previous sibling (named or anonymous) or nil.
-func (n *Node) PrevSibling() *Node { return wrapPtr(n.inner.PrevSibling()) }
+func (n *Node) PrevSibling() *Node { return n.wrap(n.inner.PrevSibling()) }
 
 // NextNamedSibling returns the next named sibling or nil.
-func (n *Node) NextNamedSibling() *Node { return wrapPtr(n.inner.NextNamedSibling()) }
+func (n *Node) NextNamedSibling() *Node { return n.wrap(n.inner.NextNamedSibling()) }
 
 // PrevNamedSibling returns the previous named sibling or nil.
-func (n *Node) PrevNamedSibling() *Node { return wrapPtr(n.inner.PrevNamedSibling()) }
+func (n *Node) PrevNamedSibling() *Node { return n.wrap(n.inner.PrevNamedSibling()) }
 
 // IsNamed reports whether the node corresponds to a named grammar rule.
 func (n *Node) IsNamed() bool { return n.inner.IsNamed() }
@@ -197,8 +258,19 @@ func WrapTree(t *ts.Tree) *Tree { return &Tree{inner: t} }
 // Inner exposes the underlying *ts.Tree for internal use.
 func (t *Tree) Inner() *ts.Tree { return t.inner }
 
-// RootNode returns the root node of the parse tree.
-func (t *Tree) RootNode() *Node { return wrapPtr(t.inner.RootNode()) }
+// RootNode returns the root node of the parse tree, stamped with the
+// tree's language so Type() lookups across the walk need no CGO call.
+func (t *Tree) RootNode() *Node {
+	root := t.inner.RootNode()
+	if root == nil {
+		return nil
+	}
+	return &Node{
+		inner:   *root,
+		valid:   true,
+		langKey: unsafe.Pointer(root.Language().Inner),
+	}
+}
 
 // Close releases the tree's C resources.
 func (t *Tree) Close() {

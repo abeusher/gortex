@@ -108,7 +108,31 @@ func (mw *MultiWatcher) Start() error {
 	mw.mu.Lock()
 	defer mw.mu.Unlock()
 
-	for prefix, w := range mw.watchers {
+	// Per-repo watcher startup is independent, and each w.Start blocks
+	// ~150ms on macOS draining the FSEvents initial-replay storm (plus
+	// OS stream setup and a .git/HEAD watcher). Run them concurrently
+	// so an N-repo daemon pays one drain window instead of N serialised
+	// ones — on a 20-repo install this cuts ~3.4s of warmup to ~0.4s.
+	//
+	// Each goroutine writes only its own slot in results[] (no shared
+	// write), and mw's started/gitWatchers maps plus the forwardEvents
+	// goroutines are folded in serially after the wait. mw.mu stays
+	// held for the whole call so Start/Stop can't interleave; the
+	// concurrency here is purely within one Start.
+	type startResult struct {
+		prefix string
+		w      *Watcher
+		gw     *GitWatcher
+		ok     bool
+	}
+	prefixes := make([]string, 0, len(mw.watchers))
+	for prefix := range mw.watchers {
+		prefixes = append(prefixes, prefix)
+	}
+	results := make([]startResult, len(prefixes))
+	var wg sync.WaitGroup
+	for i, prefix := range prefixes {
+		w := mw.watchers[prefix]
 		meta := mw.multi.GetMetadata(prefix)
 		if meta == nil {
 			mw.logger.Warn("skipping watcher start: repo metadata not found",
@@ -126,35 +150,49 @@ func (mw *MultiWatcher) Start() error {
 			continue
 		}
 
-		if err := w.Start([]string{meta.RootPath}); err != nil {
-			mw.logger.Warn("failed to start watcher for repo",
-				zap.String("prefix", prefix),
-				zap.Error(err),
-			)
+		wg.Add(1)
+		go func(slot int, prefix string, w *Watcher, rootPath string) {
+			defer wg.Done()
+			if err := w.Start([]string{rootPath}); err != nil {
+				mw.logger.Warn("failed to start watcher for repo",
+					zap.String("prefix", prefix),
+					zap.Error(err),
+				)
+				return
+			}
+			res := startResult{prefix: prefix, w: w, ok: true}
+
+			// Start the .git/HEAD watcher alongside the file watcher.
+			// It's best-effort — repos without a .git dir (uninitialised
+			// worktrees, tarball checkouts) simply skip it.
+			if idx := mw.multi.GetIndexer(prefix); idx != nil {
+				gw, err := NewGitWatcher(rootPath, idx, mw.logger.With(zap.String("repo", prefix)))
+				if err != nil {
+					mw.logger.Debug("git-watcher: init failed",
+						zap.String("prefix", prefix), zap.Error(err))
+				} else if err := gw.Start(); err != nil {
+					mw.logger.Debug("git-watcher: start failed",
+						zap.String("prefix", prefix), zap.Error(err))
+					_ = gw.Stop()
+				} else {
+					res.gw = gw
+				}
+			}
+			results[slot] = res
+		}(i, prefix, w, meta.RootPath)
+	}
+	wg.Wait()
+
+	for _, res := range results {
+		if !res.ok {
 			continue
 		}
-
-		mw.started[prefix] = true
-
-		// Start the .git/HEAD watcher alongside the file watcher.
-		// It's best-effort — repos without a .git dir (uninitialised
-		// worktrees, tarball checkouts) simply skip it.
-		if idx := mw.multi.GetIndexer(prefix); idx != nil {
-			gw, err := NewGitWatcher(meta.RootPath, idx, mw.logger.With(zap.String("repo", prefix)))
-			if err != nil {
-				mw.logger.Debug("git-watcher: init failed",
-					zap.String("prefix", prefix), zap.Error(err))
-			} else if err := gw.Start(); err != nil {
-				mw.logger.Debug("git-watcher: start failed",
-					zap.String("prefix", prefix), zap.Error(err))
-				_ = gw.Stop()
-			} else {
-				mw.gitWatchers[prefix] = gw
-			}
+		mw.started[res.prefix] = true
+		if res.gw != nil {
+			mw.gitWatchers[res.prefix] = res.gw
 		}
-
 		// Forward events from this watcher and trigger cross-repo resolution.
-		go mw.forwardEvents(prefix, w)
+		go mw.forwardEvents(res.prefix, res.w)
 	}
 
 	return nil
