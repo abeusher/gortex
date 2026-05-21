@@ -187,6 +187,11 @@ type Server struct {
 	// watcher's symbol-change callback via SetWatcher.
 	staleRefsBroadcaster *staleRefsBroadcaster
 
+	// graphInvalidatedBroadcaster fans `notifications/graph_invalidated`
+	// to subscribers whenever the graph is rebuilt — a coarse
+	// "drop your caches" signal. Fired from RunAnalysis.
+	graphInvalidatedBroadcaster *graphInvalidatedBroadcaster
+
 	// llmService is the optional LLM service backing the `ask` MCP tool
 	// and the `search_symbols` assist modes. nil until SetLLMService is
 	// called by the daemon entrypoint. The service wraps whichever
@@ -280,6 +285,9 @@ func (s *Server) ReleaseSession(id string) {
 	}
 	if s.staleRefsBroadcaster != nil {
 		s.staleRefsBroadcaster.unsubscribe(id)
+	}
+	if s.graphInvalidatedBroadcaster != nil {
+		s.graphInvalidatedBroadcaster.unsubscribe(id)
 	}
 	// Editor-overlay sessions are pinned to the MCP session that
 	// registered them. When the MCP session ends — for any reason —
@@ -676,6 +684,7 @@ func NewServer(engine *query.Engine, g *graph.Graph, idx *indexer.Indexer, watch
 	s.readinessBroadcaster = newReadinessBroadcaster(s.mcpServer, logger)
 	s.healthBroadcaster = newHealthBroadcaster(s.mcpServer, nil, logger)
 	s.staleRefsBroadcaster = newStaleRefsBroadcaster(s.mcpServer, s.sessions, s.session, logger)
+	s.graphInvalidatedBroadcaster = newGraphInvalidatedBroadcaster(s.mcpServer, logger)
 
 	// Lazy-tool registry MUST be installed before any addTool calls so
 	// non-hot tools land in the deferred catalog instead of the live
@@ -695,6 +704,7 @@ func NewServer(engine *query.Engine, g *graph.Graph, idx *indexer.Indexer, watch
 	s.registerReadinessTools()
 	s.registerHealthTools()
 	s.registerStaleRefsTools()
+	s.registerGraphInvalidatedTools()
 	s.registerDataflowTools()
 	s.registerASTTools()
 	s.registerCloneTools()
@@ -1280,6 +1290,12 @@ func (s *Server) RunAnalysis() {
 	// can change after re-warm even when the analysis itself didn't
 	// — node counts move on every reindex. Fire updates regardless.
 	s.notifyBootstrapResourcesUpdated()
+
+	// Coarse hot-reload signal: the graph has just been rebuilt, so
+	// any cached query result a long-lived client holds may be stale.
+	if s.graphInvalidatedBroadcaster != nil && s.graph != nil {
+		s.graphInvalidatedBroadcaster.broadcast(s.graph.NodeCount(), s.graph.EdgeCount(), "reanalysis")
+	}
 }
 
 func (s *Server) getCommunities() *analysis.CommunityResult {
