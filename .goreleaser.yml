@@ -24,9 +24,17 @@ builds:
     goos:
       - linux
       - darwin
+      - windows
     goarch:
       - amd64
       - arm64
+    ignore:
+      # windows/arm64 needs an aarch64-w64-mingw32 cross-toolchain that
+      # the goreleaser-cross image doesn't ship; windows/amd64 covers
+      # every mainstream Windows dev box. Revisit when the image gains
+      # the llvm-mingw arm64 target.
+      - goos: windows
+        goarch: arm64
     # Per-target CC + CXX. goreleaser-cross exposes these cross-toolchains
     # on PATH; CGO needs both set per target triple because some deps
     # (tree-sitter yaml scanner, etc.) ship C++. Without CXX, the system
@@ -53,6 +61,11 @@ builds:
         env:
           - CC=aarch64-linux-gnu-gcc
           - CXX=aarch64-linux-gnu-g++
+      - goos: windows
+        goarch: amd64
+        env:
+          - CC=x86_64-w64-mingw32-gcc
+          - CXX=x86_64-w64-mingw32-g++
     # Per-target build hook. Fires after each Mach-O / ELF is linked,
     # before the archive step. The script is a no-op for non-darwin
     # targets, so we don't need a per-override hook list.
@@ -66,6 +79,11 @@ builds:
 
 archives:
   - formats: [tar.gz]
+    # Windows users expect a .zip, not a .tar.gz — and Scoop only
+    # understands zip archives.
+    format_overrides:
+      - goos: windows
+        formats: [zip]
     # Version intentionally omitted — `/releases/latest/download/<name>` URLs
     # require an exact filename, and users linking to the latest release
     # shouldn't need to know the version. Version is still in the release
@@ -124,3 +142,21 @@ homebrew_casks:
     generate_completions_from_executable:
       executable: gortex
       shell_parameter_format: cobra
+
+# Scoop manifest — `scoop install gortex` on Windows. goreleaser commits
+# the generated manifest (pointing at the signed windows/amd64 .zip in
+# this release) to a separate bucket repo on every tagged release,
+# exactly like the Homebrew cask above.
+scoops:
+  - name: gortex
+    repository:
+      owner: gortexhq
+      name: scoop-bucket
+      # GITHUB_TOKEN can only push to the source repo, so the bucket
+      # needs its own PAT with `repo` scope on gortexhq/scoop-bucket,
+      # stored as SCOOP_BUCKET_TOKEN in repo secrets. release.yml wires
+      # it in.
+      token: "{{ .Env.SCOOP_BUCKET_TOKEN }}"
+    homepage: "https://github.com/zzet/gortex"
+    description: "Code intelligence engine that indexes repositories into an in-memory knowledge graph."
+    license: "Custom"

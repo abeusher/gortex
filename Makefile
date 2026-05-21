@@ -9,7 +9,7 @@ COMMIT    ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 DATE      ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 LDFLAGS   := -s -w -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.date=$(DATE)
 
-.PHONY: build build-onnx build-gomlx build-hugot \
+.PHONY: build build-onnx build-gomlx build-hugot build-windows \
        test bench bench-rpi bench-rpi-quick bench-rpi-profile bench-compare \
        lint fmt clean install tag-release \
        deps-onnx deps-gomlx deps-hugot deps-vectors \
@@ -73,7 +73,7 @@ fmt:
 	gofmt -s -w .
 
 clean:
-	rm -f $(BINARY) gortex-linux gortex-rpi
+	rm -f $(BINARY) gortex.exe gortex-linux gortex-rpi gortex-rpi32
 
 install:
 	go install -ldflags '$(LDFLAGS)' ./cmd/gortex/
@@ -117,6 +117,17 @@ build-rpi32:
 	CGO_ENABLED=1 GOOS=linux GOARCH=arm GOARM=7 CC=arm-linux-gnueabihf-gcc \
 		go build -ldflags '$(LDFLAGS)' -o gortex-rpi32 ./cmd/gortex/
 	@echo "✓ Built gortex-rpi32 (linux/arm/v7)"
+
+# Cross-compile for Windows (amd64). Requires the mingw-w64 toolchain
+# (`brew install mingw-w64` on macOS, `apt install gcc-mingw-w64` on
+# Debian/Ubuntu). CGO stays on because tree-sitter needs a C/C++
+# compiler; the llama tag is omitted — the in-process llama.cpp backend
+# isn't part of the Windows build.
+build-windows:
+	CGO_ENABLED=1 GOOS=windows GOARCH=amd64 \
+		CC=x86_64-w64-mingw32-gcc CXX=x86_64-w64-mingw32-g++ \
+		go build -ldflags '$(LDFLAGS)' -o gortex.exe ./cmd/gortex/
+	@echo "✓ Built gortex.exe (windows/amd64)"
 
 # ---------------------------------------------------------------------------
 # Marketplace plugin bundle

@@ -9,11 +9,13 @@ on:
   pull_request:
     paths:
       - "scripts/install.sh"
+      - "scripts/install.ps1"
       - ".github/workflows/install-script.yml"
   push:
     branches: [main]
     paths:
       - "scripts/install.sh"
+      - "scripts/install.ps1"
 
 jobs:
   posix-syntax:
@@ -77,3 +79,20 @@ jobs:
           # Marker block must appear exactly once.
           count=$(grep -c '^# >>> gortex installer >>>' "$HOME/.bashrc")
           test "$count" = "1"
+
+  powershell-syntax:
+    # Parse-check install.ps1 — the PowerShell counterpart of the
+    # posix-syntax job. A full install can only run once a release ships
+    # Windows artifacts, so this validates that the script parses without
+    # errors on every change.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Parse install.ps1
+        shell: pwsh
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path scripts/install.ps1), [ref]$null, [ref]$errors) | Out-Null
+          if ($errors) { $errors; exit 1 }
+          Write-Host "install.ps1 parses cleanly"

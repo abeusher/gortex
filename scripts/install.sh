@@ -60,9 +60,12 @@ detect_os() {
 	case "$uname_s" in
 		Linux) echo linux ;;
 		Darwin) echo darwin ;;
-		# Catch users running this in WSL — Windows binaries aren't published yet,
-		# but the Linux build runs fine under WSL.
-		MINGW*|MSYS*|CYGWIN*) die "Windows native install isn't supported yet; run this from WSL or use the manual download from https://github.com/${GORTEX_REPO}/releases" ;;
+		# Native Windows shells (Git Bash / MSYS / Cygwin) can't run this
+		# POSIX installer — point users at the PowerShell installer. The
+		# Linux build still runs fine under WSL.
+		MINGW*|MSYS*|CYGWIN*) die "this POSIX installer can't run on native Windows.
+  In PowerShell, run:  irm https://get.gortex.dev/install.ps1 | iex
+  (or 'scoop install gortex', or run this script from inside WSL)" ;;
 		*) die "unsupported OS: $uname_s (Linux and macOS supported)" ;;
 	esac
 }

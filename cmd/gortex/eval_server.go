@@ -6,7 +6,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"syscall"
 
 	"github.com/spf13/cobra"
 
@@ -17,6 +16,7 @@ import (
 	gortexmcp "github.com/zzet/gortex/internal/mcp"
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/parser/languages"
+	"github.com/zzet/gortex/internal/platform"
 	"github.com/zzet/gortex/internal/query"
 )
 
@@ -131,7 +131,7 @@ func runEvalServer(cmd *cobra.Command, args []string) error {
 
 	// Handle graceful shutdown.
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(sigCh, platform.ShutdownSignals()...)
 
 	select {
 	case err := <-errCh:

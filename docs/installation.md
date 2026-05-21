@@ -1,6 +1,6 @@
 # Installing Gortex
 
-Pre-built binaries are published to [GitHub Releases](https://github.com/zzet/gortex/releases) for linux/amd64, linux/arm64, darwin/amd64 (Intel Mac), and darwin/arm64 (Apple Silicon). Every release is **cosign-signed**, ships **SLSA-3 provenance**, and is **VirusTotal-scanned** — see [Verifying releases](#verifying-releases-supply-chain-security) below. Windows support is planned.
+Pre-built binaries are published to [GitHub Releases](https://github.com/zzet/gortex/releases) for linux/amd64, linux/arm64, darwin/amd64 (Intel Mac), darwin/arm64 (Apple Silicon), and windows/amd64. Every release is **cosign-signed**, ships **SLSA-3 provenance**, and is **VirusTotal-scanned** — see [Verifying releases](#verifying-releases-supply-chain-security) below.
 
 **New to Gortex?** After installing, see [onboarding.md](onboarding.md) for the 15-minute walkthrough: `gortex install` (once per machine) → `gortex init` (once per repo) → verify your AI assistant uses graph tools → what to do if it doesn't.
 
@@ -23,6 +23,27 @@ brew install zzet/tap/gortex
 ```
 
 Homebrew strips the `homebrew-` prefix from tap repositories, so `zzet/homebrew-tap` is installed as `zzet/tap`. Updates via `brew upgrade`. No Gatekeeper prompt — `brew` doesn't set the quarantine attribute on downloads.
+
+## Windows — one-line install (PowerShell)
+
+```powershell
+irm https://get.gortex.dev/install.ps1 | iex
+```
+
+Detects the architecture, downloads the signed `gortex_windows_amd64.zip`, verifies the SHA256 against `checksums.txt`, installs `gortex.exe` to `%LOCALAPPDATA%\Programs\gortex`, and adds that directory to your user `PATH`. Re-runs upgrade in place and back up the previous binary as `gortex.exe.previous`.
+
+Override defaults via environment variables: `GORTEX_VERSION=v0.15.0` (pin a version), `GORTEX_INSTALL_DIR` (custom install directory), `GORTEX_NO_PATH=1` (skip the PATH update), `GORTEX_NO_VERIFY=1` (skip checksum verification), `GORTEX_FORCE=1` (overwrite without backup). Source: [`scripts/install.ps1`](../scripts/install.ps1).
+
+Windows on ARM is supported via x64 emulation — the installer downloads the amd64 build there too. The daemon uses an AF_UNIX socket, which requires Windows 10 1803 or newer.
+
+## Windows — Scoop
+
+```powershell
+scoop bucket add gortex https://github.com/gortexhq/scoop-bucket
+scoop install gortex
+```
+
+The bucket holds the `gortex` manifest, which points at the signed GitHub Release archives. `scoop update gortex` upgrades in place.
 
 ## Linux — Debian / Ubuntu (.deb)
 

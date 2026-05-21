@@ -98,6 +98,7 @@ jobs:
             -w /go/src/gortex \
             -e GITHUB_TOKEN \
             -e HOMEBREW_TAP_TOKEN \
+            -e SCOOP_BUCKET_TOKEN \
             ghcr.io/goreleaser/goreleaser-cross:v1.26 \
             release --clean
         env:
@@ -105,6 +106,10 @@ jobs:
           # Personal access token with `repo` scope on zzet/homebrew-tap.
           # GITHUB_TOKEN can only push to the source repo, not the tap.
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          # Same story for the Scoop bucket — a PAT with `repo` scope on
+          # gortexhq/scoop-bucket. Required for the `scoops` block in
+          # .goreleaser.yml to push the Windows manifest.
+          SCOOP_BUCKET_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
 
       # goreleaser-cross runs as root inside the container, so everything
       # in dist/ is owned by root:root on the host. The subsequent cosign
@@ -155,7 +160,7 @@ jobs:
         run: |
           cd dist
           shopt -s nullglob
-          for f in *.tar.gz *.deb *.rpm *.apk checksums.txt; do
+          for f in *.tar.gz *.zip *.deb *.rpm *.apk checksums.txt; do
             echo "Signing $f..."
             cosign sign-blob \
               --output-signature "${f}.sig" \
@@ -189,7 +194,7 @@ jobs:
           # (one "hash  filename" line per artifact). We hash the primary
           # artifacts only — .sig/.pem are attestations of these files,
           # they don't need their own provenance.
-          HASHES=$(sha256sum *.tar.gz *.deb *.rpm *.apk | base64 -w0)
+          HASHES=$(sha256sum *.tar.gz *.zip *.deb *.rpm *.apk | base64 -w0)
           echo "hashes=$HASHES" >> "$GITHUB_OUTPUT"
 
       # Always wipe signing material — even on failure — so a P12 / .p8
@@ -241,6 +246,7 @@ jobs:
           mkdir -p dist
           gh release download "${GITHUB_REF#refs/tags/}" --dir dist \
             --pattern '*.tar.gz' \
+            --pattern '*.zip' \
             --pattern '*.deb' \
             --pattern '*.rpm' \
             --pattern '*.apk'
@@ -251,6 +257,7 @@ jobs:
           vt_api_key: ${{ secrets.VT_API_KEY }}
           files: |
             ./dist/*.tar.gz
+            ./dist/*.zip
             ./dist/*.deb
             ./dist/*.rpm
             ./dist/*.apk

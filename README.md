@@ -44,10 +44,16 @@ Built for 15 AI coding agents (Claude Code, Kiro, Cursor, Windsurf, VS Code (and
 ## Installation
 
 ```bash
+# macOS / Linux
 curl -fsSL https://get.gortex.dev | sh
 ```
 
-> Detects OS/arch, downloads the signed release tarball, verifies the SHA256 against `checksums.txt` (and cosign if installed), drops the binary in `$HOME/.local/bin`, and adds it to your shell rc. Re-runs upgrade in place. No silent sudo. Linux + macOS, amd64 + arm64. Windows support is planned.
+```powershell
+# Windows (PowerShell)
+irm https://get.gortex.dev/install.ps1 | iex
+```
+
+> Detects OS/arch, downloads the signed release archive, verifies the SHA256 against `checksums.txt` (and cosign if installed), installs the binary, and puts it on your PATH. Re-runs upgrade in place. No silent sudo. Linux + macOS + Windows, amd64 + arm64. On Windows, `scoop install gortex` works too.
 
 For Homebrew, package managers (`.deb` / `.rpm` / `.apk`), direct binary download, supply-chain verification (cosign + SLSA-3 + VirusTotal), and from-source builds — see [docs/installation.md](docs/installation.md).
 

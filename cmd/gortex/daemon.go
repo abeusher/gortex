@@ -10,7 +10,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/jedib0t/go-pretty/v6/table"
@@ -21,6 +20,7 @@ import (
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/platform"
 )
 
 var (
@@ -82,7 +82,7 @@ var daemonLogsCmd = &cobra.Command{
 
 func init() {
 	daemonStartCmd.Flags().BoolVar(&daemonDetach, "detach", false,
-		"fork to background after starting (writes to ~/.cache/gortex/daemon.log)")
+		"fork to background after starting (logs to the daemon log file — see `gortex daemon logs`)")
 	daemonStartCmd.Flags().BoolVar(&daemonEmbeddings, "embeddings", false,
 		"load a semantic embedding provider (opt-in — adds ~87 MB model download on first use and ~60 ms/symbol warmup)")
 	daemonStartCmd.Flags().StringVar(&daemonHTTPAddr, "http-addr", "",
@@ -459,14 +459,18 @@ func spawnDetachedDaemon() error {
 	child.Stdout = logFile
 	child.Stderr = logFile
 	child.Stdin = nil
-	// Detach from the controlling terminal so Ctrl-C on the parent
-	// doesn't kill the daemon.
-	child.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	// Detach the child from the parent's controlling terminal /
+	// console so Ctrl-C on the parent doesn't kill the daemon.
+	child.SysProcAttr = platform.DetachSysProcAttr()
 	if err := child.Start(); err != nil {
 		_ = logFile.Close()
 		return fmt.Errorf("spawn daemon: %w", err)
 	}
-	// Don't wait — the child inherits the log file handle.
+	// Don't block on the child — it's detached and inherits the log
+	// file handle. Reap it in a background goroutine so a crash during
+	// startup surfaces on `exited` instead of stalling the poll loop.
+	exited := make(chan error, 1)
+	go func() { exited <- child.Wait() }()
 
 	// Wait until the socket is live or a timeout hits, so we fail fast
 	// if the child died on startup. The socket opens after buildDaemonState
@@ -484,10 +488,11 @@ func spawnDetachedDaemon() error {
 		}
 		// Bail out early if the child has already exited — no point
 		// waiting another 59 seconds for a corpse.
-		var ws syscall.WaitStatus
-		if pid, _ := syscall.Wait4(child.Process.Pid, &ws, syscall.WNOHANG, nil); pid == child.Process.Pid {
-			return fmt.Errorf("daemon exited during startup (status %d); check %s",
-				ws.ExitStatus(), daemon.LogFilePath())
+		select {
+		case werr := <-exited:
+			return fmt.Errorf("daemon exited during startup (%v); check %s",
+				werr, daemon.LogFilePath())
+		default:
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
@@ -926,8 +931,9 @@ func daemonControlClient() (*daemon.Client, error) {
 }
 
 // killByPID is the fallback stop path for stale daemons that have a PID
-// file but don't respond on the socket. Sends SIGTERM, waits, then
-// SIGKILL. Silently returns nil if the PID no longer exists.
+// file but don't respond on the socket. Asks the process to terminate,
+// waits, then force-kills. Silently returns nil if the PID no longer
+// exists.
 func killByPID() error {
 	pidBytes, err := os.ReadFile(daemon.PIDFilePath())
 	if err != nil {
@@ -937,24 +943,24 @@ func killByPID() error {
 	if pid <= 0 {
 		return nil
 	}
-	_ = syscall.Kill(pid, syscall.SIGTERM)
+	_ = platform.TerminateProcess(pid)
 
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if err := syscall.Kill(pid, 0); err != nil {
+		if !platform.ProcessAlive(pid) {
 			// Process gone.
 			_ = os.Remove(daemon.PIDFilePath())
 			_ = os.Remove(daemon.SocketPath())
-			fmt.Fprintln(os.Stderr, "[gortex daemon] stopped (via SIGTERM)")
+			fmt.Fprintln(os.Stderr, "[gortex daemon] stopped")
 			return nil
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
 	// Last resort.
-	_ = syscall.Kill(pid, syscall.SIGKILL)
+	_ = platform.KillProcess(pid)
 	_ = os.Remove(daemon.PIDFilePath())
 	_ = os.Remove(daemon.SocketPath())
-	fmt.Fprintln(os.Stderr, "[gortex daemon] stopped (via SIGKILL)")
+	fmt.Fprintln(os.Stderr, "[gortex daemon] stopped (force-killed)")
 	return nil
 }
 

@@ -270,6 +270,7 @@ require (
 	github.com/yalue/onnxruntime_go v1.30.1
 	github.com/zeebo/blake3 v0.2.4
 	go.uber.org/zap v1.28.0
+	golang.org/x/sys v0.44.0
 	golang.org/x/term v0.43.0
 	golang.org/x/tools v0.45.0
 	gopkg.in/yaml.v3 v3.0.1
@@ -360,7 +361,6 @@ require (
 	golang.org/x/image v0.40.0 // indirect
 	golang.org/x/mod v0.36.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
-	golang.org/x/sys v0.44.0 // indirect
 	golang.org/x/text v0.37.0 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 	k8s.io/klog/v2 v2.140.0 // indirect
@@ -373,3 +373,10 @@ replace github.com/tree-sitter/tree-sitter-elixir => github.com/elixir-lang/tree
 // Parser.ParseWithOptions hits it on every Parse, capping parser
 // throughput to one goroutine at a time. See internal/thirdparty/go-pointer.
 replace github.com/mattn/go-pointer => ./internal/thirdparty/go-pointer
+
+// Vendored copy of github.com/google/renameio v1.0.1 with an added
+// Windows implementation. Upstream v1.0.1 builds only on non-Windows
+// platforms (tempfile.go / writefile.go are `+build !windows`), which
+// blocked the Windows build because github.com/coder/hnsw imports it
+// unconditionally. See internal/thirdparty/renameio.
+replace github.com/google/renameio => ./internal/thirdparty/renameio

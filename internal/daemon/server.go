@@ -11,12 +11,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"strconv"
 	"sync"
-	"syscall"
 	"time"
 
 	"go.uber.org/zap"
+
+	"github.com/zzet/gortex/internal/platform"
 )
 
 // Server is the long-living Gortex daemon. It owns the Unix socket
@@ -116,9 +118,11 @@ func New(socketPath, version string, logger *zap.Logger) *Server {
 	}
 }
 
-// Listen creates the socket, writes the PID file, and installs SIGINT/SIGTERM
-// handlers for graceful shutdown. The socket permissions are 0o600 — the
-// daemon is user-local and nothing else on the machine should reach it.
+// Listen creates the socket, writes the PID file, and installs the
+// shutdown-signal handlers for graceful shutdown. The socket permissions
+// are 0o600 on Unix — the daemon is user-local and nothing else on the
+// machine should reach it; on Windows, %LocalAppData% ACLs scope it to
+// the user instead.
 func (s *Server) Listen() error {
 	if err := EnsureParentDir(s.SocketPath); err != nil {
 		return fmt.Errorf("ensure socket dir: %w", err)
@@ -137,9 +141,14 @@ func (s *Server) Listen() error {
 		_ = os.Remove(PIDFilePath())
 		return fmt.Errorf("listen: %w", err)
 	}
-	if err := os.Chmod(s.SocketPath, 0o600); err != nil {
-		_ = l.Close()
-		return fmt.Errorf("chmod socket: %w", err)
+	// chmod the socket to user-only on Unix. Windows has no POSIX mode
+	// bits — the socket inherits the ACLs of %LocalAppData%, which is
+	// already user-scoped — so skip it there.
+	if runtime.GOOS != "windows" {
+		if err := os.Chmod(s.SocketPath, 0o600); err != nil {
+			_ = l.Close()
+			return fmt.Errorf("chmod socket: %w", err)
+		}
 	}
 	s.listener = l
 	s.started = time.Now()
@@ -167,7 +176,7 @@ func (s *Server) Listen() error {
 
 	// Install signal handlers once the listener is live.
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(sigCh, platform.ShutdownSignals()...)
 	go func() {
 		<-sigCh
 		s.Logger.Info("daemon: received signal, shutting down")
@@ -554,7 +563,7 @@ func (s *Server) writePIDFile() error {
 	}
 	if existing, err := os.ReadFile(path); err == nil {
 		if pid, _ := strconv.Atoi(string(existing)); pid > 0 {
-			if err := syscall.Kill(pid, 0); err == nil {
+			if platform.ProcessAlive(pid) {
 				return fmt.Errorf("daemon already running (pid %d)", pid)
 			}
 			// Stale pid file — old daemon crashed without cleanup.

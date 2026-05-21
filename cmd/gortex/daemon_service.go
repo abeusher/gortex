@@ -89,7 +89,7 @@ func runDaemonInstallService(cmd *cobra.Command, _ []string) error {
 	case "linux":
 		return installSystemd(w, exe)
 	default:
-		return fmt.Errorf("service install not supported on %s yet (Windows is Phase 4+, contributions welcome)", runtime.GOOS)
+		return fmt.Errorf("service install is not supported on %s — run 'gortex daemon start --detach' to keep the daemon running in the background", runtime.GOOS)
 	}
 }
 
