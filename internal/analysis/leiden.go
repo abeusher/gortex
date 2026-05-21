@@ -32,56 +32,28 @@ import (
 // Result has the same shape as DetectCommunities so the call site
 // can swap them out without other changes.
 func DetectCommunitiesLeiden(g *graph.Graph) *CommunityResult {
-	nodes := g.AllNodes()
-	edges := g.AllEdges()
+	result, _ := detectCommunitiesLeidenRaw(g)
+	return result
+}
 
-	// Same node/edge filter as Louvain: symbol nodes only, weighted
-	// by edge kind via edgeWeight().
-	symbolNodes := make(map[string]bool, len(nodes))
-	for _, n := range nodes {
-		if n.Kind != graph.KindFile && n.Kind != graph.KindImport {
-			symbolNodes[n.ID] = true
-		}
+// detectCommunitiesLeidenRaw runs the full Leiden pipeline and
+// returns both the labelled CommunityResult and the raw partition
+// (original-node-id → stable raw community key, pre-renumbering)
+// alongside the weighted adjacency it was computed on. The raw
+// partition is what the incremental path caches and re-seeds from:
+// the public CommunityResult only carries renumbered "community-N"
+// ids and drops singletons, neither of which can drive a restricted
+// re-optimization. The returned partition is nil when the graph has
+// no clustering-relevant edges (the result is then empty too).
+func detectCommunitiesLeidenRaw(g *graph.Graph) (*CommunityResult, *leidenPartition) {
+	lg := buildLeidenGraph(g)
+	if lg == nil {
+		return &CommunityResult{NodeToComm: make(map[string]string)}, nil
 	}
-
-	type edgeKey struct{ a, b string }
-	weights := make(map[edgeKey]float64)
-	for _, e := range edges {
-		if !symbolNodes[e.From] || !symbolNodes[e.To] {
-			continue
-		}
-		w := edgeWeight(e.Kind)
-		if w == 0 {
-			continue
-		}
-		weights[edgeKey{e.From, e.To}] += w
-		weights[edgeKey{e.To, e.From}] += w
-	}
-
-	neighbors := make(map[string]map[string]float64)
-	for k, w := range weights {
-		if neighbors[k.a] == nil {
-			neighbors[k.a] = make(map[string]float64)
-		}
-		neighbors[k.a][k.b] = w
-	}
-
-	var totalWeight float64
-	for _, w := range weights {
-		totalWeight += w
-	}
-	totalWeight /= 2
-
-	if totalWeight == 0 {
-		return &CommunityResult{NodeToComm: make(map[string]string)}
-	}
-
-	degree := make(map[string]float64)
-	for id := range symbolNodes {
-		for _, w := range neighbors[id] {
-			degree[id] += w
-		}
-	}
+	symbolNodes := lg.symbolNodes
+	neighbors := lg.neighbors
+	totalWeight := lg.totalWeight
+	degree := lg.degree
 
 	// Per-iteration state. Each iteration shrinks the graph by
 	// replacing nodes with refined sub-communities. We keep
@@ -142,7 +114,14 @@ func DetectCommunitiesLeiden(g *graph.Graph) *CommunityResult {
 	// Renumber, build Community structs, label, disambiguate, group
 	// — same downstream pipeline as Louvain so the result is
 	// indistinguishable in shape.
-	return buildCommunityResult(g, finalComm, neighbors, totalWeight, degree)
+	result := buildCommunityResult(g, finalComm, neighbors, totalWeight, degree)
+	return result, &leidenPartition{
+		comm:        finalComm,
+		neighbors:   neighbors,
+		degree:      degree,
+		totalWeight: totalWeight,
+		symbolNodes: symbolNodes,
+	}
 }
 
 // leidenFastLocalMoves is the queue-based phase-1 routine. Each

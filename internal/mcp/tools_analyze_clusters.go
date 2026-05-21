@@ -37,10 +37,14 @@ func (s *Server) handleAnalyzeClusters(ctx context.Context, req mcp.CallToolRequ
 	algorithm := strings.ToLower(strings.TrimSpace(req.GetString("algorithm", "leiden")))
 
 	var cr *analysis.CommunityResult
+	// incrStats is populated only on the Leiden path; it records
+	// whether the partition was recomputed incrementally (only the
+	// packages that changed since the last call) or in full.
+	var incrStats analysis.IncrementalCommunityStats
 	switch algorithm {
 	case "", "leiden":
 		algorithm = "leiden"
-		cr = s.getCommunities()
+		cr, incrStats = s.incrementalCommunities()
 	case "louvain":
 		cr = analysis.DetectCommunitiesLouvain(s.graph)
 	case "spectral":
@@ -164,12 +168,32 @@ func (s *Server) handleAnalyzeClusters(ctx context.Context, req mcp.CallToolRequ
 		truncated = true
 	}
 
-	return s.respondJSONOrTOON(ctx, req, map[string]any{
+	resp := map[string]any{
 		"clusters":  rows,
 		"total":     len(rows),
 		"truncated": truncated,
 		"algorithm": algorithm,
-	})
+	}
+	// On the Leiden path, report whether the partition was recomputed
+	// incrementally (only the changed packages) or in full, so a
+	// caller can see the cache working.
+	if algorithm == "leiden" {
+		recompute := "incremental"
+		if !incrStats.Incremental {
+			recompute = "full"
+		}
+		detection := map[string]any{
+			"recompute":           recompute,
+			"changed_packages":    incrStats.ChangedPackages,
+			"total_packages":      incrStats.TotalPackages,
+			"repartitioned_nodes": incrStats.RepartitionedNodes,
+		}
+		if incrStats.FullRecomputeReason != "" {
+			detection["full_recompute_reason"] = incrStats.FullRecomputeReason
+		}
+		resp["detection"] = detection
+	}
+	return s.respondJSONOrTOON(ctx, req, resp)
 }
 
 // handleAnalyzeConcepts labels each cluster with a human-readable

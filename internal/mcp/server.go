@@ -100,7 +100,13 @@ type Server struct {
 	communities    *analysis.CommunityResult
 	processes      *analysis.ProcessResult
 	pageRank       *analysis.PageRankResult
-	analysisMu     sync.RWMutex
+	// leidenCache carries the last Leiden partition between
+	// `analyze kind=clusters` calls so a re-run after only a couple
+	// of packages changed re-partitions just those packages instead
+	// of the whole graph. nil until the first clusters request;
+	// guarded by analysisMu.
+	leidenCache *analysis.LeidenPartitionCache
+	analysisMu  sync.RWMutex
 
 	// cochange caches the git-history co-change graph. cochangeByFile
 	// maps a file path to its co-changing file paths and association
@@ -1303,7 +1309,14 @@ func (s *Server) ResolveToolScope(toolName string, repo any) (*ScopedRepos, *mcp
 // without polling.
 func (s *Server) RunAnalysis() {
 	s.analysisMu.Lock()
-	s.communities = analysis.DetectCommunities(s.graph)
+	// Detect communities through the incremental path, threading the
+	// partition cache. When a re-warm only touched a few packages
+	// this recomputes just those; the cache is also left warm so the
+	// next `analyze kind=clusters` call inherits it. The result is
+	// shape-identical to a full DetectCommunities run.
+	communities, cache, _ := analysis.DetectCommunitiesLeidenIncremental(s.graph, s.leidenCache)
+	s.communities = communities
+	s.leidenCache = cache
 	s.processes = analysis.DiscoverProcesses(s.graph)
 	s.pageRank = analysis.ComputePageRank(s.graph)
 	s.analysisMu.Unlock()
@@ -1324,6 +1337,20 @@ func (s *Server) getCommunities() *analysis.CommunityResult {
 	s.analysisMu.RLock()
 	defer s.analysisMu.RUnlock()
 	return s.communities
+}
+
+// incrementalCommunities runs Leiden community detection through the
+// incremental path, threading the per-server partition cache so a
+// re-run after only a few packages changed re-partitions just those
+// packages. The cache it returns is stored back under analysisMu so
+// the next clusters request can build on it. The accompanying stats
+// describe whether the fast path or a full recompute ran.
+func (s *Server) incrementalCommunities() (*analysis.CommunityResult, analysis.IncrementalCommunityStats) {
+	s.analysisMu.Lock()
+	defer s.analysisMu.Unlock()
+	result, cache, stats := analysis.DetectCommunitiesLeidenIncremental(s.graph, s.leidenCache)
+	s.leidenCache = cache
+	return result, stats
 }
 
 func (s *Server) getProcesses() *analysis.ProcessResult {

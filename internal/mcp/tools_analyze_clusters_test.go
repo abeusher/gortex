@@ -16,18 +16,24 @@ func newClustersTestServer(t *testing.T) *Server {
 	t.Helper()
 	g := graph.New()
 
-	// Five members in a tight cluster — three call edges among them.
+	// Five members wired into a ring — a cohesive auth cluster that
+	// real Leiden detection collapses into one community of 5.
 	for _, id := range []string{"a", "b", "c", "d", "e"} {
 		g.AddNode(&graph.Node{ID: id, Name: id, Kind: graph.KindFunction, FilePath: "auth/" + id + ".go", Language: "go"})
 	}
 	g.AddEdge(&graph.Edge{From: "a", To: "b", Kind: graph.EdgeCalls})
 	g.AddEdge(&graph.Edge{From: "b", To: "c", Kind: graph.EdgeCalls})
 	g.AddEdge(&graph.Edge{From: "c", To: "d", Kind: graph.EdgeCalls})
+	g.AddEdge(&graph.Edge{From: "d", To: "e", Kind: graph.EdgeCalls})
+	g.AddEdge(&graph.Edge{From: "e", To: "a", Kind: graph.EdgeCalls})
 
-	// Two-member cluster — should be filtered out under default min_size=3.
+	// Two-member cluster — mutually calling, so detection forms a
+	// real community of 2 that the default min_size=3 filters out.
 	for _, id := range []string{"x", "y"} {
 		g.AddNode(&graph.Node{ID: id, Name: id, Kind: graph.KindFunction, FilePath: "utils/" + id + ".go", Language: "python"})
 	}
+	g.AddEdge(&graph.Edge{From: "x", To: "y", Kind: graph.EdgeCalls})
+	g.AddEdge(&graph.Edge{From: "y", To: "x", Kind: graph.EdgeCalls})
 
 	s := &Server{
 		graph:      g,
@@ -37,21 +43,11 @@ func newClustersTestServer(t *testing.T) *Server {
 		sessions:   newSessionMap(),
 		toolScopes: newScopeRegistry(),
 	}
+	// Seed s.communities so handlers that read it directly
+	// (handleAnalyzeConcepts) have data; the clusters handler
+	// recomputes from the graph through the incremental path.
 	s.analysisMu.Lock()
-	s.communities = &analysis.CommunityResult{
-		Communities: []analysis.Community{
-			{
-				ID: "c-auth", Label: "auth", Hub: "b", Size: 5,
-				Members: []string{"a", "b", "c", "d", "e"},
-				Files:   []string{"auth/a.go", "auth/b.go", "auth/c.go", "auth/d.go", "auth/e.go"},
-			},
-			{
-				ID: "c-utils", Label: "utils", Size: 2,
-				Members: []string{"x", "y"},
-				Files:   []string{"utils/x.go", "utils/y.go"},
-			},
-		},
-	}
+	s.communities = analysis.DetectCommunities(g)
 	s.analysisMu.Unlock()
 	return s
 }
@@ -95,7 +91,7 @@ func TestClusters_DefaultMinSize(t *testing.T) {
 	clusters, _ := out["clusters"].([]any)
 	require.Len(t, clusters, 1, "min_size default 3 drops the 2-member cluster")
 	row := clusters[0].(map[string]any)
-	assert.Equal(t, "c-auth", row["id"])
+	assert.Equal(t, "community-0", row["id"])
 	assert.EqualValues(t, 5, row["size"].(float64))
 }
 
@@ -124,8 +120,9 @@ func TestClusters_DensityCorrect(t *testing.T) {
 
 	clusters, _ := out["clusters"].([]any)
 	row := clusters[0].(map[string]any)
-	// 3 intra edges (a→b, b→c, c→d). Possible-directed-pairs = 5*4=20.
-	assert.InDelta(t, 0.15, row["density"].(float64), 1e-6, "3/20 = 0.15")
+	// 5 intra edges (the a→b→c→d→e→a ring). Possible-directed-pairs
+	// = 5*4 = 20.
+	assert.InDelta(t, 0.25, row["density"].(float64), 1e-6, "5/20 = 0.25")
 }
 
 func TestClusters_FileSpread(t *testing.T) {
@@ -158,7 +155,7 @@ func TestClusters_PathPrefix(t *testing.T) {
 	out := callAnalyzeClusters(t, s, map[string]any{"path_prefix": "utils/", "min_size": 1})
 	clusters, _ := out["clusters"].([]any)
 	require.Len(t, clusters, 1)
-	assert.Equal(t, "c-utils", clusters[0].(map[string]any)["id"])
+	assert.Equal(t, "community-1", clusters[0].(map[string]any)["id"])
 }
 
 func TestClusters_EmptyCommunities(t *testing.T) {
