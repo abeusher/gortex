@@ -32,6 +32,7 @@ import (
 	"github.com/zzet/gortex/internal/modules"
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/parser/crashpool"
+	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/progress"
 	"github.com/zzet/gortex/internal/reach"
 	"github.com/zzet/gortex/internal/resolver"
@@ -667,6 +668,39 @@ func (idx *Indexer) ResolveFilePath(graphPath string) string {
 	}
 	return filepath.Clean(filepath.Join(idx.rootPath, rel))
 }
+
+// relKey reduces an absolute path under the repo root to the canonical
+// repo-relative key the graph and the mtime map are indexed by: forward
+// slashes, and Unicode NFC.
+//
+// The NFC fold is load-bearing. A file with a non-ASCII name is handed
+// to the indexer in different byte forms depending on the source — the
+// filesystem walk (filepath.WalkDir) yields decomposed NFD on macOS,
+// while the git watcher decodes `git diff` output that git stored as
+// precomposed NFC. Keying the bulk walk under one form and an
+// incremental patch under the other would split a single file across
+// two graph keys: the watcher's evict would miss the walk's node,
+// IncrementalReindex would see the file as both deleted and freshly
+// created, and the daemon would carry a stale duplicate. Folding every
+// key through one form here removes that whole class of mismatch.
+//
+// On a path that is not under rootPath (filepath.Rel fails) the input
+// is returned slash-normalised and NFC-folded so the result is still a
+// stable key, just not repo-relative.
+func (idx *Indexer) relKey(absPath string) string {
+	rel, err := filepath.Rel(idx.rootPath, absPath)
+	if err != nil {
+		return pathkey.Normalize(filepath.ToSlash(absPath))
+	}
+	return pathkey.Normalize(filepath.ToSlash(rel))
+}
+
+// RelKey exposes relKey to in-package collaborators (the watcher) that
+// hold an absolute filesystem path and need the canonical repo-relative
+// graph key for it — e.g. to look up a file's nodes before and after a
+// re-index. Going through one helper keeps the watcher's key in lockstep
+// with the keys IndexFile / EvictFile write.
+func (idx *Indexer) RelKey(absPath string) string { return idx.relKey(absPath) }
 
 // SetRepoPrefix sets the repository prefix for multi-repo mode.
 // When non-empty, all node IDs and file paths are prefixed with "<repoPrefix>/".
@@ -1648,13 +1682,15 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (*IndexResult, er
 	// instead of vanishing silently.
 	idx.emitSizeSkipNodes(skippedBySize)
 
-	// Populate fileMtimes for all detected files.
+	// Populate fileMtimes for all detected files. Keyed through
+	// relKey so the mtime map agrees with the graph's file-node keys
+	// (and with the incremental / git-watcher paths) on the NFC form
+	// of every non-ASCII filename.
 	idx.mtimeMu.Lock()
 	idx.fileMtimes = make(map[string]int64, len(files))
 	for _, f := range files {
 		if info, err := os.Stat(f); err == nil {
-			relPath, _ := filepath.Rel(absRoot, f)
-			idx.fileMtimes[filepath.ToSlash(relPath)] = info.ModTime().UnixNano()
+			idx.fileMtimes[idx.relKey(f)] = info.ModTime().UnixNano()
 		}
 	}
 	idx.mtimeMu.Unlock()
@@ -1902,10 +1938,12 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 		return err
 	}
 
-	relPath, err := filepath.Rel(idx.rootPath, absPath)
-	if err != nil {
-		relPath = filePath
-	}
+	// relKey gives the canonical key (slash form, Unicode NFC). Using
+	// it here keeps an incremental re-index — which may be driven by a
+	// git-watcher path in NFC or an FSEvents path in NFD — landing on
+	// the exact graph key the bulk walk created, so the evict below
+	// finds the file's existing nodes instead of leaking a duplicate.
+	relPath := idx.relKey(absPath)
 
 	// In multi-repo mode, the graph stores prefixed file paths.
 	graphPath := idx.prefixPath(relPath)
@@ -2004,10 +2042,12 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 		}
 	}
 
-	// Update mtime for this file (uses raw relPath for disk-based tracking).
+	// Update mtime for this file. relPath is already the canonical
+	// key (relKey applied slash + NFC), so the mtime entry lines up
+	// with the graph file-node key and with the bulk-walk mtimes.
 	if info, err := os.Stat(absPath); err == nil {
 		idx.mtimeMu.Lock()
-		idx.fileMtimes[filepath.ToSlash(relPath)] = info.ModTime().UnixNano()
+		idx.fileMtimes[relPath] = info.ModTime().UnixNano()
 		idx.mtimeMu.Unlock()
 	}
 
@@ -2130,11 +2170,19 @@ func (idx *Indexer) ResolveAll() {
 }
 
 // EvictFile removes all nodes and edges belonging to filePath.
+//
+// filePath may arrive in any Unicode form — the git watcher derives it
+// from `git diff` output (NFC), while an FSEvents-driven evict carries
+// the filesystem's form (NFD on macOS). relKey folds both to the
+// canonical NFC key the graph indexed the file under, so the eviction
+// actually finds the file's nodes rather than silently no-opping and
+// leaving a stale subtree behind.
 func (idx *Indexer) EvictFile(filePath string) (int, int) {
-	relPath, err := filepath.Rel(idx.rootPath, filePath)
-	if err != nil {
-		relPath = filePath
+	absPath := filePath
+	if !filepath.IsAbs(absPath) {
+		absPath = filepath.Join(idx.rootPath, filePath)
 	}
+	relPath := idx.relKey(absPath)
 	// In multi-repo mode, the graph stores prefixed file paths.
 	graphPath := idx.prefixPath(relPath)
 	// Remove from search index.
@@ -2409,15 +2457,13 @@ func (idx *Indexer) RefreshFileMtime(filePath string) {
 	if err != nil {
 		return
 	}
-	relPath, err := filepath.Rel(idx.rootPath, absPath)
-	if err != nil {
-		relPath = filePath
-	}
 	info, err := os.Stat(absPath)
 	if err != nil {
 		return
 	}
-	key := filepath.ToSlash(relPath)
+	// relKey (slash + NFC) so the lookup hits the same fileMtimes
+	// entry the index walk created for a non-ASCII filename.
+	key := idx.relKey(absPath)
 	idx.mtimeMu.Lock()
 	if _, tracked := idx.fileMtimes[key]; tracked {
 		idx.fileMtimes[key] = info.ModTime().UnixNano()
@@ -2496,7 +2542,9 @@ func (idx *Indexer) IncrementalReindexPaths(root string, paths []string) (*Index
 		if relErr != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 			return nil, fmt.Errorf("incremental reindex: path %q is outside repository root %q", p, absRoot)
 		}
-		scopeRels[filepath.ToSlash(rel)] = true
+		// Canonical key (slash + NFC) so scopeRels matches fileMtimes
+		// keys when deletion detection intersects the two below.
+		scopeRels[idx.relKey(absPath)] = true
 
 		info, statErr := os.Stat(absPath)
 		if statErr != nil {
@@ -2526,8 +2574,9 @@ func (idx *Indexer) IncrementalReindexPaths(root string, paths []string) (*Index
 				if idx.shouldExclude(path, absRoot, false) {
 					return nil
 				}
-				relPath, _ := filepath.Rel(absRoot, path)
-				relPath = filepath.ToSlash(relPath)
+				// relKey (slash + NFC) keeps the disk set keyed
+				// consistently with fileMtimes for non-ASCII names.
+				relPath := idx.relKey(path)
 				diskFiles[relPath] = true
 				if !merkleMode && idx.IsStale(relPath) {
 					staleFiles = append(staleFiles, path)
@@ -2548,7 +2597,10 @@ func (idx *Indexer) IncrementalReindexPaths(root string, paths []string) (*Index
 		if idx.shouldExclude(absPath, absRoot, false) {
 			continue
 		}
-		relPath := filepath.ToSlash(rel)
+		// relKey (slash + NFC) — same canonical key the graph and
+		// fileMtimes use, so a non-ASCII path passed in here matches
+		// regardless of the Unicode form the caller supplied.
+		relPath := idx.relKey(absPath)
 		diskFiles[relPath] = true
 		if !merkleMode && idx.IsStale(relPath) {
 			staleFiles = append(staleFiles, absPath)
@@ -2718,8 +2770,11 @@ func (idx *Indexer) IncrementalReindex(root string) (*IndexResult, error) {
 			return nil
 		}
 
-		relPath, _ := filepath.Rel(absRoot, path)
-		relPath = filepath.ToSlash(relPath)
+		// relKey (slash + NFC) so the disk set is keyed identically
+		// to fileMtimes — otherwise a non-ASCII file the snapshot
+		// stored under one Unicode form and this walk observes under
+		// another would be seen as both deleted and newly created.
+		relPath := idx.relKey(path)
 		diskFiles[relPath] = true
 
 		if !merkleMode && idx.IsStale(relPath) {
@@ -4576,8 +4631,14 @@ func (idx *Indexer) extractContracts() {
 
 // IsStale returns true if the file at relPath has been modified on disk since
 // it was last indexed, based on comparing stored mtime against current disk mtime.
+//
+// relPath is folded to the canonical key (slash form, Unicode NFC)
+// before lookup so a caller passing a non-ASCII path in a different
+// Unicode form than fileMtimes was keyed with still resolves — without
+// the fold the lookup would miss and the file be reported permanently
+// stale, re-indexing it under a second key on every pass.
 func (idx *Indexer) IsStale(relPath string) bool {
-	relPath = filepath.ToSlash(relPath)
+	relPath = pathkey.Normalize(filepath.ToSlash(relPath))
 
 	idx.mtimeMu.RLock()
 	storedMtime, ok := idx.fileMtimes[relPath]

@@ -5,6 +5,8 @@ import (
 	"strings"
 
 	ignore "github.com/sabhiram/go-gitignore"
+
+	"github.com/zzet/gortex/internal/pathkey"
 )
 
 // Matcher tests whether a path should be excluded from indexing/watching.
@@ -16,6 +18,11 @@ type Matcher struct {
 
 // New compiles the given patterns into a Matcher. A nil/empty list is
 // valid and will match nothing.
+//
+// Patterns are folded to Unicode NFC so a pattern naming a non-ASCII
+// directory matches paths regardless of which Unicode form the
+// filesystem walk produced — MatchRel folds the candidate path to the
+// same form before testing it.
 func New(patterns []string) *Matcher {
 	cleaned := make([]string, 0, len(patterns))
 	for _, p := range patterns {
@@ -23,7 +30,7 @@ func New(patterns []string) *Matcher {
 		if p == "" || strings.HasPrefix(p, "#") {
 			continue
 		}
-		cleaned = append(cleaned, p)
+		cleaned = append(cleaned, pathkey.Normalize(p))
 	}
 	return &Matcher{
 		ign:      ignore.CompileIgnoreLines(cleaned...),
@@ -42,12 +49,16 @@ func (m *Matcher) Patterns() []string {
 }
 
 // MatchRel reports whether a repo-root-relative path is excluded.
-// Path separators are normalised to forward slashes before matching.
+// Path separators are normalised to forward slashes and the path is
+// folded to Unicode NFC — matching how New normalised the patterns —
+// before matching, so a non-ASCII path component compares equal to its
+// pattern whether the OS supplied it decomposed (macOS NFD) or
+// precomposed (Linux / git NFC).
 func (m *Matcher) MatchRel(relPath string) bool {
 	if m == nil || m.ign == nil {
 		return false
 	}
-	rel := filepath.ToSlash(relPath)
+	rel := pathkey.Normalize(filepath.ToSlash(relPath))
 	rel = strings.TrimPrefix(rel, "./")
 	if rel == "" || rel == "." {
 		return false

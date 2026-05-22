@@ -5,6 +5,8 @@ import (
 	"encoding/hex"
 	"path/filepath"
 	"strings"
+
+	"github.com/zzet/gortex/internal/pathkey"
 )
 
 // CacheKey produces a filesystem-safe directory name identifying one
@@ -14,12 +16,17 @@ import (
 // reconciles, instead of cold-indexing because the commit hash moved.
 // A detached HEAD (empty branch) falls back to the commit hash so each
 // checked-out commit still gets a stable slot.
+//
+// Both the repo path and the ref are folded to Unicode NFC before
+// hashing: a non-ASCII path or branch name presents with different
+// bytes on macOS (NFD) than on Linux / git (NFC), and without the
+// fold the same repo would key into two distinct snapshot slots.
 func CacheKey(repoPath, branch, commitHash string) string {
 	abs, err := filepath.Abs(repoPath)
 	if err != nil {
 		abs = repoPath
 	}
-	h := sha256.Sum256([]byte(abs))
+	h := sha256.Sum256([]byte(pathkey.Normalize(abs)))
 	pathPart := hex.EncodeToString(h[:6])
 
 	ref := strings.TrimSpace(branch)
@@ -38,6 +45,10 @@ func refSlug(ref string) string {
 	if ref == "" {
 		return "none"
 	}
+	// Fold to NFC first: a non-ASCII branch name read in decomposed
+	// form on one platform and precomposed form on another would
+	// otherwise hash to two different slugs for the same branch.
+	ref = pathkey.Normalize(ref)
 	var b strings.Builder
 	for _, r := range ref {
 		switch {

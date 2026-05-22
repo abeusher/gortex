@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/zzet/gortex/internal/pathkey"
 )
 
 const (
@@ -36,12 +38,16 @@ type FeedbackStore struct {
 
 // RepoCacheKey produces a filesystem-safe directory name from repo path alone
 // (no commit hash). Used for data that persists across commits, like feedback.
+//
+// The path is folded to Unicode NFC before hashing so a repo whose path
+// contains non-ASCII characters keys to the same directory whether the
+// caller passes a decomposed (macOS) or precomposed (Linux / git) form.
 func RepoCacheKey(repoPath string) string {
 	abs, err := filepath.Abs(repoPath)
 	if err != nil {
 		abs = repoPath
 	}
-	h := sha256.Sum256([]byte(abs))
+	h := sha256.Sum256([]byte(pathkey.Normalize(abs)))
 	return hex.EncodeToString(h[:6]) + "_latest"
 }
 

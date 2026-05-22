@@ -18,6 +18,7 @@ import (
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/excludes"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/reach"
 )
 
@@ -49,23 +50,23 @@ type SymbolChangeCallback func(filePath string, oldSymbols, newSymbols []*graph.
 
 // Watcher keeps the knowledge graph in live sync with the filesystem.
 type Watcher struct {
-	indexer          *Indexer
-	fsw              fswatcher.Watcher
-	fsCancel         context.CancelFunc
-	config           config.WatchConfig
-	excludes         *excludes.Matcher
-	events           chan GraphChangeEvent
-	history          []GraphChangeEvent
-	historyMu        sync.Mutex
-	pending          map[string]*time.Timer
-	mu               sync.Mutex
+	indexer   *Indexer
+	fsw       fswatcher.Watcher
+	fsCancel  context.CancelFunc
+	config    config.WatchConfig
+	excludes  *excludes.Matcher
+	events    chan GraphChangeEvent
+	history   []GraphChangeEvent
+	historyMu sync.Mutex
+	pending   map[string]*time.Timer
+	mu        sync.Mutex
 	// patchMu serialises per-path patchGraph invocations so the
 	// post-patch reach rebuild (which scans every Node.Meta) cannot
 	// race with another debounced patch's IndexFile / EvictFile /
 	// detectClonesAndEmitEdges, all of which mutate the same Meta
 	// maps unprotected. Storm-mode uses patchGraphNoResolve (driven
 	// from a single goroutine in drainStorm) and bypasses this lock.
-	patchMu sync.Mutex
+	patchMu          sync.Mutex
 	logger           *zap.Logger
 	done             chan struct{}
 	stopped          chan struct{}
@@ -574,12 +575,15 @@ func (w *Watcher) patchGraph(path string, kind ChangeKind) {
 	nodesBefore := w.indexer.graph.NodeCount()
 	edgesBefore := w.indexer.graph.EdgeCount()
 
-	// Compute the relative path for snapshotting old symbols.
+	// Compute the relative path for snapshotting old symbols. RelKey
+	// folds it to the canonical key (slash form, Unicode NFC) so the
+	// GetFileNodes / snapshotSymbols lookups below hit the same graph
+	// key the indexer stored — a watcher event for a non-ASCII-named
+	// file arrives in the filesystem's Unicode form (NFD on macOS),
+	// which would otherwise miss an NFC-keyed node.
 	relPath := path
 	if w.indexer.rootPath != "" {
-		if rp, err := filepath.Rel(w.indexer.rootPath, path); err == nil {
-			relPath = rp
-		}
+		relPath = w.indexer.RelKey(path)
 	}
 
 	switch kind {
@@ -810,12 +814,28 @@ func structuralFingerprint(symbols []*graph.Node) string {
 
 // normalizeEventPath aligns an event path emitted by the OS-level
 // backend with the form the indexer stored when it walked the tree.
-// On macOS, FSEvents reports paths under /private/var/... and
-// /private/tmp/... even when the watcher was registered with /var/...
-// or /tmp/... — those are real /private/-rooted symlinks. The indexer
-// keyed its symbols by the user-facing form, so without this we'd
-// fail to find any symbols to evict on modify or delete.
+//
+// Two macOS-specific corrections are applied:
+//
+//   - /private/ symlink resolution: FSEvents reports paths under
+//     /private/var/... and /private/tmp/... even when the watcher was
+//     registered with /var/... or /tmp/... — those are real
+//     /private/-rooted symlinks. The indexer keyed its symbols by the
+//     user-facing form, so without this we'd fail to find any symbols
+//     to evict on modify or delete.
+//
+//   - Unicode NFC folding: APFS / HFS+ hand back filenames in
+//     decomposed NFD form, so a watcher event for a non-ASCII-named
+//     file carries different bytes than the same file does in `git
+//     diff` output or on a Linux checkout. Folding the path to NFC
+//     here means every consumer downstream — the exclude matcher, the
+//     storm batch, the per-file debounce map — sees one stable form.
+//     IndexFile / EvictFile fold again at their own boundary, so this
+//     is belt-and-braces, but it also keeps the debounce/batch maps
+//     (keyed on this path directly) free of accidental NFD/NFC
+//     duplicates for the same file.
 func normalizeEventPath(path, rootPath string) string {
+	path = pathkey.Normalize(path)
 	if runtime.GOOS != "darwin" {
 		return path
 	}
