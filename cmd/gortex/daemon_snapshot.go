@@ -282,6 +282,18 @@ func saveSnapshotTo(g *graph.Graph, repos []snapshotRepo, snapContracts []snapsh
 		_ = os.Remove(tmp)
 		return err
 	}
+	// Shrink-guard: the new snapshot is fully written to tmp but not
+	// yet swapped in. If it has collapsed against the snapshot already
+	// on disk — a sign the in-memory graph is the product of a partial
+	// or failed index — refuse the swap and keep the prior good
+	// snapshot. A modest shrink (deleted files) still goes through;
+	// only a suspicious collapse is blocked. Returning nil rather than
+	// an error is deliberate: keeping the good snapshot is the guard's
+	// success outcome, not a write failure for the caller to surface.
+	if snapshotWouldCollapse(path, header.NodeCount, header.EdgeCount, logger) {
+		_ = os.Remove(tmp)
+		return nil
+	}
 	// Atomic swap so a concurrent crash can never leave a truncated
 	// snapshot on disk.
 	if err := os.Rename(tmp, path); err != nil {
@@ -295,6 +307,87 @@ func saveSnapshotTo(g *graph.Graph, repos []snapshotRepo, snapContracts []snapsh
 		zap.Int("repos", header.RepoCount),
 		zap.Int("contracts", header.ContractCount))
 	return nil
+}
+
+// snapshotShrinkFloorPercent is the share of the prior snapshot's node
+// and edge counts the new snapshot must retain to be allowed to
+// overwrite it. Below this floor the new graph is treated as the
+// product of a partial or failed index and the swap is refused.
+//
+// 50% is chosen to sit firmly between two regimes. A legitimate
+// shrink is incremental: deleting files trims a slice of one repo,
+// and the daemon tracks several repos at once, so even an aggressive
+// cleanup rarely halves the whole graph in a single save. A failed
+// index collapses it far harder — the load path elsewhere in this
+// file documents a real incident where a half-loaded graph came back
+// as 47k nodes against an expected 146k, a ~68% drop. A 50% floor
+// clears the worst plausible honest shrink while still catching that
+// class of collapse.
+const snapshotShrinkFloorPercent = 50
+
+// readSnapshotHeader decodes just the snapshotHeader from the snapshot
+// at path — the header is the first gob record, so this stops after
+// it without touching the (potentially huge) node/edge stream. ok is
+// false when there is no usable baseline to compare against: a missing
+// file, an unreadable / truncated stream, or a schema-version
+// mismatch (an older header's counts are not comparable).
+func readSnapshotHeader(path string) (hdr snapshotHeader, ok bool) {
+	f, err := os.Open(path)
+	if err != nil {
+		return snapshotHeader{}, false
+	}
+	defer func() { _ = f.Close() }()
+
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		return snapshotHeader{}, false
+	}
+	defer func() { _ = gz.Close() }()
+
+	var header snapshotHeader
+	if err := gob.NewDecoder(gz).Decode(&header); err != nil {
+		return snapshotHeader{}, false
+	}
+	if header.SchemaVersion != snapshotSchemaVersion {
+		return snapshotHeader{}, false
+	}
+	return header, true
+}
+
+// snapshotWouldCollapse reports whether overwriting the snapshot at
+// path with one carrying newNodes / newEdges would replace a healthy
+// snapshot with a drastically smaller one. It returns true — and logs
+// a warning — only for a suspicious collapse; a missing / unreadable
+// baseline, a previously-empty snapshot, or a modest shrink all return
+// false so the save proceeds.
+func snapshotWouldCollapse(path string, newNodes, newEdges int, logger *zap.Logger) bool {
+	prev, ok := readSnapshotHeader(path)
+	if !ok {
+		// No comparable baseline — nothing to protect, allow the write.
+		return false
+	}
+	// A prior snapshot with no nodes or no edges gives no meaningful
+	// ratio (and is not a "good" snapshot worth protecting anyway).
+	if prev.NodeCount == 0 || prev.EdgeCount == 0 {
+		return false
+	}
+	// Retaining at least the floor share of BOTH counts is required;
+	// a collapse in either nodes or edges is enough to refuse. Compare
+	// by cross-multiplication to avoid floating-point rounding:
+	//   new < prev * floor/100   ⇔   new*100 < prev*floor
+	nodesCollapsed := newNodes*100 < prev.NodeCount*snapshotShrinkFloorPercent
+	edgesCollapsed := newEdges*100 < prev.EdgeCount*snapshotShrinkFloorPercent
+	if !nodesCollapsed && !edgesCollapsed {
+		return false
+	}
+	logger.Warn("snapshot: refusing to overwrite — new snapshot has shrunk drastically, keeping the prior good snapshot",
+		zap.String("path", path),
+		zap.Int("prev_nodes", prev.NodeCount),
+		zap.Int("new_nodes", newNodes),
+		zap.Int("prev_edges", prev.EdgeCount),
+		zap.Int("new_edges", newEdges),
+		zap.Int("shrink_floor_percent", snapshotShrinkFloorPercent))
+	return true
 }
 
 // toSnapshotContract flattens a contracts.Contract into its wire form.

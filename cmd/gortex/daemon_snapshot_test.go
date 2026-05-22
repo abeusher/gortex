@@ -402,6 +402,140 @@ func TestLoadSnapshot_CorruptFile_ReportsError(t *testing.T) {
 	assert.Equal(t, 0, g.NodeCount())
 }
 
+// TestSaveSnapshot_ShrinkGuardBlocksCollapse proves the shrink-guard
+// refuses to overwrite a healthy snapshot with one whose node/edge
+// counts have collapsed — the signature of a partial or failed index.
+// The prior good snapshot must survive untouched on disk.
+func TestSaveSnapshot_ShrinkGuardBlocksCollapse(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "snap.gob.gz")
+
+	// A healthy baseline snapshot: 200 nodes, 199 edges.
+	healthy := graph.New()
+	for i := 0; i < 200; i++ {
+		healthy.AddNode(&graph.Node{
+			ID: fmt.Sprintf("repo/a.go::Sym%d", i), Kind: graph.KindFunction,
+			Name: fmt.Sprintf("Sym%d", i), FilePath: "repo/a.go", Language: "go",
+			RepoPrefix: "repo",
+		})
+		if i > 0 {
+			healthy.AddEdge(&graph.Edge{
+				From: fmt.Sprintf("repo/a.go::Sym%d", i),
+				To:   "repo/a.go::Sym0", Kind: graph.EdgeCalls,
+			})
+		}
+	}
+	require.NoError(t, saveSnapshotTo(healthy, nil, nil, version, path, zap.NewNop()))
+
+	// A collapsed graph — 10 nodes, ~5% of the baseline. Attempting to
+	// persist it must be refused.
+	collapsed := graph.New()
+	for i := 0; i < 10; i++ {
+		collapsed.AddNode(&graph.Node{
+			ID: fmt.Sprintf("repo/a.go::Sym%d", i), Kind: graph.KindFunction,
+			Name: fmt.Sprintf("Sym%d", i), FilePath: "repo/a.go", Language: "go",
+			RepoPrefix: "repo",
+		})
+	}
+	// The guard's refusal is not surfaced as an error — keeping the
+	// good snapshot is a success outcome.
+	require.NoError(t, saveSnapshotTo(collapsed, nil, nil, version, path, zap.NewNop()))
+
+	// The on-disk snapshot must still be the healthy 200-node one.
+	hdr, ok := readSnapshotHeader(path)
+	require.True(t, ok, "the prior good snapshot must still be readable")
+	assert.Equal(t, 200, hdr.NodeCount, "shrink-guard must have preserved the healthy snapshot")
+	assert.Equal(t, 199, hdr.EdgeCount, "shrink-guard must have preserved the healthy snapshot")
+
+	// And no leftover .tmp file from the refused write.
+	_, statErr := os.Stat(path + ".tmp")
+	assert.True(t, os.IsNotExist(statErr), "the refused write's tmp file must be cleaned up")
+}
+
+// TestSaveSnapshot_ShrinkGuardAllowsModestShrink proves a genuine,
+// moderate shrink (files deleted) still overwrites the prior snapshot —
+// the guard blocks only a suspicious collapse, not normal churn.
+func TestSaveSnapshot_ShrinkGuardAllowsModestShrink(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "snap.gob.gz")
+
+	big := graph.New()
+	for i := 0; i < 200; i++ {
+		big.AddNode(&graph.Node{
+			ID: fmt.Sprintf("repo/a.go::Sym%d", i), Kind: graph.KindFunction,
+			Name: fmt.Sprintf("Sym%d", i), FilePath: "repo/a.go", Language: "go",
+			RepoPrefix: "repo",
+		})
+	}
+	require.NoError(t, saveSnapshotTo(big, nil, nil, version, path, zap.NewNop()))
+
+	// 150 nodes — 75% retained, well above the 50% floor. A legitimate
+	// shrink that must be allowed through.
+	smaller := graph.New()
+	for i := 0; i < 150; i++ {
+		smaller.AddNode(&graph.Node{
+			ID: fmt.Sprintf("repo/a.go::Sym%d", i), Kind: graph.KindFunction,
+			Name: fmt.Sprintf("Sym%d", i), FilePath: "repo/a.go", Language: "go",
+			RepoPrefix: "repo",
+		})
+	}
+	require.NoError(t, saveSnapshotTo(smaller, nil, nil, version, path, zap.NewNop()))
+
+	hdr, ok := readSnapshotHeader(path)
+	require.True(t, ok)
+	assert.Equal(t, 150, hdr.NodeCount, "a modest shrink must be allowed to overwrite the snapshot")
+}
+
+// TestSaveSnapshot_ShrinkGuardAllowsFirstWrite proves the guard never
+// blocks the very first snapshot — with no prior file there is no good
+// snapshot to protect.
+func TestSaveSnapshot_ShrinkGuardAllowsFirstWrite(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "fresh.gob.gz")
+
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "a.go::Foo", Kind: graph.KindFunction, Name: "Foo", FilePath: "a.go", Language: "go"})
+	require.NoError(t, saveSnapshotTo(g, nil, nil, version, path, zap.NewNop()))
+
+	hdr, ok := readSnapshotHeader(path)
+	require.True(t, ok, "the first snapshot must be written even though it is small")
+	assert.Equal(t, 1, hdr.NodeCount)
+}
+
+// TestSnapshotWouldCollapse_EdgeOnlyCollapseIsBlocked proves the guard
+// fires when edges collapse even though nodes are retained — a resolver
+// failure can shed the call graph while leaving symbol nodes intact.
+func TestSnapshotWouldCollapse_EdgeOnlyCollapseIsBlocked(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "snap.gob.gz")
+
+	healthy := graph.New()
+	for i := 0; i < 100; i++ {
+		healthy.AddNode(&graph.Node{
+			ID: fmt.Sprintf("repo/a.go::Sym%d", i), Kind: graph.KindFunction,
+			Name: fmt.Sprintf("Sym%d", i), FilePath: "repo/a.go", Language: "go",
+			RepoPrefix: "repo",
+		})
+		if i > 0 {
+			healthy.AddEdge(&graph.Edge{
+				From: fmt.Sprintf("repo/a.go::Sym%d", i),
+				To:   "repo/a.go::Sym0", Kind: graph.EdgeCalls,
+			})
+		}
+	}
+	require.NoError(t, saveSnapshotTo(healthy, nil, nil, version, path, zap.NewNop()))
+
+	// All 100 nodes retained, but only 5 of 99 edges — the call graph
+	// has collapsed. The guard must catch the edge-side collapse.
+	if !snapshotWouldCollapse(path, 100, 5, zap.NewNop()) {
+		t.Error("a collapse confined to edges must still be blocked")
+	}
+	// Both counts healthy → allowed.
+	if snapshotWouldCollapse(path, 100, 99, zap.NewNop()) {
+		t.Error("an unchanged graph must not be flagged as a collapse")
+	}
+}
+
 // TestStartPeriodicSnapshots_WritesOnTick verifies the 10-minute ticker
 // (configurable interval in tests) actually fires and writes to disk.
 // The daemon relies on this for crash-recovery — on a `kill -9` it
