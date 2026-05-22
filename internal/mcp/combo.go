@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/zzet/gortex/internal/persistence"
+	"github.com/zzet/gortex/internal/search/rerank"
 )
 
 // comboManager is the in-memory wrapper for ComboStore. It records
@@ -19,6 +20,14 @@ type comboManager struct {
 	store persistence.ComboStore
 	dir   string
 	mode  AgentMode
+
+	// kwStore is the per-keyword association index -- a sibling of
+	// `store` that keys on each surviving query token rather than the
+	// whole normalized query. It is persisted to its own file
+	// (kwDir) so the two schemas evolve independently. Guarded by the
+	// same mu.
+	kwStore persistence.KeywordStore
+	kwDir   string
 
 	// Overridable for tests. Seconds since the unix epoch, not a Time, so
 	// comparisons stay fast and the struct stays gob-friendly.
@@ -42,6 +51,17 @@ const (
 	// always mean this file when I search for X" association is genuine.
 	comboMaxAgeAISec    = int64(7 * 86400)
 	comboMaxAgeHumanSec = int64(30 * 86400)
+
+	// Per-keyword boost gate. A keyword is a coarser key than a whole
+	// query, so the per-keyword path uses a lower min-hits threshold
+	// and a smaller per-hit boost than the exact-query path -- a
+	// keyword-only match should nudge, never dominate.
+	keywordMinHits     = 2
+	keywordBoostPerHit = 0.12
+	// keywordMaxBoost caps the per-keyword multiplier well below
+	// comboMaxBoost so an exact-query combo always out-boosts a
+	// keyword-only one.
+	keywordMaxBoost = 1.6
 )
 
 func newComboManager(cacheDir, repoPath string, mode AgentMode) *comboManager {
@@ -50,9 +70,13 @@ func newComboManager(cacheDir, repoPath string, mode AgentMode) *comboManager {
 		return &comboManager{mode: mode, now: nowFn}
 	}
 	dir := persistence.ComboDir(cacheDir, repoPath)
-	cm := &comboManager{dir: dir, mode: mode, now: nowFn}
+	kwDir := persistence.KeywordDir(cacheDir, repoPath)
+	cm := &comboManager{dir: dir, kwDir: kwDir, mode: mode, now: nowFn}
 	if loaded, err := persistence.LoadCombo(dir); err == nil && loaded != nil {
 		cm.store = *loaded
+	}
+	if loaded, err := persistence.LoadKeyword(kwDir); err == nil && loaded != nil {
+		cm.kwStore = *loaded
 	}
 	return cm
 }
@@ -78,6 +102,19 @@ func (cm *comboManager) reapStaleLocked() {
 			}
 		}
 		q.Matches = fresh
+	}
+	// The per-keyword index decays on the same clock as the
+	// whole-query index -- a keyword association no agent has
+	// reinforced inside the mode's window is stale noise.
+	for ki := range cm.kwStore.Keywords {
+		k := &cm.kwStore.Keywords[ki]
+		fresh := k.Matches[:0]
+		for _, m := range k.Matches {
+			if m.LastUsed >= cutoff {
+				fresh = append(fresh, m)
+			}
+		}
+		k.Matches = fresh
 	}
 }
 
@@ -145,10 +182,18 @@ func (cm *comboManager) Record(rawQuery, symbolID string) {
 		cm.moveToEndLocked(idx)
 	}
 
-	if cm.dir == "" {
-		return
+	// Mirror the hit into the per-keyword index: one (keyword ->
+	// symbol) association per surviving query token. A later task
+	// with overlapping keywords -- but different phrasing -- inherits
+	// these even though its whole-query key never matches.
+	cm.recordKeywordsLocked(rawQuery, symbolID, now)
+
+	if cm.dir != "" {
+		_ = persistence.SaveCombo(cm.dir, &cm.store)
 	}
-	_ = persistence.SaveCombo(cm.dir, &cm.store)
+	if cm.kwDir != "" {
+		_ = persistence.SaveKeyword(cm.kwDir, &cm.kwStore)
+	}
 }
 
 // BoostMap returns a per-symbol multiplier derived from combo history for
@@ -219,4 +264,178 @@ func (cm *comboManager) HasData() bool {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	return len(cm.store.Queries) > 0
+}
+
+// keywordGenericStopWords are generic software nouns that match
+// thousands of unrelated symbols -- mirroring the LLM-expansion
+// stoplist. Recording a (keyword -> symbol) hit for one of these
+// would pollute the index: the keyword would "associate" with
+// whatever symbol the agent happened to pick. Combined with
+// assistStopWords (English function words) this is the filter the
+// per-keyword recorder applies to every query token.
+var keywordGenericStopWords = map[string]struct{}{
+	"function": {}, "functions": {}, "method": {}, "methods": {},
+	"library": {}, "module": {}, "modules": {}, "package": {}, "packages": {},
+	"system": {}, "service": {}, "services": {}, "code": {}, "source": {},
+	"data": {}, "value": {}, "values": {}, "object": {}, "objects": {},
+	"item": {}, "items": {}, "info": {}, "information": {}, "content": {},
+	"thing": {}, "things": {}, "stuff": {}, "general": {}, "common": {},
+	"basic": {}, "simple": {}, "main": {}, "text": {}, "logic": {},
+	"process": {}, "handle": {}, "handler": {}, "handling": {}, "flow": {},
+	"action": {}, "helper": {}, "helpers": {}, "util": {}, "utils": {},
+	"utility": {}, "type": {}, "kind": {}, "name": {}, "list": {},
+}
+
+// keywordTokens extracts the meaningful query keywords from a raw
+// query: the camelCase-aware tokens, lowercased and deduplicated,
+// minus English function words (assistStopWords) and generic
+// software nouns (keywordGenericStopWords), and minus sub-3-char
+// fragments that carry no association signal.
+func keywordTokens(rawQuery string) []string {
+	var out []string
+	seen := map[string]struct{}{}
+	for _, tok := range rerank.Tokenize(rawQuery) {
+		t := strings.ToLower(strings.TrimSpace(tok))
+		if len(t) < 3 {
+			continue
+		}
+		if _, stop := assistStopWords[t]; stop {
+			continue
+		}
+		if _, stop := keywordGenericStopWords[t]; stop {
+			continue
+		}
+		if _, dup := seen[t]; dup {
+			continue
+		}
+		seen[t] = struct{}{}
+		out = append(out, t)
+	}
+	return out
+}
+
+// recordKeywordsLocked records a (keyword -> symbol) hit for every
+// surviving keyword of rawQuery. Caller holds cm.mu. The per-keyword
+// match list is kept hit-ordered and capped tighter than the
+// whole-query list.
+func (cm *comboManager) recordKeywordsLocked(rawQuery, symbolID string, now int64) {
+	for _, kw := range keywordTokens(rawQuery) {
+		idx := cm.findKeywordLocked(kw)
+		if idx < 0 {
+			cm.kwStore.Keywords = append(cm.kwStore.Keywords, persistence.KeywordAssoc{
+				Keyword: kw,
+				Matches: []persistence.KeywordMatch{{SymbolID: symbolID, HitCount: 1, LastUsed: now}},
+			})
+			continue
+		}
+		ka := &cm.kwStore.Keywords[idx]
+		mIdx := -1
+		for i := range ka.Matches {
+			if ka.Matches[i].SymbolID == symbolID {
+				mIdx = i
+				break
+			}
+		}
+		if mIdx < 0 {
+			ka.Matches = append(ka.Matches, persistence.KeywordMatch{
+				SymbolID: symbolID, HitCount: 1, LastUsed: now,
+			})
+		} else {
+			ka.Matches[mIdx].HitCount++
+			ka.Matches[mIdx].LastUsed = now
+		}
+		sort.Slice(ka.Matches, func(i, j int) bool {
+			return ka.Matches[i].HitCount > ka.Matches[j].HitCount
+		})
+		if cap := persistence.MaxKeywordEntries(); len(ka.Matches) > cap {
+			ka.Matches = ka.Matches[:cap]
+		}
+	}
+}
+
+// findKeywordLocked returns the index of kw in kwStore.Keywords, or
+// -1. Caller holds cm.mu.
+func (cm *comboManager) findKeywordLocked(kw string) int {
+	for i := range cm.kwStore.Keywords {
+		if cm.kwStore.Keywords[i].Keyword == kw {
+			return i
+		}
+	}
+	return -1
+}
+
+// KeywordBoostMap returns a per-symbol multiplier derived from the
+// per-keyword association index for rawQuery. It tokenizes the query,
+// looks up each keyword's recorded symbols, and boosts a symbol by
+// how many of the N query keywords it matched (K) scaled by K/N and
+// the keyword hit count. A symbol that matches every query keyword
+// gets the full keyword boost; one that matches a single keyword of
+// five gets a fifth of it.
+//
+// Returns nil when the query has no usable keywords or nothing clears
+// the keywordMinHits gate; callers treat nil as "no reweight". The
+// boost is capped at keywordMaxBoost -- below comboMaxBoost -- so an
+// exact whole-query combo always out-boosts a keyword-only match.
+func (cm *comboManager) KeywordBoostMap(rawQuery string) map[string]float64 {
+	if cm == nil {
+		return nil
+	}
+	keywords := keywordTokens(rawQuery)
+	if len(keywords) == 0 {
+		return nil
+	}
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	cm.reapStaleLocked()
+
+	n := float64(len(keywords))
+	// Per symbol: how many distinct query keywords it matched, and the
+	// summed hit count across those keywords.
+	type acc struct {
+		matched int
+		hits    int
+	}
+	per := map[string]*acc{}
+	for _, kw := range keywords {
+		idx := cm.findKeywordLocked(kw)
+		if idx < 0 {
+			continue
+		}
+		for _, m := range cm.kwStore.Keywords[idx].Matches {
+			if int(m.HitCount) < keywordMinHits {
+				continue
+			}
+			a := per[m.SymbolID]
+			if a == nil {
+				a = &acc{}
+				per[m.SymbolID] = a
+			}
+			a.matched++
+			a.hits += int(m.HitCount)
+		}
+	}
+	if len(per) == 0 {
+		return nil
+	}
+	out := make(map[string]float64, len(per))
+	for sym, a := range per {
+		coverage := float64(a.matched) / n
+		// Each hit above the gate adds keywordBoostPerHit, scaled by
+		// the fraction of query keywords the symbol covered.
+		extra := float64(a.hits-keywordMinHits+1) * keywordBoostPerHit * coverage
+		if extra < 0 {
+			extra = 0
+		}
+		boost := 1.0 + extra
+		if boost > keywordMaxBoost {
+			boost = keywordMaxBoost
+		}
+		if boost > 1.0 {
+			out[sym] = boost
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }

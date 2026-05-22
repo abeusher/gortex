@@ -30,10 +30,28 @@ func (s *Server) buildRerankContext(ctx context.Context, query string) *rerank.C
 	}
 
 	if s.combo != nil {
+		// The combo boost fuses two stores: the exact whole-query
+		// index (BoostMap) and the per-keyword association index
+		// (KeywordBoostMap). They are max()-merged so a symbol picks
+		// up the stronger of "this exact query led here before" and
+		// "queries sharing these keywords led here before" -- the
+		// exact-query boost is capped higher, so it dominates a
+		// keyword-only boost whenever both fire. FeedbackSignal reads
+		// the merged closure unchanged.
 		boosts := s.combo.BoostMap(query)
-		if len(boosts) > 0 {
+		kwBoosts := s.combo.KeywordBoostMap(query)
+		if len(boosts) > 0 || len(kwBoosts) > 0 {
+			merged := make(map[string]float64, len(boosts)+len(kwBoosts))
+			for id, v := range kwBoosts {
+				merged[id] = v
+			}
+			for id, v := range boosts {
+				if existing, ok := merged[id]; !ok || v > existing {
+					merged[id] = v
+				}
+			}
 			rctx.ComboBoostOf = func(id string) float64 {
-				if v, ok := boosts[id]; ok {
+				if v, ok := merged[id]; ok {
 					return v
 				}
 				return 1.0
