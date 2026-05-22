@@ -2326,6 +2326,244 @@ func (idx *Indexer) SetRootPath(root string) {
 	idx.rootPath = abs
 }
 
+// IncrementalReindexPaths re-indexes only the files reachable from the
+// supplied paths, instead of walking the whole repository root.
+//
+// Each path may be absolute or relative to root, and may be a file or a
+// directory; directories are walked recursively with the same
+// exclude / language filters as a full pass. Within that scoped file
+// set the behaviour matches IncrementalReindex: only files that are
+// stale (mtime or, in Merkle mode, content) are re-indexed, and a file
+// previously tracked under one of the scoped paths but now absent from
+// disk is evicted.
+//
+// When paths is empty the call degrades to IncrementalReindex(root) —
+// callers can therefore pass an optional path list unconditionally.
+func (idx *Indexer) IncrementalReindexPaths(root string, paths []string) (*IndexResult, error) {
+	if len(paths) == 0 {
+		return idx.IncrementalReindex(root)
+	}
+
+	start := time.Now()
+
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return nil, err
+	}
+	idx.rootPath = absRoot
+
+	// scopeRels holds the repo-relative slash-paths the caller asked to
+	// reindex — used both to drive the discovery walk and to bound
+	// deletion detection to the scoped subtree.
+	scopeRels := make(map[string]bool)
+
+	// diskFiles is the set of in-scope language files currently on
+	// disk; staleFiles is the subset that changed since the last pass.
+	diskFiles := make(map[string]bool)
+	var staleFiles []string
+
+	merkleMode := idx.merkleEnabled()
+
+	for _, p := range paths {
+		absPath := p
+		if !filepath.IsAbs(absPath) {
+			absPath = filepath.Join(absRoot, filepath.FromSlash(p))
+		}
+		absPath = filepath.Clean(absPath)
+
+		// A path outside the repo root is rejected: scoping is a
+		// narrowing operation, never an escape hatch to index files
+		// the repo doesn't own.
+		rel, relErr := filepath.Rel(absRoot, absPath)
+		if relErr != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return nil, fmt.Errorf("incremental reindex: path %q is outside repository root %q", p, absRoot)
+		}
+		scopeRels[filepath.ToSlash(rel)] = true
+
+		info, statErr := os.Stat(absPath)
+		if statErr != nil {
+			// A path that no longer exists is not an error: it may be
+			// a deleted file the caller still wants evicted. Deletion
+			// detection below handles it via scopeRels.
+			if errors.Is(statErr, os.ErrNotExist) {
+				continue
+			}
+			return nil, fmt.Errorf("incremental reindex: stat %q: %w", p, statErr)
+		}
+
+		if info.IsDir() {
+			walkErr := filepath.WalkDir(absPath, func(path string, d os.DirEntry, err error) error {
+				if err != nil {
+					return nil
+				}
+				if d.IsDir() {
+					if idx.shouldExclude(path, absRoot, true) {
+						return filepath.SkipDir
+					}
+					return nil
+				}
+				if _, ok := idx.effectiveLanguage(path); !ok {
+					return nil
+				}
+				if idx.shouldExclude(path, absRoot, false) {
+					return nil
+				}
+				relPath, _ := filepath.Rel(absRoot, path)
+				relPath = filepath.ToSlash(relPath)
+				diskFiles[relPath] = true
+				if !merkleMode && idx.IsStale(relPath) {
+					staleFiles = append(staleFiles, path)
+				}
+				return nil
+			})
+			if walkErr != nil {
+				return nil, walkErr
+			}
+			continue
+		}
+
+		// Single file. Apply the same language / exclude gate so a
+		// caller can't force a non-source or excluded file in.
+		if _, ok := idx.effectiveLanguage(absPath); !ok {
+			continue
+		}
+		if idx.shouldExclude(absPath, absRoot, false) {
+			continue
+		}
+		relPath := filepath.ToSlash(rel)
+		diskFiles[relPath] = true
+		if !merkleMode && idx.IsStale(relPath) {
+			staleFiles = append(staleFiles, absPath)
+		}
+	}
+
+	// In Merkle mode the per-file mtime check is skipped; the stale set
+	// comes from a content-addressed tree diff over the whole repo,
+	// then intersected back down to the requested scope.
+	if merkleMode {
+		for _, abs := range idx.merkleStaleFiles(absRoot, diskFiles) {
+			rel, relErr := filepath.Rel(absRoot, abs)
+			if relErr != nil {
+				continue
+			}
+			if diskFiles[filepath.ToSlash(rel)] {
+				staleFiles = append(staleFiles, abs)
+			}
+		}
+	}
+
+	// Deletion detection, bounded to the scoped subtree. A file tracked
+	// in fileMtimes that sits under one of the requested paths but is
+	// absent from this scoped discovery walk is a deletion candidate;
+	// the same stat-before-evict guard as IncrementalReindex applies so
+	// a newly-excluded or transiently-unreachable file is preserved.
+	idx.mtimeMu.RLock()
+	var candidates []string
+	for relPath := range idx.fileMtimes {
+		if diskFiles[relPath] {
+			continue
+		}
+		if relPathInScope(relPath, scopeRels) {
+			candidates = append(candidates, relPath)
+		}
+	}
+	idx.mtimeMu.RUnlock()
+
+	var deletedFiles []string
+	for _, relPath := range candidates {
+		absPath := filepath.Join(absRoot, filepath.FromSlash(relPath))
+		_, statErr := os.Stat(absPath)
+		if statErr == nil {
+			continue
+		}
+		if errors.Is(statErr, os.ErrNotExist) {
+			deletedFiles = append(deletedFiles, relPath)
+			continue
+		}
+		idx.logger.Warn("incremental reindex: stat failed during scoped deletion detection, preserving",
+			zap.String("rel", relPath), zap.Error(statErr))
+	}
+
+	for _, relPath := range deletedFiles {
+		graphPath := idx.prefixPath(relPath)
+		idx.graph.EvictFile(graphPath)
+		idx.mtimeMu.Lock()
+		delete(idx.fileMtimes, relPath)
+		idx.mtimeMu.Unlock()
+	}
+
+	// Re-index stale files with the same one-shot retry as the
+	// whole-root path — a file locked or mid-write when the walk caught
+	// it gets a second chance before landing on FailedFiles.
+	var failedFiles []string
+	for _, f := range staleFiles {
+		if err := idx.IndexFile(f); err != nil {
+			idx.logger.Debug("incremental reindex: failed to index file",
+				zap.String("file", f), zap.Error(err))
+			failedFiles = append(failedFiles, f)
+		}
+	}
+	if len(failedFiles) > 0 {
+		retry := failedFiles
+		failedFiles = nil
+		for _, f := range retry {
+			if err := idx.IndexFile(f); err != nil {
+				idx.logger.Warn("incremental reindex: file failed after retry",
+					zap.String("file", f), zap.Error(err))
+				failedFiles = append(failedFiles, f)
+			}
+		}
+	}
+
+	// Re-infer interface implementations and re-run stub-call passes —
+	// eviction may have dropped edges. Skipped under deferGlobalPasses
+	// so a batch caller runs one global pass at the end.
+	if !idx.deferGlobalPasses && (len(staleFiles) > 0 || len(deletedFiles) > 0) {
+		idx.resolver.InferImplements()
+		idx.resolver.InferOverrides()
+		resolver.ResolveGRPCStubCalls(idx.graph)
+		resolver.ResolveTemporalCalls(idx.graph)
+		resolver.SynthesizeExternalCalls(idx.graph, idx.externalCallSynthesisEnabled())
+	}
+
+	idx.buildSearchIndex()
+
+	if len(staleFiles) > 0 || len(deletedFiles) > 0 {
+		idx.extractContracts()
+		idx.indexGen.Add(1) // files changed — invalidate the trigram cache
+	}
+
+	nodes, edges := idx.repoNodeEdgeCount()
+	result := &IndexResult{
+		NodeCount:      nodes,
+		EdgeCount:      edges,
+		FileCount:      len(diskFiles),
+		StaleFileCount: len(staleFiles),
+		FailedFiles:    failedFiles,
+		DurationMs:     time.Since(start).Milliseconds(),
+	}
+	idx.warnIfEdgeSanityViolated(result)
+	return result, nil
+}
+
+// relPathInScope reports whether a repo-relative slash-path falls under
+// any of the scoped paths — either an exact file match or anywhere
+// inside a scoped directory.
+func relPathInScope(relPath string, scope map[string]bool) bool {
+	if scope[relPath] {
+		return true
+	}
+	for s := range scope {
+		if s == "." {
+			return true
+		}
+		if strings.HasPrefix(relPath, s+"/") {
+			return true
+		}
+	}
+	return false
+}
+
 // IncrementalReindex walks the file tree and re-indexes only files that changed
 // since the last snapshot. It also evicts nodes for deleted files.
 func (idx *Indexer) IncrementalReindex(root string) (*IndexResult, error) {

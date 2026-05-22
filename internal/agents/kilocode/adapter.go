@@ -39,7 +39,7 @@ var alwaysAllow = []string{
 	"find_import_path", "explain_change_impact", "get_recent_changes",
 	"smart_context", "get_edit_plan", "get_test_targets", "suggest_pattern",
 	"get_communities", "get_processes",
-	"detect_changes", "index_repository",
+	"detect_changes", "index_repository", "reindex_repository",
 	"verify_change", "check_guards", "prefetch_context",
 	"analyze", "diff_context", "index_health", "get_symbol_history",
 	"scaffold", "batch_edit", "contracts", "feedback",

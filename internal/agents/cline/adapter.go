@@ -52,7 +52,7 @@ var alwaysAllow = []string{
 	"find_import_path", "explain_change_impact", "get_recent_changes",
 	"smart_context", "get_edit_plan", "get_test_targets", "suggest_pattern",
 	"get_communities", "get_community", "get_processes", "get_process",
-	"detect_changes", "index_repository",
+	"detect_changes", "index_repository", "reindex_repository",
 	"verify_change", "check_guards", "prefetch_context",
 	"find_dead_code", "find_hotspots", "find_cycles", "would_create_cycle",
 	"diff_context", "index_health", "get_symbol_history",

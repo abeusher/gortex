@@ -721,6 +721,54 @@ func (mi *MultiIndexer) IndexRepo(repoPrefix string) (*IndexResult, error) {
 	return result, nil
 }
 
+// IncrementalReindexRepo incrementally re-indexes a single tracked repo
+// by prefix: only the files that changed since the last pass are
+// re-parsed and deleted files are evicted, against the repo's existing
+// per-repo Indexer (so its mtime snapshot is preserved). Unlike
+// IndexRepo it does NOT evict the whole repo first.
+//
+// When paths is non-empty the pass is scoped to those files /
+// directories; otherwise the whole repo root is scanned. Returns an
+// error when the prefix is not a tracked repo.
+func (mi *MultiIndexer) IncrementalReindexRepo(repoPrefix string, paths []string) (*IndexResult, error) {
+	mi.mu.RLock()
+	meta, ok := mi.repos[repoPrefix]
+	idx := mi.indexers[repoPrefix]
+	mi.mu.RUnlock()
+	if !ok || meta == nil {
+		return nil, fmt.Errorf("repository not found: %s", repoPrefix)
+	}
+	if idx == nil {
+		// Tracked but no live indexer (e.g. restored from snapshot
+		// without one) — fall back to a full re-index, which rebuilds
+		// the per-repo indexer from scratch.
+		return mi.IndexRepo(repoPrefix)
+	}
+
+	result, err := idx.IncrementalReindexPaths(meta.RootPath, paths)
+	if err != nil {
+		return nil, fmt.Errorf("reindexing %s: %w", meta.RootPath, err)
+	}
+
+	mi.mu.Lock()
+	mi.repos[repoPrefix] = &RepoMetadata{
+		RepoPrefix:    repoPrefix,
+		RootPath:      meta.RootPath,
+		Identity:      meta.Identity,
+		LastIndexTime: time.Now(),
+		FileCount:     result.FileCount,
+		NodeCount:     result.NodeCount,
+		EdgeCount:     result.EdgeCount,
+		ParseErrors:   result.Errors,
+		FileMtimes:    idx.FileMtimes(),
+	}
+	mi.mu.Unlock()
+
+	mi.ReconcileContractEdges()
+
+	return result, nil
+}
+
 // TrackRepo validates the path, detects identity, indexes, and adds to config.
 func (mi *MultiIndexer) TrackRepo(entry config.RepoEntry) (*IndexResult, error) {
 	return mi.TrackRepoCtx(context.Background(), entry)

@@ -43,7 +43,8 @@ var defaultToolScopes = map[string]ToolScope{
 
 	// --- Per-repo tools ------------------------------------------
 	// Index management against one repo.
-	"index_repository": ScopeRepo,
+	"index_repository":   ScopeRepo,
+	"reindex_repository": ScopeRepo,
 
 	// Symbol-level query surface.
 	"get_symbol":           ScopeRepo,

@@ -470,6 +470,7 @@ These wrap the discovery + impact + memory surfaces into ordered playbooks so po
 | Tool | What it gives you |
 |------|-------------------|
 | index_repository | Index a repository path into the graph |
+| reindex_repository | Incremental re-index — re-parses only changed files (optionally scoped to ` + "`paths`" + `); much cheaper than a full index_repository |
 | track_repository | Add a repo to the workspace, index immediately, persist to config |
 | untrack_repository | Remove a repo, evict its nodes/edges, persist to config |
 | get_active_project | Current project name and member repository list |

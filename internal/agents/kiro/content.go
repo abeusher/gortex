@@ -127,6 +127,7 @@ You **MUST** prefer Gortex graph queries over file reads on every task in this r
 |---------------------------------------|------------------------------------------|
 | Manually adding a repo to config      | ` + "`track_repository`" + ` — indexes immediately, persists to config |
 | Manually removing a repo from config  | ` + "`untrack_repository`" + ` — evicts nodes/edges, persists to config |
+| Refreshing the graph after edits      | ` + "`reindex_repository`" + ` — incremental re-index of changed files only; pass ` + "`paths`" + ` to scope |
 | Wondering which project is active     | ` + "`get_active_project`" + ` — returns project name and repo list |
 | Switching project context             | ` + "`set_active_project`" + ` — re-scopes all subsequent queries |
 | Scoping a query to one repo           | Pass ` + "`repo`" + ` param to ` + "`search_symbols`" + `, ` + "`find_usages`" + `, etc. |
@@ -347,7 +348,7 @@ var AutoApproveTools = []string{
 	"find_import_path", "explain_change_impact", "get_recent_changes",
 	"smart_context", "get_edit_plan", "get_test_targets", "suggest_pattern",
 	"get_communities", "get_processes",
-	"detect_changes", "index_repository",
+	"detect_changes", "index_repository", "reindex_repository",
 	"verify_change", "check_guards", "prefetch_context",
 	"analyze",
 	"diff_context", "index_health", "get_symbol_history",

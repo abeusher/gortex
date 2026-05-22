@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -13,6 +14,7 @@ import (
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/search/rerank"
 )
@@ -669,6 +671,19 @@ func (s *Server) registerCoreTools() {
 	)
 
 	s.addTool(
+		mcp.NewTool("reindex_repository",
+			mcp.WithDescription("Incrementally re-index a repository: re-parses only the files that changed since the last index pass (mtime, or content under Merkle mode) and evicts nodes for deleted files. Much cheaper than index_repository, which rebuilds the whole graph. Pass `paths` to scope the pass to specific files or directories; omit it to scan the whole repository. Returns what was reindexed plus node/edge counts, the stale-file count, and timing."),
+			mcp.WithString("path", mcp.Description("Absolute path to the repository, or a tracked repo prefix. Defaults to the active repository.")),
+			mcp.WithArray("paths",
+				mcp.Description("Optional list of file or directory paths to scope the reindex to — absolute, or relative to the repository root. Directories are walked recursively. When omitted, the whole repository root is scanned."),
+				mcp.WithStringItems(),
+			),
+			mcp.WithString("format", mcp.Description("Output format: json (default), gcx (GCX1 compact wire format), or toon")),
+		),
+		s.handleReindexRepository,
+	)
+
+	s.addTool(
 		mcp.NewTool("get_symbol",
 			mcp.WithDescription("Use instead of Read to locate a function, type, interface, or variable definition. Returns location and signature without reading the whole file."),
 			mcp.WithString("id", mcp.Required(), mcp.Description("Node ID (e.g. pkg/server.go::HandleRequest)")),
@@ -901,6 +916,103 @@ func (s *Server) handleIndexRepository(ctx context.Context, req mcp.CallToolRequ
 	}
 	s.RunAnalysis()
 	return s.respondJSONOrTOON(ctx, req, result)
+}
+
+// handleReindexRepository implements the reindex_repository tool: an
+// incremental re-index that re-parses only changed files (and evicts
+// deleted ones) instead of rebuilding the whole graph. The optional
+// `paths` argument scopes the pass to specific files / directories.
+func (s *Server) handleReindexRepository(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	paths := req.GetStringSlice("paths", nil)
+	// Drop blank entries so a caller passing [""] doesn't accidentally
+	// degrade a scoped request into a whole-repo scan.
+	cleaned := make([]string, 0, len(paths))
+	for _, p := range paths {
+		if strings.TrimSpace(p) != "" {
+			cleaned = append(cleaned, p)
+		}
+	}
+	paths = cleaned
+
+	pathArg := req.GetString("path", "")
+
+	var (
+		result *indexer.IndexResult
+		err    error
+	)
+
+	// Multi-repo mode: route through the per-repo indexer so nodes keep
+	// their RepoPrefix and per-repo stats stay consistent.
+	if s.multiIndexer != nil {
+		prefix := ""
+		if pathArg != "" {
+			prefix = s.resolveRepoPrefixOrReconcile(ctx, pathArg)
+			if prefix == "" {
+				return mcp.NewToolResultError(fmt.Sprintf(
+					"path %q is not a tracked repository; use track_repository to add it", pathArg)), nil
+			}
+		} else {
+			// No path given — fall back to the session's bound repo,
+			// then to the sole tracked repo when there is exactly one.
+			prefix, _ = s.sessionLocality(ctx)
+			if prefix == "" {
+				if tracked := s.multiIndexer.RepoPrefixes(); len(tracked) == 1 {
+					prefix = tracked[0]
+				}
+			}
+			if prefix == "" {
+				return mcp.NewToolResultError(
+					"reindex_repository: no repository specified and the active repository is ambiguous; pass `path`"), nil
+			}
+		}
+		result, err = s.multiIndexer.IncrementalReindexRepo(prefix, paths)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+	} else {
+		if s.indexer == nil {
+			return mcp.NewToolResultError("reindex_repository: no indexer available"), nil
+		}
+		root := pathArg
+		if root == "" {
+			root = s.indexer.RootPath()
+		}
+		if root == "" {
+			return mcp.NewToolResultError(
+				"reindex_repository: no repository root known; pass `path`"), nil
+		}
+		root, absErr := filepath.Abs(root)
+		if absErr != nil {
+			return mcp.NewToolResultError(absErr.Error()), nil
+		}
+		result, err = s.indexer.IncrementalReindexPaths(root, paths)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+	}
+
+	s.RunAnalysis()
+
+	scope := "repository"
+	if len(paths) > 0 {
+		scope = "paths"
+	}
+	payload := map[string]any{
+		"scope":            scope,
+		"result":           result,
+		"node_count":       result.NodeCount,
+		"edge_count":       result.EdgeCount,
+		"file_count":       result.FileCount,
+		"stale_file_count": result.StaleFileCount,
+		"duration_ms":      result.DurationMs,
+	}
+	if len(paths) > 0 {
+		payload["reindexed_paths"] = paths
+	}
+	if len(result.FailedFiles) > 0 {
+		payload["failed_files"] = result.FailedFiles
+	}
+	return s.respondJSONOrTOON(ctx, req, payload)
 }
 
 func (s *Server) handleGetSymbol(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
