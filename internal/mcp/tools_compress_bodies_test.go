@@ -364,6 +364,102 @@ func TestReadFile_CompressBodies_Keep(t *testing.T) {
 	assert.Equal(t, "ValidateToken", kept[0])
 }
 
+func TestGetSymbolSource_MaxLines(t *testing.T) {
+	srv, dir := setupCompressTestServer(t)
+
+	// A function long enough to bust a small max_lines budget, with
+	// an if and a for so there is a skeleton worth keeping.
+	var b strings.Builder
+	b.WriteString("package big\n\nfunc Crunch(n int) int {\n\ttotal := 0\n")
+	for i := 0; i < 20; i++ {
+		b.WriteString("\ttotal = total + ")
+		b.WriteString(itoaInt(i))
+		b.WriteString("\n")
+	}
+	b.WriteString("\tif total > 100 {\n\t\ttotal = total * 2\n\t}\n")
+	b.WriteString("\tfor i := 0; i < n; i++ {\n\t\ttotal = total - i\n\t}\n")
+	b.WriteString("\treturn total\n}\n")
+	path := filepath.Join(dir, "crunch.go")
+	require.NoError(t, os.WriteFile(path, []byte(b.String()), 0o644))
+	require.NoError(t, srv.indexer.IndexFile(path))
+
+	var symbolID string
+	for _, n := range srv.graph.AllNodes() {
+		if n.Name == "Crunch" && n.Kind == "function" {
+			symbolID = n.ID
+			break
+		}
+	}
+	require.NotEmpty(t, symbolID, "Crunch symbol not indexed")
+
+	r := callTool(t, srv, "get_symbol_source", map[string]any{
+		"id":            symbolID,
+		"context_lines": float64(0),
+		"max_lines":     float64(15),
+	})
+	m := extractTextResult(t, r)
+	src, _ := m["source"].(string)
+	assert.Contains(t, src, "func Crunch(n int) int {", "signature must survive")
+	assert.Contains(t, src, "if total > 100 {", "control flow must survive")
+	assert.Contains(t, src, "for i := 0; i < n; i++ {", "control flow must survive")
+	assert.Contains(t, src, "return total", "return must survive")
+	assert.Contains(t, src, "lines elided", "leaf runs must be collapsed")
+	assert.NotContains(t, src, "total = total + 7", "a leaf statement must be dropped")
+	assert.Equal(t, true, m["salience_truncated"], "response must flag salience truncation")
+}
+
+func TestReadFile_MaxLines(t *testing.T) {
+	srv, dir := setupCompressTestServer(t)
+	var b strings.Builder
+	b.WriteString("package big\n\nfunc Walk(n int) int {\n\tx := 0\n")
+	for i := 0; i < 30; i++ {
+		b.WriteString("\tx = x + ")
+		b.WriteString(itoaInt(i))
+		b.WriteString("\n")
+	}
+	b.WriteString("\tif x > 0 {\n\t\tx = x - 1\n\t}\n\treturn x\n}\n")
+	path := filepath.Join(dir, "walk.go")
+	require.NoError(t, os.WriteFile(path, []byte(b.String()), 0o644))
+	require.NoError(t, srv.indexer.IndexFile(path))
+
+	r := callTool(t, srv, "read_file", map[string]any{
+		"path":      "walk.go",
+		"max_lines": float64(20),
+	})
+	m := extractTextResult(t, r)
+	content, _ := m["content"].(string)
+	assert.Contains(t, content, "func Walk(n int) int {")
+	assert.Contains(t, content, "if x > 0 {")
+	assert.Contains(t, content, "return x")
+	assert.Contains(t, content, "lines elided")
+	assert.NotContains(t, content, "x = x + 15", "a leaf statement must be dropped")
+	assert.Equal(t, true, m["salience_truncated"])
+}
+
+func TestReadFile_MaxLines_NonCodeHeadCut(t *testing.T) {
+	srv, dir := setupCompressTestServer(t)
+	var b strings.Builder
+	for i := 0; i < 50; i++ {
+		b.WriteString("log line ")
+		b.WriteString(itoaInt(i))
+		b.WriteString("\n")
+	}
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "app.log"), []byte(b.String()), 0o644))
+
+	r := callTool(t, srv, "read_file", map[string]any{
+		"path":      "app.log",
+		"max_lines": float64(10),
+	})
+	m := extractTextResult(t, r)
+	content, _ := m["content"].(string)
+	// A non-code file cannot be parsed — max_lines falls back to a
+	// plain head cut with a marker.
+	assert.Contains(t, content, "log line 0")
+	assert.NotContains(t, content, "log line 40", "the tail must be cut")
+	assert.Contains(t, content, "max_lines budget")
+	assert.Equal(t, true, m["salience_truncated"])
+}
+
 // itoaInt is a tiny stdlib-free int-to-string for fixture builders.
 func itoaInt(n int) string {
 	if n == 0 {

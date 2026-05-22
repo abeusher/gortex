@@ -616,6 +616,16 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 		}
 	}
 
+	// Salience truncation: collapse leaf-statement runs (and head-cut
+	// non-code files) when the file is still over the max_lines budget.
+	salienceTruncated := false
+	if maxLines := req.GetInt("max_lines", 0); maxLines > 0 {
+		if out, truncated, _ := elide.SalienceTruncate(content, language, maxLines); truncated {
+			content = out
+			salienceTruncated = true
+		}
+	}
+
 	// Record the access for frecency credit on any node defined in
 	// this file. read_file is a heavy access (full file), so we
 	// credit every defined symbol — keeps the "agent is working in
@@ -643,6 +653,9 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 		if len(keptSymbols) > 0 {
 			result["kept_symbols"] = keptSymbols
 		}
+	}
+	if salienceTruncated {
+		result["salience_truncated"] = true
 	}
 
 	etag := computeETag(result)

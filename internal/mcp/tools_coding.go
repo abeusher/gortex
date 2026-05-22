@@ -61,6 +61,7 @@ func (s *Server) registerCodingTools() {
 			mcp.WithString("format", mcp.Description("Output format: json (default), gcx (GCX1 compact wire format), or toon")),
 			mcp.WithNumber("max_bytes", mcp.Description("Cap the marshaled response at this many bytes. The longest list is trimmed; truncation metadata rides on the response. Omit for no cap.")),
 			mcp.WithBoolean("compress_bodies", mcp.Description("Replace function/method bodies in the returned source with a `{ /* N lines elided */ }` stub. Signatures, doc-comments, and structure stay intact. ~30-40% of original tokens. Useful when you only need the surface signature of the symbol, not its implementation. Default: false.")),
+			mcp.WithNumber("max_lines", mcp.Description("When the returned source exceeds this many lines, collapse runs of leaf statements inside function bodies into `… N lines elided …` markers while keeping the signature and the full control-flow skeleton — a structure-preserving alternative to a hard line cut. Omit or 0 to disable.")),
 		),
 		s.handleGetSymbolSource,
 	)
@@ -120,6 +121,7 @@ func (s *Server) registerCodingTools() {
 			mcp.WithString("path", mcp.Required(), mcp.Description("Absolute path, or repo-prefixed / repo-root-relative path")),
 			mcp.WithBoolean("compress_bodies", mcp.Description("Replace function/method bodies with elided stubs (default: false)")),
 			mcp.WithString("keep", mcp.Description("Comma-separated symbol names, IDs, or node kinds whose bodies stay verbatim when compress_bodies is set — every other body in the file is still stubbed. Ignored unless compress_bodies is true.")),
+			mcp.WithNumber("max_lines", mcp.Description("When the file exceeds this many lines, collapse runs of leaf statements inside function bodies into `… N lines elided …` markers while keeping declarations and the control-flow skeleton. Falls back to a plain head cut for non-code files. Omit or 0 to disable.")),
 			mcp.WithNumber("max_bytes", mcp.Description("Cap the marshaled response at this many bytes; truncation flag rides on the response. Omit for no cap.")),
 			mcp.WithString("if_none_match", mcp.Description("ETag from a previous response — returns not_modified if content unchanged")),
 		),
@@ -616,6 +618,17 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 		}
 	}
 
+	// Salience truncation: when the symbol is still larger than
+	// max_lines, keep its control-flow skeleton and collapse runs of
+	// leaf statements rather than cutting the tail off blind.
+	salienceTruncated := false
+	if maxLines := req.GetInt("max_lines", 0); maxLines > 0 {
+		if out, truncated, _ := elide.SalienceTruncate([]byte(source), node.Language, maxLines); truncated {
+			source = string(out)
+			salienceTruncated = true
+		}
+	}
+
 	// Server-side accounting only — the savings value isn't returned to
 	// the caller (agents don't act on it and it burns tokens in every
 	// response). Aggregated stats remain available via the `savings` tool.
@@ -638,6 +651,9 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 	}
 	if bodiesElided {
 		result["bodies_elided"] = true
+	}
+	if salienceTruncated {
+		result["salience_truncated"] = true
 	}
 
 	// ETag conditional fetch.
