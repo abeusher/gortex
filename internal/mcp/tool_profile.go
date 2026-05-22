@@ -82,7 +82,7 @@ func (s *Server) handleToolProfile(ctx context.Context, req mcp.CallToolRequest)
 		lazyEnabled = s.lazy.Enabled()
 		deferred = s.lazy.DeferredNames()
 	}
-	return s.respondJSONOrTOON(ctx, req, map[string]any{
+	profile := map[string]any{
 		"lazy_enabled":   lazyEnabled,
 		"total":          len(live) + len(deferred),
 		"live_count":     len(live),
@@ -90,5 +90,14 @@ func (s *Server) handleToolProfile(ctx context.Context, req mcp.CallToolRequest)
 		"live":           live,
 		"deferred":       deferred,
 		"scopes":         scopes,
-	})
+	}
+	// Per-host runtime context — the resolved host name and its guidance
+	// fragment, when the MCP client identified itself (host_context.go).
+	if hc := s.sessionHostContext(ctx); hc.name != "" {
+		profile["host"] = hc.name
+		if hc.instruction != "" {
+			profile["host_instruction"] = hc.instruction
+		}
+	}
+	return s.respondJSONOrTOON(ctx, req, profile)
 }

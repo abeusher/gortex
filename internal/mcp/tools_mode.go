@@ -52,17 +52,19 @@ func (s *Server) editingToolsHidden(ctx context.Context) bool {
 }
 
 func (s *Server) toolSurfaceFilter(ctx context.Context, tools []mcp.Tool) []mcp.Tool {
-	if !s.editingToolsHidden(ctx) {
-		return tools
-	}
-	out := make([]mcp.Tool, 0, len(tools))
-	for _, t := range tools {
-		if editingToolNames[t.Name] {
-			continue
+	if s.editingToolsHidden(ctx) {
+		kept := make([]mcp.Tool, 0, len(tools))
+		for _, t := range tools {
+			if editingToolNames[t.Name] {
+				continue
+			}
+			kept = append(kept, t)
 		}
-		out = append(out, t)
+		tools = kept
 	}
-	return out
+	// Per-host adaptation: drop tools the host duplicates and apply any
+	// host-specific description overrides (see host_context.go).
+	return s.sessionHostContext(ctx).apply(tools)
 }
 
 // checkToolGate returns a structured error result when toolName must not
