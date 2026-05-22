@@ -383,6 +383,12 @@ type sessionState struct {
 	// for the post-filter tools (ctx_grep / ctx_slice / …). Allocated
 	// lazily on first capture.
 	responses *responseBuffer
+
+	// cursor is the per-session stateful navigation cursor used by the
+	// nav tool — a current symbol plus a back-history. Allocated lazily
+	// on the first nav call and freed with the rest of sessionState on
+	// disconnect.
+	cursor *navCursor
 }
 
 type lastSearchState struct {
@@ -797,6 +803,7 @@ func NewServer(engine *query.Engine, g *graph.Graph, idx *indexer.Indexer, watch
 	s.registerWikiTools()
 	s.registerWalkGraphTool()
 	s.registerGraphQueryTool()
+	s.registerNavTool()
 	s.registerResources()
 	s.registerPrompts()
 

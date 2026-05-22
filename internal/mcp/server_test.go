@@ -105,6 +105,7 @@ func findAndCallHandler(srv *Server, name string, ctx context.Context, req mcpli
 		"taint_paths":           srv.handleTaintPaths,
 		"walk_graph":            srv.handleWalkGraph,
 		"graph_query":           srv.handleGraphQuery,
+		"nav":                   srv.handleNav,
 	}
 	h, ok := handlers[name]
 	if !ok {
