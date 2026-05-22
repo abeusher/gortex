@@ -1,8 +1,11 @@
 package languages
 
 import (
+	"bytes"
 	"regexp"
 	"strings"
+
+	"gopkg.in/yaml.v3"
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/parser"
@@ -10,8 +13,12 @@ import (
 	tree_sitter_markdown "github.com/zzet/gortex/internal/parser/tsitter/markdown"
 )
 
-// linkPattern matches markdown links: [text](target)
+// linkPattern matches inline markdown links: [text](target)
 var linkPattern = regexp.MustCompile(`\[([^\]]+)\]\(([^)]+)\)`)
+
+// wikiLinkPattern matches wiki-style links: [[target]], [[target|label]],
+// [[target#heading]].
+var wikiLinkPattern = regexp.MustCompile(`\[\[([^\[\]]+)\]\]`)
 
 // MarkdownExtractor extracts Markdown document structure.
 type MarkdownExtractor struct {
@@ -45,6 +52,10 @@ func (e *MarkdownExtractor) Extract(filePath string, src []byte) (*parser.Extrac
 	seen := make(map[string]bool)
 	seenLinks := make(map[string]bool)
 
+	// YAML frontmatter relations — wiki-links, document paths, and tags
+	// declared in the `---` fenced block at the top of the file.
+	e.extractFrontmatterRelations(src, filePath, fileNode.ID, seenLinks, result)
+
 	// Walk the AST for headings, code blocks, and inline content.
 	var walk func(node *sitter.Node)
 	walk = func(node *sitter.Node) {
@@ -54,9 +65,11 @@ func (e *MarkdownExtractor) Extract(filePath string, src []byte) (*parser.Extrac
 		case "fenced_code_block":
 			e.extractCodeBlock(node, src, filePath, fileNode.ID, seen, result)
 		case "paragraph", "inline":
-			// Extract links from inline text.
+			// Extract inline and wiki links from inline text.
 			text := node.Content(src)
-			e.extractLinks(text, filePath, fileNode.ID, seenLinks, result, int(node.StartPoint().Row)+1)
+			line := int(node.StartPoint().Row) + 1
+			e.extractLinks(text, filePath, fileNode.ID, seenLinks, result, line)
+			e.extractWikiLinks(text, filePath, fileNode.ID, seenLinks, result, line)
 		}
 
 		for i := 0; i < int(node.NamedChildCount()); i++ {
@@ -151,15 +164,148 @@ func (e *MarkdownExtractor) extractLinks(text, filePath, fileID string, seen map
 		if idx := strings.Index(target, "#"); idx > 0 {
 			target = target[:idx]
 		}
-		if target == "" || seen[target] {
+		if target == "" {
 			continue
 		}
-		seen[target] = true
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileID, To: "unresolved::import::" + target,
-			Kind: graph.EdgeImports, FilePath: filePath, Line: line,
-		})
+		emitMarkdownLink(fileID, filePath, target, line, seen, result)
 	}
+}
+
+// extractWikiLinks emits a link edge for every wiki-style [[target]]
+// reference in text — the Obsidian / wiki convention the inline
+// [text](path) form does not cover.
+func (e *MarkdownExtractor) extractWikiLinks(text, filePath, fileID string, seen map[string]bool, result *parser.ExtractionResult, line int) {
+	for _, m := range wikiLinkPattern.FindAllStringSubmatch(text, -1) {
+		if target := normalizeWikiTarget(m[1]); target != "" {
+			emitMarkdownLink(fileID, filePath, target, line, seen, result)
+		}
+	}
+}
+
+// normalizeWikiTarget reduces a wiki-link body to its target page:
+// [[target|label]] → target, [[target#heading]] → target. A pure
+// same-page anchor ([[#heading]]) yields "".
+func normalizeWikiTarget(inner string) string {
+	t := strings.TrimSpace(inner)
+	if i := strings.IndexByte(t, '|'); i >= 0 {
+		t = strings.TrimSpace(t[:i])
+	}
+	if i := strings.IndexByte(t, '#'); i >= 0 {
+		t = strings.TrimSpace(t[:i])
+	}
+	return t
+}
+
+// emitMarkdownLink appends a document-to-document link edge, deduped
+// by target so the same relation is recorded once per file.
+func emitMarkdownLink(fileID, filePath, target string, line int, seen map[string]bool, result *parser.ExtractionResult) {
+	to := "unresolved::import::" + target
+	if seen[to] {
+		return
+	}
+	seen[to] = true
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: fileID, To: to, Kind: graph.EdgeImports, FilePath: filePath, Line: line,
+	})
+}
+
+// extractFrontmatterRelations parses a leading YAML frontmatter block
+// and emits a relation edge for every wiki-link, markdown-document
+// path, and tag it declares.
+func (e *MarkdownExtractor) extractFrontmatterRelations(src []byte, filePath, fileID string, seen map[string]bool, result *parser.ExtractionResult) {
+	fm := frontmatterBlock(src)
+	if len(fm) == 0 {
+		return
+	}
+	var doc map[string]any
+	if err := yaml.Unmarshal(fm, &doc); err != nil || doc == nil {
+		return
+	}
+	for key, val := range doc {
+		e.emitFrontmatterValue(key, val, filePath, fileID, seen, result)
+	}
+}
+
+// frontmatterBlock returns the YAML text between a leading `---` fence
+// and its closing `---` / `...` fence, or nil when the file carries no
+// frontmatter.
+func frontmatterBlock(src []byte) []byte {
+	s := bytes.TrimPrefix(src, []byte{0xEF, 0xBB, 0xBF})
+	lines := bytes.SplitAfter(s, []byte("\n"))
+	if len(lines) == 0 || strings.TrimRight(string(lines[0]), "\r\n") != "---" {
+		return nil
+	}
+	var body [][]byte
+	for _, ln := range lines[1:] {
+		switch strings.TrimRight(string(ln), "\r\n") {
+		case "---", "...":
+			return bytes.Join(body, nil)
+		}
+		body = append(body, ln)
+	}
+	return nil
+}
+
+// emitFrontmatterValue walks a decoded frontmatter value — scalar,
+// sequence, or nested mapping — emitting a relation edge for each
+// wiki-link, markdown path, or tag string it finds.
+func (e *MarkdownExtractor) emitFrontmatterValue(key string, val any, filePath, fileID string, seen map[string]bool, result *parser.ExtractionResult) {
+	switch v := val.(type) {
+	case string:
+		e.emitFrontmatterString(key, v, filePath, fileID, seen, result)
+	case []any:
+		for _, item := range v {
+			e.emitFrontmatterValue(key, item, filePath, fileID, seen, result)
+		}
+	case map[string]any:
+		for k, item := range v {
+			e.emitFrontmatterValue(k, item, filePath, fileID, seen, result)
+		}
+	}
+}
+
+// emitFrontmatterString classifies one frontmatter scalar: a `tags`
+// entry becomes a topic relation, a value carrying a [[wiki-link]] or
+// a bare markdown-document path becomes a document relation.
+func (e *MarkdownExtractor) emitFrontmatterString(key, val, filePath, fileID string, seen map[string]bool, result *parser.ExtractionResult) {
+	val = strings.TrimSpace(val)
+	if val == "" {
+		return
+	}
+	// `tags:` / `tag:` — each value is a topic relation.
+	if key == "tags" || key == "tag" {
+		to := "unresolved::tag::" + val
+		if !seen[to] {
+			seen[to] = true
+			result.Edges = append(result.Edges, &graph.Edge{
+				From: fileID, To: to, Kind: graph.EdgeReferences, FilePath: filePath, Line: 1,
+			})
+		}
+		return
+	}
+	// A wiki-link relation expressed in frontmatter (related: "[[Foo]]").
+	if matches := wikiLinkPattern.FindAllStringSubmatch(val, -1); matches != nil {
+		for _, m := range matches {
+			if t := normalizeWikiTarget(m[1]); t != "" {
+				emitMarkdownLink(fileID, filePath, t, 1, seen, result)
+			}
+		}
+		return
+	}
+	// A bare markdown-document path (parent: ../index.md).
+	if isMarkdownDocPath(val) {
+		emitMarkdownLink(fileID, filePath, val, 1, seen, result)
+	}
+}
+
+// isMarkdownDocPath reports whether val is a local path to a markdown
+// document — used to treat a frontmatter scalar as a document relation.
+func isMarkdownDocPath(val string) bool {
+	if strings.Contains(val, "://") {
+		return false
+	}
+	lower := strings.ToLower(val)
+	return strings.HasSuffix(lower, ".md") || strings.HasSuffix(lower, ".mdx")
 }
 
 var _ parser.Extractor = (*MarkdownExtractor)(nil)

@@ -95,3 +95,65 @@ func TestMarkdownExtractor_Extensions(t *testing.T) {
 	assert.Equal(t, "markdown", e.Language())
 	assert.Equal(t, []string{".md", ".mdx"}, e.Extensions())
 }
+
+func TestMarkdownExtractor_WikiLinks(t *testing.T) {
+	src := []byte(`# Notes
+
+See [[Other Page]] for details, and [[guide/setup|the setup guide]].
+
+A heading anchor [[Reference#Section]] resolves to the page.
+
+A same-page anchor [[#Local Heading]] is not a document relation.
+`)
+	e := NewMarkdownExtractor()
+	result, err := e.Extract("notes.md", src)
+	require.NoError(t, err)
+
+	imports := edgesOfKind(result.Edges, graph.EdgeImports)
+	targets := make([]string, len(imports))
+	for i, ed := range imports {
+		targets[i] = ed.To
+	}
+	assert.Contains(t, targets, "unresolved::import::Other Page")
+	assert.Contains(t, targets, "unresolved::import::guide/setup")
+	assert.Contains(t, targets, "unresolved::import::Reference")
+	// The same-page anchor [[#Local Heading]] has no document target.
+	assert.NotContains(t, targets, "unresolved::import::")
+}
+
+func TestMarkdownExtractor_Frontmatter(t *testing.T) {
+	src := []byte(`---
+title: My Note
+tags:
+  - parsing
+  - graph
+related: "[[Parent Note]]"
+up: ../index.md
+---
+
+# My Note
+
+Body text with a [[Sibling]] link.
+`)
+	e := NewMarkdownExtractor()
+	result, err := e.Extract("note.md", src)
+	require.NoError(t, err)
+
+	imports := make([]string, 0)
+	refs := make([]string, 0)
+	for _, ed := range result.Edges {
+		switch ed.Kind {
+		case graph.EdgeImports:
+			imports = append(imports, ed.To)
+		case graph.EdgeReferences:
+			refs = append(refs, ed.To)
+		}
+	}
+	// Frontmatter wiki-link, frontmatter doc path, and a body wiki-link.
+	assert.Contains(t, imports, "unresolved::import::Parent Note")
+	assert.Contains(t, imports, "unresolved::import::../index.md")
+	assert.Contains(t, imports, "unresolved::import::Sibling")
+	// `tags:` entries become topic relations.
+	assert.Contains(t, refs, "unresolved::tag::parsing")
+	assert.Contains(t, refs, "unresolved::tag::graph")
+}
