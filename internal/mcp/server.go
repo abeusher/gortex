@@ -372,6 +372,11 @@ type sessionState struct {
 	// workflow, when non-nil, is the active phase-enforcement state
 	// machine for this session (see tools_workflow.go).
 	workflow *workflowState
+
+	// responses is the ring of recent large tool responses captured
+	// for the post-filter tools (ctx_grep / ctx_slice / …). Allocated
+	// lazily on first capture.
+	responses *responseBuffer
 }
 
 type lastSearchState struct {
@@ -747,6 +752,7 @@ func NewServer(engine *query.Engine, g *graph.Graph, idx *indexer.Indexer, watch
 
 	s.registerCoreTools()
 	s.registerCodingTools()
+	s.registerPostFilterTools()
 	s.registerPlanningModeTool()
 	s.registerWorkflowTool()
 	s.registerScopeTools()

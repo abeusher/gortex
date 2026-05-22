@@ -106,6 +106,11 @@ func (s *Server) wrapToolHandler(h mcpserver.ToolHandlerFunc) mcpserver.ToolHand
 		if warming && hErr == nil {
 			res = decorateResultWithWarming(res, env)
 		}
+		// Capture large successful responses into the session ring so
+		// the post-filter tools can re-cut them without re-querying.
+		if hErr == nil {
+			s.captureResponse(ctx, req.Params.Name, res)
+		}
 		return res, hErr
 	}
 }
