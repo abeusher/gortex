@@ -1,0 +1,137 @@
+package mcp
+
+import (
+	"strings"
+
+	mcpgo "github.com/mark3labs/mcp-go/mcp"
+
+	"github.com/zzet/gortex/internal/search/rerank"
+)
+
+// expandMode controls which query-expansion channels search_symbols
+// runs. The default is `both` -- LLM expansion (when the assist gate
+// engages) plus the deterministic equivalence-class expansion. The
+// other modes pin a single channel or disable expansion entirely.
+type expandMode int
+
+const (
+	// expandBoth runs LLM expansion (gated by assist) and equivalence
+	// expansion together. The default when the `expand` arg is unset.
+	expandBoth expandMode = iota
+	// expandEquivalenceOnly runs only the deterministic equivalence
+	// table + auto-concept expansion; the LLM channel is skipped even
+	// when a provider is configured.
+	expandEquivalenceOnly
+	// expandLLMOnly runs only the LLM expansion channel.
+	expandLLMOnly
+	// expandOff disables every expansion channel -- a pure BM25 query.
+	expandOff
+)
+
+// parseExpandMode reads the `expand` arg. Unrecognised values fall
+// back to `both` so a typo can't silently break expansion.
+func parseExpandMode(req mcpgo.CallToolRequest) expandMode {
+	switch strings.ToLower(strings.TrimSpace(req.GetString("expand", ""))) {
+	case "equivalence", "equiv":
+		return expandEquivalenceOnly
+	case "llm":
+		return expandLLMOnly
+	case "off", "none":
+		return expandOff
+	default:
+		return expandBoth
+	}
+}
+
+// allowsLLMExpansion reports whether the mode permits the LLM channel.
+func (m expandMode) allowsLLMExpansion() bool {
+	return m == expandBoth || m == expandLLMOnly
+}
+
+// allowsEquivalenceExpansion reports whether the mode permits the
+// deterministic equivalence channel.
+func (m expandMode) allowsEquivalenceExpansion() bool {
+	return m == expandBoth || m == expandEquivalenceOnly
+}
+
+// expandEquivalenceClasses returns the deterministic expansion terms
+// for a query: for every query token, its curated-equivalence-table
+// siblings and its per-repo auto-mined concept siblings. The result
+// is a deduplicated slice with the query's own tokens removed, ready
+// to feed the BM25 OR-merge alongside (or instead of) LLM expansion.
+//
+// This channel runs even when no LLM provider is configured -- it is
+// the deterministic vocabulary-bridging win. Returns nil when
+// equivalence expansion is disabled in config, when the query is
+// empty, or when no token has a sibling.
+func (s *Server) expandEquivalenceClasses(query string) []string {
+	if !s.searchConfig().EquivalenceClassesEnabled() {
+		return nil
+	}
+	tokens := rerank.Tokenize(query)
+	if len(tokens) == 0 {
+		return nil
+	}
+	// Query tokens themselves are never expansion terms -- BM25
+	// already searched them.
+	queryTokens := make(map[string]struct{}, len(tokens))
+	for _, t := range tokens {
+		queryTokens[strings.ToLower(t)] = struct{}{}
+	}
+
+	table := s.equivalence
+	auto := s.getAutoConcepts()
+
+	var (
+		out  []string
+		seen = map[string]struct{}{}
+	)
+	add := func(term string) {
+		term = strings.ToLower(strings.TrimSpace(term))
+		if term == "" {
+			return
+		}
+		if _, isQuery := queryTokens[term]; isQuery {
+			return
+		}
+		if _, dup := seen[term]; dup {
+			return
+		}
+		seen[term] = struct{}{}
+		out = append(out, term)
+	}
+	for _, tok := range tokens {
+		for _, sib := range table.Expand(tok) {
+			add(sib)
+		}
+		for _, sib := range auto.Expand(tok) {
+			add(sib)
+		}
+	}
+	return out
+}
+
+// mergeExpansionTerms unions several expansion-term lists into one
+// deduplicated slice, preserving the order the lists are supplied
+// in (soup disjuncts first so they retain priority, then LLM
+// synonyms, then equivalence siblings). Comparison is
+// case-insensitive; blank terms are dropped.
+func mergeExpansionTerms(lists ...[]string) []string {
+	var out []string
+	seen := map[string]struct{}{}
+	for _, list := range lists {
+		for _, term := range list {
+			t := strings.TrimSpace(term)
+			if t == "" {
+				continue
+			}
+			key := strings.ToLower(t)
+			if _, dup := seen[key]; dup {
+				continue
+			}
+			seen[key] = struct{}{}
+			out = append(out, t)
+		}
+	}
+	return out
+}

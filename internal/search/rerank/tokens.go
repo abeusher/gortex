@@ -113,3 +113,10 @@ func overlap(query, target []string) float64 {
 	}
 	return float64(hit) / float64(len(query))
 }
+
+// Tokenize is the exported entry point for the camelCase- and
+// snake_case-aware tokenizer. Callers outside the rerank package
+// (the search handler's equivalence-class expansion) use it to
+// split a query into the word tokens the equivalence table and the
+// auto-concept vocabulary are keyed on. The result is deduplicated.
+func Tokenize(s string) []string { return tokenize(s) }

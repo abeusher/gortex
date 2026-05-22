@@ -814,6 +814,19 @@ type SearchConfig struct {
 	//   - "off": disable soup handling entirely.
 	// An empty value is treated as "split".
 	KeywordSoupRewrite string `mapstructure:"keyword_soup_rewrite" yaml:"keyword_soup_rewrite,omitempty"`
+
+	// EquivalenceClasses enables deterministic, LLM-free query
+	// expansion through the curated software-concept synonym table
+	// plus the per-repo auto-mined concept vocabulary. On by default
+	// (the pointer is nil-checked: nil means "on"). Set it false to
+	// disable equivalence expansion entirely.
+	EquivalenceClasses *bool `mapstructure:"equivalence_classes" yaml:"equivalence_classes,omitempty"`
+
+	// EquivalenceExtra adds repo-custom synonym classes to the curated
+	// equivalence table. Each entry maps a class label to its member
+	// words; the label itself joins the class. A label that names a
+	// curated word extends that curated class rather than forking it.
+	EquivalenceExtra map[string][]string `mapstructure:"equivalence_extra" yaml:"equivalence_extra,omitempty"`
 }
 
 // Keyword-soup rewrite modes for SearchConfig.KeywordSoupRewrite.
@@ -822,6 +835,13 @@ const (
 	KeywordSoupNudge = "nudge"
 	KeywordSoupOff   = "off"
 )
+
+// EquivalenceClassesEnabled reports whether deterministic
+// equivalence-class query expansion is on. It defaults to true --
+// a nil EquivalenceClasses pointer (the unset state) means enabled.
+func (c SearchConfig) EquivalenceClassesEnabled() bool {
+	return c.EquivalenceClasses == nil || *c.EquivalenceClasses
+}
 
 // EffectiveKeywordSoupRewrite folds the empty default into the
 // canonical "split" mode and lower-cases the value, so callers can

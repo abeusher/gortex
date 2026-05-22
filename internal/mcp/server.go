@@ -27,6 +27,7 @@ import (
 	"github.com/zzet/gortex/internal/platform"
 	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/savings"
+	"github.com/zzet/gortex/internal/search"
 	"github.com/zzet/gortex/internal/semantic"
 	"github.com/zzet/gortex/internal/server/hub"
 	"github.com/zzet/gortex/internal/workspace"
@@ -101,6 +102,11 @@ type Server struct {
 	communities    *analysis.CommunityResult
 	processes      *analysis.ProcessResult
 	pageRank       *analysis.PageRankResult
+	// autoConcepts is the per-repo, LLM-free concept vocabulary mined
+	// from symbol names -- the deterministic complement to LLM query
+	// expansion. Rebuilt on every RunAnalysis pass; guarded by
+	// analysisMu and read via getAutoConcepts.
+	autoConcepts *search.AutoConcepts
 	// leidenCache carries the last Leiden partition between
 	// `analyze kind=clusters` calls so a re-run after only a couple
 	// of packages changed re-partitions just those packages instead
@@ -159,7 +165,12 @@ type Server struct {
 	// equivalence-class expansion, prose indexing). Installed via
 	// SetSearchConfig right after NewServer; the zero value keeps
 	// every knob at its documented default.
-	searchCfg        config.SearchConfig
+	searchCfg config.SearchConfig
+	// equivalence is the curated software-concept synonym table
+	// (plus any repo-custom classes from searchCfg.EquivalenceExtra).
+	// Built once by SetSearchConfig; immutable thereafter so no lock
+	// is needed. Nil until SetSearchConfig runs -- callers nil-check.
+	equivalence      *search.EquivalenceTable
 	contractRegistry *contracts.Registry
 	semanticMgr      *semantic.Manager
 	feedback         *feedbackManager
@@ -1368,6 +1379,10 @@ func (s *Server) RunAnalysis() {
 	s.leidenCache = cache
 	s.processes = analysis.DiscoverProcesses(s.graph)
 	s.pageRank = analysis.ComputePageRank(s.graph)
+	// Auto-concept vocabulary: mine domain phrases from symbol names
+	// so equivalence-class expansion can bridge repo-specific terms
+	// even with no LLM provider configured.
+	s.autoConcepts = search.BuildAutoConcepts(s.graph)
 	s.analysisMu.Unlock()
 
 	// Bootstrap-resource payloads (graph_stats, index_health, etc.)
@@ -1412,6 +1427,15 @@ func (s *Server) getPageRank() *analysis.PageRankResult {
 	s.analysisMu.RLock()
 	defer s.analysisMu.RUnlock()
 	return s.pageRank
+}
+
+// getAutoConcepts returns the per-repo auto-mined concept
+// vocabulary. Nil until the first RunAnalysis pass; callers
+// nil-check (AutoConcepts.Expand is itself nil-safe).
+func (s *Server) getAutoConcepts() *search.AutoConcepts {
+	s.analysisMu.RLock()
+	defer s.analysisMu.RUnlock()
+	return s.autoConcepts
 }
 
 // SetArchitecture installs the declarative architecture-rules DSL so

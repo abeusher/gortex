@@ -714,6 +714,7 @@ func (s *Server) registerCoreTools() {
 			mcp.WithString("assist", mcp.Description("LLM assist mode: \"auto\" (default — engages on natural-language queries, skips identifier lookups), \"on\" (force engage), \"off\" (bypass), \"deep\" (on + a body-grounded verification pass that reads candidate code and HONESTLY drops irrelevant matches — slower, may return empty results when nothing genuinely matches). Requires an LLM provider configured via `llm.provider` (local / anthropic / openai / ollama / claudecli / gemini / bedrock / deepseek); behaves as \"off\" when none is available.")),
 			mcp.WithBoolean("debug", mcp.Description("When true, attach a `rerank` block to the response carrying per-candidate scores and per-signal contributions from the 11-signal rerank pipeline (bm25, semantic, fan_in, fan_out, churn, community, minhash, api_signature, type_signature, recency, feedback) plus the active per-signal weight map. Off by default; enable to inspect ranking decisions or tune `.gortex.yaml::search::weights`.")),
 			mcp.WithString("query_class", mcp.Description("Advisory hint that tunes the bm25-vs-semantic balance of the rerank: \"auto\" (default — detect from query shape), \"symbol\" (identifier / API lookup — BM25-heavy), \"concept\" (natural-language description — balanced), \"path\" (file-path query — most BM25-heavy), \"signature\" (type/function-signature fragment — BM25-leaning), \"keyword_soup\" (a degenerate boolean OR-list \u2014 suppresses LLM expansion and splits the soup into per-disjunct BM25 fetches; a `query_advice` nudge rides on the response). The class actually used is echoed back as `query_class` in the response.")),
+			mcp.WithString("expand", mcp.Description("Query-expansion channels: \"both\" (default \u2014 LLM expansion when the assist gate engages, plus the deterministic equivalence-class table), \"equivalence\" (only the LLM-free curated synonym table + per-repo auto-mined concepts), \"llm\" (only LLM expansion), \"off\" (pure BM25, no expansion). Equivalence expansion bridges query vocabulary to the words a symbol uses (auth->login, delete->remove) and runs even with no LLM provider configured.")),
 			mcp.WithNumber("max_per_file", mcp.Description("Cap how many results a single source file may contribute to the diverse head of the result set (default 3). Hits beyond the cap are demoted below not-yet-capped results — never dropped — so the top of the list spans more files. Set 0 to disable diversification.")),
 		),
 		s.handleSearchSymbols,
@@ -1111,8 +1112,11 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	// forces assist off -- neither expansion nor rerank earns its cost
 	// on a disjunct list.
 	assist := parseAssistMode(req)
+	// expand mode picks which query-expansion channels run -- LLM,
+	// the deterministic equivalence table, both (default), or off.
+	expand := parseExpandMode(req)
 	engage := shouldEngageAssist(assist, q) && s.llmService != nil && s.llmService.Enabled()
-	if isSoup {
+	if isSoup || !expand.allowsLLMExpansion() {
 		engage = false
 	}
 
@@ -1127,14 +1131,22 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	// when assist engaged, or the soup's split disjuncts when this is
 	// a soup query handled in "split" mode. The two are mutually
 	// exclusive -- soup forces assist off above.
-	var expandedTerms []string
-	var soupFragments []string
+	// LLM-derived synonyms (when assist engaged), the soup's split
+	// disjuncts (soup query in split mode), and the deterministic
+	// equivalence-class siblings all compose into one expansion-term
+	// list. fetchAndMergeBM25 dedups the merged result by node ID, so
+	// overlapping channels never double-count a candidate.
+	var llmTerms, soupFragments, equivTerms []string
 	if engage {
-		expandedTerms = expandSearchTerms(ctx, s, q)
-	} else if isSoup && soupMode == config.KeywordSoupSplit {
-		soupFragments = rerank.SplitSoupFragments(q)
-		expandedTerms = soupFragments
+		llmTerms = expandSearchTerms(ctx, s, q)
 	}
+	if isSoup && soupMode == config.KeywordSoupSplit {
+		soupFragments = rerank.SplitSoupFragments(q)
+	}
+	if expand.allowsEquivalenceExpansion() {
+		equivTerms = s.expandEquivalenceClasses(q)
+	}
+	expandedTerms := mergeExpansionTerms(soupFragments, llmTerms, equivTerms)
 
 	var nodes []*graph.Node
 	var primaryCount int
@@ -1317,8 +1329,11 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 			"merged_count":  mergedCount,  // BM25 hits after merging expansion terms, pre-filter
 			"final_count":   total,        // post-filter, post-rerank — matches the top-level total
 		}
-		if len(expandedTerms) > 0 {
-			assistDebug["terms"] = expandedTerms
+		if len(llmTerms) > 0 {
+			assistDebug["terms"] = llmTerms
+		}
+		if len(equivTerms) > 0 {
+			assistDebug["equivalence_terms"] = equivTerms
 		}
 		if verifyRan {
 			assistDebug["verify_considered"] = verifyDbg.Considered

@@ -1,6 +1,9 @@
 package mcp
 
-import "github.com/zzet/gortex/internal/config"
+import (
+	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/search"
+)
 
 // SetSearchConfig installs the `.gortex.yaml::search` block on the
 // server. Called by the server / daemon entrypoint right after
@@ -11,6 +14,10 @@ import "github.com/zzet/gortex/internal/config"
 // its documented default.
 func (s *Server) SetSearchConfig(cfg config.SearchConfig) {
 	s.searchCfg = cfg
+	// Build the curated equivalence table once, merging in any
+	// repo-custom classes. Cheap and immutable -- safe to do here
+	// rather than lazily, and no lock is needed afterwards.
+	s.equivalence = search.NewEquivalenceTable(cfg.EquivalenceExtra)
 }
 
 // searchConfig returns the installed search config. The zero value is
