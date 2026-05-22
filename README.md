@@ -91,6 +91,8 @@ For Homebrew, package managers (`.deb` / `.rpm` / `.apk`), direct binary downloa
 - **GCX1 compact wire format** — published, round-trippable text format for MCP tool responses. Opt-in per call via `format: "gcx"` on every list-shaped tool (~17). Auto-served as the default for known clients (Claude Code, Cursor, VS Code, Zed, Aider, Kilo Code, OpenCode, OpenClaw, Codex) when no `format` is passed; explicit `format` always wins. **Median −27.4% savings vs JSON** across a 20-case benchmark under tiktoken `cl100k_base` (Claude 3 / Opus 4 / Sonnet 4 / Haiku 4.5 / GPT-4o family) and a parallel **−27.3% under Claude Opus 4.7** input-token counts (best case −38.3%), 100% round-trip integrity. Spec: [`docs/wire-format.md`](docs/wire-format.md). Standalone MIT-licensed reference implementations: Go ([`github.com/gortexhq/gcx-go`](https://github.com/gortexhq/gcx-go)) and TypeScript ([`github.com/gortexhq/gcx-ts`](https://github.com/gortexhq/gcx-ts), npm [`@gortex/wire`](https://www.npmjs.com/package/@gortex/wire)). Reproducible harness: [`bench/wire-format/`](bench/wire-format/) (dual-tokenizer scorecard; `--use-api` for exact Opus 4.7 counts via Anthropic `count_tokens`)
 - **TOON fallback wire format** — second-tier compact text (~10–15% smaller than JSON, lossy but human-friendly) on every list-shaped tool for clients that don't yet speak GCX. Pass `format: "toon"`
 - **Budget-by-default MCP responses** — list-shaped tools cap each page at the project default budget and return `next_cursor` for the tail. Pagination, sparse fieldsets, and graceful degradation built in. Per-call caps via `max_bytes` *and* `max_tokens` (composable — tighter wins; ~3.5 bytes/token heuristic calibrated across JSON / TOON / GCX1). Truncation rides on the response as `_truncated_by_budget` / `_truncated_by_tokens` / `_max_returned_<list>` markers (JSON) or a `# truncated_by_budget=true` / `# max_tokens=N truncated_by_tokens=true` comment (GCX)
+- **Graded-fidelity context economy** — `smart_context` can return a `context_manifest` (`fidelity: "graded"`) that tiers symbols by graph distance — focus symbols at full source, their caller/callee ring as elided signature stubs, the keyword-match remainder as outline — all packed under one `token_budget`, with budget pressure demoting entries full → compressed → outline rather than dropping them. `estimate: true` projects a call's token cost before fetching; an `if_none_match` pack root turns a repeated call on unchanged code into a near-zero-token `not_modified` no-op. `compress_bodies` takes a `keep` predicate (stub a whole file *except* the symbols being edited); `get_symbol_source` / `read_file` take `max_lines` for AST-aware salience truncation — the control-flow skeleton is kept and leaf-statement runs collapse to `… N lines elided …` markers instead of a blind line cut. Source-returning tools attach structured `omissions` notes (`compressed` / `truncated` / `binary` / `vendored` / `generated`) so the model is never guessing about absent code
+- **Response post-filter re-cutting** — every large tool response is captured into a bounded per-session ring; `ctx_grep` / `ctx_slice` / `ctx_peek` / `head_results` / `ctx_stats` re-cut a prior result — regex search with `-A`/`-B`/`-C` context and a grep-style match block, explicit line slices, head/tail previews — without re-issuing the original query
 - **16 MCP resources** — bootstrap state (`gortex://stats`, `gortex://workspace`, `gortex://repos`, `gortex://active-project`, `gortex://schema`, `gortex://session`, `gortex://index-health`), community / process rollups (`gortex://communities`, `gortex://community/{id}`, `gortex://processes`, `gortex://process/{id}`), and analyzer-backed summaries (`gortex://report`, `gortex://god-nodes`, `gortex://surprises`, `gortex://audit`, `gortex://questions`). Read-only, URI-addressable, push `notifications/resources/updated` after each graph re-warm — no polling
 - **Framework graph layer** — handler→route edges from HTTP / gRPC / GraphQL / WebSocket / Phoenix / Kafka topic registrations; ORM model→table edges across GORM, SQLAlchemy, Django, ActiveRecord, JPA, TypeORM, Ecto; component-tree edges for JSX/TSX and Phoenix HEEx. Surfaced via `analyze` `kind: "routes" / "models" / "components"`
 - **Infrastructure graph layer** — first-class `KindResource` (Kubernetes Deployments, Services, Ingresses, ConfigMaps, Secrets, CronJobs), `KindKustomization` (overlay tree), and `KindImage` (Dockerfile FROM targets and K8s `container.image`) with `depends_on` / `configures` / `mounts` / `exposes` / `uses_env` edges. Cross-references with code-side `os.Getenv` calls automatically. Surfaced via `analyze` `kind: "k8s_resources" / "kustomize" / "images"`
@@ -519,7 +521,7 @@ Four additional push channels modeled on `subscribe_diagnostics` — per-session
 ### Coding Workflow
 | Tool | Description |
 |------|-------------|
-| `get_symbol_source` | Source code of a single symbol (80% fewer tokens than Read). Returns `tokens_saved` per call |
+| `get_symbol_source` | Source code of a single symbol (80% fewer tokens than Read). Returns `tokens_saved` per call. `compress_bodies` stubs bodies (with an optional `keep` subset); `max_lines` salience-truncates an oversized symbol to its control-flow skeleton |
 | `batch_symbols` | Multiple symbols with source/callers/callees in one call |
 | `find_import_path` | Correct import path for a symbol |
 | `explain_change_impact` | Risk-tiered blast radius with affected processes. A zero-edge target carries the "likely unused" vs "possible extraction gap" caveat |
@@ -534,7 +536,7 @@ Four additional push channels modeled on `subscribe_diagnostics` — per-session
 ### Agent-Optimized (token efficiency)
 | Tool | Description |
 |------|-------------|
-| `smart_context` | Task-aware minimal context — replaces 5-10 exploration calls |
+| `smart_context` | Task-aware minimal context — replaces 5-10 exploration calls. `fidelity: "graded"` returns a graph-distance-tiered `context_manifest` under one `token_budget`; `estimate: true` projects token cost without fetching; `if_none_match` dedups an unchanged pack to `not_modified` |
 | `get_edit_plan` | Dependency-ordered edit sequence for multi-file refactors |
 | `get_test_targets` | Maps changed symbols to test files and run commands |
 | `get_untested_symbols` | Inverse of `get_test_targets` — functions/methods not reached from any test file, ranked by fan-in |
@@ -542,6 +544,17 @@ Four additional push channels modeled on `subscribe_diagnostics` — per-session
 | `export_context` | Portable markdown/JSON context briefing for sharing outside MCP |
 | `feedback` | `action: "record"`: report useful/missing symbols. `action: "query"`: aggregated stats — most useful, most missed, accuracy metrics |
 | `ask` | Optional in-process LLM research agent (`-tags llama` + `llm.model`) — navigates the graph and returns a synthesized answer; `chain: true` for cross-repo call-chain tracing |
+
+### Response Re-Cutting
+Gortex captures every large tool response into a bounded per-session ring; these tools re-cut a captured response without re-issuing the original query.
+
+| Tool | Description |
+|------|-------------|
+| `ctx_stats` | List the session's buffered responses — handles, tools, line / byte / token counts |
+| `ctx_grep` / `grep_results` | Regex (or literal) search over a buffered response — structured `matches[]` plus a grep-style block with `-A`/`-B`/`-C` context |
+| `ctx_slice` | An explicit line range of a buffered response |
+| `ctx_peek` | Head + tail preview of a buffered response |
+| `head_results` | The first N lines of a buffered response |
 
 ### Analysis
 | Tool | Description |
