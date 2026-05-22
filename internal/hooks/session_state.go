@@ -20,6 +20,10 @@ type sessionState struct {
 	// Gortex MCP tool this session. ModeConsultUnlock keys the
 	// deny→additionalContext downgrade on it.
 	GraphConsulted bool `json:"graph_consulted,omitempty"`
+	// NonSymbolicStreak counts consecutive non-symbolic fallback tool
+	// calls (Read / Grep / Glob) since the last symbolic call or nudge.
+	// ModeAdaptiveNudge fires a soft-deny when it crosses the threshold.
+	NonSymbolicStreak int `json:"non_symbolic_streak,omitempty"`
 }
 
 // hookSessionDirEnvVar lets tests redirect the per-session state

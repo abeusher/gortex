@@ -30,6 +30,13 @@ import (
 //     posture nudges the agent to consult the graph before falling back
 //     to raw file reads, then gets out of the way.
 //
+//   - ModeAdaptiveNudge ("nudge"): instead of denying every fallback
+//     call, the hook counts consecutive non-symbolic tool calls per
+//     session and soft-denies once when the streak crosses a threshold,
+//     then resets — so the reminder fires once per burst and the very
+//     next call proceeds. A symbolic / `mcp__gortex__*` call resets the
+//     streak to zero.
+//
 // The modes co-exist by selection — a user picks one per install via
 // `gortex install --hook-mode=<mode>`. Switching modes is a single
 // re-install; the Claude Code adapter rewrites the hook command and
@@ -44,6 +51,9 @@ const (
 	// ModeConsultUnlock denies fallback reads until the agent has
 	// consulted the Gortex graph once, then downgrades to soft context.
 	ModeConsultUnlock
+	// ModeAdaptiveNudge soft-denies once per burst of non-symbolic
+	// fallback calls rather than denying every call.
+	ModeAdaptiveNudge
 )
 
 // ParseMode resolves the string form into a Mode. Empty / unknown
@@ -55,6 +65,8 @@ func ParseMode(s string) Mode {
 		return ModeEnrich
 	case "consult-unlock":
 		return ModeConsultUnlock
+	case "nudge", "adaptive-nudge":
+		return ModeAdaptiveNudge
 	default:
 		return ModeDeny
 	}
@@ -68,6 +80,8 @@ func (m Mode) String() string {
 		return "enrich"
 	case ModeConsultUnlock:
 		return "consult-unlock"
+	case ModeAdaptiveNudge:
+		return "nudge"
 	default:
 		return "deny"
 	}

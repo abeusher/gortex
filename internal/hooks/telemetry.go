@@ -15,6 +15,9 @@ const (
 	DecisionProbedMiss       DecisionKind = "probed_miss"
 	DecisionSkippedNonSymbol DecisionKind = "skipped_non_symbol"
 	DecisionTimedOut         DecisionKind = "timed_out"
+	// DecisionNudged records that ModeAdaptiveNudge fired its
+	// once-per-burst soft-deny after a streak of non-symbolic calls.
+	DecisionNudged DecisionKind = "nudged"
 )
 
 type hookDecision struct {

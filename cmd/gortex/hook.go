@@ -23,6 +23,6 @@ var hookCmd = &cobra.Command{
 func init() {
 	hookCmd.Flags().IntVar(&hookPort, "port", 8765, "Gortex web server port")
 	hookCmd.Flags().StringVar(&hookMode, "mode", "deny",
-		"hook posture: 'deny' (redirect Grep/Glob/Read of indexed source), 'enrich' (never deny; PostToolUse appends graph context), or 'consult-unlock' (deny fallback reads until the graph is queried once this session)")
+		"hook posture: 'deny' (redirect Grep/Glob/Read of indexed source), 'enrich' (never deny; PostToolUse appends graph context), 'consult-unlock' (deny fallback reads until the graph is queried once this session), or 'nudge' (soft-deny once per burst of non-symbolic calls)")
 	rootCmd.AddCommand(hookCmd)
 }

@@ -102,6 +102,9 @@ func TestParseMode(t *testing.T) {
 		"consult-unlock":   ModeConsultUnlock,
 		"Consult-Unlock":   ModeConsultUnlock,
 		"  consult-unlock": ModeConsultUnlock,
+		"nudge":            ModeAdaptiveNudge,
+		"NUDGE":            ModeAdaptiveNudge,
+		"adaptive-nudge":   ModeAdaptiveNudge,
 		"unknown":          ModeDeny,
 	}
 	for input, want := range cases {
@@ -122,6 +125,9 @@ func TestModeString(t *testing.T) {
 	}
 	if ModeConsultUnlock.String() != "consult-unlock" {
 		t.Errorf("ModeConsultUnlock.String() = %q, want \"consult-unlock\"", ModeConsultUnlock.String())
+	}
+	if ModeAdaptiveNudge.String() != "nudge" {
+		t.Errorf("ModeAdaptiveNudge.String() = %q, want \"nudge\"", ModeAdaptiveNudge.String())
 	}
 }
 
@@ -232,5 +238,141 @@ func TestRunPreToolUse_ConsultUnlock_SoftPathUnchanged(t *testing.T) {
 	}
 	if dec.HookSpecificOutput.PermissionDecision == "deny" {
 		t.Errorf("soft path must not become a deny, got %q", dec.HookSpecificOutput.PermissionDecision)
+	}
+}
+
+// nudgeReadDecision feeds one non-symbolic Read of indexed source
+// through ModeAdaptiveNudge and returns the decoded HookOutput. An
+// empty out string means the call was allowed with no payload.
+func nudgeReadDecision(t *testing.T, port int, sessionID string) (string, HookOutput) {
+	t.Helper()
+	payload := []byte(`{"hook_event_name":"PreToolUse","tool_name":"Read","session_id":"` +
+		sessionID + `","tool_input":{"file_path":"/repo/handler.go"}}`)
+	out := captureStdout(t, func() { runPreToolUse(payload, port, ModeAdaptiveNudge) })
+	if out == "" {
+		return "", HookOutput{}
+	}
+	return out, decodeHookOutput(t, out)
+}
+
+// TestRunPreToolUse_AdaptiveNudge_FiresOncePerBurst is the core spec:
+// the first nudgeThreshold-1 non-symbolic calls are allowed, the Nth is
+// soft-denied, and the (N+1)th is allowed again because the streak was
+// reset by the nudge.
+func TestRunPreToolUse_AdaptiveNudge_FiresOncePerBurst(t *testing.T) {
+	withSessionDir(t)
+	port := fakeIndexedBridge(t, map[string]bool{"/repo/handler.go": true})
+
+	// Calls 1..nudgeThreshold-1: allowed (no deny).
+	for i := 1; i < nudgeThreshold; i++ {
+		_, dec := nudgeReadDecision(t, port, "nudge-1")
+		if dec.HookSpecificOutput != nil && dec.HookSpecificOutput.PermissionDecision == "deny" {
+			t.Fatalf("call %d should be allowed (below threshold), got deny", i)
+		}
+	}
+
+	// Call N (== nudgeThreshold): soft-denied exactly once.
+	out, dec := nudgeReadDecision(t, port, "nudge-1")
+	if out == "" || dec.HookSpecificOutput == nil {
+		t.Fatalf("call %d should emit a soft-deny payload", nudgeThreshold)
+	}
+	if dec.HookSpecificOutput.PermissionDecision != "deny" {
+		t.Fatalf("call %d should be soft-denied, got %q", nudgeThreshold,
+			dec.HookSpecificOutput.PermissionDecision)
+	}
+	reason := dec.HookSpecificOutput.PermissionDecisionReason
+	if !strings.Contains(reason, "fires once") {
+		t.Errorf("nudge reason should note it fires once, got:\n%s", reason)
+	}
+	if !strings.Contains(reason, "search_symbols") {
+		t.Errorf("nudge reason should point at Gortex graph tools, got:\n%s", reason)
+	}
+
+	// Call N+1: allowed — the nudge reset the streak.
+	_, dec = nudgeReadDecision(t, port, "nudge-1")
+	if dec.HookSpecificOutput != nil && dec.HookSpecificOutput.PermissionDecision == "deny" {
+		t.Errorf("call %d should proceed (streak reset by the nudge), got deny", nudgeThreshold+1)
+	}
+
+	// The streak counter is back to zero on disk.
+	if got := loadSessionState("nudge-1").NonSymbolicStreak; got != 1 {
+		// After the reset (call N) the allowed call N+1 increments the
+		// streak back to 1.
+		t.Errorf("expected streak=1 after one post-nudge call, got %d", got)
+	}
+}
+
+// TestRunPreToolUse_AdaptiveNudge_GortexCallResetsStreak verifies a
+// mcp__gortex__* call clears the non-symbolic streak so a partial burst
+// never escalates to a nudge.
+func TestRunPreToolUse_AdaptiveNudge_GortexCallResetsStreak(t *testing.T) {
+	withSessionDir(t)
+	port := fakeIndexedBridge(t, map[string]bool{"/repo/handler.go": true})
+
+	// Build a streak just shy of the threshold.
+	for i := 1; i < nudgeThreshold; i++ {
+		nudgeReadDecision(t, port, "nudge-2")
+	}
+	if got := loadSessionState("nudge-2").NonSymbolicStreak; got != nudgeThreshold-1 {
+		t.Fatalf("expected streak=%d before reset, got %d", nudgeThreshold-1, got)
+	}
+
+	// A Gortex MCP call resets the streak.
+	gortexCall := []byte(`{"hook_event_name":"PreToolUse","tool_name":"mcp__gortex__search_symbols","session_id":"nudge-2","tool_input":{"query":"Foo"}}`)
+	_ = captureStdout(t, func() { runPreToolUse(gortexCall, port, ModeAdaptiveNudge) })
+	if got := loadSessionState("nudge-2").NonSymbolicStreak; got != 0 {
+		t.Fatalf("gortex MCP call should reset streak to 0, got %d", got)
+	}
+
+	// The next non-symbolic call is allowed — the burst was broken.
+	_, dec := nudgeReadDecision(t, port, "nudge-2")
+	if dec.HookSpecificOutput != nil && dec.HookSpecificOutput.PermissionDecision == "deny" {
+		t.Errorf("post-reset call should be allowed, got deny")
+	}
+}
+
+// TestRunPreToolUse_AdaptiveNudge_SymbolicCallResetsStreak verifies that
+// any non-denying call (here, a Read of an unindexed file) also resets
+// the streak — only denying fallback calls extend it.
+func TestRunPreToolUse_AdaptiveNudge_SymbolicCallResetsStreak(t *testing.T) {
+	withSessionDir(t)
+	// handler.go is indexed (denying); unindexed.go is not (soft).
+	port := fakeIndexedBridge(t, map[string]bool{"/repo/handler.go": true})
+
+	for i := 1; i < nudgeThreshold; i++ {
+		nudgeReadDecision(t, port, "nudge-3")
+	}
+
+	// A Read of an unindexed file produces a non-denying result.
+	soft := []byte(`{"hook_event_name":"PreToolUse","tool_name":"Read","session_id":"nudge-3","tool_input":{"file_path":"/repo/unindexed.go"}}`)
+	_ = captureStdout(t, func() { runPreToolUse(soft, port, ModeAdaptiveNudge) })
+	if got := loadSessionState("nudge-3").NonSymbolicStreak; got != 0 {
+		t.Errorf("a non-denying call should reset the streak, got %d", got)
+	}
+}
+
+// TestRunPreToolUse_AdaptiveNudge_LogsNudged checks the once-per-burst
+// soft-deny is recorded in the telemetry log as DecisionNudged.
+func TestRunPreToolUse_AdaptiveNudge_LogsNudged(t *testing.T) {
+	withSessionDir(t)
+	logPath := redirectTelemetry(t)
+	port := fakeIndexedBridge(t, map[string]bool{"/repo/handler.go": true})
+
+	for i := 1; i <= nudgeThreshold; i++ {
+		nudgeReadDecision(t, port, "nudge-4")
+	}
+
+	recs := readDecisions(t, logPath)
+	var nudged int
+	for _, r := range recs {
+		if r.Decision == DecisionNudged {
+			nudged++
+			if r.Tool != "Read" {
+				t.Errorf("nudged record should carry the tool name, got %q", r.Tool)
+			}
+		}
+	}
+	if nudged != 1 {
+		t.Errorf("expected exactly one nudged telemetry record, got %d (all: %+v)", nudged, recs)
 	}
 }

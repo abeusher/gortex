@@ -123,6 +123,12 @@ func runPreToolUse(data []byte, gortexPort int, mode Mode) {
 		}
 	}
 
+	// Adaptive-nudge mode replaces every-call denial with a single
+	// soft-deny per burst of non-symbolic fallback calls.
+	if mode == ModeAdaptiveNudge {
+		result = adaptiveNudge(input, isGortexMCP, result)
+	}
+
 	if result.context == "" && !result.deny {
 		return
 	}
@@ -171,6 +177,72 @@ func consultUnlockReason(reason string) string {
 		return strings.TrimPrefix(unlock, "\n")
 	}
 	return reason + unlock
+}
+
+// nudgeThreshold is the number of consecutive non-symbolic fallback
+// tool calls that triggers a single soft-deny under ModeAdaptiveNudge.
+const nudgeThreshold = 3
+
+// adaptiveNudge implements the ModeAdaptiveNudge posture. Rather than
+// denying every Read / Grep / Glob fallback, it tracks a per-session
+// streak of non-symbolic calls and soft-denies exactly once when the
+// streak reaches nudgeThreshold, then resets the streak so the very
+// next call proceeds. A symbolic or Gortex MCP call resets the streak.
+//
+// result is the outcome of the per-tool enrich switch. result.deny is
+// the signal that the current call is a non-symbolic fallback the
+// classifiers flagged; anything else is treated as symbolic.
+func adaptiveNudge(input HookInput, isGortexMCP bool, result enrichResult) enrichResult {
+	// A Gortex MCP call (or any call enrich didn't flag as a deny) is
+	// symbolic enough — reset the streak and let it proceed. Any
+	// advisory context still rides along.
+	if isGortexMCP || !result.deny {
+		st := loadSessionState(input.SessionID)
+		if st.NonSymbolicStreak != 0 {
+			st.NonSymbolicStreak = 0
+			saveSessionState(input.SessionID, st)
+		}
+		return enrichResult{context: result.context}
+	}
+
+	// Non-symbolic fallback call: extend the streak.
+	st := loadSessionState(input.SessionID)
+	st.NonSymbolicStreak++
+
+	if st.NonSymbolicStreak >= nudgeThreshold {
+		// Fire the reminder once, then reset so the next identical
+		// call is allowed through — the nudge is per-burst, not
+		// per-call.
+		st.NonSymbolicStreak = 0
+		saveSessionState(input.SessionID, st)
+		logHookDecision(input.ToolName, "", DecisionNudged, 0, 0)
+		return enrichResult{
+			deny:   true,
+			reason: nudgeReason(downgradeReason(result)),
+		}
+	}
+
+	// Below threshold — record the streak and let the call through
+	// with whatever advisory context enrich produced.
+	saveSessionState(input.SessionID, st)
+	return enrichResult{context: result.context}
+}
+
+// nudgeReason builds the soft-deny message shown when the adaptive
+// nudge fires. It keeps the underlying graph-tool guidance and adds the
+// one-shot notice so the agent knows the next call will proceed.
+func nudgeReason(guidance string) string {
+	var b strings.Builder
+	b.WriteString("[Gortex] You've made several raw file-search calls in a row. ")
+	b.WriteString("Prefer Gortex graph tools — `search_symbols`, `find_usages`, `get_callers`, `get_symbol_source`, `smart_context` — they are faster and far more precise.\n")
+	if guidance != "" {
+		b.WriteString(guidance)
+		if !strings.HasSuffix(guidance, "\n") {
+			b.WriteString("\n")
+		}
+	}
+	b.WriteString("This reminder fires once — the next call will proceed.")
+	return b.String()
 }
 
 func enrich(input HookInput, port int) enrichResult {

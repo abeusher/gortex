@@ -196,8 +196,11 @@ func TestNormalizeHookMode(t *testing.T) {
 		"Enrich":         HookModeEnrich,
 		"consult-unlock": HookModeConsultUnlock,
 		"Consult-Unlock": HookModeConsultUnlock,
-		"unknown":        HookModeDeny, // safe fallback
-		"off":            HookModeDeny, // install flag handles disable separately
+		"nudge":          HookModeAdaptiveNudge,
+		"NUDGE":          HookModeAdaptiveNudge,
+		"adaptive-nudge": HookModeAdaptiveNudge, // accepted alias
+		"unknown":        HookModeDeny,          // safe fallback
+		"off":            HookModeDeny,          // install flag handles disable separately
 	}
 	for input, want := range cases {
 		t.Run(input, func(t *testing.T) {
@@ -214,6 +217,10 @@ func TestHookCommandWithMode(t *testing.T) {
 		"enrich mode must append --mode=enrich")
 	assert.Equal(t, base+" --mode=consult-unlock", hookCommandWithMode(base, HookModeConsultUnlock),
 		"consult-unlock mode must append --mode=consult-unlock")
+	assert.Equal(t, base+" --mode=nudge", hookCommandWithMode(base, HookModeAdaptiveNudge),
+		"nudge mode must append --mode=nudge")
+	assert.Equal(t, base+" --mode=nudge", hookCommandWithMode(base, "adaptive-nudge"),
+		"adaptive-nudge alias must normalize to --mode=nudge")
 	assert.Equal(t, base, hookCommandWithMode(base, ""),
 		"empty mode defaults to deny — no flag")
 }

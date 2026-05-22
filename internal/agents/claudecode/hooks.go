@@ -29,25 +29,30 @@ const CurrentPreToolUseMatcher = "Read|Grep|Glob|Task|Bash|Edit|Write"
 // don't benefit from a post-call graph snapshot, so they're omitted.
 const CurrentPostToolUseMatcher = "Read|Grep|Glob"
 
-// HookModeDeny / HookModeEnrich / HookModeConsultUnlock are the posture
-// strings the installer accepts. They mirror hooks.Mode without
-// importing it (the claudecode package is a leaf of the agents adapter
-// tree and must stay import-free of hooks).
+// HookModeDeny / HookModeEnrich / HookModeConsultUnlock /
+// HookModeAdaptiveNudge are the posture strings the installer accepts.
+// They mirror hooks.Mode without importing it (the claudecode package
+// is a leaf of the agents adapter tree and must stay import-free of
+// hooks).
 const (
 	HookModeDeny          = "deny"
 	HookModeEnrich        = "enrich"
 	HookModeConsultUnlock = "consult-unlock"
+	HookModeAdaptiveNudge = "nudge"
 )
 
 // normalizeHookMode maps user input to a canonical mode. Empty or
 // unknown values fall through to deny so existing installs and shell
-// typos preserve the original behavior.
+// typos preserve the original behavior. "adaptive-nudge" is accepted
+// as an alias for the canonical "nudge".
 func normalizeHookMode(mode string) string {
 	switch strings.ToLower(strings.TrimSpace(mode)) {
 	case HookModeEnrich:
 		return HookModeEnrich
 	case HookModeConsultUnlock:
 		return HookModeConsultUnlock
+	case HookModeAdaptiveNudge, "adaptive-nudge":
+		return HookModeAdaptiveNudge
 	default:
 		return HookModeDeny
 	}
@@ -64,6 +69,8 @@ func hookCommandWithMode(base, mode string) string {
 		return base + " --mode=enrich"
 	case HookModeConsultUnlock:
 		return base + " --mode=consult-unlock"
+	case HookModeAdaptiveNudge:
+		return base + " --mode=nudge"
 	default:
 		return base
 	}
