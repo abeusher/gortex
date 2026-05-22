@@ -425,8 +425,10 @@ func (w *Watcher) handleEvent(event fswatcher.WatchEvent) {
 		}
 	}
 
-	// Only process files with known extensions.
-	if _, ok := w.indexer.registry.DetectLanguage(path); !ok {
+	// Only process files with a detectable language — an extension
+	// the registry knows, or an unknown-extension script the shebang
+	// fallback can place.
+	if _, ok := w.indexer.effectiveLanguage(path, nil); !ok {
 		// Still handle remove for previously indexed files.
 		if kind != ChangeDeleted && kind != ChangeRenamed {
 			return

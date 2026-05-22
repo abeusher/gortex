@@ -311,7 +311,7 @@ func (s *Server) constructOverlayLayer(files []daemon.OverlayFile) (*graph.Overl
 		if reg == nil {
 			continue
 		}
-		lang, ok := reg.DetectLanguage(absPath)
+		lang, ok := reg.DetectLanguageContent(absPath, []byte(ov.Content))
 		if !ok {
 			continue
 		}

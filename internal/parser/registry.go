@@ -56,10 +56,26 @@ func (r *Registry) GetByExtension(ext string) (Extractor, bool) {
 	return r.extractors[lang], true
 }
 
-// DetectLanguage determines the language for a file path. Lookup
-// order: exact basename (Makefile, CMakeLists.txt), compound
-// extension (.blade.php, .html.erb), single extension (.go).
+// DetectLanguage determines the language for a file path using only
+// its name — the extension / basename mapping, with no content probe.
+// Equivalent to DetectLanguageContent with nil content.
 func (r *Registry) DetectLanguage(filePath string) (string, bool) {
+	return r.DetectLanguageContent(filePath, nil)
+}
+
+// DetectLanguageContent determines the language for a file, using its
+// content (when supplied) to disambiguate. Resolution order:
+//
+//  1. exact basename (Makefile, CMakeLists.txt)
+//  2. compound extension (.blade.php, .html.erb)
+//  3. single extension (.go) — for an ambiguous extension (.h, .m) a
+//     content probe refines C vs C++ vs Objective-C / MATLAB / etc.
+//  4. unknown extension — a `#!` shebang line, when present, maps the
+//     interpreter to a language (e.g. a .cgi Perl script)
+//
+// content may be nil; detection then degrades to name-based mapping,
+// so DetectLanguage and a content-free DetectLanguageContent agree.
+func (r *Registry) DetectLanguageContent(filePath string, content []byte) (string, bool) {
 	base := filepath.Base(filePath)
 	if lang, ok := r.nameMap[base]; ok {
 		return lang, true
@@ -72,8 +88,23 @@ func (r *Registry) DetectLanguage(filePath string) (string, bool) {
 		}
 	}
 	ext := filepath.Ext(filePath)
-	lang, ok := r.extMap[ext]
-	return lang, ok
+	if lang, ok := r.extMap[ext]; ok {
+		// Ambiguous extensions (.h, .m) get a content probe; the
+		// refined language is used only when it has an extractor.
+		if refined, refok := sniffAmbiguous(ext, content); refok {
+			if _, registered := r.extractors[refined]; registered {
+				return refined, true
+			}
+		}
+		return lang, true
+	}
+	// Unknown extension — fall back to a shebang interpreter probe.
+	if lang, ok := sniffShebang(content); ok {
+		if _, registered := r.extractors[lang]; registered {
+			return lang, true
+		}
+	}
+	return "", false
 }
 
 // SupportedLanguages returns all registered language names.

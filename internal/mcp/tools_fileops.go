@@ -662,11 +662,22 @@ func (s *Server) detectLanguageForPath(ctx context.Context, absPath, relPath str
 	// Fall back to the parser registry from whichever indexer owns
 	// the file. In multi-repo mode, every indexer holds the same
 	// registry instance; in single-repo mode we ask the lone indexer.
+	//
+	// A bounded prefix read lets the registry's content probe place
+	// an ambiguous extension (.h, .m) or an unknown-extension script.
+	var head []byte
+	if f, err := os.Open(absPath); err == nil {
+		buf := make([]byte, 512)
+		if n, _ := f.Read(buf); n > 0 {
+			head = buf[:n]
+		}
+		f.Close()
+	}
 	if s.multiIndexer != nil {
 		for _, prefix := range s.multiIndexer.RepoPrefixes() {
 			if idx := s.multiIndexer.GetIndexer(prefix); idx != nil {
 				if reg := idx.Registry(); reg != nil {
-					if lang, ok := reg.DetectLanguage(absPath); ok {
+					if lang, ok := reg.DetectLanguageContent(absPath, head); ok {
 						return lang
 					}
 				}
@@ -675,7 +686,7 @@ func (s *Server) detectLanguageForPath(ctx context.Context, absPath, relPath str
 	}
 	if s.indexer != nil {
 		if reg := s.indexer.Registry(); reg != nil {
-			if lang, ok := reg.DetectLanguage(absPath); ok {
+			if lang, ok := reg.DetectLanguageContent(absPath, head); ok {
 				return lang
 			}
 		}

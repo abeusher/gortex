@@ -133,15 +133,15 @@ func TestEffectiveLanguage(t *testing.T) {
 	}}
 	idx := New(g, reg, cfg, zap.NewNop())
 
-	lang, ok := idx.effectiveLanguage("main.go")
+	lang, ok := idx.effectiveLanguage("main.go", nil)
 	require.True(t, ok)
 	require.Equal(t, "go", lang)
 
-	lang, ok = idx.effectiveLanguage("doc.pdf")
+	lang, ok = idx.effectiveLanguage("doc.pdf", nil)
 	require.True(t, ok)
 	require.Equal(t, "markdown", lang)
 
-	_, ok = idx.effectiveLanguage("mystery.zzz")
+	_, ok = idx.effectiveLanguage("mystery.zzz", nil)
 	require.False(t, ok)
 }
 

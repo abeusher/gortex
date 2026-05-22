@@ -1465,7 +1465,7 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (*IndexResult, er
 			}
 			return nil
 		}
-		lang, ok := idx.effectiveLanguage(path)
+		lang, ok := idx.effectiveLanguage(path, nil)
 		if !ok {
 			return nil
 		}
@@ -1564,7 +1564,7 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (*IndexResult, er
 				}
 
 				relPath, _ := filepath.Rel(absRoot, path)
-				lang, _ := idx.effectiveLanguage(path)
+				lang, _ := idx.effectiveLanguage(path, src)
 				ext, _ := idx.registry.GetByLanguage(lang)
 				if ext == nil {
 					continue
@@ -1961,7 +1961,7 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 		return err
 	}
 
-	lang, ok := idx.effectiveLanguage(absPath)
+	lang, ok := idx.effectiveLanguage(absPath, src)
 	if !ok {
 		return nil
 	}
@@ -2082,7 +2082,7 @@ func (idx *Indexer) StructuralSymbols(filePath string) ([]*graph.Node, bool) {
 		return nil, false
 	}
 
-	lang, ok := idx.effectiveLanguage(absPath)
+	lang, ok := idx.effectiveLanguage(absPath, src)
 	if !ok {
 		return nil, false
 	}
@@ -2568,7 +2568,7 @@ func (idx *Indexer) IncrementalReindexPaths(root string, paths []string) (*Index
 					}
 					return nil
 				}
-				if _, ok := idx.effectiveLanguage(path); !ok {
+				if _, ok := idx.effectiveLanguage(path, nil); !ok {
 					return nil
 				}
 				if idx.shouldExclude(path, absRoot, false) {
@@ -2591,7 +2591,7 @@ func (idx *Indexer) IncrementalReindexPaths(root string, paths []string) (*Index
 
 		// Single file. Apply the same language / exclude gate so a
 		// caller can't force a non-source or excluded file in.
-		if _, ok := idx.effectiveLanguage(absPath); !ok {
+		if _, ok := idx.effectiveLanguage(absPath, nil); !ok {
 			continue
 		}
 		if idx.shouldExclude(absPath, absRoot, false) {
@@ -2763,7 +2763,7 @@ func (idx *Indexer) IncrementalReindex(root string) (*IndexResult, error) {
 			}
 			return nil
 		}
-		if _, ok := idx.effectiveLanguage(path); !ok {
+		if _, ok := idx.effectiveLanguage(path, nil); !ok {
 			return nil
 		}
 		if idx.shouldExclude(path, absRoot, false) {

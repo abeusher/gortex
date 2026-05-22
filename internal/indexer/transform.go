@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -94,11 +95,46 @@ func (p *transformPipeline) languageFor(path string) string {
 	return ""
 }
 
+// sniffPrefixBytes bounds the prefix read for a shebang probe on a
+// file whose extension the registry does not recognise.
+const sniffPrefixBytes = 512
+
+// readSniffPrefix reads up to sniffPrefixBytes from path for a content
+// probe. Returns nil on any error — the caller treats a nil prefix as
+// "no content available" and degrades to name-based detection.
+func readSniffPrefix(path string) []byte {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	buf := make([]byte, sniffPrefixBytes)
+	n, _ := f.Read(buf)
+	if n <= 0 {
+		return nil
+	}
+	return buf[:n]
+}
+
 // effectiveLanguage detects a file's language: its native extension
-// mapping first, then any transform rule that re-types it.
-func (idx *Indexer) effectiveLanguage(path string) (string, bool) {
-	if lang, ok := idx.registry.DetectLanguage(path); ok {
+// mapping first, with a content probe disambiguating an ambiguous
+// extension (.h, .m) when src is supplied; a `#!` shebang fallback for
+// an unknown-extension script (reading a bounded prefix when the
+// caller holds no content); then any transform rule that re-types it.
+//
+// src may be nil — callers that have not read the file (walk-time and
+// staleness gates) pass nil and still get the shebang fallback via the
+// bounded prefix read.
+func (idx *Indexer) effectiveLanguage(path string, src []byte) (string, bool) {
+	if lang, ok := idx.registry.DetectLanguageContent(path, src); ok {
 		return lang, true
+	}
+	if len(src) == 0 {
+		if prefix := readSniffPrefix(path); prefix != nil {
+			if lang, ok := idx.registry.DetectLanguageContent(path, prefix); ok {
+				return lang, true
+			}
+		}
 	}
 	if lang := idx.transforms.languageFor(path); lang != "" {
 		return lang, true
