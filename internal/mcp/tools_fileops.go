@@ -99,15 +99,19 @@ func matchedRepoPrefix(mi multiRepoLookup, rawPath string) string {
 	if mi == nil || rawPath == "" {
 		return ""
 	}
+	best := ""
 	for _, prefix := range mi.RepoPrefixes() {
 		if prefix == "" {
 			continue
 		}
-		if strings.HasPrefix(rawPath, prefix+"/") {
-			return prefix
+		// Longest match wins so a nested repo (prefix "a/b") is chosen
+		// over its parent (prefix "a") for a path under the child,
+		// independent of RepoPrefixes() iteration order.
+		if strings.HasPrefix(rawPath, prefix+"/") && len(prefix) > len(best) {
+			best = prefix
 		}
 	}
-	return ""
+	return best
 }
 
 // multiRepoLookup is the subset of *MultiIndexer that resolveFilePath

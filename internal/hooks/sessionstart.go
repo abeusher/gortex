@@ -184,8 +184,16 @@ func renderCwdCoverage(cwd string, s *daemon.StatusResponse) string {
 		if extra > 0 {
 			summary = fmt.Sprintf("%s, +%d more", summary, extra)
 		}
-		return fmt.Sprintf("**cwd `%s` is a workspace root** containing %d tracked repo(s): %s. Enforcement is active for files inside these repos.\n",
-			abs, len(contained), summary)
+		example := "<repo>"
+		if len(names) > 0 {
+			example = names[0]
+		}
+		return fmt.Sprintf("**cwd `%s` is a workspace root** containing %d tracked repo(s): %s. "+
+			"Enforcement is active for files inside these repos.\n\n"+
+			"This cwd is not itself a tracked repo, so a tool call with no explicit scope fans out across "+
+			"all %d repos. To target one repo, prefix file paths with the repo name "+
+			"(e.g. `%s/path/to/file.go`) or pass an explicit `repo:` filter.\n",
+			abs, len(contained), summary, len(contained), example)
 	default:
 		return fmt.Sprintf("⚠️  **cwd `%s` is not covered by any tracked repo.** Read/Grep/Glob/Bash will fall through to soft guidance only — graph tools won't be available for this directory.\n\nTo enable enforcement: `gortex track %s`\n",
 			abs, abs)

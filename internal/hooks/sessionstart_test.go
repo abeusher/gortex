@@ -117,6 +117,12 @@ func TestRunSessionStart_DaemonReady_CwdContainsRepos(t *testing.T) {
 	if strings.Contains(ac, "labrador") {
 		t.Errorf("unrelated repo leaked into briefing:\n%s", ac)
 	}
+	if !strings.Contains(ac, "fans out across") {
+		t.Errorf("expected multi-repo fan-out guidance, got:\n%s", ac)
+	}
+	if !strings.Contains(ac, "prefix file paths with the repo name") {
+		t.Errorf("expected repo-prefix routing guidance, got:\n%s", ac)
+	}
 }
 
 func TestRunSessionStart_DaemonReady_CwdNotTracked(t *testing.T) {
