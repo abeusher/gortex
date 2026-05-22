@@ -84,6 +84,14 @@ type Watcher struct {
 	stormTimer   *time.Timer           // fires after the quiet period
 	stormActive  bool                  // true while waiting to drain
 	stormDrained func(int)             // test hook: batch drained; batch size arg
+
+	// poller is the adaptive-interval fallback that re-checks git
+	// HEAD movement and tracked-file mtimes on a timer, catching the
+	// changes the fsnotify backend misses (inotify watch exhaustion,
+	// network filesystems, dropped events). Created in Start and torn
+	// down in Stop alongside the fsnotify backend. nil when the
+	// per-repo watcher is disabled via WatchConfig.Enabled.
+	poller *Poller
 }
 
 const maxHistory = 1000
@@ -231,6 +239,15 @@ func (w *Watcher) Start(paths []string) error {
 			}
 		}
 	}
+
+	// Launch the adaptive-interval poller alongside the fsnotify
+	// backend. It is a fallback for the changes fsnotify misses, so
+	// it shares the watcher's lifecycle. Gated on WatchConfig.Enabled
+	// — a repo that opted out of watching gets no fallback either.
+	if w.config.Enabled {
+		w.poller = newPoller(w, w.indexer, w.logger)
+		w.poller.Start()
+	}
 	return nil
 }
 
@@ -295,6 +312,11 @@ func (w *Watcher) drainInitialReplay(window time.Duration) {
 
 // Stop halts the watcher and cleans up resources.
 func (w *Watcher) Stop() error {
+	// Stop the adaptive poller first so a poll cycle in flight can't
+	// dispatch a patch into a half-torn-down watcher.
+	if w.poller != nil {
+		w.poller.Stop()
+	}
 	close(w.done)
 	if w.fsCancel != nil {
 		w.fsCancel()
