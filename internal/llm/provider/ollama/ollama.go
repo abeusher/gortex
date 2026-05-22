@@ -21,6 +21,7 @@ import (
 
 	"github.com/zzet/gortex/internal/llm"
 	"github.com/zzet/gortex/internal/llm/provider/httpx"
+	"github.com/zzet/gortex/internal/tokens"
 )
 
 // Provider implements llm.Provider against an Ollama daemon.
@@ -96,8 +97,14 @@ func (p *Provider) Complete(ctx context.Context, req llm.CompletionRequest) (llm
 		}
 		body.Format = encoded
 	}
+	// Size the context window to this specific request. Ollama
+	// otherwise applies a small fixed default (2048) that silently
+	// truncates a large prompt; a fixed large value would waste
+	// memory on a small one. deriveNumCtx scales num_ctx with the
+	// actual prompt and generation budget.
+	body.Options = map[string]any{"num_ctx": deriveNumCtx(req)}
 	if req.MaxTokens > 0 {
-		body.Options = map[string]any{"num_predict": req.MaxTokens}
+		body.Options["num_predict"] = req.MaxTokens
 	}
 
 	raw, err := json.Marshal(body)
@@ -156,6 +163,67 @@ func (p *Provider) attempt(ctx context.Context, raw []byte) httpx.Result {
 		return httpx.Result{Hollow: true}
 	}
 	return httpx.Result{Text: text}
+}
+
+// num_ctx sizing bounds and the constants deriveNumCtx works from.
+const (
+	// minNumCtx is the floor for the derived window. It equals
+	// Ollama's own default — a small prompt never gets a window
+	// smaller than the model would have used anyway.
+	minNumCtx = 2048
+	// maxNumCtx is the ceiling. The KV cache grows linearly with
+	// num_ctx, so an unbounded value risks an out-of-memory abort on
+	// the host running Ollama; a model whose native window is
+	// smaller clamps internally regardless.
+	maxNumCtx = 32768
+	// numCtxBlock rounds the derived window up to a multiple of this
+	// — llama.cpp allocates the KV cache in blocks, so a rounded
+	// value avoids a ragged allocation.
+	numCtxBlock = 512
+	// perMessageOverhead approximates the chat-template tokens each
+	// message adds beyond its content (role markers, separators,
+	// special tokens) — small but real once a conversation grows.
+	perMessageOverhead = 8
+	// defaultGenBudget reserves window space for the model's reply
+	// when the request sets no explicit MaxTokens (num_predict then
+	// runs unbounded). It must be large enough that an average
+	// completion is not itself truncated by a too-tight window.
+	defaultGenBudget = 512
+)
+
+// deriveNumCtx computes the Ollama num_ctx (context-window size) for a
+// specific request. num_ctx must span the whole prompt plus the
+// generated reply, so the estimate sums the token cost of every
+// message, adds per-message chat-template overhead and the generation
+// budget, applies a safety margin for tokenizer drift (Gortex counts
+// with cl100k; the served model uses its own tokenizer), rounds up to
+// a KV-cache block boundary, and clamps to [minNumCtx, maxNumCtx].
+func deriveNumCtx(req llm.CompletionRequest) int {
+	promptTokens := 0
+	for _, m := range req.Messages {
+		promptTokens += tokens.Count(m.Content) + perMessageOverhead
+	}
+
+	genBudget := req.MaxTokens
+	if genBudget <= 0 {
+		genBudget = defaultGenBudget
+	}
+
+	// 15% headroom absorbs the error between cl100k token counts and
+	// the served model's own tokenizer — erring large keeps a real
+	// prompt from being truncated.
+	needed := (promptTokens + genBudget) * 115 / 100
+
+	// Round up to the next KV-cache block.
+	needed = ((needed + numCtxBlock - 1) / numCtxBlock) * numCtxBlock
+
+	if needed < minNumCtx {
+		return minNumCtx
+	}
+	if needed > maxNumCtx {
+		return maxNumCtx
+	}
+	return needed
 }
 
 // mapMessages flattens the provider-neutral conversation onto Ollama
