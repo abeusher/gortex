@@ -452,6 +452,19 @@ type Graph struct {
 	// upgraded Origin). The count is the tamper-evidence surface:
 	// provenance cannot churn without it moving.
 	edgeIdentityRevisions atomic.Int64
+	// edgeMutGen bumps whenever the AllEdges output would change —
+	// new edge inserted, existing edge removed, or an edge's
+	// canonical key changed via ReindexEdge. Origin-only updates
+	// (counted by edgeIdentityRevisions) do not bump this because the
+	// slice content is unaffected. AllEdges uses the counter as a
+	// cache-validity tag so repeated post-resolve analysis walks
+	// share one materialised slice instead of each rebuilding the
+	// 4 M-edge snapshot.
+	edgeMutGen atomic.Uint64
+
+	allEdgesCacheMu  sync.Mutex
+	allEdgesCache    []*Edge
+	allEdgesCacheGen uint64
 }
 
 // New creates an empty graph.
@@ -715,6 +728,7 @@ func (g *Graph) AddBatch(nodes []*Node, edges []*Edge) {
 				g.edgeIdentityRevisions.Add(1)
 			}
 			if inserted {
+				g.edgeMutGen.Add(1)
 				var srcRepo string
 				if src, ok := s.nodes[e.From]; ok && src != nil {
 					srcRepo = src.RepoPrefix
@@ -756,6 +770,7 @@ func (g *Graph) AddEdge(e *Edge) {
 		g.edgeIdentityRevisions.Add(1)
 	}
 	if inserted {
+		g.edgeMutGen.Add(1)
 		var srcRepo string
 		if src, ok := sFrom.nodes[e.From]; ok && src != nil {
 			srcRepo = src.RepoPrefix
@@ -922,6 +937,9 @@ func (g *Graph) ReindexEdge(e *Edge, oldTo string) {
 	removeEdgeFromBucket(sOld.inEdges, sOld.inEdgeKeys, sOld.inEdgeIdx, oldTo, oldKey)
 	sNew := g.shardFor(e.To)
 	addEdgeToBucket(sNew.inEdges, sNew.inEdgeKeys, sNew.inEdgeIdx, e.To, e)
+	// No edgeMutGen bump here: outEdges retains the same *Edge slot,
+	// and the cached AllEdges slice holds pointers — readers see the
+	// already-mutated e.To via that pointer. The cache stays valid.
 }
 
 // GetNode returns a node by ID, or nil if not found.
@@ -1106,6 +1124,11 @@ func (g *Graph) EvictFile(filePath string) (nodesRemoved, edgesRemoved int) {
 // O(slice-size) filterEdge scan the older implementation used.
 func (g *Graph) evictEdgesLocked(evictedIDs map[string]string) int {
 	removed := 0
+	defer func() {
+		if removed > 0 {
+			g.edgeMutGen.Add(1)
+		}
+	}()
 
 	// Phase 1: remove outgoing edges from every evicted node. Use the
 	// parallel outEdgeKeys slice to look up each entry's insertion-time
@@ -1196,6 +1219,7 @@ func (g *Graph) RemoveEdge(from, to string, kind EdgeKind) bool {
 	sTo := g.shardFor(to)
 	removeEdgeFromBucket(sTo.inEdges, sTo.inEdgeKeys, sTo.inEdgeIdx, to, k)
 	sFrom.repoEdgeRemove(srcRepo, removed)
+	g.edgeMutGen.Add(1)
 	return true
 }
 
@@ -1242,16 +1266,53 @@ func (g *Graph) AllNodes() []*Node {
 	return out
 }
 
-// AllEdges returns a snapshot of all edges.
+// AllEdges returns a snapshot of all outgoing edges across every shard.
+//
+// Cached by the edgeMutGen counter: once built, subsequent calls
+// return the same slice pointer as long as no edge has been
+// inserted, removed, or had its slot pointer replaced. Mutations
+// bump edgeMutGen, the next AllEdges sees the mismatch and rebuilds.
+//
+// On a 4 M-edge graph (k8s) one snapshot is ~32 MB of pointer slice;
+// the post-resolve analysis fan-out (cycles, communities, deadcode,
+// hierarchy, pagerank, hits, betweenness, several MCP analyzers) used
+// to call this dozens of times per cold-index, all allocating fresh
+// — 2.72 GB / 8 % of total in the heap profile. Caching collapses
+// that to a single allocation per generation.
+//
+// Callers MUST treat the returned slice as read-only. Mutating its
+// pointers is a data race against any concurrent reader holding the
+// same cached reference. The underlying *Edge structs are themselves
+// shared with the graph and may be mutated by ReindexEdge /
+// SetEdgeProvenance — that's intentional, and readers see those
+// mutations through the pointer.
 func (g *Graph) AllEdges() []*Edge {
+	curGen := g.edgeMutGen.Load()
+	g.allEdgesCacheMu.Lock()
+	defer g.allEdgesCacheMu.Unlock()
+	if g.allEdgesCache != nil && g.allEdgesCacheGen == curGen {
+		return g.allEdgesCache
+	}
+
 	g.lockAllRead()
-	defer g.unlockAllRead()
-	var out []*Edge
+	// Pre-size from the per-shard outEdges entry counts. EdgeCount
+	// would re-lock; just sum inline while holding the locks.
+	total := 0
+	for _, s := range g.shards {
+		for _, edges := range s.outEdges {
+			total += len(edges)
+		}
+	}
+	out := make([]*Edge, 0, total)
 	for _, s := range g.shards {
 		for _, edges := range s.outEdges {
 			out = append(out, edges...)
 		}
 	}
+	g.unlockAllRead()
+
+	g.allEdgesCache = out
+	g.allEdgesCacheGen = curGen
 	return out
 }
 
