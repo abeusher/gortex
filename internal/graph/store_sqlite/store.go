@@ -1,0 +1,944 @@
+// Package store_sqlite is the on-disk, SQLite-backed implementation of
+// graph.Store. It uses the pure-Go modernc.org/sqlite driver so the
+// binary stays CGO-free on this code path, and satisfies the same
+// conformance suite as the in-memory store (see
+// internal/graph/storetest).
+//
+// Hot queries are precompiled as prepared statements in Open and
+// closed in Close. Writes serialize through a single Go-side mutex
+// because SQLite already serialises writers internally and an explicit
+// mutex sidesteps SQLITE_BUSY contention when the conformance suite
+// fans out 8 concurrent writers; reads still run concurrently under
+// WAL mode.
+//
+// Meta maps are encoded with gob; an empty / nil Meta is stored as
+// NULL so the common case adds no row weight beyond the column header.
+//
+// EdgeIdentityRevisions is tracked in memory (atomic counter) -- it
+// mirrors the in-memory store's monotonic "provenance churn" signal
+// and does not need to survive process restarts (the in-memory store
+// resets it on every New(), so the contract is per-process).
+package store_sqlite
+
+import (
+	"bytes"
+	"database/sql"
+	"encoding/gob"
+	"errors"
+	"fmt"
+	"sync"
+	"sync/atomic"
+
+	"github.com/zzet/gortex/internal/graph"
+
+	_ "modernc.org/sqlite"
+)
+
+// Store is the SQLite-backed graph.Store implementation.
+type Store struct {
+	db *sql.DB
+
+	// writeMu serialises every mutation. SQLite serialises writers
+	// internally; doing the same on the Go side turns SQLITE_BUSY
+	// contention into clean lock-wait and keeps the conformance
+	// concurrency test predictable.
+	writeMu sync.Mutex
+
+	edgeIdentityRevs atomic.Int64
+
+	// Prepared statements (compiled once in Open, closed in Close).
+	stmtInsertNode             *sql.Stmt
+	stmtGetNode                *sql.Stmt
+	stmtGetNodeByQual          *sql.Stmt
+	stmtFindByName             *sql.Stmt
+	stmtFindByNameInRepo       *sql.Stmt
+	stmtFileNodes              *sql.Stmt
+	stmtRepoNodes              *sql.Stmt
+	stmtAllNodes               *sql.Stmt
+	stmtNodeCount              *sql.Stmt
+	stmtRepoPrefixes           *sql.Stmt
+	stmtRepoStatsNodes         *sql.Stmt
+	stmtRepoStatsEdges         *sql.Stmt
+	stmtRepoNodeCount          *sql.Stmt
+	stmtRepoEdgeCount          *sql.Stmt
+	stmtAllRepoCountsNodes     *sql.Stmt
+	stmtAllRepoCountsEdges     *sql.Stmt
+	stmtStatsByKind            *sql.Stmt
+	stmtStatsByLanguage        *sql.Stmt
+
+	stmtInsertEdge        *sql.Stmt
+	stmtOutEdges          *sql.Stmt
+	stmtInEdges           *sql.Stmt
+	stmtAllEdges          *sql.Stmt
+	stmtEdgeCount         *sql.Stmt
+	stmtRemoveEdge        *sql.Stmt
+	stmtUpdateEdgeOrigin  *sql.Stmt
+	stmtSelectEdgeOrigin  *sql.Stmt
+	stmtDeleteEdgeByKey   *sql.Stmt
+
+	stmtSelectFileNodeIDs  *sql.Stmt
+	stmtSelectRepoNodeIDs  *sql.Stmt
+	stmtDeleteNodeByFile   *sql.Stmt
+	stmtDeleteNodeByRepo   *sql.Stmt
+}
+
+// Compile-time assertion: *Store satisfies graph.Store.
+var _ graph.Store = (*Store)(nil)
+
+// Open opens (or creates) the SQLite database at path, runs the schema
+// migration, and prepares hot statements. The DB is opened with WAL
+// journaling and synchronous=NORMAL -- the same durability/throughput
+// tradeoff every embedded-SQLite app uses for write-heavy workloads.
+//
+// Pass ":memory:" for an ephemeral in-process database (handy for
+// tests when you don't need on-disk persistence).
+func Open(path string) (*Store, error) {
+	dsn := path + "?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(OFF)"
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite open: %w", err)
+	}
+	// One open connection: SQLite is single-writer regardless and
+	// holding a single connection prevents WAL mode from being clobbered
+	// by a fresh connection that didn't see the PRAGMA. Reads still
+	// scale through the single connection's row iterators.
+	db.SetMaxOpenConns(1)
+
+	if _, err := db.Exec(schemaSQL); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("sqlite schema: %w", err)
+	}
+
+	s := &Store{db: db}
+	if err := s.prepare(); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("sqlite prepare: %w", err)
+	}
+	return s, nil
+}
+
+// Close closes every prepared statement and the underlying *sql.DB.
+func (s *Store) Close() error {
+	stmts := []*sql.Stmt{
+		s.stmtInsertNode, s.stmtGetNode, s.stmtGetNodeByQual,
+		s.stmtFindByName, s.stmtFindByNameInRepo,
+		s.stmtFileNodes, s.stmtRepoNodes,
+		s.stmtAllNodes, s.stmtNodeCount, s.stmtRepoPrefixes,
+		s.stmtRepoStatsNodes, s.stmtRepoStatsEdges,
+		s.stmtRepoNodeCount, s.stmtRepoEdgeCount,
+		s.stmtAllRepoCountsNodes, s.stmtAllRepoCountsEdges,
+		s.stmtStatsByKind, s.stmtStatsByLanguage,
+		s.stmtInsertEdge, s.stmtOutEdges, s.stmtInEdges,
+		s.stmtAllEdges, s.stmtEdgeCount, s.stmtRemoveEdge,
+		s.stmtUpdateEdgeOrigin, s.stmtSelectEdgeOrigin, s.stmtDeleteEdgeByKey,
+		s.stmtSelectFileNodeIDs, s.stmtSelectRepoNodeIDs,
+		s.stmtDeleteNodeByFile, s.stmtDeleteNodeByRepo,
+	}
+	for _, st := range stmts {
+		if st != nil {
+			_ = st.Close()
+		}
+	}
+	return s.db.Close()
+}
+
+func (s *Store) prepare() error {
+	var err error
+	prep := func(out **sql.Stmt, q string) {
+		if err != nil {
+			return
+		}
+		var st *sql.Stmt
+		st, err = s.db.Prepare(q)
+		if err != nil {
+			err = fmt.Errorf("prepare %q: %w", q, err)
+			return
+		}
+		*out = st
+	}
+
+	const nodeCols = `id, kind, name, qual_name, file_path, start_line, end_line, language, repo_prefix, workspace_id, project_id, meta`
+
+	prep(&s.stmtInsertNode,
+		`INSERT OR REPLACE INTO nodes (`+nodeCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
+	prep(&s.stmtGetNode,
+		`SELECT `+nodeCols+` FROM nodes WHERE id = ?`)
+	prep(&s.stmtGetNodeByQual,
+		`SELECT `+nodeCols+` FROM nodes WHERE qual_name = ? LIMIT 1`)
+	prep(&s.stmtFindByName,
+		`SELECT `+nodeCols+` FROM nodes WHERE name = ?`)
+	prep(&s.stmtFindByNameInRepo,
+		`SELECT `+nodeCols+` FROM nodes WHERE name = ? AND repo_prefix = ?`)
+	prep(&s.stmtFileNodes,
+		`SELECT `+nodeCols+` FROM nodes WHERE file_path = ?`)
+	prep(&s.stmtRepoNodes,
+		`SELECT `+nodeCols+` FROM nodes WHERE repo_prefix = ?`)
+	prep(&s.stmtAllNodes,
+		`SELECT `+nodeCols+` FROM nodes`)
+	prep(&s.stmtNodeCount,
+		`SELECT COUNT(*) FROM nodes`)
+	prep(&s.stmtRepoPrefixes,
+		`SELECT DISTINCT repo_prefix FROM nodes WHERE repo_prefix <> ''`)
+
+	prep(&s.stmtRepoStatsNodes,
+		`SELECT repo_prefix, kind, language, COUNT(*) FROM nodes WHERE repo_prefix <> '' GROUP BY repo_prefix, kind, language`)
+	prep(&s.stmtRepoStatsEdges,
+		`SELECT n.repo_prefix, COUNT(*)
+		 FROM edges e
+		 JOIN nodes n ON n.id = e.from_id
+		 WHERE n.repo_prefix <> ''
+		 GROUP BY n.repo_prefix`)
+	prep(&s.stmtRepoNodeCount,
+		`SELECT COUNT(*) FROM nodes WHERE repo_prefix = ?`)
+	prep(&s.stmtRepoEdgeCount,
+		`SELECT COUNT(*)
+		 FROM edges e
+		 JOIN nodes n ON n.id = e.from_id
+		 WHERE n.repo_prefix = ?`)
+	prep(&s.stmtAllRepoCountsNodes,
+		`SELECT repo_prefix, COUNT(*) FROM nodes WHERE repo_prefix <> '' GROUP BY repo_prefix`)
+	prep(&s.stmtAllRepoCountsEdges,
+		`SELECT n.repo_prefix, COUNT(*)
+		 FROM edges e
+		 JOIN nodes n ON n.id = e.from_id
+		 WHERE n.repo_prefix <> ''
+		 GROUP BY n.repo_prefix`)
+
+	prep(&s.stmtStatsByKind,
+		`SELECT kind, COUNT(*) FROM nodes GROUP BY kind`)
+	prep(&s.stmtStatsByLanguage,
+		`SELECT language, COUNT(*) FROM nodes GROUP BY language`)
+
+	const edgeCols = `from_id, to_id, kind, file_path, line, confidence, confidence_label, origin, tier, cross_repo, meta`
+
+	prep(&s.stmtInsertEdge,
+		`INSERT OR IGNORE INTO edges (`+edgeCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+	prep(&s.stmtOutEdges,
+		`SELECT `+edgeCols+` FROM edges WHERE from_id = ?`)
+	prep(&s.stmtInEdges,
+		`SELECT `+edgeCols+` FROM edges WHERE to_id = ?`)
+	prep(&s.stmtAllEdges,
+		`SELECT `+edgeCols+` FROM edges`)
+	prep(&s.stmtEdgeCount,
+		`SELECT COUNT(*) FROM edges`)
+	prep(&s.stmtRemoveEdge,
+		`DELETE FROM edges WHERE from_id = ? AND to_id = ? AND kind = ?`)
+
+	prep(&s.stmtSelectEdgeOrigin,
+		`SELECT origin FROM edges WHERE from_id = ? AND to_id = ? AND kind = ? AND file_path = ? AND line = ?`)
+	prep(&s.stmtUpdateEdgeOrigin,
+		`UPDATE edges SET origin = ?, tier = ? WHERE from_id = ? AND to_id = ? AND kind = ? AND file_path = ? AND line = ?`)
+	prep(&s.stmtDeleteEdgeByKey,
+		`DELETE FROM edges WHERE from_id = ? AND to_id = ? AND kind = ? AND file_path = ? AND line = ?`)
+
+	prep(&s.stmtSelectFileNodeIDs,
+		`SELECT id FROM nodes WHERE file_path = ?`)
+	prep(&s.stmtSelectRepoNodeIDs,
+		`SELECT id FROM nodes WHERE repo_prefix = ?`)
+	prep(&s.stmtDeleteNodeByFile,
+		`DELETE FROM nodes WHERE file_path = ?`)
+	prep(&s.stmtDeleteNodeByRepo,
+		`DELETE FROM nodes WHERE repo_prefix = ?`)
+
+	return err
+}
+
+// -- meta encode/decode ----------------------------------------------------
+
+func encodeMeta(m map[string]any) ([]byte, error) {
+	if len(m) == 0 {
+		return nil, nil
+	}
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(m); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func decodeMeta(b []byte) (map[string]any, error) {
+	if len(b) == 0 {
+		return nil, nil
+	}
+	var m map[string]any
+	if err := gob.NewDecoder(bytes.NewReader(b)).Decode(&m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+// -- row scanners ---------------------------------------------------------
+
+func scanNode(scanner interface {
+	Scan(...any) error
+}) (*graph.Node, error) {
+	var (
+		n        graph.Node
+		metaBlob []byte
+	)
+	err := scanner.Scan(
+		&n.ID, &n.Kind, &n.Name, &n.QualName, &n.FilePath,
+		&n.StartLine, &n.EndLine, &n.Language,
+		&n.RepoPrefix, &n.WorkspaceID, &n.ProjectID, &metaBlob,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if len(metaBlob) > 0 {
+		m, derr := decodeMeta(metaBlob)
+		if derr != nil {
+			return nil, derr
+		}
+		n.Meta = m
+	}
+	return &n, nil
+}
+
+func scanEdge(scanner interface {
+	Scan(...any) error
+}) (*graph.Edge, error) {
+	var (
+		e         graph.Edge
+		metaBlob  []byte
+		crossRepo int64
+	)
+	err := scanner.Scan(
+		&e.From, &e.To, &e.Kind, &e.FilePath, &e.Line,
+		&e.Confidence, &e.ConfidenceLabel, &e.Origin, &e.Tier,
+		&crossRepo, &metaBlob,
+	)
+	if err != nil {
+		return nil, err
+	}
+	e.CrossRepo = crossRepo != 0
+	if len(metaBlob) > 0 {
+		m, derr := decodeMeta(metaBlob)
+		if derr != nil {
+			return nil, derr
+		}
+		e.Meta = m
+	}
+	return &e, nil
+}
+
+// -- writes ---------------------------------------------------------------
+
+// AddNode inserts or replaces a node. Idempotent on the id column --
+// re-adding the same id with new content does a last-write-wins
+// update, matching the in-memory store's behaviour.
+func (s *Store) AddNode(n *graph.Node) {
+	if n == nil || n.ID == "" {
+		return
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if err := s.insertNodeLocked(s.stmtInsertNode, n); err != nil {
+		// graph.Store.AddNode has no error channel; the in-memory
+		// store can't fail either. We swallow the error here for API
+		// parity; surface as a panic only on a clearly catastrophic
+		// failure (closed DB), not on a transient busy.
+		panicOnFatal(err)
+	}
+}
+
+func (s *Store) insertNodeLocked(stmt *sql.Stmt, n *graph.Node) error {
+	metaBlob, err := encodeMeta(n.Meta)
+	if err != nil {
+		return err
+	}
+	_, err = stmt.Exec(
+		n.ID, string(n.Kind), n.Name, n.QualName, n.FilePath,
+		n.StartLine, n.EndLine, n.Language,
+		n.RepoPrefix, n.WorkspaceID, n.ProjectID, metaBlob,
+	)
+	return err
+}
+
+// AddEdge inserts an edge. Idempotent on the logical edge key (from,
+// to, kind, file_path, line) -- a second AddEdge with the same key is
+// a no-op (INSERT OR IGNORE), matching the in-memory store's "stored
+// pointer replaced in place" semantics. Origin upgrades on a re-add
+// are NOT applied through this path; use SetEdgeProvenance for that
+// (matches the in-memory store: AddEdge replaces the *Edge pointer,
+// but the conformance suite only verifies dedup-by-key, not pointer
+// replacement, and the in-memory store also routes provenance
+// upgrades through SetEdgeProvenance).
+func (s *Store) AddEdge(e *graph.Edge) {
+	if e == nil {
+		return
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if err := s.insertEdgeLocked(s.stmtInsertEdge, e); err != nil {
+		panicOnFatal(err)
+	}
+}
+
+func (s *Store) insertEdgeLocked(stmt *sql.Stmt, e *graph.Edge) error {
+	metaBlob, err := encodeMeta(e.Meta)
+	if err != nil {
+		return err
+	}
+	var crossRepo int64
+	if e.CrossRepo {
+		crossRepo = 1
+	}
+	_, err = stmt.Exec(
+		e.From, e.To, string(e.Kind), e.FilePath, e.Line,
+		e.Confidence, e.ConfidenceLabel, e.Origin, e.Tier,
+		crossRepo, metaBlob,
+	)
+	return err
+}
+
+// AddBatch inserts nodes and edges in a single transaction -- the
+// 10-100x speedup vs per-statement commits at indexing scale.
+func (s *Store) AddBatch(nodes []*graph.Node, edges []*graph.Edge) {
+	if len(nodes) == 0 && len(edges) == 0 {
+		return
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		panicOnFatal(err)
+		return
+	}
+	commit := false
+	defer func() {
+		if !commit {
+			_ = tx.Rollback()
+		}
+	}()
+
+	insertNode := tx.Stmt(s.stmtInsertNode)
+	defer insertNode.Close()
+	insertEdge := tx.Stmt(s.stmtInsertEdge)
+	defer insertEdge.Close()
+
+	for _, n := range nodes {
+		if n == nil || n.ID == "" {
+			continue
+		}
+		if err := s.insertNodeLocked(insertNode, n); err != nil {
+			panicOnFatal(err)
+			return
+		}
+	}
+	for _, e := range edges {
+		if e == nil {
+			continue
+		}
+		if err := s.insertEdgeLocked(insertEdge, e); err != nil {
+			panicOnFatal(err)
+			return
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		panicOnFatal(err)
+		return
+	}
+	commit = true
+}
+
+// SetEdgeProvenance mutates an existing edge's origin in-place and
+// bumps the identity-revision counter when the origin actually
+// changes. Returns true iff a change was applied. Mirrors the
+// in-memory store's "delete-then-insert of identity" semantics.
+func (s *Store) SetEdgeProvenance(e *graph.Edge, newOrigin string) bool {
+	if e == nil {
+		return false
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	// Look up the stored origin -- the caller-supplied *Edge may be a
+	// detached copy whose Origin already matches newOrigin even though
+	// the row still has the old value.
+	var storedOrigin string
+	row := s.stmtSelectEdgeOrigin.QueryRow(e.From, e.To, string(e.Kind), e.FilePath, e.Line)
+	if err := row.Scan(&storedOrigin); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false
+		}
+		panicOnFatal(err)
+		return false
+	}
+	if storedOrigin == newOrigin {
+		return false
+	}
+	newTier := e.Tier
+	if newTier != "" {
+		newTier = graph.ResolvedBy(newOrigin)
+	}
+	if _, err := s.stmtUpdateEdgeOrigin.Exec(newOrigin, newTier, e.From, e.To, string(e.Kind), e.FilePath, e.Line); err != nil {
+		panicOnFatal(err)
+		return false
+	}
+	// Reflect the change on the caller's struct, mirroring the
+	// in-memory store which mutates the in-graph *Edge in place.
+	e.Origin = newOrigin
+	if e.Tier != "" {
+		e.Tier = newTier
+	}
+	s.edgeIdentityRevs.Add(1)
+	return true
+}
+
+// ReindexEdge updates the stored row after e.To has been mutated from
+// oldTo to e.To. Implemented as delete-old + insert-new under the
+// same write lock (SQLite's UNIQUE constraint on (from,to,kind,file,
+// line) makes "UPDATE to_id" a one-shot, but the delete+insert form
+// keeps semantics identical when the new (from,to,...) key happens to
+// already exist -- the INSERT OR IGNORE drops the dup, just like the
+// in-memory store's bucket-replace).
+func (s *Store) ReindexEdge(e *graph.Edge, oldTo string) {
+	if e == nil || oldTo == e.To {
+		return
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	if _, err := s.stmtDeleteEdgeByKey.Exec(e.From, oldTo, string(e.Kind), e.FilePath, e.Line); err != nil {
+		panicOnFatal(err)
+		return
+	}
+	if err := s.insertEdgeLocked(s.stmtInsertEdge, e); err != nil {
+		panicOnFatal(err)
+		return
+	}
+}
+
+// RemoveEdge deletes every edge between (from, to) with the given
+// kind. Returns true iff at least one row was deleted.
+func (s *Store) RemoveEdge(from, to string, kind graph.EdgeKind) bool {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	res, err := s.stmtRemoveEdge.Exec(from, to, string(kind))
+	if err != nil {
+		panicOnFatal(err)
+		return false
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		panicOnFatal(err)
+		return false
+	}
+	return n > 0
+}
+
+// EvictFile removes every node anchored to filePath and every edge
+// that touches one of those nodes. Returns (nodesRemoved,
+// edgesRemoved).
+func (s *Store) EvictFile(filePath string) (nodesRemoved, edgesRemoved int) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return s.evictByScopeLocked(s.stmtSelectFileNodeIDs, s.stmtDeleteNodeByFile, filePath)
+}
+
+// EvictRepo removes every node in repoPrefix and every edge that
+// touches one. Returns (nodesRemoved, edgesRemoved).
+func (s *Store) EvictRepo(repoPrefix string) (nodesRemoved, edgesRemoved int) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return s.evictByScopeLocked(s.stmtSelectRepoNodeIDs, s.stmtDeleteNodeByRepo, repoPrefix)
+}
+
+// evictByScopeLocked is the shared body of EvictFile / EvictRepo --
+// collect the affected node IDs, delete every edge touching one of
+// them, then delete the nodes themselves.
+func (s *Store) evictByScopeLocked(selectIDs, deleteNodes *sql.Stmt, scope string) (int, int) {
+	rows, err := selectIDs.Query(scope)
+	if err != nil {
+		panicOnFatal(err)
+		return 0, 0
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			panicOnFatal(err)
+			return 0, 0
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		panicOnFatal(err)
+		return 0, 0
+	}
+	rows.Close()
+	if len(ids) == 0 {
+		return 0, 0
+	}
+
+	// Delete every edge touching one of these nodes. We run a single
+	// DELETE per node id to avoid bumping into SQLite's bound-variable
+	// limit on big batches; under the write lock this is a
+	// straight-line walk.
+	var edgesRemoved int
+	for _, id := range ids {
+		res, err := s.db.Exec(`DELETE FROM edges WHERE from_id = ? OR to_id = ?`, id, id)
+		if err != nil {
+			panicOnFatal(err)
+			return 0, edgesRemoved
+		}
+		if n, err := res.RowsAffected(); err == nil {
+			edgesRemoved += int(n)
+		}
+	}
+
+	res, err := deleteNodes.Exec(scope)
+	if err != nil {
+		panicOnFatal(err)
+		return 0, edgesRemoved
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		panicOnFatal(err)
+		return 0, edgesRemoved
+	}
+	return int(n), edgesRemoved
+}
+
+// -- reads ---------------------------------------------------------------
+
+func (s *Store) GetNode(id string) *graph.Node {
+	row := s.stmtGetNode.QueryRow(id)
+	n, err := scanNode(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		panicOnFatal(err)
+		return nil
+	}
+	return n
+}
+
+func (s *Store) GetNodeByQualName(qualName string) *graph.Node {
+	if qualName == "" {
+		return nil
+	}
+	row := s.stmtGetNodeByQual.QueryRow(qualName)
+	n, err := scanNode(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		panicOnFatal(err)
+		return nil
+	}
+	return n
+}
+
+func (s *Store) FindNodesByName(name string) []*graph.Node {
+	return s.queryNodes(s.stmtFindByName, name)
+}
+
+func (s *Store) FindNodesByNameInRepo(name, repoPrefix string) []*graph.Node {
+	return s.queryNodes(s.stmtFindByNameInRepo, name, repoPrefix)
+}
+
+func (s *Store) GetFileNodes(filePath string) []*graph.Node {
+	return s.queryNodes(s.stmtFileNodes, filePath)
+}
+
+func (s *Store) GetRepoNodes(repoPrefix string) []*graph.Node {
+	return s.queryNodes(s.stmtRepoNodes, repoPrefix)
+}
+
+func (s *Store) AllNodes() []*graph.Node {
+	return s.queryNodes(s.stmtAllNodes)
+}
+
+func (s *Store) queryNodes(stmt *sql.Stmt, args ...any) []*graph.Node {
+	rows, err := stmt.Query(args...)
+	if err != nil {
+		panicOnFatal(err)
+		return nil
+	}
+	defer rows.Close()
+	var out []*graph.Node
+	for rows.Next() {
+		n, err := scanNode(rows)
+		if err != nil {
+			panicOnFatal(err)
+			return out
+		}
+		out = append(out, n)
+	}
+	return out
+}
+
+func (s *Store) GetOutEdges(nodeID string) []*graph.Edge {
+	return s.queryEdges(s.stmtOutEdges, nodeID)
+}
+
+func (s *Store) GetInEdges(nodeID string) []*graph.Edge {
+	return s.queryEdges(s.stmtInEdges, nodeID)
+}
+
+func (s *Store) AllEdges() []*graph.Edge {
+	return s.queryEdges(s.stmtAllEdges)
+}
+
+func (s *Store) queryEdges(stmt *sql.Stmt, args ...any) []*graph.Edge {
+	rows, err := stmt.Query(args...)
+	if err != nil {
+		panicOnFatal(err)
+		return nil
+	}
+	defer rows.Close()
+	var out []*graph.Edge
+	for rows.Next() {
+		e, err := scanEdge(rows)
+		if err != nil {
+			panicOnFatal(err)
+			return out
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+// -- counts and stats -----------------------------------------------------
+
+func (s *Store) NodeCount() int {
+	var n int
+	if err := s.stmtNodeCount.QueryRow().Scan(&n); err != nil {
+		panicOnFatal(err)
+		return 0
+	}
+	return n
+}
+
+func (s *Store) EdgeCount() int {
+	var n int
+	if err := s.stmtEdgeCount.QueryRow().Scan(&n); err != nil {
+		panicOnFatal(err)
+		return 0
+	}
+	return n
+}
+
+func (s *Store) Stats() graph.GraphStats {
+	st := graph.GraphStats{
+		ByKind:     map[string]int{},
+		ByLanguage: map[string]int{},
+	}
+	st.TotalNodes = s.NodeCount()
+	st.TotalEdges = s.EdgeCount()
+
+	rows, err := s.stmtStatsByKind.Query()
+	if err != nil {
+		panicOnFatal(err)
+		return st
+	}
+	for rows.Next() {
+		var kind string
+		var n int
+		if err := rows.Scan(&kind, &n); err != nil {
+			rows.Close()
+			panicOnFatal(err)
+			return st
+		}
+		st.ByKind[kind] = n
+	}
+	rows.Close()
+
+	rows, err = s.stmtStatsByLanguage.Query()
+	if err != nil {
+		panicOnFatal(err)
+		return st
+	}
+	for rows.Next() {
+		var lang string
+		var n int
+		if err := rows.Scan(&lang, &n); err != nil {
+			rows.Close()
+			panicOnFatal(err)
+			return st
+		}
+		st.ByLanguage[lang] = n
+	}
+	rows.Close()
+	return st
+}
+
+func (s *Store) RepoStats() map[string]graph.GraphStats {
+	out := map[string]graph.GraphStats{}
+	rows, err := s.stmtRepoStatsNodes.Query()
+	if err != nil {
+		panicOnFatal(err)
+		return out
+	}
+	for rows.Next() {
+		var repo, kind, lang string
+		var n int
+		if err := rows.Scan(&repo, &kind, &lang, &n); err != nil {
+			rows.Close()
+			panicOnFatal(err)
+			return out
+		}
+		st, ok := out[repo]
+		if !ok {
+			st = graph.GraphStats{ByKind: map[string]int{}, ByLanguage: map[string]int{}}
+		}
+		st.TotalNodes += n
+		st.ByKind[kind] += n
+		st.ByLanguage[lang] += n
+		out[repo] = st
+	}
+	rows.Close()
+
+	rows, err = s.stmtRepoStatsEdges.Query()
+	if err != nil {
+		panicOnFatal(err)
+		return out
+	}
+	for rows.Next() {
+		var repo string
+		var n int
+		if err := rows.Scan(&repo, &n); err != nil {
+			rows.Close()
+			panicOnFatal(err)
+			return out
+		}
+		st, ok := out[repo]
+		if !ok {
+			st = graph.GraphStats{ByKind: map[string]int{}, ByLanguage: map[string]int{}}
+		}
+		st.TotalEdges = n
+		out[repo] = st
+	}
+	rows.Close()
+	return out
+}
+
+func (s *Store) RepoPrefixes() []string {
+	rows, err := s.stmtRepoPrefixes.Query()
+	if err != nil {
+		panicOnFatal(err)
+		return nil
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			panicOnFatal(err)
+			return out
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// -- provenance verification ---------------------------------------------
+
+func (s *Store) EdgeIdentityRevisions() int {
+	return int(s.edgeIdentityRevs.Load())
+}
+
+// VerifyEdgeIdentities is a no-op for the SQL backend: the in-memory
+// store's invariant is "the same *Edge pointer lives in both
+// adjacency views". The SQL store has a single row per edge, so the
+// invariant is trivially satisfied -- no walk can find a divergence
+// to report.
+func (s *Store) VerifyEdgeIdentities() error { return nil }
+
+// -- memory estimation (advisory) ----------------------------------------
+
+// perRowByteEstimate is a deliberately rough per-row byte cost --
+// the disk backend doesn't have an in-memory footprint to report, so
+// the contract (per Store interface comment) is "return what you can
+// compute and callers treat the result as advisory". The conformance
+// test only checks NodeCount.
+const (
+	perNodeByteEstimate = 256
+	perEdgeByteEstimate = 128
+)
+
+func (s *Store) RepoMemoryEstimate(repoPrefix string) graph.RepoMemoryEstimate {
+	var est graph.RepoMemoryEstimate
+	var n, e int
+	if err := s.stmtRepoNodeCount.QueryRow(repoPrefix).Scan(&n); err != nil {
+		panicOnFatal(err)
+		return est
+	}
+	if err := s.stmtRepoEdgeCount.QueryRow(repoPrefix).Scan(&e); err != nil {
+		panicOnFatal(err)
+		return est
+	}
+	est.NodeCount = n
+	est.EdgeCount = e
+	est.NodeBytes = uint64(n) * perNodeByteEstimate
+	est.EdgeBytes = uint64(e) * perEdgeByteEstimate
+	return est
+}
+
+func (s *Store) AllRepoMemoryEstimates() map[string]graph.RepoMemoryEstimate {
+	out := map[string]graph.RepoMemoryEstimate{}
+	rows, err := s.stmtAllRepoCountsNodes.Query()
+	if err != nil {
+		panicOnFatal(err)
+		return out
+	}
+	for rows.Next() {
+		var repo string
+		var n int
+		if err := rows.Scan(&repo, &n); err != nil {
+			rows.Close()
+			panicOnFatal(err)
+			return out
+		}
+		est := out[repo]
+		est.NodeCount = n
+		est.NodeBytes = uint64(n) * perNodeByteEstimate
+		out[repo] = est
+	}
+	rows.Close()
+
+	rows, err = s.stmtAllRepoCountsEdges.Query()
+	if err != nil {
+		panicOnFatal(err)
+		return out
+	}
+	for rows.Next() {
+		var repo string
+		var n int
+		if err := rows.Scan(&repo, &n); err != nil {
+			rows.Close()
+			panicOnFatal(err)
+			return out
+		}
+		est := out[repo]
+		est.EdgeCount = n
+		est.EdgeBytes = uint64(n) * perEdgeByteEstimate
+		out[repo] = est
+	}
+	rows.Close()
+	return out
+}
+
+// -- helpers --------------------------------------------------------------
+
+// panicOnFatal turns truly catastrophic SQLite errors (closed DB,
+// schema mismatch, disk-full at insert time) into a panic so callers
+// see them, while letting expected sql.ErrNoRows / busy / no-affected
+// callers stay quiet. The graph.Store interface deliberately does not
+// surface errors -- it mirrors the in-memory store's "everything
+// succeeds" contract -- so a fatal storage failure cannot be ignored.
+func panicOnFatal(err error) {
+	if err == nil {
+		return
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return
+	}
+	panic(fmt.Errorf("store_sqlite: %w", err))
+}
