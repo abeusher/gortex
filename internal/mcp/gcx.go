@@ -381,6 +381,17 @@ func encodeFindUsages(sg *query.SubGraph) ([]byte, error) {
 			fpath = fn.FilePath
 			fline = fn.StartLine
 		}
+		// Prefer the edge's own call-site line over the enclosing
+		// symbol's start. Two calls from the same caller used to
+		// surface as duplicate rows pinned to the caller's first
+		// line; the edge line is what the agent actually wants to
+		// jump to.
+		if e.Line > 0 {
+			fline = e.Line
+		}
+		if e.FilePath != "" {
+			fpath = e.FilePath
+		}
 		tier := e.Tier
 		if tier == "" {
 			tier = graph.ResolvedBy(e.Origin)

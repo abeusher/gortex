@@ -190,7 +190,37 @@ func TestEncodeFindUsages_OneRowPerEdge(t *testing.T) {
 	require.Equal(t, "a.go::Caller", rows[0]["from"])
 	require.Equal(t, "b.go::Target", rows[0]["to"])
 	require.Equal(t, "Caller", rows[0]["from_name"])
+	// Edge with no Line falls back to the caller's start line.
 	require.Equal(t, "10", rows[0]["from_line"])
+}
+
+// TestEncodeFindUsages_FromLineIsCallSite pins the call-site-line
+// behaviour: when an edge carries its own Line (the actual offset of
+// the `Target(...)` call expression), find_usages must surface that
+// — not the enclosing caller's start line. Two calls from the same
+// caller used to collapse onto the caller's first line, which made
+// it impossible to tell duplicate-looking rows apart.
+func TestEncodeFindUsages_FromLineIsCallSite(t *testing.T) {
+	sg := &query.SubGraph{
+		Nodes: []*graph.Node{
+			newTestNode("a.go::Caller", "Caller", graph.KindFunction, "a.go", 10),
+			newTestNode("b.go::Target", "Target", graph.KindFunction, "b.go", 20),
+		},
+		Edges: []*graph.Edge{
+			{From: "a.go::Caller", To: "b.go::Target", Kind: "calls", Origin: "lsp_resolved", Confidence: 1.0, FilePath: "a.go", Line: 27},
+			{From: "a.go::Caller", To: "b.go::Target", Kind: "calls", Origin: "lsp_resolved", Confidence: 1.0, FilePath: "a.go", Line: 42},
+		},
+	}
+	payload, err := encodeFindUsages(sg)
+	require.NoError(t, err)
+	dec := wire.NewDecoder(strings.NewReader(string(payload)))
+	_, err = dec.Header()
+	require.NoError(t, err)
+	rows, err := dec.All()
+	require.NoError(t, err)
+	require.Len(t, rows, 2)
+	require.Equal(t, "27", rows[0]["from_line"])
+	require.Equal(t, "42", rows[1]["from_line"])
 }
 
 func TestEncodeAnalyze_DeadCode(t *testing.T) {
