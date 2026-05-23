@@ -17,6 +17,7 @@ import (
 	"github.com/zzet/gortex/internal/embedding"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/parser"
+	"github.com/zzet/gortex/internal/progress"
 	"github.com/zzet/gortex/internal/resolver"
 	"github.com/zzet/gortex/internal/search"
 	"github.com/zzet/gortex/internal/search/trigram"
@@ -375,7 +376,7 @@ func (mi *MultiIndexer) EndBatch() {
 		idx.SetDeferGlobalPasses(false)
 	}
 	mi.mu.Unlock()
-	mi.RunGlobalGraphPasses()
+	mi.RunGlobalGraphPasses(context.Background())
 }
 
 // RunGlobalGraphPasses runs the graph-wide derivation passes once
@@ -384,10 +385,11 @@ func (mi *MultiIndexer) EndBatch() {
 // extends/implements/composes parents), and markTestSymbolsAndEmitEdges
 // (test→subject EdgeTests). Idempotent — graph.AddEdge dedupes by
 // edgeKey and the resolver passes skip already-present parents.
-func (mi *MultiIndexer) RunGlobalGraphPasses() {
+func (mi *MultiIndexer) RunGlobalGraphPasses(ctx context.Context) {
 	if mi.graph == nil {
 		return
 	}
+	reporter := progress.FromContext(ctx)
 	r := resolver.New(mi.graph)
 	if added := r.InferImplements(); added > 0 {
 		mi.logger.Info("inferred implements (global)", zap.Int("added", added))
@@ -402,7 +404,8 @@ func (mi *MultiIndexer) RunGlobalGraphPasses() {
 			zap.Int("edges", emitted),
 		)
 	}
-	if cs := detectClonesAndEmitEdges(mi.graph, mi.cloneThreshold()); cs.Items > 0 {
+	reporter.Report("clone detection pass (global)", 0, 0)
+	if cs := detectClonesAndEmitEdgesCtx(ctx, mi.graph, mi.cloneThreshold()); cs.Items > 0 {
 		mi.logger.Info("clone edges emitted (global)",
 			zap.Int("items", cs.Items),
 			zap.Int("clone_pairs", cs.Pairs),
@@ -417,6 +420,7 @@ func (mi *MultiIndexer) RunGlobalGraphPasses() {
 	// interface-satisfaction fallback signal) and before
 	// DetectCrossRepoEdges so a cross-repo gRPC call gets its parallel
 	// cross_repo_calls edge.
+	reporter.Report("gRPC stub resolution (global)", 0, 0)
 	if grpcResolved := resolver.ResolveGRPCStubCalls(mi.graph); grpcResolved > 0 {
 		mi.logger.Info("gRPC stub calls resolved (global)",
 			zap.Int("edges", grpcResolved),
@@ -426,6 +430,7 @@ func (mi *MultiIndexer) RunGlobalGraphPasses() {
 	// interface→impl propagation needs EdgeImplements already
 	// materialised; cross-repo workflow→activity dispatch then picks
 	// up its parallel cross_repo_calls edge below.
+	reporter.Report("Temporal stub resolution (global)", 0, 0)
 	if temporalResolved := resolver.ResolveTemporalCalls(mi.graph); temporalResolved > 0 {
 		mi.logger.Info("Temporal stub calls resolved (global)",
 			zap.Int("edges", temporalResolved),
@@ -434,6 +439,7 @@ func (mi *MultiIndexer) RunGlobalGraphPasses() {
 	// External-call placeholder synthesis (opt-in). Runs after the
 	// stub passes so only genuinely un-indexed external targets are
 	// left to materialise into call-chain terminals.
+	reporter.Report("external-call synthesis (global)", 0, 0)
 	if extCalls := resolver.SynthesizeExternalCalls(mi.graph, mi.externalCallSynthesisEnabled()); extCalls > 0 {
 		mi.logger.Info("external-call placeholders synthesized (global)",
 			zap.Int("edges", extCalls),
@@ -442,6 +448,7 @@ func (mi *MultiIndexer) RunGlobalGraphPasses() {
 	// Cross-repo edge layer. Runs after InferImplements / InferOverrides
 	// so the implements / extends edges they materialise across repo
 	// boundaries pick up their parallel cross_repo_* edges.
+	reporter.Report("cross-repo edges (global)", 0, 0)
 	if crossRepoEdges := resolver.DetectCrossRepoEdges(mi.graph); crossRepoEdges > 0 {
 		mi.logger.Info("cross-repo edges emitted (global)",
 			zap.Int("edges", crossRepoEdges),
@@ -771,7 +778,7 @@ func (mi *MultiIndexer) indexMultiRepo(repos []config.RepoEntry) (map[string]*In
 	// placeholder edges, and contract bridges are in place. RunDeferredPasses
 	// intentionally skips these so we don't pay an O(global) walk per
 	// repo (was the dominant cost at R≈100+).
-	mi.RunGlobalGraphPasses()
+	mi.RunGlobalGraphPasses(context.Background())
 
 	if len(indexErrors) > 0 && len(results) == 0 {
 		return nil, fmt.Errorf("all repos failed to index: %s", strings.Join(indexErrors, "; "))

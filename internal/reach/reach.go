@@ -11,10 +11,12 @@
 package reach
 
 import (
+	"context"
 	"sort"
 	"sync/atomic"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/progress"
 )
 
 // Reachability index keys. Each value is a []string of node IDs that
@@ -104,9 +106,21 @@ var buildCounter uint64
 // and the build counter advances each time so any consumer that read
 // an entry from a prior generation will fall back to a live walk.
 func BuildIndex(g *graph.Graph) *Stats {
+	return BuildIndexCtx(context.Background(), g)
+}
+
+// BuildIndexCtx is BuildIndex with intra-stage progress reporting.
+// Pulls a progress.Reporter from ctx (no-op when none is attached) and
+// emits per-seed progress every reachProgressEvery seeds — the pass
+// otherwise looks hung from the outside, since "reach" is one of the
+// longest stages on monorepo-scale graphs (~200 s on k8s with 150 k
+// impact seeds). Pure operator-visibility instrumentation: the per-
+// report call is cheap (no I/O when the reporter is the default no-op).
+func BuildIndexCtx(ctx context.Context, g *graph.Graph) *Stats {
 	if g == nil {
 		return &Stats{}
 	}
+	reporter := progress.FromContext(ctx)
 	mu := g.ResolveMutex()
 	mu.Lock()
 	defer mu.Unlock()
@@ -119,6 +133,19 @@ func BuildIndex(g *graph.Graph) *Stats {
 	// that compare reach payloads across runs.
 	sort.Slice(nodes, func(i, j int) bool { return nodes[i].ID < nodes[j].ID })
 
+	// Pre-count impact seeds so the progress denominator is real, not
+	// the total node count (the loop skips ~80% of nodes — files,
+	// imports, params, vars, …).
+	var seedTotal int
+	for _, n := range nodes {
+		if n != nil && ImpactSeedKind(n.Kind) {
+			seedTotal++
+		}
+	}
+	reporter.Report("reachability index", 0, seedTotal)
+
+	const reachProgressEvery = 1000
+	seedsDone := 0
 	for _, n := range nodes {
 		if n == nil || !ImpactSeedKind(n.Kind) {
 			continue
@@ -146,7 +173,13 @@ func BuildIndex(g *graph.Graph) *Stats {
 		stats.EntriesD1 += len(tiers[0].IDs)
 		stats.EntriesD2 += len(tiers[1].IDs)
 		stats.EntriesD3 += len(tiers[2].IDs)
+
+		seedsDone++
+		if seedsDone%reachProgressEvery == 0 {
+			reporter.Report("reachability index", seedsDone, seedTotal)
+		}
 	}
+	reporter.Report("reachability index", seedsDone, seedTotal)
 	return stats
 }
 

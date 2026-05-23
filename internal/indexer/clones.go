@@ -1,12 +1,14 @@
 package indexer
 
 import (
+	"context"
 	"sort"
 	"strings"
 
 	"github.com/zzet/gortex/internal/clones"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/parser"
+	"github.com/zzet/gortex/internal/progress"
 )
 
 // cloneSigMetaKey is the Node.Meta key under which a function/method's
@@ -341,10 +343,22 @@ type CloneDetectionStats struct {
 // EvictFile removes that node's edges in both directions before this
 // pass re-runs.
 func detectClonesAndEmitEdges(g *graph.Graph, threshold float64) CloneDetectionStats {
+	return detectClonesAndEmitEdgesCtx(context.Background(), g, threshold)
+}
+
+// detectClonesAndEmitEdgesCtx is the context-aware sibling of
+// detectClonesAndEmitEdges. It emits sub-stage progress markers via
+// the reporter attached to ctx (see progress.WithReporter): clone
+// detection is the longest single stage on monorepo-scale graphs and
+// without intra-stage reporters an operator sees just one
+// "clone detection pass" marker followed by minutes of silence — no
+// way to tell finalise-signatures from LSH from edge-emission.
+func detectClonesAndEmitEdgesCtx(ctx context.Context, g *graph.Graph, threshold float64) CloneDetectionStats {
 	var stats CloneDetectionStats
 	if g == nil {
 		return stats
 	}
+	reporter := progress.FromContext(ctx)
 	// Serialise against other graph-wide passes that mutate Node.Meta
 	// (markTestSymbolsAndEmitEdges, ResolveTemporalCalls, reach.BuildIndex,
 	// releases enrichment). Without this lock, the AllNodes walk below
@@ -369,8 +383,10 @@ func detectClonesAndEmitEdges(g *graph.Graph, threshold float64) CloneDetectionS
 	// Runs under the existing g.ResolveMutex() so the Meta mutations
 	// (delete clone_shingles, set clone_sig) don't race the AllNodes
 	// walk below.
+	reporter.Report("clones: CMS-finalise signatures", 0, 0)
 	finaliseCloneSignatures(g)
 
+	reporter.Report("clones: gather items", 0, 0)
 	var items []clones.Item
 	for _, n := range g.AllNodes() {
 		if n == nil || n.Meta == nil {
@@ -407,10 +423,12 @@ func detectClonesAndEmitEdges(g *graph.Graph, threshold float64) CloneDetectionS
 		return stats
 	}
 
+	reporter.Report("clones: LSH + Jaccard filter", len(items), 0)
 	detected, sb, sbi := clones.DetectPairsStratifiedWithStats(items, threshold)
 	stats.SkippedBuckets = sb
 	stats.SkippedBucketItems = sbi
 	stats.Pairs = len(detected)
+	reporter.Report("clones: emit similarity edges", len(detected), 0)
 	directPairs := make(map[[2]string]struct{}, len(detected))
 	for _, p := range detected {
 		from := g.GetNode(p.A)
@@ -432,6 +450,7 @@ func detectClonesAndEmitEdges(g *graph.Graph, threshold float64) CloneDetectionS
 	// holds g.ResolveMutex — the diffusion pass mutates Node-adjacent
 	// edge state and must rendezvous on the same lock as the clone
 	// pass it extends.
+	reporter.Report("clones: diffuse similarity edges", 0, 0)
 	dp, de := diffuseSimilarityEdges(g, detected, directPairs)
 	stats.DiffusedPairs = dp
 	stats.DiffusedEdges = de

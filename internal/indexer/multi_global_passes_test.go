@@ -145,8 +145,8 @@ func TestMultiIndexer_RunGlobalGraphPasses_Idempotent(t *testing.T) {
 	require.Greater(t, testsBefore, 0)
 
 	// Re-run the global passes. None of the three should add duplicates.
-	mi.RunGlobalGraphPasses()
-	mi.RunGlobalGraphPasses()
+	mi.RunGlobalGraphPasses(context.Background())
+	mi.RunGlobalGraphPasses(context.Background())
 
 	assert.Equal(t, implsBefore, countEdges(g, graph.EdgeImplements),
 		"InferImplements re-emission should be idempotent")

@@ -541,10 +541,11 @@ func (idx *Indexer) SetDeferGlobalPasses(v bool) { idx.deferGlobalPasses = v }
 // re-emission is a no-op. Logs counts for telemetry. Use when batching
 // multiple per-repo TrackRepoCtx / IncrementalReindex calls under
 // SetDeferGlobalPasses(true).
-func (idx *Indexer) RunGlobalGraphPasses() {
+func (idx *Indexer) RunGlobalGraphPasses(ctx context.Context) {
 	if idx.graph == nil {
 		return
 	}
+	reporter := progress.FromContext(ctx)
 	if added := idx.resolver.InferImplements(); added > 0 {
 		idx.logger.Info("inferred implements (global)", zap.Int("added", added))
 	}
@@ -558,7 +559,8 @@ func (idx *Indexer) RunGlobalGraphPasses() {
 			zap.Int("edges", emitted),
 		)
 	}
-	if cs := detectClonesAndEmitEdges(idx.graph, idx.cloneThreshold()); cs.Items > 0 {
+	reporter.Report("clone detection pass (global)", 0, 0)
+	if cs := detectClonesAndEmitEdgesCtx(ctx, idx.graph, idx.cloneThreshold()); cs.Items > 0 {
 		idx.logger.Info("clone edges emitted (global)",
 			zap.Int("items", cs.Items),
 			zap.Int("clone_pairs", cs.Pairs),
@@ -573,6 +575,7 @@ func (idx *Indexer) RunGlobalGraphPasses() {
 	// interface-satisfaction fallback signal depends on its
 	// EdgeImplements edges) and before DetectCrossRepoEdges so a
 	// cross-repo gRPC call gets its parallel cross_repo_calls edge.
+	reporter.Report("gRPC stub resolution (global)", 0, 0)
 	if grpcResolved := resolver.ResolveGRPCStubCalls(idx.graph); grpcResolved > 0 {
 		idx.logger.Info("gRPC stub calls resolved (global)",
 			zap.Int("edges", grpcResolved),
@@ -582,6 +585,7 @@ func (idx *Indexer) RunGlobalGraphPasses() {
 	// constraints as gRPC: needs InferImplements (Java interface chain)
 	// to have run; runs before DetectCrossRepoEdges so cross-repo
 	// Temporal dispatch gets its parallel cross_repo_calls edge.
+	reporter.Report("Temporal stub resolution (global)", 0, 0)
 	if temporalResolved := resolver.ResolveTemporalCalls(idx.graph); temporalResolved > 0 {
 		idx.logger.Info("Temporal stub calls resolved (global)",
 			zap.Int("edges", temporalResolved),
@@ -591,6 +595,7 @@ func (idx *Indexer) RunGlobalGraphPasses() {
 	// resolver and the gRPC/Temporal stub passes so every edge that
 	// could land on a real node already has; the leftover external
 	// terminals are then materialised into synthetic call-chain nodes.
+	reporter.Report("external-call synthesis (global)", 0, 0)
 	if extCalls := resolver.SynthesizeExternalCalls(idx.graph, idx.externalCallSynthesisEnabled()); extCalls > 0 {
 		idx.logger.Info("external-call placeholders synthesized (global)",
 			zap.Int("edges", extCalls),
@@ -599,6 +604,7 @@ func (idx *Indexer) RunGlobalGraphPasses() {
 	// Cross-repo edge layer. Runs after InferImplements / InferOverrides
 	// so cross-repo implements / extends edges pick up their parallel
 	// cross_repo_* edges. No-op on single-repo graphs (no RepoPrefix).
+	reporter.Report("cross-repo edges (global)", 0, 0)
 	if crossRepoEdges := resolver.DetectCrossRepoEdges(idx.graph); crossRepoEdges > 0 {
 		idx.logger.Info("cross-repo edges emitted (global)",
 			zap.Int("edges", crossRepoEdges),
@@ -607,8 +613,11 @@ func (idx *Indexer) RunGlobalGraphPasses() {
 	// Reachability index — runs last in the global pass so every
 	// preceding pass's edges are baked into the precomputed depth-1/2/3
 	// sets. Mirrors the per-repo IndexCtx tail so daemon warm-starts
-	// have the same fast path multi-repo orchestrators get.
-	if reachStats := reach.BuildIndex(idx.graph); reachStats.NodesIndexed > 0 {
+	// have the same fast path multi-repo orchestrators get. Reporter is
+	// triggered up front so an operator sees the stage start; the Ctx
+	// variant emits per-N-seed heartbeats inside the BFS loop.
+	reporter.Report("reachability index (global)", 0, 0)
+	if reachStats := reach.BuildIndexCtx(ctx, idx.graph); reachStats.NodesIndexed > 0 {
 		idx.logger.Info("reachability index built (global)",
 			zap.Int("nodes", reachStats.NodesIndexed),
 			zap.Int("d1_entries", reachStats.EntriesD1),
@@ -1885,7 +1894,7 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (*IndexResult, er
 				)
 			}
 			reporter.Report("clone detection pass", 0, 0)
-			if cs := detectClonesAndEmitEdges(idx.graph, idx.cloneThreshold()); cs.Items > 0 {
+			if cs := detectClonesAndEmitEdgesCtx(ctx, idx.graph, idx.cloneThreshold()); cs.Items > 0 {
 				idx.logger.Info("clone edges emitted",
 					zap.Int("items", cs.Items),
 					zap.Int("clone_pairs", cs.Pairs),
@@ -1900,12 +1909,14 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (*IndexResult, er
 			// interface inference are final. Skipped under
 			// deferGlobalPasses; the batch caller folds it into
 			// RunGlobalGraphPasses.
+			reporter.Report("gRPC stub resolution", 0, 0)
 			if grpcResolved := resolver.ResolveGRPCStubCalls(idx.graph); grpcResolved > 0 {
 				idx.logger.Info("gRPC stub calls resolved",
 					zap.Int("edges", grpcResolved),
 				)
 			}
 			// Temporal stub-call resolution — same staging as gRPC.
+			reporter.Report("Temporal stub resolution", 0, 0)
 			if temporalResolved := resolver.ResolveTemporalCalls(idx.graph); temporalResolved > 0 {
 				idx.logger.Info("Temporal stub calls resolved",
 					zap.Int("edges", temporalResolved),
@@ -1914,6 +1925,7 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (*IndexResult, er
 			// External-call placeholder synthesis (opt-in) — runs after
 			// the resolver and stub passes so only genuinely un-indexed
 			// external targets are left to materialise.
+			reporter.Report("external-call synthesis", 0, 0)
 			if extCalls := resolver.SynthesizeExternalCalls(idx.graph, idx.externalCallSynthesisEnabled()); extCalls > 0 {
 				idx.logger.Info("external-call placeholders synthesized",
 					zap.Int("edges", extCalls),
@@ -1923,9 +1935,11 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (*IndexResult, er
 			// every impact seed, stamped into Node.Meta so AnalyzeImpact
 			// answers in O(seeds × reach) map lookups instead of a live
 			// BFS. Runs last so every preceding pass's edges (resolver,
-			// semantic enrichment, gRPC stubs) are folded in.
-			if reachStats := reach.BuildIndex(idx.graph); reachStats.NodesIndexed > 0 {
-				reporter.Report("reachability index", 0, 0)
+			// semantic enrichment, gRPC stubs) are folded in. Marker is
+			// emitted up front so an operator sees the stage start; the
+			// Ctx variant emits per-N-seed heartbeats inside the BFS.
+			reporter.Report("reachability index", 0, 0)
+			if reachStats := reach.BuildIndexCtx(ctx, idx.graph); reachStats.NodesIndexed > 0 {
 				idx.logger.Info("reachability index built",
 					zap.Int("nodes", reachStats.NodesIndexed),
 					zap.Int("d1_entries", reachStats.EntriesD1),
