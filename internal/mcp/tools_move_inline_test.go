@@ -1,7 +1,6 @@
 package mcp
 
 import (
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -51,13 +50,6 @@ func setupMoveInlineRepo(t *testing.T, files map[string]string) (*Server, string
 	srv := NewServer(eng, g, idx, nil, zap.NewNop(), nil)
 	srv.RunAnalysis()
 	return srv, dir
-}
-
-func decodeResp(t *testing.T, raw string) map[string]any {
-	t.Helper()
-	var resp map[string]any
-	require.NoError(t, json.Unmarshal([]byte(raw), &resp))
-	return resp
 }
 
 func mustErrText(t *testing.T, result *mcplib.CallToolResult) string {
