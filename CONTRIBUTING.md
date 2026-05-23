@@ -2,6 +2,18 @@
 
 Thank you for considering contributing to Gortex! This guide will help you get started.
 
+## Licensing of contributions
+
+Gortex is released under the [Apache License, Version 2.0](LICENSE.md).
+By submitting a contribution (a pull request, patch, or other work) you
+agree that it is licensed to the project under the same Apache 2.0 terms,
+as described in section 5 of the License. You retain copyright in your
+contribution; the project retains a perpetual, worldwide, royalty-free
+license to use, modify, and redistribute it as part of Gortex.
+
+Contributors are listed in [CONTRIBUTORS.md](CONTRIBUTORS.md). Add yourself
+to that file in the same PR if you'd like to be credited.
+
 ## Getting Started
 
 ### Prerequisites
