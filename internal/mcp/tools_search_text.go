@@ -34,7 +34,7 @@ func (s *Server) handleSearchText(ctx context.Context, req mcp.CallToolRequest) 
 	if query == "" {
 		return mcp.NewToolResultError("search_text: query is required"), nil
 	}
-	if s.indexer == nil {
+	if s.indexer == nil && s.multiIndexer == nil {
 		return mcp.NewToolResultError("search_text: no indexer available"), nil
 	}
 
@@ -46,7 +46,18 @@ func (s *Server) handleSearchText(ctx context.Context, req mcp.CallToolRequest) 
 		limit = 1000
 	}
 
-	matches := s.indexer.GrepText(query, limit)
+	// Multi-repo mode: the daemon owns a MultiIndexer and the per-repo
+	// Indexer pointer (s.indexer) is unset or empty-rooted. Fan out
+	// across every tracked repo's trigram searcher and stamp repo
+	// prefixes on the match paths so downstream tooling sees the same
+	// shape graph nodes use. Single-indexer callers (one-shot CLI,
+	// tests) fall through to the legacy path.
+	var matches []trigram.Match
+	if s.multiIndexer != nil {
+		matches = s.multiIndexer.GrepText(query, limit)
+	} else {
+		matches = s.indexer.GrepText(query, limit)
+	}
 
 	// Sub-path scoping: a `path` argument or a `scope:`-named saved
 	// scope's paths narrow the literal hits to a monorepo service

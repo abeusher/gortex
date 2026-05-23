@@ -19,6 +19,7 @@ import (
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/resolver"
 	"github.com/zzet/gortex/internal/search"
+	"github.com/zzet/gortex/internal/search/trigram"
 )
 
 // RepoMetadata holds per-repo indexing state.
@@ -1333,6 +1334,59 @@ func (mi *MultiIndexer) GetIndexer(repoPrefix string) *Indexer {
 	mi.mu.RLock()
 	defer mi.mu.RUnlock()
 	return mi.indexers[repoPrefix]
+}
+
+// GrepText fans out a trigram-accelerated literal search across every
+// tracked per-repo Indexer and returns the union, capped at limit.
+// Match paths are re-stamped from repo-root-relative to repo-prefixed
+// (e.g. "internal/foo.go" → "gortex/internal/foo.go") so callers can
+// route hits back to the right working tree without consulting the
+// MultiIndexer afterwards. A non-positive limit returns every match.
+// Returns nil when no per-repo indexer can serve the query — the
+// single-Indexer path (Indexer.GrepText) is used by callers without a
+// MultiIndexer.
+func (mi *MultiIndexer) GrepText(query string, limit int) []trigram.Match {
+	if mi == nil || query == "" {
+		return nil
+	}
+	mi.mu.RLock()
+	type job struct {
+		prefix string
+		idx    *Indexer
+	}
+	jobs := make([]job, 0, len(mi.indexers))
+	for prefix, idx := range mi.indexers {
+		if idx == nil {
+			continue
+		}
+		jobs = append(jobs, job{prefix: prefix, idx: idx})
+	}
+	mi.mu.RUnlock()
+
+	// Per-repo cap mirrors the overall limit when set; the merge below
+	// applies the final cap so a small repo contributing 100 matches
+	// doesn't starve a larger one. Zero / negative means no per-repo
+	// cap (let each searcher return everything).
+	perCap := limit
+	out := make([]trigram.Match, 0, len(jobs)*8)
+	for _, j := range jobs {
+		hits := j.idx.GrepText(query, perCap)
+		if len(hits) == 0 {
+			continue
+		}
+		for i := range hits {
+			// Trigram emits forward-slash repo-relative paths. Stamp
+			// the repo prefix so downstream tools (resolveGraphPath,
+			// path-prefix filters) see the same shape they get from
+			// the graph nodes.
+			hits[i].Path = j.prefix + "/" + hits[i].Path
+		}
+		out = append(out, hits...)
+	}
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out
 }
 
 // IndexerForFile routes an absolute path to the per-repo Indexer that

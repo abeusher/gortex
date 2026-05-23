@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	mcplib "github.com/mark3labs/mcp-go/mcp"
@@ -16,6 +17,7 @@ import (
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/parser/languages"
 	"github.com/zzet/gortex/internal/query"
+	"github.com/zzet/gortex/internal/search"
 )
 
 type searchTextMatch struct {
@@ -152,4 +154,76 @@ func TestSearchText_PathScoping(t *testing.T) {
 	require.NoError(t, json.Unmarshal([]byte(scoped.Content[0].(mcplib.TextContent).Text), &scopedOut))
 	require.Len(t, scopedOut.Matches, 1)
 	require.Contains(t, scopedOut.Matches[0].Path, "services/billing")
+}
+
+// TestSearchText_MultiRepoFanout pins the multi-repo path: when the
+// server holds a MultiIndexer, search_text must fan out across every
+// tracked per-repo trigram searcher and re-prefix match paths so
+// downstream tools (resolveGraphPath, path filters) see the same
+// repo-prefixed shape graph nodes use. Before the fix, the handler
+// only consulted s.indexer.GrepText — which in multi-repo mode has no
+// rootPath and silently returned an empty result for every query.
+func TestSearchText_MultiRepoFanout(t *testing.T) {
+	repoA := setupMiniRepoNamed(t, "alpha", "package alpha\n\n// unique_alpha_marker\nfunc A() {}\n")
+	repoB := setupMiniRepoNamed(t, "beta", "package beta\n\n// unique_beta_marker\nfunc B() {}\n")
+
+	tmpCfg := filepath.Join(t.TempDir(), "config.yaml")
+	gc := &config.GlobalConfig{
+		Repos: []config.RepoEntry{
+			{Path: repoA, Name: "alpha"},
+			{Path: repoB, Name: "beta"},
+		},
+	}
+	gc.SetConfigPath(tmpCfg)
+	require.NoError(t, gc.Save())
+	cm, err := config.NewConfigManager(tmpCfg)
+	require.NoError(t, err)
+
+	reg := parser.NewRegistry()
+	reg.Register(languages.NewGoExtractor())
+	g := graph.New()
+	mi := indexer.NewMultiIndexer(g, reg, search.NewBM25(), cm, zap.NewNop())
+	_, err = mi.IndexAll()
+	require.NoError(t, err)
+	require.True(t, mi.IsMultiRepo())
+
+	eng := query.NewEngine(g)
+	singleton := indexer.New(g, reg, config.IndexConfig{}, zap.NewNop())
+	srv := NewServer(eng, g, singleton, nil, zap.NewNop(), nil, MultiRepoOptions{
+		ConfigManager: cm,
+		MultiIndexer:  mi,
+	})
+
+	// Each repo's unique marker must surface, prefixed with the repo name.
+	alpha := callTool(t, srv, "search_text", map[string]any{"query": "unique_alpha_marker"})
+	require.False(t, alpha.IsError)
+	var alphaOut struct {
+		Matches []searchTextMatch `json:"matches"`
+		Count   int               `json:"count"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(alpha.Content[0].(mcplib.TextContent).Text), &alphaOut))
+	require.Equal(t, 1, alphaOut.Count, "alpha marker must surface; pre-fix it returned 0")
+	require.True(t, strings.HasPrefix(alphaOut.Matches[0].Path, "alpha/"),
+		"match path must be repo-prefixed, got %q", alphaOut.Matches[0].Path)
+
+	beta := callTool(t, srv, "search_text", map[string]any{"query": "unique_beta_marker"})
+	require.False(t, beta.IsError)
+	var betaOut struct {
+		Matches []searchTextMatch `json:"matches"`
+		Count   int               `json:"count"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(beta.Content[0].(mcplib.TextContent).Text), &betaOut))
+	require.Equal(t, 1, betaOut.Count)
+	require.True(t, strings.HasPrefix(betaOut.Matches[0].Path, "beta/"))
+}
+
+// setupMiniRepoNamed mirrors setupMiniRepo but lets the caller supply
+// the main.go body so each repo carries a distinct literal the search
+// can latch onto.
+func setupMiniRepoNamed(t *testing.T, name, body string) string {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), name)
+	require.NoError(t, os.MkdirAll(dir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "main.go"), []byte(body), 0o644))
+	return dir
 }
