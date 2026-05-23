@@ -71,6 +71,29 @@ func goConfigMethod(receiver, method string) (source, op string, ok bool) {
 	return "", "", false
 }
 
+// goConfigSourceImported reports whether the file's import set carries
+// the package that backs a config source. Used to suppress
+// false-positive classifications where a method name overlaps with a
+// viper method but the receiver is an unrelated domain type (e.g.
+// `req.GetString("query")` against an mcp.CallToolRequest in a file
+// that has nothing to do with viper).
+func goConfigSourceImported(source string, imports map[string]string) bool {
+	switch source {
+	case "viper":
+		for _, path := range imports {
+			if strings.Contains(path, "spf13/viper") {
+				return true
+			}
+		}
+		return false
+	default:
+		// `env` (os.Getenv / os.Setenv) and future provider sources
+		// without a distinguishing import: trust the receiver
+		// disambiguation already done in goConfigMethod.
+		return true
+	}
+}
+
 // goConfigEvent is the deferred record emitted at capture time and
 // resolved during the post-pass. Mirrors goObservabilityEvent and
 // goFlagEvent.

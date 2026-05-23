@@ -380,13 +380,19 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 				})
 			}
 			if source, op, key, ok := detectGoConfigKey(expr.Node, m.Captures["callm.receiver"].Text, method, src); ok {
-				configEvents = append(configEvents, goConfigEvent{
-					source: source,
-					op:     op,
-					method: method,
-					key:    key,
-					line:   expr.StartLine + 1,
-				})
+				// Gate provider-specific classifications on the import
+				// set so a `req.GetString("query")` against an mcp
+				// request type doesn't get mistaken for a viper read in
+				// a file that never imports viper.
+				if goConfigSourceImported(source, imports) {
+					configEvents = append(configEvents, goConfigEvent{
+						source: source,
+						op:     op,
+						method: method,
+						key:    key,
+						line:   expr.StartLine + 1,
+					})
+				}
 			}
 			if tables, cols, query, ok := detectGoSQLCall(expr.Node, method, src); ok {
 				sqlEvents = append(sqlEvents, goSQLEvent{

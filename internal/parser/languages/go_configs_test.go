@@ -9,6 +9,8 @@ import (
 func TestGoConfigs_ViperGetReadEdge(t *testing.T) {
 	src := `package foo
 
+import _ "github.com/spf13/viper"
+
 type Viper struct{}
 
 func (v *Viper) GetString(key string) string { return "" }
@@ -51,6 +53,8 @@ func Run(v *Viper) {
 func TestGoConfigs_SetEmitsWriteEdge(t *testing.T) {
 	src := `package foo
 
+import _ "github.com/spf13/viper"
+
 type Viper struct{}
 
 func (v *Viper) Set(key string, val any) {}
@@ -81,6 +85,8 @@ func Run(v *Viper) {
 func TestGoConfigs_BindEnvEmitsRegister(t *testing.T) {
 	src := `package foo
 
+import _ "github.com/spf13/viper"
+
 type Viper struct{}
 
 func (v *Viper) BindEnv(key string) error { return nil }
@@ -106,6 +112,8 @@ func Run(v *Viper) {
 func TestGoConfigs_DynamicKeySkipped(t *testing.T) {
 	src := `package foo
 
+import _ "github.com/spf13/viper"
+
 type Viper struct{}
 
 func (v *Viper) GetString(key string) string { return "" }
@@ -121,13 +129,12 @@ func Run(v *Viper, dynamic string) {
 }
 
 func TestGoConfigs_NonViperGetIgnored(t *testing.T) {
-	// `Cache.Get` shares the bare method name 'Get' but is not in
-	// the viper allowlist (only typed `Get*` plus exact `Get`).
-	// The viper allowlist DOES include exact `Get`, so a `Cache`
-	// type's `Get` would currently match — this is an acknowledged
-	// false-positive trade-off when the user opts into the configs
-	// gate. The gate stays default-off for this reason. This test
-	// documents the behaviour: bare `Cache.Get("key")` matches.
+	// `Cache.Get` shares the bare method name 'Get' with viper.Get.
+	// Files that don't import viper are gated out so a domain
+	// type's `Get` is no longer classified as a viper read. The
+	// previous behaviour (acknowledged false positive) silently
+	// polluted graph diffs in any file that called `<x>.GetString`
+	// against unrelated types (mcp.CallToolRequest, sync.Map, …).
 	src := `package foo
 
 type Cache struct{}
@@ -139,8 +146,32 @@ func Run(c *Cache) {
 }
 `
 	fix := runGoExtract(t, src)
-	if got := len(fix.nodesByKind[graph.KindConfigKey]); got != 1 {
-		t.Errorf("acknowledged false positive: bare Get should currently match, got %d", got)
+	if got := len(fix.nodesByKind[graph.KindConfigKey]); got != 0 {
+		t.Errorf("no viper import: Cache.Get should not classify as a viper read, got %d", got)
+	}
+}
+
+func TestGoConfigs_NonViperGetStringIgnoredWithoutImport(t *testing.T) {
+	// Regression pin for the preview_edit false-positive: a
+	// non-viper type with a GetString method must not produce a
+	// KindConfigKey when the file doesn't import viper. The actual
+	// repro that surfaced this was `req.GetString("query")` against
+	// an mcp.CallToolRequest in tools_search.go.
+	src := `package mcp
+
+type Request struct{}
+
+func (r Request) GetString(name, def string) string { return def }
+
+func Handle(req Request) {
+	_ = req.GetString("query", "")
+	_ = req.GetString("promote", "true")
+	_ = req.GetString("max_results", "10")
+}
+`
+	fix := runGoExtract(t, src)
+	if got := len(fix.nodesByKind[graph.KindConfigKey]); got != 0 {
+		t.Errorf("Request.GetString without viper import must not classify, got %d", got)
 	}
 }
 
@@ -166,6 +197,8 @@ func Run(c *Cache) {
 
 func TestGoConfigs_DuplicateKeyDeduplicates(t *testing.T) {
 	src := `package foo
+
+import _ "github.com/spf13/viper"
 
 type Viper struct{}
 
