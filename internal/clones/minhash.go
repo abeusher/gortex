@@ -27,6 +27,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"hash/fnv"
+	"sort"
 )
 
 const (
@@ -138,6 +139,69 @@ func ComputeSignatureWithTokens(body string) (Signature, int, bool) {
 		}
 	}
 	return sig, len(tokens), true
+}
+
+// Shingles returns a body's normalised-token count and the
+// deduplicated, sorted set of its shingle hashes. The bool result is
+// false when the body has fewer than MinTokens normalised tokens —
+// matching the gate ComputeSignature applies internally.
+//
+// Use this when the caller wants to interpose between shingle
+// extraction and MinHash signature computation. The CMS-driven
+// boilerplate filter (in the indexer) walks every body's shingle set,
+// records each shingle in a global Count-Min Sketch, then calls
+// SignatureFromShingles with the subset whose CMS frequency falls
+// below the boilerplate threshold.
+//
+// The returned slice is sorted ascending so downstream determinism
+// (signature output) does not depend on Go map iteration order.
+func Shingles(body string) ([]uint64, int, bool) {
+	tokens := Tokenize(body)
+	if len(tokens) < MinTokens {
+		return nil, 0, false
+	}
+	set := shingleSet(tokens)
+	if len(set) == 0 {
+		return nil, 0, false
+	}
+	out := make([]uint64, 0, len(set))
+	for sh := range set {
+		out = append(out, sh)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out, len(tokens), true
+}
+
+// SignatureFromShingles computes the MinHash signature from a pre-
+// extracted shingle set. The minShingles floor drops bodies whose
+// surviving shingle count is too low to yield a stable signature —
+// MinHash over a handful of shingles produces high-variance slot
+// values that collide randomly in LSH bands. Used by the CMS filter
+// after high-frequency shingles are excluded; callers that want every
+// body in (no minimum) should pass minShingles = 0.
+func SignatureFromShingles(shingles []uint64, minShingles int) (Signature, bool) {
+	if len(shingles) < minShingles {
+		return Signature{}, false
+	}
+	if len(shingles) == 0 {
+		return Signature{}, false
+	}
+	var sig Signature
+	for i := range sig {
+		sig[i] = ^uint32(0)
+	}
+	a := hashParams
+	for _, sh := range shingles {
+		// Pre-reduce so a*x stays under 2^64 (mirrors ComputeSignature).
+		x := sh % minHashPrime
+		for i := range NumHashes {
+			h := uint32((a[i][0]*x + a[i][1]) % minHashPrime)
+			if h < sig[i] {
+				sig[i] = h
+			}
+		}
+	}
+	return sig, true
 }
 
 // shingleSet returns the deduplicated set of k-gram hashes for a token

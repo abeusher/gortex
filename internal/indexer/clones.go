@@ -24,6 +24,44 @@ const cloneSigMetaKey = "clone_sig"
 // considered as a candidate.
 const cloneTokensMetaKey = "clone_tokens"
 
+// cloneShinglesMetaKey is the Node.Meta key under which a function /
+// method's raw shingle hash set is stashed during the per-file parse,
+// so the global CMS-filter pass (finaliseCloneSignatures) can decide
+// which shingles to exclude before computing the final MinHash
+// signature. The entry is deleted from Meta as soon as the signature
+// lands — it is intentionally short-lived because the shingle set is
+// large (≈ tokens − 2 entries per body) and persisting it across the
+// clone-detection pass would waste tens of MB on a monorepo.
+const cloneShinglesMetaKey = "clone_shingles"
+
+// CMS-filter tuning.
+//
+// cmsBoilerplateRatio: a shingle appearing in more than this fraction
+// of bodies is treated as boilerplate and excluded from signature
+// computation. 1% is the textbook value used by near-duplicate web
+// indexing systems and balances precision (false-clone suppression)
+// against recall (genuine clones whose shared content happens to use
+// a moderately common idiom).
+//
+// cmsMinCorpus: below this many bodies the global frequency
+// distribution is too thin for the threshold to be meaningful — a
+// 200-body repo has no shingle that legitimately appears in 2 bodies
+// without already being noise — so we fall back to unfiltered MinHash.
+// Around this size the LSH pass is also fast enough that filtering
+// gains nothing.
+//
+// minSurvivingShingles: after filtering, a body with fewer
+// discriminative shingles than this is dropped from clone detection
+// entirely. MinHash over a handful of shingles produces random slot
+// values that collide unpredictably in LSH bands; the body is then a
+// false-clone factory, not a real clone source. Boilerplate-dominated
+// bodies (e.g. trivial controller / DTO wrappers) land here.
+const (
+	cmsBoilerplateRatio  = 0.01
+	cmsMinCorpus         = 2000
+	minSurvivingShingles = 8
+)
+
 // applyCloneSignatures is the per-file half of clone detection. It runs
 // inside applyCoverageDomains (gated on the "clones" coverage domain),
 // slices each function/method body out of the file source, computes a
@@ -60,14 +98,21 @@ func applyCloneSignatures(src []byte, result *parser.ExtractionResult) {
 		if body == "" {
 			continue
 		}
-		sig, tokens, ok := clones.ComputeSignatureWithTokens(body)
+		// Stash the deduplicated shingle set rather than the final
+		// MinHash signature: signature computation is deferred to the
+		// global CMS-filter pass (finaliseCloneSignatures), which
+		// derives a per-corpus boilerplate-shingle set and excludes it
+		// from each body's signature. The shingle slice is short-lived
+		// on Meta — finaliseCloneSignatures clears it after stamping
+		// the real signature.
+		shingles, tokens, ok := clones.Shingles(body)
 		if !ok {
 			continue
 		}
 		if n.Meta == nil {
 			n.Meta = map[string]any{}
 		}
-		n.Meta[cloneSigMetaKey] = clones.EncodeSignature(sig)
+		n.Meta[cloneShinglesMetaKey] = shingles
 		n.Meta[cloneTokensMetaKey] = tokens
 	}
 }
@@ -162,6 +207,109 @@ func bodyText(lines []string, startLine, endLine int) string {
 	return b.String()
 }
 
+// finaliseCloneSignatures runs after every file's shingles have been
+// stamped on its function / method nodes (by applyCloneSignatures
+// during the per-file parse). It builds a Count-Min Sketch of shingle
+// frequencies across every body in the graph, then walks the bodies
+// again and computes a MinHash signature excluding shingles that
+// exceed the boilerplate threshold (present in > cmsBoilerplateRatio
+// of bodies). The stashed shingle set is cleared from Meta as soon as
+// the signature lands so the LSH pass downstream sees the same
+// node-shape the legacy path produced — just with cleaner signatures.
+//
+// Bodies whose surviving shingle count falls below minSurvivingShingles
+// are dropped from clone detection entirely (no clone_sig stamp): a
+// body whose token stream is dominated by boilerplate is, by
+// definition, a controller / DTO / dispatch shape rather than
+// distinguishable code, and including it in MinHash would just produce
+// random LSH collisions.
+//
+// Below cmsMinCorpus bodies the corpus is too small for the
+// frequency distribution to be meaningful; the pass falls back to
+// unfiltered MinHash so small repos preserve the legacy behaviour.
+//
+// Caller must hold g.ResolveMutex() — the function mutates Node.Meta
+// (deletes clone_shingles, sets clone_sig) across nodes that other
+// graph-wide passes (markTestSymbolsAndEmitEdges, ResolveTemporalCalls,
+// reach.BuildIndex) also touch under the same mutex.
+func finaliseCloneSignatures(g *graph.Graph) {
+	// First pass: collect every body that has stashed shingles. We
+	// capture the *graph.Node pointers up front so the CMS-build pass
+	// and the signature-compute pass don't both re-walk g.AllNodes().
+	bodies := make([]*graph.Node, 0, 8192)
+	for _, n := range g.AllNodes() {
+		if n == nil || n.Meta == nil {
+			continue
+		}
+		if n.Kind != graph.KindFunction && n.Kind != graph.KindMethod {
+			continue
+		}
+		if _, ok := n.Meta[cloneShinglesMetaKey].([]uint64); !ok {
+			continue
+		}
+		bodies = append(bodies, n)
+	}
+	if len(bodies) == 0 {
+		return
+	}
+
+	useFilter := len(bodies) >= cmsMinCorpus
+	var cms *clones.CMS
+	var threshold uint32
+	if useFilter {
+		// Default sketch sizing — see the CMS doc comment for the
+		// width/depth → ε/δ derivation. 1 MB peak for a transient,
+		// per-build pass is comfortably below any constraint.
+		cms = clones.NewCMS(65536, 4)
+		for _, n := range bodies {
+			shingles, _ := n.Meta[cloneShinglesMetaKey].([]uint64)
+			for _, sh := range shingles {
+				cms.Add(sh)
+			}
+		}
+		threshold = uint32(float64(len(bodies)) * cmsBoilerplateRatio)
+		if threshold < 1 {
+			threshold = 1
+		}
+	}
+
+	// Second pass: signature computation. Each body either lands a
+	// fresh clone_sig (signature over surviving shingles) or is
+	// dropped entirely (no clone_sig, never enters detection items
+	// list). In both cases clone_shingles is removed from Meta.
+	for _, n := range bodies {
+		shingles, _ := n.Meta[cloneShinglesMetaKey].([]uint64)
+		var filtered []uint64
+		if useFilter {
+			filtered = make([]uint64, 0, len(shingles))
+			for _, sh := range shingles {
+				if cms.Count(sh) > threshold {
+					continue
+				}
+				filtered = append(filtered, sh)
+			}
+		} else {
+			filtered = shingles
+		}
+		floor := minSurvivingShingles
+		if !useFilter {
+			// Without filtering, every shingle survives — fall back
+			// to the legacy gate so we don't silently drop bodies the
+			// old code would have kept.
+			floor = 0
+		}
+		sig, ok := clones.SignatureFromShingles(filtered, floor)
+		delete(n.Meta, cloneShinglesMetaKey)
+		if !ok {
+			// Boilerplate-dominated or empty after filter — drop
+			// from clone detection. detectClonesAndEmitEdges skips
+			// nodes without a clone_sig.
+			continue
+		}
+		n.Meta[cloneSigMetaKey] = clones.EncodeSignature(sig)
+	}
+}
+
 // CloneDetectionStats summarises one detectClonesAndEmitEdges run for
 // the caller's logger. Exposed so the orchestrator can surface what the
 // per-bucket cap dropped — a high skippedBucketItems means the
@@ -206,6 +354,23 @@ func detectClonesAndEmitEdges(g *graph.Graph, threshold float64) CloneDetectionS
 	// rendezvous on the same lock the resolver already uses.
 	g.ResolveMutex().Lock()
 	defer g.ResolveMutex().Unlock()
+
+	// Finalise pending signatures: applyCloneSignatures stamped the
+	// raw shingle set on each function/method node during the per-file
+	// parse. This pass builds a Count-Min Sketch of corpus-wide shingle
+	// frequencies, then computes the MinHash signature for each body
+	// after excluding shingles whose frequency exceeds the boilerplate
+	// threshold. The expensive LSH candidate enumeration that comes
+	// next then runs over signatures that reflect discriminative
+	// content only — k8s-style controller-pattern bodies stop colliding
+	// on shared "if v err return v" / "( v . v )" shingles, which is
+	// what drives the LSH bucket explosion at monorepo scale.
+	//
+	// Runs under the existing g.ResolveMutex() so the Meta mutations
+	// (delete clone_shingles, set clone_sig) don't race the AllNodes
+	// walk below.
+	finaliseCloneSignatures(g)
+
 	var items []clones.Item
 	for _, n := range g.AllNodes() {
 		if n == nil || n.Meta == nil {
