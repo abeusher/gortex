@@ -28,9 +28,9 @@ type Provider struct {
 	// initialize request alongside the primary workspace root.
 	workspaceFolders []string
 	languages        []string
-	daemon      bool
-	maxParallel int
-	logger      *zap.Logger
+	daemon           bool
+	maxParallel      int
+	logger           *zap.Logger
 	// spec is the ServerSpec this provider was built from (when the
 	// caller used NewProviderFromSpec). nil for legacy NewProvider
 	// invocations — those fall back to single-language routing.
@@ -65,6 +65,21 @@ type Provider struct {
 	// the LSP client's message-pump goroutine.
 	diagHookMu sync.RWMutex
 	diagHook   func(absPath string, diags []Diagnostic)
+
+	// capsMu guards caps and dynamicCaps. Read on every Supports()
+	// call (hot path), so use RWMutex — register/unregister bursts
+	// are rare relative to capability checks.
+	capsMu sync.RWMutex
+	// caps is the snapshot returned by the server's initialize reply
+	// — what the server statically supports. Set once per subprocess
+	// lifetime; reset to a zero value on respawn.
+	caps ServerCapabilities
+	// dynamicCaps holds capabilities the server announced lazily via
+	// client/registerCapability. Keyed by Registration.ID (the wire
+	// handle the server uses for unregisterCapability). Reset on
+	// every ensureClient — a fresh subprocess starts with an empty
+	// dynamic table and re-registers what it needs.
+	dynamicCaps map[string]Registration
 }
 
 // NewProvider creates an LSP provider.
@@ -83,6 +98,7 @@ func NewProvider(command string, args []string, languages []string, daemon bool,
 		openDocs:    map[string]bool{},
 		lastDiag:    map[string][]Diagnostic{},
 		diagWaiters: map[string][]chan []Diagnostic{},
+		dynamicCaps: map[string]Registration{},
 	}
 }
 
@@ -379,6 +395,14 @@ func (p *Provider) ensureClient(workspaceRoot string) error {
 		return nil
 	}
 
+	// Reset the dynamic capability table — a fresh subprocess has no
+	// dynamic registrations until it re-announces them. Reset under
+	// the lock so any racing Supports() reader sees a coherent state.
+	p.capsMu.Lock()
+	p.caps = ServerCapabilities{}
+	p.dynamicCaps = map[string]Registration{}
+	p.capsMu.Unlock()
+
 	client, err := NewClient(p.command, p.args, p.env, workspaceRoot, p.logger)
 	if err != nil {
 		return err
@@ -421,10 +445,31 @@ func (p *Provider) ensureClient(workspaceRoot string) error {
 			// for configuration treat null as "use defaults".
 			return []any{nil}, nil
 		})
+	// client/registerCapability and client/unregisterCapability —
+	// dynamic capability announcements. Some servers send these as
+	// requests (with id, expecting a null ack); others send them as
+	// notifications. We wire both forms to the same handlers so the
+	// caps table converges regardless of which framing the server
+	// chose. See applyRegistrations / applyUnregistrations.
 	client.OnRequest("client/registerCapability",
-		func(_ string, _ json.RawMessage) (any, *jsonRPCError) { return nil, nil })
+		func(_ string, params json.RawMessage) (any, *jsonRPCError) {
+			p.applyRegistrations(params)
+			// LSP spec: reply with null (an empty success result).
+			return nil, nil
+		})
 	client.OnRequest("client/unregisterCapability",
-		func(_ string, _ json.RawMessage) (any, *jsonRPCError) { return nil, nil })
+		func(_ string, params json.RawMessage) (any, *jsonRPCError) {
+			p.applyUnregistrations(params)
+			return nil, nil
+		})
+	client.OnNotification("client/registerCapability",
+		func(_ string, params json.RawMessage) {
+			p.applyRegistrations(params)
+		})
+	client.OnNotification("client/unregisterCapability",
+		func(_ string, params json.RawMessage) {
+			p.applyUnregistrations(params)
+		})
 	client.OnRequest("workspace/applyEdit",
 		func(_ string, _ json.RawMessage) (any, *jsonRPCError) {
 			// Default: refuse. The apply-code-action path swaps this
@@ -488,6 +533,13 @@ func (p *Provider) ensureClient(workspaceRoot string) error {
 		_ = client.Shutdown()
 		return fmt.Errorf("initialize: %w", err)
 	}
+
+	// Snapshot the server's static capabilities so Supports() can
+	// answer "did the server advertise this at initialize time?".
+	// Dynamic registrations may arrive any time after this point.
+	p.capsMu.Lock()
+	p.caps = initResult.Capabilities
+	p.capsMu.Unlock()
 
 	// Send initialized notification.
 	if err := client.Notify("initialized", struct{}{}); err != nil {

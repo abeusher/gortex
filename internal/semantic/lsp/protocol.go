@@ -1,5 +1,7 @@
 package lsp
 
+import "encoding/json"
+
 // LSP protocol types — minimal subset needed for semantic enrichment.
 // Based on LSP 3.17.
 
@@ -151,6 +153,39 @@ type ServerCapabilities struct {
 // ExecuteCommandOptions tells which commands the server can execute.
 type ExecuteCommandOptions struct {
 	Commands []string `json:"commands,omitempty"`
+}
+
+// Registration is one capability the server is registering dynamically
+// via client/registerCapability. The id is opaque and used as the key
+// for a later client/unregisterCapability. Method names the LSP feature
+// (e.g. "textDocument/foldingRange"). RegisterOptions carries the
+// server's configuration for the capability (a document selector,
+// trigger characters, etc.) — opaque to us; we just preserve it so
+// callers that want to consult it can.
+type Registration struct {
+	ID              string          `json:"id"`
+	Method          string          `json:"method"`
+	RegisterOptions json.RawMessage `json:"registerOptions,omitempty"`
+}
+
+// RegistrationParams is the payload of client/registerCapability.
+type RegistrationParams struct {
+	Registrations []Registration `json:"registrations"`
+}
+
+// Unregistration identifies a previously-registered capability to drop.
+// The LSP spec uses the misspelled wire field "unregisterations" — keep
+// that spelling on the params struct, but the singular type is sane.
+type Unregistration struct {
+	ID     string `json:"id"`
+	Method string `json:"method"`
+}
+
+// UnregistrationParams is the payload of client/unregisterCapability.
+// The JSON field name "unregisterations" is the LSP spec's misspelling
+// — keep it; servers send that exact name on the wire.
+type UnregistrationParams struct {
+	Unregisterations []Unregistration `json:"unregisterations"`
 }
 
 // TextDocumentIdentifier identifies a text document.
