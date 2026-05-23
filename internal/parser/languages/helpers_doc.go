@@ -44,17 +44,43 @@ const (
 //
 // Returns "" when no leading comment is found. Safe to call on every
 // emit — the cost per call is O(comment-block-size).
+//
+// Allocation contract: the only allocations are the small `collected`
+// slice plus the trimmed-prefix strings returned by stripLineComment*.
+// The line walk uses bytes.LastIndexByte against src in place — no
+// intermediate `[][]byte` of every preceding line is built. The
+// `make([][]byte, 0, upToRow)` predecessor was 37% of the indexer's
+// total allocation on a TS-heavy repo (Profile #4).
 func ExtractDocAbove(src []byte, startRow0 int, lang docCommentLang) string {
 	if startRow0 <= 0 || len(src) == 0 {
 		return ""
 	}
-	// Walk lines as []byte slices into src — no per-line string copy.
-	// The old splitLinesUpTo allocated one Go string per line of the
-	// file before the declaration; for a function at line 4000 with a
-	// 5-line doc block that's 3995 wasted allocations every call.
-	// Profile #3 measured 753 MB / 30 s in splitLinesUpTo alone.
-	lineBytes := lineBytesUpTo(src, startRow0)
-	if len(lineBytes) == 0 {
+	// Locate the byte offset of the '\n' that ends row (startRow0 - 1).
+	// Lines we want are rows [0, startRow0); the last such line ends at
+	// the byte just before this '\n' (exclusive of the '\n' itself).
+	//
+	// If the forward scan exhausts src without reaching startRow0
+	// (startRow0 is past EOF, or the trailing row has no '\n'), `end`
+	// retains the last seen '\n'. The trailing partial line with no
+	// terminator is intentionally not walked — this matches the
+	// behaviour of the predecessor `lineBytesUpTo`, which only
+	// appended a line when it observed its terminating '\n', so a
+	// missing-newline final row was dropped.
+	end := -1
+	{
+		row := 0
+		for i := 0; i < len(src); i++ {
+			if src[i] != '\n' {
+				continue
+			}
+			row++
+			end = i
+			if row == startRow0 {
+				break
+			}
+		}
+	}
+	if end < 0 {
 		return ""
 	}
 
@@ -70,12 +96,20 @@ func ExtractDocAbove(src []byte, startRow0 int, lang docCommentLang) string {
 		blockStart  = []byte("/**")
 	)
 
-	// Walk upward from the line just above the declaration.
+	// Walk upward from the line just above the declaration. `end`
+	// indexes the '\n' that terminates the current line (exclusive);
+	// the line's bytes are src[prev+1 : end] where `prev` is the '\n'
+	// that ends the previous line, or -1 when we hit row 0.
 	collected := make([]string, 0, 8)
 	inBlock := false
-	for i := len(lineBytes) - 1; i >= 0; i-- {
-		line := bytes.TrimRight(lineBytes[i], "\r")
+	for end >= 0 {
+		prev := bytes.LastIndexByte(src[:end], '\n')
+		line := bytes.TrimRight(src[prev+1:end], "\r")
 		trimmed := bytes.TrimSpace(line)
+		// Step now so the existing `continue` statements in the switch
+		// advance to the previous line. `goto done` skips the step
+		// entirely, which is what we want.
+		end = prev
 
 		switch lang {
 		case DocLangSlashSlash:
@@ -238,29 +272,6 @@ func firstPyParagraph(s string) string {
 		}
 	}
 	return truncateDoc(b.String())
-}
-
-// lineBytesUpTo returns lines[0..upToRow] as []byte slices into src.
-// Each slice excludes the trailing '\n'. No string copy is performed —
-// callers materialise strings on-demand only for the few lines they
-// actually consume. The returned outer slice owns no source bytes, so
-// callers should not retain it past the lifetime of src.
-func lineBytesUpTo(src []byte, upToRow int) [][]byte {
-	if upToRow <= 0 {
-		return nil
-	}
-	lines := make([][]byte, 0, upToRow)
-	start := 0
-	row := 0
-	for i := 0; i < len(src) && row < upToRow; i++ {
-		if src[i] != '\n' {
-			continue
-		}
-		lines = append(lines, src[start:i])
-		start = i + 1
-		row++
-	}
-	return lines
 }
 
 // stripLineCommentPrefixBytes strips a leading comment-opener prefix
