@@ -645,23 +645,57 @@ func autoLinkBody(body string, g *graph.Graph, workspaceID string, opts autoLink
 	// (2) Name-based resolution. Each unique token is queried once.
 	tokens := tokeniseIdentifiers(body, opts.MinTokenLen)
 	for _, tok := range tokens {
-		matches := g.FindNodesByName(tok)
-		// Skip ambiguous tokens to keep auto-link precision high —
-		// 1 match is almost always the right call; many matches
-		// would pollute the digest.
-		if len(matches) == 0 || len(matches) > 3 {
+		// Plain-English single-word tokens like "memory", "tests",
+		// "validation" routinely collide with field / constant
+		// names elsewhere in the graph (`repoItem.memory`,
+		// `Config.MCP`). Require a code-shape signal — uppercase
+		// letter, underscore, dot, or `::` qualifier — before we
+		// even try the name lookup. Without this the auto-linker
+		// pulls in arbitrary nodes whose name happens to overlap
+		// with a body word, and the surfaced memories look
+		// unrelated to anything the note actually discusses.
+		if !hasIdentifierSignal(tok) {
 			continue
 		}
-		for _, n := range matches {
-			if opts.HonorScope && workspaceID != "" && n.WorkspaceID != workspaceID {
-				continue
-			}
-			if add(n.ID) {
-				return out
-			}
+		matches := g.FindNodesByName(tok)
+		// One match means an unambiguous reference; anything more
+		// is too noisy to auto-link without confirmation. The prior
+		// threshold (up to 3) accepted false positives like the
+		// body word "memory" pulling in three unrelated field
+		// nodes.
+		if len(matches) != 1 {
+			continue
+		}
+		n := matches[0]
+		if opts.HonorScope && workspaceID != "" && n.WorkspaceID != workspaceID {
+			continue
+		}
+		if add(n.ID) {
+			return out
 		}
 	}
 	return out
+}
+
+// hasIdentifierSignal reports whether tok carries a positive
+// "this is code, not English" marker. Pure-lowercase single-word
+// tokens fail the test — they're indistinguishable from common
+// vocabulary and overwhelm the auto-linker with accidental hits.
+func hasIdentifierSignal(tok string) bool {
+	hasUpper := false
+	hasUnderscore := false
+	hasDot := false
+	for _, r := range tok {
+		switch {
+		case r >= 'A' && r <= 'Z':
+			hasUpper = true
+		case r == '_':
+			hasUnderscore = true
+		case r == '.':
+			hasDot = true
+		}
+	}
+	return hasUpper || hasUnderscore || hasDot
 }
 
 // extractIDCandidates pulls every "<...>::<...>" run out of the body

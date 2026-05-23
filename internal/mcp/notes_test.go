@@ -242,6 +242,39 @@ func TestAutoLink_HonorsWorkspaceScope(t *testing.T) {
 	assert.NotContains(t, links, "pkg/b.go::Baz", "ws-b symbol must not leak into ws-a auto-link result")
 }
 
+// TestAutoLink_DoesNotMatchBareEnglishWords pins the regression: a
+// note body containing the word "memory" used to auto-link to
+// `daemon_status_tui.go::repoItem.memory` (a field whose Name is
+// literally "memory"), and "MCP" auto-linked to `Config.MCP`. The
+// auto-linker now requires a code-shape signal on each token
+// (uppercase, underscore, or dot) and a single unambiguous graph
+// match, so plain English words and short caps acronyms with
+// multiple matches no longer pollute the link set.
+func TestAutoLink_DoesNotMatchBareEnglishWords(t *testing.T) {
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "pkg/tui.go::repoItem.memory", Name: "memory", FilePath: "pkg/tui.go"})
+	g.AddNode(&graph.Node{ID: "pkg/config.go::Config.MCP", Name: "MCP", FilePath: "pkg/config.go"})
+	g.AddNode(&graph.Node{ID: "pkg/cli.go::otherMCP", Name: "MCP", FilePath: "pkg/cli.go"})
+
+	body := "Validation memory: MCP integration tests exercising store_memory"
+	links := autoLinkBody(body, g, "", defaultAutoLinkOptions())
+
+	// bare "memory" / "MCP" with multiple-name-match must not link.
+	require.NotContains(t, links, "pkg/tui.go::repoItem.memory",
+		"plain English `memory` must not pull in a field of the same name")
+	require.NotContains(t, links, "pkg/config.go::Config.MCP",
+		"short caps `MCP` with multiple matches is ambiguous; must not auto-link")
+	require.NotContains(t, links, "pkg/cli.go::otherMCP",
+		"short caps `MCP` with multiple matches must not auto-link")
+
+	// A signal-bearing token like store_memory still works when the
+	// graph has a uniquely-named node for it.
+	g.AddNode(&graph.Node{ID: "pkg/mem.go::store_memory", Name: "store_memory", FilePath: "pkg/mem.go"})
+	links = autoLinkBody(body, g, "", defaultAutoLinkOptions())
+	require.Contains(t, links, "pkg/mem.go::store_memory",
+		"snake_case tokens carry the code signal and must still link when unambiguous")
+}
+
 func TestAutoLink_CapsAtMaxLinks(t *testing.T) {
 	g := graph.New()
 	body := strings.Builder{}
