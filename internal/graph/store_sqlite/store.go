@@ -1288,3 +1288,22 @@ func (s *Store) FindNodesByNames(names []string) map[string][]*graph.Node {
 	}
 	return out
 }
+
+// -- BulkLoader implementation -------------------------------------------
+
+// Compile-time assertion: *Store satisfies graph.BulkLoader. The
+// sqlite AddBatch path already runs inside one transaction per
+// chunk and the resolver's batched mutators (ReindexEdges,
+// SetEdgeProvenanceBatch) are already amortised. The BulkLoad
+// bracket is marker-only here: it exists so the indexer's
+// in-memory shadow swap activates — the resolver and its
+// post-resolve passes then run against an in-memory *Graph at
+// nanosecond latency, and the final AddBatch dumps the resolved
+// graph to sqlite in one shot.
+var _ graph.BulkLoader = (*Store)(nil)
+
+// BeginBulkLoad enters bulk mode. No-op for sqlite.
+func (s *Store) BeginBulkLoad() {}
+
+// FlushBulk exits bulk mode. No-op for sqlite.
+func (s *Store) FlushBulk() error { return nil }

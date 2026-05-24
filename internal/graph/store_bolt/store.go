@@ -1766,3 +1766,25 @@ func (s *Store) FindNodesByNames(names []string) map[string][]*graph.Node {
 	})
 	return out
 }
+
+// -- BulkLoader implementation -------------------------------------------
+
+// Compile-time assertion: *Store satisfies graph.BulkLoader. Bolt's
+// AddBatch is already chunked-tx (see addBatchChunkSize), so the
+// BulkLoad bracket is marker-only: implementing the interface lets
+// the indexer's in-memory shadow swap activate for bolt-backed
+// stores. The shadow swap replaces 2000 per-file AddBatch calls with
+// one AddBatch(allNodes, allEdges) at the end — the existing
+// chunked path handles that fine; the bigger win is running the
+// resolver + post-resolve passes against in-memory instead of
+// through bolt's mmap-backed BTree per call.
+var _ graph.BulkLoader = (*Store)(nil)
+
+// BeginBulkLoad enters bulk mode. No-op for bolt — the chunked-tx
+// AddBatch path already amortises per-call overhead well enough.
+// The marker exists so the indexer's BulkLoader probe activates the
+// in-memory shadow swap (the actual perf win).
+func (s *Store) BeginBulkLoad() {}
+
+// FlushBulk exits bulk mode. No-op for bolt.
+func (s *Store) FlushBulk() error { return nil }
