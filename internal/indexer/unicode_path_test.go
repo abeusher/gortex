@@ -47,7 +47,7 @@ func goSrc(funcName string) string {
 // fileKindNodes returns only the file-kind nodes the graph holds for
 // the given key — used to detect a duplicate file-node leaking after a
 // re-index.
-func fileKindNodes(g *graph.Graph, key string) []*graph.Node {
+func fileKindNodes(g graph.Store, key string) []*graph.Node {
 	var out []*graph.Node
 	for _, n := range g.GetFileNodes(key) {
 		if n.Kind == graph.KindFile {

@@ -32,6 +32,12 @@ type Store struct {
 	// two concurrent provenance bumps could both observe the
 	// pre-change Origin and double-charge the revision counter.
 	provMu sync.Mutex
+
+	// resolveMu is the resolver-coordination mutex returned by
+	// ResolveMutex. Held by cross-repo / temporal / external resolver
+	// passes to keep their edge mutations from interleaving. Separate
+	// from provMu since the two protect different invariants.
+	resolveMu sync.Mutex
 }
 
 // Compile-time assertion: *Store satisfies graph.Store.
@@ -59,6 +65,12 @@ func Open(path string) (*Store, error) {
 	}
 	return &Store{db: db}, nil
 }
+
+// ResolveMutex returns the resolver-coordination mutex. Held by
+// cross-repo / temporal / external resolver passes to serialise edge
+// mutations. Separate from provMu (which protects SetEdgeProvenance's
+// read-modify-write) since the two guard different invariants.
+func (s *Store) ResolveMutex() *sync.Mutex { return &s.resolveMu }
 
 // Close closes the underlying bbolt DB.
 func (s *Store) Close() error {

@@ -72,7 +72,7 @@ const (
 //
 // Returns the number of temporal.stub edges pointing at a resolved
 // handler after the pass.
-func ResolveTemporalCalls(g *graph.Graph) int {
+func ResolveTemporalCalls(g graph.Store) int {
 	if g == nil {
 		return 0
 	}
@@ -177,7 +177,7 @@ func (idx *temporalIndex) lookup(kind, name, callerRepo string) (id, origin stri
 // `@WorkflowInterface` annotations (propagated to interface
 // implementors), and (b) returns a name index the stub-call resolver
 // consults.
-func buildTemporalIndex(g *graph.Graph) *temporalIndex {
+func buildTemporalIndex(g graph.Store) *temporalIndex {
 	idx := &temporalIndex{byKindName: map[string][]*graph.Node{}}
 
 	// Phase 1 — Go side. Walk `temporal.register` edges and stamp the
@@ -343,7 +343,7 @@ func stampTemporalRole(n *graph.Node, role, name string) {
 //  3. Unique workspace-wide function whose name matches.
 //
 // Returns nil when no unambiguous match exists.
-func findGoTemporalTarget(g *graph.Graph, caller *graph.Node, name string) *graph.Node {
+func findGoTemporalTarget(g graph.Store, caller *graph.Node, name string) *graph.Node {
 	var sameFile, sameRepo, all []*graph.Node
 	for _, n := range g.AllNodes() {
 		if n == nil {
@@ -384,7 +384,7 @@ func findGoTemporalTarget(g *graph.Graph, caller *graph.Node, name string) *grap
 // distinguished from class methods by the absence of a "receiver"
 // Meta. We narrow to the interface's source-line range so multiple
 // interfaces in one file don't bleed into each other.
-func collectJavaInterfaceMethods(g *graph.Graph, ifaceID string) []*graph.Node {
+func collectJavaInterfaceMethods(g graph.Store, ifaceID string) []*graph.Node {
 	iface := g.GetNode(ifaceID)
 	if iface == nil {
 		return nil
@@ -411,7 +411,7 @@ func collectJavaInterfaceMethods(g *graph.Graph, ifaceID string) []*graph.Node {
 // methodsOfJavaType returns the method nodes of a Java class — i.e.
 // every KindMethod node whose Meta["receiver"] matches the type name.
 // The Java extractor uses the receiver field for class membership.
-func methodsOfJavaType(g *graph.Graph, t *graph.Node) []*graph.Node {
+func methodsOfJavaType(g graph.Store, t *graph.Node) []*graph.Node {
 	if t == nil {
 		return nil
 	}

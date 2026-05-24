@@ -67,7 +67,7 @@ const externalCallPrefix = "external-call::"
 // the external hop visible. Enabled is the opt-in gate
 // (`.gortex.yaml::index::synthesize_external_calls`); when false the
 // pass is a no-op and the graph is untouched.
-func SynthesizeExternalCalls(g *graph.Graph, enabled bool) int {
+func SynthesizeExternalCalls(g graph.Store, enabled bool) int {
 	if g == nil || !enabled {
 		return 0
 	}
@@ -221,7 +221,7 @@ func newExternalCallNode(nodeID, ecosystem, importPath, callerLang string) *grap
 // edgeCallerLanguage returns the source language of the node that owns
 // the call edge's From end, falling back to the file extension of the
 // edge's own FilePath when the caller node carries no Language.
-func edgeCallerLanguage(g *graph.Graph, e *graph.Edge) string {
+func edgeCallerLanguage(g graph.Store, e *graph.Edge) string {
 	if from := g.GetNode(e.From); from != nil && from.Language != "" {
 		return from.Language
 	}

@@ -101,7 +101,7 @@ type IndexError struct {
 
 // Indexer walks a repository and populates the graph.
 type Indexer struct {
-	graph         *graph.Graph
+	graph         graph.Store
 	registry      *parser.Registry
 	resolver      *resolver.Resolver
 	search        search.Backend
@@ -281,8 +281,12 @@ type contractCacheEntry struct {
 	contracts []contracts.Contract
 }
 
-// New creates an Indexer.
-func New(g *graph.Graph, reg *parser.Registry, cfg config.IndexConfig, logger *zap.Logger) *Indexer {
+// New creates an Indexer that writes through the supplied graph.Store.
+// Any backend (in-memory, bbolt-on-disk, sqlite-on-disk, remote) is
+// acceptable — the indexer's mutation paths go through the Store
+// interface methods only, so swapping backends is a zero-code-change
+// configuration choice for callers.
+func New(g graph.Store, reg *parser.Registry, cfg config.IndexConfig, logger *zap.Logger) *Indexer {
 	idx := &Indexer{
 		graph:    g,
 		registry: reg,
@@ -485,7 +489,7 @@ func (idx *Indexer) upgradeSearchToBleve(snapshot []bleveUpgradeEntry) {
 }
 
 // Graph returns the underlying graph.
-func (idx *Indexer) Graph() *graph.Graph { return idx.graph }
+func (idx *Indexer) Graph() graph.Store { return idx.graph }
 
 // Search returns the search backend.
 func (idx *Indexer) Search() search.Backend { return idx.search }

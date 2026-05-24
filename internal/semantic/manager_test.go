@@ -15,7 +15,7 @@ type mockProvider struct {
 	name       string
 	languages  []string
 	available  bool
-	enrichFunc func(g *graph.Graph, root string) (*EnrichResult, error)
+	enrichFunc func(g graph.Store, root string) (*EnrichResult, error)
 	closed     bool
 }
 
@@ -24,7 +24,7 @@ func (m *mockProvider) Languages() []string { return m.languages }
 func (m *mockProvider) Available() bool     { return m.available }
 func (m *mockProvider) Close() error        { m.closed = true; return nil }
 
-func (m *mockProvider) Enrich(g *graph.Graph, repoRoot string) (*EnrichResult, error) {
+func (m *mockProvider) Enrich(g graph.Store, repoRoot string) (*EnrichResult, error) {
 	if m.enrichFunc != nil {
 		return m.enrichFunc(g, repoRoot)
 	}
@@ -37,7 +37,7 @@ func (m *mockProvider) Enrich(g *graph.Graph, repoRoot string) (*EnrichResult, e
 	}, nil
 }
 
-func (m *mockProvider) EnrichFile(g *graph.Graph, repoRoot, filePath string) (*EnrichResult, error) {
+func (m *mockProvider) EnrichFile(g graph.Store, repoRoot, filePath string) (*EnrichResult, error) {
 	return nil, nil
 }
 
@@ -87,7 +87,7 @@ func TestManager_PrioritySelection(t *testing.T) {
 		name:      "high-priority",
 		languages: []string{"go"},
 		available: true,
-		enrichFunc: func(g *graph.Graph, root string) (*EnrichResult, error) {
+		enrichFunc: func(g graph.Store, root string) (*EnrichResult, error) {
 			highCalled = true
 			return &EnrichResult{Provider: "high-priority", Language: "go"}, nil
 		},
@@ -96,7 +96,7 @@ func TestManager_PrioritySelection(t *testing.T) {
 		name:      "low-priority",
 		languages: []string{"go"},
 		available: true,
-		enrichFunc: func(g *graph.Graph, root string) (*EnrichResult, error) {
+		enrichFunc: func(g graph.Store, root string) (*EnrichResult, error) {
 			lowCalled = true
 			return &EnrichResult{Provider: "low-priority", Language: "go"}, nil
 		},

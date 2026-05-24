@@ -17,7 +17,7 @@ import (
 // builder spans every ecosystem the external-call synthesis pass
 // classifies, so one table can exercise Go modules, pip packages, and
 // npm packages through the same real extract → resolve pipeline.
-func buildMultiLangGraph(t *testing.T, files map[string]string) *graph.Graph {
+func buildMultiLangGraph(t *testing.T, files map[string]string) graph.Store {
 	t.Helper()
 	g := graph.New()
 	for path, src := range files {
@@ -58,7 +58,7 @@ func buildMultiLangGraph(t *testing.T, files map[string]string) *graph.Graph {
 // with — and then the opt-in external-call synthesis pass. It mirrors
 // the indexer settle point: synthesis runs strictly after resolution +
 // guard, so the test exercises the same ordering the daemon uses.
-func resolveAndSynthesize(g *graph.Graph, enabled bool) int {
+func resolveAndSynthesize(g graph.Store, enabled bool) int {
 	New(g).ResolveAll()
 	return SynthesizeExternalCalls(g, enabled)
 }
@@ -66,7 +66,7 @@ func resolveAndSynthesize(g *graph.Graph, enabled bool) int {
 // callTargetsFrom collects the To-end of every call/reference edge
 // leaving fromID, so a test can assert on the post-resolution shape of
 // a caller's outbound calls.
-func callTargetsFrom(g *graph.Graph, fromID string) []string {
+func callTargetsFrom(g graph.Store, fromID string) []string {
 	var out []string
 	for _, e := range g.GetOutEdges(fromID) {
 		if e.Kind == graph.EdgeCalls || e.Kind == graph.EdgeReferences {

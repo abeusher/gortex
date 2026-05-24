@@ -48,7 +48,7 @@ func (m *SymbolMap) Size() int {
 // MatchNodeByFileLine finds a Gortex node by file path and line number.
 // This is the primary matching strategy for SCIP and LSP results.
 // It finds the innermost (smallest range) non-file node containing the line.
-func MatchNodeByFileLine(g *graph.Graph, filePath string, line int) *graph.Node {
+func MatchNodeByFileLine(g graph.Store, filePath string, line int) *graph.Node {
 	nodes := g.GetFileNodes(filePath)
 
 	// First: find the innermost node containing this line (smallest range).
@@ -89,12 +89,12 @@ func MatchNodeByFileLine(g *graph.Graph, filePath string, line int) *graph.Node 
 }
 
 // MatchNodeByQualName finds a Gortex node by qualified name.
-func MatchNodeByQualName(g *graph.Graph, qualName string) *graph.Node {
+func MatchNodeByQualName(g graph.Store, qualName string) *graph.Node {
 	return g.GetNodeByQualName(qualName)
 }
 
 // MatchNodeByNameInFile finds a Gortex node by name within a specific file.
-func MatchNodeByNameInFile(g *graph.Graph, name, filePath string) *graph.Node {
+func MatchNodeByNameInFile(g graph.Store, name, filePath string) *graph.Node {
 	nodes := g.GetFileNodes(filePath)
 	for _, n := range nodes {
 		if n.Name == name {

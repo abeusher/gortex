@@ -98,7 +98,7 @@ func TestResolver_CrossRepoResolver_SerializeOnGraph(t *testing.T) {
 // one unresolved edge so the resolver actually has work to do during
 // the race test. The shape doesn't matter — only that buildDirIndexes
 // observes >0 file nodes and the resolveEdge inner loop runs.
-func buildSmallGraph(t *testing.T) *graph.Graph {
+func buildSmallGraph(t *testing.T) graph.Store {
 	t.Helper()
 	g := graph.New()
 	for _, fp := range []string{"repo-a/lib/a.go", "repo-a/lib/b.go", "repo-b/main.go"} {

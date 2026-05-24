@@ -50,7 +50,7 @@ func TestRunGreet(t *testing.T) {
 	return dir
 }
 
-func countEdges(g *graph.Graph, kind graph.EdgeKind) int {
+func countEdges(g graph.Store, kind graph.EdgeKind) int {
 	n := 0
 	for _, e := range g.AllEdges() {
 		if e.Kind == kind {

@@ -25,7 +25,7 @@ import (
 // findTopicNode walks the graph for a KindTopic node by ID and
 // returns it (or nil if absent). Used by topic-edge tests to assert
 // node materialisation alongside edge presence.
-func findTopicNode(g *graph.Graph, id string) *graph.Node {
+func findTopicNode(g graph.Store, id string) *graph.Node {
 	for _, n := range g.AllNodes() {
 		if n.Kind == graph.KindTopic && n.ID == id {
 			return n
@@ -36,7 +36,7 @@ func findTopicNode(g *graph.Graph, id string) *graph.Node {
 
 // collectTopicEdges returns every produces_topic / consumes_topic
 // edge in the graph as "from→to" strings, for diagnostic output.
-func collectTopicEdges(g *graph.Graph, kind graph.EdgeKind) []string {
+func collectTopicEdges(g graph.Store, kind graph.EdgeKind) []string {
 	var out []string
 	for _, e := range g.AllEdges() {
 		if e.Kind == kind {
@@ -264,7 +264,7 @@ func TestReconcileContractEdges_TopicEdges_CrossWorkspaceIsolation(t *testing.T)
 }
 
 // topicNodeIDs returns the ID of every KindTopic node in the graph.
-func topicNodeIDs(g *graph.Graph) []string {
+func topicNodeIDs(g graph.Store) []string {
 	var out []string
 	for _, n := range g.AllNodes() {
 		if n.Kind == graph.KindTopic {

@@ -55,7 +55,7 @@ func (idx *Indexer) materializeDataflowParams() {
 // and lifts the edge target from the function node to the param
 // node at the recorded position. Edges that already point at a
 // param node are left alone.
-func rewriteArgOf(g *graph.Graph, e *graph.Edge) {
+func rewriteArgOf(g graph.Store, e *graph.Edge) {
 	if e == nil || e.Meta == nil {
 		return
 	}
@@ -83,7 +83,7 @@ func rewriteArgOf(g *graph.Graph, e *graph.Edge) {
 
 // rewriteReturnsTo lifts the placeholder From by joining on the
 // resolved EdgeCalls edge from the same caller and line.
-func rewriteReturnsTo(g *graph.Graph, e *graph.Edge) {
+func rewriteReturnsTo(g graph.Store, e *graph.Edge) {
 	if e == nil || e.Meta == nil {
 		return
 	}
@@ -112,7 +112,7 @@ func rewriteReturnsTo(g *graph.Graph, e *graph.Edge) {
 // unresolved target string so we don't lift to the wrong call when
 // two calls live on the same line. Falls back to the first match
 // otherwise.
-func findCallTarget(g *graph.Graph, callerID string, line int, calleeText string) string {
+func findCallTarget(g graph.Store, callerID string, line int, calleeText string) string {
 	out := g.GetOutEdges(callerID)
 	var fallback string
 	for _, e := range out {
@@ -163,7 +163,7 @@ func callTargetMatches(call *graph.Edge, calleeText string) bool {
 
 // paramNodeAtPosition returns the param node ID with the recorded
 // position attached to ownerID via EdgeParamOf.
-func paramNodeAtPosition(g *graph.Graph, ownerID string, pos int) string {
+func paramNodeAtPosition(g graph.Store, ownerID string, pos int) string {
 	in := g.GetInEdges(ownerID)
 	for _, e := range in {
 		if e.Kind != graph.EdgeParamOf {

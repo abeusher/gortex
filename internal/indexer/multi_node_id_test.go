@@ -130,7 +130,7 @@ func TestMultiRepo_ResolvesCallEdges(t *testing.T) {
 	}
 }
 
-func outEdgeSummaries(g *graph.Graph, id string) []string {
+func outEdgeSummaries(g graph.Store, id string) []string {
 	var out []string
 	for _, e := range g.GetOutEdges(id) {
 		out = append(out, string(e.Kind)+":"+e.To)

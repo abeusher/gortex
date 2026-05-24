@@ -50,7 +50,7 @@ const grpcStubPrefix = unresolvedPrefix + "grpc::"
 //
 // Returns the number of grpc.stub edges pointing at a resolved handler
 // after the pass.
-func ResolveGRPCStubCalls(g *graph.Graph) int {
+func ResolveGRPCStubCalls(g graph.Store) int {
 	if g == nil {
 		return 0
 	}
@@ -138,7 +138,7 @@ func (idx *grpcHandlerIndex) lookup(service, method, callerRepo string) (id, ori
 
 // buildGRPCHandlerIndex walks the graph once and indexes server-side
 // gRPC handler methods by service, via both discovery signals.
-func buildGRPCHandlerIndex(g *graph.Graph) *grpcHandlerIndex {
+func buildGRPCHandlerIndex(g graph.Store) *grpcHandlerIndex {
 	typesByName := map[string][]*graph.Node{}
 	ifacesByName := map[string][]*graph.Node{}
 	for _, n := range g.AllNodes() {

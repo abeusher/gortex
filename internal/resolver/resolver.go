@@ -35,7 +35,7 @@ type ResolveStats struct {
 // Indexer.IndexFile) crash the daemon with "concurrent map writes"
 // in buildDirIndexes.
 type Resolver struct {
-	graph        *graph.Graph
+	graph        graph.Store
 	dirIndex     map[string][]*graph.Node
 	lastDirIndex map[string][]*graph.Node
 	// providesForIdx maps `provides_for: AbstractName` (from @Module
@@ -68,7 +68,7 @@ type Resolver struct {
 	// pass, torn down at the end.
 	depModuleIndex map[string][]depModuleEntry
 	// mu serialises resolution phases against the shared graph.
-	// Pointer so every Resolver built from the same *graph.Graph
+	// Pointer so every Resolver built from the same graph.Store
 	// locks the same mutex — necessary for MultiIndexer's per-repo
 	// goroutines, each of which spawns its own Resolver instance.
 	// Without the shared lock, concurrent ResolveAll passes race on
@@ -121,11 +121,11 @@ type depModuleEntry struct {
 	node       *graph.Node
 }
 
-// New creates a Resolver for the given graph. The returned Resolver
-// shares graph.ResolveMutex() with every other Resolver built from
-// the same Graph, so their ResolveAll / ResolveFile calls serialise
-// end-to-end.
-func New(g *graph.Graph) *Resolver {
+// New creates a Resolver for the given store. The returned Resolver
+// shares store.ResolveMutex() with every other Resolver built from
+// the same Store, so their ResolveAll / ResolveFile calls serialise
+// end-to-end across cross-repo / temporal / external passes.
+func New(g graph.Store) *Resolver {
 	return &Resolver{graph: g, mu: g.ResolveMutex()}
 }
 

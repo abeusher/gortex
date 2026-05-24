@@ -747,7 +747,7 @@ func TestPropertyReindexIsolation(t *testing.T) {
 }
 
 // countRepoEdges counts edges where at least one endpoint belongs to the given repo prefix.
-func countRepoEdges(g *graph.Graph, repoPrefix string) int {
+func countRepoEdges(g graph.Store, repoPrefix string) int {
 	prefix := repoPrefix + "/"
 	count := 0
 	for _, e := range g.AllEdges() {

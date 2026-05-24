@@ -25,7 +25,7 @@ import "github.com/zzet/gortex/internal/graph"
 //
 // Returns the count of cross-repo relationships found this pass — the
 // number of parallel edges that exist after it, modulo graph dedup.
-func DetectCrossRepoEdges(g *graph.Graph) int {
+func DetectCrossRepoEdges(g graph.Store) int {
 	if g == nil {
 		return 0
 	}

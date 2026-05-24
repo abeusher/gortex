@@ -62,7 +62,7 @@ type CrossWorkspaceDepLookup func(sourceWorkspaceID string) []CrossWorkspaceDepR
 // the target workspace via `cross_workspace_deps` AND, for import
 // edges, the import path has a declared-module prefix.
 type CrossRepoResolver struct {
-	graph        *graph.Graph
+	graph        graph.Store
 	dirIndex     map[string][]*graph.Node
 	lastDirIndex map[string][]*graph.Node
 	// reachableReposByFile maps a caller file's ID to the set of repo
@@ -98,7 +98,7 @@ type CrossRepoResolver struct {
 }
 
 // NewCrossRepo creates a CrossRepoResolver for the given graph.
-func NewCrossRepo(g *graph.Graph) *CrossRepoResolver {
+func NewCrossRepo(g graph.Store) *CrossRepoResolver {
 	return &CrossRepoResolver{graph: g, mu: g.ResolveMutex()}
 }
 

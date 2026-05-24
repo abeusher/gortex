@@ -87,7 +87,7 @@ func Gone() {}
 // of its structural identity (node identities + edge triples). Two
 // graphs with an equal projection are byte-identical for every query
 // the engine can answer.
-func canonicalGraph(g *graph.Graph) string {
+func canonicalGraph(g graph.Store) string {
 	var lines []string
 	for _, n := range g.AllNodes() {
 		if n == nil {

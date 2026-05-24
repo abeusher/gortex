@@ -28,7 +28,7 @@ import (
 //
 // Returns counts for telemetry: number of nodes marked as test,
 // number of EdgeTests emitted.
-func markTestSymbolsAndEmitEdges(g *graph.Graph) (markedTests int, edgesEmitted int) {
+func markTestSymbolsAndEmitEdges(g graph.Store) (markedTests int, edgesEmitted int) {
 	if g == nil {
 		return 0, 0
 	}
@@ -173,7 +173,7 @@ func isTestNode(n *graph.Node) bool {
 //
 // Returns "" when no signal applies; the caller leaves test_runner
 // unset rather than guessing.
-func detectTestRunnerForFile(g *graph.Graph, fileNode *graph.Node) string {
+func detectTestRunnerForFile(g graph.Store, fileNode *graph.Node) string {
 	if fileNode == nil {
 		return ""
 	}
@@ -215,7 +215,7 @@ func detectTestRunnerForFile(g *graph.Graph, fileNode *graph.Node) string {
 // (mirrors DetectJSTSTestRunner so files compiled by a non-JS / TS
 // extractor still classify correctly), Python (pytest / unittest),
 // and Ruby (rspec / minitest).
-func detectRunnerFromImportEdges(g *graph.Graph, fileNode *graph.Node) string {
+func detectRunnerFromImportEdges(g graph.Store, fileNode *graph.Node) string {
 	const prefix = "unresolved::import::"
 	for _, e := range g.GetOutEdges(fileNode.ID) {
 		if e == nil || e.Kind != graph.EdgeImports {

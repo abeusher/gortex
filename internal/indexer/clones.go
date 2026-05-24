@@ -234,7 +234,7 @@ func bodyText(lines []string, startLine, endLine int) string {
 // (deletes clone_shingles, sets clone_sig) across nodes that other
 // graph-wide passes (markTestSymbolsAndEmitEdges, ResolveTemporalCalls,
 // reach.BuildIndex) also touch under the same mutex.
-func finaliseCloneSignatures(g *graph.Graph) {
+func finaliseCloneSignatures(g graph.Store) {
 	// First pass: collect every body that has stashed shingles. We
 	// capture the *graph.Node pointers up front so the CMS-build pass
 	// and the signature-compute pass don't both re-walk g.AllNodes().
@@ -342,7 +342,7 @@ type CloneDetectionStats struct {
 // edges cannot survive — when either endpoint's file is reindexed,
 // EvictFile removes that node's edges in both directions before this
 // pass re-runs.
-func detectClonesAndEmitEdges(g *graph.Graph, threshold float64) CloneDetectionStats {
+func detectClonesAndEmitEdges(g graph.Store, threshold float64) CloneDetectionStats {
 	return detectClonesAndEmitEdgesCtx(context.Background(), g, threshold)
 }
 
@@ -353,7 +353,7 @@ func detectClonesAndEmitEdges(g *graph.Graph, threshold float64) CloneDetectionS
 // without intra-stage reporters an operator sees just one
 // "clone detection pass" marker followed by minutes of silence — no
 // way to tell finalise-signatures from LSH from edge-emission.
-func detectClonesAndEmitEdgesCtx(ctx context.Context, g *graph.Graph, threshold float64) CloneDetectionStats {
+func detectClonesAndEmitEdgesCtx(ctx context.Context, g graph.Store, threshold float64) CloneDetectionStats {
 	var stats CloneDetectionStats
 	if g == nil {
 		return stats
@@ -527,7 +527,7 @@ type diffusionEdge struct {
 // directPairs carries the canonicalised clone pairs already emitted as
 // EdgeSimilarTo; any pair in that set is skipped so semantically_related
 // and similar_to partition cleanly.
-func diffuseSimilarityEdges(g *graph.Graph, pairs []clones.Pair, directPairs map[[2]string]struct{}) (diffusedPairs, diffusedEdges int) {
+func diffuseSimilarityEdges(g graph.Store, pairs []clones.Pair, directPairs map[[2]string]struct{}) (diffusedPairs, diffusedEdges int) {
 	if g == nil || len(pairs) < 2 {
 		return 0, 0
 	}
@@ -633,7 +633,7 @@ func diffuseSimilarityEdges(g *graph.Graph, pairs []clones.Pair, directPairs map
 // node's file/line for locality. Origin is ast_inferred — the
 // relationship is a statistical estimate over normalised tokens, not a
 // structural fact.
-func emitSimilarEdge(g *graph.Graph, from, to *graph.Node, similarity float64) {
+func emitSimilarEdge(g graph.Store, from, to *graph.Node, similarity float64) {
 	g.AddEdge(&graph.Edge{
 		From:       from.ID,
 		To:         to.ID,
@@ -651,7 +651,7 @@ func emitSimilarEdge(g *graph.Graph, from, to *graph.Node, similarity float64) {
 // edge is anchored at the source node's file/line and origin is
 // ast_inferred — the score is a statistical estimate over normalised
 // tokens, here additionally smoothed across the similarity graph.
-func emitSemanticallyRelatedEdge(g *graph.Graph, from, to *graph.Node, similarity float64) {
+func emitSemanticallyRelatedEdge(g graph.Store, from, to *graph.Node, similarity float64) {
 	g.AddEdge(&graph.Edge{
 		From:       from.ID,
 		To:         to.ID,

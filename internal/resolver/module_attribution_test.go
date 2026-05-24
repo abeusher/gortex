@@ -11,7 +11,7 @@ import (
 
 // seedFile adds a KindFile node with the given language to the
 // graph; tests use it to drive the language-aware attribution pass.
-func seedFile(g *graph.Graph, fileID, language string) {
+func seedFile(g graph.Store, fileID, language string) {
 	g.AddNode(&graph.Node{
 		ID: fileID, Kind: graph.KindFile, Name: fileID,
 		FilePath: fileID, Language: language,
@@ -21,7 +21,7 @@ func seedFile(g *graph.Graph, fileID, language string) {
 // seedExternalImport drops in an EdgeImports edge that's already
 // landed at an `external::*` target — the post-pass inputs we want
 // to exercise.
-func seedExternalImport(g *graph.Graph, fileID, importPath string) *graph.Edge {
+func seedExternalImport(g graph.Store, fileID, importPath string) *graph.Edge {
 	e := &graph.Edge{
 		From:     fileID,
 		To:       "external::" + importPath,
@@ -179,7 +179,7 @@ func TestAttributeNonGo_IdempotentOnSecondPass(t *testing.T) {
 // outEdgesOfKind is a small filter over Graph.GetOutEdges for the
 // assertions above; declared here to keep the test file self-
 // contained.
-func outEdgesOfKind(g *graph.Graph, fileID string, kind graph.EdgeKind) []*graph.Edge {
+func outEdgesOfKind(g graph.Store, fileID string, kind graph.EdgeKind) []*graph.Edge {
 	var out []*graph.Edge
 	for _, e := range g.GetOutEdges(fileID) {
 		if e.Kind == kind {

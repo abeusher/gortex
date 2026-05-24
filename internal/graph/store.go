@@ -1,5 +1,7 @@
 package graph
 
+import "sync"
+
 // Store is the persistence-and-query backend the rest of gortex sees
 // behind the *Graph type. The only implementation today is the
 // in-memory *Graph; future implementations will include an on-disk
@@ -21,12 +23,14 @@ package graph
 //     and remote backends return whatever they can compute and callers
 //     treat the result as advisory.
 //
-//   - *Graph's ResolveMutex() is intentionally NOT on the interface.
-//     It's an in-memory implementation detail (the indexer's
-//     post-parse resolver uses it for fine-grained coordination) and
-//     does not generalise to disk / remote backends. Resolver callers
-//     keep operating on *Graph directly until that coordination is
-//     reshaped.
+//   - ResolveMutex() returns a backend-owned mutex that resolver
+//     instances (cross-repo, temporal, external) share to serialise
+//     their edge-mutation passes against each other and against the
+//     indexer's incremental rewrites. Every backend needs equivalent
+//     coordination; the in-memory store uses its existing
+//     graph-wide resolveMu, disk backends keep a dedicated mutex
+//     alongside their own write serialisation. The returned pointer
+//     is owned by the store and must not be Unlocked when not held.
 type Store interface {
 	// --- Writes -----------------------------------------------------
 
@@ -78,6 +82,13 @@ type Store interface {
 
 	RepoMemoryEstimate(repoPrefix string) RepoMemoryEstimate
 	AllRepoMemoryEstimates() map[string]RepoMemoryEstimate
+
+	// --- Coordination ----------------------------------------------
+
+	// ResolveMutex returns a backend-owned mutex resolver instances
+	// share to serialise edge-mutation passes. See the package doc
+	// above for the full contract.
+	ResolveMutex() *sync.Mutex
 }
 
 // Compile-time assertion: *Graph satisfies the Store interface. If a

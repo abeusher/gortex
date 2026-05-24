@@ -880,7 +880,7 @@ func TestReconcileContractEdges_OpenAPIBridge(t *testing.T) {
 
 // matchEdgeSummaries dumps all EdgeMatches as "from → to" strings for
 // failure-message context when the expected bridges aren't present.
-func matchEdgeSummaries(g *graph.Graph) []string {
+func matchEdgeSummaries(g graph.Store) []string {
 	var out []string
 	for _, e := range g.AllEdges() {
 		if e.Kind == graph.EdgeMatches {
@@ -927,7 +927,7 @@ func TestReconcileContractEdges_PurgesStaleOnUntrack(t *testing.T) {
 		len(remaining), remaining)
 }
 
-func collectMatchEdges(g *graph.Graph) []string {
+func collectMatchEdges(g graph.Store) []string {
 	var out []string
 	for _, e := range g.AllEdges() {
 		if e.Kind == graph.EdgeMatches {

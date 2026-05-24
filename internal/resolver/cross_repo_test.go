@@ -18,7 +18,7 @@ import (
 // without it, a bare name like `Helper` could land on any repo that
 // happens to define a `Helper`, which is the exact name-collision
 // false-positive class this guards against.
-func wireImport(g *graph.Graph, callerFile, targetRepo, targetFile string) {
+func wireImport(g graph.Store, callerFile, targetRepo, targetFile string) {
 	g.AddNode(&graph.Node{
 		ID: targetFile, Kind: graph.KindFile, Name: targetFile,
 		FilePath: targetFile, Language: "go", RepoPrefix: targetRepo,

@@ -39,7 +39,7 @@ const modulePathStdlib = "stdlib"
 // Statistics counters surface back through ExternalsResult so the caller
 // can report nodes/edges added.
 type externalsAttribution struct {
-	g            *graph.Graph
+	g            graph.Store
 	pkgByPath    map[string]*packages.Package
 	moduleByPath map[string]string
 	extByObj     map[types.Object]string
@@ -57,7 +57,7 @@ type externalsAttribution struct {
 // roots. Walking pkg.Imports collects every dep — stdlib and module-cache
 // alike — so resolveSymbol can find the owning *packages.Package for an
 // arbitrary types.Object.
-func newExternalsAttribution(g *graph.Graph, roots []*packages.Package, provider string) *externalsAttribution {
+func newExternalsAttribution(g graph.Store, roots []*packages.Package, provider string) *externalsAttribution {
 	pkgByPath := make(map[string]*packages.Package)
 	var visit func(p *packages.Package)
 	visit = func(p *packages.Package) {

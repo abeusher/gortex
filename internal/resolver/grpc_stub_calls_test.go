@@ -14,7 +14,7 @@ import (
 // grpc.stub call edge, and a server-side handler discoverable via
 // registration and/or interface satisfaction.
 type grpcTestGraph struct {
-	g *graph.Graph
+	g graph.Store
 }
 
 func newGRPCTestGraph() *grpcTestGraph { return &grpcTestGraph{g: graph.New()} }

@@ -63,7 +63,7 @@ func openAndScan(conn *Conn, statement string) error {
 }
 `
 
-func similarToEdges(g *graph.Graph) []*graph.Edge {
+func similarToEdges(g graph.Store) []*graph.Edge {
 	var out []*graph.Edge
 	for _, e := range g.AllEdges() {
 		if e.Kind == graph.EdgeSimilarTo {

@@ -65,7 +65,7 @@ func (p *Provider) Available() bool {
 	return true
 }
 
-func (p *Provider) Enrich(g *graph.Graph, repoRoot string) (*semantic.EnrichResult, error) {
+func (p *Provider) Enrich(g graph.Store, repoRoot string) (*semantic.EnrichResult, error) {
 	start := time.Now()
 
 	absRoot, err := filepath.Abs(repoRoot)
@@ -285,7 +285,7 @@ func (p *Provider) Enrich(g *graph.Graph, repoRoot string) (*semantic.EnrichResu
 	return result, nil
 }
 
-func (p *Provider) EnrichFile(g *graph.Graph, repoRoot, filePath string) (*semantic.EnrichResult, error) {
+func (p *Provider) EnrichFile(g graph.Store, repoRoot, filePath string) (*semantic.EnrichResult, error) {
 	// go/types can do incremental loading per package, but for simplicity
 	// we re-enrich the whole graph. The manager's debounce prevents thrashing.
 	return nil, nil
@@ -528,7 +528,7 @@ func (p *Provider) loadPackages(dir string) ([]*packages.Package, *token.FileSet
 }
 
 // enrichImplements confirms existing EdgeImplements edges using go/types.
-func (p *Provider) enrichImplements(g *graph.Graph, pkgs []*packages.Package, objToNode map[types.Object]string) int {
+func (p *Provider) enrichImplements(g graph.Store, pkgs []*packages.Package, objToNode map[types.Object]string) int {
 	confirmed := 0
 
 	// Collect all interfaces from the loaded packages.
@@ -565,7 +565,7 @@ func (p *Provider) enrichImplements(g *graph.Graph, pkgs []*packages.Package, ob
 }
 
 // addMissingImplements discovers interface implementations that tree-sitter missed.
-func (p *Provider) addMissingImplements(g *graph.Graph, pkgs []*packages.Package, objToNode map[types.Object]string, absRoot string) int {
+func (p *Provider) addMissingImplements(g graph.Store, pkgs []*packages.Package, objToNode map[types.Object]string, absRoot string) int {
 	added := 0
 
 	// Collect interfaces and concrete types.
@@ -619,7 +619,7 @@ func (p *Provider) addMissingImplements(g *graph.Graph, pkgs []*packages.Package
 }
 
 // findContainingFunc finds the Gortex function/method node that contains the given position.
-func findContainingFunc(g *graph.Graph, pkgs []*packages.Package, fset *token.FileSet, absRoot string, pos token.Position) *graph.Node {
+func findContainingFunc(g graph.Store, pkgs []*packages.Package, fset *token.FileSet, absRoot string, pos token.Position) *graph.Node {
 	relPath := relativePath(pos.Filename, absRoot)
 	if relPath == "" {
 		return nil

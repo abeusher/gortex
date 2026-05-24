@@ -45,7 +45,7 @@ type RepoMetadata struct {
 
 // MultiIndexer orchestrates indexing across multiple repositories.
 type MultiIndexer struct {
-	graph     *graph.Graph
+	graph     graph.Store
 	registry  *parser.Registry
 	search    search.Backend
 	embedder  embedding.Provider
@@ -491,7 +491,7 @@ func (mi *MultiIndexer) externalCallSynthesisEnabled() bool {
 
 // NewMultiIndexer creates a MultiIndexer.
 func NewMultiIndexer(
-	g *graph.Graph,
+	g graph.Store,
 	reg *parser.Registry,
 	s search.Backend,
 	cm *config.ConfigManager,
@@ -1587,7 +1587,7 @@ func (mi *MultiIndexer) MergedContractRegistry() *contracts.Registry {
 // re-extract shapes (the type nodes already have them from
 // snapshotContractShapes if they were referenced anywhere), it just
 // attaches them to the new contract entries.
-func (mi *MultiIndexer) attachInlinedShapes(cr *contracts.Registry, g *graph.Graph) {
+func (mi *MultiIndexer) attachInlinedShapes(cr *contracts.Registry, g graph.Store) {
 	idsToTouch := map[string]bool{}
 	for _, c := range cr.All() {
 		if c.Meta == nil {
@@ -2036,7 +2036,7 @@ func (mi *MultiIndexer) ReconcileContractEdges() int {
 // have the contract ID can also look up the topic node directly.
 // Meta on the node carries the broker family and the raw topic name
 // for filterless queries.
-func emitTopicEdges(g *graph.Graph, m contracts.CrossLink, topicNodes map[string]struct{}) {
+func emitTopicEdges(g graph.Store, m contracts.CrossLink, topicNodes map[string]struct{}) {
 	// Trust the matcher to bucket only same-broker contracts together
 	// because Contract.ID already includes the broker token; if the
 	// broker isn't on the provider Meta, fall through to the contract
@@ -2136,7 +2136,7 @@ func parseTopicContractID(id string) (broker, name string, ok bool) {
 }
 
 // Graph returns the underlying shared graph.
-func (mi *MultiIndexer) Graph() *graph.Graph {
+func (mi *MultiIndexer) Graph() graph.Store {
 	return mi.graph
 }
 

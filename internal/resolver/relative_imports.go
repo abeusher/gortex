@@ -79,7 +79,7 @@ func (r *Resolver) resolveRelativeImports() {
 // "" if no candidate exists in the graph or if `stem` doesn't look like
 // a relative-import stem (no slash separator — those are absolute
 // module references handled by attributeNonGoModuleImports).
-func resolvePythonRelativeImport(g *graph.Graph, stem string) string {
+func resolvePythonRelativeImport(g graph.Store, stem string) string {
 	if !strings.Contains(stem, "/") {
 		return ""
 	}
@@ -97,7 +97,7 @@ func resolvePythonRelativeImport(g *graph.Graph, stem string) string {
 // validated to belong to the module-attribution pass and are skipped
 // here. Returns "" when the resolved path escapes the repo root or
 // when the target file is not in the graph.
-func resolveDartRelativeImport(g *graph.Graph, importingFile, uri string) string {
+func resolveDartRelativeImport(g graph.Store, importingFile, uri string) string {
 	if uri == "" || strings.HasPrefix(uri, "dart:") || strings.HasPrefix(uri, "package:") {
 		return ""
 	}

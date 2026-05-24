@@ -44,6 +44,13 @@ type Store struct {
 	// concurrency test predictable.
 	writeMu sync.Mutex
 
+	// resolveMu is the resolver-coordination mutex returned by
+	// ResolveMutex. Held by cross-repo / temporal / external resolver
+	// passes to keep their edge mutations from interleaving. Separate
+	// from writeMu so the resolver can hold it across multiple writes
+	// without blocking unrelated steady-state mutations.
+	resolveMu sync.Mutex
+
 	edgeIdentityRevs atomic.Int64
 
 	// Prepared statements (compiled once in Open, closed in Close).
@@ -84,6 +91,14 @@ type Store struct {
 
 // Compile-time assertion: *Store satisfies graph.Store.
 var _ graph.Store = (*Store)(nil)
+
+// ResolveMutex returns the resolver-coordination mutex. Held by
+// cross-repo / temporal / external resolver passes to serialise edge
+// mutations. Separate from writeMu (which protects per-statement
+// write serialisation against SQLITE_BUSY) so the resolver can hold
+// it across multi-write batches without blocking unrelated steady-
+// state mutations on the same store.
+func (s *Store) ResolveMutex() *sync.Mutex { return &s.resolveMu }
 
 // Open opens (or creates) the SQLite database at path, runs the schema
 // migration, and prepares hot statements. The DB is opened with WAL
