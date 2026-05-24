@@ -1,22 +1,21 @@
 // Command store-bench compares the three graph.Store implementations
-// (in-memory, bbolt-on-disk, SQLite-on-disk) on equivalent workloads.
+// (in-memory, bbolt-on-disk, SQLite-on-disk) by running the FULL
+// indexer pipeline against the same source repo through each backend.
 //
-// Procedure:
+// What changed from the earlier "migration" harness: previously this
+// bench built an in-memory reference graph once, then bulk-loaded it
+// into each backend via AddBatch. That measured the cost of migrating
+// a pre-built graph between stores, NOT the cost of indexing through
+// the store. The disk backends' real workload — write per-file batches
+// streaming out of the parser — was never exercised, so the numbers
+// understated bbolt's per-Tx commit fan-out and overstated sqlite's
+// bulk-insert efficiency.
 //
-//  1. Index the target repo once with the in-memory indexer to build a
-//     reference graph.Graph. This becomes the "ground truth" data set
-//     every backend gets loaded with.
-//  2. For each backend: open a fresh store, bulk-load it from the
-//     reference graph via AddBatch (timed), measure on-disk size,
-//     run a fixed query workload (point lookups + adjacency walks +
-//     name searches), measure p50/p95 latencies, sample heap RSS.
-//  3. Print a comparison table.
-//
-// The reference-graph step uses the in-memory store as the source of
-// truth so all backends benchmark against identical data. The bench
-// measures the Store interface itself, not end-to-end indexing through
-// each backend (that comes later, once the indexer is refactored to
-// take graph.Store rather than *graph.Graph).
+// Now each backend gets its own indexer.New(store, ...) call and runs
+// the complete IndexCtx pipeline (parse → resolve → search index →
+// contracts → clones → stub resolution → external-call synthesis).
+// That's apples-to-apples: the same work the daemon would do on a
+// cold start, against the backend that would persist it.
 package main
 
 import (
@@ -44,9 +43,9 @@ import (
 	"github.com/zzet/gortex/internal/progress"
 )
 
-// stageReporter mirrors bench/perf-profile's progress sink so we get
-// visibility into where the indexer is spending time on the reference
-// build (and also confirms the indexer is doing real work).
+// stageReporter prints per-stage timings to stderr so a long-running
+// backend (full indexer pipeline through bbolt on a 35k-file repo)
+// shows progress instead of looking hung.
 type stageReporter struct {
 	start time.Time
 	last  string
@@ -58,37 +57,37 @@ func (s *stageReporter) Report(stage string, cur, total int) {
 	}
 	s.last = stage
 	if cur == 0 && total == 0 {
-		fmt.Fprintf(os.Stderr, "  [%6.2fs] %s\n", time.Since(s.start).Seconds(), stage)
+		fmt.Fprintf(os.Stderr, "    [%6.2fs] %s\n", time.Since(s.start).Seconds(), stage)
 		return
 	}
-	fmt.Fprintf(os.Stderr, "  [%6.2fs] %s %d/%d\n", time.Since(s.start).Seconds(), stage, cur, total)
+	fmt.Fprintf(os.Stderr, "    [%6.2fs] %s %d/%d\n", time.Since(s.start).Seconds(), stage, cur, total)
 }
 
 type benchResult struct {
-	Backend     string
-	NodeCount   int
-	EdgeCount   int
-	LoadMs      float64 // AddBatch(refNodes, refEdges) wall time
-	DiskBytes   int64   // on-disk size after load (0 for in-memory)
-	QueryP50us  float64 // microseconds for clarity at sub-ms latencies
-	QueryP95us  float64
-	HeapMB      float64 // process heap after a forced GC
-	IndexBuilt  bool    // true when load completed
-	Err         string
+	Backend    string
+	NodeCount  int
+	EdgeCount  int
+	IndexMs    float64 // full indexer pipeline wall time
+	DiskBytes  int64   // on-disk size after Close (0 for in-memory)
+	QueryP50us float64
+	QueryP95us float64
+	HeapAllocMB float64 // live allocated bytes after GC
+	HeapInuseMB float64 // span footprint after GC
+	Err        string
 }
 
 type queryWorkload struct {
-	nodeIDs     []string // for GetNode
-	outIDs      []string // for GetOutEdges
-	inIDs       []string // for GetInEdges
-	names       []string // for FindNodesByName
-	filePaths   []string // for GetFileNodes
+	nodeIDs   []string
+	outIDs    []string
+	inIDs     []string
+	names     []string
+	filePaths []string
 }
 
 func main() {
 	root := flag.String("root", "", "repo root to index (required)")
-	workers := flag.Int("workers", runtime.NumCPU(), "indexer parallelism for reference graph")
-	querySize := flag.Int("queries", 1000, "number of point/adjacency queries per backend")
+	workers := flag.Int("workers", runtime.NumCPU(), "indexer parallelism")
+	querySize := flag.Int("queries", 1000, "query workload size per backend")
 	skipMemory := flag.Bool("skip-memory", false, "skip the in-memory baseline")
 	skipBolt := flag.Bool("skip-bolt", false, "skip the bbolt backend")
 	skipSQLite := flag.Bool("skip-sqlite", false, "skip the sqlite backend")
@@ -96,125 +95,166 @@ func main() {
 	if *root == "" {
 		die("usage: store-bench -root <path>")
 	}
-
-	// Build reference graph in memory.
-	fmt.Fprintln(os.Stderr, "[step 1] indexing reference graph...")
-	t0 := time.Now()
-	refGraph, refStats, err := buildReferenceGraph(*root, *workers)
+	absRoot, err := filepath.Abs(*root)
 	if err != nil {
-		die("reference index: %v", err)
+		die("abs: %v", err)
 	}
-	fmt.Fprintf(os.Stderr, "  reference graph: %d nodes, %d edges, indexed in %.2fs\n",
-		refStats.nodeCount, refStats.edgeCount, time.Since(t0).Seconds())
 
-	// Pick a deterministic-ish query workload from the reference graph.
-	workload := pickQueries(refGraph, *querySize)
-	fmt.Fprintf(os.Stderr, "  workload: %d point lookups, %d adjacency walks, %d name searches, %d file scans\n",
-		len(workload.nodeIDs), len(workload.outIDs)+len(workload.inIDs), len(workload.names), len(workload.filePaths))
-
-	// Run each backend.
 	var results []benchResult
-
 	if !*skipMemory {
-		fmt.Fprintln(os.Stderr, "[step 2a] benching in-memory backend...")
-		results = append(results, benchBackend("memory", refGraph, workload, func() (graph.Store, func() int64, error) {
-			return graph.New(), func() int64 { return 0 }, nil
-		}))
+		fmt.Fprintln(os.Stderr, "[memory] indexing through in-memory Store...")
+		results = append(results, runBackend("memory", absRoot, *workers, *querySize,
+			func() (graph.Store, func() int64, error) {
+				return graph.New(), func() int64 { return 0 }, nil
+			}))
 	}
-
 	if !*skipBolt {
-		fmt.Fprintln(os.Stderr, "[step 2b] benching bbolt backend...")
-		results = append(results, benchBackend("bbolt", refGraph, workload, func() (graph.Store, func() int64, error) {
-			dir, err := os.MkdirTemp("", "store-bench-bolt-*")
-			if err != nil {
-				return nil, nil, err
-			}
-			path := filepath.Join(dir, "store.db")
-			s, err := store_bolt.Open(path)
-			if err != nil {
-				os.RemoveAll(dir)
-				return nil, nil, err
-			}
-			diskFn := func() int64 {
-				_ = s.Close()
-				return fileSize(path)
-			}
-			return s, diskFn, nil
-		}))
+		fmt.Fprintln(os.Stderr, "[bbolt] indexing through bbolt on-disk Store...")
+		results = append(results, runBackend("bbolt", absRoot, *workers, *querySize,
+			func() (graph.Store, func() int64, error) {
+				dir, err := os.MkdirTemp("", "store-bench-bolt-*")
+				if err != nil {
+					return nil, nil, err
+				}
+				path := filepath.Join(dir, "store.db")
+				s, err := store_bolt.Open(path)
+				if err != nil {
+					os.RemoveAll(dir)
+					return nil, nil, err
+				}
+				diskFn := func() int64 {
+					_ = s.Close()
+					return fileSize(path)
+				}
+				return s, diskFn, nil
+			}))
 	}
-
 	if !*skipSQLite {
-		fmt.Fprintln(os.Stderr, "[step 2c] benching sqlite backend...")
-		results = append(results, benchBackend("sqlite", refGraph, workload, func() (graph.Store, func() int64, error) {
-			dir, err := os.MkdirTemp("", "store-bench-sqlite-*")
-			if err != nil {
-				return nil, nil, err
-			}
-			path := filepath.Join(dir, "store.sqlite")
-			s, err := store_sqlite.Open(path)
-			if err != nil {
-				os.RemoveAll(dir)
-				return nil, nil, err
-			}
-			diskFn := func() int64 {
-				_ = s.Close()
-				// SQLite WAL mode keeps a -wal companion file; count both
-				// so the reported size matches what an operator would see
-				// in their data dir.
-				return fileSize(path) + fileSize(path+"-wal") + fileSize(path+"-shm")
-			}
-			return s, diskFn, nil
-		}))
+		fmt.Fprintln(os.Stderr, "[sqlite] indexing through sqlite on-disk Store...")
+		results = append(results, runBackend("sqlite", absRoot, *workers, *querySize,
+			func() (graph.Store, func() int64, error) {
+				dir, err := os.MkdirTemp("", "store-bench-sqlite-*")
+				if err != nil {
+					return nil, nil, err
+				}
+				path := filepath.Join(dir, "store.sqlite")
+				s, err := store_sqlite.Open(path)
+				if err != nil {
+					os.RemoveAll(dir)
+					return nil, nil, err
+				}
+				diskFn := func() int64 {
+					_ = s.Close()
+					return fileSize(path) + fileSize(path+"-wal") + fileSize(path+"-shm")
+				}
+				return s, diskFn, nil
+			}))
 	}
 
-	// Print table.
 	printTable(os.Stdout, results)
 }
 
-// -- reference graph build --------------------------------------------------
+// runBackend executes the full indexer pipeline through one backend
+// and reports the metrics. Each backend gets a fresh Store, a fresh
+// Indexer, a fresh query workload sampled from its own populated
+// state. The reference-graph step is gone: there is no shared graph
+// alive across backends, so heap measurements are not contaminated by
+// the previous backend's resident state.
+func runBackend(
+	name string,
+	absRoot string,
+	workers int,
+	querySize int,
+	factory func() (graph.Store, func() int64, error),
+) benchResult {
+	r := benchResult{Backend: name}
 
-type refStats struct {
-	nodeCount int
-	edgeCount int
-}
-
-func buildReferenceGraph(root string, workers int) (*graph.Graph, refStats, error) {
-	absRoot, err := filepath.Abs(root)
+	store, diskFn, err := factory()
 	if err != nil {
-		return nil, refStats{}, fmt.Errorf("abs: %w", err)
+		r.Err = "factory: " + err.Error()
+		return r
 	}
-	g := graph.New()
+
 	reg := parser.NewRegistry()
 	languages.RegisterAll(reg)
 	cfg := config.Config{}
 	cfg.Index.Workers = workers
-	idx := indexer.New(g, reg, cfg.Index, zap.NewNop())
+
+	idx := indexer.New(store, reg, cfg.Index, zap.NewNop())
+
 	rep := &stageReporter{start: time.Now()}
 	ctx := progress.WithReporter(context.Background(), rep)
-	res, err := idx.IndexCtx(ctx, absRoot)
+
+	t0 := time.Now()
+	_, err = idx.IndexCtx(ctx, absRoot)
+	r.IndexMs = msSince(t0)
 	if err != nil {
-		return nil, refStats{}, err
+		r.Err = "index: " + err.Error()
+		return r
 	}
-	if res != nil && len(res.Errors) > 0 {
-		fmt.Fprintf(os.Stderr, "  indexer reported %d errors; first: %v\n", len(res.Errors), res.Errors[0])
+	r.NodeCount = store.NodeCount()
+	r.EdgeCount = store.EdgeCount()
+
+	// Build query workload from THIS backend's populated state. Each
+	// backend gets its own deterministic-ish sample so the queries hit
+	// genuine state, not random IDs guessed at.
+	wl := pickQueriesFromStore(store, querySize)
+
+	latencies := make([]time.Duration, 0,
+		len(wl.nodeIDs)+len(wl.outIDs)+len(wl.inIDs)+len(wl.names)+len(wl.filePaths))
+	for _, id := range wl.nodeIDs {
+		t := time.Now()
+		_ = store.GetNode(id)
+		latencies = append(latencies, time.Since(t))
 	}
-	// Cross-check the result against the live graph — they should agree;
-	// disagreement is a smoke signal we want to see immediately.
-	if g.NodeCount() == 0 && res != nil && res.NodeCount > 0 {
-		fmt.Fprintf(os.Stderr, "  WARNING: result reports %d nodes but graph is empty\n", res.NodeCount)
+	for _, id := range wl.outIDs {
+		t := time.Now()
+		_ = store.GetOutEdges(id)
+		latencies = append(latencies, time.Since(t))
 	}
-	return g, refStats{nodeCount: g.NodeCount(), edgeCount: g.EdgeCount()}, nil
+	for _, id := range wl.inIDs {
+		t := time.Now()
+		_ = store.GetInEdges(id)
+		latencies = append(latencies, time.Since(t))
+	}
+	for _, n := range wl.names {
+		t := time.Now()
+		_ = store.FindNodesByName(n)
+		latencies = append(latencies, time.Since(t))
+	}
+	for _, fp := range wl.filePaths {
+		t := time.Now()
+		_ = store.GetFileNodes(fp)
+		latencies = append(latencies, time.Since(t))
+	}
+	r.QueryP50us = pctUs(latencies, 50)
+	r.QueryP95us = pctUs(latencies, 95)
+
+	// Sample heap. Force GC first so the figure reflects retained
+	// state (the live graph + indexer state), not allocation churn
+	// from the workload loop. Report both HeapAlloc (live bytes,
+	// the honest "how much does the daemon really need" number) and
+	// HeapInuse (span footprint, what `ps` would show).
+	runtime.GC()
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	r.HeapAllocMB = float64(m.HeapAlloc) / 1e6
+	r.HeapInuseMB = float64(m.HeapInuse) / 1e6
+
+	// On-disk size — diskFn closes the store and stats the file.
+	r.DiskBytes = diskFn()
+
+	return r
 }
 
-// -- workload sampling ------------------------------------------------------
-
-func pickQueries(g *graph.Graph, n int) queryWorkload {
-	nodes := g.AllNodes()
+// pickQueriesFromStore samples a deterministic-ish query workload
+// from a populated Store. Uses AllNodes (which every backend
+// implements) so the sampling code stays backend-agnostic.
+func pickQueriesFromStore(s graph.Store, n int) queryWorkload {
+	nodes := s.AllNodes()
 	if len(nodes) == 0 {
 		return queryWorkload{}
 	}
-	// Sort for deterministic pre-shuffle order; then a crypto/rand-seeded
-	// pick gives reproducible workloads across runs of the same graph.
 	sort.Slice(nodes, func(i, j int) bool { return nodes[i].ID < nodes[j].ID })
 
 	pickN := func(count int) []*graph.Node {
@@ -243,21 +283,19 @@ func pickQueries(g *graph.Graph, n int) queryWorkload {
 		nodeIDs: make([]string, 0, n),
 		outIDs:  make([]string, 0, n/2),
 		inIDs:   make([]string, 0, n/2),
-		names:   nil,
-		filePaths: nil,
 	}
 	nameSet := map[string]struct{}{}
 	fileSet := map[string]struct{}{}
-	for i, n := range sampleNodes {
-		wl.nodeIDs = append(wl.nodeIDs, n.ID)
+	for i, nd := range sampleNodes {
+		wl.nodeIDs = append(wl.nodeIDs, nd.ID)
 		if i%2 == 0 {
-			wl.outIDs = append(wl.outIDs, n.ID)
+			wl.outIDs = append(wl.outIDs, nd.ID)
 		} else {
-			wl.inIDs = append(wl.inIDs, n.ID)
+			wl.inIDs = append(wl.inIDs, nd.ID)
 		}
-		nameSet[n.Name] = struct{}{}
-		if n.FilePath != "" {
-			fileSet[n.FilePath] = struct{}{}
+		nameSet[nd.Name] = struct{}{}
+		if nd.FilePath != "" {
+			fileSet[nd.FilePath] = struct{}{}
 		}
 	}
 	for k := range nameSet {
@@ -266,8 +304,6 @@ func pickQueries(g *graph.Graph, n int) queryWorkload {
 	for k := range fileSet {
 		wl.filePaths = append(wl.filePaths, k)
 	}
-	// Cap names and files at the per-backend query budget so they don't
-	// dominate latency totals on graphs with many distinct names/files.
 	if len(wl.names) > n/4 {
 		wl.names = wl.names[:n/4]
 	}
@@ -277,102 +313,27 @@ func pickQueries(g *graph.Graph, n int) queryWorkload {
 	return wl
 }
 
-// -- per-backend run --------------------------------------------------------
-
-func benchBackend(
-	name string,
-	ref *graph.Graph,
-	wl queryWorkload,
-	factory func() (graph.Store, func() int64, error),
-) benchResult {
-	r := benchResult{Backend: name}
-
-	s, diskFn, err := factory()
-	if err != nil {
-		r.Err = "factory: " + err.Error()
-		return r
-	}
-
-	refNodes := ref.AllNodes()
-	refEdges := ref.AllEdges()
-
-	// Load: time the bulk insert. Mirrors how a daemon would restore
-	// a snapshot or initial-populate a fresh store on startup.
-	t0 := time.Now()
-	s.AddBatch(refNodes, refEdges)
-	r.LoadMs = msSince(t0)
-	r.NodeCount = s.NodeCount()
-	r.EdgeCount = s.EdgeCount()
-	r.IndexBuilt = true
-
-	// Query latencies. Mixed workload: point lookups, adjacency walks,
-	// name searches, file-node scans. One total slice per backend; the
-	// global p50/p95 covers the mix.
-	latencies := make([]time.Duration, 0,
-		len(wl.nodeIDs)+len(wl.outIDs)+len(wl.inIDs)+len(wl.names)+len(wl.filePaths))
-
-	for _, id := range wl.nodeIDs {
-		t := time.Now()
-		_ = s.GetNode(id)
-		latencies = append(latencies, time.Since(t))
-	}
-	for _, id := range wl.outIDs {
-		t := time.Now()
-		_ = s.GetOutEdges(id)
-		latencies = append(latencies, time.Since(t))
-	}
-	for _, id := range wl.inIDs {
-		t := time.Now()
-		_ = s.GetInEdges(id)
-		latencies = append(latencies, time.Since(t))
-	}
-	for _, n := range wl.names {
-		t := time.Now()
-		_ = s.FindNodesByName(n)
-		latencies = append(latencies, time.Since(t))
-	}
-	for _, fp := range wl.filePaths {
-		t := time.Now()
-		_ = s.GetFileNodes(fp)
-		latencies = append(latencies, time.Since(t))
-	}
-	r.QueryP50us = pctUs(latencies, 50)
-	r.QueryP95us = pctUs(latencies, 95)
-
-	// Sample heap. Force GC first so the figure reflects retained state
-	// rather than allocation churn from the query loop.
-	runtime.GC()
-	var m runtime.MemStats
-	runtime.ReadMemStats(&m)
-	r.HeapMB = float64(m.HeapInuse) / 1e6
-
-	// Disk size — diskFn closes the store and returns size in bytes.
-	// In-memory backend returns 0.
-	r.DiskBytes = diskFn()
-
-	return r
-}
-
 // -- output -----------------------------------------------------------------
 
 func printTable(w *os.File, rows []benchResult) {
 	fmt.Fprintln(w, "")
-	fmt.Fprintln(w, "# Store backend comparison")
+	fmt.Fprintln(w, "# Store backend comparison (full indexer pipeline per backend)")
 	fmt.Fprintln(w, "")
-	fmt.Fprintln(w, "| backend | nodes | edges | load | disk size | heap | query p50 | query p95 |")
-	fmt.Fprintln(w, "|---------|------:|------:|-----:|----------:|-----:|----------:|----------:|")
+	fmt.Fprintln(w, "| backend | nodes | edges | index | disk size | heap (alloc / inuse) | query p50 | query p95 |")
+	fmt.Fprintln(w, "|---------|------:|------:|------:|----------:|---------------------:|----------:|----------:|")
 	for _, r := range rows {
 		if r.Err != "" {
 			fmt.Fprintf(w, "| %s | — | — | — | — | — | — | %s |\n", r.Backend, r.Err)
 			continue
 		}
-		fmt.Fprintf(w, "| %s | %s | %s | %s | %s | %s | %s | %s |\n",
+		fmt.Fprintf(w, "| %s | %s | %s | %s | %s | %s / %s | %s | %s |\n",
 			r.Backend,
 			fmtInt(r.NodeCount),
 			fmtInt(r.EdgeCount),
-			fmtMs(r.LoadMs),
+			fmtMs(r.IndexMs),
 			fmtBytes(r.DiskBytes),
-			fmtMB(r.HeapMB),
+			fmtMB(r.HeapAllocMB),
+			fmtMB(r.HeapInuseMB),
 			fmtUs(r.QueryP50us),
 			fmtUs(r.QueryP95us),
 		)
