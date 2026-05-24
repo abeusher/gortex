@@ -6,7 +6,9 @@ import (
 	"encoding/gob"
 	"errors"
 	"fmt"
+	"iter"
 	"math"
+	"strings"
 	"sync"
 	"time"
 
@@ -489,6 +491,16 @@ func inEdgeIdxKey(toID string, ek []byte) []byte {
 	return buf
 }
 
+// kindEdgeIdxKey: kind + 0x00 + edgeKey. Lets EdgesByKind prefix-scan
+// idx_edge_kind by the kind name and only decode the matching edges.
+func kindEdgeIdxKey(kind graph.EdgeKind, ek []byte) []byte {
+	buf := make([]byte, 0, len(kind)+1+len(ek))
+	buf = append(buf, kind...)
+	buf = append(buf, 0x00)
+	buf = append(buf, ek...)
+	return buf
+}
+
 // scopedKey: prefix + 0x00 + nodeID — used by the kind/file/repo/name
 // node indexes whose values are empty (presence is the data).
 func scopedKey(prefix, nodeID string) []byte {
@@ -646,6 +658,16 @@ func (s *Store) putEdgeTx(tx *bbolt.Tx, e *graph.Edge) (inserted, originChanged 
 	if err := tx.Bucket(bucketIdxEdgeIn).Put(inEdgeIdxKey(e.To, ek), nil); err != nil {
 		return false, false, err
 	}
+	if err := tx.Bucket(bucketIdxEdgeKind).Put(kindEdgeIdxKey(e.Kind, ek), nil); err != nil {
+		return false, false, err
+	}
+	// The unresolved index is sparse — populated only for edges that
+	// match the prefix the resolver hot path will scan.
+	if strings.HasPrefix(e.To, "unresolved::") {
+		if err := tx.Bucket(bucketIdxEdgeUnres).Put(ek, nil); err != nil {
+			return false, false, err
+		}
+	}
 	if originChanged {
 		if err := bumpEdgeIdentityRevisions(tx); err != nil {
 			return false, false, err
@@ -788,6 +810,10 @@ func (s *Store) reindexEdgeTx(tx *bbolt.Tx, e *graph.Edge, oldTo string) error {
 	_ = edges.Delete(oldKey)
 	_ = tx.Bucket(bucketIdxEdgeOut).Delete(outEdgeIdxKey(e.From, oldKey))
 	_ = tx.Bucket(bucketIdxEdgeIn).Delete(inEdgeIdxKey(oldTo, oldKey))
+	_ = tx.Bucket(bucketIdxEdgeKind).Delete(kindEdgeIdxKey(e.Kind, oldKey))
+	// The old key may or may not have been in idx_edge_unres — Delete
+	// is a no-op when absent so this is safe to issue unconditionally.
+	_ = tx.Bucket(bucketIdxEdgeUnres).Delete(oldKey)
 	_, _, err := s.putEdgeTx(tx, e)
 	return err
 }
@@ -937,6 +963,8 @@ func (s *Store) RemoveEdge(from, to string, kind graph.EdgeKind) bool {
 				toDelete = append(toDelete, cp)
 			}
 		}
+		kindIdx := tx.Bucket(bucketIdxEdgeKind)
+		unresIdx := tx.Bucket(bucketIdxEdgeUnres)
 		for _, ek := range toDelete {
 			if err := edges.Delete(ek); err != nil {
 				return err
@@ -947,6 +975,8 @@ func (s *Store) RemoveEdge(from, to string, kind graph.EdgeKind) bool {
 			if err := inIdx.Delete(inEdgeIdxKey(to, ek)); err != nil {
 				return err
 			}
+			_ = kindIdx.Delete(kindEdgeIdxKey(kind, ek))
+			_ = unresIdx.Delete(ek)
 			removed = true
 		}
 		return nil
@@ -1065,7 +1095,20 @@ func (s *Store) evictNodesByID(tx *bbolt.Tx, ids []string) (int, int) {
 	collect(outIdx)
 	collect(inIdx)
 
+	kindIdx := tx.Bucket(bucketIdxEdgeKind)
+	unresIdx := tx.Bucket(bucketIdxEdgeUnres)
+	// Walk seen ONCE to derive the edge Kind for the kind-index
+	// cleanup; we cached the raw bytes' decoded From/To above but not
+	// the Kind, so re-decode per row. This still beats reopening the
+	// edge from the bucket because raw is already in OS page cache.
 	for _, row := range seen {
+		raw := edges.Get(row.key)
+		if raw != nil {
+			if e, derr := decodeEdge(raw); derr == nil && e != nil {
+				_ = kindIdx.Delete(kindEdgeIdxKey(e.Kind, row.key))
+			}
+		}
+		_ = unresIdx.Delete(row.key)
 		_ = edges.Delete(row.key)
 		_ = outIdx.Delete(outEdgeIdxKey(row.from, row.key))
 		_ = inIdx.Delete(inEdgeIdxKey(row.to, row.key))
@@ -1557,4 +1600,95 @@ func bumpEdgeIdentityRevisions(tx *bbolt.Tx) error {
 	var buf [8]byte
 	binary.BigEndian.PutUint64(buf[:], n)
 	return b.Put(metaKeyEdgeIdentityRevisions, buf[:])
+}
+
+// -- predicate-shaped reads ---------------------------------------------
+//
+// Each method opens a single bbolt View, range-scans the appropriate
+// secondary index, decodes only the matching rows, and yields each
+// *Edge / *Node to the caller. The yielded values are decoded copies
+// — bbolt invalidates page-cache bytes once the txn ends, so we cannot
+// hand back zero-copy references the way the in-memory store does.
+
+// EdgesByKind: range-scan idx_edge_kind for the kind prefix and
+// decode only the matching edge rows.
+func (s *Store) EdgesByKind(kind graph.EdgeKind) iter.Seq[*graph.Edge] {
+	return func(yield func(*graph.Edge) bool) {
+		_ = s.db.View(func(tx *bbolt.Tx) error {
+			kindIdx := tx.Bucket(bucketIdxEdgeKind)
+			edges := tx.Bucket(bucketEdges)
+			pfx := append([]byte(kind), 0x00)
+			c := kindIdx.Cursor()
+			for k, _ := c.Seek(pfx); k != nil && bytes.HasPrefix(k, pfx); k, _ = c.Next() {
+				ek := k[len(pfx):]
+				raw := edges.Get(ek)
+				if raw == nil {
+					continue
+				}
+				e, derr := decodeEdge(raw)
+				if derr != nil || e == nil {
+					continue
+				}
+				if !yield(e) {
+					return errors.New("store_bolt: yield stop")
+				}
+			}
+			return nil
+		})
+	}
+}
+
+// NodesByKind: range-scan idx_node_kind for the kind prefix and
+// decode only the matching node rows.
+func (s *Store) NodesByKind(kind graph.NodeKind) iter.Seq[*graph.Node] {
+	return func(yield func(*graph.Node) bool) {
+		_ = s.db.View(func(tx *bbolt.Tx) error {
+			kindIdx := tx.Bucket(bucketIdxNodeKind)
+			nodes := tx.Bucket(bucketNodes)
+			pfx := append([]byte(kind), 0x00)
+			c := kindIdx.Cursor()
+			for k, _ := c.Seek(pfx); k != nil && bytes.HasPrefix(k, pfx); k, _ = c.Next() {
+				id := k[len(pfx):]
+				raw := nodes.Get(id)
+				if raw == nil {
+					continue
+				}
+				n, derr := decodeNode(raw)
+				if derr != nil || n == nil {
+					continue
+				}
+				if !yield(n) {
+					return errors.New("store_bolt: yield stop")
+				}
+			}
+			return nil
+		})
+	}
+}
+
+// EdgesWithUnresolvedTarget: walk idx_edge_unres (which is populated
+// only for edges whose To has the "unresolved::" prefix) and decode
+// each matching edge.
+func (s *Store) EdgesWithUnresolvedTarget() iter.Seq[*graph.Edge] {
+	return func(yield func(*graph.Edge) bool) {
+		_ = s.db.View(func(tx *bbolt.Tx) error {
+			unresIdx := tx.Bucket(bucketIdxEdgeUnres)
+			edges := tx.Bucket(bucketEdges)
+			c := unresIdx.Cursor()
+			for k, _ := c.First(); k != nil; k, _ = c.Next() {
+				raw := edges.Get(k)
+				if raw == nil {
+					continue
+				}
+				e, derr := decodeEdge(raw)
+				if derr != nil || e == nil {
+					continue
+				}
+				if !yield(e) {
+					return errors.New("store_bolt: yield stop")
+				}
+			}
+			return nil
+		})
+	}
 }

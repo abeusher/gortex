@@ -13,6 +13,9 @@
 //	idx_node_qualname  key=qualName                value=nodeID
 //	idx_edge_out       key=fromID\x00edgeKeyBytes  value=empty
 //	idx_edge_in        key=toID\x00edgeKeyBytes    value=empty
+//	idx_edge_kind      key=kind\x00edgeKeyBytes    value=empty
+//	idx_edge_unres     key=edgeKeyBytes            value=empty
+//	                   (only edges whose To starts "unresolved::")
 //	meta               misc counters (edge_identity_revisions, ...)
 //
 // edgeKeyBytes is a stable binary encoding of (from, to, kind, file, line).
@@ -34,6 +37,8 @@ var (
 	bucketIdxNodeQual  = []byte("idx_node_qualname")
 	bucketIdxEdgeOut   = []byte("idx_edge_out")
 	bucketIdxEdgeIn    = []byte("idx_edge_in")
+	bucketIdxEdgeKind  = []byte("idx_edge_kind")
+	bucketIdxEdgeUnres = []byte("idx_edge_unres")
 	bucketMeta         = []byte("meta")
 )
 
@@ -48,6 +53,8 @@ var allBuckets = [][]byte{
 	bucketIdxNodeQual,
 	bucketIdxEdgeOut,
 	bucketIdxEdgeIn,
+	bucketIdxEdgeKind,
+	bucketIdxEdgeUnres,
 	bucketMeta,
 }
 

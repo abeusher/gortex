@@ -13,6 +13,7 @@ package storetest
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 
@@ -62,6 +63,9 @@ func RunConformance(t *testing.T, factory Factory) {
 	t.Run("AllRepoMemoryEstimates", func(t *testing.T) { testAllRepoMemoryEstimates(t, factory) })
 	t.Run("MetaPreserved", func(t *testing.T) { testMetaPreserved(t, factory) })
 	t.Run("EmptyStore", func(t *testing.T) { testEmptyStore(t, factory) })
+	t.Run("EdgesByKind", func(t *testing.T) { testEdgesByKind(t, factory) })
+	t.Run("NodesByKind", func(t *testing.T) { testNodesByKind(t, factory) })
+	t.Run("EdgesWithUnresolvedTarget", func(t *testing.T) { testEdgesWithUnresolvedTarget(t, factory) })
 }
 
 // -- fixture helpers ---------------------------------------------------
@@ -673,6 +677,139 @@ func testMetaPreserved(t *testing.T, factory Factory) {
 	}
 	if got.Meta["visibility"] != "public" {
 		t.Fatalf("Meta[visibility] = %v", got.Meta["visibility"])
+	}
+}
+
+func testEdgesByKind(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	s.AddNode(mkNode("a", "A", "x.go", graph.KindFunction))
+	s.AddNode(mkNode("b", "B", "x.go", graph.KindFunction))
+	s.AddNode(mkNode("c", "C", "y.go", graph.KindType))
+
+	e1 := mkEdge("a", "b", graph.EdgeCalls)
+	e1.Line = 1
+	e2 := mkEdge("a", "b", graph.EdgeCalls)
+	e2.Line = 2
+	e3 := mkEdge("a", "c", graph.EdgeReferences)
+	s.AddEdge(e1)
+	s.AddEdge(e2)
+	s.AddEdge(e3)
+
+	var calls []*graph.Edge
+	for e := range s.EdgesByKind(graph.EdgeCalls) {
+		calls = append(calls, e)
+	}
+	if len(calls) != 2 {
+		t.Fatalf("EdgesByKind(EdgeCalls) yielded %d, want 2", len(calls))
+	}
+	for _, e := range calls {
+		if e.Kind != graph.EdgeCalls {
+			t.Fatalf("yielded edge has wrong kind: %s", e.Kind)
+		}
+	}
+
+	var refs []*graph.Edge
+	for e := range s.EdgesByKind(graph.EdgeReferences) {
+		refs = append(refs, e)
+	}
+	if len(refs) != 1 {
+		t.Fatalf("EdgesByKind(EdgeReferences) yielded %d, want 1", len(refs))
+	}
+
+	// Unknown kind yields nothing.
+	count := 0
+	for range s.EdgesByKind(graph.EdgeKind("nonexistent")) {
+		count++
+	}
+	if count != 0 {
+		t.Fatalf("EdgesByKind(nonexistent) yielded %d, want 0", count)
+	}
+
+	// Early stop honours the contract.
+	stopped := 0
+	for range s.EdgesByKind(graph.EdgeCalls) {
+		stopped++
+		if stopped == 1 {
+			break
+		}
+	}
+	if stopped != 1 {
+		t.Fatalf("early stop yielded %d before break, want 1", stopped)
+	}
+}
+
+func testNodesByKind(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	s.AddNode(mkNode("a", "A", "x.go", graph.KindFunction))
+	s.AddNode(mkNode("b", "B", "x.go", graph.KindFunction))
+	s.AddNode(mkNode("c", "C", "y.go", graph.KindType))
+
+	var fns []*graph.Node
+	for n := range s.NodesByKind(graph.KindFunction) {
+		fns = append(fns, n)
+	}
+	if len(fns) != 2 {
+		t.Fatalf("NodesByKind(KindFunction) yielded %d, want 2", len(fns))
+	}
+	for _, n := range fns {
+		if n.Kind != graph.KindFunction {
+			t.Fatalf("yielded node has wrong kind: %s", n.Kind)
+		}
+	}
+
+	var types []*graph.Node
+	for n := range s.NodesByKind(graph.KindType) {
+		types = append(types, n)
+	}
+	if len(types) != 1 {
+		t.Fatalf("NodesByKind(KindType) yielded %d, want 1", len(types))
+	}
+
+	// Early stop honours the contract.
+	stopped := 0
+	for range s.NodesByKind(graph.KindFunction) {
+		stopped++
+		if stopped == 1 {
+			break
+		}
+	}
+	if stopped != 1 {
+		t.Fatalf("early stop yielded %d before break, want 1", stopped)
+	}
+}
+
+func testEdgesWithUnresolvedTarget(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	s.AddNode(mkNode("a", "A", "x.go", graph.KindFunction))
+	s.AddNode(mkNode("b", "B", "x.go", graph.KindFunction))
+
+	e1 := mkEdge("a", "b", graph.EdgeCalls)
+	e1.Line = 1
+	e2 := mkEdge("a", "unresolved::Foo", graph.EdgeCalls)
+	e2.Line = 2
+	e3 := mkEdge("a", "unresolved::Bar", graph.EdgeCalls)
+	e3.Line = 3
+	e4 := mkEdge("a", "resolved", graph.EdgeCalls)
+	e4.Line = 4
+	s.AddEdge(e1)
+	s.AddEdge(e2)
+	s.AddEdge(e3)
+	s.AddEdge(e4)
+
+	var unres []*graph.Edge
+	for e := range s.EdgesWithUnresolvedTarget() {
+		unres = append(unres, e)
+	}
+	if len(unres) != 2 {
+		t.Fatalf("EdgesWithUnresolvedTarget yielded %d, want 2", len(unres))
+	}
+	for _, e := range unres {
+		if !strings.HasPrefix(e.To, "unresolved::") {
+			t.Fatalf("yielded edge has non-unresolved To: %s", e.To)
+		}
 	}
 }
 

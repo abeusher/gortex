@@ -26,6 +26,7 @@ import (
 	"encoding/gob"
 	"errors"
 	"fmt"
+	"iter"
 	"sync"
 	"sync/atomic"
 
@@ -1078,4 +1079,84 @@ func panicOnFatal(err error) {
 		return
 	}
 	panic(fmt.Errorf("store_sqlite: %w", err))
+}
+
+// -- predicate-shaped reads ---------------------------------------------
+//
+// Each method runs one indexed SELECT and streams rows back via the
+// iter.Seq[T] yield callback. Stops cleanly when yield returns false.
+// Heavier than the equivalent bolt path (sql parsing + driver row
+// materialisation) but cuts the resolver's wasted full-table scans
+// down to "match-only" cardinality, which is the whole point.
+
+// EdgesByKind: indexed scan on edges_by_kind_index_to (or whatever
+// the existing per-kind index is). All rows for a single kind.
+func (s *Store) EdgesByKind(kind graph.EdgeKind) iter.Seq[*graph.Edge] {
+	return func(yield func(*graph.Edge) bool) {
+		rows, err := s.db.Query(`
+SELECT from_id, to_id, kind, file_path, line, confidence, confidence_label, origin, tier, cross_repo, meta
+FROM edges WHERE kind = ?`, string(kind))
+		if err != nil {
+			return
+		}
+		defer func() { _ = rows.Close() }()
+		for rows.Next() {
+			e, err := scanEdge(rows)
+			if err != nil || e == nil {
+				continue
+			}
+			if !yield(e) {
+				return
+			}
+		}
+	}
+}
+
+// NodesByKind: indexed scan on nodes_by_kind.
+func (s *Store) NodesByKind(kind graph.NodeKind) iter.Seq[*graph.Node] {
+	return func(yield func(*graph.Node) bool) {
+		rows, err := s.db.Query(`
+SELECT id, kind, name, qual_name, file_path, start_line, end_line, language,
+       repo_prefix, workspace_id, project_id, meta
+FROM nodes WHERE kind = ?`, string(kind))
+		if err != nil {
+			return
+		}
+		defer func() { _ = rows.Close() }()
+		for rows.Next() {
+			n, err := scanNode(rows)
+			if err != nil || n == nil {
+				continue
+			}
+			if !yield(n) {
+				return
+			}
+		}
+	}
+}
+
+// EdgesWithUnresolvedTarget: range scan on the to_id column using the
+// `LIKE 'unresolved::%'` predicate. SQLite turns LIKE-with-fixed-
+// prefix into a range lookup against the primary or secondary index
+// on to_id (the existing edges_by_to index covers it), so this scans
+// only the contiguous unresolved::* slice rather than the whole table.
+func (s *Store) EdgesWithUnresolvedTarget() iter.Seq[*graph.Edge] {
+	return func(yield func(*graph.Edge) bool) {
+		rows, err := s.db.Query(`
+SELECT from_id, to_id, kind, file_path, line, confidence, confidence_label, origin, tier, cross_repo, meta
+FROM edges WHERE to_id >= 'unresolved::' AND to_id < 'unresolved:;'`)
+		if err != nil {
+			return
+		}
+		defer func() { _ = rows.Close() }()
+		for rows.Next() {
+			e, err := scanEdge(rows)
+			if err != nil || e == nil {
+				continue
+			}
+			if !yield(e) {
+				return
+			}
+		}
+	}
 }

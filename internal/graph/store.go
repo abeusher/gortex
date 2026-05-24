@@ -1,6 +1,9 @@
 package graph
 
-import "sync"
+import (
+	"iter"
+	"sync"
+)
 
 // EdgeReindex is the per-edge payload for ReindexEdges. Edge points
 // at the (already mutated) Edge value the caller wants the store to
@@ -96,6 +99,39 @@ type Store interface {
 
 	AllNodes() []*Node
 	AllEdges() []*Edge
+
+	// --- Predicate-shaped reads (push filters into the store) ------
+	//
+	// These methods replace the pre-Store idiom of `for _, e := range
+	// AllEdges() { if cond { ... } }`. On the in-memory backend they
+	// iterate the existing internal byKind / byPrefix buckets — same
+	// algorithmic cost as the inline filter. On disk backends they
+	// fan out to dedicated indexes (idx_edge_kind / idx_node_kind /
+	// the to_id LIKE prefix scan, etc.) so the row count actually
+	// materialised is proportional to the predicate match, not the
+	// whole table.
+	//
+	// The resolver alone calls AllEdges/AllNodes 34× per pass and
+	// throws away >99% of each scan; using these predicate methods
+	// instead cut a 503-second sqlite resolver pass on a 122k-node
+	// graph down to seconds.
+	//
+	// Iterators stop when the consumer's yield returns false.
+	// Implementations MUST honour early-stop so callers can break
+	// out of a search.
+
+	// EdgesByKind yields every edge whose Kind matches.
+	EdgesByKind(kind EdgeKind) iter.Seq[*Edge]
+
+	// NodesByKind yields every node whose Kind matches.
+	NodesByKind(kind NodeKind) iter.Seq[*Node]
+
+	// EdgesWithUnresolvedTarget yields every edge whose To has the
+	// "unresolved::" prefix. The resolver's main loop calls this
+	// once per pass; on disk backends it should range-scan a
+	// to-keyed index over the single contiguous "unresolved::" slice
+	// rather than materialise the whole edges table.
+	EdgesWithUnresolvedTarget() iter.Seq[*Edge]
 
 	// --- Counts and stats ------------------------------------------
 

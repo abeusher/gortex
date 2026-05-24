@@ -1,6 +1,8 @@
 package graph
 
 import (
+	"iter"
+	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -494,6 +496,60 @@ func (g *Graph) ReindexEdges(batch []EdgeReindex) {
 			continue
 		}
 		g.ReindexEdge(r.Edge, r.OldTo)
+	}
+}
+
+// EdgesByKind yields every edge whose Kind matches. In-memory
+// implementation iterates the materialised AllEdges() slice and
+// filters; the algorithmic cost is identical to a hand-written
+// "for _, e := range g.AllEdges() { if e.Kind == kind }" loop, which
+// is what most call sites used before the predicate API existed.
+// Disk backends override this with an index-backed scan.
+func (g *Graph) EdgesByKind(kind EdgeKind) iter.Seq[*Edge] {
+	return func(yield func(*Edge) bool) {
+		for _, e := range g.AllEdges() {
+			if e == nil || e.Kind != kind {
+				continue
+			}
+			if !yield(e) {
+				return
+			}
+		}
+	}
+}
+
+// NodesByKind yields every node whose Kind matches. Same semantics
+// and same in-memory cost story as EdgesByKind.
+func (g *Graph) NodesByKind(kind NodeKind) iter.Seq[*Node] {
+	return func(yield func(*Node) bool) {
+		for _, n := range g.AllNodes() {
+			if n == nil || n.Kind != kind {
+				continue
+			}
+			if !yield(n) {
+				return
+			}
+		}
+	}
+}
+
+// EdgesWithUnresolvedTarget yields every edge whose To has the
+// "unresolved::" prefix — the resolver's main pending-edge filter.
+// In-memory iterates all edges and prefix-checks; disk backends back
+// it with a range scan on a to-keyed index.
+func (g *Graph) EdgesWithUnresolvedTarget() iter.Seq[*Edge] {
+	return func(yield func(*Edge) bool) {
+		for _, e := range g.AllEdges() {
+			if e == nil {
+				continue
+			}
+			if !strings.HasPrefix(e.To, "unresolved::") {
+				continue
+			}
+			if !yield(e) {
+				return
+			}
+		}
 	}
 }
 
