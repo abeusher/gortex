@@ -36,6 +36,9 @@ import (
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_bolt"
+	"github.com/zzet/gortex/internal/graph/store_cayley"
+	"github.com/zzet/gortex/internal/graph/store_duckdb"
+	"github.com/zzet/gortex/internal/graph/store_kuzu"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/parser"
@@ -91,6 +94,10 @@ func main() {
 	skipMemory := flag.Bool("skip-memory", false, "skip the in-memory baseline")
 	skipBolt := flag.Bool("skip-bolt", false, "skip the bbolt backend")
 	skipSQLite := flag.Bool("skip-sqlite", false, "skip the sqlite backend")
+	skipKuzu := flag.Bool("skip-kuzu", false, "skip the kuzu (Cypher) backend")
+	skipCayley := flag.Bool("skip-cayley", false, "skip the cayley (pure-Go quad store) backend")
+	skipDuckDB := flag.Bool("skip-duckdb", false, "skip the duckdb (columnar SQL) backend")
+	only := flag.String("only", "", "comma-separated subset to run (memory,bolt,sqlite,kuzu,cayley,duckdb); overrides skip-* flags")
 	flag.Parse()
 	if *root == "" {
 		die("usage: store-bench -root <path>")
@@ -150,8 +157,102 @@ func main() {
 				return s, diskFn, nil
 			}))
 	}
+	wantKuzu := !*skipKuzu
+	wantCayley := !*skipCayley
+	wantDuckDB := !*skipDuckDB
+	wantMem := !*skipMemory
+	wantBolt := !*skipBolt
+	wantSQLite := !*skipSQLite
+	if *only != "" {
+		set := map[string]bool{}
+		for _, s := range strings.Split(*only, ",") {
+			set[strings.TrimSpace(s)] = true
+		}
+		wantMem, wantBolt, wantSQLite = set["memory"], set["bolt"], set["sqlite"]
+		wantKuzu, wantCayley, wantDuckDB = set["kuzu"], set["cayley"], set["duckdb"]
+	}
+	_ = wantMem
+	_ = wantBolt
+	_ = wantSQLite
+	if wantKuzu {
+		fmt.Fprintln(os.Stderr, "[kuzu] indexing through KuzuDB (Cypher) Store...")
+		results = append(results, runBackend("kuzu", absRoot, *workers, *querySize,
+			func() (graph.Store, func() int64, error) {
+				dir, err := os.MkdirTemp("", "store-bench-kuzu-*")
+				if err != nil {
+					return nil, nil, err
+				}
+				path := filepath.Join(dir, "store.kuzu")
+				s, err := store_kuzu.Open(path)
+				if err != nil {
+					os.RemoveAll(dir)
+					return nil, nil, err
+				}
+				diskFn := func() int64 {
+					_ = s.Close()
+					return dirSize(path)
+				}
+				return s, diskFn, nil
+			}))
+	}
+	if wantCayley {
+		fmt.Fprintln(os.Stderr, "[cayley] indexing through Cayley (pure-Go quads) Store...")
+		results = append(results, runBackend("cayley", absRoot, *workers, *querySize,
+			func() (graph.Store, func() int64, error) {
+				dir, err := os.MkdirTemp("", "store-bench-cayley-*")
+				if err != nil {
+					return nil, nil, err
+				}
+				s, err := store_cayley.Open(dir)
+				if err != nil {
+					os.RemoveAll(dir)
+					return nil, nil, err
+				}
+				diskFn := func() int64 {
+					_ = s.Close()
+					return dirSize(dir)
+				}
+				return s, diskFn, nil
+			}))
+	}
+	if wantDuckDB {
+		fmt.Fprintln(os.Stderr, "[duckdb] indexing through DuckDB (columnar SQL) Store...")
+		results = append(results, runBackend("duckdb", absRoot, *workers, *querySize,
+			func() (graph.Store, func() int64, error) {
+				dir, err := os.MkdirTemp("", "store-bench-duckdb-*")
+				if err != nil {
+					return nil, nil, err
+				}
+				path := filepath.Join(dir, "store.duckdb")
+				s, err := store_duckdb.Open(path)
+				if err != nil {
+					os.RemoveAll(dir)
+					return nil, nil, err
+				}
+				diskFn := func() int64 {
+					_ = s.Close()
+					return fileSize(path) + fileSize(path+".wal")
+				}
+				return s, diskFn, nil
+			}))
+	}
 
 	printTable(os.Stdout, results)
+}
+
+// dirSize totals every regular file under root in bytes. Used for
+// backends whose persisted state is a directory (Cayley's KV bolt
+// store + Kuzu's catalog/data/wal split) rather than a single file.
+func dirSize(root string) int64 {
+	var total int64
+	_ = filepath.Walk(root, func(p string, info os.FileInfo, err error) error {
+		if err != nil || info == nil || info.IsDir() {
+			return nil
+		}
+		total += info.Size()
+		return nil
+	})
+	return total
 }
 
 // runBackend executes the full indexer pipeline through one backend
