@@ -76,6 +76,19 @@ type Resolver struct {
 	// goroutine iterates via graph.AllEdges()).
 	mu *sync.Mutex
 
+	// lookupCache holds per-pass batched results from GetNodesByIDs /
+	// FindNodesByNames. Populated by ResolveAll/ResolveFile before
+	// the worker fan-out and cleared on return. Workers consult these
+	// maps first; misses fall through to the underlying Store.
+	//
+	// Without the cache, the resolver fires ~3-10 store point lookups
+	// per pending edge — across 10-30k unresolved edges that's 100k+
+	// queries, each one a prepared-stmt round trip on disk backends
+	// (~ms each through modernc.org/sqlite). With the cache the same
+	// information lands in two batched queries per pass.
+	nodeByID    map[string]*graph.Node
+	nodesByName map[string][]*graph.Node
+
 	// lspHelper, when non-nil, is consulted before falling back to
 	// AST heuristics for cross-file dispatch in languages whose
 	// helper-reported extensions match (today: TS/JS/JSX/TSX via
@@ -172,6 +185,18 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 	if len(pending) == 0 {
 		return &ResolveStats{}
 	}
+
+	// Pre-warm the per-pass lookup cache. The resolver workers below
+	// will call store.GetNode for endpoints and store.FindNodesByName
+	// for resolution candidates — across 10-30k pending edges that's
+	// 100k+ individual prepared-stmt queries on a disk backend
+	// (hundreds of seconds through modernc.org/sqlite). Collecting the
+	// IDs / names upfront and batch-loading them collapses those
+	// queries to ~10 chunked SELECT IN statements. Cleared on return
+	// via defer so callers outside ResolveAll see the empty caches and
+	// fall through to the underlying store on every lookup.
+	r.warmLookupCache(pending)
+	defer r.clearLookupCache()
 
 	workers := runtime.NumCPU()
 	if workers < 1 {
@@ -331,6 +356,103 @@ func (r *Resolver) buildDirIndexes() {
 func (r *Resolver) clearDirIndexes() {
 	r.dirIndex = nil
 	r.lastDirIndex = nil
+}
+
+// warmLookupCache batches the per-edge GetNode / FindNodesByName
+// queries the worker loop would otherwise fire serially. We collect
+// every From/To node ID across the pending slice and the bare
+// identifier name embedded in each `unresolved::*` target, then issue
+// the two batched queries the Store exposes. Workers consult the
+// resulting maps via cachedGetNode / cachedFindNodesByName; misses
+// fall through to the underlying store.
+func (r *Resolver) warmLookupCache(pending []*graph.Edge) {
+	if len(pending) == 0 {
+		return
+	}
+	idSet := make(map[string]struct{}, len(pending)*2)
+	nameSet := make(map[string]struct{}, len(pending))
+	for _, e := range pending {
+		if e == nil {
+			continue
+		}
+		if e.From != "" {
+			idSet[e.From] = struct{}{}
+		}
+		// e.To at this point still carries the "unresolved::" prefix;
+		// pre-loading by that string isn't useful (no node has that
+		// id). We seed the name cache from the embedded identifier so
+		// the worker's FindNodesByName hit lands in the cache.
+		if name := identifierFromTarget(e.To); name != "" {
+			nameSet[name] = struct{}{}
+		}
+	}
+	ids := make([]string, 0, len(idSet))
+	for id := range idSet {
+		ids = append(ids, id)
+	}
+	names := make([]string, 0, len(nameSet))
+	for n := range nameSet {
+		names = append(names, n)
+	}
+	r.nodeByID = r.graph.GetNodesByIDs(ids)
+	r.nodesByName = r.graph.FindNodesByNames(names)
+	// Fold every candidate node returned by the name lookup into the
+	// id cache too: when a worker picks a candidate and the
+	// downstream guard (cross_pkg / cross_repo) calls GetNode on the
+	// chosen target, the cache should hit instead of falling through
+	// to a per-id store call.
+	if r.nodeByID == nil && len(r.nodesByName) > 0 {
+		r.nodeByID = make(map[string]*graph.Node, len(r.nodesByName))
+	}
+	for _, hits := range r.nodesByName {
+		for _, n := range hits {
+			if n == nil || n.ID == "" {
+				continue
+			}
+			if _, ok := r.nodeByID[n.ID]; !ok {
+				r.nodeByID[n.ID] = n
+			}
+		}
+	}
+}
+
+func (r *Resolver) clearLookupCache() {
+	r.nodeByID = nil
+	r.nodesByName = nil
+}
+
+// cachedGetNode returns the node for id, consulting the per-pass
+// lookup cache first and falling through to the underlying store on
+// miss. The cache is a positive-only fast path — absence means "not
+// pre-warmed", not "doesn't exist", so a miss still asks the store.
+// Outside a ResolveAll pass the cache is nil and every call goes
+// straight to the store.
+func (r *Resolver) cachedGetNode(id string) *graph.Node {
+	if id == "" {
+		return nil
+	}
+	if r.nodeByID != nil {
+		if n, ok := r.nodeByID[id]; ok {
+			return n
+		}
+	}
+	return r.graph.GetNode(id)
+}
+
+// cachedFindNodesByName returns the candidates for name, consulting
+// the per-pass cache first and falling through to the store on miss.
+// Returns the in-cache slice directly when hit — callers MUST treat
+// the result as read-only.
+func (r *Resolver) cachedFindNodesByName(name string) []*graph.Node {
+	if name == "" {
+		return nil
+	}
+	if r.nodesByName != nil {
+		if hits, ok := r.nodesByName[name]; ok {
+			return hits
+		}
+	}
+	return r.graph.FindNodesByName(name)
 }
 
 // buildDepModuleIndex collects every dep::<module-path> contract node
@@ -647,7 +769,7 @@ func (r *Resolver) resolveEdge(e *graph.Edge, stats *ResolveStats) (oldTo string
 			// every CLI-wired command and command-table entry looks
 			// like dead code.
 			if e.Kind == graph.EdgeReads && e.To != before {
-				if n := r.graph.GetNode(e.To); n != nil && (n.Kind == graph.KindFunction || n.Kind == graph.KindMethod) {
+				if n := r.cachedGetNode(e.To); n != nil && (n.Kind == graph.KindFunction || n.Kind == graph.KindMethod) {
 					e.Kind = graph.EdgeReferences
 				}
 			}
@@ -685,8 +807,11 @@ func (r *Resolver) resolveExtern(e *graph.Edge, spec string, stats *ResolveStats
 
 	// Pass 1: does the symbol live in a file under this import path?
 	// Reuse dirIndex populated by buildDirIndexes — no extra scan.
+	// cachedFindNodesByName lands in the per-pass batch cache for
+	// the common worker hot path; falls through to the store when
+	// called outside ResolveAll.
 	callerRepo := r.callerRepoPrefix(e)
-	candidates := r.graph.FindNodesByName(symbol)
+	candidates := r.cachedFindNodesByName(symbol)
 	for _, c := range candidates {
 		if c.Kind != graph.KindFunction && c.Kind != graph.KindMethod && c.Kind != graph.KindType && c.Kind != graph.KindInterface {
 			continue

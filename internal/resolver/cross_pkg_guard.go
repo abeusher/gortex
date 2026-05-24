@@ -77,7 +77,7 @@ func (r *Resolver) guardCrossPackageCallEdges(jobs []reindexJob, closure map[str
 			continue
 		}
 		callerFile := r.edgeCallerFile(j.edge)
-		target := r.graph.GetNode(j.newTo)
+		target := r.cachedGetNode(j.newTo)
 		if callerFile == "" || target == nil {
 			continue
 		}
@@ -138,8 +138,13 @@ func isCallLikeEdge(k graph.EdgeKind) bool {
 
 // edgeCallerFile returns the file path of the node that owns the edge's
 // From end. Empty when the caller node is unknown.
+//
+// Hot path: called once per cross-package-guarded edge. The pre-warmed
+// per-pass cache populated in ResolveAll holds every From ID across the
+// pending slice, so this call is a map lookup during a ResolveAll pass
+// and a direct store call elsewhere.
 func (r *Resolver) edgeCallerFile(e *graph.Edge) string {
-	if n := r.graph.GetNode(e.From); n != nil && n.FilePath != "" {
+	if n := r.cachedGetNode(e.From); n != nil && n.FilePath != "" {
 		return n.FilePath
 	}
 	return e.FilePath
