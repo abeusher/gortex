@@ -27,6 +27,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -115,11 +116,18 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("sqlite open: %w", err)
 	}
-	// One open connection: SQLite is single-writer regardless and
-	// holding a single connection prevents WAL mode from being clobbered
-	// by a fresh connection that didn't see the PRAGMA. Reads still
-	// scale through the single connection's row iterators.
-	db.SetMaxOpenConns(1)
+	// Pool up to NumCPU connections so the resolver's parallel
+	// worker fan-out (NumCPU goroutines doing FindNodesByName /
+	// GetNode / GetOutEdges concurrently) doesn't serialise through
+	// a single connection — the dominant gap between the SQLite and
+	// bbolt backends on the bench's resolver stage was exactly that.
+	// SQLite's WAL mode allows concurrent readers across multiple
+	// connections; writes still serialise via writeMu on the Go
+	// side, then via SQLite's internal write lock. Every connection
+	// the pool opens picks up the journal-mode / synchronous /
+	// busy-timeout pragmas from the DSN above, so we don't need to
+	// pin one connection to "remember" them.
+	db.SetMaxOpenConns(runtime.NumCPU())
 
 	if _, err := db.Exec(schemaSQL); err != nil {
 		_ = db.Close()
