@@ -38,7 +38,6 @@ import (
 	"github.com/zzet/gortex/internal/graph/store_bolt"
 	"github.com/zzet/gortex/internal/graph/store_cayley"
 	"github.com/zzet/gortex/internal/graph/store_duckdb"
-	"github.com/zzet/gortex/internal/graph/store_cozo"
 	"github.com/zzet/gortex/internal/graph/store_kuzu"
 	"github.com/zzet/gortex/internal/graph/store_ladybug"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
@@ -101,7 +100,8 @@ func main() {
 	skipDuckDB := flag.Bool("skip-duckdb", false, "skip the duckdb (columnar SQL) backend")
 	skipLadybug := flag.Bool("skip-ladybug", false, "skip the ladybug (Kuzu fork, Cypher) backend")
 	skipCozo := flag.Bool("skip-cozo", false, "skip the cozo (Datalog) backend")
-	only := flag.String("only", "", "comma-separated subset to run (memory,bolt,sqlite,kuzu,cayley,duckdb,ladybug,cozo); overrides skip-* flags")
+	skipLora := flag.Bool("skip-lora", false, "skip the lora (Rust Cypher) backend")
+	only := flag.String("only", "", "comma-separated subset to run (memory,bolt,sqlite,kuzu,cayley,duckdb,ladybug,cozo,lora); overrides skip-* flags")
 	flag.Parse()
 	if *root == "" {
 		die("usage: store-bench -root <path>")
@@ -120,6 +120,7 @@ func main() {
 	wantDuckDB := !*skipDuckDB
 	wantLadybug := !*skipLadybug
 	wantCozo := !*skipCozo
+	wantLora := !*skipLora
 	if *only != "" {
 		set := map[string]bool{}
 		for _, s := range strings.Split(*only, ",") {
@@ -129,6 +130,7 @@ func main() {
 		wantKuzu, wantCayley, wantDuckDB = set["kuzu"], set["cayley"], set["duckdb"]
 		wantLadybug = set["ladybug"]
 		wantCozo = set["cozo"]
+		wantLora = set["lora"]
 	}
 
 	var results []benchResult
@@ -243,26 +245,13 @@ func main() {
 				return s, diskFn, nil
 			}))
 	}
-	if wantCozo {
+	if wantCozo && cozoFactory != nil {
 		fmt.Fprintln(os.Stderr, "[cozo] indexing through CozoDB (Datalog) Store...")
-		results = append(results, runBackend("cozo", absRoot, *workers, *querySize,
-			func() (graph.Store, func() int64, error) {
-				dir, err := os.MkdirTemp("", "store-bench-cozo-*")
-				if err != nil {
-					return nil, nil, err
-				}
-				path := filepath.Join(dir, "store.cozo")
-				s, err := store_cozo.Open(path)
-				if err != nil {
-					os.RemoveAll(dir)
-					return nil, nil, err
-				}
-				diskFn := func() int64 {
-					_ = s.Close()
-					return dirSize(path)
-				}
-				return s, diskFn, nil
-			}))
+		results = append(results, runBackend("cozo", absRoot, *workers, *querySize, cozoFactory))
+	}
+	if wantLora && loraFactory != nil {
+		fmt.Fprintln(os.Stderr, "[lora] indexing through LoraDB (Rust Cypher) Store...")
+		results = append(results, runBackend("lora", absRoot, *workers, *querySize, loraFactory))
 	}
 	if wantLadybug {
 		fmt.Fprintln(os.Stderr, "[ladybug] indexing through LadybugDB (Kuzu-fork, Cypher) Store...")

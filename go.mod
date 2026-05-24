@@ -351,6 +351,7 @@ require (
 	github.com/klauspost/compress v1.18.5 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/knights-analytics/ortgenai v0.3.1 // indirect
+	github.com/lora-db/lora/crates/bindings/lora-go v0.0.0-00010101000000-000000000000 // indirect
 	github.com/lucasb-eyer/go-colorful v1.4.0 // indirect
 	github.com/marcboeker/go-duckdb/arrowmapping v0.0.21 // indirect
 	github.com/marcboeker/go-duckdb/mapping v0.0.21 // indirect
@@ -422,3 +423,5 @@ replace github.com/mattn/go-pointer => ./internal/thirdparty/go-pointer
 // blocked the Windows build because github.com/coder/hnsw imports it
 // unconditionally. See internal/thirdparty/renameio.
 replace github.com/google/renameio => ./internal/thirdparty/renameio
+
+replace github.com/lora-db/lora/crates/bindings/lora-go => /tmp/lora-build/crates/bindings/lora-go
