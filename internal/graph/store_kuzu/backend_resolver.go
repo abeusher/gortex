@@ -41,7 +41,55 @@ RETURN count(newE) AS resolved`
 	return s.runResolverQueryLocked(q, "ResolveSameFile")
 }
 
-func (s *Store) ResolveSamePackage() (int, error)           { return 0, nil }
+// ResolveSamePackage drains the "same Go-style package" case: edges
+// where the caller and a unique candidate share the same directory
+// portion of file_path AND the same repo_prefix. Kuzu has no
+// regex_extract, so directory is derived by splitting on "/" and
+// reassembling all but the last segment with list_to_string.
+func (s *Store) ResolveSamePackage() (int, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	// Kuzu has neither regex_extract nor split — but it does have
+	// regexp_replace, which we abuse to extract the directory by
+	// stripping everything from the last "/" onward. Files with no
+	// "/" come back unchanged so we add an explicit guard with
+	// CONTAINS to skip top-level files.
+	const q = `
+MATCH (caller:Node)-[e:Edge]->(stub:Node)
+WHERE stub.id STARTS WITH 'unresolved::'
+  AND caller.file_path <> ''
+  AND caller.file_path CONTAINS '/'
+WITH e, caller, stub, substring(stub.id, 13, size(stub.id) - 12) AS name,
+     regexp_replace(caller.file_path, '/[^/]+$', '') AS caller_dir
+OPTIONAL MATCH (cnd:Node {name: name})
+WHERE cnd.repo_prefix = caller.repo_prefix
+  AND cnd.id <> stub.id
+  AND cnd.file_path <> caller.file_path
+  AND cnd.file_path CONTAINS '/'
+  AND regexp_replace(cnd.file_path, '/[^/]+$', '') = caller_dir
+WITH e, caller, stub, name, caller_dir, count(cnd) AS cnt
+WHERE cnt = 1
+MATCH (target:Node {name: name})
+WHERE target.repo_prefix = caller.repo_prefix
+  AND target.id <> stub.id
+  AND target.file_path <> caller.file_path
+  AND target.file_path CONTAINS '/'
+  AND regexp_replace(target.file_path, '/[^/]+$', '') = caller_dir
+DELETE e
+CREATE (caller)-[newE:Edge {
+    kind: e.kind,
+    file_path: e.file_path,
+    line: e.line,
+    confidence: e.confidence,
+    confidence_label: e.confidence_label,
+    origin: 'ast_resolved',
+    tier: 'ast_resolved',
+    cross_repo: e.cross_repo,
+    meta: e.meta
+}]->(target)
+RETURN count(newE) AS resolved`
+	return s.runResolverQueryLocked(q, "ResolveSamePackage")
+}
 func (s *Store) ResolveImportAware() (int, error)           { return 0, nil }
 func (s *Store) ResolveRelativeImports(string) (int, error) { return 0, nil }
 func (s *Store) ResolveCrossRepo() (int, error)             { return 0, nil }

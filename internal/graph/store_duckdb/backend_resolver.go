@@ -32,7 +32,38 @@ WHERE edges.edge_id = u.edge_id`
 	return s.runResolverUpdateLocked(q, "ResolveSameFile")
 }
 
-func (s *Store) ResolveSamePackage() (int, error)           { return 0, nil }
+// ResolveSamePackage drains the "same Go-style package" case in
+// DuckDB SQL: caller and a unique candidate share the same
+// directory portion of file_path and the same repo_prefix.
+// Directory is extracted via regexp_extract.
+func (s *Store) ResolveSamePackage() (int, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	const q = `
+WITH unique_candidates AS (
+    SELECT e.edge_id, MIN(t.id) AS target_id
+    FROM edges e
+    JOIN nodes c ON c.id = e.from_id
+    JOIN nodes t ON t.name = substring(e.to_id, 13)
+                AND regexp_extract(t.file_path, '^(.*)/[^/]+$', 1) =
+                    regexp_extract(c.file_path, '^(.*)/[^/]+$', 1)
+                AND t.repo_prefix = c.repo_prefix
+                AND t.id <> e.to_id
+                AND t.file_path <> c.file_path
+                AND c.file_path <> ''
+                AND regexp_extract(c.file_path, '^(.*)/[^/]+$', 1) <> ''
+    WHERE e.to_id LIKE 'unresolved::%'
+    GROUP BY e.edge_id
+    HAVING COUNT(*) = 1
+)
+UPDATE edges
+SET to_id  = u.target_id,
+    origin = 'ast_resolved',
+    tier   = 'ast_resolved'
+FROM unique_candidates u
+WHERE edges.edge_id = u.edge_id`
+	return s.runResolverUpdateLocked(q, "ResolveSamePackage")
+}
 func (s *Store) ResolveImportAware() (int, error)           { return 0, nil }
 func (s *Store) ResolveRelativeImports(string) (int, error) { return 0, nil }
 func (s *Store) ResolveCrossRepo() (int, error)             { return 0, nil }
