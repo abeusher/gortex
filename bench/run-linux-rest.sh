@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Sequential Linux-kernel bench for the remaining 4 disk backends
-# (ladybug, duckdb, sqlite, cozo). Forces shadow swap via
+# Sequential Linux-kernel bench for the rest of the disk backends
+# (ladybug, duckdb, sqlite). Forces shadow swap via
 # GORTEX_SHADOW_MAX_FILES so each backend gets the same drain
 # benefit as kuzu.
 

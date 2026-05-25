@@ -75,7 +75,18 @@ type benchResult struct {
 	QueryP95us float64
 	HeapAllocMB float64 // live allocated bytes after GC
 	HeapInuseMB float64 // span footprint after GC
-	Err        string
+	// Per-MCP-tool latency. Each entry is keyed by the MCP tool name
+	// (get_symbol, find_usages, get_callers, get_dependencies,
+	// search_symbols, get_file_summary) and holds the Store-level
+	// operation cost the tool incurs at the persistence layer.
+	PerTool map[string]toolStats
+	Err     string
+}
+
+type toolStats struct {
+	P50us float64
+	P95us float64
+	N     int
 }
 
 type queryWorkload struct {
@@ -278,35 +289,69 @@ func runBackend(
 	// genuine state, not random IDs guessed at.
 	wl := pickQueriesFromStore(store, querySize)
 
-	latencies := make([]time.Duration, 0,
-		len(wl.nodeIDs)+len(wl.outIDs)+len(wl.inIDs)+len(wl.names)+len(wl.filePaths))
+	r.PerTool = map[string]toolStats{}
+
+	// get_symbol — single node fetch by ID.
+	getSym := make([]time.Duration, 0, len(wl.nodeIDs))
 	for _, id := range wl.nodeIDs {
 		t := time.Now()
 		_ = store.GetNode(id)
-		latencies = append(latencies, time.Since(t))
+		getSym = append(getSym, time.Since(t))
 	}
+	r.PerTool["get_symbol"] = toolStatsFrom(getSym)
+
+	// get_dependencies — outgoing edges from a symbol.
+	getDeps := make([]time.Duration, 0, len(wl.outIDs))
 	for _, id := range wl.outIDs {
 		t := time.Now()
 		_ = store.GetOutEdges(id)
-		latencies = append(latencies, time.Since(t))
+		getDeps = append(getDeps, time.Since(t))
 	}
+	r.PerTool["get_dependencies"] = toolStatsFrom(getDeps)
+
+	// find_usages — incoming references edges.
+	findUses := make([]time.Duration, 0, len(wl.inIDs))
 	for _, id := range wl.inIDs {
 		t := time.Now()
-		_ = store.GetInEdges(id)
-		latencies = append(latencies, time.Since(t))
+		edges := store.GetInEdges(id)
+		_ = filterEdgeKind(edges, graph.EdgeReferences)
+		findUses = append(findUses, time.Since(t))
 	}
+	r.PerTool["find_usages"] = toolStatsFrom(findUses)
+
+	// get_callers — incoming call edges.
+	getCallers := make([]time.Duration, 0, len(wl.inIDs))
+	for _, id := range wl.inIDs {
+		t := time.Now()
+		edges := store.GetInEdges(id)
+		_ = filterEdgeKind(edges, graph.EdgeCalls)
+		getCallers = append(getCallers, time.Since(t))
+	}
+	r.PerTool["get_callers"] = toolStatsFrom(getCallers)
+
+	// search_symbols — name lookup (Store-level; the BM25 rerank on top
+	// is backend-independent).
+	searchSym := make([]time.Duration, 0, len(wl.names))
 	for _, n := range wl.names {
 		t := time.Now()
 		_ = store.FindNodesByName(n)
-		latencies = append(latencies, time.Since(t))
+		searchSym = append(searchSym, time.Since(t))
 	}
+	r.PerTool["search_symbols"] = toolStatsFrom(searchSym)
+
+	// get_file_summary — all symbols in a file.
+	getFile := make([]time.Duration, 0, len(wl.filePaths))
 	for _, fp := range wl.filePaths {
 		t := time.Now()
 		_ = store.GetFileNodes(fp)
-		latencies = append(latencies, time.Since(t))
+		getFile = append(getFile, time.Since(t))
 	}
-	r.QueryP50us = pctUs(latencies, 50)
-	r.QueryP95us = pctUs(latencies, 95)
+	r.PerTool["get_file_summary"] = toolStatsFrom(getFile)
+
+	// Legacy aggregate (kept for the headline number in the main table).
+	all := append(append(append(append(append(getSym, getDeps...), findUses...), getCallers...), searchSym...), getFile...)
+	r.QueryP50us = pctUs(all, 50)
+	r.QueryP95us = pctUs(all, 95)
 
 	// Sample heap. Force GC first so the figure reflects retained
 	// state (the live graph + indexer state), not allocation churn
@@ -391,6 +436,24 @@ func pickQueriesFromStore(s graph.Store, n int) queryWorkload {
 	return wl
 }
 
+func toolStatsFrom(latencies []time.Duration) toolStats {
+	return toolStats{
+		P50us: pctUs(latencies, 50),
+		P95us: pctUs(latencies, 95),
+		N:     len(latencies),
+	}
+}
+
+func filterEdgeKind(edges []*graph.Edge, kind graph.EdgeKind) []*graph.Edge {
+	out := edges[:0]
+	for _, e := range edges {
+		if e.Kind == kind {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
 // -- output -----------------------------------------------------------------
 
 func printTable(w *os.File, rows []benchResult) {
@@ -417,6 +480,35 @@ func printTable(w *os.File, rows []benchResult) {
 		)
 	}
 	fmt.Fprintln(w, "")
+
+	// Per-MCP-tool latency table. One row per backend, one column per
+	// tool. Each cell is "p50 / p95" of the Store-level call the tool
+	// runs at the persistence layer.
+	tools := []string{"get_symbol", "get_dependencies", "find_usages", "get_callers", "search_symbols", "get_file_summary"}
+	fmt.Fprintln(w, "# Per-MCP-tool latency (Store-level p50 / p95)")
+	fmt.Fprintln(w, "")
+	fmt.Fprint(w, "| backend |")
+	for _, t := range tools {
+		fmt.Fprintf(w, " %s |", t)
+	}
+	fmt.Fprintln(w)
+	fmt.Fprint(w, "|---------|")
+	for range tools {
+		fmt.Fprint(w, "------------------:|")
+	}
+	fmt.Fprintln(w)
+	for _, r := range rows {
+		if r.Err != "" || r.PerTool == nil {
+			continue
+		}
+		fmt.Fprintf(w, "| %s |", r.Backend)
+		for _, t := range tools {
+			s := r.PerTool[t]
+			fmt.Fprintf(w, " %s / %s |", fmtUs(s.P50us), fmtUs(s.P95us))
+		}
+		fmt.Fprintln(w)
+	}
+	fmt.Fprintln(w)
 }
 
 // -- small helpers ----------------------------------------------------------
