@@ -324,6 +324,28 @@ func runBackend(
 	}
 	r.PerTool["get_file_summary"] = toolStatsFrom(getFile)
 
+	// fts_search — backend-native full-text search via the
+	// graph.SymbolSearcher capability. Bypasses BM25/Bleve entirely
+	// and measures the disk store's own FTS round-trip. Skipped on
+	// backends that don't implement the capability so the column
+	// stays meaningful (zeroes for non-FTS stores would imply
+	// "instant" which is false). Workload mirrors search_symbols:
+	// every sampled node name becomes one query.
+	if searcher, ok := store.(graph.SymbolSearcher); ok && len(wl.names) > 0 {
+		// Build the FTS index on the corpus we just populated.
+		// BuildSymbolIndex is idempotent; the indexer also calls
+		// it post-drain so this is a defensive belt+suspenders
+		// for store-bench's standalone runtime.
+		_ = searcher.BuildSymbolIndex()
+		ftsSearch := make([]time.Duration, 0, len(wl.names))
+		for _, n := range wl.names {
+			t := time.Now()
+			_, _ = searcher.SearchSymbols(n, 20)
+			ftsSearch = append(ftsSearch, time.Since(t))
+		}
+		r.PerTool["fts_search"] = toolStatsFrom(ftsSearch)
+	}
+
 	// Legacy aggregate (kept for the headline number in the main table).
 	all := append(append(append(append(append(getSym, getDeps...), findUses...), getCallers...), searchSym...), getFile...)
 	r.QueryP50us = pctUs(all, 50)
@@ -460,7 +482,7 @@ func printTable(w *os.File, rows []benchResult) {
 	// Per-MCP-tool latency table. One row per backend, one column per
 	// tool. Each cell is "p50 / p95" of the Store-level call the tool
 	// runs at the persistence layer.
-	tools := []string{"get_symbol", "get_dependencies", "find_usages", "get_callers", "search_symbols", "get_file_summary"}
+	tools := []string{"get_symbol", "get_dependencies", "find_usages", "get_callers", "search_symbols", "get_file_summary", "fts_search"}
 	fmt.Fprintln(w, "# Per-MCP-tool latency (Store-level p50 / p95)")
 	fmt.Fprintln(w, "")
 	fmt.Fprint(w, "| backend |")
