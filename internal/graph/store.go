@@ -126,7 +126,7 @@ type Store interface {
 	//
 	// The resolver alone calls AllEdges/AllNodes 34× per pass and
 	// throws away >99% of each scan; using these predicate methods
-	// instead cut a 503-second sqlite resolver pass on a 122k-node
+	// instead cut a 503-second disk-backed resolver pass on a 122k-node
 	// graph down to seconds.
 	//
 	// Iterators stop when the consumer's yield returns false.
@@ -151,11 +151,10 @@ type Store interface {
 	// The resolver fires ~3-10 GetNode / FindNodesByName calls per
 	// unresolved edge across its workers. With 10-30k pending edges
 	// that's 100k-300k individual queries. On in-memory that's
-	// fine (map lookups, nanoseconds). On sqlite each prepared-stmt
-	// Exec through modernc.org/sqlite costs ~1-5 ms — at 100k+ calls
-	// the per-pass cost is hundreds of seconds, dominating the
-	// resolver. The batched variants collapse those into one (or
-	// chunked) bulk query.
+	// fine (map lookups, nanoseconds). On a disk backend each point
+	// lookup is ~ms — at 100k+ calls the per-pass cost is hundreds
+	// of seconds, dominating the resolver. The batched variants
+	// collapse those into one (or chunked) bulk query.
 
 	// GetNodesByIDs returns a map id→*Node for every input ID present
 	// in the store. IDs not in the store are simply absent from the

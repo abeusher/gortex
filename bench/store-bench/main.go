@@ -1,21 +1,12 @@
-// Command store-bench compares the three graph.Store implementations
-// (in-memory, bbolt-on-disk, SQLite-on-disk) by running the FULL
-// indexer pipeline against the same source repo through each backend.
+// Command store-bench compares the supported graph.Store implementations
+// (in-memory + ladybug) by running the FULL indexer pipeline against the
+// same source repo through each backend.
 //
-// What changed from the earlier "migration" harness: previously this
-// bench built an in-memory reference graph once, then bulk-loaded it
-// into each backend via AddBatch. That measured the cost of migrating
-// a pre-built graph between stores, NOT the cost of indexing through
-// the store. The disk backends' real workload — write per-file batches
-// streaming out of the parser — was never exercised, so the numbers
-// understated bbolt's per-Tx commit fan-out and overstated sqlite's
-// bulk-insert efficiency.
-//
-// Now each backend gets its own indexer.New(store, ...) call and runs
-// the complete IndexCtx pipeline (parse → resolve → search index →
-// contracts → clones → stub resolution → external-call synthesis).
-// That's apples-to-apples: the same work the daemon would do on a
-// cold start, against the backend that would persist it.
+// Each backend gets its own indexer.New(store, ...) call and runs the
+// complete IndexCtx pipeline (parse → resolve → search index → contracts
+// → clones → stub resolution → external-call synthesis). That's
+// apples-to-apples: the same work the daemon would do on a cold start,
+// against the backend that would persist it.
 package main
 
 import (
@@ -37,9 +28,7 @@ import (
 	"github.com/zzet/gortex/internal/analysis"
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
-	"github.com/zzet/gortex/internal/graph/store_duckdb"
 	"github.com/zzet/gortex/internal/graph/store_ladybug"
-	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/parser/languages"
@@ -48,7 +37,7 @@ import (
 )
 
 // stageReporter prints per-stage timings to stderr so a long-running
-// backend (full indexer pipeline through bbolt on a 35k-file repo)
+// backend (full indexer pipeline through ladybug on a 35k-file repo)
 // shows progress instead of looking hung.
 type stageReporter struct {
 	start time.Time
@@ -104,10 +93,8 @@ func main() {
 	workers := flag.Int("workers", runtime.NumCPU(), "indexer parallelism")
 	querySize := flag.Int("queries", 1000, "query workload size per backend")
 	skipMemory := flag.Bool("skip-memory", false, "skip the in-memory baseline")
-	skipSQLite := flag.Bool("skip-sqlite", false, "skip the sqlite backend")
-	skipDuckDB := flag.Bool("skip-duckdb", false, "skip the duckdb (columnar SQL) backend")
 	skipLadybug := flag.Bool("skip-ladybug", false, "skip the ladybug (embedded Cypher property-graph) backend")
-	only := flag.String("only", "", "comma-separated subset to run (memory,sqlite,duckdb,ladybug); overrides skip-* flags")
+	only := flag.String("only", "", "comma-separated subset to run (memory,ladybug); overrides skip-* flags")
 	vectorCorpus := flag.Int("vectors", 0, "vector corpus size for HNSW bench (0 disables); needs a backend with graph.VectorSearcher")
 	vectorDim := flag.Int("vector-dim", 384, "embedding dimensionality (MiniLM-L6-v2 default)")
 	vectorQueries := flag.Int("vector-queries", 200, "number of SimilarTo / Search queries to time per backend")
@@ -123,16 +110,13 @@ func main() {
 
 	// Resolve which backends to run. -only overrides every -skip flag.
 	wantMem := !*skipMemory
-	wantSQLite := !*skipSQLite
-	wantDuckDB := !*skipDuckDB
 	wantLadybug := !*skipLadybug
 	if *only != "" {
 		set := map[string]bool{}
 		for _, s := range strings.Split(*only, ",") {
 			set[strings.TrimSpace(s)] = true
 		}
-		wantMem, wantSQLite = set["memory"], set["sqlite"]
-		wantDuckDB = set["duckdb"]
+		wantMem = set["memory"]
 		wantLadybug = set["ladybug"]
 	}
 
@@ -151,48 +135,6 @@ func main() {
 		results = append(results, runBackend("memory", absRoot, *workers, *querySize, vecBench,
 			func() (graph.Store, func() int64, error) {
 				return graph.New(), func() int64 { return 0 }, nil
-			}))
-	}
-	if wantSQLite {
-		fmt.Fprintln(os.Stderr, "[sqlite] indexing through sqlite on-disk Store...")
-		results = append(results, runBackend("sqlite", absRoot, *workers, *querySize, vecBench,
-			func() (graph.Store, func() int64, error) {
-				dir, err := os.MkdirTemp("", "store-bench-sqlite-*")
-				if err != nil {
-					return nil, nil, err
-				}
-				path := filepath.Join(dir, "store.sqlite")
-				s, err := store_sqlite.Open(path)
-				if err != nil {
-					os.RemoveAll(dir)
-					return nil, nil, err
-				}
-				diskFn := func() int64 {
-					_ = s.Close()
-					return fileSize(path) + fileSize(path+"-wal") + fileSize(path+"-shm")
-				}
-				return s, diskFn, nil
-			}))
-	}
-	if wantDuckDB {
-		fmt.Fprintln(os.Stderr, "[duckdb] indexing through DuckDB (columnar SQL) Store...")
-		results = append(results, runBackend("duckdb", absRoot, *workers, *querySize, vecBench,
-			func() (graph.Store, func() int64, error) {
-				dir, err := os.MkdirTemp("", "store-bench-duckdb-*")
-				if err != nil {
-					return nil, nil, err
-				}
-				path := filepath.Join(dir, "store.duckdb")
-				s, err := store_duckdb.Open(path)
-				if err != nil {
-					os.RemoveAll(dir)
-					return nil, nil, err
-				}
-				diskFn := func() int64 {
-					_ = s.Close()
-					return fileSize(path) + fileSize(path+".wal")
-				}
-				return s, diskFn, nil
 			}))
 	}
 	if wantLadybug {
@@ -384,10 +326,9 @@ func runBackend(
 	// running over the populated store. For backends that implement
 	// the capability interface (today only ladybug) we time the
 	// engine-native CALL; for the memory backend (which IS *graph.Graph)
-	// we time the in-process analysis.* fallback. sqlite / duckdb
-	// don't get a number — converting their state into *graph.Graph
-	// would add a one-time copy cost that would dominate the
-	// measurement and make the comparison meaningless.
+	// we time the in-process analysis.* fallback. Backends without
+	// either capability are skipped — zeroing the cell would imply
+	// "instant" which is false.
 	measureAlgos(store, &r)
 
 	// fts_search — backend-native full-text search via the
@@ -510,8 +451,8 @@ func pickQueriesFromStore(s graph.Store, n int) queryWorkload {
 //   - is *graph.Graph (the memory backend) → time the in-process
 //     analysis.* fallback over the same graph the indexer wrote
 //     into.
-//   - anything else → skip (zeroing the cell for sqlite/duckdb
-//     would imply "instant" which is false).
+//   - anything else → skip (zeroing the cell would imply "instant"
+//     which is false).
 //
 // Each cell holds a single-sample p50 / p95 — both are the same
 // value, the per-tool table column shape just expects the

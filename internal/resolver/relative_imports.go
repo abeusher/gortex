@@ -27,8 +27,8 @@ func (r *Resolver) resolveRelativeImports() {
 	// Pre-build a map of every KindFile node's ID. The relative-
 	// import resolvers below check 1-2 candidate IDs per edge to
 	// decide whether a target file exists; doing that as a per-edge
-	// GetNode (a SQL query each on a disk backend) is what made this
-	// pass dominate sqlite resolve time. One NodesByKind scan
+	// GetNode (a per-edge round-trip on a disk backend) is what made
+	// this pass dominate disk-backed resolve time. One NodesByKind scan
 	// materialises the set once at indexed cost; lookups become
 	// O(1) map hits.
 	fileIDs := make(map[string]struct{}, 1024)

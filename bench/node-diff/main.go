@@ -1,3 +1,5 @@
+//go:build ladybug
+
 // Command node-diff indexes the same repo twice — once through the
 // in-memory Store and once through a disk Store — then prints the
 // symmetric difference of the two node sets so we can classify which
@@ -17,7 +19,7 @@ import (
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
-	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/graph/store_ladybug"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/parser/languages"
@@ -39,12 +41,12 @@ func main() {
 	memNodes := indexAndCollect(abs, *workers, "memory", func() graph.Store {
 		return graph.New()
 	})
-	dskNodes := indexAndCollect(abs, *workers, "sqlite", func() graph.Store {
-		dir, err := os.MkdirTemp("", "node-diff-sqlite-*")
+	dskNodes := indexAndCollect(abs, *workers, "ladybug", func() graph.Store {
+		dir, err := os.MkdirTemp("", "node-diff-ladybug-*")
 		if err != nil {
 			panic(err)
 		}
-		s, err := store_sqlite.Open(filepath.Join(dir, "store.sqlite"))
+		s, err := store_ladybug.Open(filepath.Join(dir, "store.lbug"))
 		if err != nil {
 			panic(err)
 		}
@@ -52,12 +54,12 @@ func main() {
 	})
 
 	// Smoke-test: write one of the "missing" nodes directly to a
-	// fresh sqlite store. If it round-trips, sqlite is innocent and
+	// fresh ladybug store. If it round-trips, ladybug is innocent and
 	// the loss is upstream (shadow drain, indexer pipeline ordering,
-	// etc). If it doesn't, sqlite is silently dropping these nodes.
+	// etc). If it doesn't, ladybug is silently dropping these nodes.
 	{
 		dir, _ := os.MkdirTemp("", "node-diff-smoke-*")
-		s, _ := store_sqlite.Open(filepath.Join(dir, "store.sqlite"))
+		s, _ := store_ladybug.Open(filepath.Join(dir, "store.lbug"))
 		probe := &graph.Node{
 			ID:       "module::pypi:agents",
 			Kind:     "module",
@@ -77,10 +79,10 @@ func main() {
 	onlyMem := diff(memIDs, dskIDs)
 	onlyDsk := diff(dskIDs, memIDs)
 
-	fmt.Printf("memory: %d nodes\n", len(memIDs))
-	fmt.Printf("sqlite: %d nodes\n", len(dskIDs))
-	fmt.Printf("only in memory: %d\n", len(onlyMem))
-	fmt.Printf("only in sqlite: %d\n", len(onlyDsk))
+	fmt.Printf("memory:  %d nodes\n", len(memIDs))
+	fmt.Printf("ladybug: %d nodes\n", len(dskIDs))
+	fmt.Printf("only in memory:  %d\n", len(onlyMem))
+	fmt.Printf("only in ladybug: %d\n", len(onlyDsk))
 	fmt.Println()
 
 	if len(onlyMem) > 0 {
@@ -88,7 +90,7 @@ func main() {
 		describe(memIDs, onlyMem)
 	}
 	if len(onlyDsk) > 0 {
-		fmt.Println("=== nodes only in sqlite ===")
+		fmt.Println("=== nodes only in ladybug ===")
 		describe(dskIDs, onlyDsk)
 	}
 }

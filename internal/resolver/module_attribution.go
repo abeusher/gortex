@@ -87,8 +87,8 @@ func (r *Resolver) attributeNonGoModuleImports() {
 	// Pre-build a set of every (fileID, moduleID) pair the graph
 	// already has an EdgeDependsOnModule edge for. The old code
 	// called hasDependsOnModule per rewrite, which on a disk backend
-	// fans out to N per-file GetOutEdges SELECTs (50k+ on a sqlite-
-	// backed gortex pass). One EdgesByKind scan is an indexed range
+	// fans out to N per-file GetOutEdges queries (50k+ on a
+	// gortex-scale pass). One EdgesByKind scan is an indexed range
 	// read on every backend, plus a Go-side map build that turns
 	// the per-rewrite check into a constant-time lookup.
 	existingDepends := make(map[string]map[string]struct{})

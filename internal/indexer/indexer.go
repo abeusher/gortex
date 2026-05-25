@@ -289,10 +289,10 @@ type contractCacheEntry struct {
 }
 
 // New creates an Indexer that writes through the supplied graph.Store.
-// Any backend (in-memory, bbolt-on-disk, sqlite-on-disk, remote) is
-// acceptable — the indexer's mutation paths go through the Store
-// interface methods only, so swapping backends is a zero-code-change
-// configuration choice for callers.
+// Any backend (in-memory, ladybug-on-disk, remote) is acceptable — the
+// indexer's mutation paths go through the Store interface methods only,
+// so swapping backends is a zero-code-change configuration choice for
+// callers.
 func New(g graph.Store, reg *parser.Registry, cfg config.IndexConfig, logger *zap.Logger) *Indexer {
 	idx := &Indexer{
 		graph:    g,
@@ -1712,8 +1712,7 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 	// the persisted state.
 	//
 	// Guards:
-	//   - Backend must implement graph.BulkLoader (ladybug, duckdb,
-	//     sqlite all opt in).
+	//   - Backend must implement graph.BulkLoader (ladybug opts in).
 	//   - Store must be empty (NodeCount == 0 && EdgeCount == 0). The
 	//     final dump is BulkLoad's INSERT-only fast path — running it
 	//     against a non-empty store would corrupt or duplicate.

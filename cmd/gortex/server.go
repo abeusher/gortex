@@ -427,12 +427,12 @@ func runServer(cmd *cobra.Command, _ []string) error {
 	// Create persistence store. The snapshot cache exists for the
 	// in-memory backend, where heap state is lost on restart — load
 	// from snapshot skips the parse phase on a warm restart. For
-	// on-disk backends (ladybug, sqlite, duckdb) the store IS
-	// already persistent across restarts: re-opening the same path
-	// hands back the previous run's graph in milliseconds, and
-	// replaying a snapshot via per-row g.AddNode would just
-	// re-write everything we already have at glacial per-row
-	// Cypher speed. Skip the cache entirely on those backends.
+	// the ladybug on-disk backend the store IS already persistent
+	// across restarts: re-opening the same path hands back the
+	// previous run's graph in milliseconds, and replaying a snapshot
+	// via per-row g.AddNode would just re-write everything we already
+	// have at glacial per-row Cypher speed. Skip the cache entirely
+	// on those backends.
 	var store persistence.Store
 	persistentBackend := !strings.EqualFold(strings.TrimSpace(serverBackend), "memory") && strings.TrimSpace(serverBackend) != ""
 	switch {

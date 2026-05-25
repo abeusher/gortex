@@ -1,4 +1,6 @@
-// Command edge-diff indexes the same repo twice (memory + sqlite) and
+//go:build ladybug
+
+// Command edge-diff indexes the same repo twice (memory + ladybug) and
 // prints the symmetric difference of the edge sets, classified by
 // (Kind, FromKind, ToKind). Helps localise the source of any remaining
 // edge-count gap after a backend or pipeline fix.
@@ -17,7 +19,7 @@ import (
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
-	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/graph/store_ladybug"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/parser/languages"
@@ -47,12 +49,12 @@ func main() {
 	memNodes, memEdges := indexAndCollect(abs, *workers, "memory", func() graph.Store {
 		return graph.New()
 	})
-	dskNodes, dskEdges := indexAndCollect(abs, *workers, "sqlite", func() graph.Store {
-		dir, err := os.MkdirTemp("", "edge-diff-sqlite-*")
+	dskNodes, dskEdges := indexAndCollect(abs, *workers, "ladybug", func() graph.Store {
+		dir, err := os.MkdirTemp("", "edge-diff-ladybug-*")
 		if err != nil {
 			panic(err)
 		}
-		s, err := store_sqlite.Open(filepath.Join(dir, "store.sqlite"))
+		s, err := store_ladybug.Open(filepath.Join(dir, "store.lbug"))
 		if err != nil {
 			panic(err)
 		}
@@ -62,19 +64,19 @@ func main() {
 	memSet := edgeKeyMap(memEdges)
 	dskSet := edgeKeyMap(dskEdges)
 
-	fmt.Printf("memory: %d nodes / %d edges (unique keys %d)\n", len(memNodes), len(memEdges), len(memSet))
-	fmt.Printf("sqlite: %d nodes / %d edges (unique keys %d)\n", len(dskNodes), len(dskEdges), len(dskSet))
+	fmt.Printf("memory:  %d nodes / %d edges (unique keys %d)\n", len(memNodes), len(memEdges), len(memSet))
+	fmt.Printf("ladybug: %d nodes / %d edges (unique keys %d)\n", len(dskNodes), len(dskEdges), len(dskSet))
 
 	onlyMem := keysOnlyIn(memSet, dskSet)
 	onlyDsk := keysOnlyIn(dskSet, memSet)
-	fmt.Printf("only in memory: %d unique edges\n", len(onlyMem))
-	fmt.Printf("only in sqlite: %d unique edges\n", len(onlyDsk))
+	fmt.Printf("only in memory:  %d unique edges\n", len(onlyMem))
+	fmt.Printf("only in ladybug: %d unique edges\n", len(onlyDsk))
 
 	if dups := len(memEdges) - len(memSet); dups > 0 {
 		fmt.Printf("\nmemory: %d duplicate edge slots (raw count - unique-key count)\n", dups)
 	}
 	if dups := len(dskEdges) - len(dskSet); dups > 0 {
-		fmt.Printf("sqlite: %d duplicate edge slots (raw count - unique-key count)\n", dups)
+		fmt.Printf("ladybug: %d duplicate edge slots (raw count - unique-key count)\n", dups)
 	}
 
 	if len(onlyMem) > 0 {
@@ -82,7 +84,7 @@ func main() {
 		describeEdges(memSet, onlyMem, memNodes, *sampleLimit)
 	}
 	if len(onlyDsk) > 0 {
-		fmt.Println("\n=== edges only in sqlite ===")
+		fmt.Println("\n=== edges only in ladybug ===")
 		describeEdges(dskSet, onlyDsk, dskNodes, *sampleLimit)
 	}
 }

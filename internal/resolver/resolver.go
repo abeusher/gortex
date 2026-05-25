@@ -83,9 +83,9 @@ type Resolver struct {
 	//
 	// Without the cache, the resolver fires ~3-10 store point lookups
 	// per pending edge — across 10-30k unresolved edges that's 100k+
-	// queries, each one a prepared-stmt round trip on disk backends
-	// (~ms each through modernc.org/sqlite). With the cache the same
-	// information lands in two batched queries per pass.
+	// queries, each one a round trip on disk backends (~ms each).
+	// With the cache the same information lands in two batched
+	// queries per pass.
 	nodeByID    map[string]*graph.Node
 	nodesByName map[string][]*graph.Node
 
@@ -227,11 +227,10 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 	}
 
 	// Use the predicate-shaped Store method so disk backends scan
-	// only the contiguous "unresolved::*" slice (via a sparse
-	// idx_edge_unres bucket on bolt, a to_id range scan on sqlite)
-	// instead of pulling the whole edges table back to the client and
-	// filtering in Go. In-memory keeps the same cost as the old
-	// AllEdges()+prefix-check loop.
+	// only the contiguous "unresolved::*" slice instead of pulling
+	// the whole edges table back to the client and filtering in Go.
+	// In-memory keeps the same cost as the old AllEdges()+prefix-check
+	// loop.
 	var pending []*graph.Edge
 	for e := range r.graph.EdgesWithUnresolvedTarget() {
 		pending = append(pending, e)
@@ -243,8 +242,8 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 	// Pre-warm the per-pass lookup cache. The resolver workers below
 	// will call store.GetNode for endpoints and store.FindNodesByName
 	// for resolution candidates — across 10-30k pending edges that's
-	// 100k+ individual prepared-stmt queries on a disk backend
-	// (hundreds of seconds through modernc.org/sqlite). Collecting the
+	// 100k+ individual queries on a disk backend
+	// (hundreds of seconds wall time). Collecting the
 	// IDs / names upfront and batch-loading them collapses those
 	// queries to ~10 chunked SELECT IN statements. Cleared on return
 	// via defer so callers outside ResolveAll see the empty caches and

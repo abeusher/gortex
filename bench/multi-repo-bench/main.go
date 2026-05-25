@@ -29,9 +29,7 @@ import (
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
-	"github.com/zzet/gortex/internal/graph/store_duckdb"
 	"github.com/zzet/gortex/internal/graph/store_ladybug"
-	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/parser/languages"
@@ -74,7 +72,7 @@ func main() {
 	configPath := flag.String("config", "", "path to global gortex config.yaml (default ~/.config/gortex/config.yaml)")
 	workers := flag.Int("workers", runtime.NumCPU(), "indexer parallelism")
 	querySample := flag.Int("queries", 500, "per-backend GetNode sample size")
-	only := flag.String("only", "memory,ladybug", "comma-separated backends to run (memory,sqlite,duckdb,ladybug)")
+	only := flag.String("only", "memory,ladybug", "comma-separated backends to run (memory,ladybug)")
 	allRepos := flag.Bool("all-repos", false, "bench every repo in the global config, not just the active project (default off — ActiveRepos honours active_project)")
 	projects := flag.String("projects", "", "comma-separated list of project slugs to include (overrides active_project; ignored when -all-repos)")
 	flag.Parse()
@@ -111,48 +109,6 @@ func main() {
 			name: "memory",
 			open: func() (graph.Store, func() int64, error) {
 				return graph.New(), func() int64 { return 0 }, nil
-			},
-		})
-	}
-	if set["sqlite"] {
-		factories = append(factories, backendFactory{
-			name: "sqlite",
-			open: func() (graph.Store, func() int64, error) {
-				dir, err := os.MkdirTemp("", "multi-repo-bench-sqlite-*")
-				if err != nil {
-					return nil, nil, err
-				}
-				path := filepath.Join(dir, "store.sqlite")
-				s, err := store_sqlite.Open(path)
-				if err != nil {
-					os.RemoveAll(dir)
-					return nil, nil, err
-				}
-				return s, func() int64 {
-					_ = s.Close()
-					return fileSize(path) + fileSize(path+"-wal") + fileSize(path+"-shm")
-				}, nil
-			},
-		})
-	}
-	if set["duckdb"] {
-		factories = append(factories, backendFactory{
-			name: "duckdb",
-			open: func() (graph.Store, func() int64, error) {
-				dir, err := os.MkdirTemp("", "multi-repo-bench-duckdb-*")
-				if err != nil {
-					return nil, nil, err
-				}
-				path := filepath.Join(dir, "store.duckdb")
-				s, err := store_duckdb.Open(path)
-				if err != nil {
-					os.RemoveAll(dir)
-					return nil, nil, err
-				}
-				return s, func() int64 {
-					_ = s.Close()
-					return fileSize(path) + fileSize(path+".wal")
-				}, nil
 			},
 		})
 	}

@@ -202,8 +202,8 @@ func buildDaemonState(logger *zap.Logger) (*daemonState, error) {
 	// make that incremental path viable — without them, warmup would
 	// have no signal to distinguish "indexed and unchanged" from "new
 	// on disk", treat everything as stale, and produce duplicate
-	// nodes/edges on every restart (bug B1). For persistent backends
-	// (ladybug, sqlite, duckdb) the on-disk store IS the snapshot —
+	// nodes/edges on every restart (bug B1). For the ladybug
+	// persistent backend the on-disk store IS the snapshot —
 	// snapshot load is skipped to avoid replaying gob-encoded state
 	// over the already-populated disk store.
 	var loadResult snapshotLoadResult
