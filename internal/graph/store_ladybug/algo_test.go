@@ -202,3 +202,50 @@ func TestAlgo_PageRankThenLouvain(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, louvainHits, 7)
 }
+
+func TestComponentFinder_WCC_OneComponent(t *testing.T) {
+	s := seedAlgoTestGraph(t)
+	hits, err := s.WeaklyConnectedComponents(graph.ComponentOpts{})
+	require.NoError(t, err)
+	require.Len(t, hits, 7)
+	// Hub + both triangles are one undirected component (the bridge
+	// c -> d unifies them) — every node must share the same group_id.
+	first := hits[0].ComponentID
+	for _, h := range hits {
+		assert.Equal(t, first, h.ComponentID,
+			"all 7 nodes should be in one WCC; got %v", hits)
+	}
+}
+
+func TestComponentFinder_SCC_ThreeComponents(t *testing.T) {
+	s := seedAlgoTestGraph(t)
+	hits, err := s.StronglyConnectedComponents(graph.ComponentOpts{})
+	require.NoError(t, err)
+	require.Len(t, hits, 7)
+
+	// Index by node ID.
+	commFor := map[string]int64{}
+	for _, h := range hits {
+		commFor[h.NodeID] = h.ComponentID
+	}
+	// Triangle 1 = {a, b, c} must all share one SCC.
+	assert.Equal(t, commFor["a"], commFor["b"])
+	assert.Equal(t, commFor["b"], commFor["c"])
+	// Triangle 2 = {d, e, f} must all share one SCC.
+	assert.Equal(t, commFor["d"], commFor["e"])
+	assert.Equal(t, commFor["e"], commFor["f"])
+	// Triangle 1 and triangle 2 must be DIFFERENT SCCs (no path
+	// back from d to c).
+	assert.NotEqual(t, commFor["a"], commFor["d"],
+		"the two triangles must be separate SCCs; got %v", commFor)
+	// Hub is its own SCC (no inbound calls from any node it points at).
+	assert.NotEqual(t, commFor["hub"], commFor["a"])
+	assert.NotEqual(t, commFor["hub"], commFor["d"])
+}
+
+func TestComponentFinder_SCC_RespectsMaxIterations(t *testing.T) {
+	s := seedAlgoTestGraph(t)
+	hits, err := s.StronglyConnectedComponents(graph.ComponentOpts{MaxIterations: 5})
+	require.NoError(t, err)
+	require.Len(t, hits, 7)
+}

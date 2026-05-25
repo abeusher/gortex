@@ -264,3 +264,65 @@ func (s *Store) Louvain(opts graph.CommunityOpts) ([]graph.CommunityHit, error) 
 	return hits, nil
 }
 
+// WeaklyConnectedComponents runs WCC (undirected reachability)
+// over a projected subgraph. Returns one hit per node with the
+// integer component label; two nodes with the same ComponentID
+// are in the same WCC.
+func (s *Store) WeaklyConnectedComponents(opts graph.ComponentOpts) ([]graph.ComponentHit, error) {
+	return s.runComponentAlgo("weakly_connected_components", opts)
+}
+
+// StronglyConnectedComponents runs SCC (directional mutual
+// reachability) over a projected subgraph. Two nodes share an
+// SCC iff they are mutually reachable along directed edges; SCCs
+// of size > 1 are the cycle structure of the directed graph.
+//
+// Ladybug ships two SCC implementations — a BFS-based default
+// (used here) and a Kosaraju DFS variant
+// (strongly_connected_components_kosaraju) "recommended for sparse
+// graphs or those with high diameter" per the docs. Callers that
+// need Kosaraju behaviour can invoke graph_query directly.
+func (s *Store) StronglyConnectedComponents(opts graph.ComponentOpts) ([]graph.ComponentHit, error) {
+	return s.runComponentAlgo("strongly_connected_components", opts)
+}
+
+// runComponentAlgo is the shared shape for the two component
+// algos. cypherCall is the algo's CALL name; both algos return
+// the same (node, group_id) shape.
+func (s *Store) runComponentAlgo(cypherCall string, opts graph.ComponentOpts) ([]graph.ComponentHit, error) {
+	projOpts := projectionOpts{nodeKinds: opts.NodeKinds, edgeKinds: opts.EdgeKinds}
+
+	knobs := ""
+	if opts.MaxIterations > 0 {
+		knobs = fmt.Sprintf(", maxIterations := %d", opts.MaxIterations)
+	}
+
+	var hits []graph.ComponentHit
+	err := s.withProjection(projOpts, func(name string) error {
+		q := fmt.Sprintf(
+			`CALL %s('%s'%s) RETURN node.id AS id, group_id`,
+			cypherCall, name, knobs,
+		)
+		rows, err := querySelectSafe(s, q, nil)
+		if err != nil {
+			return fmt.Errorf("%s: %w", cypherCall, err)
+		}
+		hits = make([]graph.ComponentHit, 0, len(rows))
+		for _, row := range rows {
+			if len(row) < 2 {
+				continue
+			}
+			id, _ := row[0].(string)
+			if id == "" {
+				continue
+			}
+			hits = append(hits, graph.ComponentHit{NodeID: id, ComponentID: asInt64(row[1])})
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return hits, nil
+}
+

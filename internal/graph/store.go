@@ -530,3 +530,47 @@ type CommunityHit struct {
 type CommunityDetector interface {
 	Louvain(opts CommunityOpts) ([]CommunityHit, error)
 }
+
+// ComponentOpts tunes connected-component computation over a
+// projected subgraph. Zero values request the backend default
+// (maxIterations=100 on Ladybug). NodeKinds / EdgeKinds restrict
+// the projection.
+type ComponentOpts struct {
+	NodeKinds     []NodeKind
+	EdgeKinds     []EdgeKind
+	MaxIterations int
+}
+
+// ComponentHit is one row of a connected-component output: the
+// node ID plus the integer component label the algorithm assigned.
+// Two nodes with the same ComponentID are in the same component.
+// The integer is opaque (Ladybug uses internal node offsets).
+type ComponentHit struct {
+	NodeID      string
+	ComponentID int64
+}
+
+// ComponentFinder is an optional interface backends MAY implement
+// to expose engine-native weakly- and strongly-connected-component
+// algorithms. Two methods because the algorithms answer different
+// questions:
+//
+//   - WeaklyConnectedComponents treats edges as undirected — every
+//     pair of nodes reachable from each other (ignoring direction)
+//     lands in one component. Useful for "is this symbol part of
+//     the connected core?" diagnostics.
+//
+//   - StronglyConnectedComponents respects edge direction — only
+//     nodes mutually reachable end up in the same component. The
+//     SCC of a call graph is the cycle structure: every non-
+//     trivial SCC (size > 1) is a mutual-recursion ring.
+//
+// When the store implements ComponentFinder, the daemon's
+// connectivity diagnostics and circular-dependency detection
+// (`analyze kind=wcc` / `analyze kind=scc`) route through it;
+// otherwise the in-process analysis.ComputeWCC / analysis.ComputeSCC
+// fallbacks run.
+type ComponentFinder interface {
+	WeaklyConnectedComponents(opts ComponentOpts) ([]ComponentHit, error)
+	StronglyConnectedComponents(opts ComponentOpts) ([]ComponentHit, error)
+}
