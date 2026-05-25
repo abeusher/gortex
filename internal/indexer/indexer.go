@@ -369,6 +369,14 @@ func (idx *Indexer) shouldIndexForSearch(n *graph.Node) bool {
 	if n.Kind == graph.KindLocal {
 		return false
 	}
+	// KindBuiltin nodes are language intrinsics (append / len /
+	// string / int / ...). Surfacing them in name search would
+	// drown every other hit on common identifiers — agents already
+	// know `string` / `append`. They remain queryable by kind and
+	// by ID for the analytics passes that care.
+	if n.Kind == graph.KindBuiltin {
+		return false
+	}
 	// Prose-section nodes are searchable only when prose indexing is
 	// enabled (search.index_prose); the rest of the graph is
 	// unaffected by the toggle.

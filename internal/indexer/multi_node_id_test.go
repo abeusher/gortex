@@ -176,9 +176,15 @@ func TestTrackRepoCtx_FirstOfManyStillGetsPrefix(t *testing.T) {
 
 	// Every node must carry a non-empty RepoPrefix and its FilePath must
 	// live under that prefix. Any violation means a code path bypassed
-	// applyRepoPrefix.
+	// applyRepoPrefix. KindModule and KindBuiltin are deliberately
+	// cross-repo singletons (one `module::pypi:requests` /
+	// `builtin::go::type::string` shared across every repo that uses
+	// them) so they're exempt from the per-repo prefix rule.
 	var missingPrefix, badFilePaths []string
 	for _, n := range g.AllNodes() {
+		if n.Kind == graph.KindModule || n.Kind == graph.KindBuiltin {
+			continue
+		}
 		if n.RepoPrefix == "" {
 			missingPrefix = append(missingPrefix, n.ID)
 			continue

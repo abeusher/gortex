@@ -231,10 +231,12 @@ func indexFixture(t *testing.T, checkoutName string) fixtureResult {
 	for _, n := range g.AllNodes() {
 		// This test is about source-symbol IDs (functions, methods,
 		// types, files) — the things overlay merging keys on.
-		// Contract-kind nodes (kind=contract) don't currently carry a
-		// RepoPrefix field; skip them here so the parity gate is
-		// precise about what it gates.
-		if n.Kind == graph.KindContract {
+		// Contract / Module / Builtin nodes are deliberately
+		// cross-repo singletons (one `dep::foo`, `module::pypi:requests`,
+		// `builtin::go::len` shared across every repo that uses them)
+		// and don't carry RepoPrefix; skip them so the parity gate
+		// stays precise about what it gates.
+		if n.Kind == graph.KindContract || n.Kind == graph.KindModule || n.Kind == graph.KindBuiltin {
 			continue
 		}
 		if n.RepoPrefix == "" {

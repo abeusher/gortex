@@ -55,6 +55,20 @@ const (
 	// these nodes; consumers that want the locals can ask for them
 	// by kind explicitly.
 	KindLocal NodeKind = "local"
+	// KindBuiltin represents a language intrinsic — a function /
+	// type / constant that's part of the language itself, not
+	// declared in any indexed source file. ID convention:
+	// `builtin::<lang>::<name>` for functions (`builtin::go::append`,
+	// `builtin::py::len`) and `builtin::<lang>::type::<name>` for
+	// types (`builtin::go::type::string`). Meta.builtin_kind ∈
+	// "func" | "type" | "const". KindBuiltin is excluded from the
+	// BM25 search index — surfacing `string` / `int` / `append`
+	// would flood every name lookup. They participate in normal
+	// graph queries: `find_usages(builtin::go::type::float64)`
+	// answers "every variable typed as float64 in this codebase",
+	// which is the load-bearing query for type-drift / dataflow
+	// analyses.
+	KindBuiltin NodeKind = "builtin"
 	// KindConstant peels off `const`, `iota`, top-level immutable
 	// bindings, and language-specific constant declarations from
 	// KindVariable. Existing variable-kind nodes are re-classified on

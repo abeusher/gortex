@@ -383,6 +383,15 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 	// materialised the tparam node.
 	r.bindGenericParamRefs()
 
+	// Attribute Go language intrinsics (append / len / make / string
+	// / int / ...) to canonical `builtin::go::*` IDs and materialise
+	// one KindBuiltin node per unique builtin. Eliminates ~50k of
+	// the bare-name `unresolved::*` population on a Go-heavy
+	// codebase and turns the analytics queries that need these
+	// targets (`find_usages(builtin::go::type::float64)` for
+	// type-drift analysis) into one-hop lookups.
+	r.attributeGoBuiltins()
+
 	// Relative-import resolution for Python and Dart files. Runs
 	// before module attribution so internal-target stems never get
 	// mis-mapped to a phantom pypi/pub package.
@@ -653,6 +662,20 @@ func (r *Resolver) ResolveFile(filePath string) *ResolveStats {
 			}
 		}
 	}
+
+	// Re-run the attribution passes that ResolveAll runs. ResolveFile
+	// handles incremental updates — a re-parse of one file emits
+	// fresh `unresolved::<name>` edges that haven't been seen by these
+	// passes yet, so without re-running them the incremental graph
+	// diverges from a cold re-index (caught by
+	// TestIncrementalReindex_ConvergesToFullIndex). Each pass is
+	// idempotent on already-rewritten edges (the `unresolved::`
+	// prefix check makes a second sweep a no-op).
+	r.rebindGoMethodReceivers()
+	r.bindBareNameScopeRefs()
+	r.bindGenericParamRefs()
+	r.attributeGoBuiltins()
+
 	return stats
 }
 
