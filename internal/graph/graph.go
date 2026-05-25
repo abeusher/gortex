@@ -1449,6 +1449,81 @@ func (g *Graph) AllEdges() []*Edge {
 	return out
 }
 
+// DrainNodes yields every node and FREES the graph's internal node
+// storage shard-by-shard as it goes. After Drain finishes the graph
+// holds zero nodes. Intended for the one-shot persist path where the
+// shadow is about to be discarded: AllNodes would pin the full 11 GB
+// graph for the entire persist phase; Drain releases each shard's
+// node map (and the per-name / per-file / per-repo indexes) as soon
+// as that shard's iteration completes, so GC can reclaim ~700 MB at
+// a time on a Linux-scale graph instead of waiting for the indexer's
+// defer to return.
+//
+// The graph remains structurally consistent during Drain — edges and
+// other indexes are untouched, only the node maps are emptied. If
+// you also need DrainEdges, call them in either order; both are
+// destructive and idempotent (a second call yields nothing).
+func (g *Graph) DrainNodes() iter.Seq[*Node] {
+	return func(yield func(*Node) bool) {
+		for _, s := range g.shards {
+			s.mu.Lock()
+			nodes := s.nodes
+			// Replace with an empty map so the shard's read methods
+			// keep working (return zero) instead of nil-panicking.
+			s.nodes = map[string]*Node{}
+			s.byFile = map[string][]*Node{}
+			s.byName = map[string][]*Node{}
+			s.byQual = map[string]*Node{}
+			s.byRepo = map[string][]*Node{}
+			s.byFileIdx = map[string]map[string]int{}
+			s.byNameIdx = map[string]map[string]int{}
+			s.byRepoIdx = map[string]map[string]int{}
+			s.mu.Unlock()
+			for _, n := range nodes {
+				if !yield(n) {
+					return
+				}
+			}
+			// nodes goes out of scope here — the shard's old map plus
+			// every *Node it referenced is now GC-eligible (assuming
+			// the caller has dropped any remaining reference).
+		}
+	}
+}
+
+// DrainEdges yields every edge and FREES the graph's internal edge
+// storage shard-by-shard. Same semantics as DrainNodes — meant for
+// the persist hand-off, not for general queries.
+func (g *Graph) DrainEdges() iter.Seq[*Edge] {
+	// Invalidate the AllEdges cache so any subsequent caller doesn't
+	// see drained-shard zombies. The cache holds direct *Edge slice
+	// references that DrainEdges is about to start freeing.
+	g.allEdgesCacheMu.Lock()
+	g.allEdgesCache = nil
+	g.allEdgesCacheGen = 0
+	g.allEdgesCacheMu.Unlock()
+	return func(yield func(*Edge) bool) {
+		for _, s := range g.shards {
+			s.mu.Lock()
+			outEdges := s.outEdges
+			s.outEdges = map[string][]*Edge{}
+			s.inEdges = map[string][]*Edge{}
+			s.outEdgeIdx = map[string]map[edgeHash]int{}
+			s.inEdgeIdx = map[string]map[edgeHash]int{}
+			s.outEdgeKeys = map[string][]edgeHash{}
+			s.inEdgeKeys = map[string][]edgeHash{}
+			s.mu.Unlock()
+			for _, edges := range outEdges {
+				for _, e := range edges {
+					if !yield(e) {
+						return
+					}
+				}
+			}
+		}
+	}
+}
+
 // Stats returns summary counts by kind and language.
 func (g *Graph) Stats() GraphStats {
 	g.lockAllRead()

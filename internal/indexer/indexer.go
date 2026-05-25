@@ -1632,7 +1632,38 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 			}
 			reporter.Report("persisting bulk graph", 0, 0)
 			bl.BeginBulkLoad()
-			diskTarget.AddBatch(inMemShadow.AllNodes(), inMemShadow.AllEdges())
+			// Drain the shadow shard-by-shard so the indexer's hold on
+			// the 11-GB Linux-scale graph is released progressively
+			// instead of pinned until persist returns. The drain
+			// iterators free each shard's node/edge maps as they
+			// advance, so peak RAM during the persist window is
+			// roughly the chunk buffer + the backend's working set,
+			// not full shadow + Kuzu COPY buffer.
+			const persistChunk = 100000
+			nodeBuf := make([]*graph.Node, 0, persistChunk)
+			for n := range inMemShadow.DrainNodes() {
+				nodeBuf = append(nodeBuf, n)
+				if len(nodeBuf) >= persistChunk {
+					diskTarget.AddBatch(nodeBuf, nil)
+					nodeBuf = nodeBuf[:0]
+				}
+			}
+			if len(nodeBuf) > 0 {
+				diskTarget.AddBatch(nodeBuf, nil)
+				nodeBuf = nil
+			}
+			edgeBuf := make([]*graph.Edge, 0, persistChunk)
+			for e := range inMemShadow.DrainEdges() {
+				edgeBuf = append(edgeBuf, e)
+				if len(edgeBuf) >= persistChunk {
+					diskTarget.AddBatch(nil, edgeBuf)
+					edgeBuf = edgeBuf[:0]
+				}
+			}
+			if len(edgeBuf) > 0 {
+				diskTarget.AddBatch(nil, edgeBuf)
+				edgeBuf = nil
+			}
 			if ferr := bl.FlushBulk(); ferr != nil {
 				retErr = fmt.Errorf("indexer: persist bulk graph: %w", ferr)
 			}
