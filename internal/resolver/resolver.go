@@ -355,6 +355,16 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 		}
 	}
 
+	// Rebind cross-file Go method receivers onto the canonical type
+	// node ID. The Go extractor builds the EdgeMemberOf target as
+	// `<methodfile>::TypeName` because it parses one file at a time;
+	// methods declared in files other than the type's defining file
+	// point at a phantom ID until this pass collapses them onto the
+	// real `<typefile>::TypeName` node. See rebindGoMethodReceivers
+	// for the full rationale (InferImplements + find_implementations
+	// + class_hierarchy correctness all ride on this).
+	r.rebindGoMethodReceivers()
+
 	// Relative-import resolution for Python and Dart files. Runs
 	// before module attribution so internal-target stems never get
 	// mis-mapped to a phantom pypi/pub package.
