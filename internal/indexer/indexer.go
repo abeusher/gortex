@@ -372,6 +372,24 @@ func initialSearchBackend(g graph.Store) search.Backend {
 	return search.NewAuto()
 }
 
+// isSymbolSearcherBackend reports whether the swappable's currently
+// active backend is the SymbolSearcher adapter. Used to suppress
+// the Bleve auto-upgrade goroutine — if the active backend is
+// already a native FTS, upgrading to Bleve would re-index the same
+// corpus into a parallel in-process Bleve and silently swap it in,
+// defeating the FTS path and pinning the ~100MB heap the FTS
+// integration was meant to release.
+func isSymbolSearcherBackend(b search.Backend) bool {
+	if b == nil {
+		return false
+	}
+	if sw, ok := b.(*search.Swappable); ok {
+		b = sw.Inner()
+	}
+	_, ok := b.(*search.SymbolSearcherBackend)
+	return ok
+}
+
 // ftsTokensFor produces the pre-tokenised text the backend FTS path
 // indexes. Mirrors searchIndexFields' field selection but joins
 // every field through search.Tokenize (camelCase / snake_case /
@@ -2206,7 +2224,16 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 	// upgradeOnce gates the spawn so multi-repo warmup, which calls
 	// IndexCtx once per tracked repo, doesn't launch one upgrade
 	// goroutine per post-threshold repo. One per indexer lifetime.
-	if idx.search.Count() >= search.AutoThreshold {
+	//
+	// Skip the upgrade when the active search backend is the
+	// SymbolSearcher adapter: the disk store's native FTS is
+	// already serving search at engine-native latency, and
+	// spawning a parallel Bleve build would (a) waste ~100MB heap
+	// re-indexing the same corpus and (b) silently swap the
+	// adapter out for Bleve on completion — defeating the whole
+	// FTS path. The Swappable's current backend tells us which
+	// branch we're on.
+	if !isSymbolSearcherBackend(idx.search) && idx.search.Count() >= search.AutoThreshold {
 		idx.upgradeOnce.Do(func() {
 			reporter.Report("scheduling search backend upgrade", 0, 0)
 			idx.upgradeSpawnedMu.Lock()
