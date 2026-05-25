@@ -23,11 +23,17 @@ import (
 // `x := …` / `var x = …` / a range clause / a type-switch / a for-
 // statement init clause maps to a synthetic ID:
 //
-//	<ownerID>#local:<name>@<line>
+//	<ownerID>#local:<name>@+<offsetFromOwnerStartLine>
 //
-// where ownerID is the enclosing function/method node and line is
-// the 1-based decl line. These IDs are valid edge endpoints — the
-// BFS in `flow_between` traverses them — but no graph node is
+// where ownerID is the enclosing function/method node and the
+// offset is the local's 1-based line minus the function-decl's
+// 1-based line. The leading `+` flags the value as a relative
+// offset rather than an absolute line — important for the
+// incremental indexer: adding a line *above* the enclosing
+// function leaves every local-binding ID inside it stable, so the
+// per-save edge churn collapses from O(locals-in-file) to
+// O(locals-below-the-edit). These IDs are valid edge endpoints —
+// the BFS in `flow_between` traverses them — but no graph node is
 // materialised, keeping symbol search free of every transient
 // binding in every function body.
 //
@@ -46,7 +52,7 @@ import (
 //     mirrors the call edge for the same call site. Indexer post-
 //     resolution rewrites them once the callee is known — see
 //     `materializeDataflowParams` in internal/indexer.
-func emitGoDataflow(ownerID string, body *sitter.Node, paramsByName map[string]string, src []byte, filePath string, result *parser.ExtractionResult) {
+func emitGoDataflow(ownerID string, ownerStartLine int, body *sitter.Node, paramsByName map[string]string, src []byte, filePath string, result *parser.ExtractionResult) {
 	if body == nil {
 		return
 	}
@@ -59,11 +65,12 @@ func emitGoDataflow(ownerID string, body *sitter.Node, paramsByName map[string]s
 		scope.bindings[name] = []string{paramID}
 	}
 	walker := &goFlowWalker{
-		ownerID:  ownerID,
-		filePath: filePath,
-		src:      src,
-		scope:    scope,
-		result:   result,
+		ownerID:        ownerID,
+		ownerStartLine: ownerStartLine,
+		filePath:       filePath,
+		src:            src,
+		scope:          scope,
+		result:         result,
 	}
 	walker.walk(body)
 }
@@ -83,13 +90,17 @@ func newGoFlowScope() *goFlowScope {
 
 // goFlowWalker carries the per-function state needed to emit
 // dataflow edges. ownerID is the enclosing function node ID;
+// ownerStartLine is the 1-based source line of the function's
+// declaration — local-binding IDs are anchored to it so edits
+// above the function don't churn every binding inside;
 // scope tracks live bindings; result accumulates emitted edges.
 type goFlowWalker struct {
-	ownerID  string
-	filePath string
-	src      []byte
-	scope    *goFlowScope
-	result   *parser.ExtractionResult
+	ownerID        string
+	ownerStartLine int
+	filePath       string
+	src            []byte
+	scope          *goFlowScope
+	result         *parser.ExtractionResult
 }
 
 func (w *goFlowWalker) walk(n *sitter.Node) {
@@ -126,10 +137,20 @@ func (w *goFlowWalker) walk(n *sitter.Node) {
 }
 
 // localID returns the synthetic local-binding ID for `name` at the
-// given line. Always anchored to ownerID so two functions can have
-// identically-named locals without colliding.
+// given absolute line. Always anchored to ownerID so two functions
+// can have identically-named locals without colliding. The line is
+// encoded as an offset from the owner's declaration line (prefixed
+// `+` so it's unambiguous): a same-function shift caused by an edit
+// above the function leaves the ID stable. A defensive zero-anchor
+// fallback handles cases where the caller didn't supply an owner
+// start line (the walker is constructed with one in production; the
+// fallback keeps misuse from producing IDs missing the @ separator).
 func (w *goFlowWalker) localID(name string, line int) string {
-	return w.ownerID + "#local:" + name + "@" + strconv.Itoa(line)
+	offset := line
+	if w.ownerStartLine > 0 {
+		offset = line - w.ownerStartLine + 1
+	}
+	return w.ownerID + "#local:" + name + "@+" + strconv.Itoa(offset)
 }
 
 func (w *goFlowWalker) handleShortVarDecl(n *sitter.Node) {

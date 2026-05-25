@@ -228,9 +228,14 @@ const (
 	// dataflow without materialising a graph node per local variable,
 	// edges target a synthetic ID of the form:
 	//
-	//   <ownerID>#local:<name>@<line>
+	//   <ownerID>#local:<name>@+<offsetFromOwnerStartLine>
 	//
-	// where ownerID is the enclosing function/method/closure node.
+	// where ownerID is the enclosing function/method/closure node
+	// and the offset is the local's 1-based line minus the owner's
+	// declaration line (leading `+` flags the value as a relative
+	// offset). The offset-based ID keeps locals stable across edits
+	// that shift the function as a whole — only edits inside the
+	// function above a binding shift that binding's ID.
 	// These IDs are valid edge endpoints — BFS traverses them — but
 	// no graph node is created, keeping search results free of
 	// every transient binding in every function body.
