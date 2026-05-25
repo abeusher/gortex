@@ -268,9 +268,13 @@ type BackendResolver interface {
 //
 // Contract:
 //
-//   - BeginBulkLoad must be called on an empty store (NodeCount == 0,
-//     EdgeCount == 0). Calling it on a non-empty store is a programmer
-//     error; backends are free to refuse or no-op.
+//   - BeginBulkLoad may be called on a non-empty store. The cold-start
+//     parse phase calls it on an empty store, but later passes (notably
+//     the contracts pass, which appends a few hundred contract nodes /
+//     edges after resolve) re-enter the bracket against a populated
+//     backend. FlushBulk commits via the backend's native bulk
+//     primitive in MERGE-on-primary-key mode, so re-appending rows
+//     that share an ID with existing data does not duplicate them.
 //
 //   - Between BeginBulkLoad and FlushBulk, AddBatch is the only mutator
 //     the caller may invoke. Reads (GetNode, AllEdges, EdgesByKind, …)
