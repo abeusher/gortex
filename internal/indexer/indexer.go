@@ -349,6 +349,36 @@ func searchIndexFields(n *graph.Node) []string {
 	return []string{n.Name, n.FilePath, sig}
 }
 
+// ftsTokensFor produces the pre-tokenised text the backend FTS path
+// indexes. Mirrors searchIndexFields' field selection but joins
+// every field through search.Tokenize (camelCase / snake_case /
+// path-segment splitter) so the resulting token list matches the
+// in-process BM25 corpus contract — the same query produces the
+// same recall against either backend. Joined with spaces so the
+// downstream COPY FROM sees a single STRING column value.
+func ftsTokensFor(n *graph.Node) string {
+	fields := searchIndexFields(n)
+	if n.QualName != "" {
+		// QualName carries the dotted form (`pkg.Sub.Type.Method`)
+		// that adds qualifier-hop recall ("auth" matching
+		// "auth.ValidateToken"). searchIndexFields omits it for
+		// the legacy BM25 path (which folds qual into the
+		// name-token bag separately), so we add it explicitly here.
+		fields = append(fields, n.QualName)
+	}
+	tokens := make([]string, 0, 16)
+	for _, f := range fields {
+		if f == "" {
+			continue
+		}
+		tokens = append(tokens, search.Tokenize(f)...)
+	}
+	if len(tokens) == 0 {
+		return ""
+	}
+	return strings.Join(tokens, " ")
+}
+
 // shouldIndexForSearch reports whether a node should be added to the
 // text search index (BM25/Bleve). File and Import nodes are never
 // searchable symbols. Beyond that, config.SkipSearch filters out
@@ -1667,9 +1697,31 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 			// advance, so peak RAM during the persist window is
 			// roughly the chunk buffer + the backend's working set,
 			// not full shadow + the disk backend's bulk-COPY buffer.
+			//
+			// Collect (id, tokens) for every search-eligible node as
+			// the drain yields them — feeds the backend's native FTS
+			// at FlushBulk time when the store implements
+			// graph.SymbolSearcher. Nodes that fail
+			// shouldIndexForSearch (KindFile / KindImport /
+			// KindLocal / KindBuiltin / skip-search lang+kind pairs)
+			// are excluded so the FTS corpus matches the in-process
+			// BM25 corpus exactly.
+			searcher, hasFTS := diskTarget.(graph.SymbolSearcher)
+			var ftsItems []graph.SymbolFTSItem
+			if hasFTS {
+				// Pre-size to the shadow's node count to avoid grow
+				// churn on a 600k-node Vscode-shape repo.
+				ftsItems = make([]graph.SymbolFTSItem, 0, inMemShadow.NodeCount())
+			}
 			const persistChunk = 100000
 			nodeBuf := make([]*graph.Node, 0, persistChunk)
 			for n := range inMemShadow.DrainNodes() {
+				if hasFTS && idx.shouldIndexForSearch(n) {
+					ftsItems = append(ftsItems, graph.SymbolFTSItem{
+						NodeID: n.ID,
+						Tokens: ftsTokensFor(n),
+					})
+				}
 				nodeBuf = append(nodeBuf, n)
 				if len(nodeBuf) >= persistChunk {
 					diskTarget.AddBatch(nodeBuf, nil)
@@ -1694,6 +1746,22 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 			}
 			if ferr := bl.FlushBulk(); ferr != nil {
 				retErr = fmt.Errorf("indexer: persist bulk graph: %w", ferr)
+			}
+			// Build the backend FTS after the bulk load completes so
+			// CREATE_FTS_INDEX has the full corpus to scan in one
+			// pass. BulkUpsertSymbolFTS does its own
+			// extension-install dance, so this is the only place the
+			// indexer needs to know about SymbolSearcher.
+			if hasFTS && len(ftsItems) > 0 {
+				reporter.Report("building symbol fts", 0, 0)
+				if ferr := searcher.BulkUpsertSymbolFTS(ftsItems); ferr != nil {
+					idx.logger.Warn("indexer: bulk symbol FTS upsert failed",
+						zap.Error(ferr))
+				} else if ferr := searcher.BuildSymbolIndex(); ferr != nil {
+					idx.logger.Warn("indexer: backend FTS build failed",
+						zap.Error(ferr))
+				}
+				reporter.Report("building symbol fts", 1, 1)
 			}
 			reporter.Report("persisting bulk graph", 1, 1)
 			idx.graph = diskTarget
@@ -2294,11 +2362,23 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 
 	// Add new symbols to search index. shouldIndexForSearch enforces
 	// the same SkipSearch filter used by the bulk and upgrade paths.
+	// When the backing store implements graph.SymbolSearcher we
+	// also mirror each upsert into its native FTS, so an
+	// incremental reindex doesn't fall out of sync with the
+	// bulk-built corpus.
+	searcher, _ := idx.graph.(graph.SymbolSearcher)
 	for _, n := range result.Nodes {
 		if !idx.shouldIndexForSearch(n) {
 			continue
 		}
 		idx.search.Add(n.ID, searchIndexFields(n)...)
+		if searcher != nil {
+			if err := searcher.UpsertSymbolFTS(n.ID, ftsTokensFor(n)); err != nil {
+				idx.logger.Debug("indexer: backend FTS upsert failed",
+					zap.String("id", n.ID),
+					zap.Error(err))
+			}
+		}
 	}
 
 	if resolve {

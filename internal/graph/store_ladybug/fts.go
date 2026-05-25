@@ -2,6 +2,8 @@ package store_ladybug
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 
@@ -76,6 +78,120 @@ func (s *Store) UpsertSymbolFTS(nodeID, tokens string) error {
 		"tokens": tokens,
 	}); err != nil {
 		return fmt.Errorf("upsert SymbolFTS: %w", err)
+	}
+	return nil
+}
+
+// BulkUpsertSymbolFTS is the cold-start fast path: write a TSV of
+// (id, tokens) pairs to a temp file and COPY FROM into SymbolFTS in
+// one shot. Per-row cost ≈ 1µs on Ladybug's columnar storage,
+// vs ~1ms for the Cypher MERGE path UpsertSymbolFTS takes —
+// ~1000x cheaper at 600k-node scale.
+//
+// The COPY destination is wiped first via `MATCH (f:SymbolFTS)
+// DELETE f` so a re-run replaces the corpus rather than appending.
+// This is safe because the indexer always calls
+// BulkUpsertSymbolFTS once per IndexCtx (after the shadow drain
+// completes), not on the daemon's incremental reindex path.
+//
+// Idempotent under empty input — no-ops cleanly so callers don't
+// need to length-check.
+func (s *Store) BulkUpsertSymbolFTS(items []graph.SymbolFTSItem) error {
+	if len(items) == 0 {
+		return nil
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if err := s.ensureFTSExtensionLocked(); err != nil {
+		return err
+	}
+
+	// Dedup by ID — last write wins, mirroring the per-call
+	// UpsertSymbolFTS's MERGE semantics. The indexer's drain
+	// shouldn't produce duplicates at the searchable-node layer
+	// (every Node ID is unique), but guard against the edge case
+	// where a re-parse of a file emitted the same ID twice.
+	pos := make(map[string]int, len(items))
+	deduped := items[:0]
+	for _, it := range items {
+		if it.NodeID == "" {
+			continue
+		}
+		if p, ok := pos[it.NodeID]; ok {
+			deduped[p] = it
+		} else {
+			pos[it.NodeID] = len(deduped)
+			deduped = append(deduped, it)
+		}
+	}
+	items = deduped
+	if len(items) == 0 {
+		return nil
+	}
+
+	// Wipe prior FTS rows so the cold-load fast path is a clean
+	// rebuild. Costs O(N) on the existing row set — acceptable
+	// because this only runs at IndexCtx commit, not on every
+	// incremental update.
+	if err := runCypherSafe(s, `MATCH (f:SymbolFTS) DELETE f`); err != nil {
+		return fmt.Errorf("clear SymbolFTS before bulk upsert: %w", err)
+	}
+
+	dir, err := os.MkdirTemp("", "lbug-fts-bulk-")
+	if err != nil {
+		return fmt.Errorf("mkdir bulk tmp: %w", err)
+	}
+	defer os.RemoveAll(dir)
+	path := filepath.Join(dir, "symbolfts.tsv")
+	if err := writeSymbolFTSTSV(path, items); err != nil {
+		return fmt.Errorf("write SymbolFTS tsv: %w", err)
+	}
+	// HEADER=false maps columns by position (no chance of a
+	// header-name mismatch silently dropping rows). DELIM='\t'
+	// because Ladybug's CSV parser does not handle RFC-4180-style
+	// quoted strings containing commas — same convention the
+	// Node / Edge COPY paths use. Tokens never contain tabs (we
+	// strip them in writeSymbolFTSTSV) so this is safe.
+	copyQ := fmt.Sprintf("COPY SymbolFTS FROM '%s' (HEADER=false, DELIM='\\t')", escapeCypherStringLit(path))
+	if err := runCypherSafe(s, copyQ); err != nil {
+		return fmt.Errorf("copy SymbolFTS: %w", err)
+	}
+	// Bulk-load invalidated the prior index; force a rebuild on
+	// next SearchSymbols.
+	s.fts.indexBuilt.Store(false)
+	return nil
+}
+
+// writeSymbolFTSTSV writes items to a tab-separated file in
+// (id, tokens) order. Tabs / newlines in tokens are normalised to
+// spaces so the COPY parser doesn't misalign rows.
+func writeSymbolFTSTSV(path string, items []graph.SymbolFTSItem) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	var b strings.Builder
+	clean := func(s string) string {
+		// Strip / replace TSV-toxic characters. Replace tabs and
+		// newlines with spaces; collapse runs of whitespace later
+		// if needed (FTS tokeniser already splits on whitespace
+		// so consecutive spaces are harmless).
+		if !strings.ContainsAny(s, "\t\r\n") {
+			return s
+		}
+		r := strings.NewReplacer("\t", " ", "\r", " ", "\n", " ")
+		return r.Replace(s)
+	}
+	for _, it := range items {
+		b.Reset()
+		b.WriteString(clean(it.NodeID))
+		b.WriteByte('\t')
+		b.WriteString(clean(it.Tokens))
+		b.WriteByte('\n')
+		if _, err := f.WriteString(b.String()); err != nil {
+			return err
+		}
 	}
 	return nil
 }

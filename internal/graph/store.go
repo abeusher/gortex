@@ -304,6 +304,15 @@ type SymbolHit struct {
 	Score  float64
 }
 
+// SymbolFTSItem is the payload BulkUpsertSymbolFTS takes per node:
+// the node's ID and its pre-tokenised text. Reused so the indexer
+// can preallocate one slice and the backend can iterate without
+// per-element wrapper allocs.
+type SymbolFTSItem struct {
+	NodeID string
+	Tokens string
+}
+
 // SymbolSearcher is an optional interface backends MAY implement to
 // expose engine-native full-text search over the graph's symbol
 // names. When the backing store implements it, the daemon's
@@ -314,12 +323,19 @@ type SymbolHit struct {
 //
 // Contract:
 //
-//   - UpsertSymbolFTS is called by the indexer for every node that
-//     should be searchable. The store decides how to persist the
-//     pre-tokenised text (a sidecar table, an FTS column, an
-//     in-engine index — backend choice). Tokens are produced by
+//   - UpsertSymbolFTS is the per-call write path used by incremental
+//     reindex. The store decides how to persist the pre-tokenised
+//     text (a sidecar table, an FTS column, an in-engine index —
+//     backend choice). Tokens are produced by
 //     internal/search.Tokenize so camelCase / snake_case / path-
 //     separator semantics match the existing BM25 corpus contract.
+//
+//   - BulkUpsertSymbolFTS is the cold-start fast path used by the
+//     indexer's shadow-swap drain. Implementations SHOULD use the
+//     backend's native bulk primitive (TSV + COPY FROM on Ladybug)
+//     so a 600k-node repo doesn't pay per-row Cypher parse cost.
+//     Idempotent on NodeID like UpsertSymbolFTS — re-running with
+//     an overlapping set replaces in place.
 //
 //   - BuildSymbolIndex finalises the index after the bulk parse
 //     phase. For backends whose FTS index updates automatically on
@@ -331,12 +347,13 @@ type SymbolHit struct {
 //     descending. The query string is the user's raw input; the
 //     backend is expected to tokenise it the same way it tokenised
 //     the indexed text (typically by passing it through
-//     internal/search.TokenizeQuery before invoking the FTS).
+//     internal/search.Tokenize before invoking the FTS).
 //
 //   - Close is implied by graph.Store.Close — no separate
 //     teardown method here.
 type SymbolSearcher interface {
 	UpsertSymbolFTS(nodeID, tokens string) error
+	BulkUpsertSymbolFTS(items []SymbolFTSItem) error
 	BuildSymbolIndex() error
 	SearchSymbols(query string, limit int) ([]SymbolHit, error)
 }
