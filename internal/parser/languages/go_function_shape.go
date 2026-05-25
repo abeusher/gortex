@@ -24,7 +24,7 @@ import (
 // declLine is the 1-based line of the declaration, used as the
 // anchor for nodes/edges that don't have a finer-grained AST
 // position to reference.
-func emitGoFunctionShape(ownerID string, defNode *sitter.Node, paramsCap, resultCap *parser.CapturedNode, src []byte, filePath string, declLine int, result *parser.ExtractionResult) {
+func emitGoFunctionShape(ownerID string, defNode *sitter.Node, paramsCap, resultCap *parser.CapturedNode, src []byte, filePath string, declLine int, imports map[string]string, result *parser.ExtractionResult) {
 	if defNode == nil {
 		return
 	}
@@ -40,9 +40,13 @@ func emitGoFunctionShape(ownerID string, defNode *sitter.Node, paramsCap, result
 		// MaterializeDataflowParams pass once the call resolver
 		// has landed every callee. declLine anchors local-binding
 		// IDs as offsets so edits above the function don't churn
-		// every binding inside.
+		// every binding inside. imports are the file's package
+		// aliases so selector-expression cases inside the walker
+		// can rewrite `pkg.Method` calls to the proper
+		// `unresolved::extern::<importPath>::<Method>` shape
+		// instead of dropping the qualifier.
 		paramsByName := goParamNamesFromCapture(paramsCap, src)
-		emitGoDataflow(ownerID, declLine, body, paramsByName, src, filePath, result)
+		emitGoDataflow(ownerID, declLine, body, paramsByName, imports, src, filePath, result)
 	}
 }
 

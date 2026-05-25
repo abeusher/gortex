@@ -57,7 +57,7 @@ import (
 //     mirrors the call edge for the same call site. Indexer post-
 //     resolution rewrites them once the callee is known — see
 //     `materializeDataflowParams` in internal/indexer.
-func emitGoDataflow(ownerID string, ownerStartLine int, body *sitter.Node, paramsByName map[string]string, src []byte, filePath string, result *parser.ExtractionResult) {
+func emitGoDataflow(ownerID string, ownerStartLine int, body *sitter.Node, paramsByName map[string]string, imports map[string]string, src []byte, filePath string, result *parser.ExtractionResult) {
 	if body == nil {
 		return
 	}
@@ -77,6 +77,7 @@ func emitGoDataflow(ownerID string, ownerStartLine int, body *sitter.Node, param
 		scope:          scope,
 		result:         result,
 		emittedLocals:  map[string]struct{}{},
+		imports:        imports,
 	}
 	walker.walk(body)
 }
@@ -144,6 +145,14 @@ type goFlowWalker struct {
 	scope          *goFlowScope
 	result         *parser.ExtractionResult
 	emittedLocals  map[string]struct{}
+	// imports maps the file's package aliases to their import paths
+	// (`fmt → "fmt"`, `assert → "github.com/stretchr/testify/assert"`).
+	// Threaded through so the selector-expression cases in calleeRef /
+	// exprSources can emit `unresolved::extern::<importPath>::<method>`
+	// when the LHS identifier is an imported package — matching the
+	// shape the call extractor uses — instead of collapsing the
+	// qualifier to `*.` and losing the resolution evidence.
+	imports map[string]string
 }
 
 func (w *goFlowWalker) walk(n *sitter.Node) {
@@ -538,11 +547,22 @@ func (w *goFlowWalker) calleeRef(call *sitter.Node) string {
 		if method == "" {
 			return ""
 		}
-		// Receiver-typed targets (e.g. an import alias dispatch)
-		// can't be reconstructed without the file's import map.
-		// Fall through to the generic "*." form — same shape the
-		// call extractor uses when receiver is a local.
-		_ = recv
+		// Package-qualified call: when the receiver is a bare
+		// identifier matching one of the file's import aliases,
+		// emit the same `unresolved::extern::<importPath>::<method>`
+		// shape the call extractor uses for explicit calls (see
+		// golang.go::Extract `imports[c.receiver]` branch). The
+		// resolver's resolveExtern pass then lands these on
+		// stdlib::/dep::/external:: targets or the real cross-repo
+		// symbol when the import path resolves to an indexed file.
+		// Without this branch the qualifier is dropped and we leak
+		// `unresolved::*.<method>` for every package call inside a
+		// dataflow context.
+		if recv != nil && recv.Type() == "identifier" {
+			if importPath := w.importPathFor(recv.Content(w.src)); importPath != "" {
+				return "unresolved::extern::" + importPath + "::" + method
+			}
+		}
 		return "unresolved::*." + method
 	case "generic_function":
 		// `f[T](args)` — strip the type instantiation wrapper.
@@ -611,6 +631,17 @@ func (w *goFlowWalker) exprSources(n *sitter.Node) []string {
 		fieldName := field.Content(w.src)
 		if fieldName == "" {
 			return nil
+		}
+		// Package-qualified value: when the receiver is a bare
+		// identifier matching one of the file's import aliases,
+		// emit `unresolved::extern::<importPath>::<field>` so the
+		// resolver can land it on stdlib::/dep::/external::. See
+		// the matching comment in calleeRef.
+		operand := n.ChildByFieldName("operand")
+		if operand != nil && operand.Type() == "identifier" {
+			if importPath := w.importPathFor(operand.Content(w.src)); importPath != "" {
+				return []string{"unresolved::extern::" + importPath + "::" + fieldName}
+			}
 		}
 		return []string{"unresolved::*." + fieldName}
 	case "call_expression":
@@ -726,4 +757,18 @@ func (w *goFlowWalker) emitValueFlow(src, dst string, line int) {
 		Line:     line,
 		Origin:   graph.OriginASTResolved,
 	})
+}
+
+// importPathFor returns the import path the given identifier names
+// as a package alias in the current file, or "" when the identifier
+// doesn't match any import. The walker's imports map is the same
+// map populated by the Go extractor's emitImport handler, so an
+// `assert` alias for `github.com/stretchr/testify/assert` resolves
+// here exactly as it does in the call extractor's
+// `imports[c.receiver]` branch.
+func (w *goFlowWalker) importPathFor(name string) string {
+	if name == "" || w.imports == nil {
+		return ""
+	}
+	return w.imports[name]
 }

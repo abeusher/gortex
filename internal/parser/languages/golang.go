@@ -279,10 +279,10 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 			// No-op (the package name is not currently surfaced as a node).
 
 		case m.Captures["func.def"] != nil:
-			e.emitFunction(m, filePath, fileID, src, result, paramsByFunc)
+			e.emitFunction(m, filePath, fileID, src, result, paramsByFunc, imports)
 
 		case m.Captures["method.def"] != nil:
-			e.emitMethod(m, filePath, fileID, src, result, paramsByFunc)
+			e.emitMethod(m, filePath, fileID, src, result, paramsByFunc, imports)
 
 		case m.Captures["typedef.def"] != nil:
 			e.emitTypeDecl(m, filePath, fileID, src, result, seenTypeName)
@@ -831,7 +831,7 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 
 // --- Per-match emit helpers -----------------------------------------
 
-func (e *GoExtractor) emitFunction(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, paramsByFunc map[string]typeEnv) {
+func (e *GoExtractor) emitFunction(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, paramsByFunc map[string]typeEnv, imports map[string]string) {
 	name := m.Captures["func.name"].Text
 	def := m.Captures["func.def"]
 	id := filePath + "::" + name
@@ -875,7 +875,7 @@ func (e *GoExtractor) emitFunction(m parser.QueryResult, filePath, fileID string
 	})
 	emitGoThrowsEdges(node, m.Captures["func.result"], filePath, result)
 	emitGoFunctionShape(id, def.Node, m.Captures["func.params"], m.Captures["func.result"],
-		src, filePath, def.StartLine+1, result)
+		src, filePath, def.StartLine+1, imports, result)
 }
 
 // goFuncBody returns the `block` body child of a function/method
@@ -897,7 +897,7 @@ func goFuncBody(decl *sitter.Node) *sitter.Node {
 	return nil
 }
 
-func (e *GoExtractor) emitMethod(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, paramsByFunc map[string]typeEnv) {
+func (e *GoExtractor) emitMethod(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, paramsByFunc map[string]typeEnv, imports map[string]string) {
 	name := m.Captures["method.name"].Text
 	def := m.Captures["method.def"]
 	receiverText := m.Captures["method.receiver"].Text
@@ -958,7 +958,7 @@ func (e *GoExtractor) emitMethod(m parser.QueryResult, filePath, fileID string, 
 	})
 	emitGoThrowsEdges(node, m.Captures["method.result"], filePath, result)
 	emitGoFunctionShape(id, def.Node, m.Captures["method.params"], m.Captures["method.result"],
-		src, filePath, def.StartLine+1, result)
+		src, filePath, def.StartLine+1, imports, result)
 }
 
 // goTypeParams reads the `type_parameters` child of a Go declaration
