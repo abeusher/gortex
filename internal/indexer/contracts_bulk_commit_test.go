@@ -57,13 +57,16 @@ func (r *recordingBulkGraph) AddBatch(nodes []*graph.Node, edges []*graph.Edge) 
 	r.Graph.AddBatch(nodes, edges)
 }
 
-// TestCommitContracts_UsesBulkLoader asserts that the final write
-// phase of commitContracts brackets its node + edge inserts with
-// BeginBulkLoad / FlushBulk and uses AddBatch — not the per-row
-// AddNode / AddEdge calls that previously made Ladybug's contracts
-// pass ~35s per repo. The recording wrapper satisfies
-// graph.BulkLoader so the indexer's BulkLoader probe engages.
-func TestCommitContracts_UsesBulkLoader(t *testing.T) {
+// TestCommitContracts_BatchesViaAddBatch asserts that the final
+// write phase of commitContracts emits all contract nodes and
+// edges through a single AddBatch call and does NOT engage the
+// BulkLoader COPY bracket. Contract IDs frequently coincide with
+// existing source-symbol IDs (a handler appears as both a Go
+// function and an HTTP-contract anchor), and Ladybug's COPY FROM
+// is INSERT-only on the node table — wrapping the contracts pass
+// in BeginBulkLoad/FlushBulk would crash on the first collision.
+// AddBatch's per-call MERGE path absorbs duplicates safely.
+func TestCommitContracts_BatchesViaAddBatch(t *testing.T) {
 	g := newRecordingBulkGraph()
 	require.Implements(t, (*graph.BulkLoader)(nil), graph.Store(g))
 
@@ -99,9 +102,9 @@ func TestCommitContracts_UsesBulkLoader(t *testing.T) {
 	idx.commitContracts(reg)
 
 	require.Equal(t,
-		[]string{"BeginBulkLoad", "AddBatch", "FlushBulk"},
+		[]string{"AddBatch"},
 		g.calls,
-		"contracts commit must route through the BulkLoader fast path",
+		"contracts commit must batch through a single AddBatch call",
 	)
 	require.Zero(t, g.addNode.Load(), "no per-row AddNode calls expected")
 	require.Zero(t, g.addEdge.Load(), "no per-row AddEdge calls expected")

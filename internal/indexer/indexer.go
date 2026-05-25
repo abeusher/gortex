@@ -3981,26 +3981,17 @@ func (idx *Indexer) commitContracts(reg *contracts.Registry) {
 		zap.Duration("commit_bulk_elapsed", bulkElapsed))
 }
 
-// bulkCommit writes nodes + edges through the backend's BulkLoader
-// fast path when available (Ladybug's COPY FROM is ~100x faster than
-// per-row Cypher MERGE) and falls back to a single AddBatch otherwise.
-// The store is non-empty at call time — see graph.BulkLoader's contract
-// note. Ladybug's COPY is INSERT-only on the node table, so callers
-// MUST not pass node IDs that already exist on disk; commitContracts
-// filters dep::<module> contracts for that reason.
+// bulkCommit writes nodes + edges in one AddBatch call. The bulk
+// COPY path is intentionally NOT used here: contract IDs often
+// coincide with existing source-symbol IDs (a route handler shows
+// up as both a Go function and an HTTP-contract anchor), and
+// Ladybug's COPY FROM is INSERT-only on the node table so any
+// collision fails the whole batch. AddBatch's non-bulk path runs
+// MERGE for every row so duplicates are absorbed in place; the
+// per-call cost is amortised by the chunked UNWIND-MERGE path the
+// backend uses internally.
 func (idx *Indexer) bulkCommit(nodes []*graph.Node, edges []*graph.Edge) {
 	if len(nodes) == 0 && len(edges) == 0 {
-		return
-	}
-	if bl, ok := idx.graph.(graph.BulkLoader); ok {
-		bl.BeginBulkLoad()
-		idx.graph.AddBatch(nodes, edges)
-		if err := bl.FlushBulk(); err != nil {
-			idx.logger.Warn("bulkCommit: FlushBulk failed",
-				zap.Error(err),
-				zap.Int("nodes", len(nodes)),
-				zap.Int("edges", len(edges)))
-		}
 		return
 	}
 	idx.graph.AddBatch(nodes, edges)

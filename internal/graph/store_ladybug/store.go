@@ -357,20 +357,18 @@ func (s *Store) AddBatch(nodes []*graph.Node, edges []*graph.Edge) {
 
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	// Per-call AddNode/AddEdge loop instead of the Kuzu-style UNWIND
-	// path. The fork's UNWIND-MERGE statement triggers a C++
-	// "unordered_map::at: key not found" panic when a row references
-	// a node id that doesn't yet exist; the per-call form's explicit
-	// stub-then-MERGE pattern in upsertEdgeLocked sidesteps it.
-	// Bulk indexing routes through the BulkLoader COPY path above, so
-	// this loop only runs on the small/incremental write surface
-	// (conformance tests, daemon's reactive re-indexes).
-	for _, n := range nodes {
-		if n == nil || n.ID == "" {
-			continue
-		}
-		s.upsertNodeLocked(n)
+	// Nodes use the UNWIND-MERGE batching path — safe because nodes
+	// carry no FK references, so the "unordered_map::at: key not
+	// found" crash that bites edge UNWIND can't fire here. Batching
+	// turns N upserts into ceil(N/chunk) Cypher calls — meaningful on
+	// Ladybug where each cgo round-trip costs ~1 ms.
+	if len(nodes) > 0 {
+		s.addNodesUnwindLocked(nodes)
 	}
+	// Edges stay on the per-call upsertEdgeLocked path: it stubs the
+	// endpoints with explicit MERGE before MERGEing the edge, which
+	// dodges the C++ panic the fork raises when UNWIND-MERGE sees an
+	// edge row whose endpoint id isn't yet in the node table.
 	for _, e := range edges {
 		if e == nil {
 			continue
