@@ -71,9 +71,27 @@ func (s *Server) handleAnalyzeTestsAsEdges(ctx context.Context, req mcp.CallTool
 		primary = symbolsByTest
 	}
 
+	// Batch-fetch every primary key and every related ID in one bulk
+	// round-trip. On a repo with thousands of EdgeTests edges the old
+	// per-id GetNode pattern burned one cgo Cypher call per row plus
+	// one per related ID on Ladybug — easily 5-10k round-trips per
+	// analyze kind=tests_as_edges call.
+	idSet := make(map[string]struct{}, len(primary))
+	for id, relatedIDs := range primary {
+		idSet[id] = struct{}{}
+		for _, rid := range relatedIDs {
+			idSet[rid] = struct{}{}
+		}
+	}
+	allIDs := make([]string, 0, len(idSet))
+	for id := range idSet {
+		allIDs = append(allIDs, id)
+	}
+	nodeByID := s.graph.GetNodesByIDs(allIDs)
+
 	rows := make([]testEdgeRow, 0, len(primary))
 	for id, relatedIDs := range primary {
-		n := s.graph.GetNode(id)
+		n := nodeByID[id]
 		if n == nil {
 			continue
 		}
@@ -88,7 +106,7 @@ func (s *Server) handleAnalyzeTestsAsEdges(ctx context.Context, req mcp.CallTool
 			}
 			seen[rid] = true
 			name := rid
-			if rn := s.graph.GetNode(rid); rn != nil {
+			if rn := nodeByID[rid]; rn != nil {
 				name = rn.Name
 			}
 			related = append(related, testEdgeRef{ID: rid, Name: name})

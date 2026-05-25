@@ -137,9 +137,17 @@ func (s *Server) replayTimeline(radius map[string]int, windowDays, limit int) []
 	if windowDays > 0 {
 		cutoff = time.Now().Add(-time.Duration(windowDays) * 24 * time.Hour)
 	}
+	// Batch-fetch every node in the radius; the radius is the BFS
+	// frontier (often hundreds of IDs), and per-id GetNode on Ladybug
+	// would issue that many cgo round-trips per replay call.
+	ids := make([]string, 0, len(radius))
+	for id := range radius {
+		ids = append(ids, id)
+	}
+	nodeByID := s.graph.GetNodesByIDs(ids)
 	rows := make([]replayTimelineRow, 0, len(radius))
 	for id := range radius {
-		n := s.graph.GetNode(id)
+		n := nodeByID[id]
 		if n == nil {
 			continue
 		}
@@ -197,12 +205,23 @@ func (s *Server) replayTimeline(radius map[string]int, windowDays, limit int) []
 }
 
 func (s *Server) replayCallers(radius map[string]int, anchor string, limit int) []replayCallerRow {
+	// Batch-fetch the radius minus the anchor; same rationale as
+	// replayTimeline — per-id GetNode on Ladybug cost one cgo call
+	// per BFS node.
+	ids := make([]string, 0, len(radius))
+	for id := range radius {
+		if id == anchor {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	nodeByID := s.graph.GetNodesByIDs(ids)
 	rows := make([]replayCallerRow, 0, len(radius))
 	for id, d := range radius {
 		if id == anchor {
 			continue
 		}
-		n := s.graph.GetNode(id)
+		n := nodeByID[id]
 		if n == nil {
 			continue
 		}
@@ -226,9 +245,15 @@ func (s *Server) replayCallers(radius map[string]int, anchor string, limit int) 
 }
 
 func (s *Server) replayCoverageGaps(radius map[string]int, limit int) []replayCoverageRow {
+	// Batch-fetch the radius — same rationale as replayTimeline.
+	ids := make([]string, 0, len(radius))
+	for id := range radius {
+		ids = append(ids, id)
+	}
+	nodeByID := s.graph.GetNodesByIDs(ids)
 	rows := make([]replayCoverageRow, 0)
 	for id := range radius {
-		n := s.graph.GetNode(id)
+		n := nodeByID[id]
 		if n == nil {
 			continue
 		}

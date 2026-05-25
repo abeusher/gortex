@@ -628,9 +628,13 @@ func autoLinkBody(body string, g graph.Store, workspaceID string, opts autoLinkO
 	}
 
 	// (1) Direct ID matches — anything containing "::" is treated as
-	// a candidate ID. The regexp-free scan keeps this hot path cheap.
-	for _, candidate := range extractIDCandidates(body) {
-		node := g.GetNode(candidate)
+	// a candidate ID. Batch the lookup so even auto-linkers with many
+	// candidates on long notes only pay one backend round-trip on
+	// disk-backed stores.
+	candidates := extractIDCandidates(body)
+	candidateNodes := g.GetNodesByIDs(candidates)
+	for _, candidate := range candidates {
+		node := candidateNodes[candidate]
 		if node == nil {
 			continue
 		}
