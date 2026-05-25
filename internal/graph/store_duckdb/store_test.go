@@ -20,3 +20,15 @@ func TestDuckDBStoreConformance(t *testing.T) {
 		return s
 	})
 }
+
+func TestDuckDBBackendResolverConformance(t *testing.T) {
+	storetest.RunBackendResolverConformance(t, func(t *testing.T) graph.Store {
+		dir := t.TempDir()
+		s, err := store_duckdb.Open(filepath.Join(dir, "test.duckdb"))
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		t.Cleanup(func() { _ = s.Close() })
+		return s
+	})
+}

@@ -1724,7 +1724,7 @@ func (s *Store) ResolveUniqueNames() (int, error) {
 	const q = `
 MATCH ()-[e:Edge]->(stub:Node)
 WHERE stub.id STARTS WITH 'unresolved::'
-WITH e, stub, substring(stub.id, 12) AS name
+WITH e, stub, substring(stub.id, 13, size(stub.id) - 12) AS name
 MATCH (target:Node {name: name})
 WITH e, stub, name, collect(target) AS targets
 WHERE size(targets) = 1

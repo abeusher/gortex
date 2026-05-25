@@ -20,3 +20,15 @@ func TestKuzuStoreConformance(t *testing.T) {
 		return s
 	})
 }
+
+func TestKuzuBackendResolverConformance(t *testing.T) {
+	storetest.RunBackendResolverConformance(t, func(t *testing.T) graph.Store {
+		dir := t.TempDir()
+		s, err := store_kuzu.Open(filepath.Join(dir, "test.kuzu"))
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		t.Cleanup(func() { _ = s.Close() })
+		return s
+	})
+}

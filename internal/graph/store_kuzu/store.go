@@ -1728,17 +1728,21 @@ func (s *Store) ResolveUniqueNames() (int, error) {
 	// CREATE a new edge with the same properties but the resolved
 	// to-endpoint — Kuzu rel edges are immutable on their endpoint
 	// pair so a direct SET of from/to is not supported).
+	// Two-pass: first count candidates per name, then for names with
+	// exactly one candidate, rewrite. Kuzu's binder rejects
+	// `targets[0] AS target` followed by a CREATE referencing
+	// `target` because the type collapses to ANY through indexing;
+	// re-MATCHing `target` by name (when we know count=1) keeps
+	// the type bound for the CREATE.
 	const q = `
-MATCH ()-[e:Edge]->(stub:Node)
+MATCH (caller:Node)-[e:Edge]->(stub:Node)
 WHERE stub.id STARTS WITH 'unresolved::'
-WITH e, stub, substring(stub.id, 12) AS name
+WITH e, caller, stub, substring(stub.id, 13, size(stub.id) - 12) AS name
+OPTIONAL MATCH (cnd:Node {name: name})
+WITH e, caller, stub, name, count(cnd) AS cnt
+WHERE cnt = 1
 MATCH (target:Node {name: name})
-WITH e, stub, name, collect(target) AS targets
-WHERE size(targets) = 1
-WITH e, targets[0] AS target
-MATCH (caller:Node)-[oldE:Edge {kind: e.kind, file_path: e.file_path, line: e.line}]->(stub2:Node)
-WHERE stub2.id STARTS WITH 'unresolved::' AND id(oldE) = id(e)
-DELETE oldE
+DELETE e
 CREATE (caller)-[newE:Edge {
     kind: e.kind,
     file_path: e.file_path,
