@@ -304,6 +304,32 @@ func (e *Engine) FindUsagesScoped(nodeID string, opts QueryOptions) *SubGraph {
 	edges := e.g.GetInEdges(nodeID)
 	nodeMap := make(map[string]*graph.Node)
 	var filtered []*graph.Edge
+
+	// First pass: collect every From id whose edge kind qualifies as
+	// a usage. We need the From *Node for the workspace / test
+	// filters below, but the legacy loop fetched it with one GetNode
+	// per edge — on Ladybug that's one cgo Cypher round-trip per
+	// inbound edge, which for hot symbols (hundreds of callers) was
+	// the dominant cost of find_usages. Pre-filter the kinds, then
+	// batch the lookup so the disk backend issues one query instead
+	// of N. The target nodeID rides on the same batch so the
+	// "include the target node itself" step at the end of this
+	// function does not need its own per-id call.
+	fromIDs := make([]string, 0, len(edges)+1)
+	seenFrom := make(map[string]struct{}, len(edges))
+	for _, edge := range edges {
+		if !isUsageEdgeKind(edge.Kind) {
+			continue
+		}
+		if _, dup := seenFrom[edge.From]; dup {
+			continue
+		}
+		seenFrom[edge.From] = struct{}{}
+		fromIDs = append(fromIDs, edge.From)
+	}
+	fromIDs = append(fromIDs, nodeID)
+	fromByID := e.g.GetNodesByIDs(fromIDs)
+
 	for _, edge := range edges {
 		// EdgeProvides + EdgeConsumes carry DI token relationships —
 		// `@Inject(TOKEN)` and `{ provide: TOKEN, useValue: ... }`
@@ -319,17 +345,8 @@ func (e *Engine) FindUsagesScoped(nodeID string, opts QueryOptions) *SubGraph {
 		// callers via the legacy reads_config path; find_usages on a
 		// Service returns Ingresses routing to it (EdgeDependsOn);
 		// find_usages on an Image returns workloads pulling it.
-		if edge.Kind == graph.EdgeCalls || edge.Kind == graph.EdgeReferences ||
-			edge.Kind == graph.EdgeInstantiates ||
-			edge.Kind == graph.EdgeReturns || edge.Kind == graph.EdgeTypedAs ||
-			edge.Kind == graph.EdgeImplements || edge.Kind == graph.EdgeExtends ||
-			edge.Kind == graph.EdgeComposes ||
-			edge.Kind == graph.EdgeProvides || edge.Kind == graph.EdgeConsumes ||
-			edge.Kind == graph.EdgeReadsConfig || edge.Kind == graph.EdgeWritesConfig ||
-			edge.Kind == graph.EdgeUsesEnv || edge.Kind == graph.EdgeConfigures ||
-			edge.Kind == graph.EdgeMounts || edge.Kind == graph.EdgeExposes ||
-			edge.Kind == graph.EdgeDependsOn {
-			from := e.g.GetNode(edge.From)
+		if isUsageEdgeKind(edge.Kind) {
+			from := fromByID[edge.From]
 			if opts.WorkspaceID != "" && !opts.ScopeAllows(from) {
 				continue
 			}
@@ -342,8 +359,8 @@ func (e *Engine) FindUsagesScoped(nodeID string, opts QueryOptions) *SubGraph {
 			}
 		}
 	}
-	// Include the target node itself.
-	if n := e.g.GetNode(nodeID); n != nil {
+	// Include the target node itself (already in the batch above).
+	if n := fromByID[nodeID]; n != nil {
 		nodeMap[n.ID] = n
 	}
 	nodes := make([]*graph.Node, 0, len(nodeMap))
@@ -884,6 +901,28 @@ func stripMeta(sg *SubGraph) {
 	for _, n := range sg.Nodes {
 		n.Meta = nil
 	}
+}
+
+// isUsageEdgeKind reports whether an edge kind counts as a "usage"
+// for FindUsages — the same predicate the legacy inline if-chain
+// evaluated. Hoisted into a function so the kind set can be reused
+// across the pre-filter pass and the materialisation pass without
+// drifting.
+func isUsageEdgeKind(k graph.EdgeKind) bool {
+	switch k {
+	case graph.EdgeCalls, graph.EdgeReferences,
+		graph.EdgeInstantiates,
+		graph.EdgeReturns, graph.EdgeTypedAs,
+		graph.EdgeImplements, graph.EdgeExtends,
+		graph.EdgeComposes,
+		graph.EdgeProvides, graph.EdgeConsumes,
+		graph.EdgeReadsConfig, graph.EdgeWritesConfig,
+		graph.EdgeUsesEnv, graph.EdgeConfigures,
+		graph.EdgeMounts, graph.EdgeExposes,
+		graph.EdgeDependsOn:
+		return true
+	}
+	return false
 }
 
 // isTestSource reports whether a node was flagged as a test by the
