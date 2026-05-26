@@ -52,10 +52,7 @@ func (s *Server) handleAnalyzeLogEvents(ctx context.Context, req mcp.CallToolReq
 		Emitters []string `json:"emitters,omitempty"`
 	}
 	byString := map[string]*logRow{}
-	for _, e := range s.graph.AllEdges() {
-		if e.Kind != graph.EdgeEmits {
-			continue
-		}
+	for e := range edgesByKinds(s.graph, graph.EdgeEmits) {
 		n := s.graph.GetNode(e.To)
 		if n == nil || n.Kind != graph.KindString {
 			continue
@@ -224,10 +221,7 @@ func (s *Server) handleAnalyzeSQLCallSites(ctx context.Context, req mcp.CallTool
 		Writes  int      `json:"writes"`
 	}
 	bySite := map[string]*sqlCallSite{}
-	for _, e := range s.graph.AllEdges() {
-		if e.Kind != graph.EdgeQueries {
-			continue
-		}
+	for e := range edgesByKinds(s.graph, graph.EdgeQueries) {
 		row, ok := bySite[e.From]
 		if !ok {
 			name, file := e.From, ""
