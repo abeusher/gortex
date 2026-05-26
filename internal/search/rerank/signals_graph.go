@@ -13,7 +13,7 @@ func (FanInSignal) Contribute(_ string, c *Candidate, ctx *Context) float64 {
 	if ctx.Graph == nil {
 		return 0
 	}
-	count := len(ctx.Graph.GetInEdges(c.Node.ID))
+	count := len(ctx.inEdges(c.Node.ID))
 	return normLog(count, ctx.fanInMax)
 }
 
@@ -29,7 +29,7 @@ func (FanOutSignal) Contribute(_ string, c *Candidate, ctx *Context) float64 {
 	if ctx.Graph == nil {
 		return 0
 	}
-	count := len(ctx.Graph.GetOutEdges(c.Node.ID))
+	count := len(ctx.outEdges(c.Node.ID))
 	return normLog(count, ctx.fanOutMax)
 }
 
@@ -47,7 +47,7 @@ func (MinHashSignal) Contribute(_ string, c *Candidate, ctx *Context) float64 {
 		return 0
 	}
 	var total, n float64
-	for _, e := range ctx.Graph.GetOutEdges(c.Node.ID) {
+	for _, e := range ctx.outEdges(c.Node.ID) {
 		if e.Kind != graph.EdgeSimilarTo {
 			continue
 		}
@@ -63,7 +63,7 @@ func (MinHashSignal) Contribute(_ string, c *Candidate, ctx *Context) float64 {
 	}
 	// Symmetric edge — also walk incoming (snapshots that omit
 	// outgoing copies of similar_to don't lose recall).
-	for _, e := range ctx.Graph.GetInEdges(c.Node.ID) {
+	for _, e := range ctx.inEdges(c.Node.ID) {
 		if e.Kind != graph.EdgeSimilarTo {
 			continue
 		}

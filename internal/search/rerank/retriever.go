@@ -91,6 +91,7 @@ func (gc *GraphCompletion) Retrieve(ctx context.Context, g graph.Store, query st
 
 	out := make([]*Candidate, 0, len(seeds)*2)
 	seen := make(map[string]*Candidate, len(seeds)*2)
+	seedIDs := make([]string, 0, len(seeds))
 	for _, c := range seeds {
 		if c == nil || c.Node == nil {
 			continue
@@ -100,14 +101,38 @@ func (gc *GraphCompletion) Retrieve(ctx context.Context, g graph.Store, query st
 		}
 		seen[c.Node.ID] = c
 		out = append(out, c)
+		seedIDs = append(seedIDs, c.Node.ID)
 	}
 
-	for _, seed := range seeds {
-		if seed == nil || seed.Node == nil {
-			continue
+	// One batched out-edge round-trip across every seed instead of
+	// one cgo call per seed. On Ladybug this drops ~30 round-trips
+	// into 1 for a typical search_symbols completion pass.
+	outEdges := g.GetOutEdgesByNodeIDs(seedIDs)
+
+	// Collect every distinct target id, then materialise the target
+	// nodes in one batched GetNodesByIDs call — same shape, same win.
+	toIDs := make([]string, 0, len(outEdges)*4)
+	toSeen := make(map[string]struct{}, len(outEdges)*4)
+	for _, seedID := range seedIDs {
+		for _, e := range outEdges[seedID] {
+			if !keepAll && !allowed[e.Kind] {
+				continue
+			}
+			if _, dup := seen[e.To]; dup {
+				continue
+			}
+			if _, dup := toSeen[e.To]; dup {
+				continue
+			}
+			toSeen[e.To] = struct{}{}
+			toIDs = append(toIDs, e.To)
 		}
+	}
+	toNodes := g.GetNodesByIDs(toIDs)
+
+	for _, seedID := range seedIDs {
 		added := 0
-		for _, e := range g.GetOutEdges(seed.Node.ID) {
+		for _, e := range outEdges[seedID] {
 			if !keepAll && !allowed[e.Kind] {
 				continue
 			}
@@ -117,7 +142,7 @@ func (gc *GraphCompletion) Retrieve(ctx context.Context, g graph.Store, query st
 			if _, dup := seen[e.To]; dup {
 				continue
 			}
-			toNode := g.GetNode(e.To)
+			toNode := toNodes[e.To]
 			if toNode == nil {
 				continue
 			}

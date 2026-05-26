@@ -121,6 +121,17 @@ type Context struct {
 	// runs once per file rather than once per candidate. Bounded by
 	// the candidate set's file count.
 	pathPenaltyCache map[string]float64
+
+	// outEdgeCache / inEdgeCache hold the per-candidate edge slices
+	// fetched in one batched round-trip from Graph at prepare() time.
+	// FanInSignal / FanOutSignal / MinHashSignal read from these
+	// instead of calling Graph.GetIn/OutEdges per-candidate, which on
+	// the Ladybug backend collapses ~6N per-search cgo round-trips
+	// (~150 calls × 14ms ≈ 2 s) into 2. Empty when Graph is nil.
+	// Callers must use the inEdges / outEdges accessors so signals
+	// stay graph-agnostic.
+	outEdgeCache map[string][]*graph.Edge
+	inEdgeCache  map[string][]*graph.Edge
 }
 
 // now returns the active timestamp (test-injectable when Now != 0).
@@ -133,6 +144,12 @@ func (c *Context) now() int64 {
 
 // prepare populates the internal scratch fields once per Rerank call.
 // Idempotent — safe to call again after mutating the candidate slice.
+//
+// Edge fetches happen in two batched round-trips (one inbound, one
+// outbound) collected from every candidate's ID up front. On the
+// Ladybug backend each per-candidate GetInEdges / GetOutEdges call
+// costs ~14ms cgo; batching collapses ~150 round-trips per Rerank
+// into 2.
 func (c *Context) prepare(cands []*Candidate) {
 	c.communityCount = make(map[string]int, len(cands))
 	c.maxCommunityCount = 0
@@ -144,12 +161,18 @@ func (c *Context) prepare(cands []*Candidate) {
 	c.fileScoreSum = make(map[string]float64, len(cands))
 	c.maxFileScoreSum = 0
 	c.pathPenaltyCache = make(map[string]float64, len(cands))
+	c.outEdgeCache = nil
+	c.inEdgeCache = nil
 
+	// First pass: collect candidate IDs (the input to the batched edge
+	// fetch) and populate the non-edge scratch fields.
+	ids := make([]string, 0, len(cands))
 	for _, cand := range cands {
 		if cand == nil || cand.Node == nil {
 			continue
 		}
 		c.candidateIDs[cand.Node.ID] = struct{}{}
+		ids = append(ids, cand.Node.ID)
 
 		if c.CommunityOf != nil {
 			com := c.CommunityOf(cand.Node.ID)
@@ -158,17 +181,6 @@ func (c *Context) prepare(cands []*Candidate) {
 				if c.communityCount[com] > c.maxCommunityCount {
 					c.maxCommunityCount = c.communityCount[com]
 				}
-			}
-		}
-
-		if c.Graph != nil {
-			fi := len(c.Graph.GetInEdges(cand.Node.ID))
-			fo := len(c.Graph.GetOutEdges(cand.Node.ID))
-			if fi > c.fanInMax {
-				c.fanInMax = fi
-			}
-			if fo > c.fanOutMax {
-				c.fanOutMax = fo
 			}
 		}
 
@@ -192,6 +204,55 @@ func (c *Context) prepare(cands []*Candidate) {
 			}
 		}
 	}
+
+	// Second pass: one batched in-edge + one out-edge round-trip
+	// against Graph, then walk the cached maps to compute fanInMax /
+	// fanOutMax. Skipped when Graph is nil — fan signals contribute 0.
+	if c.Graph != nil && len(ids) > 0 {
+		c.outEdgeCache = c.Graph.GetOutEdgesByNodeIDs(ids)
+		c.inEdgeCache = c.Graph.GetInEdgesByNodeIDs(ids)
+		for _, id := range ids {
+			if fi := len(c.inEdgeCache[id]); fi > c.fanInMax {
+				c.fanInMax = fi
+			}
+			if fo := len(c.outEdgeCache[id]); fo > c.fanOutMax {
+				c.fanOutMax = fo
+			}
+		}
+	}
+}
+
+// outEdges returns the prepared outgoing-edge slice for nodeID. Reads
+// from the prepare()-populated cache when available; falls back to a
+// direct Graph.GetOutEdges call when prepare did not cache the node
+// (a signal calling outside the candidate set, or Graph was nil at
+// prepare time but a later mutation set it). Signals must use this
+// accessor instead of calling Graph directly so the batched-fetch
+// invariant holds.
+func (c *Context) outEdges(nodeID string) []*graph.Edge {
+	if c.outEdgeCache != nil {
+		if edges, ok := c.outEdgeCache[nodeID]; ok {
+			return edges
+		}
+	}
+	if c.Graph == nil {
+		return nil
+	}
+	return c.Graph.GetOutEdges(nodeID)
+}
+
+// inEdges is the inbound sibling of outEdges. See that doc-comment
+// for the contract.
+func (c *Context) inEdges(nodeID string) []*graph.Edge {
+	if c.inEdgeCache != nil {
+		if edges, ok := c.inEdgeCache[nodeID]; ok {
+			return edges
+		}
+	}
+	if c.Graph == nil {
+		return nil
+	}
+	return c.Graph.GetInEdges(nodeID)
 }
 
 // churnFor consults the ChurnOf hook, then Node.Meta["churn"], then
