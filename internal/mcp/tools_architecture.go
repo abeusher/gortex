@@ -62,17 +62,31 @@ func (s *Server) handleGetArchitecture(ctx context.Context, req mcp.CallToolRequ
 	topEntryPoints := max(req.GetInt("top_entry_points", 10), 1)
 	pathPrefix := strings.TrimSpace(req.GetString("path_prefix", ""))
 
-	scoped := s.scopedNodes(ctx)
-	inScope := make(map[string]*graph.Node, len(scoped))
-	for _, n := range scoped {
-		if pathPrefix != "" && !strings.HasPrefix(n.FilePath, pathPrefix) {
-			continue
+	// scoped + inScope are only needed when the session is bound or
+	// the caller supplied a path-prefix narrowing. Otherwise every
+	// node is in scope and downstream membership tests are tautologies
+	// the helpers handle via nil inScope.
+	_, _, bound := s.sessionScope(ctx)
+	needScoped := bound || pathPrefix != ""
+	var scoped []*graph.Node
+	var inScope map[string]bool
+	var totalNodesScoped int
+	if needScoped {
+		scoped = s.scopedNodes(ctx)
+		inScope = make(map[string]bool, len(scoped))
+		for _, n := range scoped {
+			if pathPrefix != "" && !strings.HasPrefix(n.FilePath, pathPrefix) {
+				continue
+			}
+			inScope[n.ID] = true
 		}
-		inScope[n.ID] = n
+		totalNodesScoped = len(inScope)
+	} else {
+		totalNodesScoped = s.graph.NodeCount()
 	}
 
 	// 1. Summary — language mix + node/edge counts.
-	summary := architectureSummary(scoped, inScope, s.graph)
+	summary := architectureSummary(scoped, inScope, totalNodesScoped, s.graph)
 
 	// 2. Communities — same shape as the outline tool, capped here.
 	communitiesSection := architectureCommunities(s.getCommunities(), inScope, topCommunities)
@@ -169,11 +183,25 @@ func architectureHierarchy(g graph.Store, cr *analysis.CommunityResult, resoluti
 
 // architectureSummary builds the language mix + node/edge count
 // header. Edges are bounded to the scoped subgraph so multi-repo
-// callers don't see cross-workspace numbers.
-func architectureSummary(allScoped []*graph.Node, inScope map[string]*graph.Node, g graph.Store) map[string]any {
+// callers don't see cross-workspace numbers. nil inScope is the
+// signal that every node is in scope — the helper short-circuits
+// the lang count through Stats() and the edge count through
+// EdgeCount() rather than materialising the whole graph over cgo.
+func architectureSummary(allScoped []*graph.Node, inScope map[string]bool, totalNodes int, g graph.Store) map[string]any {
 	langCounts := map[string]int{}
-	for _, n := range inScope {
-		if n.Language != "" {
+	if inScope == nil {
+		// Unbound session + no path-prefix — pull the aggregate from
+		// the backend's cached stats. One indexed groupby vs a
+		// whole-table scan over cgo.
+		stats := g.Stats()
+		for lang, c := range stats.ByLanguage {
+			langCounts[lang] = c
+		}
+	} else {
+		for _, n := range allScoped {
+			if !inScope[n.ID] || n.Language == "" {
+				continue
+			}
 			langCounts[n.Language]++
 		}
 	}
@@ -197,14 +225,14 @@ func architectureSummary(allScoped []*graph.Node, inScope map[string]*graph.Node
 	// EdgeCount(), which is an O(1) lookup. Skips materialising
 	// every edge over cgo just to count them.
 	var totalEdges int
-	if len(inScope) == g.NodeCount() {
+	if inScope == nil {
 		totalEdges = g.EdgeCount()
 	} else {
 		for _, e := range g.AllEdges() {
-			if _, ok := inScope[e.From]; !ok {
+			if !inScope[e.From] {
 				continue
 			}
-			if _, ok := inScope[e.To]; !ok {
+			if !inScope[e.To] {
 				continue
 			}
 			totalEdges++
@@ -216,32 +244,40 @@ func architectureSummary(allScoped []*graph.Node, inScope map[string]*graph.Node
 		primary = languages[0].Name
 	}
 
+	unscopedCount := totalNodes
+	if inScope != nil {
+		unscopedCount = len(allScoped)
+	}
 	return map[string]any{
-		"total_nodes":          len(inScope),
-		"total_nodes_unscoped": len(allScoped),
+		"total_nodes":          totalNodes,
+		"total_nodes_unscoped": unscopedCount,
 		"total_edges":          totalEdges,
 		"primary_language":     primary,
 		"languages":            languages,
 	}
 }
 
-func architectureCommunities(cr *analysis.CommunityResult, inScope map[string]*graph.Node, top int) map[string]any {
+func architectureCommunities(cr *analysis.CommunityResult, inScope map[string]bool, top int) map[string]any {
 	out := map[string]any{"count": 0}
 	if cr == nil {
 		return out
 	}
 	kept := make([]analysis.Community, 0, len(cr.Communities))
 	for _, c := range cr.Communities {
-		// Drop communities with no members in scope.
-		match := false
-		for _, m := range c.Members {
-			if _, ok := inScope[m]; ok {
-				match = true
-				break
+		// nil inScope means "every node is in scope" — keep the
+		// community unconditionally. Otherwise drop the community
+		// when no member lands inside the session's workspace.
+		if inScope != nil {
+			match := false
+			for _, m := range c.Members {
+				if inScope[m] {
+					match = true
+					break
+				}
 			}
-		}
-		if !match {
-			continue
+			if !match {
+				continue
+			}
 		}
 		kept = append(kept, c)
 	}
@@ -269,13 +305,13 @@ func architectureCommunities(cr *analysis.CommunityResult, inScope map[string]*g
 	return out
 }
 
-func architectureHotspots(g graph.Store, cr *analysis.CommunityResult, inScope map[string]*graph.Node, top int) []map[string]any {
+func architectureHotspots(g graph.Store, cr *analysis.CommunityResult, inScope map[string]bool, top int) []map[string]any {
 	out := []map[string]any{}
 	for _, h := range analysis.FindHotspots(g, cr, 0) {
 		if len(out) >= top {
 			break
 		}
-		if _, ok := inScope[h.ID]; !ok {
+		if inScope != nil && !inScope[h.ID] {
 			continue
 		}
 		out = append(out, map[string]any{
@@ -296,22 +332,53 @@ func architectureHotspots(g graph.Store, cr *analysis.CommunityResult, inScope m
 // incoming edges and at least one outgoing edge — the "called by
 // no one, calls into the system" pattern.
 //
+// The candidate pool is either the kind-filtered subset of an in-scope
+// node map (bound session / path-prefix narrowing) or — when inScope
+// is nil — the function+method slice pulled directly from the storage
+// layer via NodesByKindsScanner. The legacy code path walked the full
+// scoped-nodes slice every call just to keep the callable subset.
+//
 // Uses NodeDegreeAggregator when the backend implements it (one
 // batched in/out count instead of 2N GetInEdges/GetOutEdges cgo
 // round-trips on Ladybug — the per-node loop was the entire
 // wall-clock cost of this section on large repos).
-func architectureEntryPoints(inScope map[string]*graph.Node, g graph.Store, top int) []map[string]any {
+func architectureEntryPoints(inScope map[string]bool, g graph.Store, top int) []map[string]any {
 	type entryCandidate struct {
 		node   *graph.Node
 		fanOut int
 	}
-	// Pre-filter on kind Go-side first — inScope is in-memory.
-	pool := make([]*graph.Node, 0, len(inScope))
-	for _, n := range inScope {
-		if n.Kind != graph.KindFunction && n.Kind != graph.KindMethod {
-			continue
+	// Pre-filter on kind Go-side first. When inScope is nil pull
+	// only function/method via the kind scanner; otherwise project
+	// the same subset out of the supplied scope set.
+	var pool []*graph.Node
+	if inScope == nil {
+		if scan, ok := g.(graph.NodesByKindsScanner); ok {
+			pool = scan.NodesByKinds([]graph.NodeKind{graph.KindFunction, graph.KindMethod})
+		} else {
+			all := g.AllNodes()
+			pool = make([]*graph.Node, 0, len(all))
+			for _, n := range all {
+				if n.Kind == graph.KindFunction || n.Kind == graph.KindMethod {
+					pool = append(pool, n)
+				}
+			}
 		}
-		pool = append(pool, n)
+	} else {
+		// Materialise the callable subset out of the in-scope node
+		// id set. The caller's scoped slice already lives in memory,
+		// so this stays cheap — but the inScope map carries bools,
+		// not nodes, so we re-resolve via GetNode for each id.
+		pool = make([]*graph.Node, 0, len(inScope))
+		for id := range inScope {
+			n := g.GetNode(id)
+			if n == nil {
+				continue
+			}
+			if n.Kind != graph.KindFunction && n.Kind != graph.KindMethod {
+				continue
+			}
+			pool = append(pool, n)
+		}
 	}
 	cands := make([]entryCandidate, 0, len(pool))
 	if agg, ok := g.(graph.NodeDegreeAggregator); ok && len(pool) > 0 {
@@ -364,13 +431,13 @@ func architectureEntryPoints(inScope map[string]*graph.Node, g graph.Store, top 
 	return out
 }
 
-func architectureProcesses(pr *analysis.ProcessResult, inScope map[string]*graph.Node, top int) []architectureProcess {
+func architectureProcesses(pr *analysis.ProcessResult, inScope map[string]bool, top int) []architectureProcess {
 	if pr == nil {
 		return []architectureProcess{}
 	}
 	kept := make([]analysis.Process, 0, len(pr.Processes))
 	for _, p := range pr.Processes {
-		if _, ok := inScope[p.EntryPoint]; !ok {
+		if inScope != nil && !inScope[p.EntryPoint] {
 			continue
 		}
 		kept = append(kept, p)
