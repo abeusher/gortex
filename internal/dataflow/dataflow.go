@@ -412,33 +412,16 @@ func (e *Engine) ResolveCandidates(p TaintPattern, limit int) []*graph.Node {
 	return out
 }
 
-// taintEligibleKinds is the seed-bucket allowlist that mirrors
-// taintEligible. Kept as a slice (not a set) so callers can iterate
-// the NodesByKind bucket of each kind in a stable order.
+// taintEligibleKinds is the seed-bucket allowlist of node kinds that
+// could plausibly be a dataflow source or sink. Files / imports / pkg
+// markers don't carry value semantics, so excluding them up front
+// keeps the candidate set focused. Kept as a slice (not a set) so
+// callers can iterate the NodesByKind bucket of each kind in a stable
+// order.
 var taintEligibleKinds = []graph.NodeKind{
 	graph.KindFunction, graph.KindMethod, graph.KindParam,
 	graph.KindField, graph.KindVariable, graph.KindConstant,
 	graph.KindType, graph.KindInterface,
-}
-
-// taintEligible filters the node universe to symbols that could
-// plausibly be a dataflow source or sink. Files / imports / pkg
-// markers don't carry value semantics, so excluding them up front
-// keeps the candidate set focused. Mirrors taintEligibleKinds —
-// kept as a switch (not a set lookup) because expandSinkCandidates
-// uses Kind directly on individual nodes where the slice form would
-// be a needless containment check.
-func taintEligible(n *graph.Node) bool {
-	if n == nil {
-		return false
-	}
-	switch n.Kind {
-	case graph.KindFunction, graph.KindMethod, graph.KindParam,
-		graph.KindField, graph.KindVariable, graph.KindConstant,
-		graph.KindType, graph.KindInterface:
-		return true
-	}
-	return false
 }
 
 // TaintFinding is one (source, sink) hit produced by TaintPaths.
