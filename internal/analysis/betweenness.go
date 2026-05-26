@@ -76,7 +76,26 @@ func ComputeBetweenness(g graph.Store) *BetweennessResult {
 	if g == nil {
 		return &BetweennessResult{Scores: map[string]float64{}}
 	}
-	nodes := g.AllNodes()
+	// Betweenness measures shortest-path centrality across the
+	// call / reference subgraph; only function and method nodes carry
+	// those edges, so the unfiltered AllNodes() pull was wasted on the
+	// other 90% of the node table. NodesByKindsScanner pushes the
+	// kind filter into the storage layer; the in-memory fallback is
+	// functionally identical to the old loop.
+	betweennessKinds := []graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences}
+	bcNodeKinds := []graph.NodeKind{graph.KindFunction, graph.KindMethod}
+	var nodes []*graph.Node
+	if scan, ok := g.(graph.NodesByKindsScanner); ok {
+		nodes = scan.NodesByKinds(bcNodeKinds)
+	} else {
+		all := g.AllNodes()
+		nodes = make([]*graph.Node, 0, len(all))
+		for _, n := range all {
+			if n.Kind == graph.KindFunction || n.Kind == graph.KindMethod {
+				nodes = append(nodes, n)
+			}
+		}
+	}
 	n := len(nodes)
 	if n == 0 {
 		return &BetweennessResult{Scores: map[string]float64{}}
@@ -84,8 +103,8 @@ func ComputeBetweenness(g graph.Store) *BetweennessResult {
 
 	// Stable node ordering: betweenness itself is order-independent,
 	// but a deterministic order makes the sampled pivot pick
-	// reproducible regardless of the map-iteration order AllNodes
-	// happens to return.
+	// reproducible regardless of the map-iteration order
+	// NodesByKinds happens to return.
 	ids := make([]string, n)
 	for i, nd := range nodes {
 		ids[i] = nd.ID
@@ -98,7 +117,6 @@ func ComputeBetweenness(g graph.Store) *BetweennessResult {
 	// materialising the full edge table over cgo; the legacy AllEdges
 	// pass was a ~286k row over cgo cost for a typical hotspots run.
 	adj := make(map[string][]string, n)
-	betweennessKinds := []graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences}
 	if scan, ok := g.(graph.EdgesByKindsScanner); ok {
 		for e := range scan.EdgesByKinds(betweennessKinds) {
 			if e == nil {

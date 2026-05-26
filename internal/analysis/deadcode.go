@@ -626,7 +626,25 @@ const hotspotBetweennessWeight = 0.4
 // other symbols — that augments the fan-in/out signals rather than replacing them.
 // If threshold <= 0, the default threshold is mean + 2*stddev.
 func FindHotspots(g graph.Store, communities *CommunityResult, threshold float64) []HotspotEntry {
-	nodes := g.AllNodes()
+	// Pull only function/method nodes — the hotspots ranking is
+	// callable-only, so the AllNodes() materialisation that the
+	// legacy path used to bucket the same subset Go-side pulled the
+	// whole node table over cgo for nothing. NodesByKindsScanner
+	// pushes the filter inside the backend; the in-memory fallback
+	// is functionally identical to the old loop.
+	hotspotKinds := []graph.NodeKind{graph.KindFunction, graph.KindMethod}
+	var nodes []*graph.Node
+	if scan, ok := g.(graph.NodesByKindsScanner); ok {
+		nodes = scan.NodesByKinds(hotspotKinds)
+	} else {
+		all := g.AllNodes()
+		nodes = make([]*graph.Node, 0, len(all))
+		for _, n := range all {
+			if n.Kind == graph.KindFunction || n.Kind == graph.KindMethod {
+				nodes = append(nodes, n)
+			}
+		}
+	}
 
 	// Build lookup maps for community membership
 	nodeToComm := make(map[string]string)
@@ -641,9 +659,7 @@ func FindHotspots(g graph.Store, communities *CommunityResult, threshold float64
 	// the candidate count rather than the whole graph.
 	candidateIDs := make([]string, 0, len(nodes))
 	for _, n := range nodes {
-		if n.Kind == graph.KindFunction || n.Kind == graph.KindMethod {
-			candidateIDs = append(candidateIDs, n.ID)
-		}
+		candidateIDs = append(candidateIDs, n.ID)
 	}
 	fanIn, fanOut := CollectFanCounts(g, candidateIDs,
 		[]graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences},
@@ -695,10 +711,6 @@ func FindHotspots(g graph.Store, communities *CommunityResult, threshold float64
 
 	var entries []rawEntry
 	for _, n := range nodes {
-		if n.Kind != graph.KindFunction && n.Kind != graph.KindMethod {
-			continue
-		}
-
 		fi := fanIn[n.ID]
 		fo := fanOut[n.ID]
 		cc := crossings[n.ID]
