@@ -3,6 +3,7 @@ package query
 import (
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/search"
@@ -408,9 +409,13 @@ func (e *Engine) SearchSymbolsRanked(query string, limit int, opts QueryOptions,
 
 	var cands []*rerank.Candidate
 	if s := e.getSearch(); s != nil && s.Count() > 0 {
-		cands = e.gatherBackendCandidates(query, fetchLimit)
+		cands = e.gatherBackendCandidates(query, fetchLimit, opts.SearchTimings)
 	} else {
+		start := time.Now()
 		nodes := e.searchSubstring(query, fetchLimit)
+		if opts.SearchTimings != nil {
+			opts.SearchTimings.FallbackMS += time.Since(start).Milliseconds()
+		}
 		cands = make([]*rerank.Candidate, 0, len(nodes))
 		for i, n := range nodes {
 			cands = append(cands, &rerank.Candidate{Node: n, TextRank: i, VectorRank: -1})
@@ -476,12 +481,16 @@ func (e *Engine) SearchSymbolsScoped(query string, limit int, opts QueryOptions)
 // (Ladybug) that collapses 60+ cgo Cypher round-trips per query
 // into one — the dominant cost on the search hot path before this
 // changed.
-func (e *Engine) gatherBackendCandidates(query string, limit int) []*rerank.Candidate {
+func (e *Engine) gatherBackendCandidates(query string, limit int, timings *SearchTimings) []*rerank.Candidate {
 	backend := e.getSearch()
 
 	// Pull text + vector channels separately when the backend exposes
 	// them (HybridBackend). Otherwise treat plain Search() output as
-	// text-only.
+	// text-only. The wall-clock for the backend search call lands on
+	// the outer caller's BM25*MS bucket — measuring around the engine
+	// boundary captures the full per-call cost without double-counting
+	// against the post-call GetNodesByIDs / FindNodesByName / Fallback
+	// phases that this function instruments individually below.
 	var (
 		textResults []search.SearchResult
 		vectorIDs   []string
@@ -507,7 +516,11 @@ func (e *Engine) gatherBackendCandidates(query string, limit int) []*rerank.Cand
 			idBatch = append(idBatch, id)
 		}
 	}
+	getNodesStart := time.Now()
 	nodeByID := e.g.GetNodesByIDs(idBatch)
+	if timings != nil {
+		timings.GetNodesMS += time.Since(getNodesStart).Milliseconds()
+	}
 
 	idx := make(map[string]int) // node ID → slice index for dedup
 	cands := make([]*rerank.Candidate, 0, len(textResults)+len(vectorIDs))
@@ -552,6 +565,7 @@ func (e *Engine) gatherBackendCandidates(query string, limit int) []*rerank.Cand
 
 	// Exact-name matches that BM25 might rank low — splice them in at
 	// the tail of the text channel so they're still text-ranked.
+	findNameStart := time.Now()
 	for _, n := range e.g.FindNodesByName(query) {
 		if n.Kind == graph.KindFile || n.Kind == graph.KindImport {
 			continue
@@ -562,6 +576,9 @@ func (e *Engine) gatherBackendCandidates(query string, limit int) []*rerank.Cand
 		idx[n.ID] = len(cands)
 		cands = append(cands, &rerank.Candidate{Node: n, TextRank: len(textResults), VectorRank: -1})
 	}
+	if timings != nil {
+		timings.FindNameMS += time.Since(findNameStart).Milliseconds()
+	}
 
 	// Substring fallback for remaining slots — strictly TextRank=-1
 	// (the rerank pipeline still considers them via signature/recency
@@ -569,6 +586,7 @@ func (e *Engine) gatherBackendCandidates(query string, limit int) []*rerank.Cand
 	// sorted by ID, then truncated, so the candidate set does not
 	// depend on the randomised map-iteration order of AllNodes().
 	if len(cands) < limit {
+		fallbackStart := time.Now()
 		lower := strings.ToLower(query)
 		var subMatches []*graph.Node
 		for _, n := range e.g.AllNodes() {
@@ -589,6 +607,9 @@ func (e *Engine) gatherBackendCandidates(query string, limit int) []*rerank.Cand
 			if len(cands) >= limit {
 				break
 			}
+		}
+		if timings != nil {
+			timings.FallbackMS += time.Since(fallbackStart).Milliseconds()
 		}
 	}
 

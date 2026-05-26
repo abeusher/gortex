@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"strings"
+	"time"
 
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
 
@@ -161,8 +162,21 @@ func expandSearchTerms(ctx context.Context, s *Server, query string) []string {
 // merging; useful for diagnostic / debug surfaces that want to show
 // how many candidates expansion contributed.
 func fetchAndMergeBM25(eng *query.Engine, original string, expanded []string, fetchLimit int, scope query.QueryOptions) (merged []*graph.Node, primaryCount int) {
+	return fetchAndMergeBM25Timed(eng, original, expanded, fetchLimit, scope, nil)
+}
+
+// fetchAndMergeBM25Timed is fetchAndMergeBM25 with per-phase wall-clock
+// breakdowns. The MCP handler hands a fresh SearchTimings struct so
+// the resulting Debug log line attributes BM25 time honestly across
+// the primary call and the per-term expansion calls. Pass nil to skip
+// instrumentation (e.g. unit tests that don't care).
+func fetchAndMergeBM25Timed(eng *query.Engine, original string, expanded []string, fetchLimit int, scope query.QueryOptions, timings *query.SearchTimings) (merged []*graph.Node, primaryCount int) {
+	primaryStart := time.Now()
 	primary := eng.SearchSymbolsScoped(original, fetchLimit, scope)
 	primaryCount = len(primary)
+	if timings != nil {
+		timings.BM25PrimaryMS += time.Since(primaryStart).Milliseconds()
+	}
 	if len(expanded) == 0 {
 		return primary, primaryCount
 	}
@@ -180,7 +194,11 @@ func fetchAndMergeBM25(eng *query.Engine, original string, expanded []string, fe
 		if term == "" {
 			continue
 		}
+		expansionStart := time.Now()
 		extra := eng.SearchSymbolsScoped(term, fetchLimit, scope)
+		if timings != nil {
+			timings.BM25ExpansionMS += time.Since(expansionStart).Milliseconds()
+		}
 		for _, n := range extra {
 			if seen[n.ID] {
 				continue

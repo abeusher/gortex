@@ -60,6 +60,27 @@ type QueryOptions struct {
 	// indexer's test-edge pass. Lets find_usages / get_callers answer
 	// "who depends on X *in production*" without test-noise dilution.
 	ExcludeTests bool `json:"exclude_tests,omitempty"`
+
+	// SearchTimings, when non-nil, is populated by the search hot path
+	// (SearchSymbolsScoped → gatherBackendCandidates) with per-phase
+	// wall-clock breakdowns. Used by the MCP search_symbols handler's
+	// debug log line; nil disables instrumentation. Single-call: the
+	// caller MUST hand a fresh struct per query (the engine does not
+	// reset). Never serialised — `json:"-"` keeps the option struct
+	// JSON shape stable.
+	SearchTimings *SearchTimings `json:"-"`
+}
+
+// SearchTimings carries per-phase wall-clock measurements collected
+// by the BM25 retrieval pipeline. Zero-valued fields mean the phase
+// didn't run on this call (e.g. FallbackMS is 0 when the BM25 result
+// already saturated the limit).
+type SearchTimings struct {
+	BM25PrimaryMS    int64 // time spent in the primary BM25 backend call
+	BM25ExpansionMS  int64 // time spent across all expansion-term BM25 calls
+	GetNodesMS       int64 // time spent materialising BM25/vector IDs via GetNodesByIDs
+	FindNameMS       int64 // time spent on the FindNodesByName splice-in
+	FallbackMS       int64 // time spent in the substring/name-contains fallback
 }
 
 // ScopeAllows reports whether a node passes the workspace/project

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	toon "github.com/toon-format/toon-go"
@@ -1103,7 +1104,15 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 		projectArg = fq.Project
 	}
 	scopeWS, scopeProj := s.resolveQueryScope(ctx, workspaceArg, projectArg)
-	scope := query.QueryOptions{WorkspaceID: scopeWS, ProjectID: scopeProj}
+	// Per-phase timing for the search hot path. The struct is populated
+	// across the engine boundary (BM25 backend call wall-clock attributes
+	// to BM25*MS in fetchAndMergeBM25Timed; GetNodes / FindName / Fallback
+	// land here from inside Engine.gatherBackendCandidates) and surfaced
+	// at the end as a single debug log line. Nil-safe: callers without
+	// debug logging pay zero overhead.
+	timings := &query.SearchTimings{}
+	phaseStart := time.Now()
+	scope := query.QueryOptions{WorkspaceID: scopeWS, ProjectID: scopeProj, SearchTimings: timings}
 
 	// Keyword-soup defense: a degenerate boolean / OR-list query
 	// ("A OR B OR 'no access'") defeats ordinary retrieval. Detect it
@@ -1165,11 +1174,14 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	var nodes []*graph.Node
 	var primaryCount int
 	if len(expandedTerms) > 0 {
-		nodes, primaryCount = fetchAndMergeBM25(s.engineFor(ctx), q, expandedTerms, fetchLimit, scope)
+		nodes, primaryCount = fetchAndMergeBM25Timed(s.engineFor(ctx), q, expandedTerms, fetchLimit, scope, timings)
 	} else {
+		bm25Start := time.Now()
 		nodes = s.engineFor(ctx).SearchSymbolsScoped(q, fetchLimit, scope)
+		timings.BM25PrimaryMS += time.Since(bm25Start).Milliseconds()
 		primaryCount = len(nodes)
 	}
+	candsAfterGather := len(nodes)
 	mergedCount := len(nodes) // pre-filter; comparable to primaryCount
 
 	// Apply repo/project/ref filter.
@@ -1274,13 +1286,17 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 		queryClass = rerank.QueryClassKeywordSoup
 	}
 	rctx.QueryClass = queryClass
+	candsAfterFilter := len(nodes)
 	var rerankBreakdown []*rerank.Candidate
-	nodes = applyRerankBoosts(s, nodes, q, rctx, &rerankBreakdown)
+	var rerankPrepare, rerankSignals time.Duration
+	nodes, rerankPrepare, rerankSignals = applyRerankBoostsTimed(s, nodes, q, rctx, &rerankBreakdown)
 
 	// Per-file diversification: keep one file's many symbols from
 	// monopolising the head of the result set. Runs after the rerank
 	// so demotion acts on final scores; nothing is dropped.
+	diversifyStart := time.Now()
 	nodes, rerankBreakdown = diversifyByFile(nodes, rerankBreakdown, req.GetInt("max_per_file", defaultMaxPerFile))
+	diversifyMS := time.Since(diversifyStart).Milliseconds()
 
 	// Remember the returned IDs for attribution on later consume calls.
 	// Cap at top limit so unseen "overflow" results don't get credited.
@@ -1392,6 +1408,44 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 		}
 		resp["rerank"] = encodeRerankBreakdown(pageBreakdown, s.engineFor(ctx).Rerank())
 	}
+
+	// Per-phase Debug log line — single zap.Debug call carrying every
+	// timing field for this search_symbols invocation. The bench harness
+	// greps for the "search_symbols phases" message at --log-level
+	// debug; production runs at info level pay nothing. Tracked phases:
+	// BM25 primary / expansion calls (wall-clock around the engine),
+	// the inner GetNodesByIDs / FindNodesByName / Fallback hops (from
+	// the engine), rerank prepare (batched edge fetch) and signals
+	// (in-process scoring), diversify, and the candidate counts at
+	// gather → filter → final.
+	if s.logger != nil {
+		totalMS := time.Since(phaseStart).Milliseconds()
+		// "BM25 backend" cost = the BM25 wall-clock minus the inner
+		// phases the engine also accumulated under that call. Negative
+		// values are clamped to 0 (clock granularity / contention).
+		bm25Backend := timings.BM25PrimaryMS + timings.BM25ExpansionMS - timings.GetNodesMS - timings.FindNameMS - timings.FallbackMS
+		if bm25Backend < 0 {
+			bm25Backend = 0
+		}
+		s.logger.Debug("search_symbols phases",
+			zap.String("query", q),
+			zap.Int("expansion_terms", len(expandedTerms)),
+			zap.Int64("bm25_primary_ms", timings.BM25PrimaryMS),
+			zap.Int64("bm25_expansion_ms", timings.BM25ExpansionMS),
+			zap.Int64("bm25_backend_ms", bm25Backend),
+			zap.Int64("get_nodes_ms", timings.GetNodesMS),
+			zap.Int64("find_name_ms", timings.FindNameMS),
+			zap.Int64("fallback_ms", timings.FallbackMS),
+			zap.Duration("rerank_prepare_ms", rerankPrepare),
+			zap.Duration("rerank_signals_ms", rerankSignals),
+			zap.Int64("diversify_ms", diversifyMS),
+			zap.Int64("total_ms", totalMS),
+			zap.Int("cands_after_gather", candsAfterGather),
+			zap.Int("cands_after_filter", candsAfterFilter),
+			zap.Int("cands_final", len(nodes)),
+		)
+	}
+
 	return s.respondJSONOrTOON(ctx, req, resp)
 }
 

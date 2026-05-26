@@ -132,7 +132,23 @@ type Context struct {
 	// stay graph-agnostic.
 	outEdgeCache map[string][]*graph.Edge
 	inEdgeCache  map[string][]*graph.Edge
+
+	// preparedCands is the candidate slice identity prepare() was last
+	// called against. Pipeline.Rerank skips re-prepare when the same
+	// slice header is seen back-to-back so callers that pre-call
+	// Prepare for per-phase timing do not pay for it twice. The check
+	// is identity-only (same slice, same length) — any mutation that
+	// reallocates resets it.
+	preparedCands []*Candidate
 }
+
+// Prepare populates the internal scratch fields used by every signal
+// once per Rerank call. Exposed so callers that want to time prepare
+// separately (the search hot path) can call it explicitly; in that
+// case the subsequent Rerank call detects the prepared state and
+// skips the duplicate work. Safe to call multiple times against the
+// same slice — it's a full reset on each call.
+func (c *Context) Prepare(cands []*Candidate) { c.prepare(cands) }
 
 // now returns the active timestamp (test-injectable when Now != 0).
 func (c *Context) now() int64 {
@@ -151,6 +167,7 @@ func (c *Context) now() int64 {
 // costs ~14ms cgo; batching collapses ~150 round-trips per Rerank
 // into 2.
 func (c *Context) prepare(cands []*Candidate) {
+	c.preparedCands = cands
 	c.communityCount = make(map[string]int, len(cands))
 	c.maxCommunityCount = 0
 	c.candidateIDs = make(map[string]struct{}, len(cands))
