@@ -72,16 +72,23 @@ func BuildWakeup(g graph.Store, communities *analysis.CommunityResult, opts Wake
 		opts.TopEntryPoints = 5
 	}
 
-	nodes := g.AllNodes()
+	// Wakeup is a whole-repo digest — language tally + hotspot list +
+	// entry-point list, with no session scoping. The lang count can
+	// come from Stats() (one indexed groupby on disk backends);
+	// hotspots and entry points already iterate the function/method
+	// subset via the analyzers / NodesByKindsScanner path, so the
+	// AllNodes() pull the legacy build used to feed the lang summary
+	// just adds a redundant 107k-row cgo trip on Ladybug.
+	stats := g.Stats()
 	var b strings.Builder
 	b.WriteString("# Codebase wakeup\n\n")
 
-	// Summary line: total nodes, top 3 languages.
 	langCounts := map[string]int{}
-	for _, n := range nodes {
-		if n.Language != "" {
-			langCounts[n.Language]++
+	for lang, c := range stats.ByLanguage {
+		if lang == "" {
+			continue
 		}
+		langCounts[lang] = c
 	}
 	type langRow struct {
 		name  string
@@ -105,8 +112,9 @@ func BuildWakeup(g graph.Store, communities *analysis.CommunityResult, opts Wake
 	for _, l := range topLangs {
 		langSummary = append(langSummary, fmt.Sprintf("%s (%d)", l.name, l.count))
 	}
+	fileCount := stats.ByKind[string(graph.KindFile)]
 	fmt.Fprintf(&b, "**Scale.** %d indexed symbols across %d files. Primary: %s.\n\n",
-		len(nodes), countFileNodes(nodes), strings.Join(langSummary, ", "))
+		stats.TotalNodes, fileCount, strings.Join(langSummary, ", "))
 
 	// Communities.
 	if communities != nil && len(communities.Communities) > 0 {
@@ -144,7 +152,7 @@ func BuildWakeup(g graph.Store, communities *analysis.CommunityResult, opts Wake
 	}
 
 	// Entry points.
-	entries := wakeupEntryPoints(nodes, g, opts.TopEntryPoints)
+	entries := wakeupEntryPoints(g, opts.TopEntryPoints)
 	if len(entries) > 0 {
 		b.WriteString("**Entry points.**\n")
 		for _, e := range entries {
@@ -158,15 +166,6 @@ func BuildWakeup(g graph.Store, communities *analysis.CommunityResult, opts Wake
 	return out, len(out) / 4
 }
 
-func countFileNodes(nodes []*graph.Node) int {
-	n := 0
-	for _, x := range nodes {
-		if x.Kind == graph.KindFile {
-			n++
-		}
-	}
-	return n
-}
 
 // wakeupEntryPoints returns functions/methods with zero incoming
 // edges and at least one outgoing edge, ranked by out-degree.
@@ -177,18 +176,25 @@ func countFileNodes(nodes []*graph.Node) int {
 // twice per candidate, the worst single hot spot in this file). We
 // stash the fan-out alongside each node so the sort never has to
 // re-query.
-func wakeupEntryPoints(nodes []*graph.Node, g graph.Store, top int) []*graph.Node {
+func wakeupEntryPoints(g graph.Store, top int) []*graph.Node {
 	type entry struct {
 		node   *graph.Node
 		fanOut int
 	}
-	// Pre-filter on kind Go-side first — the input slice is in-memory.
-	pool := make([]*graph.Node, 0, len(nodes))
-	for _, n := range nodes {
-		if n.Kind != graph.KindFunction && n.Kind != graph.KindMethod {
-			continue
+	// Pull only the callable subset via NodesByKindsScanner so disk
+	// backends never materialise the whole node table for an entry-
+	// point candidate set that only ranges across function + method.
+	var pool []*graph.Node
+	if scan, ok := g.(graph.NodesByKindsScanner); ok {
+		pool = scan.NodesByKinds([]graph.NodeKind{graph.KindFunction, graph.KindMethod})
+	} else {
+		all := g.AllNodes()
+		pool = make([]*graph.Node, 0, len(all))
+		for _, n := range all {
+			if n.Kind == graph.KindFunction || n.Kind == graph.KindMethod {
+				pool = append(pool, n)
+			}
 		}
-		pool = append(pool, n)
 	}
 	entries := make([]entry, 0, len(pool))
 	if agg, ok := g.(graph.NodeDegreeAggregator); ok && len(pool) > 0 {
