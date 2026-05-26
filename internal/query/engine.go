@@ -456,6 +456,16 @@ func (e *Engine) SearchSymbolsRanked(query string, limit int, opts QueryOptions,
 			ctx = &rerank.Context{}
 		}
 		ctx.Graph = e.g
+		// When the caller supplied opts.RerankContext (the bundle-
+		// seeding handler), inherit its cached edges so this per-call
+		// rerank's prepare can read them — saves the 2 batched edge
+		// fetches per BM25 fan-out on the bundle hot path. Session
+		// signals stay scoped to the OUTER rerank (the one the handler
+		// runs against the merged candidate set); the inner rerank
+		// gets a structural-only context plus the bundle-cached edges.
+		if rctx == nil && opts.RerankContext != nil {
+			ctx.InheritEdgeCacheFrom(opts.RerankContext)
+		}
 		rerankStart := time.Now()
 		e.rerank.Rerank(query, cands, ctx)
 		if opts.SearchTimings != nil {

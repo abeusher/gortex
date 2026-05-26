@@ -206,6 +206,23 @@ func (c *Context) SeedEdgeCaches(inEdges, outEdges map[string][]*graph.Edge, pre
 // in its debug log without grepping internal state.
 func (c *Context) CachePreSeeded() bool { return c.cachePreSeeded }
 
+// InheritEdgeCacheFrom shares the source context's edge caches +
+// cachePreSeeded flag onto c. Used by the engine to give per-call
+// inner reranks access to the handler-built bundle cache without
+// inheriting the handler's session-aware signals (locality, combo,
+// frecency, feedback). Cheap pointer-copy of the map references; the
+// inner rerank's prepare() reads through them and any backfills it
+// triggers land in the SHARED map so subsequent calls benefit. Pass
+// nil to clear.
+func (c *Context) InheritEdgeCacheFrom(src *Context) {
+	if c == nil || src == nil {
+		return
+	}
+	c.outEdgeCache = src.outEdgeCache
+	c.inEdgeCache = src.inEdgeCache
+	c.cachePreSeeded = src.cachePreSeeded
+}
+
 // EdgeCacheHitRate reports the fraction of nodeIDs that have an entry
 // in the in OR out edge cache. 0.0 when the caches are empty; 1.0 when
 // every input id has a cache entry on both sides. Used by the
