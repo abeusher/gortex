@@ -2060,7 +2060,12 @@ func (s *Server) handleFindHotspots(ctx context.Context, req mcp.CallToolRequest
 		threshold = v
 	}
 
-	entries := analysis.FindHotspots(s.graph, s.getCommunities(), threshold)
+	var entries []analysis.HotspotEntry
+	if threshold == 0 {
+		entries = s.getHotspots()
+	} else {
+		entries = analysis.FindHotspots(s.graph, s.getCommunities(), threshold)
+	}
 
 	// K17: optional novelty / directional reranking modes. Default
 	// "complexity" preserves the legacy ranking.

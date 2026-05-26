@@ -118,6 +118,13 @@ type Server struct {
 	// of the whole graph. nil until the first clusters request;
 	// guarded by analysisMu.
 	leidenCache *analysis.LeidenPartitionCache
+	// hotspots is the default-threshold (mean + 2*stddev) hotspot
+	// ranking. FindHotspots' inner ComputeBetweenness pass dominates
+	// the wall clock of get_repo_outline / get_architecture /
+	// gortex_wakeup / the analyze(hotspots) resource — caching it
+	// once per RunAnalysis turn turns repeat calls into a map lookup.
+	// Rebuilt each RunAnalysis pass; guarded by analysisMu.
+	hotspots []analysis.HotspotEntry
 	analysisMu  sync.RWMutex
 
 	// cochange caches the git-history co-change graph. cochangeByFile
@@ -1471,6 +1478,10 @@ func (s *Server) RunAnalysis() {
 	// HITS authority/hub scores -- fed into the search rerank as an
 	// authority signal that complements raw fan-in.
 	s.hits = analysis.ComputeHITS(s.graph)
+	// Default-threshold hotspot ranking — cached because FindHotspots
+	// triggers ComputeBetweenness which is the shared wall-clock
+	// floor for outline / architecture / wakeup / the resource view.
+	s.hotspots = analysis.FindHotspots(s.graph, communities, 0)
 	s.analysisMu.Unlock()
 
 	// Bootstrap-resource payloads (graph_stats, index_health, etc.)
@@ -1533,6 +1544,17 @@ func (s *Server) getHITS() *analysis.HITSResult {
 	s.analysisMu.RLock()
 	defer s.analysisMu.RUnlock()
 	return s.hits
+}
+
+// getHotspots returns the default-threshold hotspot ranking computed
+// by the most recent RunAnalysis pass. Nil/empty until the first
+// pass; callers use the live FindHotspots(threshold) path when they
+// need a non-default threshold. Returned slice is shared and must
+// not be mutated by the caller.
+func (s *Server) getHotspots() []analysis.HotspotEntry {
+	s.analysisMu.RLock()
+	defer s.analysisMu.RUnlock()
+	return s.hotspots
 }
 
 // SetArchitecture installs the declarative architecture-rules DSL so

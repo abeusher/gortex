@@ -92,7 +92,7 @@ func (s *Server) handleGetArchitecture(ctx context.Context, req mcp.CallToolRequ
 	communitiesSection := architectureCommunities(s.getCommunities(), inScope, topCommunities)
 
 	// 3. Hotspots — load-bearing symbols, scoped + capped.
-	hotspots := architectureHotspots(s.graph, s.getCommunities(), inScope, topHotspots)
+	hotspots := architectureHotspots(s.getHotspots(), inScope, topHotspots)
 
 	// 4. Entry points — functions with zero in-edges that have
 	// out-edges (called by no one, calls into the system). Sorted
@@ -305,9 +305,9 @@ func architectureCommunities(cr *analysis.CommunityResult, inScope map[string]bo
 	return out
 }
 
-func architectureHotspots(g graph.Store, cr *analysis.CommunityResult, inScope map[string]bool, top int) []map[string]any {
+func architectureHotspots(hotspots []analysis.HotspotEntry, inScope map[string]bool, top int) []map[string]any {
 	out := []map[string]any{}
-	for _, h := range analysis.FindHotspots(g, cr, 0) {
+	for _, h := range hotspots {
 		if len(out) >= top {
 			break
 		}

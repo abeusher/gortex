@@ -153,7 +153,7 @@ func (s *Server) handleGetRepoOutline(ctx context.Context, req mcp.CallToolReque
 	// threshold to ensure we get the top N regardless of repo size.
 	// Post-filtered to the session's workspace.
 	hotspotsSection := []map[string]any{}
-	hs := analysis.FindHotspots(s.graph, s.getCommunities(), 0)
+	hs := s.getHotspots()
 	for _, h := range hs {
 		if len(hotspotsSection) >= topHotspotsN {
 			break

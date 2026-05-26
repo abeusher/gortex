@@ -41,6 +41,13 @@ type WakeupOptions struct {
 	TopCommunities int
 	TopHotspots    int
 	TopEntryPoints int
+	// PrecomputedHotspots, when non-nil, is the default-threshold
+	// hotspot ranking the caller has already paid for. Threaded by
+	// the MCP handler from the server-wide cache so the wakeup turn
+	// skips a redundant FindHotspots (and its ComputeBetweenness
+	// pass). nil means BuildWakeup computes it fresh — the CLI
+	// `gortex wakeup` path.
+	PrecomputedHotspots []analysis.HotspotEntry
 }
 
 // DefaultWakeupOptions returns the defaults the MCP handler uses.
@@ -139,7 +146,12 @@ func BuildWakeup(g graph.Store, communities *analysis.CommunityResult, opts Wake
 	}
 
 	// Hotspots.
-	hotspots := analysis.FindHotspots(g, communities, 0)
+	var hotspots []analysis.HotspotEntry
+	if opts.PrecomputedHotspots != nil {
+		hotspots = opts.PrecomputedHotspots
+	} else {
+		hotspots = analysis.FindHotspots(g, communities, 0)
+	}
 	if len(hotspots) > opts.TopHotspots {
 		hotspots = hotspots[:opts.TopHotspots]
 	}
@@ -272,6 +284,7 @@ func (s *Server) handleGortexWakeup(ctx context.Context, req mcp.CallToolRequest
 		opts.TopEntryPoints = v
 	}
 
+	opts.PrecomputedHotspots = s.getHotspots()
 	md, est := BuildWakeup(s.graph, s.getCommunities(), opts)
 
 	format := strings.ToLower(strings.TrimSpace(req.GetString("format", "markdown")))
