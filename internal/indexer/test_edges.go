@@ -40,11 +40,15 @@ func markTestSymbolsAndEmitEdges(g graph.Store) (markedTests int, edgesEmitted i
 	g.ResolveMutex().Lock()
 	defer g.ResolveMutex().Unlock()
 
-	// Pass 1: classify file nodes, then function/method nodes.
-	testFiles := map[string]bool{}          // file node ID → is test file
-	fileRunners := map[string]string{}      // file FilePath → test runner
-	for _, n := range g.AllNodes() {
-		if n == nil || n.Kind != graph.KindFile {
+	// Pass 1: classify file nodes, then function/method nodes. Build
+	// a local testNodes set keyed by node id so Pass 2 can probe it
+	// without re-walking the Meta. (Node.Meta mutations on returned
+	// nodes don't persist back to disk backends, so a later GetNode
+	// in Pass 2 wouldn't see the is_test flag we set here.)
+	testFiles := map[string]bool{}     // file node ID → is test file
+	fileRunners := map[string]string{} // file FilePath → test runner
+	for n := range g.NodesByKind(graph.KindFile) {
+		if n == nil {
 			continue
 		}
 		if IsTestFile(n.FilePath) {
@@ -60,22 +64,10 @@ func markTestSymbolsAndEmitEdges(g graph.Store) (markedTests int, edgesEmitted i
 		}
 	}
 
-	for _, n := range g.AllNodes() {
-		if n == nil {
-			continue
-		}
-		if n.Kind != graph.KindFunction && n.Kind != graph.KindMethod {
-			continue
-		}
-		// Test-file membership is the authoritative signal. No standard
-		// runner (go test, pytest, ...) picks up a test by name outside
-		// a test file, so a production function that merely starts with
-		// "Test"/"Benchmark" (e.g. TestRole) must not be flagged. The
-		// name convention only refines the *role* — benchmark / fuzz /
-		// example — for symbols already inside a test file; anything
-		// else there is test support code: role "test".
+	testNodes := map[string]bool{}
+	stampTestSymbol := func(n *graph.Node) {
 		if !testFiles[n.FilePath] {
-			continue
+			return
 		}
 		role := TestRole(n.Name, n.Language)
 		if role == "" {
@@ -89,31 +81,49 @@ func markTestSymbolsAndEmitEdges(g graph.Store) (markedTests int, edgesEmitted i
 		if runner := fileRunners[n.FilePath]; runner != "" {
 			n.Meta["test_runner"] = runner
 		}
+		testNodes[n.ID] = true
 		markedTests++
+	}
+	for n := range g.NodesByKind(graph.KindFunction) {
+		if n != nil {
+			// Test-file membership is the authoritative signal. No
+			// standard runner (go test, pytest, ...) picks up a test
+			// by name outside a test file, so a production function
+			// that merely starts with "Test"/"Benchmark" (e.g.
+			// TestRole) must not be flagged. The name convention only
+			// refines the *role* — benchmark / fuzz / example — for
+			// symbols already inside a test file; anything else there
+			// is test support code: role "test".
+			stampTestSymbol(n)
+		}
+	}
+	for n := range g.NodesByKind(graph.KindMethod) {
+		if n != nil {
+			stampTestSymbol(n)
+		}
 	}
 
 	// Pass 2: walk EdgeCalls; for each (test, non-test) pair, emit a
 	// parallel EdgeTests. We dedupe per (From, To) because a single
-	// test can call the same subject multiple times.
+	// test can call the same subject multiple times. The testNodes set
+	// built in Pass 1 is the authoritative source — no inline GetNode
+	// is needed because the From / To kind filter is already enforced
+	// by "From must be a test symbol" (only function/method ids land
+	// in testNodes).
 	seen := map[string]bool{}
 	type pair struct{ from, to string }
 	var pending []struct {
 		pair pair
 		edge *graph.Edge
 	}
-	for _, e := range g.AllEdges() {
-		if e == nil || e.Kind != graph.EdgeCalls {
+	for e := range g.EdgesByKind(graph.EdgeCalls) {
+		if e == nil {
 			continue
 		}
-		fromNode := g.GetNode(e.From)
-		toNode := g.GetNode(e.To)
-		if fromNode == nil || toNode == nil {
+		if !testNodes[e.From] {
 			continue
 		}
-		if !isTestNode(fromNode) {
-			continue
-		}
-		if isTestNode(toNode) {
+		if testNodes[e.To] {
 			continue // test → test calls are infrastructure, not subject coverage
 		}
 		key := e.From + "\x00" + e.To
