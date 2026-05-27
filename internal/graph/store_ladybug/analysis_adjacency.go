@@ -6,11 +6,14 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 )
 
-// Compile-time assertion: *Store satisfies the adjacency-shaped
-// pushdown capability for the betweenness adjacency build. A drift
-// in the signature fails the build here instead of silently dropping
+// Compile-time assertions: *Store satisfies the adjacency-shaped
+// pushdown capabilities for the betweenness + hotspots wave. A drift
+// in any signature fails the build here instead of silently dropping
 // to the Go-loop fallback.
-var _ graph.EdgeAdjacencyForKinds = (*Store)(nil)
+var (
+	_ graph.EdgeAdjacencyForKinds    = (*Store)(nil)
+	_ graph.CommunityCrossingsByKind = (*Store)(nil)
+)
 
 // EdgeAdjacencyForKinds returns (from, to) id pairs for every edge
 // whose Kind is in edgeKinds AND whose endpoints both have a Kind in
@@ -59,6 +62,56 @@ RETURN a.id, b.id`
 			}
 		}
 	}
+}
+
+// CommunityCrossingsByKind ships only the (from, to) projection of
+// edges whose Kind is in the supplied set and lets the Go side do
+// the community comparison. Community membership is not a Node
+// column — it's computed at runtime by the analyzer — so the
+// comparison can't live in Cypher today. The win is the column
+// projection: where FindHotspots.countCrossings used to pull the
+// full edge row (~10 columns) twice (once per kind) over cgo, this
+// single call returns 2 columns from one IN-list join.
+//
+// Zero-count sources are dropped so callers can probe existence
+// without a >0 check.
+func (s *Store) CommunityCrossingsByKind(kinds []graph.EdgeKind, nodeToComm map[string]string) map[string]int {
+	if len(kinds) == 0 || len(nodeToComm) == 0 {
+		return nil
+	}
+	allowed := edgeKindSliceToAny(dedupeEdgeKinds(kinds))
+	if len(allowed) == 0 {
+		return nil
+	}
+	const q = `
+MATCH (a:Node)-[e:Edge]->(b:Node)
+WHERE e.kind IN $kinds
+RETURN a.id, b.id`
+	rows := s.querySelect(q, map[string]any{"kinds": allowed})
+	if len(rows) == 0 {
+		return nil
+	}
+	out := make(map[string]int)
+	for _, r := range rows {
+		if len(r) < 2 {
+			continue
+		}
+		from, _ := r[0].(string)
+		to, _ := r[1].(string)
+		if from == "" || to == "" {
+			continue
+		}
+		fc := nodeToComm[from]
+		tc := nodeToComm[to]
+		if fc == "" || tc == "" || fc == tc {
+			continue
+		}
+		out[from]++
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // dedupeNodeKinds is the node-kind counterpart of dedupeEdgeKinds —

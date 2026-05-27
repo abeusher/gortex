@@ -970,6 +970,31 @@ type EdgeAdjacencyForKinds interface {
 	EdgeAdjacencyForKinds(edgeKinds []EdgeKind, nodeKinds []NodeKind) iter.Seq[[2]string]
 }
 
+// CommunityCrossingsByKind is an optional capability backends MAY
+// implement to return per-source crossing counts for edges whose
+// Kind is in the supplied set, given a node→community membership
+// map. A "crossing" is an edge whose source community differs from
+// its target community; the count is keyed by source id.
+//
+// Replaces the FindHotspots.countCrossings loop that today iterates
+// EdgesByKind twice and tallies per-source Go-side: on the gortex
+// workspace the two EdgesByKind passes materialised the full call /
+// reference bucket over cgo (~286k rows × ~10 columns) just to
+// derive a thousand-row aggregate. The capability ships only the
+// (from, to) projection — the community comparison runs Go-side
+// because the community map isn't a Node column today.
+//
+// Empty kinds or an empty community map returns nil. The map keys
+// in the result MUST be source ids whose count is non-zero —
+// implementations MUST drop zero-count rows so callers can probe
+// existence without a >0 check.
+//
+// Optional capability — analyzers fall back to EdgesByKind iteration
+// when the backend doesn't implement it.
+type CommunityCrossingsByKind interface {
+	CommunityCrossingsByKind(kinds []EdgeKind, nodeToComm map[string]string) map[string]int
+}
+
 // EdgeKindCounter is an optional capability backends MAY implement
 // to return one row per distinct edge kind with its occurrence
 // count, server-side. Used by handleGetSurprisingConnections to

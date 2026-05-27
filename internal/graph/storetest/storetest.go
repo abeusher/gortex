@@ -88,6 +88,7 @@ func RunConformance(t *testing.T, factory Factory) {
 	t.Run("ReachableForwardByKinds", func(t *testing.T) { testReachableForwardByKinds(t, factory) })
 	t.Run("ThrowerErrorSurfacer", func(t *testing.T) { testThrowerErrorSurfacer(t, factory) })
 	t.Run("EdgeAdjacencyForKinds", func(t *testing.T) { testEdgeAdjacencyForKinds(t, factory) })
+	t.Run("CommunityCrossingsByKind", func(t *testing.T) { testCommunityCrossingsByKind(t, factory) })
 }
 
 // -- fixture helpers ---------------------------------------------------
@@ -2541,5 +2542,97 @@ func testEdgeAdjacencyForKinds(t *testing.T, factory Factory) {
 	}
 	if stopped != 1 {
 		t.Fatalf("early stop yielded %d before break, want 1", stopped)
+	}
+}
+
+// testCommunityCrossingsByKind exercises the optional
+// graph.CommunityCrossingsByKind capability. Seeds a small graph
+// with a known community partition and asserts per-source crossing
+// counts match for: no edges, all-same-community, all-cross, mixed.
+func testCommunityCrossingsByKind(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	scan, ok := s.(graph.CommunityCrossingsByKind)
+	if !ok {
+		t.Skip("backend does not implement graph.CommunityCrossingsByKind")
+	}
+
+	s.AddNode(mkNode("A1", "A1", "x.go", graph.KindFunction))
+	s.AddNode(mkNode("A2", "A2", "x.go", graph.KindFunction))
+	s.AddNode(mkNode("B1", "B1", "y.go", graph.KindFunction))
+	s.AddNode(mkNode("B2", "B2", "y.go", graph.KindFunction))
+	s.AddNode(mkNode("C1", "C1", "z.go", graph.KindFunction))
+
+	// A1 → A2 Calls (same community A — NOT a crossing)
+	e1 := mkEdge("A1", "A2", graph.EdgeCalls)
+	e1.Line = 1
+	// A1 → B1 Calls (A→B — crossing)
+	e2 := mkEdge("A1", "B1", graph.EdgeCalls)
+	e2.Line = 2
+	// A1 → C1 References (A→C — crossing, second from A1)
+	e3 := mkEdge("A1", "C1", graph.EdgeReferences)
+	e3.Line = 3
+	// B1 → B2 References (same community B — NOT a crossing)
+	e4 := mkEdge("B1", "B2", graph.EdgeReferences)
+	e4.Line = 4
+	// B2 → C1 Calls (B→C — crossing)
+	e5 := mkEdge("B2", "C1", graph.EdgeCalls)
+	e5.Line = 5
+	// A2 → B2 Writes (different community but edge kind excluded)
+	e6 := mkEdge("A2", "B2", graph.EdgeWrites)
+	e6.Line = 6
+	for _, e := range []*graph.Edge{e1, e2, e3, e4, e5, e6} {
+		s.AddEdge(e)
+	}
+
+	communities := map[string]string{
+		"A1": "A", "A2": "A",
+		"B1": "B", "B2": "B",
+		"C1": "C",
+	}
+	kinds := []graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences}
+
+	got := scan.CommunityCrossingsByKind(kinds, communities)
+	want := map[string]int{
+		"A1": 2, // → B1 + → C1
+		"B2": 1, // → C1
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("CommunityCrossingsByKind(mixed) = %v, want %v", got, want)
+	}
+
+	// All-same-community partition: no crossings at all.
+	same := map[string]string{
+		"A1": "A", "A2": "A", "B1": "A", "B2": "A", "C1": "A",
+	}
+	if r := scan.CommunityCrossingsByKind(kinds, same); len(r) != 0 {
+		t.Fatalf("CommunityCrossingsByKind(all-same) = %v, want empty", r)
+	}
+
+	// All-cross-community partition: every edge in scope is a crossing.
+	allCross := map[string]string{
+		"A1": "1", "A2": "2", "B1": "3", "B2": "4", "C1": "5",
+	}
+	allGot := scan.CommunityCrossingsByKind(kinds, allCross)
+	allWant := map[string]int{
+		"A1": 3, // A1 has 3 in-scope out-edges
+		"B1": 1, // B1 → B2 (now also a crossing)
+		"B2": 1, // B2 → C1
+	}
+	if fmt.Sprint(allGot) != fmt.Sprint(allWant) {
+		t.Fatalf("CommunityCrossingsByKind(all-cross) = %v, want %v", allGot, allWant)
+	}
+
+	// Empty kinds returns nil — never a whole-table scan.
+	if r := scan.CommunityCrossingsByKind(nil, communities); r != nil {
+		t.Fatalf("CommunityCrossingsByKind(nil kinds) = %v, want nil", r)
+	}
+	// Empty community map returns nil.
+	if r := scan.CommunityCrossingsByKind(kinds, nil); r != nil {
+		t.Fatalf("CommunityCrossingsByKind(nil comm) = %v, want nil", r)
+	}
+	// Kind absent from graph yields nil.
+	if r := scan.CommunityCrossingsByKind([]graph.EdgeKind{graph.EdgeKind("nonexistent")}, communities); r != nil {
+		t.Fatalf("CommunityCrossingsByKind(nonexistent) = %v, want nil", r)
 	}
 }

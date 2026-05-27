@@ -1040,6 +1040,50 @@ func (g *Graph) EdgeAdjacencyForKinds(edgeKinds []EdgeKind, nodeKinds []NodeKind
 	}
 }
 
+// CommunityCrossingsByKind is the in-memory reference implementation
+// of the CommunityCrossingsByKind capability. AllEdges scan with the
+// kind-set filter, then a Go-side community comparison per edge —
+// the exact loop FindHotspots.countCrossings ran before this
+// capability existed.
+//
+// Empty kinds or empty nodeToComm returns nil. Zero-count sources
+// never surface (matches the disk contract — callers probe by
+// existence).
+func (g *Graph) CommunityCrossingsByKind(kinds []EdgeKind, nodeToComm map[string]string) map[string]int {
+	if len(kinds) == 0 || len(nodeToComm) == 0 {
+		return nil
+	}
+	set := make(map[EdgeKind]struct{}, len(kinds))
+	for _, k := range kinds {
+		if k == "" {
+			continue
+		}
+		set[k] = struct{}{}
+	}
+	if len(set) == 0 {
+		return nil
+	}
+	out := make(map[string]int)
+	for _, e := range g.AllEdges() {
+		if e == nil {
+			continue
+		}
+		if _, ok := set[e.Kind]; !ok {
+			continue
+		}
+		from := nodeToComm[e.From]
+		to := nodeToComm[e.To]
+		if from == "" || to == "" || from == to {
+			continue
+		}
+		out[e.From]++
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 // EdgeKindCounts is the in-memory reference implementation of the
 // EdgeKindCounter capability. One AllEdges scan with a per-kind
 // tally — the exact loop the get_surprising_connections Go fallback
