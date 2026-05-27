@@ -88,6 +88,14 @@ func ResolveTemporalCalls(g graph.Store) int {
 	idx := buildTemporalIndex(g)
 	resolved := 0
 	var reindexBatch []graph.EdgeReindex
+	// First sweep: collect stub edges and the From IDs we need so the
+	// per-edge GetNode below collapses to one batch lookup.
+	type stubEdge struct {
+		edge       *graph.Edge
+		kind, name string
+	}
+	var stubs []stubEdge
+	fromIDSet := map[string]struct{}{}
 	for e := range g.EdgesByKind(graph.EdgeCalls) {
 		if e == nil || e.Meta == nil {
 			continue
@@ -100,16 +108,28 @@ func ResolveTemporalCalls(g graph.Store) int {
 		if kind == "" || name == "" {
 			continue
 		}
+		stubs = append(stubs, stubEdge{edge: e, kind: kind, name: name})
+		if e.From != "" {
+			fromIDSet[e.From] = struct{}{}
+		}
+	}
+	fromList := make([]string, 0, len(fromIDSet))
+	for id := range fromIDSet {
+		fromList = append(fromList, id)
+	}
+	callerNodes := g.GetNodesByIDs(fromList)
 
+	for _, s := range stubs {
+		e := s.edge
 		callerRepo := ""
-		if from := g.GetNode(e.From); from != nil {
+		if from := callerNodes[e.From]; from != nil {
 			callerRepo = from.RepoPrefix
 		}
-		handlerID, origin, conf := idx.lookup(kind, name, callerRepo)
+		handlerID, origin, conf := idx.lookup(s.kind, s.name, callerRepo)
 
 		want := handlerID
 		if want == "" {
-			want = temporalStubPlaceholder(kind, name)
+			want = temporalStubPlaceholder(s.kind, s.name)
 		}
 		if e.To == want {
 			if handlerID != "" {
@@ -187,6 +207,17 @@ func buildTemporalIndex(g graph.Store) *temporalIndex {
 	// Phase 1 — Go side. Walk `temporal.register` edges and stamp the
 	// registered function's node. The "via" tag lives on EdgeCalls
 	// edges, so narrow with EdgesByKind before the Meta filter.
+	//
+	// Collect every register edge first so we can batch-fetch every
+	// caller node and resolve every Go target name in one pair of
+	// round-trips, instead of N AllNodes scans + N GetNode calls.
+	type goRegister struct {
+		edge       *graph.Edge
+		kind, name string
+	}
+	var goRegisters []goRegister
+	registerCallerIDs := map[string]struct{}{}
+	registerNames := map[string]struct{}{}
 	for e := range g.EdgesByKind(graph.EdgeCalls) {
 		if e == nil || e.Meta == nil {
 			continue
@@ -199,25 +230,45 @@ func buildTemporalIndex(g graph.Store) *temporalIndex {
 		if kind == "" || name == "" {
 			continue
 		}
-		caller := g.GetNode(e.From)
+		goRegisters = append(goRegisters, goRegister{edge: e, kind: kind, name: name})
+		if e.From != "" {
+			registerCallerIDs[e.From] = struct{}{}
+		}
+		registerNames[name] = struct{}{}
+	}
+	callerList := make([]string, 0, len(registerCallerIDs))
+	for id := range registerCallerIDs {
+		callerList = append(callerList, id)
+	}
+	registerCallers := g.GetNodesByIDs(callerList)
+	nameList := make([]string, 0, len(registerNames))
+	for n := range registerNames {
+		nameList = append(nameList, n)
+	}
+	candidatesByName := g.FindNodesByNames(nameList)
+
+	for _, r := range goRegisters {
+		caller := registerCallers[r.edge.From]
 		if caller == nil {
 			continue
 		}
-		target := findGoTemporalTarget(g, caller, name)
+		target := pickGoTemporalTarget(candidatesByName[r.name], caller)
 		if target == nil {
 			continue
 		}
-		stampTemporalRole(target, kind, name)
-		idx.byKindName[kind+"::"+name] = append(idx.byKindName[kind+"::"+name], target)
+		stampTemporalRole(target, r.kind, r.name)
+		idx.byKindName[r.kind+"::"+r.name] = append(idx.byKindName[r.kind+"::"+r.name], target)
 	}
 
 	// Phase 2 — Java side. Walk `EdgeAnnotated` edges to find
-	// temporal-tagged interfaces and methods.
-	type javaIfaceTag struct {
-		ifaceID string
-		role    string // "activity_interface" / "workflow_interface"
+	// temporal-tagged interfaces and methods. As with Phase 1, collect
+	// every annotation edge and batch the From-side GetNode calls.
+	type javaAnno struct {
+		fromID                 string
+		ifaceRole, methodRole  string
 	}
-	var javaIfaces []javaIfaceTag
+	var javaAnnos []javaAnno
+	annoFromIDs := map[string]struct{}{}
 	for e := range g.EdgesByKind(graph.EdgeAnnotated) {
 		if e == nil {
 			continue
@@ -226,21 +277,38 @@ func buildTemporalIndex(g graph.Store) *temporalIndex {
 		if role == "" && methodRole == "" {
 			continue
 		}
-		from := g.GetNode(e.From)
+		javaAnnos = append(javaAnnos, javaAnno{fromID: e.From, ifaceRole: role, methodRole: methodRole})
+		if e.From != "" {
+			annoFromIDs[e.From] = struct{}{}
+		}
+	}
+	annoFromList := make([]string, 0, len(annoFromIDs))
+	for id := range annoFromIDs {
+		annoFromList = append(annoFromList, id)
+	}
+	annoFromNodes := g.GetNodesByIDs(annoFromList)
+
+	type javaIfaceTag struct {
+		ifaceID string
+		role    string // "activity_interface" / "workflow_interface"
+	}
+	var javaIfaces []javaIfaceTag
+	for _, a := range javaAnnos {
+		from := annoFromNodes[a.fromID]
 		if from == nil {
 			continue
 		}
 		// Method-level annotation: stamp directly.
-		if methodRole != "" && (from.Kind == graph.KindMethod || from.Kind == graph.KindFunction) {
-			stampTemporalRole(from, methodRole, from.Name)
-			idx.byKindName[normaliseTemporalKind(methodRole)+"::"+from.Name] = append(
-				idx.byKindName[normaliseTemporalKind(methodRole)+"::"+from.Name], from)
+		if a.methodRole != "" && (from.Kind == graph.KindMethod || from.Kind == graph.KindFunction) {
+			stampTemporalRole(from, a.methodRole, from.Name)
+			idx.byKindName[normaliseTemporalKind(a.methodRole)+"::"+from.Name] = append(
+				idx.byKindName[normaliseTemporalKind(a.methodRole)+"::"+from.Name], from)
 			continue
 		}
 		// Interface-level annotation: queue for the propagation pass.
-		if role != "" && from.Kind == graph.KindInterface {
-			stampTemporalRole(from, role, from.Name)
-			javaIfaces = append(javaIfaces, javaIfaceTag{ifaceID: from.ID, role: role})
+		if a.ifaceRole != "" && from.Kind == graph.KindInterface {
+			stampTemporalRole(from, a.ifaceRole, from.Name)
+			javaIfaces = append(javaIfaces, javaIfaceTag{ifaceID: from.ID, role: a.ifaceRole})
 		}
 	}
 
@@ -248,12 +316,55 @@ func buildTemporalIndex(g graph.Store) *temporalIndex {
 	// methods (flat nodes living in the same file, within the
 	// interface's line range) and stamp them. Then walk EdgeImplements
 	// from each implementor and tag its same-named methods.
+	//
+	// Build a single Java method index up front via NodesByKind, then
+	// project it into the two views the propagation needs:
+	//   - methodsByFile: file path → []*method (used for interface
+	//     methods, which the Java extractor emits as flat
+	//     <file>::<name> nodes whose StartLine sits inside the
+	//     interface's line range).
+	//   - methodsByReceiver: receiver class name → []*method (used for
+	//     impl-class methods, which carry Meta["receiver"]).
+	// One pass beats AllNodes() per interface.
+	javaMethodsByFile, javaMethodsByReceiver := buildJavaMethodViews(g, len(javaIfaces))
+
+	// Prefetch the interface nodes + the implementing-type nodes for
+	// the entire iface set so the propagation loop never issues an
+	// inline GetNode.
+	ifaceIDs := make([]string, 0, len(javaIfaces))
+	for _, t := range javaIfaces {
+		ifaceIDs = append(ifaceIDs, t.ifaceID)
+	}
+	ifaceNodes := g.GetNodesByIDs(ifaceIDs)
+	implTypeIDSet := map[string]struct{}{}
+	implIDsByIface := map[string][]string{}
+	for _, t := range javaIfaces {
+		for _, ie := range g.GetInEdges(t.ifaceID) {
+			if ie == nil || ie.Kind != graph.EdgeImplements {
+				continue
+			}
+			implIDsByIface[t.ifaceID] = append(implIDsByIface[t.ifaceID], ie.From)
+			if ie.From != "" {
+				implTypeIDSet[ie.From] = struct{}{}
+			}
+		}
+	}
+	implTypeIDList := make([]string, 0, len(implTypeIDSet))
+	for id := range implTypeIDSet {
+		implTypeIDList = append(implTypeIDList, id)
+	}
+	implTypeNodes := g.GetNodesByIDs(implTypeIDList)
+
 	for _, t := range javaIfaces {
 		methodRole := "activity"
 		if t.role == "workflow_interface" {
 			methodRole = "workflow"
 		}
-		ifaceMethods := collectJavaInterfaceMethods(g, t.ifaceID)
+		iface := ifaceNodes[t.ifaceID]
+		if iface == nil {
+			continue
+		}
+		ifaceMethods := collectJavaInterfaceMethodsFromIndex(iface, javaMethodsByFile)
 		for _, m := range ifaceMethods {
 			stampTemporalRole(m, methodRole, m.Name)
 			idx.byKindName[methodRole+"::"+m.Name] = append(idx.byKindName[methodRole+"::"+m.Name], m)
@@ -263,15 +374,12 @@ func buildTemporalIndex(g graph.Store) *temporalIndex {
 		for _, m := range ifaceMethods {
 			implMethodNames[m.Name] = struct{}{}
 		}
-		for _, ie := range g.GetInEdges(t.ifaceID) {
-			if ie == nil || ie.Kind != graph.EdgeImplements {
-				continue
-			}
-			implType := g.GetNode(ie.From)
+		for _, implTypeID := range implIDsByIface[t.ifaceID] {
+			implType := implTypeNodes[implTypeID]
 			if implType == nil {
 				continue
 			}
-			for _, m := range methodsOfJavaType(g, implType) {
+			for _, m := range methodsOfJavaTypeFromIndex(implType, javaMethodsByReceiver) {
 				if _, ok := implMethodNames[m.Name]; !ok {
 					continue
 				}
@@ -337,20 +445,25 @@ func stampTemporalRole(n *graph.Node, role, name string) {
 	}
 }
 
-// findGoTemporalTarget locates the Go function or method that a
-// `worker.Register*(F)` call refers to. The register call lives at
-// `caller` (typically `main` or a worker setup function); the function
-// `F` is either declared in the same file or imported. The search
-// order is:
+// pickGoTemporalTarget selects the Go function or method that a
+// `worker.Register*(F)` call refers to from a name-matched candidate
+// set. The register call lives at `caller`; the function `F` is
+// either declared in the same file or imported. The search order is:
 //
 //  1. Same-file function whose name matches.
 //  2. Same-repo function whose name matches.
 //  3. Unique workspace-wide function whose name matches.
 //
-// Returns nil when no unambiguous match exists.
-func findGoTemporalTarget(g graph.Store, caller *graph.Node, name string) *graph.Node {
+// Returns nil when no unambiguous match exists. The candidate list
+// MUST be pre-filtered to Name == registered name (FindNodesByNames
+// already does that); this helper applies the Go-kind and language
+// gates plus the locality tie-break.
+func pickGoTemporalTarget(candidates []*graph.Node, caller *graph.Node) *graph.Node {
+	if caller == nil {
+		return nil
+	}
 	var sameFile, sameRepo, all []*graph.Node
-	for _, n := range g.AllNodes() {
+	for _, n := range candidates {
 		if n == nil {
 			continue
 		}
@@ -358,9 +471,6 @@ func findGoTemporalTarget(g graph.Store, caller *graph.Node, name string) *graph
 			continue
 		}
 		if n.Kind != graph.KindFunction && n.Kind != graph.KindMethod {
-			continue
-		}
-		if n.Name != name {
 			continue
 		}
 		all = append(all, n)
@@ -383,28 +493,47 @@ func findGoTemporalTarget(g graph.Store, caller *graph.Node, name string) *graph
 	return nil
 }
 
-// collectJavaInterfaceMethods returns the interface's method nodes.
-// The Java extractor emits interface methods as flat
-// `<filePath>::<methodName>` nodes (no class-membership edge),
-// distinguished from class methods by the absence of a "receiver"
-// Meta. We narrow to the interface's source-line range so multiple
-// interfaces in one file don't bleed into each other.
-func collectJavaInterfaceMethods(g graph.Store, ifaceID string) []*graph.Node {
-	iface := g.GetNode(ifaceID)
+// buildJavaMethodViews materialises two indexes over every Java
+// method node in the graph: methodsByFile groups nodes whose Meta has
+// NO "receiver" (interface methods, per the Java extractor's
+// convention); methodsByReceiver groups nodes whose Meta carries a
+// non-empty receiver. One NodesByKind scan replaces the N AllNodes()
+// passes the old collectJavaInterfaceMethods + methodsOfJavaType
+// helpers ran inside the per-interface propagation loop.
+//
+// ifaceCount == 0 is a fast no-op; with no tagged interfaces the
+// indexes are unused so we skip the scan.
+func buildJavaMethodViews(g graph.Store, ifaceCount int) (map[string][]*graph.Node, map[string][]*graph.Node) {
+	if ifaceCount == 0 {
+		return nil, nil
+	}
+	methodsByFile := map[string][]*graph.Node{}
+	methodsByReceiver := map[string][]*graph.Node{}
+	for n := range g.NodesByKind(graph.KindMethod) {
+		if n == nil || n.Language != "java" {
+			continue
+		}
+		recv, _ := n.Meta["receiver"].(string)
+		if recv == "" {
+			methodsByFile[n.FilePath] = append(methodsByFile[n.FilePath], n)
+		} else {
+			methodsByReceiver[recv] = append(methodsByReceiver[recv], n)
+		}
+	}
+	return methodsByFile, methodsByReceiver
+}
+
+// collectJavaInterfaceMethodsFromIndex returns the interface's method
+// nodes — flat KindMethod nodes in the interface's file whose
+// StartLine sits inside the interface's line range. Consumes the
+// methodsByFile view built by buildJavaMethodViews so the scan is
+// O(methods in this file) rather than O(every node).
+func collectJavaInterfaceMethodsFromIndex(iface *graph.Node, methodsByFile map[string][]*graph.Node) []*graph.Node {
 	if iface == nil {
 		return nil
 	}
 	var out []*graph.Node
-	for _, n := range g.AllNodes() {
-		if n == nil || n.Kind != graph.KindMethod || n.Language != "java" {
-			continue
-		}
-		if n.FilePath != iface.FilePath {
-			continue
-		}
-		if _, hasReceiver := n.Meta["receiver"]; hasReceiver {
-			continue
-		}
+	for _, n := range methodsByFile[iface.FilePath] {
 		if n.StartLine < iface.StartLine || (iface.EndLine > 0 && n.StartLine > iface.EndLine) {
 			continue
 		}
@@ -413,27 +542,28 @@ func collectJavaInterfaceMethods(g graph.Store, ifaceID string) []*graph.Node {
 	return out
 }
 
-// methodsOfJavaType returns the method nodes of a Java class — i.e.
-// every KindMethod node whose Meta["receiver"] matches the type name.
-// The Java extractor uses the receiver field for class membership.
-func methodsOfJavaType(g graph.Store, t *graph.Node) []*graph.Node {
+// methodsOfJavaTypeFromIndex returns the method nodes whose
+// Meta["receiver"] matches the type's name (or the receiver-suffix
+// shape on the class node's ID). Consumes the methodsByReceiver view
+// built by buildJavaMethodViews so the scan is O(methods of this
+// receiver) rather than O(every node).
+func methodsOfJavaTypeFromIndex(t *graph.Node, methodsByReceiver map[string][]*graph.Node) []*graph.Node {
 	if t == nil {
 		return nil
 	}
-	var out []*graph.Node
-	for _, n := range g.AllNodes() {
-		if n == nil || n.Kind != graph.KindMethod || n.Language != "java" {
+	out := methodsByReceiver[t.Name]
+	// Honour the legacy id-suffix tie-break: a class node's id is
+	// `<filePath>::<ClassName>`; a method whose receiver matches that
+	// trailing component is still a member even when the receiver
+	// Meta carries a fully-qualified name.
+	for recv, candidates := range methodsByReceiver {
+		if recv == t.Name {
 			continue
 		}
-		recv, _ := n.Meta["receiver"].(string)
-		if recv == "" {
+		if !strings.HasSuffix(t.ID, "::"+recv) {
 			continue
 		}
-		// Java method node receiver is the class name; the class node's
-		// ID shape is `<filePath>::<ClassName>` so match by suffix.
-		if recv == t.Name || strings.HasSuffix(t.ID, "::"+recv) {
-			out = append(out, n)
-		}
+		out = append(out, candidates...)
 	}
 	return out
 }
