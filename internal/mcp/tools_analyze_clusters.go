@@ -131,26 +131,48 @@ func (s *Server) handleAnalyzeClusters(ctx context.Context, req mcp.CallToolRequ
 	// previous shape ran (N members × 2 cgo trips). Members from
 	// communities that didn't survive the truncate above never reach
 	// the store.
-	allMemberIDs := make([]string, 0)
+	//
+	// Per-cluster member cap: communities can hold thousands of nodes
+	// each. On Ladybug, fetching tens of thousands of nodes + edges per
+	// call is several seconds of cgo cost — the rendered response only
+	// uses these to compute density / language mix / top files, all of
+	// which converge on a representative sample long before they need
+	// every member. With a default 50-cluster limit and ~200 sampled
+	// members per cluster, the IN-list stays under 10k IDs and the
+	// rendering stays sub-second. The exact `size` field still reflects
+	// the true cluster size because it comes from c.Size, not from the
+	// sampled set.
+	const sampleCap = 200
+	sampleMemberIDs := make([]string, 0, len(survivors)*sampleCap)
+	sampleSets := make([]map[string]bool, 0, len(survivors))
 	for _, p := range survivors {
-		allMemberIDs = append(allMemberIDs, p.c.Members...)
+		members := p.c.Members
+		if len(members) > sampleCap {
+			members = members[:sampleCap]
+		}
+		set := make(map[string]bool, len(members))
+		for _, m := range members {
+			set[m] = true
+		}
+		sampleSets = append(sampleSets, set)
+		sampleMemberIDs = append(sampleMemberIDs, members...)
 	}
-	memberNodes := s.graph.GetNodesByIDs(allMemberIDs)
-	memberOutEdges := s.graph.GetOutEdgesByNodeIDs(allMemberIDs)
+	memberNodes := s.graph.GetNodesByIDs(sampleMemberIDs)
+	memberOutEdges := s.graph.GetOutEdgesByNodeIDs(sampleMemberIDs)
 
 	rows := make([]clusterRow, 0, len(survivors))
-	for _, p := range survivors {
+	for i, p := range survivors {
 		c := p.c
 		row := p.row
+		memberSet := sampleSets[i]
+		sampleSize := len(memberSet)
 
-		// Density requires the intra-cluster edge count, restricted to
-		// the call / reference kinds the clusterer cares about.
-		memberSet := make(map[string]bool, len(c.Members))
-		for _, m := range c.Members {
-			memberSet[m] = true
-		}
+		// Density on the sample, normalised against (sampleSize ·
+		// (sampleSize-1)) to keep the ratio meaningful when only part
+		// of the cluster was inspected. Intra-sample edges restricted
+		// to the call / reference kinds the clusterer cares about.
 		intra := 0
-		for _, m := range c.Members {
+		for m := range memberSet {
 			for _, e := range memberOutEdges[m] {
 				if e.Kind != graph.EdgeCalls && e.Kind != graph.EdgeReferences {
 					continue
@@ -160,13 +182,13 @@ func (s *Server) handleAnalyzeClusters(ctx context.Context, req mcp.CallToolRequ
 				}
 			}
 		}
-		if c.Size > 1 {
-			possible := c.Size * (c.Size - 1)
+		if sampleSize > 1 {
+			possible := sampleSize * (sampleSize - 1)
 			row.Density = roundScore(float64(intra) / float64(possible))
 		}
 
 		fileCounts := map[string]int{}
-		for _, m := range c.Members {
+		for m := range memberSet {
 			n := memberNodes[m]
 			if n == nil {
 				continue

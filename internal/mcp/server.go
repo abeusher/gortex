@@ -1554,7 +1554,29 @@ func (s *Server) incrementalCommunities() (*analysis.CommunityResult, analysis.I
 		if s.leidenCache != nil {
 			stats.TotalPackages = len(s.leidenCache.PackageFingerprints())
 		}
+		if s.logger != nil {
+			s.logger.Debug("incrementalCommunities cache hit",
+				zap.Int("nodes", cur.nodeCount),
+				zap.Int("edges", cur.edgeCount),
+				zap.Int("edge_identity_rev", cur.edgeIdentity))
+		}
 		return s.communities, stats
+	}
+	if s.logger != nil {
+		// INFO-level on the miss path so a regression that re-introduces
+		// a steady-state cache miss is visible without flipping the
+		// daemon to debug. The full token diff is here precisely to
+		// catch background-mutation regressions (some pass keeps drifting
+		// the edge count under the cache and the Leiden walk runs every
+		// call). A real first-call miss is a single line in the log.
+		s.logger.Info("incrementalCommunities cache miss",
+			zap.Bool("communities_nil", s.communities == nil),
+			zap.Int("cached_nodes", s.communitiesToken.nodeCount),
+			zap.Int("cur_nodes", cur.nodeCount),
+			zap.Int("cached_edges", s.communitiesToken.edgeCount),
+			zap.Int("cur_edges", cur.edgeCount),
+			zap.Int("cached_edge_rev", s.communitiesToken.edgeIdentity),
+			zap.Int("cur_edge_rev", cur.edgeIdentity))
 	}
 	result, cache, stats := analysis.DetectCommunitiesLeidenIncremental(s.graph, s.leidenCache)
 	s.communities = result
