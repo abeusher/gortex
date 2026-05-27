@@ -1547,17 +1547,23 @@ func (s *Server) incrementalCommunities() (*analysis.CommunityResult, analysis.I
 	s.analysisMu.Lock()
 	defer s.analysisMu.Unlock()
 	cur := s.currentCommunityToken()
-	if s.communities != nil && s.leidenCache != nil && s.communitiesToken == cur {
+	if s.communities != nil && s.communitiesToken == cur {
 		stats := analysis.IncrementalCommunityStats{
-			Incremental:   true,
-			TotalPackages: len(s.leidenCache.PackageFingerprints()),
+			Incremental: true,
+		}
+		if s.leidenCache != nil {
+			stats.TotalPackages = len(s.leidenCache.PackageFingerprints())
 		}
 		return s.communities, stats
 	}
 	result, cache, stats := analysis.DetectCommunitiesLeidenIncremental(s.graph, s.leidenCache)
 	s.communities = result
 	s.leidenCache = cache
-	s.communitiesToken = cur
+	// Capture the token AFTER the algo finishes — if the graph mutated
+	// during the (potentially slow) detector run, the token reflects
+	// the state the result was actually computed against, and the next
+	// call's token comparison stays meaningful.
+	s.communitiesToken = s.currentCommunityToken()
 	return result, stats
 }
 
