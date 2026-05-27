@@ -1,6 +1,7 @@
 package resolver
 
 import (
+	"iter"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -1803,6 +1804,25 @@ func memberMethodInfosByType(g graph.Store) map[string][]graph.MemberMethodInfo 
 		})
 	}
 	return out
+}
+
+// edgesByKinds yields every edge whose Kind is in the given set,
+// using the EdgesByKindsScanner capability when the backend
+// implements it (one Cypher IN-list scan) and falling back to a
+// chain of per-kind EdgesByKind iterators otherwise.
+func edgesByKinds(g graph.Store, kinds []graph.EdgeKind) iter.Seq[*graph.Edge] {
+	if scan, ok := g.(graph.EdgesByKindsScanner); ok {
+		return scan.EdgesByKinds(kinds)
+	}
+	return func(yield func(*graph.Edge) bool) {
+		for _, k := range kinds {
+			for e := range g.EdgesByKind(k) {
+				if !yield(e) {
+					return
+				}
+			}
+		}
+	}
 }
 
 // nodesByKindsOrAll returns every node whose Kind is in the given
