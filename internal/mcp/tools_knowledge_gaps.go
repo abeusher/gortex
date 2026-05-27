@@ -78,16 +78,17 @@ func (s *Server) handleGetKnowledgeGaps(ctx context.Context, req mcp.CallToolReq
 	perCategoryLimit := max(req.GetInt("limit_per_category", 20), 1)
 	pathPrefix := strings.TrimSpace(req.GetString("path_prefix", ""))
 
-	// Only function/method candidates feed the disconnected /
-	// untested-hotspot rollups; the community pass walks the cached
-	// CommunityResult and never touches the node table. Pulling only
-	// the two kinds keeps the storage-layer materialisation
-	// proportional to that subset.
-	scoped := s.scopedNodesByKinds(ctx, []graph.NodeKind{graph.KindFunction, graph.KindMethod})
+	// degreeByID maps node id -> (in, out) edge counts for every
+	// function/method in scope, computed once via the backend's
+	// NodeDegreeByKinds path when available. The legacy
+	// NodeDegreeCounts route shipped a 30k-element IN-list per call
+	// on Ladybug; NodeDegreeByKinds runs the same aggregate over the
+	// kind-filtered node set so the planner never builds the list.
+	degreeByID, scoped := s.scopedFunctionDegrees(ctx, pathPrefix)
 
-	disconnected := s.collectDisconnected(scoped, pathPrefix, perCategoryLimit)
+	disconnected := s.collectDisconnected(scoped, pathPrefix, perCategoryLimit, degreeByID)
 	thin, singleFile := s.collectCommunityGaps(thinSize, pathPrefix, perCategoryLimit)
-	untested := s.collectUntestedHotspots(scoped, pathPrefix, hotspotLimit, minCov, perCategoryLimit)
+	untested := s.collectUntestedHotspots(scoped, pathPrefix, hotspotLimit, minCov, perCategoryLimit, degreeByID)
 
 	return s.respondJSONOrTOON(ctx, req, map[string]any{
 		"disconnected_nodes":      disconnected,
@@ -109,18 +110,40 @@ func (s *Server) handleGetKnowledgeGaps(ctx context.Context, req mcp.CallToolReq
 	})
 }
 
+// scopedFunctionDegrees returns the per-node in/out degree map and
+// the scoped function/method node list, in two pushdown calls.
+// NodeDegreeByKinds runs server-side over the kind-filtered node
+// table — the previous path fed NodeDegreeCounts a 30k-element
+// IN-list, which the planner had to materialise before joining. The
+// scoped node list is built from NodesByKinds (or AllNodes when the
+// backend has no NodesByKindsScanner) and post-filtered for the
+// session workspace, matching scopedNodesByKinds' contract.
+func (s *Server) scopedFunctionDegrees(ctx context.Context, pathPrefix string) (map[string]graph.NodeDegreeRow, []*graph.Node) {
+	kinds := []graph.NodeKind{graph.KindFunction, graph.KindMethod}
+	scoped := s.scopedNodesByKinds(ctx, kinds)
+	var degByID map[string]graph.NodeDegreeRow
+	if dk, ok := s.graph.(graph.NodeDegreeByKinds); ok {
+		rows := dk.NodeDegreeByKinds(kinds, pathPrefix)
+		degByID = make(map[string]graph.NodeDegreeRow, len(rows))
+		for _, r := range rows {
+			degByID[r.NodeID] = r
+		}
+	}
+	return degByID, scoped
+}
+
 // collectDisconnected returns function/method nodes with zero
 // incoming and zero outgoing edges in the scoped subgraph. The
 // kind filter mirrors handleAnalyzeCoverageGaps' default — variables
 // and constants always look disconnected, so including them would
 // flood the result.
 //
-// Picks NodeDegreeAggregator when the backend implements it (one
-// batched in/out count instead of 2N GetInEdges/GetOutEdges cgo
-// round-trips on Ladybug).
-func (s *Server) collectDisconnected(scoped []*graph.Node, pathPrefix string, limit int) []gapDisconnected {
-	// scoped is already restricted to function/method by the caller;
-	// only the path-prefix filter remains.
+// Reads from the prebuilt degree map when present (the storage
+// backend computed it once in scopedFunctionDegrees), falls back to
+// per-node GetInEdges / GetOutEdges otherwise. The legacy
+// NodeDegreeAggregator path is kept as a tertiary fallback for
+// backends that publish NodeDegreeCounts but not NodeDegreeByKinds.
+func (s *Server) collectDisconnected(scoped []*graph.Node, pathPrefix string, limit int, degreeByID map[string]graph.NodeDegreeRow) []gapDisconnected {
 	candidates := make([]*graph.Node, 0, len(scoped))
 	for _, n := range scoped {
 		if pathPrefix != "" && !strings.HasPrefix(n.FilePath, pathPrefix) {
@@ -130,35 +153,58 @@ func (s *Server) collectDisconnected(scoped []*graph.Node, pathPrefix string, li
 	}
 
 	out := make([]gapDisconnected, 0)
-	if agg, ok := s.graph.(graph.NodeDegreeAggregator); ok && len(candidates) > 0 {
-		ids := make([]string, 0, len(candidates))
-		byID := make(map[string]*graph.Node, len(candidates))
+	switch {
+	case degreeByID != nil:
 		for _, n := range candidates {
-			ids = append(ids, n.ID)
-			byID[n.ID] = n
-		}
-		for _, r := range agg.NodeDegreeCounts(ids, nil) {
+			r, ok := degreeByID[n.ID]
+			if !ok {
+				// Absent from the aggregate => zero edges, by
+				// definition of the kind-filtered aggregate.
+				out = append(out, gapDisconnected{
+					ID: n.ID, Name: n.Name, Kind: string(n.Kind),
+					File: n.FilePath, Line: n.StartLine,
+				})
+				continue
+			}
 			if r.InCount > 0 || r.OutCount > 0 {
 				continue
 			}
-			n := byID[r.NodeID]
-			if n == nil {
-				continue
-			}
 			out = append(out, gapDisconnected{
 				ID: n.ID, Name: n.Name, Kind: string(n.Kind),
 				File: n.FilePath, Line: n.StartLine,
 			})
 		}
-	} else {
-		for _, n := range candidates {
-			if len(s.graph.GetInEdges(n.ID)) > 0 || len(s.graph.GetOutEdges(n.ID)) > 0 {
-				continue
+	default:
+		if agg, ok := s.graph.(graph.NodeDegreeAggregator); ok && len(candidates) > 0 {
+			ids := make([]string, 0, len(candidates))
+			byID := make(map[string]*graph.Node, len(candidates))
+			for _, n := range candidates {
+				ids = append(ids, n.ID)
+				byID[n.ID] = n
 			}
-			out = append(out, gapDisconnected{
-				ID: n.ID, Name: n.Name, Kind: string(n.Kind),
-				File: n.FilePath, Line: n.StartLine,
-			})
+			for _, r := range agg.NodeDegreeCounts(ids, nil) {
+				if r.InCount > 0 || r.OutCount > 0 {
+					continue
+				}
+				n := byID[r.NodeID]
+				if n == nil {
+					continue
+				}
+				out = append(out, gapDisconnected{
+					ID: n.ID, Name: n.Name, Kind: string(n.Kind),
+					File: n.FilePath, Line: n.StartLine,
+				})
+			}
+		} else {
+			for _, n := range candidates {
+				if len(s.graph.GetInEdges(n.ID)) > 0 || len(s.graph.GetOutEdges(n.ID)) > 0 {
+					continue
+				}
+				out = append(out, gapDisconnected{
+					ID: n.ID, Name: n.Name, Kind: string(n.Kind),
+					File: n.FilePath, Line: n.StartLine,
+				})
+			}
 		}
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -229,17 +275,15 @@ func (s *Server) collectCommunityGaps(thinSize int, pathPrefix string, limit int
 // analyze hotspots (which gates on mean+2σ) so it still surfaces
 // load-bearing nodes in small repos.
 //
-// Uses NodeDegreeAggregator when the backend implements it (one
-// batched in-count instead of N per-node GetInEdges cgo round-trips
-// on Ladybug).
-func (s *Server) collectUntestedHotspots(scoped []*graph.Node, pathPrefix string, hotspotLimit int, minCov float64, limit int) []gapUntestedHotspot {
+// Reads from the prebuilt NodeDegreeByKinds aggregate when present;
+// falls back to NodeDegreeAggregator (the older IN-list shape) for
+// backends that only publish that one, and finally to per-node
+// GetInEdges for everyone else.
+func (s *Server) collectUntestedHotspots(scoped []*graph.Node, pathPrefix string, hotspotLimit int, minCov float64, limit int, degreeByID map[string]graph.NodeDegreeRow) []gapUntestedHotspot {
 	type ranked struct {
 		node  *graph.Node
 		fanIn int
 	}
-	// Pre-filter on kind + prefix Go-side first — that touches only
-	// the in-memory scoped slice. Then ask the storage layer for the
-	// bulk in-degree count if it offers one.
 	pool := make([]*graph.Node, 0, len(scoped))
 	for _, n := range scoped {
 		if pathPrefix != "" && !strings.HasPrefix(n.FilePath, pathPrefix) {
@@ -248,23 +292,31 @@ func (s *Server) collectUntestedHotspots(scoped []*graph.Node, pathPrefix string
 		pool = append(pool, n)
 	}
 	candidates := make([]ranked, 0, len(pool))
-	if agg, ok := s.graph.(graph.NodeDegreeAggregator); ok && len(pool) > 0 {
-		ids := make([]string, 0, len(pool))
-		byID := make(map[string]*graph.Node, len(pool))
+	switch {
+	case degreeByID != nil:
 		for _, n := range pool {
-			ids = append(ids, n.ID)
-			byID[n.ID] = n
-		}
-		for _, r := range agg.NodeDegreeCounts(ids, nil) {
-			n := byID[r.NodeID]
-			if n == nil {
-				continue
-			}
+			r := degreeByID[n.ID]
 			candidates = append(candidates, ranked{node: n, fanIn: r.InCount})
 		}
-	} else {
-		for _, n := range pool {
-			candidates = append(candidates, ranked{node: n, fanIn: len(s.graph.GetInEdges(n.ID))})
+	default:
+		if agg, ok := s.graph.(graph.NodeDegreeAggregator); ok && len(pool) > 0 {
+			ids := make([]string, 0, len(pool))
+			byID := make(map[string]*graph.Node, len(pool))
+			for _, n := range pool {
+				ids = append(ids, n.ID)
+				byID[n.ID] = n
+			}
+			for _, r := range agg.NodeDegreeCounts(ids, nil) {
+				n := byID[r.NodeID]
+				if n == nil {
+					continue
+				}
+				candidates = append(candidates, ranked{node: n, fanIn: r.InCount})
+			}
+		} else {
+			for _, n := range pool {
+				candidates = append(candidates, ranked{node: n, fanIn: len(s.graph.GetInEdges(n.ID))})
+			}
 		}
 	}
 	sort.Slice(candidates, func(i, j int) bool {
