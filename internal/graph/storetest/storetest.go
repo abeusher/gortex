@@ -1160,7 +1160,7 @@ func testSymbolBundleSearcher(t *testing.T, factory Factory) {
 		{NodeID: "c", Tokens: "gamma widget"},
 		{NodeID: "d", Tokens: "delta"},
 	}
-	if err := ss.BulkUpsertSymbolFTS(items); err != nil {
+	if err := ss.BulkUpsertSymbolFTS("", items); err != nil {
 		t.Fatalf("BulkUpsertSymbolFTS: %v", err)
 	}
 	if err := ss.BuildSymbolIndex(); err != nil {

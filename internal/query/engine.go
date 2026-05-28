@@ -1084,7 +1084,7 @@ func (e *Engine) bfs(nodeID string, opts QueryOptions, forward bool, edgeKinds [
 			}
 
 			// Skip unresolved/external targets.
-			if strings.HasPrefix(neighborID, "unresolved::") || strings.HasPrefix(neighborID, "external::") {
+			if graph.IsUnresolvedTarget(neighborID) || strings.HasPrefix(neighborID, "external::") {
 				continue
 			}
 

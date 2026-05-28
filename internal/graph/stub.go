@@ -125,6 +125,66 @@ func StubRest(id string) string {
 	return ""
 }
 
+// UnresolvedMarker is the prefix the extractor emits for a call/
+// reference target the resolver still needs to bind to a concrete
+// Node.
+//
+// Forms:
+//
+//	unresolved::Name                — legacy / single-repo
+//	<repoPrefix>::unresolved::Name  — multi-repo COPY rewrite (in
+//	                                   copyBulkLocked, to dodge
+//	                                   cross-repo PK collisions)
+//
+// IsUnresolvedTarget / UnresolvedName / UnresolvedRepoPrefix
+// normalise over both shapes so callers (resolver, MCP filters,
+// data-flow tracker) don't have to know the encoding.
+const UnresolvedMarker = "unresolved::"
+
+// IsUnresolvedTarget reports whether id names an unresolved
+// extractor stub in either the bare or the multi-repo form.
+func IsUnresolvedTarget(id string) bool {
+	if id == "" {
+		return false
+	}
+	if strings.HasPrefix(id, UnresolvedMarker) {
+		return true
+	}
+	return strings.Contains(id, "::"+UnresolvedMarker)
+}
+
+// UnresolvedName returns the bare symbol name encoded in an
+// unresolved target id, stripping the `unresolved::` prefix (and
+// any leading `<repoPrefix>::`). Returns "" when id is not an
+// unresolved stub.
+func UnresolvedName(id string) string {
+	if id == "" {
+		return ""
+	}
+	if strings.HasPrefix(id, UnresolvedMarker) {
+		return id[len(UnresolvedMarker):]
+	}
+	idx := strings.Index(id, "::"+UnresolvedMarker)
+	if idx < 0 {
+		return ""
+	}
+	return id[idx+len("::"+UnresolvedMarker):]
+}
+
+// UnresolvedRepoPrefix returns the per-repo prefix encoded in an
+// unresolved target id, or "" if the id is bare or not an
+// unresolved stub.
+func UnresolvedRepoPrefix(id string) string {
+	if id == "" || strings.HasPrefix(id, UnresolvedMarker) {
+		return ""
+	}
+	idx := strings.Index(id, "::"+UnresolvedMarker)
+	if idx <= 0 {
+		return ""
+	}
+	return id[:idx]
+}
+
 // StubRepoPrefix returns the per-repo prefix of a stub id, or
 // "" if the id has no prefix or isn't a stub.
 func StubRepoPrefix(id string) string {

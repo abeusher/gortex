@@ -272,7 +272,7 @@ func navNeighbours(eng engineLike, edges []*graph.Edge, kind graph.EdgeKind, for
 		} else {
 			id = e.From
 		}
-		if seen[id] || strings.HasPrefix(id, "unresolved::") || strings.HasPrefix(id, "external::") {
+		if seen[id] || graph.IsUnresolvedTarget(id) || strings.HasPrefix(id, "external::") {
 			continue
 		}
 		n := eng.GetSymbol(id)

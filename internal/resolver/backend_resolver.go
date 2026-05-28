@@ -6,14 +6,18 @@ import (
 )
 
 // backendResolverEnabled reports whether the resolver should consult
-// graph.BackendResolver before running its Go-side worker pool. Off
-// by default — the in-memory shadow path (gortex / vscode / repos
-// under 50k files) already resolves in RAM at nanosecond latency,
-// so backend delegation would only add round-trips. Opt in via
-// GORTEX_BACKEND_RESOLVER=1 (or "true") for the large-repo, disk-
-// only path where the shadow swap is disabled and per-edge round-
-// trips dominate the resolve phase.
+// graph.BackendResolver before running its Go-side worker pool.
+// Default on for the ladybug-only daemon: the backend resolver runs
+// one Cypher per rule rather than one round-trip per unresolved edge.
+// With the multi-repo encoding exposing 100k+ `unresolved::*` edges
+// at warmup, the per-edge Go path is the difference between a sub-
+// 10-minute warmup and a hang / OOM. Set GORTEX_BACKEND_RESOLVER=0
+// to opt back out for the edge case where a small in-memory corpus
+// can be heuristically resolved faster in RAM.
 func backendResolverEnabled() bool {
 	v := os.Getenv("GORTEX_BACKEND_RESOLVER")
-	return v == "1" || strings.EqualFold(v, "true")
+	if v == "0" || strings.EqualFold(v, "false") {
+		return false
+	}
+	return true
 }

@@ -35,6 +35,17 @@ func (s *Server) ensureFresh(filePaths []string) []string {
 	if s.watcher != nil {
 		return nil
 	}
+	// In multi-repo mode the legacy single-Indexer's fileMtimes is
+	// always empty for cross-repo paths, so IsStale returns true for
+	// every file → IndexFile fires → race with the daemon's read
+	// surface, which has been observed to crash the MCP transport
+	// (CGo concurrency hazard on liblbug). The MultiIndexer's own
+	// per-repo watcher / Reconcile path owns freshness here; the
+	// single-Indexer auto-refresh is dead weight that does more harm
+	// than good.
+	if s.multiIndexer != nil {
+		return nil
+	}
 	if s.indexer == nil {
 		return nil
 	}

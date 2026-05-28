@@ -1630,7 +1630,20 @@ func roundTo(v float64, places int) float64 {
 	return float64(int64(v*pow+0.5)) / pow
 }
 
-func (s *Server) handleGetFileSummary(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Server) handleGetFileSummary(ctx context.Context, req mcp.CallToolRequest) (res *mcp.CallToolResult, retErr error) {
+	// Defensive panic recovery — get_file_summary has been observed
+	// to crash the MCP transport in multi-repo mode (file-content
+	// validation gap). Surface the panic as a tool error so the
+	// session survives.
+	defer func() {
+		if r := recover(); r != nil {
+			s.logger.Error("get_file_summary panic recovered",
+				zap.String("path", req.GetString("path", "")),
+				zap.Any("panic", r))
+			res = mcp.NewToolResultError(fmt.Sprintf("get_file_summary internal error: %v", r))
+			retErr = nil
+		}
+	}()
 	fp, err := req.RequireString("path")
 	if err != nil {
 		return mcp.NewToolResultError("path is required"), nil

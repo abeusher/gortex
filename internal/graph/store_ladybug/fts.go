@@ -89,15 +89,18 @@ func (s *Store) UpsertSymbolFTS(nodeID, tokens string) error {
 // vs ~1ms for the Cypher MERGE path UpsertSymbolFTS takes —
 // ~1000x cheaper at 600k-node scale.
 //
-// The COPY destination is wiped first via `MATCH (f:SymbolFTS)
-// DELETE f` so a re-run replaces the corpus rather than appending.
-// This is safe because the indexer always calls
-// BulkUpsertSymbolFTS once per IndexCtx (after the shadow drain
-// completes), not on the daemon's incremental reindex path.
+// repoPrefix scopes the pre-COPY wipe: when non-empty, only rows
+// whose id starts with `repoPrefix + "/"` are deleted, leaving
+// sibling repos' FTS corpus untouched. Without this scoping, the
+// MultiIndexer's per-repo drain calls would each clobber every
+// other repo's rows and only the last-committed repo's symbols
+// would be searchable (the live bug that motivated this signature
+// change). Empty repoPrefix preserves the legacy wipe-all
+// behaviour for single-repo daemons.
 //
 // Idempotent under empty input — no-ops cleanly so callers don't
 // need to length-check.
-func (s *Store) BulkUpsertSymbolFTS(items []graph.SymbolFTSItem) error {
+func (s *Store) BulkUpsertSymbolFTS(repoPrefix string, items []graph.SymbolFTSItem) error {
 	if len(items) == 0 {
 		return nil
 	}
@@ -130,11 +133,24 @@ func (s *Store) BulkUpsertSymbolFTS(items []graph.SymbolFTSItem) error {
 		return nil
 	}
 
-	// Wipe prior FTS rows so the cold-load fast path is a clean
-	// rebuild. Costs O(N) on the existing row set — acceptable
-	// because this only runs at IndexCtx commit, not on every
-	// incremental update.
-	if err := runCypherSafe(s, `MATCH (f:SymbolFTS) DELETE f`); err != nil {
+	// Wipe prior FTS rows for this repo only so sibling repos
+	// in a MultiIndexer store keep their corpus. Without this
+	// scoping a clean rebuild of repo A would wipe repo B's rows
+	// and search_symbols would only ever see whichever repo
+	// committed last.
+	if repoPrefix != "" {
+		if err := runCypherWithArgs(s, `MATCH (f:SymbolFTS) WHERE f.id STARTS WITH $p DELETE f`, map[string]any{
+			"p": repoPrefix + "/",
+		}); err != nil {
+			return fmt.Errorf("clear SymbolFTS for repo %q before bulk upsert: %w", repoPrefix, err)
+		}
+		// Drop stale tier-0 name-cache entries for this repo so a
+		// reindex that removes a symbol doesn't leave a phantom hit
+		// for searches against this prefix.
+		if s.nameIdx != nil {
+			s.nameIdx.removeByPrefix(repoPrefix + "/")
+		}
+	} else if err := runCypherSafe(s, `MATCH (f:SymbolFTS) DELETE f`); err != nil {
 		return fmt.Errorf("clear SymbolFTS before bulk upsert: %w", err)
 	}
 
@@ -252,6 +268,39 @@ func (s *Store) SearchSymbols(query string, limit int) ([]graph.SymbolHit, error
 	if limit <= 0 {
 		limit = 20
 	}
+	// Tier 0: exact-name lookup via the in-memory name index. The
+	// codedb playbook calls this the flat-symbol map: when the query
+	// is a single identifier, an O(1) hash hit replaces the FTS
+	// round-trip and the BM25 ranking cycle. We only short-circuit
+	// when the cache hits AT LEAST one node; misses fall through
+	// to the FTS path so a partial-identifier query still works.
+	//
+	// The query must look like an identifier (no whitespace, no
+	// path separators) — multi-word queries are concept searches
+	// and need BM25 to rank them across the field bag.
+	if isIdentifierQuery(query) && s.nameIdx != nil {
+		s.nameIdx.bootstrap(s)
+		ids := s.nameIdx.lookup(query)
+		if len(ids) > 0 {
+			out := make([]graph.SymbolHit, 0, len(ids))
+			// Score = 100 so the engine's rerank treats these as
+			// the strongest BM25-equivalent signal — exact-name
+			// matches dominate the head of the result set, where
+			// the user expects to find their literal-typed
+			// identifier. The downstream rerank still re-orders
+			// among them on the structural signals (fan-in,
+			// community, …) so two same-name candidates aren't
+			// frozen in insertion order.
+			for _, id := range ids {
+				out = append(out, graph.SymbolHit{NodeID: id, Score: 100.0})
+				if len(out) >= limit {
+					break
+				}
+			}
+			return out, nil
+		}
+	}
+
 	// Tokenise on the read side using the SAME splitter as the
 	// write side (search.Tokenize). Symmetry matters: the corpus
 	// has `ValidateToken` stored as [validate, token], so a
@@ -344,6 +393,21 @@ func (s *Store) SearchSymbolBundles(query string, limit int) ([]graph.SymbolBund
 	}
 	if limit <= 0 {
 		limit = 20
+	}
+	// Tier 0: same flat-symbol-map fast path as SearchSymbols. The
+	// rerank pipeline asks for bundles (node + edges) when the
+	// backend supports it; we satisfy that contract with batched
+	// node/edge fetches but skip the FTS round-trip when the
+	// in-memory name index already knows the candidates.
+	if isIdentifierQuery(query) && s.nameIdx != nil {
+		s.nameIdx.bootstrap(s)
+		ids := s.nameIdx.lookup(query)
+		if len(ids) > 0 {
+			if len(ids) > limit {
+				ids = ids[:limit]
+			}
+			return s.bundlesForIDs(ids, 100.0), nil
+		}
 	}
 	tokens := search.Tokenize(query)
 	if len(tokens) == 0 {
@@ -455,6 +519,53 @@ LIMIT $k`
 		})
 	}
 	return bundles, nil
+}
+
+// bundlesForIDs materialises bundles for a known ID list — the
+// tier-0 fast path returns this when the name index hits, so the
+// SymbolBundleSearcher contract still delivers nodes + in/out edges
+// without paying for an FTS round-trip. Three parallel batched
+// fetches mirror SearchSymbolBundles' Phase-2 fan-out so the
+// engine sees an identical bundle shape regardless of which tier
+// served the query.
+func (s *Store) bundlesForIDs(ids []string, score float64) []graph.SymbolBundle {
+	if len(ids) == 0 {
+		return nil
+	}
+	var (
+		nodes map[string]*graph.Node
+		out   map[string][]*graph.Edge
+		in    map[string][]*graph.Edge
+		wg    sync.WaitGroup
+	)
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		nodes = s.GetNodesByIDs(ids)
+	}()
+	go func() {
+		defer wg.Done()
+		out = s.GetOutEdgesByNodeIDs(ids)
+	}()
+	go func() {
+		defer wg.Done()
+		in = s.GetInEdgesByNodeIDs(ids)
+	}()
+	wg.Wait()
+	bundles := make([]graph.SymbolBundle, 0, len(ids))
+	for _, id := range ids {
+		n := nodes[id]
+		if n == nil {
+			continue
+		}
+		bundles = append(bundles, graph.SymbolBundle{
+			Node:     n,
+			Score:    score,
+			OutEdges: out[id],
+			InEdges:  in[id],
+		})
+	}
+	return bundles
 }
 
 // runCypherSafe wraps the panicking runWriteLocked helper and

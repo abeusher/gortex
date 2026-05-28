@@ -639,7 +639,7 @@ func (r *Resolver) ResolveFile(filePath string) *ResolveStats {
 	for _, n := range nodes {
 		edges := r.graph.GetOutEdges(n.ID)
 		for _, e := range edges {
-			if !strings.HasPrefix(e.To, unresolvedPrefix) {
+			if !graph.IsUnresolvedTarget(e.To) {
 				continue
 			}
 			oldTo, changed := r.resolveEdge(e, stats)
@@ -777,7 +777,18 @@ func releaseResolverClone(clone *graph.Edge) {
 // ResolveAll). When nothing changed the returned bool is false.
 func (r *Resolver) resolveEdge(e *graph.Edge, stats *ResolveStats) (oldTo string, changed bool) {
 	oldTo = e.To
-	target := strings.TrimPrefix(e.To, unresolvedPrefix)
+	// graph.UnresolvedName handles both `unresolved::Name` (legacy)
+	// and `<repoPrefix>::unresolved::Name` (multi-repo COPY rewrite).
+	// strings.TrimPrefix only stripped the bare form, leaving every
+	// multi-repo edge with target=full-id and no downstream pattern
+	// match — that was the root cause of find_usages returning zero
+	// callers across the whole gortex repo.
+	target := graph.UnresolvedName(e.To)
+	if target == "" {
+		// Not an unresolved stub at all — fall through with the raw
+		// id so the pattern dispatch below sees the original value.
+		target = strings.TrimPrefix(e.To, unresolvedPrefix)
+	}
 
 	// Resolve-time LSP hot-path. Consulted for TS/JS/JSX/TSX files
 	// (and any other languages a future helper claims via
@@ -1641,8 +1652,8 @@ func (r *Resolver) buildProvidesForIndex() {
 		}
 		to := ed.To
 		var name string
-		if strings.HasPrefix(to, "unresolved::") {
-			name = strings.TrimPrefix(to, "unresolved::")
+		if graph.IsUnresolvedTarget(to) {
+			name = graph.UnresolvedName(to)
 		} else if cut := strings.LastIndex(to, "::"); cut >= 0 {
 			name = to[cut+2:]
 		} else {
@@ -1693,8 +1704,8 @@ func (r *Resolver) buildReachabilityIndex() {
 	for e := range r.graph.EdgesByKind(graph.EdgeImports) {
 		var importedDir string
 		switch {
-		case strings.HasPrefix(e.To, "unresolved::import::"):
-			path := strings.TrimPrefix(e.To, "unresolved::import::")
+		case graph.IsUnresolvedTarget(e.To) && strings.HasPrefix(graph.UnresolvedName(e.To), "import::"):
+			path := strings.TrimPrefix(graph.UnresolvedName(e.To), "import::")
 			if files := r.dirIndex[path]; len(files) > 0 {
 				importedDir = filepath.Dir(files[0].FilePath)
 			} else if last := lastPathComponent(path); last != "" {

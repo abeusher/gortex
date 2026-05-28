@@ -376,7 +376,7 @@ func evalGraphQuery(eng *query.Engine, stages []gqStage, limit int) (*query.SubG
 						}
 						targetID = e.From
 					}
-					if strings.HasPrefix(targetID, "unresolved::") ||
+					if graph.IsUnresolvedTarget(targetID) ||
 						strings.HasPrefix(targetID, "external::") {
 						continue
 					}

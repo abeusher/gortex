@@ -307,7 +307,7 @@ func wantedEdgeKind(obj types.Object) graph.EdgeKind {
 // strings the resolver writes for unresolved or external lookups.
 func isStubTarget(to string) bool {
 	switch {
-	case strings.HasPrefix(to, "unresolved::"),
+	case graph.IsUnresolvedTarget(to),
 		strings.HasPrefix(to, "external::"),
 		graph.IsStdlibStub(to),
 		strings.HasPrefix(to, "dep::"):

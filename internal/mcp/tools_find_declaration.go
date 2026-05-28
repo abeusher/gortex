@@ -256,7 +256,7 @@ func resolveUseSiteDecl(eng *query.Engine, fileIdx map[string]*fileSymbolIndex, 
 				if e.Line != m.Line || !declResolveKinds[e.Kind] {
 					continue
 				}
-				if strings.HasPrefix(e.To, "unresolved::") || strings.HasPrefix(e.To, "external::") {
+				if graph.IsUnresolvedTarget(e.To) || strings.HasPrefix(e.To, "external::") {
 					continue
 				}
 				// Prefer a call edge over a plain reference when the

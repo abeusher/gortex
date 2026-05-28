@@ -106,10 +106,10 @@ func (r *Resolver) bindBareNameScopeRefs() {
 // value when a rewrite happened (caller batches it for ReindexEdges)
 // or "" when the edge was left alone.
 func (r *Resolver) tryBindBareName(e *graph.Edge, owned map[string][]scopeNode) string {
-	if e == nil || !strings.HasPrefix(e.To, "unresolved::") {
+	if e == nil || !graph.IsUnresolvedTarget(e.To) {
 		return ""
 	}
-	name := strings.TrimPrefix(e.To, "unresolved::")
+	name := graph.UnresolvedName(e.To)
 	if name == "" || strings.ContainsAny(name, ".*:#") {
 		// Not a bare identifier — leave to other passes (qualified
 		// names, *.method, etc.).

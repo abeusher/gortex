@@ -92,6 +92,12 @@ type Store struct {
 	// would otherwise need. Maintained on every node mutation; see
 	// file_index.go.
 	fileIDs *fileIDIndex
+
+	// nameIdx is the tier-0 fast path for SearchSymbols: a
+	// denormalised lower(name) → []NodeID map maintained alongside
+	// every Node write. Identifier-shape queries skip the FTS
+	// round-trip when this hits. See name_index.go.
+	nameIdx *nameIndex
 }
 
 // Compile-time assertion: *Store satisfies graph.Store.
@@ -169,7 +175,7 @@ func OpenWithOptions(path string, opts Options) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("store_ladybug: init conn pool: %w", err)
 	}
-	st := &Store{db: db, conn: conn, pool: pool, fileIDs: newFileIDIndex()}
+	st := &Store{db: db, conn: conn, pool: pool, fileIDs: newFileIDIndex(), nameIdx: newNameIndex()}
 	// Populate the file→id accelerator from any data already on disk
 	// (daemon restart, ladybug snapshot reload). A fresh DB returns 0
 	// rows and this is a cheap no-op; an existing DB pays one
@@ -273,6 +279,23 @@ func (s *Store) AddNode(n *graph.Node) {
 	if n == nil || n.ID == "" {
 		return
 	}
+	// Bulk-load fast path: if a drain has called BeginBulkLoad, route
+	// this write into the bulk buffer instead of taking writeMu and
+	// running an UNWIND-MERGE. Otherwise contracts / clones / DI
+	// emission paths (commitInlinedContractToGraph and friends) that
+	// call AddNode directly during the bulk window would slip a live
+	// Node row in past the bulk's view, the bulk's subsequent COPY
+	// Node would re-insert the same ID, and Kuzu's COPY rejects the
+	// duplicate primary key — torpedoing the entire repo's index.
+	// AddBatch already uses this routing; AddNode/AddEdge needed to
+	// match.
+	s.bulkMu.Lock()
+	if s.bulkActive {
+		s.bulkNodes = append(s.bulkNodes, n)
+		s.bulkMu.Unlock()
+		return
+	}
+	s.bulkMu.Unlock()
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	s.upsertNodeLocked(n)
@@ -287,6 +310,9 @@ func (s *Store) upsertNodeLocked(n *graph.Node) {
 	}
 	if s.fileIDs != nil {
 		s.fileIDs.add(n.FilePath, n.ID)
+	}
+	if s.nameIdx != nil {
+		s.nameIdx.addNode(n)
 	}
 	// MERGE on id, then SET every column. This is the upsert pattern
 	// for KuzuDB — a bare CREATE on a duplicate PK raises a
@@ -327,6 +353,19 @@ func (s *Store) AddEdge(e *graph.Edge) {
 	if e == nil {
 		return
 	}
+	// Bulk-load fast path: mirror AddNode — during a drain's
+	// BeginBulkLoad / FlushBulk window, contract / clones / DI emission
+	// code calls AddEdge directly. Letting those slip through as a live
+	// MERGE while the bulk buffer still holds a duplicate of the same
+	// edge would re-trigger the COPY-Edge "duplicate primary key" /
+	// "unable to find primary key" classes the AddNode fix addresses.
+	s.bulkMu.Lock()
+	if s.bulkActive {
+		s.bulkEdges = append(s.bulkEdges, e)
+		s.bulkMu.Unlock()
+		return
+	}
+	s.bulkMu.Unlock()
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	s.upsertEdgeLocked(e)
@@ -475,6 +514,9 @@ func (s *Store) AddBatch(nodes []*graph.Node, edges []*graph.Edge) {
 func (s *Store) addNodesUnwindLocked(nodes []*graph.Node) {
 	if s.fileIDs != nil {
 		s.fileIDs.addNodes(nodes)
+	}
+	if s.nameIdx != nil {
+		s.nameIdx.addNodes(nodes)
 	}
 	for i := 0; i < len(nodes); i += kuzuBatchChunkSize {
 		end := i + kuzuBatchChunkSize
@@ -861,8 +903,14 @@ RETURN count(DISTINCT e)`, column)
 // -- reads (point lookups) ----------------------------------------------
 
 // GetNode returns the node with the given id, or nil if absent.
+//
+// Uses the WHERE form on the PK to match the rest of the read
+// surface (GetInEdges, FindNodesByName, GetFileSubGraph etc.) —
+// the inline `{id: $id}` shape has been observed to return empty
+// under concurrent writers when the planner picks a plan that
+// doesn't survive a buffer-pool refresh.
 func (s *Store) GetNode(id string) *graph.Node {
-	const q = `MATCH (n:Node {id: $id}) RETURN ` + nodeReturnCols + ` LIMIT 1`
+	const q = `MATCH (n:Node) WHERE n.id = $id RETURN ` + nodeReturnCols + ` LIMIT 1`
 	rows := s.querySelect(q, map[string]any{"id": id})
 	if len(rows) == 0 {
 		return nil
@@ -876,7 +924,7 @@ func (s *Store) GetNodeByQualName(qualName string) *graph.Node {
 	if qualName == "" {
 		return nil
 	}
-	const q = `MATCH (n:Node {qual_name: $q}) RETURN ` + nodeReturnCols + ` LIMIT 1`
+	const q = `MATCH (n:Node) WHERE n.qual_name = $q RETURN ` + nodeReturnCols + ` LIMIT 1`
 	rows := s.querySelect(q, map[string]any{"q": qualName})
 	if len(rows) == 0 {
 		return nil
@@ -885,15 +933,45 @@ func (s *Store) GetNodeByQualName(qualName string) *graph.Node {
 }
 
 // FindNodesByName returns every node whose Name matches.
+//
+// The predicate is expressed as an outer `WHERE n.name = $name`
+// instead of an inline `(n:Node {name: $name})`. Same shape as the
+// GetInEdges fix elsewhere in this file: the inline-property form on
+// a non-PK column has been observed to return empty rows under
+// concurrent writers (the planner picks a plan that doesn't survive
+// a buffer-pool refresh), while the WHERE form goes through the
+// straightforward filter scan and stays correct. Both forms hit the
+// same name index on Kuzu's side, so there is no measurable cost
+// difference — only the correctness gap.
+//
+// This is the inbound-lookup the resolver's resolveMethodCall path
+// uses via FindNodesByNameInRepo; an empty result there leaves the
+// caller→method edge as `unresolved::Foo`, which is why
+// `find_usages` on `Graph.AddNode` returned zero callers despite
+// dozens of `g.AddNode(...)` call sites.
 func (s *Store) FindNodesByName(name string) []*graph.Node {
-	const q = `MATCH (n:Node {name: $name}) RETURN ` + nodeReturnCols
+	// Note: an earlier revision routed this through s.nameIdx with a
+	// lazy bootstrap that ran a full Cypher scan. Under the parallel
+	// warmup's per-repo IndexCtx pressure, the bootstrap Cypher
+	// running concurrently with other Cypher writers tickled a
+	// liblbug-side semasleep panic that crashed the daemon
+	// mid-warmup. Keeping FindNodesByName on the engine path
+	// preserves the correctness contract — the resolver's per-edge
+	// lookup still hits Kuzu's secondary name index — and SearchSymbols
+	// continues to consult s.nameIdx directly via lookupNodes for its
+	// tier-0 fast path.
+	const q = `MATCH (n:Node) WHERE n.name = $name RETURN ` + nodeReturnCols
 	rows := s.querySelect(q, map[string]any{"name": name})
 	return rowsToNodes(rows)
 }
 
 // FindNodesByNameInRepo restricts FindNodesByName to one repo prefix.
+// Same WHERE-clause rationale as FindNodesByName above — the inline
+// two-property `{name: ..., repo_prefix: ...}` form was the resolver's
+// primary call-edge lookup and the most likely culprit behind
+// "method has obvious callers in source but find_usages returns 0".
 func (s *Store) FindNodesByNameInRepo(name, repoPrefix string) []*graph.Node {
-	const q = `MATCH (n:Node {name: $name, repo_prefix: $repo}) RETURN ` + nodeReturnCols
+	const q = `MATCH (n:Node) WHERE n.name = $name AND n.repo_prefix = $repo RETURN ` + nodeReturnCols
 	rows := s.querySelect(q, map[string]any{"name": name, "repo": repoPrefix})
 	return rowsToNodes(rows)
 }
@@ -944,21 +1022,24 @@ func (s *Store) GetFileNodes(filePath string) []*graph.Node {
 		rows := s.querySelect(q, map[string]any{"ids": stringSliceToAny(ids)})
 		return rowsToNodes(rows)
 	}
-	const q = `MATCH (n:Node {file_path: $f}) RETURN ` + nodeReturnCols
+	const q = `MATCH (n:Node) WHERE n.file_path = $f RETURN ` + nodeReturnCols
 	rows := s.querySelect(q, map[string]any{"f": filePath})
 	return rowsToNodes(rows)
 }
 
 // GetRepoNodes returns every node in the given repo prefix.
 func (s *Store) GetRepoNodes(repoPrefix string) []*graph.Node {
-	const q = `MATCH (n:Node {repo_prefix: $r}) RETURN ` + nodeReturnCols
+	const q = `MATCH (n:Node) WHERE n.repo_prefix = $r RETURN ` + nodeReturnCols
 	rows := s.querySelect(q, map[string]any{"r": repoPrefix})
 	return rowsToNodes(rows)
 }
 
-// GetOutEdges returns every edge whose From matches nodeID.
+// GetOutEdges returns every edge whose From matches nodeID. Uses
+// WHERE-form on the PK to match the GetInEdges / GetNode contract —
+// the inline `{id: $id}` shape has been observed to return empty
+// rows under concurrent writers.
 func (s *Store) GetOutEdges(nodeID string) []*graph.Edge {
-	const q = `MATCH (a:Node {id: $id})-[e:Edge]->(b:Node) RETURN ` + edgeReturnCols
+	const q = `MATCH (a:Node)-[e:Edge]->(b:Node) WHERE a.id = $id RETURN ` + edgeReturnCols
 	rows := s.querySelect(q, map[string]any{"id": nodeID})
 	return rowsToEdges(rows)
 }
@@ -981,8 +1062,21 @@ func (s *Store) GetRepoEdges(repoPrefix string) []*graph.Edge {
 }
 
 // GetInEdges returns every edge whose To matches nodeID.
+//
+// The target predicate is expressed as `WHERE b.id = $id`, not an
+// inline `(b:Node {id: $id})` property match on the arrow target.
+// On a populated workspace the inline form silently returns zero rows
+// — the Kuzu planner skips the primary-key probe on the rel-table
+// target side and the join collapses to empty. Find_usages /
+// get_callers / analyze[cycles] / suggest_pattern all funnel through
+// this single primitive, so the empty result cascades into a
+// false-positive "no incoming references" verdict across the agent
+// surface. Aligning the shape with GetInEdgesByNodeIDs' working
+// `WHERE b.id IN $ids` keeps the planner on the same code path that
+// the batched sibling exercises (and that the conformance suite
+// covers).
 func (s *Store) GetInEdges(nodeID string) []*graph.Edge {
-	const q = `MATCH (a:Node)-[e:Edge]->(b:Node {id: $id}) RETURN ` + edgeReturnCols
+	const q = `MATCH (a:Node)-[e:Edge]->(b:Node) WHERE b.id = $id RETURN ` + edgeReturnCols
 	rows := s.querySelect(q, map[string]any{"id": nodeID})
 	return rowsToEdges(rows)
 }
@@ -1108,7 +1202,7 @@ func (s *Store) EdgesByKinds(kinds []graph.EdgeKind) iter.Seq[*graph.Edge] {
 // NodesByKind yields every node whose Kind matches.
 func (s *Store) NodesByKind(kind graph.NodeKind) iter.Seq[*graph.Node] {
 	return func(yield func(*graph.Node) bool) {
-		const q = `MATCH (n:Node {kind: $kind}) RETURN ` + nodeReturnCols
+		const q = `MATCH (n:Node) WHERE n.kind = $kind RETURN ` + nodeReturnCols
 		rows := s.querySelect(q, map[string]any{"kind": string(kind)})
 		for _, r := range rows {
 			n := rowToNode(r)
@@ -1123,8 +1217,10 @@ func (s *Store) NodesByKind(kind graph.NodeKind) iter.Seq[*graph.Node] {
 }
 
 // EdgesWithUnresolvedTarget yields every edge whose To begins with
-// "unresolved::". KuzuDB has a STARTS WITH operator that compiles to
-// a contiguous prefix scan when the column is indexed.
+// "unresolved::". The COPY-time rewrite in copyBulkLocked preserves
+// this prefix in the multi-repo form (`unresolved::<repoPrefix>::<name>`),
+// so a single STARTS WITH still catches every form without paying
+// for an index-killing CONTAINS scan.
 func (s *Store) EdgesWithUnresolvedTarget() iter.Seq[*graph.Edge] {
 	return func(yield func(*graph.Edge) bool) {
 		const q = `MATCH (a:Node)-[e:Edge]->(b:Node) WHERE b.id STARTS WITH 'unresolved::' RETURN ` + edgeReturnCols
@@ -1315,7 +1411,7 @@ const (
 
 func (s *Store) RepoMemoryEstimate(repoPrefix string) graph.RepoMemoryEstimate {
 	var est graph.RepoMemoryEstimate
-	rows := s.querySelect(`MATCH (n:Node {repo_prefix: $r}) RETURN count(n)`, map[string]any{"r": repoPrefix})
+	rows := s.querySelect(`MATCH (n:Node) WHERE n.repo_prefix = $r RETURN count(n)`, map[string]any{"r": repoPrefix})
 	if len(rows) == 0 {
 		return est
 	}
@@ -1546,10 +1642,23 @@ func (s *Store) querySelect(query string, args map[string]any) [][]any {
 
 // querySelectInner is the unlocked body shared between querySelect
 // (locks) and querySelectLocked (caller already holds writeMu).
+//
+// Engine errors on the read path are logged + the partial-or-empty
+// row buffer is returned instead of panicking. A read failure here
+// is almost always a transient Kuzu IO exception (e.g. a buffer-pool
+// read landing in the middle of a concurrent COPY's file extension —
+// "Cannot read N bytes at position M") and used to kill the daemon
+// via panicOnFatal. The graph.Store interface still has no error
+// channel so we can't bubble it up; degrading to an empty result on
+// reads gives the caller a recoverable "looks like the symbol has
+// no edges right now" path while the daemon stays up. Write paths
+// (runWriteLocked) keep panic semantics because a write failure
+// means the graph is now inconsistent and continuing would corrupt
+// subsequent state.
 func (s *Store) querySelectInner(query string, args map[string]any) [][]any {
 	res, release, err := s.executeOrQuery(query, args)
 	if err != nil {
-		panicOnFatal(err)
+		readPathLogf("executeOrQuery: %v (query=%q)", err, firstLine(query))
 		return nil
 	}
 	defer release()
@@ -1558,19 +1667,31 @@ func (s *Store) querySelectInner(query string, args map[string]any) [][]any {
 	for res.HasNext() {
 		tup, err := res.Next()
 		if err != nil {
-			panicOnFatal(err)
+			readPathLogf("Next: %v (query=%q rows=%d)", err, firstLine(query), len(rows))
 			return rows
 		}
 		vals, err := tup.GetAsSlice()
 		if err != nil {
 			tup.Close()
-			panicOnFatal(err)
+			readPathLogf("GetAsSlice: %v (query=%q rows=%d)", err, firstLine(query), len(rows))
 			return rows
 		}
 		rows = append(rows, vals)
 		tup.Close()
 	}
 	return rows
+}
+
+// readPathLogf emits a degraded-read warning to stderr (which the
+// daemon redirects to its log file). Format: a single line prefixed
+// with `store_ladybug: read degraded:` so log scrapers can find these
+// without parsing JSON. We deliberately avoid the structured zap
+// logger here — the Store has no logger reference and threading one
+// through every callsite would be a much larger change than this
+// hot-path fix is meant to be.
+func readPathLogf(format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	_, _ = fmt.Fprintf(os.Stderr, "store_ladybug: read degraded: %s\n", msg)
 }
 
 // querySelectLocked is querySelect for callers that already hold
@@ -1595,27 +1716,36 @@ func (s *Store) querySelectLocked(query string, args map[string]any) [][]any {
 func (s *Store) executeOrQuery(query string, args map[string]any) (*lbug.QueryResult, func(), error) {
 	conn := s.conn
 	release := func() {}
+	// discard pulls a connection OUT of circulation on error instead of
+	// recycling it — a connection that errored mid-statement (a failed
+	// COPY in particular) can be left poisoned, and reusing it makes a
+	// later Prepare on an unrelated goroutine panic with "mutex lock
+	// failed: Invalid argument". Falls back to a no-op for the
+	// non-pooled setup connection (test fixtures) where there's nothing
+	// to replace.
+	discard := func() {}
 	if s.pool != nil {
 		conn = s.pool.get()
 		release = func() { s.pool.put(conn) }
+		discard = func() { s.pool.discard(conn) }
 	}
 	if len(args) == 0 {
 		res, err := conn.Query(query)
 		if err != nil {
-			release()
+			discard()
 			return nil, func() {}, err
 		}
 		return res, release, nil
 	}
 	stmt, err := conn.Prepare(query)
 	if err != nil {
-		release()
+		discard()
 		return nil, func() {}, fmt.Errorf("prepare: %w", err)
 	}
 	defer stmt.Close()
 	res, err := conn.Execute(stmt, args)
 	if err != nil {
-		release()
+		discard()
 		return nil, func() {}, err
 	}
 	return res, release, nil
@@ -1749,6 +1879,16 @@ func (s *Store) copyBulkLocked(nodes []*graph.Node, edges []*graph.Edge) error {
 	}
 	if repoPrefix != "" {
 		const unresolvedTag = "unresolved::"
+		// Encoding: prepend the repo prefix to the bare
+		// `unresolved::Name` form so cross-repo emitters don't
+		// collide on the COPY PK. Result: `<repoPrefix>::unresolved::<name>`.
+		// The Go-level per-edge resolver's EdgesWithUnresolvedTarget
+		// uses a literal `STARTS WITH 'unresolved::'` scan, which
+		// intentionally MISSES these multi-repo stubs — the Cypher
+		// backend resolver runs a batched pass that handles every
+		// form via kind/name normalisation, so we save the per-edge
+		// Cypher round-trip cost on the Go side and let the engine
+		// resolve the whole population in one shot.
 		rewrite := func(id string) string {
 			if id == "" || !strings.HasPrefix(id, unresolvedTag) {
 				return id
@@ -1769,13 +1909,30 @@ func (s *Store) copyBulkLocked(nodes []*graph.Node, edges []*graph.Edge) error {
 			n.ID = rewrite(n.ID)
 		}
 	}
-	// Dedup nodes by ID (last write wins). The in-memory store's
-	// AddBatch overwrites on duplicate ID; mirror that here.
+	// Dedup nodes by SANITIZED ID (last write wins). The TSV writer
+	// strips tab/CR/LF — so two raw IDs that differ only in those
+	// characters (e.g. extractor output with embedded newlines in an
+	// inline TypeScript object-type literal: `unresolved::{   foo:
+	// X[]\n   bar: () => Y }`) collapse to the same column-0 value at
+	// COPY time, and Kuzu rejects the run with "duplicated primary
+	// key value". Using the sanitized form here keeps the dedup map's
+	// view of "same node" aligned with what the COPY parser sees. We
+	// also normalize n.ID to the sanitized form so the auto-stub and
+	// edge endpoints match, and so the eventual writeNodesTSV /
+	// writeEdgesTSV pair emit identical strings on both sides of the
+	// rel-table FK.
+	//
+	// The in-memory store's AddBatch overwrites on duplicate ID; this
+	// preserves the same semantics modulo the sanitization mapping.
 	nodePos := make(map[string]int, len(nodes))
 	dedupedNodes := nodes[:0]
 	for _, n := range nodes {
 		if n == nil || n.ID == "" {
 			continue
+		}
+		san := sanitizeTSV(n.ID)
+		if san != n.ID {
+			n.ID = san
 		}
 		if pos, ok := nodePos[n.ID]; ok {
 			dedupedNodes[pos] = n
@@ -1792,9 +1949,16 @@ func (s *Store) copyBulkLocked(nodes []*graph.Node, edges []*graph.Edge) error {
 	if s.fileIDs != nil {
 		s.fileIDs.addNodes(nodes)
 	}
+	if s.nameIdx != nil {
+		s.nameIdx.addNodes(nodes)
+	}
 
 	// Dedup edges by identity tuple (last write wins). Same rationale
-	// as the in-memory store's MERGE semantics.
+	// as the in-memory store's MERGE semantics. Endpoints are
+	// sanitized to match the node-ID sanitization above — otherwise
+	// an edge pointing at `unresolved::Writer\n}` references a node
+	// the CSV writer collapses to `unresolved::Writer }`, and Kuzu's
+	// COPY Edge fails with "unable to find primary key value".
 	type edgeKey struct {
 		from, to, kind, file string
 		line                 int
@@ -1804,6 +1968,12 @@ func (s *Store) copyBulkLocked(nodes []*graph.Node, edges []*graph.Edge) error {
 	for _, e := range edges {
 		if e == nil {
 			continue
+		}
+		if san := sanitizeTSV(e.From); san != e.From {
+			e.From = san
+		}
+		if san := sanitizeTSV(e.To); san != e.To {
+			e.To = san
 		}
 		k := edgeKey{e.From, e.To, string(e.Kind), e.FilePath, e.Line}
 		if pos, ok := edgePos[k]; ok {
@@ -1834,6 +2004,21 @@ func (s *Store) copyBulkLocked(nodes []*graph.Node, edges []*graph.Edge) error {
 			}
 		}
 	}
+	// NOTE: an earlier revision pre-filtered nodes against the live
+	// Node table here via a `MATCH (n:Node) WHERE n.id IN $ids` probe
+	// to make COPY idempotent against duplicate primary keys. That
+	// query crashed the daemon with `IO exception: Cannot read from
+	// file ... position: <bytes>` because it issued a read on the
+	// same .lbug file that a concurrent COPY (from a sibling
+	// per-repo IndexCtx whose FlushBulk had already released
+	// bulkSlot but still held writeMu inside runCopyPooled) was
+	// extending — Kuzu's MVCC can't serve a buffer-pool read while
+	// the file is being grown by another transaction in the same
+	// process. The sanitize-aware dedup above is the cheaper and
+	// safer fix for the duplicate-PK class this filter was meant to
+	// catch; cross-bulk collisions are now rare enough that the
+	// per-COPY error message (handled by the caller's retry) is
+	// acceptable when they happen.
 
 	if len(nodes) == 0 && len(edges) == 0 {
 		return nil
@@ -2077,8 +2262,8 @@ func (s *Store) ResolveUniqueNames() (int, error) {
 	// pair so a direct SET of from/to is not supported).
 	const q = `
 MATCH (caller:Node)-[e:Edge]->(stub:Node)
-WHERE stub.id STARTS WITH 'unresolved::'
-WITH e, caller, stub, substring(stub.id, 13, size(stub.id) - 12) AS name
+WHERE stub.kind = 'unresolved'
+WITH e, caller, stub, stub.name AS name
 OPTIONAL MATCH (cnd:Node {name: name})
 WITH e, caller, stub, name, count(cnd) AS cnt
 WHERE cnt = 1

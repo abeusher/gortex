@@ -346,7 +346,7 @@ func (s *Store) FileEditingContext(filePath string, kinds []graph.NodeKind) *gra
 	if filePath == "" {
 		return nil
 	}
-	const fileQ = `MATCH (n:Node {file_path: $f}) RETURN ` + nodeReturnCols
+	const fileQ = `MATCH (n:Node) WHERE n.file_path = $f RETURN ` + nodeReturnCols
 	rows := s.querySelect(fileQ, map[string]any{"f": filePath})
 	nodes := rowsToNodes(rows)
 	if len(nodes) == 0 {
@@ -375,8 +375,8 @@ func (s *Store) FileEditingContext(filePath string, kinds []graph.NodeKind) *gra
 		}
 	}
 	if res.FileNode != nil {
-		const importQ = `MATCH (a:Node {id: $id})-[e:Edge]->(b:Node)
-WHERE e.kind = 'imports'
+		const importQ = `MATCH (a:Node)-[e:Edge]->(b:Node)
+WHERE a.id = $id AND e.kind = 'imports'
 RETURN ` + edgeReturnCols
 		importRows := s.querySelect(importQ, map[string]any{"id": res.FileNode.ID})
 		res.Imports = rowsToEdges(importRows)
@@ -508,29 +508,20 @@ func (s *Store) GetFileSubGraph(filePath string) ([]*graph.Node, []*graph.Edge) 
 	if filePath == "" {
 		return nil, nil
 	}
-	// File node — primary-key probe.
-	const fileQ = `MATCH (n:Node {id: $id}) RETURN ` + nodeReturnCols
-	fileRows := s.querySelect(fileQ, map[string]any{"id": filePath})
-	fileNodes := rowsToNodes(fileRows)
-	if len(fileNodes) == 0 || fileNodes[0].Kind != graph.KindFile {
+	// Collect the file node plus every symbol anchored to it via the
+	// file_path column, exactly like the canonical in-memory
+	// Graph.GetFileSubGraph (which resolves members through
+	// GetFileNodes). The earlier revision walked file→symbol
+	// `defines`/`contains` edges instead, but the ladybug COPY and
+	// incremental-reindex paths never persist those edges — so the
+	// child set came back empty and get_file_summary reported "no
+	// symbols found" for every file. GetFileNodes routes through the
+	// file→id accelerator (a PK MATCH on the id set), so this is both
+	// correct and as cheap as the broken edge walk it replaces.
+	nodes := s.GetFileNodes(filePath)
+	if len(nodes) == 0 {
 		return nil, nil
 	}
-	fileNode := fileNodes[0]
-	// Children — rel-table FROM-index walk from the file node, union
-	// of defines (real symbols) + contains (side-band nodes — imports
-	// today, todos / fixtures tomorrow). Empirically faster on Kuzu
-	// than `MATCH (n) WHERE n.id IN $ids` over the same id set: the
-	// rel walk is a single contiguous FROM-index scan, while the
-	// IN-list plan falls back to a node-table scan in the current
-	// version.
-	childQ := `MATCH (f:Node {id: $id})-[e:Edge]->(s:Node)
-WHERE e.kind IN ['defines','contains']
-RETURN ` + prefixedNodeReturnCols("s")
-	childRows := s.querySelect(childQ, map[string]any{"id": filePath})
-	children := rowsToNodes(childRows)
-	nodes := make([]*graph.Node, 0, 1+len(children))
-	nodes = append(nodes, fileNode)
-	nodes = append(nodes, children...)
 	ids := make([]string, 0, len(nodes))
 	for _, n := range nodes {
 		if n != nil && n.ID != "" {
@@ -600,42 +591,37 @@ func (s *Store) GetFileSubGraphCounts(filePath string) ([]*graph.Node, int) {
 	if filePath == "" {
 		return nil, 0
 	}
-	const fileQ = `MATCH (n:Node {id: $id}) RETURN ` + nodeReturnCols
-	fileRows := s.querySelect(fileQ, map[string]any{"id": filePath})
-	fileNodes := rowsToNodes(fileRows)
-	if len(fileNodes) == 0 || fileNodes[0].Kind != graph.KindFile {
+	// Collect the file's nodes via the file_path accelerator — same
+	// fix as GetFileSubGraph: the old file→symbol `defines`/`contains`
+	// edge walk found nothing because those edges are never persisted
+	// to ladybug, so the count came back 0 for every file.
+	nodes := s.GetFileNodes(filePath)
+	if len(nodes) == 0 {
 		return nil, 0
 	}
-	fileNode := fileNodes[0]
-	childQ := `MATCH (f:Node {id: $id})-[e:Edge]->(s:Node)
-WHERE e.kind IN ['defines','contains']
-RETURN ` + prefixedNodeReturnCols("s")
-	childRows := s.querySelect(childQ, map[string]any{"id": filePath})
-	children := rowsToNodes(childRows)
-	nodes := make([]*graph.Node, 0, 1+len(children))
-	nodes = append(nodes, fileNode)
-	nodes = append(nodes, children...)
-	// Count adjacent edges via two scalar aggregates that pivot off
-	// the same file-node walk + rel-table indexes the node fetch uses.
-	// outQ counts edges leaving any defined/contained symbol; inQ
+	ids := make([]string, 0, len(nodes))
+	for _, n := range nodes {
+		if n != nil && n.ID != "" {
+			ids = append(ids, n.ID)
+		}
+	}
+	if len(ids) == 0 {
+		return nodes, 0
+	}
+	// Count adjacent edges via two scalar aggregates over the node-id
+	// set. outQ counts edges leaving any of the file's nodes; inQ
 	// counts edges arriving at any of them. The two counts overlap on
 	// intra-file edges (whose endpoints are both children of this
 	// file), so the returned total is an upper bound — exact for
 	// files dominated by cross-file references, slightly inflated for
 	// files dominated by intra-file structural edges. We accept the
-	// imprecision because the dedup query (a third 3-pattern join)
-	// adds more latency than the inflated count costs the gcx caller,
-	// who only renders it as a `total_edges` header scalar, never as
+	// imprecision because the dedup query (a third pattern join) adds
+	// more latency than the inflated count costs the gcx caller, who
+	// only renders it as a `total_edges` header scalar, never as
 	// anything load-bearing.
-	const outCountQ = `MATCH (f:Node {id: $id})-[de:Edge]->(s:Node)
-WHERE de.kind IN ['defines','contains']
-MATCH (s)-[e:Edge]->(:Node)
-RETURN count(e)`
-	const inCountQ = `MATCH (f:Node {id: $id})-[de:Edge]->(s:Node)
-WHERE de.kind IN ['defines','contains']
-MATCH (:Node)-[e:Edge]->(s)
-RETURN count(e)`
-	args := map[string]any{"id": filePath}
+	const outCountQ = `MATCH (a:Node)-[e:Edge]->(b:Node) WHERE a.id IN $ids RETURN count(e)`
+	const inCountQ = `MATCH (a:Node)-[e:Edge]->(b:Node) WHERE b.id IN $ids RETURN count(e)`
+	args := map[string]any{"ids": stringSliceToAny(ids)}
 	scan := func(q string) int64 {
 		rows := s.querySelect(q, args)
 		if len(rows) == 0 || len(rows[0]) == 0 {

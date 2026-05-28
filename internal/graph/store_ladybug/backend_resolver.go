@@ -2,6 +2,56 @@ package store_ladybug
 
 import "fmt"
 
+// upgradeUnresolvedStubs stamps `kind='unresolved'` plus the extracted
+// `name` and `repo_prefix` on every auto-stub the bulk COPY created for
+// an unresolved call target. Without this, the per-rule resolver
+// queries below would never find the stubs in multi-repo mode because:
+//
+//   - copyBulkLocked rewrites unresolved IDs to `<repoPrefix>::unresolved::<name>`
+//     (to dodge cross-repo PK collisions on the shared SymbolFTS / Node
+//     tables).
+//   - The auto-stub at copyBulkLocked creates Node rows for these
+//     rewritten IDs with empty Name / Kind / RepoPrefix.
+//   - Every original resolver rule did
+//     `WHERE stub.id STARTS WITH 'unresolved::'` — literal — which
+//     never matches `gortex::unresolved::AddNode`. The fallback
+//     `substring(stub.id, 13, ...)` for name extraction was also
+//     keyed to the un-prefixed form.
+//
+// The upgrade runs once per ResolveAllBulk pass, before the
+// downstream rules. After it runs, every stub carries:
+//   - kind = 'unresolved'
+//   - name = the bare symbol name (last segment after `unresolved::`)
+//   - repo_prefix = empty for the legacy form, or the prefix for the
+//                   multi-repo form
+//
+// The rules below then MATCH `stub.kind = 'unresolved'` and read
+// `stub.name` directly — no substring math, no format coupling.
+func (s *Store) upgradeUnresolvedStubs() (int, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	// Stub IDs come in two encodings:
+	//   unresolved::Name                 (legacy / single-repo)
+	//   <repoPrefix>::unresolved::Name   (multi-repo COPY rewrite)
+	//
+	// regexp_replace strips everything up to and including the
+	// last `unresolved::` substring, leaving the bare name on
+	// `stub.name`. The repo prefix is everything before
+	// `::unresolved::` (or empty for the single-repo form).
+	const q = `
+MATCH (stub:Node)
+WHERE (stub.id STARTS WITH 'unresolved::' OR stub.id CONTAINS '::unresolved::')
+  AND (stub.kind = '' OR stub.kind IS NULL)
+SET stub.kind = 'unresolved',
+    stub.name = regexp_replace(stub.id, '^.*unresolved::', ''),
+    stub.repo_prefix = CASE
+        WHEN stub.id STARTS WITH 'unresolved::' THEN ''
+        ELSE regexp_replace(stub.id, '::unresolved::.*$', '')
+    END
+RETURN count(stub) AS upgraded`
+	return s.runResolverQueryLocked(q, "upgradeUnresolvedStubs")
+}
+
 // ResolveSameFile pushes the same-source-file resolution pass into
 // the Kuzu engine. For every `unresolved::Name` edge, look for a
 // Node with that name whose file_path matches the caller's
@@ -17,8 +67,8 @@ func (s *Store) ResolveSameFile() (int, error) {
 	// Two-pass to keep `target` typed as Node through the CREATE.
 	const q = `
 MATCH (caller:Node)-[e:Edge]->(stub:Node)
-WHERE stub.id STARTS WITH 'unresolved::' AND caller.file_path <> ''
-WITH e, caller, stub, substring(stub.id, 13, size(stub.id) - 12) AS name
+WHERE stub.kind = 'unresolved' AND caller.file_path <> ''
+WITH e, caller, stub, stub.name AS name
 OPTIONAL MATCH (cnd:Node {name: name})
 WHERE cnd.file_path = caller.file_path AND cnd.id <> stub.id
 WITH e, caller, stub, name, count(cnd) AS cnt
@@ -56,10 +106,10 @@ func (s *Store) ResolveSamePackage() (int, error) {
 	// CONTAINS to skip top-level files.
 	const q = `
 MATCH (caller:Node)-[e:Edge]->(stub:Node)
-WHERE stub.id STARTS WITH 'unresolved::'
+WHERE stub.kind = 'unresolved'
   AND caller.file_path <> ''
   AND caller.file_path CONTAINS '/'
-WITH e, caller, stub, substring(stub.id, 13, size(stub.id) - 12) AS name,
+WITH e, caller, stub, stub.name AS name,
      regexp_replace(caller.file_path, '/[^/]+$', '') AS caller_dir
 OPTIONAL MATCH (cnd:Node {name: name})
 WHERE cnd.repo_prefix = caller.repo_prefix
@@ -105,14 +155,14 @@ func (s *Store) ResolveImportAware() (int, error) {
 	defer s.writeMu.Unlock()
 	const q = `
 MATCH (caller:Node)-[e:Edge]->(stub:Node)
-WHERE stub.id STARTS WITH 'unresolved::' AND caller.file_path <> ''
-WITH e, caller, stub, substring(stub.id, 13, size(stub.id) - 12) AS name
+WHERE stub.kind = 'unresolved' AND caller.file_path <> ''
+WITH e, caller, stub, stub.name AS name
 MATCH (callerFile:Node {file_path: caller.file_path})
 WHERE callerFile.kind = 'file'
 MATCH (callerFile)-[imp:Edge {kind: 'imports'}]->(importedFile:Node)
 WHERE importedFile.kind = 'file'
   AND NOT (importedFile.id STARTS WITH 'external::')
-  AND NOT (importedFile.id STARTS WITH 'unresolved::')
+  AND importedFile.kind <> 'unresolved'
 OPTIONAL MATCH (cnd:Node {name: name})
 WHERE cnd.file_path = importedFile.file_path
   AND cnd.id <> stub.id
@@ -161,8 +211,8 @@ func (s *Store) ResolveRelativeImports(lang string) (int, error) {
 	for _, suffix := range []string{".py", "/__init__.py"} {
 		q := `
 MATCH (caller:Node)-[e:Edge {kind: 'imports'}]->(stub:Node)
-WHERE stub.id STARTS WITH 'unresolved::pyrel::'
-WITH e, caller, stub, substring(stub.id, 20, size(stub.id) - 19) AS stem
+WHERE stub.kind = 'unresolved' AND stub.name STARTS WITH 'pyrel::'
+WITH e, caller, stub, substring(stub.name, 7, size(stub.name) - 7) AS stem
 MATCH (target:Node {kind: 'file'})
 WHERE target.id = stem + '` + suffix + `'
 DELETE e
@@ -197,9 +247,9 @@ func (s *Store) ResolveCrossRepo() (int, error) {
 	defer s.writeMu.Unlock()
 	const q = `
 MATCH (caller:Node)-[e:Edge]->(stub:Node)
-WHERE stub.id STARTS WITH 'unresolved::'
+WHERE stub.kind = 'unresolved'
   AND caller.repo_prefix <> ''
-WITH e, caller, stub, substring(stub.id, 13, size(stub.id) - 12) AS name
+WITH e, caller, stub, stub.name AS name
 OPTIONAL MATCH (cnd:Node {name: name})
 WHERE cnd.repo_prefix <> caller.repo_prefix
   AND cnd.repo_prefix <> ''
@@ -294,6 +344,10 @@ func (s *Store) runResolverQueryLocked(query, ruleName string) (int, error) {
 func (s *Store) ResolveAllBulk() (int, error) {
 	var total int
 	for _, fn := range []func() (int, error){
+		// MUST run first: stamps kind='unresolved' + name + repo_prefix
+		// on the auto-stub Node rows so the rules below can match them
+		// in both `unresolved::*` and `<prefix>::unresolved::*` forms.
+		s.upgradeUnresolvedStubs,
 		s.ResolveSameFile,
 		s.ResolveSamePackage,
 		s.ResolveImportAware,
