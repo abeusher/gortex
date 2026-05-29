@@ -182,6 +182,16 @@ func EnrichGraph(g graph.Store, segments []Segment, modulePath string) int {
 	}
 
 	enriched := 0
+	// Collect every node whose Meta we stamp so we can round-trip it
+	// back through the store at the end. On the in-memory backend the
+	// in-place mutation already persists (n is the canonical node); on
+	// disk backends (Ladybug) n is a per-call GetNode/AllNodes
+	// reconstruction, so without the write-back the coverage_pct stamp
+	// is silently discarded the moment AllNodes' slice goes out of
+	// scope — leaving analyze:coverage_gaps / health_score's coverage
+	// axis empty on Ladybug. Mirrors releases.EnrichGraph and the reach
+	// index, which already round-trip Meta through AddNode/AddBatch.
+	var stamped []*graph.Node
 	for _, n := range g.AllNodes() {
 		if !shouldEnrichCoverage(n.Kind) {
 			continue
@@ -206,6 +216,7 @@ func EnrichGraph(g graph.Store, segments []Segment, modulePath string) int {
 			"num_stmt": stats.NumStmt,
 			"hit":      stats.Hit,
 		}
+		stamped = append(stamped, n)
 		enriched++
 
 		// EdgeCoveredBy: invert each EdgeTests pointing at this
@@ -239,6 +250,13 @@ func EnrichGraph(g graph.Store, segments []Segment, modulePath string) int {
 				},
 			})
 		}
+	}
+	// Persist the stamped node Meta back through the store in one batch
+	// (a no-op-ish re-insert on the in-memory backend, the durable write
+	// on disk backends). Without this the coverage_pct stamps never
+	// survive on Ladybug.
+	if len(stamped) > 0 {
+		g.AddBatch(stamped, nil)
 	}
 	return enriched
 }
