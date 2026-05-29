@@ -55,3 +55,16 @@ internal_docs/
 # liblbug native libraries are fetched at build time by
 # scripts/fetch-lbug.sh (run by make / CI / release), never committed.
 internal/thirdparty/go-ladybug/lib/
+
+# Ad-hoc bench/probe tooling — kept locally, not part of the repo.
+bench/all-tools-bench/
+bench/daemon-bench/
+bench/edge-diff/
+bench/ladybug-bundle-probe/
+bench/multi-repo-bench/
+bench/node-diff/
+bench/store-bench/
+bench/unresolved-audit/
+bench/run-linux.sh
+bench/run-linux-rest.sh
+cmd/lbug-probe/
