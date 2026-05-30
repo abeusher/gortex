@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 
+	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_ladybug"
 )
@@ -17,7 +18,17 @@ func openLadybugBackend(path string, bufferPoolMB uint64) (graph.Store, func(), 
 		BufferPoolMB: bufferPoolMB,
 	})
 	if err != nil {
-		return nil, nil, fmt.Errorf("open ladybug store at %q: %w", path, err)
+		// liblbug collapses every open failure — including "another
+		// process already holds the lock on this store" — into a single
+		// generic status with no message (lbug_state is just Success/Error,
+		// and lbug_database_init exposes no error string). A second gortex
+		// process on the same store is the most common cause, so name it
+		// instead of leaving the user the bare, unactionable status code.
+		hint := "if another gortex daemon or server is using this store, stop it first (`gortex daemon status` / `gortex daemon stop`)"
+		if pid, ok := daemon.RunningPID(); ok {
+			hint = fmt.Sprintf("a gortex daemon is already running (pid %d) — stop it with `gortex daemon stop`, or use `gortex daemon restart`", pid)
+		}
+		return nil, nil, fmt.Errorf("open ladybug store at %q: %w (%s)", path, err, hint)
 	}
 	return s, func() { _ = s.Close() }, nil
 }

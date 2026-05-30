@@ -130,6 +130,17 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 	if daemon.IsRunning() {
 		return fmt.Errorf("daemon already running (socket: %s)", daemon.SocketPath())
 	}
+	// IsRunning only probes the socket. A daemon that is mid-shutdown — or
+	// one whose socket wedged — still owns the PID file and, crucially, still
+	// holds the store's on-disk lock. Starting over the top of it makes the
+	// backend open fail with an opaque "failed to open database" lock
+	// conflict, so refuse early with the PID and an actionable next step. The
+	// detached child reaches here too, but it hasn't written its own PID file
+	// yet (that happens in the serve loop), so this can't false-positive on
+	// the daemon we're in the middle of starting.
+	if pid, ok := daemon.RunningPID(); ok {
+		return fmt.Errorf("daemon already running (pid %d) — stop it with `gortex daemon stop`, or use `gortex daemon restart`", pid)
+	}
 	if daemonDetach && os.Getenv("GORTEX_DAEMON_CHILD") != "1" {
 		return spawnDetachedDaemon()
 	}
@@ -655,6 +666,13 @@ func emitDaemonStartSummary(w io.Writer, pid int, elapsed time.Duration) {
 func runDaemonStop(cmd *cobra.Command, _ []string) error {
 	w := cmd.ErrOrStderr()
 	if !daemon.IsRunning() {
+		// The socket is gone, but a process may still be alive and holding
+		// the store lock — a daemon mid-shutdown, or one whose socket wedged.
+		// killByPID terminates it AND blocks until it has actually exited,
+		// which is what `daemon restart` relies on to not race the lock.
+		if _, ok := daemon.RunningPID(); ok {
+			return killByPID()
+		}
 		emitDaemonStopAlreadyDown(w)
 		return nil
 	}
@@ -663,6 +681,13 @@ func runDaemonStop(cmd *cobra.Command, _ []string) error {
 	// post-stop summary (the socket file vanishes on clean shutdown).
 	socket := daemon.SocketPath()
 	uptime := daemonUptimeBeforeStop()
+	// Capture the PID too. ControlShutdown only *acks* — the daemon then
+	// flushes and closes the store (releasing its on-disk lock) and exits
+	// asynchronously (see server.go: the handler Shutdown()s ~100ms later in
+	// a goroutine). We must block until that process is gone, or a following
+	// `daemon start` races the still-held lock and dies with the opaque
+	// "failed to open database with status 1".
+	pid, havePID := daemon.RunningPID()
 
 	c, err := daemon.Dial(daemon.Handshake{Mode: daemon.ModeControl, ClientName: "cli"})
 	if err != nil {
@@ -678,8 +703,37 @@ func runDaemonStop(cmd *cobra.Command, _ []string) error {
 	if !resp.OK {
 		return fmt.Errorf("shutdown rejected: %s %s", resp.ErrorCode, resp.ErrorMsg)
 	}
+	if havePID {
+		waitForDaemonExit(pid)
+	}
 	emitDaemonStopSummary(w, socket, uptime)
 	return nil
+}
+
+// waitForDaemonExit blocks until the daemon process pid has exited — and thus
+// released the store's on-disk lock — force-killing it if a graceful shutdown
+// stalls. This is what makes `daemon stop` honest: when it returns, the store
+// is free for the next process, which is the foundation `daemon restart`
+// stands on. Polls cheaply; the common case (a clean flush) clears in well
+// under a second.
+func waitForDaemonExit(pid int) {
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if !platform.ProcessAlive(pid) {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	// Graceful shutdown stalled (e.g. a wedged cgo call). Don't leave a
+	// half-exited daemon clutching the lock — force it, then clean up the
+	// socket/PID so the next start isn't tripped by stale files.
+	fmt.Fprintln(os.Stderr, "[gortex daemon] graceful shutdown timed out — force-killing")
+	_ = platform.KillProcess(pid)
+	for i := 0; i < 60 && platform.ProcessAlive(pid); i++ {
+		time.Sleep(50 * time.Millisecond)
+	}
+	_ = os.Remove(daemon.PIDFilePath())
+	_ = os.Remove(daemon.SocketPath())
 }
 
 // daemonUptimeBeforeStop best-effort-fetches the daemon's reported uptime via
@@ -755,14 +809,16 @@ func runDaemonRestart(cmd *cobra.Command, args []string) error {
 
 	emitDaemonRestartBanner(cmd.ErrOrStderr())
 
-	// Stop is idempotent when not running.
+	// Stop is idempotent when not running and now blocks until the old
+	// process has fully exited — releasing the store's on-disk lock — before
+	// returning. That's what lets the start below reuse the store without
+	// racing the lock. The old code polled `daemon.IsRunning()` here, which
+	// watched the wrong resource: the socket is torn down ~100ms after the
+	// shutdown ack, long before the process exits and the lock clears, so the
+	// poll fell through early and the restart died on "failed to open
+	// database with status 1".
 	if err := runDaemonStop(cmd, args); err != nil {
 		return err
-	}
-	// Give the OS a moment to release the socket file.
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) && daemon.IsRunning() {
-		time.Sleep(50 * time.Millisecond)
 	}
 	daemonDetach = true
 	return runDaemonStart(cmd, args)

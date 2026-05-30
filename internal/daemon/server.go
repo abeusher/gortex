@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -610,6 +611,39 @@ func (s *Server) writePIDFile() error {
 		}
 	}
 	return os.WriteFile(path, []byte(strconv.Itoa(os.Getpid())), 0o600)
+}
+
+// RunningPID reports the PID of a live daemon recorded in the PID file, or
+// (0, false) when none is. Unlike IsRunning — which only probes the control
+// socket — this still reports a daemon that is *mid-shutdown*: the
+// ControlShutdown handler tears the listener down ~100ms after acking, but
+// the process stays alive while it flushes and closes the store, and it
+// holds the store's on-disk lock until it exits. That window is exactly what
+// turned a quick restart into a "failed to open database" lock conflict, so
+// callers that must not start a second daemon over the top of a dying one —
+// or that need to wait for it to exit — consult this, not the socket.
+//
+// A PID file whose process is dead is stale (the owner crashed without
+// cleanup) and reported as not-running, mirroring writePIDFile's own
+// staleness handling.
+func RunningPID() (int, bool) {
+	b, err := os.ReadFile(PIDFilePath())
+	if err != nil {
+		return 0, false
+	}
+	// TrimSpace so a PID file written with a trailing newline — by a shell
+	// `echo`, a process manager, or a hand edit — still parses. The daemon
+	// writes it without one, but tolerating both is free and the silent
+	// failure mode (guard never fires, restart races the lock again) is
+	// exactly the bug this helper exists to prevent.
+	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil || pid <= 0 {
+		return 0, false
+	}
+	if !platform.ProcessAlive(pid) {
+		return 0, false
+	}
+	return pid, true
 }
 
 func (s *Server) trackConn(c net.Conn) {
