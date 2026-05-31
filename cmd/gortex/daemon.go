@@ -102,8 +102,8 @@ func init() {
 		"also expose the MCP 2026 Streamable HTTP transport on this TCP address (e.g. 127.0.0.1:7411); empty disables")
 	daemonStartCmd.Flags().StringVar(&daemonHTTPAuthToken, "http-auth-token", "",
 		"bearer token required on every Streamable HTTP request (default: read $GORTEX_DAEMON_HTTP_TOKEN; empty allows unauthenticated localhost binds)")
-	daemonStartCmd.Flags().StringVar(&daemonBackend, "backend", "ladybug",
-		"storage backend: ladybug (default — embedded Cypher graph DB, persists to --backend-path so warm restarts skip re-indexing) | memory (in-process, no persistence — fastest per-op but pays the full cold-warmup cost on every restart)")
+	daemonStartCmd.Flags().StringVar(&daemonBackend, "backend", "sqlite",
+		"storage backend: sqlite (default — pure-Go embedded SQL, zero CGo, persists to --backend-path so warm restarts skip re-indexing) | ladybug (embedded Cypher graph DB, requires CGo) | memory (in-process, no persistence — fastest per-op but pays the full cold-warmup cost on every restart)")
 	daemonStartCmd.Flags().StringVar(&daemonBackendPath, "backend-path", "",
 		"directory where the on-disk backend persists its store. Required when --backend != memory. Default: ~/.gortex/<backend>.store")
 	daemonStartCmd.Flags().Uint64Var(&daemonBackendBufferPoolMB, "backend-buffer-pool-mb", 0,

@@ -44,8 +44,15 @@ func openBackend(name, path string, bufferPoolMB uint64, logger *zap.Logger) (gr
 			zap.Bool("prepared_stmt_cache", ladybugStmtCacheEnabled()),
 		)
 		return openLadybugBackend(resolved, bufferPoolMB)
+	case "sqlite", "sqlite3":
+		resolved, err := resolveBackendPath(path, "store.sqlite")
+		if err != nil {
+			return nil, nil, err
+		}
+		logger.Info("opening sqlite backend", zap.String("path", resolved))
+		return openSqliteBackend(resolved, bufferPoolMB)
 	default:
-		return nil, nil, fmt.Errorf("unknown --backend %q (expected: memory, ladybug)", name)
+		return nil, nil, fmt.Errorf("unknown --backend %q (expected: memory, ladybug, sqlite)", name)
 	}
 }
 

@@ -1,5 +1,3 @@
-//go:build ladybug
-
 package indexer
 
 import (
@@ -14,7 +12,7 @@ import (
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
-	"github.com/zzet/gortex/internal/graph/store_ladybug"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/parser/languages"
 )
@@ -29,7 +27,7 @@ import (
 // on len(pending) == 0.
 //
 // The test indexes the same Python project twice — once into an in-memory
-// *Graph (no shadow swap), once into a ladybug *Store (shadow swap engaged)
+// *Graph (no shadow swap), once into a sqlite *Store (shadow swap engaged)
 // — and asserts both produce the same node ID set and the same module
 // attribution output (KindModule nodes for pypi imports).
 func TestShadowSwap_ResolverFollowsGraphPointer(t *testing.T) {
@@ -77,16 +75,16 @@ def fetch(url):
 	memG := graph.New()
 	memIDs := indexAndCollect(t, memG)
 
-	lbugDir := t.TempDir()
-	lbugStore, err := store_ladybug.Open(filepath.Join(lbugDir, "store.lbug"))
+	sqliteDir := t.TempDir()
+	sqliteStore, err := store_sqlite.Open(filepath.Join(sqliteDir, "store.sqlite"))
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = lbugStore.Close() })
+	t.Cleanup(func() { _ = sqliteStore.Close() })
 
-	// Sanity: ladybug implements BulkLoader so the shadow swap engages.
-	_, isBulk := graph.Store(lbugStore).(graph.BulkLoader)
-	require.True(t, isBulk, "ladybug must implement BulkLoader for this regression to exercise the shadow swap")
+	// Sanity: sqlite implements BulkLoader so the shadow swap engages.
+	_, isBulk := graph.Store(sqliteStore).(graph.BulkLoader)
+	require.True(t, isBulk, "sqlite must implement BulkLoader for this regression to exercise the shadow swap")
 
-	dskIDs := indexAndCollect(t, lbugStore)
+	dskIDs := indexAndCollect(t, sqliteStore)
 
 	// The KindModule node the resolver materialises for `import requests`
 	// is the canary — without the fix it never gets written, because
@@ -110,7 +108,7 @@ def fetch(url):
 	sort.Strings(onlyMem)
 	sort.Strings(onlyDsk)
 	assert.Empty(t, onlyMem, "nodes only in memory: %v", onlyMem)
-	assert.Empty(t, onlyDsk, "nodes only in ladybug: %v", onlyDsk)
+	assert.Empty(t, onlyDsk, "nodes only in sqlite: %v", onlyDsk)
 }
 
 func setDiff(a, b map[string]string) []string {
