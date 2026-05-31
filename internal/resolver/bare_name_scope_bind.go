@@ -27,14 +27,14 @@ type scopeNode struct {
 // Two precedence rules govern the choice when more than one candidate
 // matches the name:
 //
-//	1. KindLocal beats KindParam — Go shadowing semantics, a local
-//	   declared with the same name as a parameter takes over from its
-//	   declaration line onwards.
-//	2. Among KindLocal candidates the most recently declared one before
-//	   the reference line wins (the standard "last shadow in scope"
-//	   rule). The edge's Line field is the reference site; we filter
-//	   candidates to StartLine <= reference line and pick the maximum
-//	   StartLine.
+//  1. KindLocal beats KindParam — Go shadowing semantics, a local
+//     declared with the same name as a parameter takes over from its
+//     declaration line onwards.
+//  2. Among KindLocal candidates the most recently declared one before
+//     the reference line wins (the standard "last shadow in scope"
+//     rule). The edge's Line field is the reference site; we filter
+//     candidates to StartLine <= reference line and pick the maximum
+//     StartLine.
 //
 // Ambiguous cases that don't resolve to one winner (e.g. two locals
 // with the same Name on the same StartLine, or no candidate before

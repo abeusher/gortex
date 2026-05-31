@@ -216,7 +216,7 @@ func TestFTS_MultiTermRecall(t *testing.T) {
 	}
 
 	// Also test with the conjunctive=false / top=10 option syntax
-	// that some Kuzu / Ladybug builds accept.
+	// that some Ladybugdb/ Ladybug builds accept.
 	probes2 := []struct {
 		name  string
 		query string

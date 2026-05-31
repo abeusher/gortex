@@ -48,7 +48,7 @@ func (s *Store) ExtractCandidates(
 	// call site / line), so we MUST distinct over the endpoint id —
 	// not the edge — to match the in-memory reference.
 	//
-	// Implicit GROUP BY on n.id: Kuzu groups by every non-aggregate
+	// Implicit GROUP BY on n.id: Ladybugdbgroups by every non-aggregate
 	// projection column.
 	const callerQ = `
 MATCH (c:Node)-[e:Edge]->(n:Node)
@@ -578,7 +578,7 @@ func (s *Store) GetFileSubGraph(filePath string) ([]*graph.Node, []*graph.Edge) 
 // Both the node fetch and the edge aggregates pivot off the file-node
 // PK + rel-table FROM walk (same shape GetFileSubGraph uses). The
 // alternative — `WHERE id IN $ids` over the Go-side accelerator's id
-// list — proved 4-5× slower on the current Kuzu version because the
+// list — proved 4-5× slower on the current Ladybugdbversion because the
 // planner falls back to a node-table scan instead of using the
 // primary-key HASH index for the IN predicate.
 //

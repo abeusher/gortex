@@ -51,7 +51,7 @@ func (s *Store) querySelect(query string, args map[string]any) [][]any {
 //
 // Engine errors on the read path are logged + the partial-or-empty
 // row buffer is returned instead of panicking. A read failure here
-// is almost always a transient Kuzu IO exception (e.g. a buffer-pool
+// is almost always a transient LadybugdbIO exception (e.g. a buffer-pool
 // read landing in the middle of a concurrent COPY's file extension —
 // "Cannot read N bytes at position M") and used to kill the daemon
 // via panicOnFatal. The graph.Store interface still has no error

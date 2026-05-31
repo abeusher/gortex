@@ -7,7 +7,7 @@ import (
 )
 
 // fileIDIndex is a Go-side accelerator that maps each file path to the
-// set of node IDs anchored to that file. Kuzu does not expose a
+// set of node IDs anchored to that file. Ladybugdbdoes not expose a
 // secondary index on `Node.file_path`, so every "find the symbols in
 // this file" lookup defaulted to a full Node-table scan
 // (`MATCH (n {file_path: $f})` — 213 k rows on the gortex graph for one

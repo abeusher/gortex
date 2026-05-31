@@ -22,7 +22,7 @@ var (
 //
 // Strategy: one Cypher per requested node kind. A single combined
 // query that switches the allowlist per row is harder to express in
-// Kuzu Cypher than the ~6-8 per-kind queries cost (and the per-query
+// LadybugdbCypher than the ~6-8 per-kind queries cost (and the per-query
 // cgo overhead is amortised against the rows that DO ship back).
 // Shape: WHERE NOT EXISTS { MATCH ()-[e:Edge]->(n) WHERE e.kind IN
 // $allowed }, confirmed via TestDeadCode_Probe.

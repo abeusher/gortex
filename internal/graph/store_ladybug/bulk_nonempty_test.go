@@ -12,7 +12,7 @@ import (
 // failure: each per-repo Indexer drains to the shared store via its own
 // BeginBulkLoad/FlushBulk. The first repo COPYs into an empty Node
 // table (fine); every subsequent repo COPYs into a non-empty Node table
-// and Kuzu rejects it with "COPY into a non-empty primary-key node
+// and Ladybugdbrejects it with "COPY into a non-empty primary-key node
 // table without a hash index is not supported" — so on a fresh store
 // only the first repo persists.
 func TestCopyBulk_SecondLoadIntoNonEmpty(t *testing.T) {

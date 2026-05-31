@@ -144,7 +144,7 @@ func (s *Store) FindNodesByNameContaining(substr string, limit int) []*graph.Nod
 // GetFileNodes returns every node anchored to filePath.
 func (s *Store) GetFileNodes(filePath string) []*graph.Node {
 	// Fast path via the Go-side file→id accelerator: hand the ids
-	// straight to a primary-key MATCH so Kuzu uses the HASH PK
+	// straight to a primary-key MATCH so Ladybugdbuses the HASH PK
 	// index instead of full-scanning Node to find a missing
 	// file_path secondary index.
 	if s.fileIDs != nil {
@@ -200,7 +200,7 @@ func (s *Store) GetRepoEdges(repoPrefix string) []*graph.Edge {
 // The target predicate is expressed as `WHERE b.id = $id`, not an
 // inline `(b:Node {id: $id})` property match on the arrow target.
 // On a populated workspace the inline form silently returns zero rows
-// — the Kuzu planner skips the primary-key probe on the rel-table
+// — the Ladybugdbplanner skips the primary-key probe on the rel-table
 // target side and the join collapses to empty. Find_usages /
 // get_callers / analyze[cycles] / suggest_pattern all funnel through
 // this single primitive, so the empty result cascades into a

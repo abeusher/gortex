@@ -151,7 +151,7 @@ RETURN n.id, count(*)`
 		if id == "" {
 			continue
 		}
-		// Kuzu returns count(*) as an int64.
+		// Ladybugdbreturns count(*) as an int64.
 		switch v := r[1].(type) {
 		case int64:
 			out[id] = int(v)

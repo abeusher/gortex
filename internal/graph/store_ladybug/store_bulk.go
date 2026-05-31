@@ -151,7 +151,7 @@ func (s *Store) copyBulkLocked(nodes []*graph.Node, edges []*graph.Edge) error {
 	// characters (e.g. extractor output with embedded newlines in an
 	// inline TypeScript object-type literal: `unresolved::{   foo:
 	// X[]\n   bar: () => Y }`) collapse to the same column-0 value at
-	// COPY time, and Kuzu rejects the run with "duplicated primary
+	// COPY time, and Ladybugdbrejects the run with "duplicated primary
 	// key value". Using the sanitized form here keeps the dedup map's
 	// view of "same node" aligned with what the COPY parser sees. We
 	// also normalize n.ID to the sanitized form so the auto-stub and
@@ -285,7 +285,7 @@ func (s *Store) copyBulkLocked(nodes []*graph.Node, edges []*graph.Edge) error {
 			if !isNonEmptyNodeCopyErr(err) {
 				return fmt.Errorf("copy nodes: %w", err)
 			}
-			// Kuzu rejects COPY into a non-empty primary-key node table
+			// Ladybugdbrejects COPY into a non-empty primary-key node table
 			// unless its PK hash index is currently materialised — and
 			// that depends on auto-checkpoint timing, so on a fresh
 			// store every per-repo drain after the first fails here
@@ -740,7 +740,7 @@ func sanitizeTSV(s string) string {
 // escapeCypherStringLit escapes a string for safe use inside a Cypher
 // single-quoted literal — turns ' into \' and \ into \\. Used for
 // COPY FROM paths, which are templated into the Cypher query (no
-// parameter binding for COPY paths in the current Kuzu binding).
+// parameter binding for COPY paths in the current Ladybugdbbinding).
 func escapeCypherStringLit(s string) string {
 	s = strings.ReplaceAll(s, `\`, `\\`)
 	s = strings.ReplaceAll(s, `'`, `\'`)

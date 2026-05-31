@@ -452,7 +452,7 @@ type SymbolBundle struct {
 // (FTS → IDs, then a node batch + an outgoing-edge batch + an
 // inbound-edge batch on those IDs). A single combined Cypher with
 // OPTIONAL MATCH + collect() is slower in practice — the
-// cross-product Kuzu builds across the two OPTIONAL MATCH +
+// cross-product Ladybugdbbuilds across the two OPTIONAL MATCH +
 // collect frames outweighs the cgo saving (probe: 150ms median vs
 // the 4-query split's 68ms median on the same id set).
 type SymbolBundleSearcher interface {
