@@ -100,7 +100,7 @@ func init() {
 	serverCmd.Flags().BoolVar(&serverNoSemantic, "no-semantic", false, "disable semantic enrichment")
 	serverCmd.Flags().StringVar(&serverSemanticMode, "semantic-mode", "typecheck", "Go analysis mode: typecheck or callgraph")
 	serverCmd.Flags().StringVar(&serverSnapshot, "snapshot", "", "load a snapshot file at startup (gob+gzip; the format `gortex index --snapshot` writes). Used by gortex-cloud's per-workspace supervisor to boot from a precomputed snapshot.")
-	serverCmd.Flags().StringVar(&serverBackend, "backend", "memory", "storage backend: memory (in-process, default — fastest, no persistence) | ladybug (embedded Cypher graph DB — persists to --backend-path, slower per-op but cold-loads from disk) | cobalt (pure-Go embedded SQL graph store, zero CGo — persists to --backend-path)")
+	serverCmd.Flags().StringVar(&serverBackend, "backend", "memory", "storage backend: memory (in-process, default — fastest, no persistence) | ladybug (embedded Cypher graph DB — persists to --backend-path, slower per-op but cold-loads from disk)")
 	serverCmd.Flags().Uint64Var(&serverBackendBufferPoolMB, "backend-buffer-pool-mb", 0,
 		"page-cache cap for the on-disk backend in MiB. 0 falls back to 4096 (4 GiB); only consulted for --backend=ladybug")
 	serverCmd.Flags().StringVar(&serverBackendPath, "backend-path", "", "directory where the on-disk backend persists its store. Required when --backend != memory. Default: ~/.gortex/<backend>.store")
