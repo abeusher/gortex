@@ -290,6 +290,24 @@ func FindDeadCode(g graph.Store, processes *ProcessResult, excludePatterns []str
 			continue
 		}
 
+		// Synthetic external-symbol / stub nodes are NOT first-party
+		// code. The external-call attribution pass materialises imported
+		// stdlib / dependency / external symbols as KindFunction /
+		// KindMethod nodes (IDs like "stdlib::fmt::Sprintf",
+		// "dep::<mod>::Sym", "external::<path>::Sym") stamped with
+		// Meta["external"]=true; the stub layer mints "<kind>::*" IDs for
+		// stdlib/external_call/builtin/module targets. By construction
+		// these carry only inbound import / member_of links — never a
+		// call/reference usage edge — so they ALWAYS look dead. Reporting
+		// them buried the real first-party signal under thousands of
+		// stdlib/dep entries. Drop them unconditionally.
+		if graph.IsStub(n.ID) {
+			continue
+		}
+		if ext, _ := n.Meta["external"].(bool); ext {
+			continue
+		}
+
 		// Framework entry points, and everything in an entry-point
 		// file, are invoked by a runtime — never dead.
 		if isEntryPointNode(n) || entryPointFiles[n.FilePath] {
