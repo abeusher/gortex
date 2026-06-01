@@ -289,6 +289,15 @@ type Indexer struct {
 	// absent file produces empty rules and a no-op pass.
 	codeownersOnce  sync.Once
 	codeownersRules []codeowners.Rule
+
+	// cloneIndex maintains the clone-detection CMS + length-stratified
+	// LSH live across single-file edits, so a steady-state reindex
+	// updates EdgeSimilarTo edges in O(edited file) instead of the
+	// whole-graph detectClonesAndEmitEdges recompute. Constructed empty
+	// (built=false) — a batch/global clone pass calls Rebuild to seed it,
+	// after which indexFile drives EvictFuncs/UpdateFuncs. While un-built
+	// indexFile falls back to the whole-graph pass.
+	cloneIndex *incrementalCloneIndex
 }
 
 // contractCacheEntry is a cached contract-extraction result for one file.
@@ -325,6 +334,7 @@ func New(g graph.Store, reg *parser.Registry, cfg config.IndexConfig, logger *za
 		logger:        logger,
 		fileMtimes:    make(map[string]int64),
 		contractCache: make(map[string]*contractCacheEntry),
+		cloneIndex:    newIncrementalCloneIndex(),
 	}
 	// Resolve JS/TS imports declared through an npm alias against the
 	// local index. The index is built lazily on first use — the repo
@@ -685,7 +695,7 @@ func (idx *Indexer) RunGlobalGraphPasses(ctx context.Context) {
 		)
 	}
 	reporter.Report("clone detection pass (global)", 0, 0)
-	if cs := detectClonesAndEmitEdgesCtx(ctx, idx.graph, idx.cloneThreshold()); cs.Items > 0 {
+	if cs := detectClonesAndEmitEdgesCtx(ctx, idx.graph, idx.repoPrefix, idx.cloneThreshold()); cs.Items > 0 {
 		idx.logger.Info("clone edges emitted (global)",
 			zap.Int("items", cs.Items),
 			zap.Int("clone_pairs", cs.Pairs),
@@ -695,6 +705,12 @@ func (idx *Indexer) RunGlobalGraphPasses(ctx context.Context) {
 			zap.Int("diffused_pairs", cs.DiffusedPairs),
 			zap.Int("diffused_edges", cs.DiffusedEdges),
 		)
+	}
+	// Seed the incremental clone index from the freshly-baselined
+	// signatures + sidecar so steady-state single-file edits after this
+	// batch go incremental instead of re-running the whole-graph pass.
+	if idx.cloneIndex != nil {
+		idx.cloneIndex.Rebuild(idx.graph, idx.repoPrefix)
 	}
 	// gRPC stub-call resolution. Runs after InferImplements (the
 	// interface-satisfaction fallback signal depends on its
@@ -2315,7 +2331,7 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 				)
 			}
 			reporter.Report("clone detection pass", 0, 0)
-			if cs := detectClonesAndEmitEdgesCtx(ctx, idx.graph, idx.cloneThreshold()); cs.Items > 0 {
+			if cs := detectClonesAndEmitEdgesCtx(ctx, idx.graph, idx.repoPrefix, idx.cloneThreshold()); cs.Items > 0 {
 				idx.logger.Info("clone edges emitted",
 					zap.Int("items", cs.Items),
 					zap.Int("clone_pairs", cs.Pairs),
@@ -2325,6 +2341,14 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 					zap.Int("diffused_pairs", cs.DiffusedPairs),
 					zap.Int("diffused_edges", cs.DiffusedEdges),
 				)
+			}
+			// Seed the incremental clone index from the freshly-baselined
+			// signatures + sidecar so steady-state single-file edits go
+			// incremental (EvictFuncs/UpdateFuncs) instead of re-running
+			// this whole-graph pass per file. The batch pass remains the
+			// re-baseline (corrects CMS drift) and owns diffusion.
+			if idx.cloneIndex != nil {
+				idx.cloneIndex.Rebuild(idx.graph, idx.repoPrefix)
 			}
 			// gRPC stub-call resolution — runs once the call graph and
 			// interface inference are final. Skipped under
@@ -2497,10 +2521,18 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 	// In multi-repo mode, the graph stores prefixed file paths.
 	graphPath := idx.prefixPath(relPath)
 
-	// Evict existing data for this file (graph + search).
+	// Evict existing data for this file (graph + search). Capture the
+	// file's function/method node IDs BEFORE the evict so the
+	// incremental clone index can drop their CMS/LSH contributions —
+	// EvictFile removes the nodes (and their clone_sig) from the graph,
+	// so this is the only point we can recover what to evict.
+	var oldFuncIDs []string
 	for _, n := range idx.graph.GetFileNodes(graphPath) {
 		if n.Kind != graph.KindFile && n.Kind != graph.KindImport {
 			idx.search.Remove(n.ID)
+		}
+		if n.Kind == graph.KindFunction || n.Kind == graph.KindMethod {
+			oldFuncIDs = append(oldFuncIDs, n.ID)
 		}
 	}
 	idx.graph.EvictFile(graphPath)
@@ -2594,13 +2626,21 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 		// incremental edit stays O(file), not O(all edges).
 		idx.materializeDataflowParamsForFile(graphPath, result.Edges)
 		// Clone detection. EvictFile above removed this file's
-		// EdgeSimilarTo edges in both directions; a full recompute
-		// restores the correct set against the freshly stamped
-		// signatures. Skipped under deferGlobalPasses — a batch
-		// caller (ReconcileAll, warmup) runs the global pass once at
-		// the end instead of paying the O(functions) walk per file.
+		// EdgeSimilarTo edges in both directions. When the incremental
+		// clone index is built, re-bank just this file's bodies
+		// (EvictFuncs the old ids, UpdateFuncs the fresh nodes) — an
+		// O(edited file) update that restores the same edge set the
+		// whole-graph pass would. Until a batch/global pass has seeded
+		// the index (built=false) we fall back to the full recompute.
+		// Skipped under deferGlobalPasses — a batch caller (ReconcileAll,
+		// warmup) runs the global pass once at the end.
 		if !idx.deferGlobalPasses {
-			detectClonesAndEmitEdges(idx.graph, idx.cloneThreshold())
+			if idx.cloneIndex != nil && idx.cloneIndex.built {
+				idx.cloneIndex.EvictFuncs(idx.graph, oldFuncIDs)
+				idx.cloneIndex.UpdateFuncs(idx.graph, idx.repoPrefix, cloneFuncNodes(result.Nodes), idx.cloneThreshold())
+			} else {
+				detectClonesAndEmitEdges(idx.graph, idx.repoPrefix, idx.cloneThreshold())
+			}
 		}
 	}
 

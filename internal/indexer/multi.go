@@ -427,17 +427,46 @@ func (mi *MultiIndexer) RunGlobalGraphPasses(ctx context.Context) {
 			zap.Int("edges", emitted),
 		)
 	}
+	// Clone detection is PER-REPOSITORY: each tracked repo gets its own
+	// finalise + detect over its own nodes (scoped by RepoPrefix), so no
+	// cross-repo candidate pair is ever formed and each repo's boilerplate
+	// CMS / threshold is computed from that repo's bodies alone. This
+	// matches the per-repo incremental maintainer (cloneIndex.Rebuild /
+	// UpdateFuncs) so the batch and incremental edge sets agree.
 	reporter.Report("clone detection pass (global)", 0, 0)
-	if cs := detectClonesAndEmitEdgesCtx(ctx, mi.graph, mi.cloneThreshold()); cs.Items > 0 {
-		mi.logger.Info("clone edges emitted (global)",
-			zap.Int("items", cs.Items),
-			zap.Int("clone_pairs", cs.Pairs),
-			zap.Int("edges", cs.Edges),
-			zap.Int("skipped_buckets", cs.SkippedBuckets),
-			zap.Int("skipped_bucket_items", cs.SkippedBucketItems),
-			zap.Int("diffused_pairs", cs.DiffusedPairs),
-			zap.Int("diffused_edges", cs.DiffusedEdges),
-		)
+	mi.mu.RLock()
+	cloneIdx := make([]*Indexer, 0, len(mi.indexers))
+	for _, idx := range mi.indexers {
+		cloneIdx = append(cloneIdx, idx)
+	}
+	mi.mu.RUnlock()
+	for _, idx := range cloneIdx {
+		// Per-repo threshold, NOT a max-over-repos value: the batch must use
+		// the same cutoff the per-repo incremental maintainer uses
+		// (UpdateFuncs/Rebuild → idx.cloneThreshold()), or the batch and
+		// incremental edge sets diverge for any repo whose configured
+		// threshold differs from the workspace maximum.
+		if cs := detectClonesAndEmitEdgesCtx(ctx, mi.graph, idx.repoPrefix, idx.cloneThreshold()); cs.Items > 0 {
+			mi.logger.Info("clone edges emitted (global)",
+				zap.String("repo", idx.repoPrefix),
+				zap.Int("items", cs.Items),
+				zap.Int("clone_pairs", cs.Pairs),
+				zap.Int("edges", cs.Edges),
+				zap.Int("skipped_buckets", cs.SkippedBuckets),
+				zap.Int("skipped_bucket_items", cs.SkippedBucketItems),
+				zap.Int("diffused_pairs", cs.DiffusedPairs),
+				zap.Int("diffused_edges", cs.DiffusedEdges),
+			)
+		}
+	}
+	// Seed each per-repo indexer's incremental clone index from the
+	// freshly-baselined signatures + sidecar (scoped to that repo's
+	// prefix) so steady-state single-file edits after this batch go
+	// incremental instead of re-running the whole-graph pass per file.
+	for _, idx := range cloneIdx {
+		if idx.cloneIndex != nil {
+			idx.cloneIndex.Rebuild(mi.graph, idx.repoPrefix)
+		}
 	}
 	// gRPC stub-call resolution. After InferImplements (the
 	// interface-satisfaction fallback signal) and before
@@ -477,23 +506,6 @@ func (mi *MultiIndexer) RunGlobalGraphPasses(ctx context.Context) {
 			zap.Int("edges", crossRepoEdges),
 		)
 	}
-}
-
-// cloneThreshold resolves the graph-wide Jaccard similarity cutoff for
-// clone detection. Thresholds are configured per-repo but the LSH pass
-// is graph-wide, so the strictest (highest) configured value across
-// tracked repos wins — fewer false-positive EdgeSimilarTo edges. Zero
-// (no repo set one) falls through to the clones package default.
-func (mi *MultiIndexer) cloneThreshold() float64 {
-	mi.mu.RLock()
-	defer mi.mu.RUnlock()
-	best := 0.0
-	for _, idx := range mi.indexers {
-		if t := idx.cloneThreshold(); t > best {
-			best = t
-		}
-	}
-	return best
 }
 
 // externalCallSynthesisEnabled resolves whether external-call placeholder

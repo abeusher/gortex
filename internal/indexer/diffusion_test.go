@@ -357,7 +357,7 @@ func TestDetectClonesAndEmitEdges_DiffusionWiring(t *testing.T) {
 		Meta: map[string]any{cloneSigMetaKey: encAB},
 	})
 
-	stats := detectClonesAndEmitEdges(g, 0)
+	stats := detectClonesAndEmitEdges(g, "", 0)
 	// A, B, C all share a signature: three direct clone pairs, so the
 	// only diffusable pairs are themselves direct clones — diffusion
 	// correctly emits nothing (partition invariant).
