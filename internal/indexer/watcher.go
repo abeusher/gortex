@@ -94,6 +94,20 @@ type Watcher struct {
 	// down in Stop alongside the fsnotify backend. nil when the
 	// per-repo watcher is disabled via WatchConfig.Enabled.
 	poller *Poller
+
+	// reconcileMu guards the overflow-driven full-tree reconcile.
+	// reconcilePending coalesces a burst of overflow / dropped-event
+	// signals into at most one reconcile in flight: the kernel inotify
+	// queue can overflow (EventOverflow) or the backend can drop events
+	// under backpressure (the Dropped() channel), and either means we
+	// may have lost a create/modify with no path to re-index. macOS
+	// FSEvents self-heals (it re-scans on UserDropped/KernelDropped),
+	// but Linux inotify does not — without this the lost event waits on
+	// the up-to-1h janitor. reconcileFn is a test seam: nil in
+	// production (the real IncrementalReindex runs).
+	reconcileMu      sync.Mutex
+	reconcilePending bool
+	reconcileFn      func()
 }
 
 const maxHistory = 1000
@@ -375,6 +389,7 @@ func (w *Watcher) loop() {
 		return
 	}
 	eventsCh := w.fsw.Events()
+	droppedCh := w.fsw.Dropped()
 	for {
 		select {
 		case <-w.done:
@@ -384,11 +399,78 @@ func (w *Watcher) loop() {
 				return
 			}
 			w.handleEvent(event)
+		case _, ok := <-droppedCh:
+			if !ok {
+				// Backend tore down its dropped channel; keep
+				// draining Events only.
+				droppedCh = nil
+				continue
+			}
+			// The backend dropped an event under backpressure (the
+			// main Events channel was full). We don't know which path
+			// was lost, so reconcile the whole tree.
+			w.triggerOverflowReconcile("dropped-event")
 		}
 	}
 }
 
+// triggerOverflowReconcile schedules a single coalesced full-tree
+// reconcile in response to a lost-event signal (a kernel inotify queue
+// overflow or a backpressure-dropped event). A burst of signals
+// collapses into at most one reconcile in flight: the first caller sets
+// reconcilePending and runs the reconcile off the event loop; concurrent
+// callers observe the flag and return immediately. Best-effort and
+// logged — the event loop is never blocked.
+func (w *Watcher) triggerOverflowReconcile(reason string) {
+	w.reconcileMu.Lock()
+	if w.reconcilePending {
+		w.reconcileMu.Unlock()
+		return
+	}
+	w.reconcilePending = true
+	fn := w.reconcileFn
+	w.reconcileMu.Unlock()
+
+	if w.logger != nil {
+		w.logger.Warn("watcher: event signal lost — scheduling full-tree reconcile",
+			zap.String("reason", reason),
+			zap.String("root", w.indexer.rootPath))
+	}
+
+	go func() {
+		defer func() {
+			w.reconcileMu.Lock()
+			w.reconcilePending = false
+			w.reconcileMu.Unlock()
+		}()
+		if fn != nil {
+			fn()
+			return
+		}
+		if _, err := w.indexer.IncrementalReindex(w.indexer.rootPath); err != nil {
+			if w.logger != nil {
+				w.logger.Warn("watcher: overflow reconcile failed",
+					zap.String("reason", reason),
+					zap.Error(err))
+			}
+		}
+	}()
+}
+
 func (w *Watcher) handleEvent(event fswatcher.WatchEvent) {
+	// Kernel inotify queue overflow arrives as a pathless EventOverflow
+	// on the Events channel (the Linux backend cannot tell us which
+	// events it lost). macOS routes its UserDropped/KernelDropped flags
+	// through the same event type. There's no path to re-index, so
+	// trigger a coalesced full-tree reconcile and stop — every
+	// path-based step below would misfire on the empty path.
+	for _, t := range event.Types {
+		if t == fswatcher.EventOverflow {
+			w.triggerOverflowReconcile("queue-overflow")
+			return
+		}
+	}
+
 	path := normalizeEventPath(event.Path, w.indexer.rootPath)
 
 	// Probe artifacts: sentinel files Start writes to confirm the
@@ -627,15 +709,30 @@ func (w *Watcher) patchGraph(path string, kind ChangeKind) {
 			return
 		}
 
-		nr, er := w.indexer.EvictFile(path)
-		nodesRemoved = nr
-		edgesRemoved = er
+		// Do NOT pre-evict. IndexFile parse-then-swaps internally: it
+		// evicts the file's prior nodes and re-adds the new ones only on a
+		// successful parse, and leaves the prior nodes intact on a parse
+		// failure. Pre-evicting here was the node-loss bug — a transiently
+		// unparseable save (mid-edit) dropped the file's symbols from the
+		// graph until the next clean save. Capture the file's prior node
+		// count first (still present pre-swap) so removed/added telemetry
+		// stays gross: a rename removes one node and adds one even though
+		// the net node delta is zero.
+		priorFileNodes := len(w.indexer.graph.GetFileNodes(relPath))
 		if err := w.indexer.IndexFile(path); err != nil {
 			w.logger.Warn("reindex file failed", zap.String("path", path), zap.Error(err))
 			return
 		}
-		nodesAdded = w.indexer.graph.NodeCount() - (nodesBefore - nr)
-		edgesAdded = w.indexer.graph.EdgeCount() - (edgesBefore - er)
+		nodesRemoved = priorFileNodes
+		nodesAdded = len(w.indexer.graph.GetFileNodes(relPath))
+		// Edge churn as the net graph-wide delta — per-file edge counting
+		// would need a subgraph walk, which this watch-patch telemetry
+		// doesn't need.
+		if edgesAfter := w.indexer.graph.EdgeCount(); edgesAfter >= edgesBefore {
+			edgesAdded = edgesAfter - edgesBefore
+		} else {
+			edgesRemoved = edgesBefore - edgesAfter
+		}
 
 		// Notify callback with old and new symbols.
 		w.symbolChangeCbMu.RLock()

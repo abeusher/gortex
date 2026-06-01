@@ -2521,21 +2521,31 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 	// In multi-repo mode, the graph stores prefixed file paths.
 	graphPath := idx.prefixPath(relPath)
 
-	// Evict existing data for this file (graph + search). Capture the
-	// file's function/method node IDs BEFORE the evict so the
+	// Parse-then-swap: we must NOT evict the file's existing nodes/edges
+	// and search entries until we hold a usable parse result. Evicting
+	// first leaves the file at zero nodes whenever the on-disk bytes are
+	// transiently unparseable (a save mid-edit) — a failed extraction
+	// then returns early and the symbols stay nuked. Capturing the old
+	// state up front and deferring the actual eviction to evictExisting()
+	// keeps the file stale-but-present on failure (stale beats empty) and
+	// shrinks the no-nodes window to the gap between evict and AddBatch.
+	//
+	// oldFuncIDs holds this file's function/method node IDs so the
 	// incremental clone index can drop their CMS/LSH contributions —
 	// EvictFile removes the nodes (and their clone_sig) from the graph,
-	// so this is the only point we can recover what to evict.
+	// so it must be captured before evictExisting runs.
 	var oldFuncIDs []string
-	for _, n := range idx.graph.GetFileNodes(graphPath) {
-		if n.Kind != graph.KindFile && n.Kind != graph.KindImport {
-			idx.search.Remove(n.ID)
+	evictExisting := func() {
+		for _, n := range idx.graph.GetFileNodes(graphPath) {
+			if n.Kind != graph.KindFile && n.Kind != graph.KindImport {
+				idx.search.Remove(n.ID)
+			}
+			if n.Kind == graph.KindFunction || n.Kind == graph.KindMethod {
+				oldFuncIDs = append(oldFuncIDs, n.ID)
+			}
 		}
-		if n.Kind == graph.KindFunction || n.Kind == graph.KindMethod {
-			oldFuncIDs = append(oldFuncIDs, n.ID)
-		}
+		idx.graph.EvictFile(graphPath)
 	}
-	idx.graph.EvictFile(graphPath)
 
 	src, err := os.ReadFile(absPath)
 	if err != nil {
@@ -2553,12 +2563,14 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 
 	// Honour the size cap on the incremental path too: an over-cap
 	// file gets a synthetic skip node, not a parse — matching the
-	// bulk IndexCtx walk.
+	// bulk IndexCtx walk. This IS a successful result, so it evicts the
+	// prior state and installs the synthetic node, same as before.
 	if maxSize := idx.config.MaxFileSize; maxSize > 0 && int64(len(src)) > maxSize {
 		n := sizeSkipNode(skippedFile{
 			relPath: filepath.ToSlash(relPath), lang: lang, size: int64(len(src)),
 		}, maxSize)
 		idx.applyRepoPrefix([]*graph.Node{n}, nil)
+		evictExisting()
 		idx.graph.AddBatch([]*graph.Node{n}, nil)
 		return nil
 	}
@@ -2580,8 +2592,16 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 		_ = quarantine.Save()
 	}
 	if result == nil {
+		// No usable parse result (transient parse failure, quarantine,
+		// timeout). Do NOT evict — the file's prior nodes/edges/search
+		// entries stay intact. A stale-but-present file beats an empty
+		// one, and the next successful re-index swaps cleanly.
 		return err
 	}
+
+	// We hold a usable result: evict the old state now, then add the
+	// new — the window where the file has no nodes is just this gap.
+	evictExisting()
 
 	// Coverage extractors (todos, licenses, ownership). Same call
 	// site exists in the bulk IndexCtx worker pool — see
