@@ -1,6 +1,8 @@
 package store_sqlite
 
 import (
+	"database/sql"
+
 	"github.com/zzet/gortex/internal/graph"
 )
 
@@ -9,8 +11,10 @@ import (
 // same backend the graph lives in means warm restarts read it through
 // one persistence surface instead of a second gob snapshot.
 var (
-	_ graph.FileMtimeWriter = (*Store)(nil)
-	_ graph.FileMtimeReader = (*Store)(nil)
+	_ graph.FileMtimeWriter   = (*Store)(nil)
+	_ graph.FileMtimeReader   = (*Store)(nil)
+	_ graph.FileMtimeReplacer = (*Store)(nil)
+	_ graph.FileMtimeDeleter  = (*Store)(nil)
 )
 
 // mtimeChunk bounds how many (repo_prefix, file_path, mtime_ns) tuples
@@ -45,6 +49,104 @@ func (s *Store) BulkSetFileMtimes(repoPrefix string, mtimes map[string]int64) er
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
+
+	if err := insertMtimesTx(tx, repoPrefix, mtimes); err != nil {
+		return err
+	}
+
+	return tx.Commit()
+}
+
+// ReplaceFileMtimes persists the AUTHORITATIVE full mtime set for one repo
+// prefix: every prior row for the prefix is dropped and the supplied set is
+// written, all in one transaction. The full-index persist path uses this so
+// files deleted since the last index are pruned — BulkSetFileMtimes (upsert)
+// would leave their rows behind, and warm-restart reconcile would then
+// detect them as phantom deletions on every restart, forcing a full
+// re-track that never converges.
+//
+// Empty input is a deliberate no-op: it never wipes a repo's mtimes from an
+// empty snapshot (the indexer guards the call with len(snapshot) > 0).
+func (s *Store) ReplaceFileMtimes(repoPrefix string, mtimes map[string]int64) error {
+	if len(mtimes) == 0 {
+		return nil
+	}
+
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
+
+	if _, err := tx.Exec(`DELETE FROM file_mtimes WHERE repo_prefix = ?`, repoPrefix); err != nil {
+		return err
+	}
+	if err := insertMtimesTx(tx, repoPrefix, mtimes); err != nil {
+		return err
+	}
+
+	return tx.Commit()
+}
+
+// DeleteFileMtimes drops the rows for a set of repo-relative file paths
+// under one repo prefix — the incremental-reindex sibling of
+// ReplaceFileMtimes. The watcher / incremental path calls it when a file is
+// deleted so the persisted set stays in step with the live graph and the
+// next warm restart does not see the path as a phantom deletion. Empty
+// input is a no-op.
+func (s *Store) DeleteFileMtimes(repoPrefix string, paths []string) error {
+	if len(paths) == 0 {
+		return nil
+	}
+
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
+
+	// Chunk so the IN-list never exceeds SQLite's host-parameter limit:
+	// one leading repo_prefix arg + up to mtimeChunk path args per stmt.
+	for start := 0; start < len(paths); start += mtimeChunk {
+		end := min(start+mtimeChunk, len(paths))
+		batch := paths[start:end]
+
+		args := make([]any, 0, len(batch)+1)
+		args = append(args, repoPrefix)
+		stmt := make([]byte, 0, 64+len(batch)*2)
+		stmt = append(stmt, "DELETE FROM file_mtimes WHERE repo_prefix = ? AND file_path IN ("...)
+		for i := range batch {
+			if i > 0 {
+				stmt = append(stmt, ',')
+			}
+			stmt = append(stmt, '?')
+			args = append(args, batch[i])
+		}
+		stmt = append(stmt, ')')
+		if _, err := tx.Exec(string(stmt), args...); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
+// insertMtimesTx writes every (path -> ns) entry for repoPrefix into the
+// given transaction with chunked multi-row INSERT OR REPLACE statements,
+// each kept under SQLite's host-parameter limit. The caller owns the tx
+// lifecycle (Begin/Commit/Rollback) and the write lock.
+func insertMtimesTx(tx *sql.Tx, repoPrefix string, mtimes map[string]int64) error {
 	// Stable ordering is not required for correctness, but iterating the
 	// map directly is fine — we only chunk by count.
 	type kv struct {
@@ -56,17 +158,8 @@ func (s *Store) BulkSetFileMtimes(repoPrefix string, mtimes map[string]int64) er
 		pending = append(pending, kv{path: p, ns: ns})
 	}
 
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
-
 	for start := 0; start < len(pending); start += mtimeChunk {
-		end := start + mtimeChunk
-		if end > len(pending) {
-			end = len(pending)
-		}
+		end := min(start+mtimeChunk, len(pending))
 		batch := pending[start:end]
 
 		// Build a multi-row INSERT OR REPLACE: (?, ?, ?), (?, ?, ?), ...
@@ -85,7 +178,7 @@ func (s *Store) BulkSetFileMtimes(repoPrefix string, mtimes map[string]int64) er
 		}
 	}
 
-	return tx.Commit()
+	return nil
 }
 
 // LoadFileMtimes returns the recorded mtimes for one repo prefix as a

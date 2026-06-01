@@ -911,6 +911,27 @@ type FileMtimeReader interface {
 	LoadFileMtimes(repoPrefix string) map[string]int64
 }
 
+// FileMtimeReplacer is an optional capability: persist the AUTHORITATIVE
+// full mtime set for a repo prefix, dropping any previously-stored rows for
+// files no longer present. The full-index persist path calls this so files
+// deleted since the last index are pruned. A backend that only implements
+// the upsert-only FileMtimeWriter leaves deleted-file rows behind, and
+// warm-restart reconcile then detects them as phantom deletions on every
+// restart — forcing a full re-track that never converges. Empty input is a
+// no-op (it must never wipe a repo's mtimes from an empty snapshot).
+type FileMtimeReplacer interface {
+	ReplaceFileMtimes(repoPrefix string, mtimes map[string]int64) error
+}
+
+// FileMtimeDeleter is an optional capability: drop the persisted mtime rows
+// for a set of repo-relative file paths. The incremental-reindex / watcher
+// path calls it when a file is deleted so the persisted set stays in step
+// with the live graph (the per-file sibling of FileMtimeReplacer). Empty
+// input is a no-op.
+type FileMtimeDeleter interface {
+	DeleteFileMtimes(repoPrefix string, paths []string) error
+}
+
 // CloneShingleWriter is an optional capability backends MAY implement
 // to persist each function/method node's MinHash shingle set (a
 // []uint64) keyed by node id. Lifting this state into the same backend

@@ -2237,14 +2237,29 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 	if diskTarget != nil {
 		mtimeTarget = diskTarget
 	}
-	if w, ok := mtimeTarget.(graph.FileMtimeWriter); ok && len(mtimeSnapshot) > 0 {
-		if err := w.BulkSetFileMtimes(idx.repoPrefix, mtimeSnapshot); err != nil {
-			idx.logger.Warn("persist file mtimes failed",
-				zap.String("repo", idx.repoPrefix), zap.Error(err))
-		} else {
-			idx.logger.Info("persisted file mtimes",
-				zap.String("repo", idx.repoPrefix),
-				zap.Int("count", len(mtimeSnapshot)))
+	// Full-index persist is AUTHORITATIVE: replace the repo's entire mtime
+	// set so files deleted since the last index are pruned. An upsert-only
+	// write (BulkSetFileMtimes) leaves deleted-file rows behind, and warm-
+	// restart reconcile then detects them as phantom deletions on every
+	// restart — forcing a full re-track that never converges. Prefer the
+	// replace capability; fall back to upsert for backends without it.
+	if len(mtimeSnapshot) > 0 {
+		var perr error
+		persisted := false
+		if r, ok := mtimeTarget.(graph.FileMtimeReplacer); ok {
+			perr, persisted = r.ReplaceFileMtimes(idx.repoPrefix, mtimeSnapshot), true
+		} else if w, ok := mtimeTarget.(graph.FileMtimeWriter); ok {
+			perr, persisted = w.BulkSetFileMtimes(idx.repoPrefix, mtimeSnapshot), true
+		}
+		if persisted {
+			if perr != nil {
+				idx.logger.Warn("persist file mtimes failed",
+					zap.String("repo", idx.repoPrefix), zap.Error(perr))
+			} else {
+				idx.logger.Info("persisted file mtimes",
+					zap.String("repo", idx.repoPrefix),
+					zap.Int("count", len(mtimeSnapshot)))
+			}
 		}
 	}
 
@@ -3517,6 +3532,24 @@ func (idx *Indexer) RefreshFileMtime(filePath string) {
 	idx.mtimeMu.Unlock()
 }
 
+// pruneDeletedFileMtimes drops the persisted mtime rows for files the
+// incremental reindex just confirmed deleted. The in-memory map is already
+// pruned by the caller; this keeps the store's FileMtime sidecar in step so
+// a later warm restart does not re-discover them as phantom deletions and
+// force a full re-track. A no-op when the backend lacks the capability
+// (the in-memory backend) or the list is empty.
+func (idx *Indexer) pruneDeletedFileMtimes(deleted []string) {
+	if len(deleted) == 0 {
+		return
+	}
+	if d, ok := idx.graph.(graph.FileMtimeDeleter); ok {
+		if err := d.DeleteFileMtimes(idx.repoPrefix, deleted); err != nil {
+			idx.logger.Warn("prune deleted file mtimes failed",
+				zap.String("repo", idx.repoPrefix), zap.Error(err))
+		}
+	}
+}
+
 // SetFileMtimes restores the file modification time map from a persisted snapshot.
 func (idx *Indexer) SetFileMtimes(mtimes map[string]int64) {
 	idx.mtimeMu.Lock()
@@ -3708,6 +3741,10 @@ func (idx *Indexer) IncrementalReindexPaths(root string, paths []string) (*Index
 		delete(idx.fileMtimes, relPath)
 		idx.mtimeMu.Unlock()
 	}
+	// Prune the persisted mtime rows for deleted files too, so the next
+	// warm restart does not see them as phantom deletions (the in-memory
+	// delete above does not reach the store's sidecar table).
+	idx.pruneDeletedFileMtimes(deletedFiles)
 
 	// Re-index stale files with the same one-shot retry as the
 	// whole-root path — a file locked or mid-write when the walk caught
@@ -3907,6 +3944,10 @@ func (idx *Indexer) IncrementalReindex(root string) (*IndexResult, error) {
 		delete(idx.fileMtimes, relPath)
 		idx.mtimeMu.Unlock()
 	}
+	// Prune the persisted mtime rows for deleted files too, so the next
+	// warm restart does not see them as phantom deletions (the in-memory
+	// delete above does not reach the store's sidecar table).
+	idx.pruneDeletedFileMtimes(deletedFiles)
 
 	// Re-index stale files. A file that fails — most often because it
 	// was locked or mid-write when the walk caught it — is collected
