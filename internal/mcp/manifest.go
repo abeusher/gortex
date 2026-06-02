@@ -45,7 +45,11 @@ type ringMember struct {
 // compressed → outline) rather than dropping it outright.
 func (s *Server) buildContextManifest(ctx context.Context, focus, outlineCandidates []*graph.Node, budget int) map[string]any {
 	if budget <= 0 {
-		budget = defaultManifestBudget
+		nodes := 0
+		if s.graph != nil {
+			nodes = s.graph.NodeCount()
+		}
+		budget = manifestBudgetForNodeCount(nodes)
 	}
 	used := 0
 	placed := make(map[string]bool)

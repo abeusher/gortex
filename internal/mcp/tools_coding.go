@@ -1126,6 +1126,49 @@ func partitionProductionFirst(nodes []*graph.Node) []*graph.Node {
 	return append(prod, tests...)
 }
 
+// buildWorkingSetClusters groups a smart_context working set by source
+// file, production files first, returning one entry per file as
+// {file, symbols:[ids], is_test}. Symbol IDs within a file and the file
+// groups themselves are sorted so the block is byte-stable and feeds a
+// deterministic pack root.
+func buildWorkingSetClusters(nodes []*graph.Node) []map[string]any {
+	if len(nodes) == 0 {
+		return nil
+	}
+	byFile := make(map[string][]string)
+	isTest := make(map[string]bool)
+	for _, n := range nodes {
+		if n == nil {
+			continue
+		}
+		byFile[n.FilePath] = append(byFile[n.FilePath], n.ID)
+		isTest[n.FilePath] = isTestFile(n.FilePath)
+	}
+	prodFiles := make([]string, 0, len(byFile))
+	testFiles := make([]string, 0)
+	for f := range byFile {
+		if isTest[f] {
+			testFiles = append(testFiles, f)
+			continue
+		}
+		prodFiles = append(prodFiles, f)
+	}
+	sort.Strings(prodFiles)
+	sort.Strings(testFiles)
+	ordered := append(prodFiles, testFiles...)
+	clusters := make([]map[string]any, 0, len(ordered))
+	for _, f := range ordered {
+		ids := byFile[f]
+		sort.Strings(ids)
+		clusters = append(clusters, map[string]any{
+			"file":    f,
+			"symbols": ids,
+			"is_test": isTest[f],
+		})
+	}
+	return clusters
+}
+
 func (s *Server) handleGetTestTargets(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	idsStr, err := req.RequireString("ids")
 	if err != nil {
@@ -1624,6 +1667,18 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 	}
 	graded := req.GetString("fidelity", "") == "graded"
 
+	// Token budget for the graded manifest defaults adaptively to repo
+	// size — same absent-vs-explicit detection as max_symbols, since
+	// req.GetInt can't distinguish them.
+	tokenBudget := req.GetInt("token_budget", defaultManifestBudget)
+	if _, present := req.GetArguments()["token_budget"]; !present {
+		nodes := 0
+		if s.graph != nil {
+			nodes = s.graph.NodeCount()
+		}
+		tokenBudget = manifestBudgetForNodeCount(nodes)
+	}
+
 	result := map[string]any{
 		"task": task,
 	}
@@ -1801,7 +1856,7 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 		estResult := map[string]any{
 			"task": task,
 			"estimate": s.buildSmartContextEstimate(
-				ctx, graded, req.GetInt("token_budget", defaultManifestBudget),
+				ctx, graded, tokenBudget,
 				relevantSymbols, outlineCandidates),
 		}
 		if s.isGCX(ctx, req) {
@@ -1854,7 +1909,7 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 	// under one token budget.
 	if graded {
 		result["context_manifest"] = s.buildContextManifest(
-			ctx, relevantSymbols, outlineCandidates, req.GetInt("token_budget", defaultManifestBudget))
+			ctx, relevantSymbols, outlineCandidates, tokenBudget)
 	}
 
 	// 5b. Include cross-repo dependencies when in multi-repo mode.
@@ -1966,6 +2021,15 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 		}
 	}
 	result["files_to_edit"] = filesToEdit
+
+	// 8b. Clustered working set — the same symbols grouped by their
+	// source file (production files first), so an agent sees which
+	// files carry the relevant symbols and which are tests without
+	// re-deriving it from the flat files_to_edit list. files_to_edit
+	// is kept for back-compat.
+	if ws := buildWorkingSetClusters(relevantSymbols); len(ws) > 0 {
+		result["working_set"] = ws
+	}
 
 	// 9. Fused blast radius — computed for every call, not just when an
 	// entry point is named. Groups the working set's callers by their

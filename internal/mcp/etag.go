@@ -190,6 +190,28 @@ func computePackRoot(result map[string]any) string {
 		}
 		h.Write([]byte{1})
 	}
+
+	// The clustered working set carries the per-file grouping and the
+	// is_test flag — both part of the pack's identity, both already
+	// sorted, so hashing them in order keeps the root deterministic.
+	if ws, ok := result["working_set"].([]map[string]any); ok {
+		for _, c := range ws {
+			file, _ := c["file"].(string)
+			h.Write([]byte(file))
+			h.Write([]byte{0})
+			if isTest, ok := c["is_test"].(bool); ok && isTest {
+				h.Write([]byte{'t'})
+			}
+			if ids, ok := c["symbols"].([]string); ok {
+				for _, id := range ids {
+					h.Write([]byte(id))
+					h.Write([]byte{0})
+				}
+			}
+			h.Write([]byte{2})
+		}
+		h.Write([]byte{1})
+	}
 	sum := h.Sum(nil)
 	return hex.EncodeToString(sum[:8])
 }

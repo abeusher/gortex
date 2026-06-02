@@ -47,7 +47,8 @@ func TestSmartContext_GradedFidelity(t *testing.T) {
 
 	budget, _ := mani["token_budget"].(float64)
 	used, _ := mani["tokens_used"].(float64)
-	assert.Equal(t, float64(defaultManifestBudget), budget, "default budget must apply")
+	wantBudget := float64(manifestBudgetForNodeCount(srv.graph.NodeCount()))
+	assert.Equal(t, wantBudget, budget, "adaptive default budget must apply when token_budget is absent")
 	assert.LessOrEqual(t, used, budget, "tokens_used must stay within budget")
 
 	tiers := map[string]int{}
@@ -143,7 +144,7 @@ func TestSmartContext_EstimateGraded(t *testing.T) {
 	est, ok := m["estimate"].(map[string]any)
 	require.True(t, ok)
 	assert.Equal(t, "graded", est["fidelity"])
-	assert.Equal(t, float64(defaultManifestBudget), est["token_budget"])
+	assert.Equal(t, float64(manifestBudgetForNodeCount(srv.graph.NodeCount())), est["token_budget"])
 	proj, _ := est["projected_tokens"].(float64)
 	budget, _ := est["token_budget"].(float64)
 	assert.LessOrEqual(t, proj, budget, "projected tokens must fit the budget")

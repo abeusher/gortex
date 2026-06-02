@@ -1395,6 +1395,22 @@ func encodeSmartContext(result map[string]any) ([]byte, error) {
 		}
 	}
 
+	if ws, ok := result["working_set"].([]map[string]any); ok && len(ws) > 0 {
+		enc := newGCX(&buf, "smart_context.working_set",
+			[]string{"file", "is_test", "symbols"},
+			"count", fmt.Sprintf("%d", len(ws)),
+		)
+		for _, c := range ws {
+			ids, _ := c["symbols"].([]string)
+			if err := enc.WriteRow(str(c["file"]), c["is_test"], strings.Join(ids, ",")); err != nil {
+				return nil, err
+			}
+		}
+		if err := enc.Close(); err != nil {
+			return nil, err
+		}
+	}
+
 	if br, ok := result["blast_radius"].(map[string]any); ok {
 		warning := str(br["warning"])
 		callerGroups, _ := br["callers_by_file"].([]map[string]any)
