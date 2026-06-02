@@ -4,12 +4,15 @@ import (
 	"path"
 	"regexp"
 	"strings"
+
+	"github.com/zzet/gortex/internal/excludes"
 )
 
 // PathPenaltySignal applies a multiplicative penalty to candidates
-// whose file path falls into one of five "supporting cast" buckets —
-// test files, compatibility shims, examples, type declarations, and
-// re-export barrels. The intuition: when an agent asks for the
+// whose file path falls into one of six "supporting cast" buckets —
+// test files, compatibility shims, examples, type declarations,
+// re-export barrels, and generated files that shadow a real
+// implementation. The intuition: when an agent asks for the
 // canonical definition of `validateToken`, the top hit should be the
 // real implementation in `auth/token.go`, not the assertion in
 // `auth/token_test.go` or the re-export in `index.ts`.
@@ -33,6 +36,10 @@ import (
 //     interface, not the implementation)
 //   - Re-export barrels → 0.7 (`index.ts`, `__init__.py`, `mod.rs`,
 //     `lib.rs` — a forwarding hop, not the source)
+//   - Generated files  → 0.4 (`foo.pb.go`, `mock_x.go`, `x_pb2.py` —
+//     ONLY when a real same-named hand-written peer exists in the
+//     graph; a generated file that is the sole definition is left at
+//     1.0 so it isn't demoted into oblivion)
 //   - Anything else    → 1.0 (no penalty)
 //
 // When a file matches multiple rubrics the smaller (more aggressive)
@@ -63,16 +70,47 @@ func (PathPenaltySignal) Contribute(_ string, c *Candidate, ctx *Context) float6
 		}
 	}
 	pen := classifyPathPenalty(fp)
+	// Generated-file gate. A generated file (foo.pb.go, mock_x.go,
+	// x_pb2.py, …) that shadows a real hand-written same-named peer
+	// is supporting cast: the agent wants the implementation, not the
+	// stub. Applied ONLY in the Uncatched branch so a generated file
+	// that ALSO matches a heavier bucket (a generated test fixture,
+	// say) keeps that heavier penalty — preserving "most aggressive
+	// wins" — and ONLY when a non-generated peer actually exists in
+	// the graph, so a generated file that is the sole definition
+	// stays un-penalised. The peer lookup needs the graph, which is
+	// why this lives in Contribute and not the pure classifier.
+	if pen == PathPenaltyUncatched && ctx != nil && ctx.Graph != nil && excludes.IsGenerated(fp) {
+		if generatedPeerExists(ctx, fp) {
+			pen = PathPenaltyGenerated
+		}
+	}
 	if ctx != nil && ctx.pathPenaltyCache != nil {
 		ctx.pathPenaltyCache[fp] = pen
 	}
 	return pen
 }
 
+// generatedPeerExists reports whether a non-generated, hand-written
+// file sharing the generated file's base name is present in the
+// graph. The candidate peer paths come from excludes.GeneratedPeerPaths
+// (foo.pb.go → foo.go, mock_user.go → user.go, …). A wrong-stem
+// derivation yields a false "no peer", which is the safe outcome: no
+// penalty rather than a spurious one.
+func generatedPeerExists(ctx *Context, fp string) bool {
+	for _, peer := range excludes.GeneratedPeerPaths(fp) {
+		if len(ctx.Graph.GetFileNodes(peer)) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // Penalty multiplier constants — exported so config / debug surfaces
 // can refer to them without re-deriving the rubric.
 const (
 	PathPenaltyTest      = 0.3
+	PathPenaltyGenerated = 0.4
 	PathPenaltyCompat    = 0.5
 	PathPenaltyExamples  = 0.5
 	PathPenaltyTypeDecl  = 0.7

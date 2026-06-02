@@ -1,7 +1,6 @@
 package mcp
 
 import (
-	"path/filepath"
 	"strings"
 
 	"github.com/zzet/gortex/internal/excludes"
@@ -26,38 +25,11 @@ func pathOmissions(path string) []map[string]any {
 		notes = append(notes, omission("vendored",
 			"file lives under a vendored dependency or build-output directory — not first-party code"))
 	}
-	if isGeneratedFile(path) {
+	if excludes.IsGenerated(path) {
 		notes = append(notes, omission("generated",
 			"file name matches a code-generation convention — edits here are overwritten by the generator"))
 	}
 	return notes
-}
-
-// generatedSuffixes lists file-name suffixes that mark generated code
-// across the languages Gortex indexes.
-var generatedSuffixes = []string{
-	".pb.go", ".pb.cc", ".pb.h", ".pb.swift", "_pb2.py", "_pb2_grpc.py",
-	"_gen.go", ".gen.go", "_generated.go", ".generated.go",
-	".g.dart", ".freezed.dart", ".g.cs", ".designer.cs",
-}
-
-// isGeneratedFile reports whether a file name matches a common
-// code-generation convention.
-func isGeneratedFile(path string) bool {
-	base := filepath.Base(path)
-	for _, suf := range generatedSuffixes {
-		if strings.HasSuffix(base, suf) {
-			return true
-		}
-	}
-	if strings.HasPrefix(base, "zz_generated") {
-		return true
-	}
-	if strings.HasSuffix(base, ".go") &&
-		(strings.HasPrefix(base, "mock_") || strings.HasSuffix(base, "_mock.go")) {
-		return true
-	}
-	return false
 }
 
 // looksBinary reports whether content is non-text. A NUL byte in the
