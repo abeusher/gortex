@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -97,6 +98,25 @@ type Controller interface {
 	// (Claude Code's Grep-redirect hook) that need a single short answer
 	// without setting up a full MCP session.
 	SearchSymbols(ctx context.Context, params SearchSymbolsParams) (SearchSymbolsResult, error)
+	// EnrichChurn runs the per-symbol / per-file churn enricher against
+	// the daemon's in-process graph. Exposed over the control surface so
+	// CLI invocations (and the post-commit / post-merge git hook) can
+	// trigger it without taking the on-disk store's write lock the daemon owns.
+	EnrichChurn(ctx context.Context, params EnrichChurnParams) (EnrichChurnResult, error)
+	// EnrichReleases runs the per-file release enricher against the
+	// daemon's in-process graph. Same routing rationale as
+	// EnrichChurn — keeps the on-disk store's write lock with the daemon.
+	EnrichReleases(ctx context.Context, params EnrichReleasesParams) (EnrichReleasesResult, error)
+	// EnrichBlame runs the git-blame authorship enricher against the
+	// daemon's in-process graph. Same routing rationale as EnrichChurn.
+	EnrichBlame(ctx context.Context, params EnrichBlameParams) (EnrichBlameResult, error)
+	// EnrichCoverage projects pre-parsed Go cover-profile segments onto
+	// the daemon's in-process graph. The CLI parses the profile so the
+	// daemon never reads the caller's filesystem.
+	EnrichCoverage(ctx context.Context, params EnrichCoverageParams) (EnrichCoverageResult, error)
+	// EnrichCochange mines co-change edges against the daemon's
+	// in-process graph. Same routing rationale as EnrichChurn.
+	EnrichCochange(ctx context.Context, params EnrichCochangeParams) (EnrichCochangeResult, error)
 	// Shutdown is invoked via the control surface and should return
 	// quickly; the daemon's actual shutdown work happens after the
 	// response is written.
@@ -121,7 +141,7 @@ func New(socketPath, version string, logger *zap.Logger) *Server {
 // Listen creates the socket, writes the PID file, and installs the
 // shutdown-signal handlers for graceful shutdown. The socket permissions
 // are 0o600 on Unix — the daemon is user-local and nothing else on the
-// machine should reach it; on Windows, %LocalAppData% ACLs scope it to
+// machine should reach it; on Windows, %USERPROFILE% ACLs scope it to
 // the user instead.
 func (s *Server) Listen() error {
 	if err := EnsureParentDir(s.SocketPath); err != nil {
@@ -142,7 +162,7 @@ func (s *Server) Listen() error {
 		return fmt.Errorf("listen: %w", err)
 	}
 	// chmod the socket to user-only on Unix. Windows has no POSIX mode
-	// bits — the socket inherits the ACLs of %LocalAppData%, which is
+	// bits — the socket inherits the ACLs of %USERPROFILE%, which is
 	// already user-scoped — so skip it there.
 	if runtime.GOOS != "windows" {
 		if err := os.Chmod(s.SocketPath, 0o600); err != nil {
@@ -517,6 +537,81 @@ func (s *Server) handleControl(_ *Session, req ControlRequest) ControlResponse {
 			return controlErr(ErrInternal, err.Error())
 		}
 		return ControlResponse{OK: true}
+
+	case ControlEnrichChurn:
+		var p EnrichChurnParams
+		if err := unmarshalParams(req.Params, &p); err != nil {
+			return controlErr(ErrInternal, err.Error())
+		}
+		result, err := s.Controller.EnrichChurn(ctx, p)
+		if err != nil {
+			return controlErr(ErrInternal, err.Error())
+		}
+		buf, err := json.Marshal(result)
+		if err != nil {
+			return controlErr(ErrInternal, "marshal enrich_churn result: "+err.Error())
+		}
+		return ControlResponse{OK: true, Result: buf}
+
+	case ControlEnrichReleases:
+		var p EnrichReleasesParams
+		if err := unmarshalParams(req.Params, &p); err != nil {
+			return controlErr(ErrInternal, err.Error())
+		}
+		result, err := s.Controller.EnrichReleases(ctx, p)
+		if err != nil {
+			return controlErr(ErrInternal, err.Error())
+		}
+		buf, err := json.Marshal(result)
+		if err != nil {
+			return controlErr(ErrInternal, "marshal enrich_releases result: "+err.Error())
+		}
+		return ControlResponse{OK: true, Result: buf}
+
+	case ControlEnrichBlame:
+		var p EnrichBlameParams
+		if err := unmarshalParams(req.Params, &p); err != nil {
+			return controlErr(ErrInternal, err.Error())
+		}
+		result, err := s.Controller.EnrichBlame(ctx, p)
+		if err != nil {
+			return controlErr(ErrInternal, err.Error())
+		}
+		buf, err := json.Marshal(result)
+		if err != nil {
+			return controlErr(ErrInternal, "marshal enrich_blame result: "+err.Error())
+		}
+		return ControlResponse{OK: true, Result: buf}
+
+	case ControlEnrichCoverage:
+		var p EnrichCoverageParams
+		if err := unmarshalParams(req.Params, &p); err != nil {
+			return controlErr(ErrInternal, err.Error())
+		}
+		result, err := s.Controller.EnrichCoverage(ctx, p)
+		if err != nil {
+			return controlErr(ErrInternal, err.Error())
+		}
+		buf, err := json.Marshal(result)
+		if err != nil {
+			return controlErr(ErrInternal, "marshal enrich_coverage result: "+err.Error())
+		}
+		return ControlResponse{OK: true, Result: buf}
+
+	case ControlEnrichCochange:
+		var p EnrichCochangeParams
+		if err := unmarshalParams(req.Params, &p); err != nil {
+			return controlErr(ErrInternal, err.Error())
+		}
+		result, err := s.Controller.EnrichCochange(ctx, p)
+		if err != nil {
+			return controlErr(ErrInternal, err.Error())
+		}
+		buf, err := json.Marshal(result)
+		if err != nil {
+			return controlErr(ErrInternal, "marshal enrich_cochange result: "+err.Error())
+		}
+		return ControlResponse{OK: true, Result: buf}
 	}
 	return controlErr(ErrInternal, "unknown control kind: "+req.Kind)
 }
@@ -571,6 +666,39 @@ func (s *Server) writePIDFile() error {
 		}
 	}
 	return os.WriteFile(path, []byte(strconv.Itoa(os.Getpid())), 0o600)
+}
+
+// RunningPID reports the PID of a live daemon recorded in the PID file, or
+// (0, false) when none is. Unlike IsRunning — which only probes the control
+// socket — this still reports a daemon that is *mid-shutdown*: the
+// ControlShutdown handler tears the listener down ~100ms after acking, but
+// the process stays alive while it flushes and closes the store, and it
+// holds the store's on-disk lock until it exits. That window is exactly what
+// turned a quick restart into a "failed to open database" lock conflict, so
+// callers that must not start a second daemon over the top of a dying one —
+// or that need to wait for it to exit — consult this, not the socket.
+//
+// A PID file whose process is dead is stale (the owner crashed without
+// cleanup) and reported as not-running, mirroring writePIDFile's own
+// staleness handling.
+func RunningPID() (int, bool) {
+	b, err := os.ReadFile(PIDFilePath())
+	if err != nil {
+		return 0, false
+	}
+	// TrimSpace so a PID file written with a trailing newline — by a shell
+	// `echo`, a process manager, or a hand edit — still parses. The daemon
+	// writes it without one, but tolerating both is free and the silent
+	// failure mode (guard never fires, restart races the lock again) is
+	// exactly the bug this helper exists to prevent.
+	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil || pid <= 0 {
+		return 0, false
+	}
+	if !platform.ProcessAlive(pid) {
+		return 0, false
+	}
+	return pid, true
 }
 
 func (s *Server) trackConn(c net.Conn) {

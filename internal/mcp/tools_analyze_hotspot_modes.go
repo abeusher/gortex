@@ -30,12 +30,13 @@ import (
 // We don't fail when the meta is absent — the analyzer treats this
 // as a soft ranker, not a strict filter, so callers get *some*
 // ranking even on un-enriched graphs (the unweighted baseline).
-func rerankHotspots(entries []analysis.HotspotEntry, g *graph.Graph, mode, direction string, windowDays int) []analysis.HotspotEntry {
+func rerankHotspots(entries []analysis.HotspotEntry, g graph.Store, mode, direction string, windowDays int) []analysis.HotspotEntry {
 	if windowDays <= 0 {
 		windowDays = 30
 	}
 	now := time.Now().UTC()
 	window := time.Duration(windowDays) * 24 * time.Hour
+	blame := blameRowsByID(g)
 
 	weighted := make([]analysis.HotspotEntry, 0, len(entries))
 	for _, e := range entries {
@@ -46,7 +47,7 @@ func rerankHotspots(entries []analysis.HotspotEntry, g *graph.Graph, mode, direc
 		var weight float64
 		switch mode {
 		case "novelty":
-			weight = noveltyWeight(n, now, window)
+			weight = noveltyWeight(blame, n, now, window)
 		case "directional":
 			weight = directionalWeight(n, now, window, direction)
 		default:
@@ -70,8 +71,8 @@ func rerankHotspots(entries []analysis.HotspotEntry, g *graph.Graph, mode, direc
 // noveltyWeight returns 1.0 - days_since_last_authored / windowDays,
 // clamped to [0, 1]. Symbols missing the meta return 0 — they sort
 // to the bottom rather than getting a free "fully novel" pass.
-func noveltyWeight(n *graph.Node, now time.Time, window time.Duration) float64 {
-	ts := nodeLastAuthoredTime(n)
+func noveltyWeight(blame map[string]graph.BlameEnrichment, n *graph.Node, now time.Time, window time.Duration) float64 {
+	ts := nodeLastAuthoredTime(blame, n)
 	if ts.IsZero() {
 		return 0
 	}
@@ -113,15 +114,12 @@ func directionalWeight(n *graph.Node, now time.Time, window time.Duration, direc
 // time.Time, or zero when the field isn't populated. Blame writes
 // the timestamp as a Unix int64; releases enrichment may write an
 // RFC3339 string — we tolerate both.
-func nodeLastAuthoredTime(n *graph.Node) time.Time {
-	if n.Meta == nil {
+func nodeLastAuthoredTime(blame map[string]graph.BlameEnrichment, n *graph.Node) time.Time {
+	e, ok := lastAuthoredFrom(blame, n)
+	if !ok || e.Timestamp == 0 {
 		return time.Time{}
 	}
-	la, ok := n.Meta["last_authored"].(map[string]any)
-	if !ok {
-		return time.Time{}
-	}
-	return decodeMetaTimestamp(la["timestamp"])
+	return time.Unix(e.Timestamp, 0)
 }
 
 // nodeAddedInTime returns meta.added_in.timestamp as a time.Time,

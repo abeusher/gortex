@@ -211,9 +211,18 @@ func (mw *MultiWatcher) forwardEvents(prefix string, w *Watcher) {
 				return
 			}
 
-			// After re-indexing, trigger cross-repo resolution.
+			// After re-indexing, trigger cross-repo resolution — scoped
+			// to the file that changed, not the whole repo. ResolveForRepo
+			// materialised the repo's entire edge set on every save (the
+			// per-edit allocation flood); ResolveForFile only re-resolves
+			// the changed file's out-edges. The watcher path is absolute,
+			// so convert it to the repo-relative graph key first.
 			if mw.multi.IsMultiRepo() {
-				stats := mw.resolver.ResolveForRepo(prefix)
+				relPath := ev.FilePath
+				if w.indexer != nil {
+					relPath = w.indexer.RelKey(ev.FilePath)
+				}
+				stats := mw.resolver.ResolveForFile(prefix, relPath)
 				if stats.CrossRepoEdges > 0 {
 					mw.logger.Debug("cross-repo edges updated after file change",
 						zap.String("repo", prefix),

@@ -9,7 +9,7 @@ import (
 
 // countOutEdgesByKind returns how many out-edges of the given kind the
 // node fromID has.
-func countOutEdgesByKind(g *graph.Graph, fromID string, kind graph.EdgeKind) int {
+func countOutEdgesByKind(g graph.Store, fromID string, kind graph.EdgeKind) int {
 	n := 0
 	for _, e := range g.GetOutEdges(fromID) {
 		if e.Kind == kind {
@@ -21,7 +21,7 @@ func countOutEdgesByKind(g *graph.Graph, fromID string, kind graph.EdgeKind) int
 
 // firstOutEdgeByKind returns the first out-edge of fromID with the given
 // kind, or nil.
-func firstOutEdgeByKind(g *graph.Graph, fromID string, kind graph.EdgeKind) *graph.Edge {
+func firstOutEdgeByKind(g graph.Store, fromID string, kind graph.EdgeKind) *graph.Edge {
 	for _, e := range g.GetOutEdges(fromID) {
 		if e.Kind == kind {
 			return e

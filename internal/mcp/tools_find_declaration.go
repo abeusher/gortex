@@ -88,7 +88,12 @@ func (s *Server) handleFindDeclaration(ctx context.Context, req mcp.CallToolRequ
 
 	// Stage 2 — resolve each use site to a declaration.
 	eng := s.engineFor(ctx)
-	fileIdx := buildDeclFileIndex(eng, matches)
+	// Pass the NodesInFilesByKindFinder capability when the backend
+	// implements it; buildDeclFileIndex falls back to AllNodes() when
+	// finder is nil (e.g. behind an overlay view that doesn't expose
+	// the capability).
+	finder, _ := s.graph.(graph.NodesInFilesByKindFinder)
+	fileIdx := buildDeclFileIndex(eng, finder, matches)
 
 	groups := make(map[string]*declGroup)
 	var declOrder []string
@@ -173,24 +178,63 @@ func (s *Server) findUseSiteMatches(useSite string, isRegex bool, pathPrefix str
 // matches, so the enclosing symbol of any match line can be found
 // quickly. It mirrors buildFileSymbolIndex but is keyed off the match
 // set directly rather than astquery targets.
-func buildDeclFileIndex(eng *query.Engine, matches []trigram.Match) map[string]*fileSymbolIndex {
+//
+// finder may be nil when no NodesInFilesByKindFinder-capable backend
+// is available (e.g. when running through an editor-buffer overlay
+// whose underlying view doesn't expose the capability); the function
+// then falls back to walking eng.AllNodes() Go-side, identical to
+// the pre-capability shape. Backends that ship the capability
+// (the disk backend) collapse the per-call node fetch into one query
+// scoped to the trigram-match file set — on the gortex workspace
+// that was ~70k AllNodes() rows over the storage boundary just to keep the few
+// hundred whose FilePath sat in the small match-file set.
+func buildDeclFileIndex(eng *query.Engine, finder graph.NodesInFilesByKindFinder, matches []trigram.Match) map[string]*fileSymbolIndex {
 	wanted := make(map[string]struct{}, len(matches))
+	files := make([]string, 0, len(matches))
 	for _, m := range matches {
-		wanted[m.Path] = struct{}{}
-	}
-	out := make(map[string]*fileSymbolIndex, len(wanted))
-	for _, n := range eng.AllNodes() {
-		if _, ok := wanted[n.FilePath]; !ok {
+		if _, ok := wanted[m.Path]; ok {
 			continue
 		}
-		switch n.Kind {
-		case graph.KindFunction, graph.KindMethod, graph.KindClosure, graph.KindType, graph.KindInterface:
-			idx := out[n.FilePath]
-			if idx == nil {
-				idx = &fileSymbolIndex{}
-				out[n.FilePath] = idx
+		wanted[m.Path] = struct{}{}
+		files = append(files, m.Path)
+	}
+	out := make(map[string]*fileSymbolIndex, len(wanted))
+
+	add := func(n *graph.Node) {
+		if n == nil {
+			return
+		}
+		idx := out[n.FilePath]
+		if idx == nil {
+			idx = &fileSymbolIndex{}
+			out[n.FilePath] = idx
+		}
+		idx.add(n)
+	}
+
+	if finder != nil {
+		kinds := []graph.NodeKind{
+			graph.KindFunction,
+			graph.KindMethod,
+			graph.KindClosure,
+			graph.KindType,
+			graph.KindInterface,
+		}
+		for _, n := range finder.NodesInFilesByKind(files, kinds) {
+			if _, ok := wanted[n.FilePath]; !ok {
+				continue
 			}
-			idx.add(n)
+			add(n)
+		}
+	} else {
+		for _, n := range eng.AllNodes() {
+			if _, ok := wanted[n.FilePath]; !ok {
+				continue
+			}
+			switch n.Kind {
+			case graph.KindFunction, graph.KindMethod, graph.KindClosure, graph.KindType, graph.KindInterface:
+				add(n)
+			}
 		}
 	}
 	for _, idx := range out {
@@ -212,7 +256,7 @@ func resolveUseSiteDecl(eng *query.Engine, fileIdx map[string]*fileSymbolIndex, 
 				if e.Line != m.Line || !declResolveKinds[e.Kind] {
 					continue
 				}
-				if strings.HasPrefix(e.To, "unresolved::") || strings.HasPrefix(e.To, "external::") {
+				if graph.IsUnresolvedTarget(e.To) || strings.HasPrefix(e.To, "external::") {
 					continue
 				}
 				// Prefer a call edge over a plain reference when the

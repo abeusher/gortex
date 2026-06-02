@@ -25,7 +25,7 @@ func TestScope_CStaticPreference(t *testing.T) {
 	g.AddNode(&graph.Node{
 		ID: "pkg/a.c::helper", Kind: graph.KindFunction, Name: "helper",
 		FilePath: "pkg/a.c", Language: "c",
-		Meta:     map[string]any{MetaScopeStatic: true},
+		Meta: map[string]any{MetaScopeStatic: true},
 	})
 	g.AddNode(&graph.Node{
 		ID: "pkg/b.c::helper", Kind: graph.KindFunction, Name: "helper",
@@ -53,17 +53,17 @@ func TestScope_CppSameNamespacePreference(t *testing.T) {
 	g.AddNode(&graph.Node{
 		ID: "src/a.cpp::caller", Kind: graph.KindFunction, Name: "caller",
 		FilePath: "src/a.cpp", Language: "cpp",
-		Meta:     map[string]any{MetaScopeNamespace: "app"},
+		Meta: map[string]any{MetaScopeNamespace: "app"},
 	})
 	g.AddNode(&graph.Node{
 		ID: "src/a.cpp::helper#app", Kind: graph.KindFunction, Name: "helper",
 		FilePath: "src/a.cpp", Language: "cpp",
-		Meta:     map[string]any{MetaScopeNamespace: "app"},
+		Meta: map[string]any{MetaScopeNamespace: "app"},
 	})
 	g.AddNode(&graph.Node{
 		ID: "src/a.cpp::helper#util", Kind: graph.KindFunction, Name: "helper",
 		FilePath: "src/a.cpp", Language: "cpp",
-		Meta:     map[string]any{MetaScopeNamespace: "util"},
+		Meta: map[string]any{MetaScopeNamespace: "util"},
 	})
 	e := &graph.Edge{
 		From: "src/a.cpp::caller", To: "unresolved::helper",
@@ -89,7 +89,7 @@ func TestScope_CppADLViaArgType(t *testing.T) {
 	g.AddNode(&graph.Node{
 		ID: "src/a.cpp::caller", Kind: graph.KindFunction, Name: "caller",
 		FilePath: "src/a.cpp", Language: "cpp",
-		Meta:     map[string]any{MetaScopeNamespace: "app"},
+		Meta: map[string]any{MetaScopeNamespace: "app"},
 	})
 	// The only "process" candidate is in namespace `util` — same-
 	// namespace lookup would miss it; ADL via the arg-type hint
@@ -97,7 +97,7 @@ func TestScope_CppADLViaArgType(t *testing.T) {
 	g.AddNode(&graph.Node{
 		ID: "src/b.cpp::process#util", Kind: graph.KindFunction, Name: "process",
 		FilePath: "src/b.cpp", Language: "cpp",
-		Meta:     map[string]any{MetaScopeNamespace: "util"},
+		Meta: map[string]any{MetaScopeNamespace: "util"},
 	})
 	e := &graph.Edge{
 		From: "src/a.cpp::caller", To: "unresolved::process",
@@ -126,17 +126,17 @@ func TestScope_JavaEnclosingClassPreference(t *testing.T) {
 	g.AddNode(&graph.Node{
 		ID: "app/User.java::User.save", Kind: graph.KindMethod, Name: "save",
 		FilePath: "app/User.java", Language: "java",
-		Meta:     map[string]any{"receiver": "User", MetaScopeClass: "User"},
+		Meta: map[string]any{"receiver": "User", MetaScopeClass: "User"},
 	})
 	g.AddNode(&graph.Node{
 		ID: "app/User.java::User.validate", Kind: graph.KindMethod, Name: "validate",
 		FilePath: "app/User.java", Language: "java",
-		Meta:     map[string]any{"receiver": "User", MetaScopeClass: "User"},
+		Meta: map[string]any{"receiver": "User", MetaScopeClass: "User"},
 	})
 	g.AddNode(&graph.Node{
 		ID: "app/Other.java::Other.validate", Kind: graph.KindMethod, Name: "validate",
 		FilePath: "app/Other.java", Language: "java",
-		Meta:     map[string]any{"receiver": "Other", MetaScopeClass: "Other"},
+		Meta: map[string]any{"receiver": "Other", MetaScopeClass: "Other"},
 	})
 	// User.save() calls validate() unqualified — must bind to User.validate.
 	e := &graph.Edge{
@@ -166,23 +166,23 @@ func TestScope_JavaSuperChainWalk(t *testing.T) {
 	g.AddNode(&graph.Node{
 		ID: "app/Child.java::Child", Kind: graph.KindType, Name: "Child",
 		FilePath: "app/Child.java", Language: "java",
-		Meta:     map[string]any{MetaScopeParentClass: "Base"},
+		Meta: map[string]any{MetaScopeParentClass: "Base"},
 	})
 	g.AddNode(&graph.Node{
 		ID: "app/Base.java::Base.helper", Kind: graph.KindMethod, Name: "helper",
 		FilePath: "app/Base.java", Language: "java",
-		Meta:     map[string]any{"receiver": "Base", MetaScopeClass: "Base"},
+		Meta: map[string]any{"receiver": "Base", MetaScopeClass: "Base"},
 	})
 	g.AddNode(&graph.Node{
 		ID: "app/Child.java::Child.run", Kind: graph.KindMethod, Name: "run",
 		FilePath: "app/Child.java", Language: "java",
-		Meta:     map[string]any{"receiver": "Child", MetaScopeClass: "Child"},
+		Meta: map[string]any{"receiver": "Child", MetaScopeClass: "Child"},
 	})
 	// Decoy: another class has a same-name `helper`.
 	g.AddNode(&graph.Node{
 		ID: "app/Other.java::Other.helper", Kind: graph.KindMethod, Name: "helper",
 		FilePath: "app/Other.java", Language: "java",
-		Meta:     map[string]any{"receiver": "Other", MetaScopeClass: "Other"},
+		Meta: map[string]any{"receiver": "Other", MetaScopeClass: "Other"},
 	})
 	// Child.run() calls helper() — should walk to Base.helper.
 	e := &graph.Edge{
@@ -211,22 +211,22 @@ func TestScope_PhpParentCall(t *testing.T) {
 	g.AddNode(&graph.Node{
 		ID: "src/Child.php::Child", Kind: graph.KindType, Name: "Child",
 		FilePath: "src/Child.php", Language: "php",
-		Meta:     map[string]any{MetaScopeParentClass: "Base"},
+		Meta: map[string]any{MetaScopeParentClass: "Base"},
 	})
 	g.AddNode(&graph.Node{
 		ID: "src/Base.php::Base.handle", Kind: graph.KindMethod, Name: "handle",
 		FilePath: "src/Base.php", Language: "php",
-		Meta:     map[string]any{"receiver": "Base", MetaScopeClass: "Base"},
+		Meta: map[string]any{"receiver": "Base", MetaScopeClass: "Base"},
 	})
 	g.AddNode(&graph.Node{
 		ID: "src/Child.php::Child.handle", Kind: graph.KindMethod, Name: "handle",
 		FilePath: "src/Child.php", Language: "php",
-		Meta:     map[string]any{"receiver": "Child", MetaScopeClass: "Child"},
+		Meta: map[string]any{"receiver": "Child", MetaScopeClass: "Child"},
 	})
 	g.AddNode(&graph.Node{
 		ID: "src/Other.php::Other.handle", Kind: graph.KindMethod, Name: "handle",
 		FilePath: "src/Other.php", Language: "php",
-		Meta:     map[string]any{"receiver": "Other", MetaScopeClass: "Other"},
+		Meta: map[string]any{"receiver": "Other", MetaScopeClass: "Other"},
 	})
 	// Child.handle() calls parent::handle() — must bind to Base.handle.
 	e := &graph.Edge{
@@ -251,17 +251,17 @@ func TestScope_PhpSelfCall(t *testing.T) {
 	g.AddNode(&graph.Node{
 		ID: "src/Service.php::Service.boot", Kind: graph.KindMethod, Name: "boot",
 		FilePath: "src/Service.php", Language: "php",
-		Meta:     map[string]any{"receiver": "Service", MetaScopeClass: "Service"},
+		Meta: map[string]any{"receiver": "Service", MetaScopeClass: "Service"},
 	})
 	g.AddNode(&graph.Node{
 		ID: "src/Service.php::Service.init", Kind: graph.KindMethod, Name: "init",
 		FilePath: "src/Service.php", Language: "php",
-		Meta:     map[string]any{"receiver": "Service", MetaScopeClass: "Service"},
+		Meta: map[string]any{"receiver": "Service", MetaScopeClass: "Service"},
 	})
 	g.AddNode(&graph.Node{
 		ID: "src/Other.php::Other.init", Kind: graph.KindMethod, Name: "init",
 		FilePath: "src/Other.php", Language: "php",
-		Meta:     map[string]any{"receiver": "Other", MetaScopeClass: "Other"},
+		Meta: map[string]any{"receiver": "Other", MetaScopeClass: "Other"},
 	})
 	e := &graph.Edge{
 		From: "src/Service.php::Service.boot", To: "unresolved::*.init",
@@ -290,7 +290,7 @@ func TestScope_StampedAsScopeResolution(t *testing.T) {
 	g.AddNode(&graph.Node{
 		ID: "pkg/a.c::helper", Kind: graph.KindFunction, Name: "helper",
 		FilePath: "pkg/a.c", Language: "c",
-		Meta:     map[string]any{MetaScopeStatic: true},
+		Meta: map[string]any{MetaScopeStatic: true},
 	})
 	g.AddNode(&graph.Node{
 		ID: "pkg/b.c::helper", Kind: graph.KindFunction, Name: "helper",

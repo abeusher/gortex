@@ -61,7 +61,7 @@ func (p *Provider) Available() bool {
 	return err == nil
 }
 
-func (p *Provider) Enrich(g *graph.Graph, repoRoot string) (*semantic.EnrichResult, error) {
+func (p *Provider) Enrich(g graph.Store, repoRoot string) (*semantic.EnrichResult, error) {
 	start := time.Now()
 
 	// Run the SCIP indexer.
@@ -86,7 +86,7 @@ func (p *Provider) Enrich(g *graph.Graph, repoRoot string) (*semantic.EnrichResu
 	return result, nil
 }
 
-func (p *Provider) EnrichFile(g *graph.Graph, repoRoot, filePath string) (*semantic.EnrichResult, error) {
+func (p *Provider) EnrichFile(g graph.Store, repoRoot, filePath string) (*semantic.EnrichResult, error) {
 	// SCIP doesn't support incremental indexing well — re-run full enrichment.
 	// For large repos, this should be gated by the watch debounce.
 	return nil, nil
@@ -142,7 +142,7 @@ func (p *Provider) runIndexer(repoRoot string) (string, error) {
 }
 
 // enrichFromIndex maps SCIP data to the Gortex graph.
-func (p *Provider) enrichFromIndex(g *graph.Graph, index *SCIPIndex, repoRoot string) *semantic.EnrichResult {
+func (p *Provider) enrichFromIndex(g graph.Store, index *SCIPIndex, repoRoot string) *semantic.EnrichResult {
 	result := &semantic.EnrichResult{}
 	symMap := semantic.NewSymbolMap()
 
@@ -272,6 +272,11 @@ func (p *Provider) enrichFromIndex(g *graph.Graph, index *SCIPIndex, repoRoot st
 	}
 
 	// Phase 4: Enrich node metadata from symbol documentation.
+	// Collect stamped nodes and round-trip them through the store at the
+	// end — EnrichNodeMeta mutates Node.Meta in place, which does not
+	// persist on disk backends (GetNode returns a per-call copy). See
+	// semantic.EnrichNodeMeta.
+	var stampedNodes []*graph.Node
 	for _, doc := range index.Documents {
 		for _, sym := range doc.Symbols {
 			nodeID, ok := symMap.GortexID(sym.Symbol)
@@ -289,16 +294,20 @@ func (p *Provider) enrichFromIndex(g *graph.Graph, index *SCIPIndex, repoRoot st
 				if typeInfo != "" {
 					semantic.EnrichNodeMeta(node, "semantic_type", typeInfo, p.Name())
 					result.NodesEnriched++
+					stampedNodes = append(stampedNodes, node)
 				}
 			}
 		}
+	}
+	if len(stampedNodes) > 0 {
+		g.AddBatch(stampedNodes, nil)
 	}
 
 	return result
 }
 
 // findContainingNode finds the innermost Gortex node that contains the given line.
-func findContainingNode(g *graph.Graph, filePath string, line int) *graph.Node {
+func findContainingNode(g graph.Store, filePath string, line int) *graph.Node {
 	nodes := g.GetFileNodes(filePath)
 	var best *graph.Node
 	bestSize := int(^uint(0) >> 1)

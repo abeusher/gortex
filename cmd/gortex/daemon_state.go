@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -36,7 +37,7 @@ import (
 // instance per running daemon; every session the daemon accepts shares
 // these pointers.
 type daemonState struct {
-	graph         *graph.Graph
+	graph         graph.Store
 	indexer       *indexer.Indexer
 	multiIndexer  *indexer.MultiIndexer
 	configManager *config.ConfigManager
@@ -95,7 +96,7 @@ type daemonState struct {
 // stdio transport wiring — the daemon hands frames to MCPServer.HandleMessage
 // via the mcpDispatcher rather than going through server.ServeStdio.
 //
-// Any previously-tracked repos (from ~/.config/gortex/config.yaml) are
+// Any previously-tracked repos (from ~/.gortex/config.yaml) are
 // loaded on startup so the daemon restarts pick up where it left off.
 // isFalsyEnv returns true when the env var is explicitly set to one
 // of the "no" spellings: "0", "false", "no", "off", "n". An unset or
@@ -177,7 +178,20 @@ func buildDaemonState(logger *zap.Logger) (*daemonState, error) {
 		}
 	}
 
-	g := graph.New()
+	g, backendCleanup, err := openBackend(daemonBackend, daemonBackendPath, resolveDaemonBufferPoolMB(), logger)
+	if err != nil {
+		return nil, fmt.Errorf("opening backend %q: %w", daemonBackend, err)
+	}
+	// Cleanup runs at daemon shutdown via the returned state's
+	// teardown chain (see DaemonState.Close); store it on the
+	// state so deferred close fires after every other shutdown
+	// step (snapshot save, etc.).
+	defer func() {
+		if err != nil {
+			backendCleanup()
+		}
+	}()
+
 	reg := parser.NewRegistry()
 	languages.RegisterAll(reg)
 	languages.RegisterCustomGrammars(reg, cfg.Index.Grammars, logger)
@@ -190,10 +204,35 @@ func buildDaemonState(logger *zap.Logger) (*daemonState, error) {
 	// have no signal to distinguish "indexed and unchanged" from "new
 	// on disk", treat everything as stale, and produce duplicate
 	// nodes/edges on every restart (bug B1).
-	loadResult, err := loadSnapshot(g, logger)
-	if err != nil {
-		logger.Warn("daemon: snapshot load failed", zap.Error(err))
+	//
+	// Two snapshot shapes:
+	//
+	//   - Memory backend: full graph replay (loadSnapshot). The
+	//     gob+gzip dump IS the persistence layer; nodes + edges are
+	//     replayed into the empty *graph.Graph.
+	//
+	//   - Persistent backend (sqlite): metadata-only load
+	//     (loadSnapshotMetadata). The graph already lives in the
+	//     backend's own on-disk store, so the snapshot only needs to
+	//     carry the data the backend doesn't track — per-repo
+	//     FileMtimes, contract registries, vector index. Skipping the
+	//     load entirely (the previous behaviour) left priorMtimes
+	//     empty and routed every warm restart through a full
+	//     TrackRepoCtx → BulkUpsertSymbolFTS reindex path.
+	var loadResult snapshotLoadResult
+	if mg, ok := g.(*graph.Graph); ok {
+		loadResult, err = loadSnapshot(mg, logger)
+		if err != nil {
+			logger.Warn("daemon: snapshot load failed", zap.Error(err))
+		}
 	}
+	// Disk-backed daemons don't read a metadata snapshot: per-
+	// repo FileMtimes live in the FileMtime sidecar table (loaded
+	// per-repo by priorMtimesFromStore in the parallel_parse loop
+	// below), KindContract nodes carry the rich contract record on
+	// Node.Meta (rehydrated via contracts.LoadRegistryFromGraph),
+	// and vector queries route to the backend's native vector index.
+	// The legacy gob round-trip is now memory-backend-only.
 
 	idx := indexer.New(g, reg, cfg.Index, logger)
 
@@ -457,14 +496,20 @@ func buildDaemonState(logger *zap.Logger) (*daemonState, error) {
 		srv.SetLSPDiagnosticsBroadcasting()
 	}
 	srv.InitFeedback("", "")
-	srv.InitNotes("", "")
-	srv.InitMemories("", "")
-	// Daemon mode has no single repo to anchor a per-repo notebook
-	// against, but the agent still wants persistence across daemon
-	// restarts and shared visibility across sessions. Fall back to a
-	// global notebook under the legacy data dir; CLI mode keeps the
-	// per-repo .gortex/notebook/ path wired in cmd/gortex/mcp.go.
-	srv.InitNotebook(filepath.Join(platform.LegacyDataDir(), "notebook-cache"))
+	// Daemon mode has no single repo to anchor the per-repo side-stores
+	// against, but notes/memories must still persist across daemon
+	// restarts and compactions (they are independent of the graph
+	// backend). Wire them to the shared sidecar DB under the data dir
+	// with a stable "daemon" partition key; per-call WorkspaceID /
+	// SessionID filtering keeps repos' notes distinct at query time.
+	// The per-repo `gortex mcp` subprocess persists under its own
+	// cache dir (cmd/gortex/mcp.go).
+	srv.InitNotes(platform.DataDir(), "daemon")
+	srv.InitMemories(platform.DataDir(), "daemon")
+	// Notebook: a global notebook under the data dir so entries survive
+	// daemon restarts and are shared across sessions; CLI mode keeps the
+	// per-repo .gortex/ path wired in cmd/gortex/mcp.go.
+	srv.InitNotebook(filepath.Join(platform.DataDir(), "notebook-cache"))
 	srv.InitCombo("", "", gortexmcp.ModeAI)
 	srv.InitFrecency("", "", gortexmcp.ModeAI)
 
@@ -475,7 +520,7 @@ func buildDaemonState(logger *zap.Logger) (*daemonState, error) {
 	}
 
 	// LLM service (opt-in via the `.gortex.yaml` `llm:` block,
-	// `~/.config/gortex/config.yaml::llm:`, or GORTEX_LLM_* env vars).
+	// `~/.gortex/config.yaml::llm:`, or GORTEX_LLM_* env vars).
 	// Repo-local config wins per non-zero field; the global config
 	// fills the rest; env overrides land last inside SetupLLM via
 	// MergeEnv. The active provider is chosen by `llm.provider`
@@ -652,53 +697,113 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger) *indexer.MultiWat
 
 	jobs := make(chan config.RepoEntry, len(repos))
 	var wg sync.WaitGroup
+	// changedRepos counts repos that actually did indexing work this
+	// warmup: a cold full-track, or a reconcile that re-indexed / evicted
+	// at least one file. When it stays zero, NOTHING on disk changed
+	// since the last shutdown, so the persisted graph already holds every
+	// resolved and derived edge — the global resolution passes below
+	// (RunDeferredPassesAll / RunGlobalResolve / RunGlobalGraphPasses) are
+	// pure recomputation and get skipped, which is what makes a true warm
+	// restart near-instant instead of replaying the full cold-warmup cost.
+	var changedRepos atomic.Int64
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for entry := range jobs {
-				// Route repos whose nodes came from the snapshot through
-				// ReconcileRepoCtx — it calls IncrementalReindex, which
-				// evicts files deleted while the daemon was down and
-				// re-indexes only files whose mtime changed. Repos not in
-				// the snapshot (newly tracked, or first startup after a
-				// schema bump) fall back to TrackRepoCtx, which does a
-				// full walk. Both paths end with the repo registered on
-				// the MultiIndexer; contract reconciliation is deferred
-				// to the single RunGlobalResolve call below.
-				//
-				// snapshotPartial == true forces the full-walk path even
-				// when prior mtimes exist: the partial-load signal means
-				// the persisted resolution state is no longer trustworthy
-				// (stale edges were dropped because their targets vanished),
-				// and the incremental path only re-resolves files whose
-				// mtime changed — so the dropped edges would never come
-				// back. Without this override every restart progressively
-				// erodes the graph until exported methods show zero
-				// callers despite having dozens of real call sites.
-				repoStart := time.Now()
-				priorMtimes := priorMtimesForEntry(state.snapshotRepos, entry)
-				if state.snapshotPartial {
-					priorMtimes = nil
-				}
-				pathFn := "track"
-				if priorMtimes != nil {
-					pathFn = "reconcile"
-					if _, err := state.multiIndexer.ReconcileRepoCtx(ctx, entry, priorMtimes); err != nil {
-						logger.Warn("daemon: startup reconcile failed",
-							zap.String("path", entry.Path), zap.Error(err))
+				// Per-entry panic guard so one repo's crash during
+				// reindex doesn't kill the worker — the bad repo logs
+				// and skips, the worker proceeds to the next job, and
+				// warmup completes.
+				func(entry config.RepoEntry) {
+					defer func() {
+						if r := recover(); r != nil {
+							logger.Error("daemon: warmup repo panic recovered",
+								zap.String("path", entry.Path),
+								zap.Any("panic", r))
+						}
+					}()
+					// Route repos whose nodes came from the snapshot through
+					// ReconcileRepoCtx — it calls IncrementalReindex, which
+					// evicts files deleted while the daemon was down and
+					// re-indexes only files whose mtime changed. Repos not in
+					// the snapshot (newly tracked, or first startup after a
+					// schema bump) fall back to TrackRepoCtx, which does a
+					// full walk. Both paths end with the repo registered on
+					// the MultiIndexer; contract reconciliation is deferred
+					// to the single RunGlobalResolve call below.
+					//
+					// snapshotPartial == true forces the full-walk path even
+					// when prior mtimes exist: the partial-load signal means
+					// the persisted resolution state is no longer trustworthy
+					// (stale edges were dropped because their targets vanished),
+					// and the incremental path only re-resolves files whose
+					// mtime changed — so the dropped edges would never come
+					// back. Without this override every restart progressively
+					// erodes the graph until exported methods show zero
+					// callers despite having dozens of real call sites.
+					repoStart := time.Now()
+					// Prefer mtimes stored in the backend's FileMtime
+					// sidecar table — that lifts the persistence off the
+					// gob snapshot for disk-backed backends, which is the
+					// path that actually rebuilds across restarts. Falls
+					// back to the snapshot's per-repo FileMtimes when the
+					// backend doesn't implement the reader (memory) or
+					// hasn't seen this repo yet.
+					priorMtimes := priorMtimesFromStore(state.graph, entry, logger)
+					if len(priorMtimes) == 0 {
+						priorMtimes = priorMtimesForEntry(state.snapshotRepos, entry)
 					}
-				} else if _, err := state.multiIndexer.TrackRepoCtx(ctx, entry); err != nil {
-					logger.Warn("daemon: startup track failed",
-						zap.String("path", entry.Path), zap.Error(err))
-				}
-				elapsed := time.Since(repoStart)
-				if elapsed > 2*time.Second {
-					logger.Info("daemon: warmup repo elapsed",
-						zap.String("path", entry.Path),
-						zap.String("path_fn", pathFn),
-						zap.Duration("elapsed", elapsed))
-				}
+					if state.snapshotPartial {
+						priorMtimes = nil
+					}
+					// A backend that crossed a schema-rebuild migration rung
+					// (NeedsRebuild) has on-disk rows in the old shape that an
+					// incremental reconcile cannot fix. Drop prior mtimes so every
+					// file re-indexes into the new schema (the nil branch below
+					// runs a full TrackRepoCtx and marks the repo changed, so the
+					// global resolve/derivation passes re-run too). No-op for
+					// backends without the capability and whenever no rebuild rung
+					// was crossed — the common case.
+					if storeNeedsRebuild(state.graph) {
+						if len(priorMtimes) > 0 {
+							logger.Info("daemon: backend signalled schema rebuild; forcing full re-index",
+								zap.String("path", entry.Path))
+						}
+						priorMtimes = nil
+					}
+					pathFn := "track"
+					if priorMtimes != nil {
+						pathFn = "reconcile"
+						res, err := state.multiIndexer.ReconcileRepoCtx(ctx, entry, priorMtimes)
+						switch {
+						case err != nil:
+							logger.Warn("daemon: startup reconcile failed",
+								zap.String("path", entry.Path), zap.Error(err))
+							// Treat a failed reconcile as "changed" so the global
+							// passes still run — degrade toward correctness, not
+							// toward the fast path, when we can't trust the delta.
+							changedRepos.Add(1)
+						case res != nil && (res.StaleFileCount > 0 || res.DeletedFileCount > 0 || len(res.FailedFiles) > 0):
+							changedRepos.Add(1)
+						}
+					} else {
+						// No prior mtimes → full cold (re)index of this repo,
+						// which is "changed" by definition.
+						changedRepos.Add(1)
+						if _, err := state.multiIndexer.TrackRepoCtx(ctx, entry); err != nil {
+							logger.Warn("daemon: startup track failed",
+								zap.String("path", entry.Path), zap.Error(err))
+						}
+					}
+					elapsed := time.Since(repoStart)
+					if elapsed > 2*time.Second {
+						logger.Info("daemon: warmup repo elapsed",
+							zap.String("path", entry.Path),
+							zap.String("path_fn", pathFn),
+							zap.Duration("elapsed", elapsed))
+					}
+				}(entry)
 			}
 		}()
 	}
@@ -715,19 +820,36 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger) *indexer.MultiWat
 		"elapsed_ms":    time.Since(phaseStart).Milliseconds(),
 	})
 
+	// Warm-restart fast path. When the reconcile loop above re-indexed
+	// nothing, the persistent backend already carries every resolved and
+	// derived edge from the prior run; the deferred per-repo passes, the
+	// cross-repo resolve, and the graph-wide derivation passes would all
+	// just recompute what's on disk. Skipping them is what turns a warm
+	// restart from a multi-minute replay of the cold-warmup cost into a
+	// near-instant "open store, reconcile zero files, start watching".
+	// The in-memory backend reaches here too, but its snapshot replay
+	// already restored the derived edges, so the skip is equally safe.
+	anyChanged := changedRepos.Load() > 0
+	logger.Info("daemon: warmup change detection",
+		zap.Int64("changed_repos", changedRepos.Load()),
+		zap.Int("tracked_repos", len(repos)),
+		zap.Bool("global_passes", anyChanged))
+
 	// Drain deferred per-repo passes (ResolveAll / semantic enrich /
 	// contract extract+commit) serially across the indexers the parallel
 	// loop populated. Must run before RunGlobalResolve so cross-repo
 	// resolution sees fully-lifted per-repo placeholder edges.
-	phaseStart = time.Now()
-	publishReadinessPhase(state, "deferred_passes_all", false, nil)
-	state.multiIndexer.RunDeferredPassesAll(ctx)
-	logger.Info("daemon: warmup phase done",
-		zap.String("phase", "deferred_passes_all"),
-		zap.Duration("elapsed", time.Since(phaseStart)))
-	publishReadinessPhase(state, "deferred_passes_all_done", false, map[string]any{
-		"elapsed_ms": time.Since(phaseStart).Milliseconds(),
-	})
+	if anyChanged {
+		phaseStart = time.Now()
+		publishReadinessPhase(state, "deferred_passes_all", false, nil)
+		state.multiIndexer.RunDeferredPassesAll(ctx)
+		logger.Info("daemon: warmup phase done",
+			zap.String("phase", "deferred_passes_all"),
+			zap.Duration("elapsed", time.Since(phaseStart)))
+		publishReadinessPhase(state, "deferred_passes_all_done", false, map[string]any{
+			"elapsed_ms": time.Since(phaseStart).Milliseconds(),
+		})
+	}
 
 	// Rehydrate per-repo contract registries from the snapshot. Only
 	// target indexers whose registry is still nil — a non-nil registry
@@ -737,7 +859,7 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger) *indexer.MultiWat
 	// MergedContractRegistry skips them, so `contracts` returns only
 	// the contracts of repos whose files happened to change since the
 	// last shutdown.
-	if len(state.snapshotContracts) > 0 {
+	{
 		phaseStart = time.Now()
 		injectedRepos, injectedCount := 0, 0
 		for prefix := range state.multiIndexer.AllMetadata() {
@@ -745,20 +867,32 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger) *indexer.MultiWat
 			if idx == nil || idx.ContractRegistry() != nil {
 				continue
 			}
-			cs, ok := state.snapshotContracts[prefix]
-			if !ok || len(cs) == 0 {
-				continue
-			}
-			reg := contracts.NewRegistry()
-			for _, c := range cs {
-				reg.Add(c)
+			// Primary path: rebuild the per-repo registry from
+			// KindContract nodes already in the backend's graph.
+			// The indexer stamps every contract record onto
+			// Node.Meta at commit time, so the graph is the
+			// authoritative source — no gob round-trip needed.
+			reg := contracts.LoadRegistryFromGraph(state.graph, prefix)
+			if reg == nil {
+				// Fallback to the legacy gob-snapshot path for
+				// daemons upgrading across this change. The
+				// snapshot copy is read-only by this point so the
+				// two sources can't drift mid-flight.
+				cs, ok := state.snapshotContracts[prefix]
+				if !ok || len(cs) == 0 {
+					continue
+				}
+				reg = contracts.NewRegistry()
+				for _, c := range cs {
+					reg.Add(c)
+				}
 			}
 			idx.SetContractRegistry(reg)
 			injectedRepos++
-			injectedCount += len(cs)
+			injectedCount += len(reg.All())
 		}
 		if injectedRepos > 0 {
-			logger.Info("daemon: rehydrated contract registries from snapshot",
+			logger.Info("daemon: rehydrated contract registries from graph/snapshot",
 				zap.Int("repos", injectedRepos),
 				zap.Int("contracts", injectedCount),
 				zap.Duration("elapsed", time.Since(phaseStart)))
@@ -788,24 +922,33 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger) *indexer.MultiWat
 	// for a fresh-start daemon (where there's no snapshot to reconcile
 	// against). After resolution, contract bridge edges may have
 	// changed too, so ReconcileContractEdges runs again.
-	phaseStart = time.Now()
-	publishReadinessPhase(state, "global_resolve", false, nil)
-	state.multiIndexer.RunGlobalResolve()
-	logger.Info("daemon: warmup phase done",
-		zap.String("phase", "global_resolve"),
-		zap.Duration("elapsed", time.Since(phaseStart)))
-	publishReadinessPhase(state, "global_resolve_done", false, map[string]any{
-		"elapsed_ms": time.Since(phaseStart).Milliseconds(),
-	})
+	if anyChanged {
+		phaseStart = time.Now()
+		publishReadinessPhase(state, "global_resolve", false, nil)
+		state.multiIndexer.RunGlobalResolve()
+		logger.Info("daemon: warmup phase done",
+			zap.String("phase", "global_resolve"),
+			zap.Duration("elapsed", time.Since(phaseStart)))
+		publishReadinessPhase(state, "global_resolve_done", false, map[string]any{
+			"elapsed_ms": time.Since(phaseStart).Milliseconds(),
+		})
+	}
 
 	// Finish the batch: turn off the per-repo skip flag and run the
 	// graph-wide derivation passes once. RunGlobalResolve above just
 	// lifted the last cross-repo placeholder EdgeCalls, so EdgeTests
 	// derivation here picks up cross-repo test→subject pairs that
-	// were unresolved during the per-repo loop.
+	// were unresolved during the per-repo loop. On the warm-restart fast
+	// path (nothing changed) ResetBatch clears the deferred-batch flags
+	// without re-running those passes — the persisted graph already has
+	// the derived edges.
 	phaseStart = time.Now()
 	publishReadinessPhase(state, "end_batch", false, nil)
-	state.multiIndexer.EndBatch()
+	if anyChanged {
+		state.multiIndexer.EndBatch()
+	} else {
+		state.multiIndexer.ResetBatch()
+	}
 	logger.Info("daemon: warmup phase done",
 		zap.String("phase", "end_batch"),
 		zap.Duration("elapsed", time.Since(phaseStart)))
@@ -863,6 +1006,51 @@ func publishReadinessPhase(state *daemonState, phase string, ready bool, extra m
 		return
 	}
 	state.mcpServer.PublishReadiness(phase, ready, extra)
+}
+
+// priorMtimesFromStore asks the backend for its persisted FileMtime
+// rows for the repo described by entry. Returns nil when the backend
+// doesn't implement the reader (in-memory backend) or has no recorded
+// mtimes for the repo (fresh cold start). When non-nil it short-
+// circuits the gob-snapshot lookup so the warm path is driven by
+// data the backend persisted itself.
+func priorMtimesFromStore(g graph.Store, entry config.RepoEntry, logger *zap.Logger) map[string]int64 {
+	reader, ok := g.(graph.FileMtimeReader)
+	if !ok {
+		if logger != nil {
+			logger.Info("daemon: priorMtimesFromStore: store does not implement FileMtimeReader")
+		}
+		return nil
+	}
+	prefix := strings.TrimPrefix(config.ResolvePrefix(entry), "/")
+	if prefix == "" {
+		if logger != nil {
+			logger.Info("daemon: priorMtimesFromStore: empty prefix",
+				zap.String("entry_path", entry.Path),
+				zap.String("entry_name", entry.Name))
+		}
+		return nil
+	}
+	mtimes := reader.LoadFileMtimes(prefix)
+	if logger != nil {
+		logger.Info("daemon: priorMtimesFromStore loaded",
+			zap.String("prefix", prefix),
+			zap.Int("count", len(mtimes)))
+	}
+	return mtimes
+}
+
+// storeNeedsRebuild reports whether the backend signalled, via the optional
+// NeedsRebuild capability, that a schema migration crossed a rung an ALTER
+// could not satisfy — so its persisted rows are in an old shape and the
+// warm/incremental reconcile must be bypassed for a full re-index. This is a
+// generic, opt-in capability probe: a backend implements NeedsRebuild() bool
+// to participate. No backend currently does, so this always reports false;
+// it stays as a hook for any future on-disk store that needs schema-version
+// gating on warm restart.
+func storeNeedsRebuild(g any) bool {
+	rb, ok := g.(interface{ NeedsRebuild() bool })
+	return ok && rb.NeedsRebuild()
 }
 
 // priorMtimesForEntry finds the snapshotted FileMtimes map for a

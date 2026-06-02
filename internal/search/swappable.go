@@ -81,6 +81,59 @@ func (s *Swappable) SearchChannels(query string, limit int) (textResults []Searc
 	return s.inner.Search(query, limit), nil
 }
 
+// SearchChannelsTimed delegates to a backend that supports the
+// per-phase timing breakdown (today only HybridBackend). Falls back
+// to SearchChannels — and a zero-valued ChannelTimings — when the
+// inner backend doesn't know how to split phases.
+func (s *Swappable) SearchChannelsTimed(query string, limit int) ([]SearchResult, []string, ChannelTimings) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	type timer interface {
+		SearchChannelsTimed(query string, limit int) ([]SearchResult, []string, ChannelTimings)
+	}
+	if cst, ok := s.inner.(timer); ok {
+		return cst.SearchChannelsTimed(query, limit)
+	}
+	if cs, ok := s.inner.(ChannelSearcher); ok {
+		text, vec := cs.SearchChannels(query, limit)
+		return text, vec, ChannelTimings{}
+	}
+	return s.inner.Search(query, limit), nil, ChannelTimings{}
+}
+
+// SearchSymbolBundles forwards to the inner backend when it implements
+// SymbolBundleSearcherBackend (production wiring: a
+// SymbolSearcherBackend whose store is the disk Store, or a
+// HybridBackend whose text backend is the same). Returns nil when the
+// inner backend doesn't expose bundles — the engine treats nil as
+// "no bundle support" and falls back to the per-call Search +
+// GetNodesByIDs + GetIn/OutEdgesByNodeIDs path.
+func (s *Swappable) SearchSymbolBundles(query string, limit int) []SymbolBundle {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if bs, ok := s.inner.(SymbolBundleSearcherBackend); ok {
+		return bs.SearchSymbolBundles(query, limit)
+	}
+	return nil
+}
+
+// VectorChannelOnly forwards to the inner backend when it implements
+// the vector-only channel pull (today: HybridBackend). Lets the
+// engine fetch the vector channel without re-running text BM25 —
+// the bundle path already has the text hits. Returns (nil, zero
+// timings) when the inner backend isn't vector-aware.
+func (s *Swappable) VectorChannelOnly(query string, limit int) ([]string, ChannelTimings) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	type vco interface {
+		VectorChannelOnly(query string, limit int) ([]string, ChannelTimings)
+	}
+	if v, ok := s.inner.(vco); ok {
+		return v.VectorChannelOnly(query, limit)
+	}
+	return nil, ChannelTimings{}
+}
+
 func (s *Swappable) Count() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

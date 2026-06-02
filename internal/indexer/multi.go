@@ -45,7 +45,7 @@ type RepoMetadata struct {
 
 // MultiIndexer orchestrates indexing across multiple repositories.
 type MultiIndexer struct {
-	graph     *graph.Graph
+	graph     graph.Store
 	registry  *parser.Registry
 	search    search.Backend
 	embedder  embedding.Provider
@@ -349,6 +349,7 @@ func (mi *MultiIndexer) RunDeferredPassesAll(ctx context.Context) {
 	}
 	if mi.graph != nil {
 		master := resolver.New(mi.graph)
+		master.SetLogger(mi.logger)
 		// Mirror the resolve-time LSP helper onto the master pass
 		// too — RunDeferredPassesAll is where placeholder edges
 		// added by deferred per-repo passes get resolved in batch,
@@ -359,7 +360,9 @@ func (mi *MultiIndexer) RunDeferredPassesAll(ctx context.Context) {
 		}
 		master.SetNpmAliasResolver(mi.npmAliasResolver())
 		master.SetWorkspaceMembership(mi.workspaceMembershipResolver())
+		mt := time.Now()
 		master.ResolveAll()
+		mi.logger.Info("DEFERRED-TIMING master.ResolveAll", zap.Duration("elapsed", time.Since(mt)))
 	}
 }
 
@@ -377,6 +380,26 @@ func (mi *MultiIndexer) EndBatch() {
 	}
 	mi.mu.Unlock()
 	mi.RunGlobalGraphPasses(context.Background())
+}
+
+// ResetBatch clears deferred-batch mode WITHOUT running the graph-wide
+// derivation passes. It is the warm-restart fast-path counterpart to
+// EndBatch: when the warmup reconcile loop observed zero changed files
+// across every repo, the persistent backend already holds every resolved
+// and derived edge from the prior run, so RunGlobalGraphPasses (plus the
+// RunDeferredPassesAll / RunGlobalResolve the caller also skips) would
+// only recompute what's already on disk — the work that turns a warm
+// restart into a 30s–500s stall. The per-Indexer SetDeferGlobalPasses
+// flag is still restored so a later watch-triggered TrackRepoCtx /
+// IncrementalReindex runs its passes inline as normal.
+func (mi *MultiIndexer) ResetBatch() {
+	mi.mu.Lock()
+	defer mi.mu.Unlock()
+	mi.deferGlobalPasses = false
+	mi.deferResolve = false
+	for _, idx := range mi.indexers {
+		idx.SetDeferGlobalPasses(false)
+	}
 }
 
 // RunGlobalGraphPasses runs the graph-wide derivation passes once
@@ -404,17 +427,46 @@ func (mi *MultiIndexer) RunGlobalGraphPasses(ctx context.Context) {
 			zap.Int("edges", emitted),
 		)
 	}
+	// Clone detection is PER-REPOSITORY: each tracked repo gets its own
+	// finalise + detect over its own nodes (scoped by RepoPrefix), so no
+	// cross-repo candidate pair is ever formed and each repo's boilerplate
+	// CMS / threshold is computed from that repo's bodies alone. This
+	// matches the per-repo incremental maintainer (cloneIndex.Rebuild /
+	// UpdateFuncs) so the batch and incremental edge sets agree.
 	reporter.Report("clone detection pass (global)", 0, 0)
-	if cs := detectClonesAndEmitEdgesCtx(ctx, mi.graph, mi.cloneThreshold()); cs.Items > 0 {
-		mi.logger.Info("clone edges emitted (global)",
-			zap.Int("items", cs.Items),
-			zap.Int("clone_pairs", cs.Pairs),
-			zap.Int("edges", cs.Edges),
-			zap.Int("skipped_buckets", cs.SkippedBuckets),
-			zap.Int("skipped_bucket_items", cs.SkippedBucketItems),
-			zap.Int("diffused_pairs", cs.DiffusedPairs),
-			zap.Int("diffused_edges", cs.DiffusedEdges),
-		)
+	mi.mu.RLock()
+	cloneIdx := make([]*Indexer, 0, len(mi.indexers))
+	for _, idx := range mi.indexers {
+		cloneIdx = append(cloneIdx, idx)
+	}
+	mi.mu.RUnlock()
+	for _, idx := range cloneIdx {
+		// Per-repo threshold, NOT a max-over-repos value: the batch must use
+		// the same cutoff the per-repo incremental maintainer uses
+		// (UpdateFuncs/Rebuild → idx.cloneThreshold()), or the batch and
+		// incremental edge sets diverge for any repo whose configured
+		// threshold differs from the workspace maximum.
+		if cs := detectClonesAndEmitEdgesCtx(ctx, mi.graph, idx.repoPrefix, idx.cloneThreshold()); cs.Items > 0 {
+			mi.logger.Info("clone edges emitted (global)",
+				zap.String("repo", idx.repoPrefix),
+				zap.Int("items", cs.Items),
+				zap.Int("clone_pairs", cs.Pairs),
+				zap.Int("edges", cs.Edges),
+				zap.Int("skipped_buckets", cs.SkippedBuckets),
+				zap.Int("skipped_bucket_items", cs.SkippedBucketItems),
+				zap.Int("diffused_pairs", cs.DiffusedPairs),
+				zap.Int("diffused_edges", cs.DiffusedEdges),
+			)
+		}
+	}
+	// Seed each per-repo indexer's incremental clone index from the
+	// freshly-baselined signatures + sidecar (scoped to that repo's
+	// prefix) so steady-state single-file edits after this batch go
+	// incremental instead of re-running the whole-graph pass per file.
+	for _, idx := range cloneIdx {
+		if idx.cloneIndex != nil {
+			idx.cloneIndex.Rebuild(mi.graph, idx.repoPrefix)
+		}
 	}
 	// gRPC stub-call resolution. After InferImplements (the
 	// interface-satisfaction fallback signal) and before
@@ -456,23 +508,6 @@ func (mi *MultiIndexer) RunGlobalGraphPasses(ctx context.Context) {
 	}
 }
 
-// cloneThreshold resolves the graph-wide Jaccard similarity cutoff for
-// clone detection. Thresholds are configured per-repo but the LSH pass
-// is graph-wide, so the strictest (highest) configured value across
-// tracked repos wins — fewer false-positive EdgeSimilarTo edges. Zero
-// (no repo set one) falls through to the clones package default.
-func (mi *MultiIndexer) cloneThreshold() float64 {
-	mi.mu.RLock()
-	defer mi.mu.RUnlock()
-	best := 0.0
-	for _, idx := range mi.indexers {
-		if t := idx.cloneThreshold(); t > best {
-			best = t
-		}
-	}
-	return best
-}
-
 // externalCallSynthesisEnabled resolves whether external-call placeholder
 // synthesis should run over the shared graph. The pass is graph-wide, so
 // it is enabled when any tracked repo opted in — a repo that wants the
@@ -491,7 +526,7 @@ func (mi *MultiIndexer) externalCallSynthesisEnabled() bool {
 
 // NewMultiIndexer creates a MultiIndexer.
 func NewMultiIndexer(
-	g *graph.Graph,
+	g graph.Store,
 	reg *parser.Registry,
 	s search.Backend,
 	cm *config.ConfigManager,
@@ -1085,7 +1120,40 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 	idx.SetRootPath(absPath)
 	idx.SetFileMtimes(priorMtimes)
 
-	result, err := idx.IncrementalReindex(absPath)
+	// Choose the reconcile strategy. A repo that changed while the
+	// daemon was down must NOT take IncrementalReindex's per-file path:
+	// re-resolving a changed file there goes through per-edge
+	// graph.ReindexEdges, and the per-edge write against a freshly
+	// reopened disk store is slow and unreliable. The shadow/bulk
+	// re-track path (IndexCtx) resolves in an in-memory shadow and
+	// commits one bulk load, so it never issues a per-edge write to the
+	// reopened store. It re-indexes the whole repo, but only repos that
+	// actually changed pay it, and it is reliable where the per-edge path
+	// is not. A repo with zero changes keeps the fast IncrementalReindex
+	// no-op (walk + 0 stale → return), which is what makes an unchanged
+	// warm restart near-instant.
+	// The shadow/bulk re-track path for the per-edge ReindexEdges
+	// problem applies ONLY to disk-backed stores, which is where the
+	// per-edge write to a reopened store is unreliable. The in-memory
+	// backend (*graph.Graph) has
+	// no reopen and no CGo write path, and IncrementalReindex is the
+	// authoritative path there — it evicts offline-deleted files in place
+	// (a re-track of a shared in-memory graph would not). Gate on the
+	// store type so the memory backend keeps its exact prior behaviour.
+	_, memoryBacked := mi.graph.(*graph.Graph)
+	var result *IndexResult
+	if !memoryBacked && idx.HasChangesSinceMtimes(absPath) {
+		result, err = idx.IndexCtx(ctx, absPath)
+		if err == nil && result != nil && result.StaleFileCount == 0 {
+			// Signal "this repo did re-indexing work" to the warmup
+			// change-detector (which keys on StaleFileCount): a full
+			// re-track touches every file, so the daemon's global
+			// resolution passes must run.
+			result.StaleFileCount = result.FileCount
+		}
+	} else {
+		result, err = idx.IncrementalReindex(absPath)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("reconciling %s: %w", absPath, err)
 	}
@@ -1149,7 +1217,14 @@ func (mi *MultiIndexer) ReconcileAll() map[string]*IndexResult {
 	// don't suppress it. With ~100 repos that's ~100× the work for the
 	// hourly janitor.
 	mi.BeginBatch()
-	defer mi.EndBatch()
+	// Always restore batch flags on exit (incl. panic) WITHOUT running the
+	// graph-wide derivation passes — those are run explicitly below, and
+	// only when a repo actually reindexed. The hourly janitor used to run
+	// EndBatch unconditionally, walking the full graph (InferImplements /
+	// InferOverrides / clone detection over hundreds of thousands of
+	// edges) every cycle even when nothing changed — wasted CPU and, on a
+	// small resident buffer pool, needless memory churn.
+	defer mi.ResetBatch()
 
 	results := make(map[string]*IndexResult, len(prefixes))
 	reindexed := 0
@@ -1187,6 +1262,10 @@ func (mi *MultiIndexer) ReconcileAll() map[string]*IndexResult {
 
 	if reindexed > 0 {
 		mi.ReconcileContractEdges()
+		// Only now — when at least one repo actually reindexed — is it
+		// worth the full-graph derivation pass. Nothing changed → skip it
+		// (the deferred ResetBatch still clears the batch flags).
+		mi.RunGlobalGraphPasses(context.Background())
 	}
 	return results
 }
@@ -1587,7 +1666,7 @@ func (mi *MultiIndexer) MergedContractRegistry() *contracts.Registry {
 // re-extract shapes (the type nodes already have them from
 // snapshotContractShapes if they were referenced anywhere), it just
 // attaches them to the new contract entries.
-func (mi *MultiIndexer) attachInlinedShapes(cr *contracts.Registry, g *graph.Graph) {
+func (mi *MultiIndexer) attachInlinedShapes(cr *contracts.Registry, g graph.Store) {
 	idsToTouch := map[string]bool{}
 	for _, c := range cr.All() {
 		if c.Meta == nil {
@@ -2036,7 +2115,7 @@ func (mi *MultiIndexer) ReconcileContractEdges() int {
 // have the contract ID can also look up the topic node directly.
 // Meta on the node carries the broker family and the raw topic name
 // for filterless queries.
-func emitTopicEdges(g *graph.Graph, m contracts.CrossLink, topicNodes map[string]struct{}) {
+func emitTopicEdges(g graph.Store, m contracts.CrossLink, topicNodes map[string]struct{}) {
 	// Trust the matcher to bucket only same-broker contracts together
 	// because Contract.ID already includes the broker token; if the
 	// broker isn't on the provider Meta, fall through to the contract
@@ -2136,7 +2215,7 @@ func parseTopicContractID(id string) (broker, name string, ok bool) {
 }
 
 // Graph returns the underlying shared graph.
-func (mi *MultiIndexer) Graph() *graph.Graph {
+func (mi *MultiIndexer) Graph() graph.Store {
 	return mi.graph
 }
 

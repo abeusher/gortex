@@ -23,13 +23,24 @@ import (
 // `x := …` / `var x = …` / a range clause / a type-switch / a for-
 // statement init clause maps to a synthetic ID:
 //
-//	<ownerID>#local:<name>@<line>
+//	<ownerID>#local:<name>@+<offsetFromOwnerStartLine>
 //
-// where ownerID is the enclosing function/method node and line is
-// the 1-based decl line. These IDs are valid edge endpoints — the
-// BFS in `flow_between` traverses them — but no graph node is
-// materialised, keeping symbol search free of every transient
-// binding in every function body.
+// where ownerID is the enclosing function/method node and the
+// offset is the local's 1-based line minus the function-decl's
+// 1-based line. The leading `+` flags the value as a relative
+// offset rather than an absolute line — important for the
+// incremental indexer: adding a line *above* the enclosing
+// function leaves every local-binding ID inside it stable, so the
+// per-save edge churn collapses from O(locals-in-file) to
+// O(locals-below-the-edit).
+//
+// Each binding is materialised as a KindLocal graph node anchored
+// to the enclosing function via EdgeMemberOf, so dataflow edges
+// targeting locals are not orphan endpoints — they navigate to a
+// first-class node like every other edge. KindLocal nodes are
+// excluded from the BM25 search index (see
+// internal/indexer.shouldIndexForSearch) so identifiers like
+// `err` / `data` / `n` / `i` don't flood search results.
 //
 // v1 limitations:
 //
@@ -46,7 +57,7 @@ import (
 //     mirrors the call edge for the same call site. Indexer post-
 //     resolution rewrites them once the callee is known — see
 //     `materializeDataflowParams` in internal/indexer.
-func emitGoDataflow(ownerID string, body *sitter.Node, paramsByName map[string]string, src []byte, filePath string, result *parser.ExtractionResult) {
+func emitGoDataflow(ownerID string, ownerStartLine int, body *sitter.Node, paramsByName map[string]string, imports map[string]string, src []byte, filePath string, result *parser.ExtractionResult) {
 	if body == nil {
 		return
 	}
@@ -59,13 +70,49 @@ func emitGoDataflow(ownerID string, body *sitter.Node, paramsByName map[string]s
 		scope.bindings[name] = []string{paramID}
 	}
 	walker := &goFlowWalker{
-		ownerID:  ownerID,
-		filePath: filePath,
-		src:      src,
-		scope:    scope,
-		result:   result,
+		ownerID:        ownerID,
+		ownerStartLine: ownerStartLine,
+		filePath:       filePath,
+		src:            src,
+		scope:          scope,
+		result:         result,
+		emittedLocals:  map[string]struct{}{},
+		imports:        imports,
 	}
 	walker.walk(body)
+}
+
+// bindLocal computes the canonical local-binding ID, registers it in
+// scope, and on first sight emits the corresponding KindLocal node +
+// EdgeMemberOf edge so the binding is a first-class graph element
+// rather than a phantom edge endpoint. Returns the ID. Dedupe key is
+// the ID itself: a binding visited through multiple walk paths still
+// produces one node row.
+func (w *goFlowWalker) bindLocal(name string, line int) string {
+	id := w.localID(name, line)
+	w.scope.bindings[name] = []string{id}
+	if _, ok := w.emittedLocals[id]; ok {
+		return id
+	}
+	w.emittedLocals[id] = struct{}{}
+	w.result.Nodes = append(w.result.Nodes, &graph.Node{
+		ID:        id,
+		Kind:      graph.KindLocal,
+		Name:      name,
+		FilePath:  w.filePath,
+		StartLine: line,
+		EndLine:   line,
+		Language:  "go",
+	})
+	w.result.Edges = append(w.result.Edges, &graph.Edge{
+		From:     id,
+		To:       w.ownerID,
+		Kind:     graph.EdgeMemberOf,
+		FilePath: w.filePath,
+		Line:     line,
+		Origin:   graph.OriginASTResolved,
+	})
+	return id
 }
 
 
@@ -83,13 +130,29 @@ func newGoFlowScope() *goFlowScope {
 
 // goFlowWalker carries the per-function state needed to emit
 // dataflow edges. ownerID is the enclosing function node ID;
-// scope tracks live bindings; result accumulates emitted edges.
+// ownerStartLine is the 1-based source line of the function's
+// declaration — local-binding IDs are anchored to it so edits
+// above the function don't churn every binding inside;
+// scope tracks live bindings; result accumulates emitted edges;
+// emittedLocals dedupes KindLocal node emissions so a binding
+// visited through more than one walk path doesn't produce
+// duplicate node rows.
 type goFlowWalker struct {
-	ownerID  string
-	filePath string
-	src      []byte
-	scope    *goFlowScope
-	result   *parser.ExtractionResult
+	ownerID        string
+	ownerStartLine int
+	filePath       string
+	src            []byte
+	scope          *goFlowScope
+	result         *parser.ExtractionResult
+	emittedLocals  map[string]struct{}
+	// imports maps the file's package aliases to their import paths
+	// (`fmt → "fmt"`, `assert → "github.com/stretchr/testify/assert"`).
+	// Threaded through so the selector-expression cases in calleeRef /
+	// exprSources can emit `unresolved::extern::<importPath>::<method>`
+	// when the LHS identifier is an imported package — matching the
+	// shape the call extractor uses — instead of collapsing the
+	// qualifier to `*.` and losing the resolution evidence.
+	imports map[string]string
 }
 
 func (w *goFlowWalker) walk(n *sitter.Node) {
@@ -126,10 +189,20 @@ func (w *goFlowWalker) walk(n *sitter.Node) {
 }
 
 // localID returns the synthetic local-binding ID for `name` at the
-// given line. Always anchored to ownerID so two functions can have
-// identically-named locals without colliding.
+// given absolute line. Always anchored to ownerID so two functions
+// can have identically-named locals without colliding. The line is
+// encoded as an offset from the owner's declaration line (prefixed
+// `+` so it's unambiguous): a same-function shift caused by an edit
+// above the function leaves the ID stable. A defensive zero-anchor
+// fallback handles cases where the caller didn't supply an owner
+// start line (the walker is constructed with one in production; the
+// fallback keeps misuse from producing IDs missing the @ separator).
 func (w *goFlowWalker) localID(name string, line int) string {
-	return w.ownerID + "#local:" + name + "@" + strconv.Itoa(line)
+	offset := line
+	if w.ownerStartLine > 0 {
+		offset = line - w.ownerStartLine + 1
+	}
+	return w.ownerID + "#local:" + name + "@+" + strconv.Itoa(offset)
 }
 
 func (w *goFlowWalker) handleShortVarDecl(n *sitter.Node) {
@@ -224,9 +297,7 @@ func (w *goFlowWalker) declareTarget(lhs *sitter.Node, decl bool, line int) (str
 		if name == "" || name == "_" {
 			return "", false
 		}
-		id := w.localID(name, line)
-		w.scope.bindings[name] = []string{id}
-		return id, true
+		return w.bindLocal(name, line), true
 	case "selector_expression":
 		// `x.field = …` — write goes to the field node when known.
 		field := lhs.ChildByFieldName("field")
@@ -343,8 +414,7 @@ func (w *goFlowWalker) handleRangeClause(n *sitter.Node) {
 		if name == "" || name == "_" {
 			continue
 		}
-		id := w.localID(name, line)
-		w.scope.bindings[name] = []string{id}
+		id := w.bindLocal(name, line)
 		for _, src := range rhsSources {
 			if src == "" || src == id {
 				continue
@@ -477,11 +547,22 @@ func (w *goFlowWalker) calleeRef(call *sitter.Node) string {
 		if method == "" {
 			return ""
 		}
-		// Receiver-typed targets (e.g. an import alias dispatch)
-		// can't be reconstructed without the file's import map.
-		// Fall through to the generic "*." form — same shape the
-		// call extractor uses when receiver is a local.
-		_ = recv
+		// Package-qualified call: when the receiver is a bare
+		// identifier matching one of the file's import aliases,
+		// emit the same `unresolved::extern::<importPath>::<method>`
+		// shape the call extractor uses for explicit calls (see
+		// golang.go::Extract `imports[c.receiver]` branch). The
+		// resolver's resolveExtern pass then lands these on
+		// stdlib::/dep::/external:: targets or the real cross-repo
+		// symbol when the import path resolves to an indexed file.
+		// Without this branch the qualifier is dropped and we leak
+		// `unresolved::*.<method>` for every package call inside a
+		// dataflow context.
+		if recv != nil && recv.Type() == "identifier" {
+			if importPath := w.importPathFor(recv.Content(w.src)); importPath != "" {
+				return "unresolved::extern::" + importPath + "::" + method
+			}
+		}
 		return "unresolved::*." + method
 	case "generic_function":
 		// `f[T](args)` — strip the type instantiation wrapper.
@@ -550,6 +631,17 @@ func (w *goFlowWalker) exprSources(n *sitter.Node) []string {
 		fieldName := field.Content(w.src)
 		if fieldName == "" {
 			return nil
+		}
+		// Package-qualified value: when the receiver is a bare
+		// identifier matching one of the file's import aliases,
+		// emit `unresolved::extern::<importPath>::<field>` so the
+		// resolver can land it on stdlib::/dep::/external::. See
+		// the matching comment in calleeRef.
+		operand := n.ChildByFieldName("operand")
+		if operand != nil && operand.Type() == "identifier" {
+			if importPath := w.importPathFor(operand.Content(w.src)); importPath != "" {
+				return []string{"unresolved::extern::" + importPath + "::" + fieldName}
+			}
 		}
 		return []string{"unresolved::*." + fieldName}
 	case "call_expression":
@@ -665,4 +757,18 @@ func (w *goFlowWalker) emitValueFlow(src, dst string, line int) {
 		Line:     line,
 		Origin:   graph.OriginASTResolved,
 	})
+}
+
+// importPathFor returns the import path the given identifier names
+// as a package alias in the current file, or "" when the identifier
+// doesn't match any import. The walker's imports map is the same
+// map populated by the Go extractor's emitImport handler, so an
+// `assert` alias for `github.com/stretchr/testify/assert` resolves
+// here exactly as it does in the call extractor's
+// `imports[c.receiver]` branch.
+func (w *goFlowWalker) importPathFor(name string) string {
+	if name == "" || w.imports == nil {
+		return ""
+	}
+	return w.imports[name]
 }

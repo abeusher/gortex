@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	toon "github.com/toon-format/toon-go"
@@ -563,11 +564,22 @@ func filterSubGraph(sg *query.SubGraph, allowed map[string]bool) *query.SubGraph
 			edges = append(edges, e)
 		}
 	}
+	totalEdges := len(edges)
+	// Counts-only payloads arrive with Edges == nil and TotalEdges
+	// pre-populated — preserve the upstream count instead of zeroing
+	// it. Inexact in the presence of a non-trivial filter (we'd need
+	// the edges to know which belong to filtered-out nodes), but the
+	// gcx output that asks for the count-only path runs with the
+	// session's workspace scope already applied at the store, so the
+	// filter pass is typically a no-op.
+	if len(sg.Edges) == 0 && sg.TotalEdges > 0 {
+		totalEdges = sg.TotalEdges
+	}
 	return &query.SubGraph{
 		Nodes:      nodes,
 		Edges:      edges,
 		TotalNodes: len(nodes),
-		TotalEdges: len(edges),
+		TotalEdges: totalEdges,
 		Truncated:  sg.Truncated,
 	}
 }
@@ -616,6 +628,69 @@ func enrichSubGraphEdges(sg *query.SubGraph) {
 			e.Origin = graph.DefaultOriginFor(e.Kind, e.Confidence, src)
 		}
 		e.Tier = graph.ResolvedBy(e.Origin)
+	}
+}
+
+// isNonDefinitionNode reports whether a node kind is NOT a file-level
+// definition and should be dropped from a get_file_summary view. It
+// excludes the file node itself, imports, and the function-body-internal
+// nodes (locals, params, closures, generic params, builtins) that the
+// file_path lookup pulls in but that the "symbols a file defines"
+// contract never wanted. Without this filter the summary floods with
+// hundreds of locals/params (the old defines-edge query excluded them by
+// construction; the GetFileNodes-based path does not).
+func isNonDefinitionNode(k graph.NodeKind) bool {
+	switch k {
+	case graph.KindFile, graph.KindImport, graph.KindLocal,
+		graph.KindParam, graph.KindClosure, graph.KindGenericParam,
+		graph.KindBuiltin:
+		return true
+	}
+	return false
+}
+
+// stripNonDefinitionNodes returns a copy of sg with non-definition nodes
+// nodes removed (and edges that reference them dropped). Used by
+// handleGetFileSummary to keep its output focused on the symbols a
+// file *defines* — the file node and per-statement import nodes are
+// useful internals (e.g. for the file-neighbourhood walk that drives
+// the disk-backend pushdown) but noise in the agent-visible payload.
+func stripNonDefinitionNodes(sg *query.SubGraph) *query.SubGraph {
+	if sg == nil {
+		return nil
+	}
+	keep := make(map[string]bool, len(sg.Nodes))
+	nodes := make([]*graph.Node, 0, len(sg.Nodes))
+	for _, n := range sg.Nodes {
+		if n == nil || isNonDefinitionNode(n.Kind) {
+			continue
+		}
+		nodes = append(nodes, n)
+		keep[n.ID] = true
+	}
+	edges := make([]*graph.Edge, 0, len(sg.Edges))
+	for _, e := range sg.Edges {
+		if e == nil || !keep[e.From] || !keep[e.To] {
+			continue
+		}
+		edges = append(edges, e)
+	}
+	totalEdges := len(edges)
+	// Counts-only payloads arrive with Edges == nil and TotalEdges
+	// already populated by the store. Keep that count — the file +
+	// import nodes we're stripping pulled some edges with them so it's
+	// a slight overcount, but the gcx callers that take this path
+	// only render it as a header scalar, not as anything load-bearing.
+	if len(sg.Edges) == 0 && sg.TotalEdges > 0 {
+		totalEdges = sg.TotalEdges
+	}
+	return &query.SubGraph{
+		Nodes:       nodes,
+		Edges:       edges,
+		TotalNodes:  len(nodes),
+		TotalEdges:  totalEdges,
+		Truncated:   sg.Truncated,
+		CallerNotes: sg.CallerNotes,
 	}
 }
 
@@ -726,7 +801,7 @@ func (s *Server) registerCoreTools() {
 			mcp.WithString("assist", mcp.Description("LLM assist mode: \"auto\" (default — engages on natural-language queries, skips identifier lookups), \"on\" (force engage), \"off\" (bypass), \"deep\" (on + a body-grounded verification pass that reads candidate code and HONESTLY drops irrelevant matches — slower, may return empty results when nothing genuinely matches). Requires an LLM provider configured via `llm.provider` (local / anthropic / openai / ollama / claudecli / gemini / bedrock / deepseek); behaves as \"off\" when none is available.")),
 			mcp.WithBoolean("debug", mcp.Description("When true, attach a `rerank` block to the response carrying per-candidate scores and per-signal contributions from the 11-signal rerank pipeline (bm25, semantic, fan_in, hits, fan_out, churn, community, minhash, api_signature, type_signature, recency, feedback) plus the active per-signal weight map. Off by default; enable to inspect ranking decisions or tune `.gortex.yaml::search::weights`.")),
 			mcp.WithString("query_class", mcp.Description("Advisory hint that tunes the bm25-vs-semantic balance of the rerank: \"auto\" (default — detect from query shape), \"symbol\" (identifier / API lookup — BM25-heavy), \"concept\" (natural-language description — balanced), \"path\" (file-path query — most BM25-heavy), \"signature\" (type/function-signature fragment — BM25-leaning), \"keyword_soup\" (a degenerate boolean OR-list \u2014 suppresses LLM expansion and splits the soup into per-disjunct BM25 fetches; a `query_advice` nudge rides on the response). The class actually used is echoed back as `query_class` in the response.")),
-			mcp.WithString("expand", mcp.Description("Query-expansion channels: \"both\" (default \u2014 LLM expansion when the assist gate engages, plus the deterministic equivalence-class table), \"equivalence\" (only the LLM-free curated synonym table + per-repo auto-mined concepts), \"llm\" (only LLM expansion), \"off\" (pure BM25, no expansion). Equivalence expansion bridges query vocabulary to the words a symbol uses (auth->login, delete->remove) and runs even with no LLM provider configured.")),
+			mcp.WithString("expand", mcp.Description("Query-expansion channels: \"both\" (default \u2014 LLM expansion when the assist gate engages, plus the deterministic equivalence-class table), \"equivalence\" (only the LLM-free curated synonym table + per-repo auto-mined concepts), \"llm\" (only LLM expansion), \"off\" (pure BM25, no expansion). Equivalence expansion bridges query vocabulary to the words a symbol uses (auth->login, delete->remove) and runs even with no LLM provider configured. For identifier queries (query_class symbol / path / signature) the server auto-disables expansion + vector even when expand is set \u2014 these classes match best on BM25 + exact-name alone.")),
 			mcp.WithString("corpus", mcp.Description("Which corpus to search: \"code\" (default \u2014 code symbols only), \"docs\" (only Markdown prose-section nodes \u2014 the heading-delimited documentation sections), \"all\" (both). With docs/all a prose query matches the right README / guide section by its body text.")),
 			mcp.WithNumber("max_per_file", mcp.Description("Cap how many results a single source file may contribute to the diverse head of the result set (default 3). Hits beyond the cap are demoted below not-yet-capped results — never dropped — so the top of the list spans more files. Set 0 to disable diversification.")),
 		),
@@ -735,7 +810,7 @@ func (s *Server) registerCoreTools() {
 
 	s.addTool(
 		mcp.NewTool("get_file_summary",
-			mcp.WithDescription("Use instead of Read to understand a file's role: returns all its symbols and imports without reading source lines."),
+			mcp.WithDescription("Use instead of Read to understand a file's role: returns the symbols a file defines (functions, methods, types, fields, …) without reading source lines. The file node itself and import nodes are excluded — use find_import_path or get_dependencies for import-shape queries."),
 			mcp.WithString("path", mcp.Required(), mcp.Description("Relative file path")),
 			mcp.WithBoolean("compact", mcp.Description("One-line-per-symbol text output (saves 50-70% tokens)")),
 			mcp.WithString("format", mcp.Description("Output format: json (default), gcx (GCX1 compact wire format), or toon")),
@@ -1103,7 +1178,15 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 		projectArg = fq.Project
 	}
 	scopeWS, scopeProj := s.resolveQueryScope(ctx, workspaceArg, projectArg)
-	scope := query.QueryOptions{WorkspaceID: scopeWS, ProjectID: scopeProj}
+	// Per-phase timing for the search hot path. The struct is populated
+	// across the engine boundary (BM25 backend call wall-clock attributes
+	// to BM25*MS in fetchAndMergeBM25Timed; GetNodes / FindName / Fallback
+	// land here from inside Engine.gatherBackendCandidates) and surfaced
+	// at the end as a single debug log line. Nil-safe: callers without
+	// debug logging pay zero overhead.
+	timings := &query.SearchTimings{}
+	phaseStart := time.Now()
+	scope := query.QueryOptions{WorkspaceID: scopeWS, ProjectID: scopeProj, SearchTimings: timings}
 
 	// Keyword-soup defense: a degenerate boolean / OR-list query
 	// ("A OR B OR 'no access'") defeats ordinary retrieval. Detect it
@@ -1120,6 +1203,37 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 		soupReason = "query reads as a boolean OR-list; search ranks best on a single concept or symbol name -- run one query per disjunct, or describe the intent in plain words"
 	}
 
+	// Identifier-shape fast path. ClassifyQuery is the structural
+	// detector the rerank uses; QueryClassSymbol / Path / Signature
+	// are queries where the rerank's classWeightTable already proves
+	// the semantic channel contributes near-zero signal (0.65 / 0.45 /
+	// 0.80 vs the baseline 1.00) — see internal/search/rerank/
+	// query_kind.go::classWeightTable. For these classes the handler
+	// forces expansion off and tells the engine to skip the vector
+	// channel entirely; the rest of the pipeline (BM25 + bundle +
+	// rerank) is the only path that matters. An explicit
+	// query_class arg pin on one of these three classes engages the
+	// fast path too. A soup query never engages the fast path —
+	// keyword_soup has its own split-disjunct treatment.
+	//
+	// Validation of the query_class arg happens here so the early
+	// gating uses the same validated value the rerank below uses;
+	// invalid input is rejected before the engine runs.
+	queryClass := rerank.ClassifyQuery(q)
+	if qcArg := strings.TrimSpace(req.GetString("query_class", "")); qcArg != "" {
+		parsed, ok := rerank.ParseQueryClass(qcArg)
+		if !ok {
+			return mcp.NewToolResultError("invalid query_class: " + qcArg + " (want auto, symbol, concept, path, signature, or keyword_soup)"), nil
+		}
+		if parsed != rerank.QueryClassUnknown {
+			queryClass = parsed
+		}
+	}
+	identifierFastPath := !isSoup && isIdentifierClass(queryClass)
+	if identifierFastPath {
+		scope.SkipVectorChannel = true
+	}
+
 	// LLM assist gate: decides whether the expansion + rerank passes
 	// run for this query. The service-enabled check is layered inside
 	// the helpers so a stub build is a clean bypass. A soup query
@@ -1129,6 +1243,14 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	// expand mode picks which query-expansion channels run -- LLM,
 	// the deterministic equivalence table, both (default), or off.
 	expand := parseExpandMode(req)
+	// Identifier-shape queries skip every expansion channel — the
+	// rerank's classWeightTable shows BM25 is near-perfect for these
+	// classes; expansion would only add the combined-OR fan-out's
+	// extra backend call without lifting recall on a literal-token
+	// query. The explicit arg pin still wins for soup / concept.
+	if identifierFastPath {
+		expand = expandOff
+	}
 	engage := shouldEngageAssist(assist, q) && s.llmService != nil && s.llmService.Enabled()
 	if isSoup || !expand.allowsLLMExpansion() {
 		engage = false
@@ -1139,6 +1261,14 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 		// Slightly widen the BM25 over-fetch when we're going to
 		// rerank: more head candidates means a more useful reorder.
 		fetchLimit = offset + limit + rerankCap
+	} else if identifierFastPath {
+		// Identifier-shape fast path: no expansion, no vector channel,
+		// no LLM rerank — the only down-stream consumer is the
+		// structural rerank pipeline scoring a single FTS-ranked head.
+		// A wide head is wasted work; every extra candidate drags an
+		// in/out edge pair through the bundle phase. Tighten to
+		// +5 so the post-filter slack still leaves a full page.
+		fetchLimit = offset + limit + 5
 	}
 
 	// Expansion terms feeding the BM25 OR-merge: LLM-derived synonyms
@@ -1162,14 +1292,28 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	}
 	expandedTerms := mergeExpansionTerms(soupFragments, llmTerms, equivTerms)
 
+	// Build the rerank context BEFORE the BM25 fetch so the engine's
+	// bundle path can seed its edge caches as the BM25 calls land.
+	// The handler-side applyRerankBoostsTimed reuses this same rctx,
+	// so the merged candidate set's edges are already cached when
+	// prepare() runs against the post-filter slice. Without this
+	// pre-fetch construction the engine's bundle would build a
+	// throwaway cache on each BM25 call and the handler's later
+	// rerank would still fetch every candidate's edges itself.
+	rctx := s.buildRerankContext(ctx, q)
+	scope.RerankContext = rctx
+
 	var nodes []*graph.Node
 	var primaryCount int
 	if len(expandedTerms) > 0 {
-		nodes, primaryCount = fetchAndMergeBM25(s.engineFor(ctx), q, expandedTerms, fetchLimit, scope)
+		nodes, primaryCount = fetchAndMergeBM25Timed(s.engineFor(ctx), q, expandedTerms, fetchLimit, scope, timings)
 	} else {
+		bm25Start := time.Now()
 		nodes = s.engineFor(ctx).SearchSymbolsScoped(q, fetchLimit, scope)
+		timings.BM25PrimaryMS += time.Since(bm25Start).Milliseconds()
 		primaryCount = len(nodes)
 	}
+	candsAfterGather := len(nodes)
 	mergedCount := len(nodes) // pre-filter; comparable to primaryCount
 
 	// Apply repo/project/ref filter.
@@ -1253,34 +1397,45 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	// feedback, churn) layer on top once the agent has spent time
 	// in the codebase. Cold queries with no session data fall back
 	// to a structural-only pass.
-	rctx := s.buildRerankContext(ctx, q)
-	// Per-class rerank weighting: detect the query class (or honour an
-	// explicit query_class hint) and pin it on the rerank Context so
-	// the pipeline scales the bm25 / semantic blend accordingly.
-	queryClass := rerank.ClassifyQuery(q)
-	if qcArg := strings.TrimSpace(req.GetString("query_class", "")); qcArg != "" {
-		parsed, ok := rerank.ParseQueryClass(qcArg)
-		if !ok {
-			return mcp.NewToolResultError("invalid query_class: " + qcArg + " (want auto, symbol, concept, path, signature, or keyword_soup)"), nil
-		}
-		if parsed != rerank.QueryClassUnknown {
-			queryClass = parsed
-		}
-	}
-	// A detected soup query reports the keyword_soup class even when
-	// the caller did not pin it, so the response surfaces the class
-	// the handler actually treated the query as.
+	//
+	// rctx was built above (before the BM25 fetch) so the engine's
+	// bundle path could seed its edge caches into the same rctx the
+	// handler-side rerank will read from.
+	// queryClass was classified + validated at the top of the handler
+	// so the identifier-shape fast path could read it. Re-apply the
+	// soup override here — soup detection happens after classification
+	// and reports keyword_soup regardless of what the structural
+	// detector thought the query looked like.
 	if isSoup {
 		queryClass = rerank.QueryClassKeywordSoup
 	}
-	rctx.QueryClass = queryClass
+	if rctx != nil {
+		rctx.QueryClass = queryClass
+	}
+	candsAfterFilter := len(nodes)
+	// Capture the post-filter candidate ID set so we can ask the rctx
+	// what fraction of these candidates' edges were already cached by
+	// the bundle pre-seed (vs needing prepare's own batched fetch).
+	// Hit-rate is reported on the debug log as cache_hit_rate.
+	if rctx != nil {
+		preIDs := make([]string, 0, len(nodes))
+		for _, n := range nodes {
+			if n != nil {
+				preIDs = append(preIDs, n.ID)
+			}
+		}
+		timings.CacheHitRate = rctx.EdgeCacheHitRate(preIDs)
+	}
 	var rerankBreakdown []*rerank.Candidate
-	nodes = applyRerankBoosts(s, nodes, q, rctx, &rerankBreakdown)
+	var rerankPrepare, rerankSignals time.Duration
+	nodes, rerankPrepare, rerankSignals = applyRerankBoostsTimed(s, nodes, q, rctx, &rerankBreakdown)
 
 	// Per-file diversification: keep one file's many symbols from
 	// monopolising the head of the result set. Runs after the rerank
 	// so demotion acts on final scores; nothing is dropped.
+	diversifyStart := time.Now()
 	nodes, rerankBreakdown = diversifyByFile(nodes, rerankBreakdown, req.GetInt("max_per_file", defaultMaxPerFile))
+	diversifyMS := time.Since(diversifyStart).Milliseconds()
 
 	// Remember the returned IDs for attribution on later consume calls.
 	// Cap at top limit so unseen "overflow" results don't get credited.
@@ -1392,6 +1547,53 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 		}
 		resp["rerank"] = encodeRerankBreakdown(pageBreakdown, s.engineFor(ctx).Rerank())
 	}
+
+	// Per-phase Debug log line — single zap.Debug call carrying every
+	// timing field for this search_symbols invocation. The bench harness
+	// greps for the "search_symbols phases" message at --log-level
+	// debug; production runs at info level pay nothing. Tracked phases:
+	// BM25 primary / expansion calls (wall-clock around the engine),
+	// the inner GetNodesByIDs / FindNodesByName / Fallback hops (from
+	// the engine), rerank prepare (batched edge fetch) and signals
+	// (in-process scoring), diversify, and the candidate counts at
+	// gather → filter → final.
+	if s.logger != nil {
+		totalMS := time.Since(phaseStart).Milliseconds()
+		// "BM25 backend" cost = the BM25 wall-clock minus the inner
+		// phases the engine also accumulated under that call. Negative
+		// values are clamped to 0 (clock granularity / contention).
+		// BundleMS is subtracted too — it's a fold of the FTS + nodes
+		// + edge fetches that, on the legacy path, would have shown up
+		// in TextBackend / GetNodes / (no field for edges) separately.
+		bm25Backend := timings.BM25PrimaryMS + timings.BM25ExpansionMS - timings.GetNodesMS - timings.FindNameMS - timings.FallbackMS - timings.BundleMS
+		if bm25Backend < 0 {
+			bm25Backend = 0
+		}
+		s.logger.Debug("search_symbols phases",
+			zap.String("query", q),
+			zap.Int("expansion_terms", len(expandedTerms)),
+			zap.Int64("bm25_primary_ms", timings.BM25PrimaryMS),
+			zap.Int64("bm25_expansion_ms", timings.BM25ExpansionMS),
+			zap.Int64("bm25_backend_ms", bm25Backend),
+			zap.Int64("text_backend_ms", timings.TextBackendMS),
+			zap.Int64("embed_ms", timings.EmbedMS),
+			zap.Int64("vector_search_ms", timings.VectorSearchMS),
+			zap.Int64("engine_rerank_ms", timings.EngineRerankMS),
+			zap.Int64("bundle_ms", timings.BundleMS),
+			zap.Float64("cache_hit_rate", timings.CacheHitRate),
+			zap.Int64("get_nodes_ms", timings.GetNodesMS),
+			zap.Int64("find_name_ms", timings.FindNameMS),
+			zap.Int64("fallback_ms", timings.FallbackMS),
+			zap.Duration("rerank_prepare_ms", rerankPrepare),
+			zap.Duration("rerank_signals_ms", rerankSignals),
+			zap.Int64("diversify_ms", diversifyMS),
+			zap.Int64("total_ms", totalMS),
+			zap.Int("cands_after_gather", candsAfterGather),
+			zap.Int("cands_after_filter", candsAfterFilter),
+			zap.Int("cands_final", len(nodes)),
+		)
+	}
+
 	return s.respondJSONOrTOON(ctx, req, resp)
 }
 
@@ -1446,7 +1648,20 @@ func roundTo(v float64, places int) float64 {
 	return float64(int64(v*pow+0.5)) / pow
 }
 
-func (s *Server) handleGetFileSummary(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Server) handleGetFileSummary(ctx context.Context, req mcp.CallToolRequest) (res *mcp.CallToolResult, retErr error) {
+	// Defensive panic recovery — get_file_summary has been observed
+	// to crash the MCP transport in multi-repo mode (file-content
+	// validation gap). Surface the panic as a tool error so the
+	// session survives.
+	defer func() {
+		if r := recover(); r != nil {
+			s.logger.Error("get_file_summary panic recovered",
+				zap.String("path", req.GetString("path", "")),
+				zap.Any("panic", r))
+			res = mcp.NewToolResultError(fmt.Sprintf("get_file_summary internal error: %v", r))
+			retErr = nil
+		}
+	}()
 	fp, err := req.RequireString("path")
 	if err != nil {
 		return mcp.NewToolResultError("path is required"), nil
@@ -1455,7 +1670,21 @@ func (s *Server) handleGetFileSummary(ctx context.Context, req mcp.CallToolReque
 	// Auto re-index stale file before querying.
 	s.ensureFresh([]string{fp})
 
-	sg := s.engineFor(ctx).GetFileSymbols(fp)
+	// gcx is the high-volume agent format and only emits total_edges
+	// in its meta header — never per-edge rows. Route gcx-only calls
+	// through the count-only path so the disk backends skip
+	// materialising every adjacent edge across cgo (a 4 000-row
+	// round-trip on a 500-symbol file becomes two scalar aggregates).
+	// compact + json paths still take the full SubGraph because
+	// compact summarises edges per confidence label and json ships
+	// every edge in the body.
+	gcxOnly := s.isGCX(ctx, req) && !isCompact(req)
+	var sg *query.SubGraph
+	if gcxOnly {
+		sg = s.engineFor(ctx).GetFileSymbolsCounts(fp)
+	} else {
+		sg = s.engineFor(ctx).GetFileSymbols(fp)
+	}
 	if len(sg.Nodes) == 0 {
 		return mcp.NewToolResultError("no symbols found for file: " + fp), nil
 	}
@@ -1470,12 +1699,26 @@ func (s *Server) handleGetFileSummary(ctx context.Context, req mcp.CallToolReque
 		return mcp.NewToolResultError("no symbols found for file in specified scope: " + fp), nil
 	}
 
+	// get_file_summary's contract is "what symbols does this file
+	// define" — the file node itself and import nodes ride on
+	// GetFileSubGraph because they're useful for other walkers, but
+	// the encoder layer wants the symbols-only view. The compact
+	// path already filtered both kinds inline; the cleaner home is
+	// here so every output format (compact, gcx, json, toon) sees the
+	// same shape.
+	sg = stripNonDefinitionNodes(sg)
+	if len(sg.Nodes) == 0 {
+		return mcp.NewToolResultError("no symbols found for file: " + fp), nil
+	}
+
 	if isCompact(req) {
 		return mcp.NewToolResultText(compactSubGraph(sg)), nil
 	}
 
-	// ETag conditional fetch.
-	etag := computeETag(sg)
+	// ETag conditional fetch. Use the structural SubGraph hash —
+	// json.Marshal'ing the whole SubGraph + Meta on every call was the
+	// dominant cost on large files (~2 ms / call on a 500-symbol file).
+	etag := etagSubGraph(sg)
 	if ifNoneMatch := req.GetString("if_none_match", ""); ifNoneMatch != "" && ifNoneMatch == etag {
 		return notModifiedResult(etag), nil
 	}

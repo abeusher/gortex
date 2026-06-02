@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -22,7 +23,6 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/persistence"
 	"github.com/zzet/gortex/internal/query"
-	"github.com/zzet/gortex/internal/releases"
 	"github.com/zzet/gortex/internal/tokens"
 	"go.uber.org/zap"
 )
@@ -33,6 +33,17 @@ import (
 func (s *Server) ensureFresh(filePaths []string) []string {
 	// Skip when watcher is active — it handles updates.
 	if s.watcher != nil {
+		return nil
+	}
+	// In multi-repo mode the legacy single-Indexer's fileMtimes is
+	// always empty for cross-repo paths, so IsStale returns true for
+	// every file → IndexFile fires → race with the daemon's read
+	// surface, which has been observed to crash the MCP transport
+	// (a concurrency hazard against the live read surface). The MultiIndexer's own
+	// per-repo watcher / Reconcile path owns freshness here; the
+	// single-Indexer auto-refresh is dead weight that does more harm
+	// than good.
+	if s.multiIndexer != nil {
 		return nil
 	}
 	if s.indexer == nil {
@@ -145,7 +156,7 @@ func (s *Server) registerEnhancementTools() {
 			mcp.WithNumber("min_pct", mcp.Description("(coverage_gaps) Lower-inclusive coverage threshold — default 0")),
 			mcp.WithNumber("max_pct", mcp.Description("(coverage_gaps) Upper-exclusive coverage threshold — default 100, i.e. anything not fully covered")),
 			mcp.WithString("provider", mcp.Description("(stale_flags) Filter to a single provider — launchdarkly, growthbook, unleash, internal")),
-			mcp.WithString("tag", mcp.Description("(todos) Filter by tag — TODO / FIXME / HACK / XXX / NOTE — case-insensitive")),
+			mcp.WithString("tag", mcp.Description("(todos) Filter by tag — TODO / FIXME / HACK / XXX / NOTE — case-insensitive. (releases) Filter to one release tag — returns the file list whose meta.added_in matches; populate via enrich_releases first.")),
 			mcp.WithString("assignee", mcp.Description("(todos) Filter by exact assignee — case-sensitive")),
 			mcp.WithString("ticket", mcp.Description("(todos) Filter by exact ticket reference — e.g. PROJ-42")),
 			mcp.WithBoolean("has_assignee", mcp.Description("(todos) Keep only TODOs that have an assignee set")),
@@ -443,7 +454,7 @@ func (s *Server) handlePrefetchContext(ctx context.Context, req mcp.CallToolRequ
 	// Gather recent symbols from parameter or session state.
 	var recentIDs []string
 	if recentStr != "" {
-		for _, id := range strings.Split(recentStr, ",") {
+		for id := range strings.SplitSeq(recentStr, ",") {
 			recentIDs = append(recentIDs, strings.TrimSpace(id))
 		}
 	}
@@ -578,14 +589,7 @@ func (s *Server) handlePrefetchContext(ctx context.Context, req mcp.CallToolRequ
 	var candidates []prefetchCandidate
 	for id, sc := range scoreMap {
 		// Exclude recently viewed symbols themselves
-		isRecent := false
-		for _, rid := range recentIDs {
-			if id == rid {
-				isRecent = true
-				break
-			}
-		}
-		if isRecent {
+		if slices.Contains(recentIDs, id) {
 			continue
 		}
 
@@ -629,14 +633,8 @@ func (s *Server) handlePrefetchContext(ctx context.Context, req mcp.CallToolRequ
 	if limit <= 0 {
 		limit = 10
 	}
-	offset := decodeCursor(req.GetString("cursor", ""))
-	if offset > totalCount {
-		offset = totalCount
-	}
-	endIdx := offset + limit
-	if endIdx > totalCount {
-		endIdx = totalCount
-	}
+	offset := min(decodeCursor(req.GetString("cursor", "")), totalCount)
+	endIdx := min(offset+limit, totalCount)
 	candidates = candidates[offset:endIdx]
 	truncated := endIdx < totalCount
 	nextCursor := ""
@@ -697,7 +695,7 @@ func (s *Server) handlePrefetchContext(ctx context.Context, req mcp.CallToolRequ
 func (s *Server) handleAnalyze(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	kind, err := req.RequireString("kind")
 	if err != nil {
-		return mcp.NewToolResultError("kind is required (one of: dead_code, hotspots, cycles, would_create_cycle, todos, blame, coverage, stale_code, ownership, coverage_gaps, stale_flags, releases, cgo_users, wasm_users, orphan_tables, unreferenced_tables, coverage_summary, channel_ops, goroutine_spawns, field_writers, race_writes, unclosed_channels, unsafe_patterns, health_score, annotation_users, config_readers, event_emitters, pubsub, string_emitters, error_surface, log_events, sql_rebuild, external_calls, routes, models, components, k8s_resources, images, kustomize, cross_repo, impact, named, tests_as_edges, connectivity_health)"), nil
+		return mcp.NewToolResultError("kind is required (one of: dead_code, hotspots, cycles, would_create_cycle, todos, blame, coverage, stale_code, ownership, coverage_gaps, stale_flags, releases, cgo_users, wasm_users, orphan_tables, unreferenced_tables, coverage_summary, channel_ops, goroutine_spawns, field_writers, race_writes, unclosed_channels, unsafe_patterns, health_score, annotation_users, config_readers, event_emitters, pubsub, string_emitters, error_surface, log_events, sql_rebuild, external_calls, routes, models, components, k8s_resources, images, kustomize, cross_repo, impact, named, tests_as_edges, connectivity_health, pagerank, louvain, wcc, scc, kcore)"), nil
 	}
 	switch kind {
 	case "dead_code":
@@ -810,8 +808,18 @@ func (s *Server) handleAnalyze(ctx context.Context, req mcp.CallToolRequest) (*m
 		return s.handleAnalyzeTestsAsEdges(ctx, req)
 	case "connectivity_health":
 		return s.handleAnalyzeConnectivityHealth(ctx, req)
+	case "pagerank":
+		return s.handleAnalyzePageRank(ctx, req)
+	case "louvain":
+		return s.handleAnalyzeLouvain(ctx, req)
+	case "wcc":
+		return s.handleAnalyzeConnectedComponents(ctx, req, false)
+	case "scc":
+		return s.handleAnalyzeConnectedComponents(ctx, req, true)
+	case "kcore":
+		return s.handleAnalyzeKCore(ctx, req)
 	default:
-		return mcp.NewToolResultError("unknown analyze kind: " + kind + " (expected: dead_code, hotspots, cycles, would_create_cycle, todos, blame, coverage, stale_code, ownership, coverage_gaps, stale_flags, releases, cgo_users, wasm_users, orphan_tables, unreferenced_tables, coverage_summary, channel_ops, goroutine_spawns, field_writers, race_writes, unclosed_channels, unsafe_patterns, sast, hygiene, health_score, annotation_users, config_readers, env_var_users, sql_call_sites, fixes_history, edge_audit, domain, event_emitters, pubsub, string_emitters, error_surface, log_events, sql_rebuild, external_calls, routes, models, components, k8s_resources, images, kustomize, cross_repo, dbt_models, impact, named, tests_as_edges, connectivity_health)"), nil
+		return mcp.NewToolResultError("unknown analyze kind: " + kind + " (expected: dead_code, hotspots, cycles, would_create_cycle, todos, blame, coverage, stale_code, ownership, coverage_gaps, stale_flags, releases, cgo_users, wasm_users, orphan_tables, unreferenced_tables, coverage_summary, channel_ops, goroutine_spawns, field_writers, race_writes, unclosed_channels, unsafe_patterns, sast, hygiene, health_score, annotation_users, config_readers, env_var_users, sql_call_sites, fixes_history, edge_audit, domain, event_emitters, pubsub, string_emitters, error_surface, log_events, sql_rebuild, external_calls, routes, models, components, k8s_resources, images, kustomize, cross_repo, dbt_models, impact, named, tests_as_edges, connectivity_health, pagerank, louvain, wcc, scc, kcore)"), nil
 	}
 }
 
@@ -847,10 +855,10 @@ func (s *Server) handleAnalyzeTodos(ctx context.Context, req mcp.CallToolRequest
 	}
 
 	var rows []todoRow
-	for _, n := range s.scopedNodes(ctx) {
-		if n.Kind != graph.KindTodo {
-			continue
-		}
+	// Push the kind filter into the storage layer — todos are a
+	// tiny slice of the node table, so the AllNodes scan was the
+	// dominant cost on a disk backend.
+	for _, n := range s.scopedNodesByKinds(ctx, []graph.NodeKind{graph.KindTodo}) {
 		tag, _ := n.Meta["tag"].(string)
 		assignee, _ := n.Meta["assignee"].(string)
 		ticket, _ := n.Meta["ticket"].(string)
@@ -1006,33 +1014,24 @@ func (s *Server) handleAnalyzeStaleCode(ctx context.Context, req mcp.CallToolReq
 		AgeDays   int    `json:"age_days"`
 	}
 	var rows []staleRow
-	for _, n := range s.scopedNodes(ctx) {
-		if _, ok := allowedKinds[n.Kind]; !ok {
+	// Push the kind filter into the storage layer; the meta gate
+	// (last_authored.timestamp) stays in Go since the meta column is
+	// opaque to the query layer.
+	blame := blameRowsByID(s.graph)
+	for _, n := range s.scopedNodesByKinds(ctx, allowedKindsSlice(allowedKinds)) {
+		la, ok := lastAuthoredFrom(blame, n)
+		if !ok || la.Timestamp == 0 {
 			continue
 		}
-		la, ok := n.Meta["last_authored"].(map[string]any)
-		if !ok {
-			continue
-		}
-		ts, ok := la["timestamp"].(int64)
-		if !ok {
-			// JSON unmarshal lands ints as float64 in some paths;
-			// accept both shapes so the analyzer works on graphs
-			// loaded from snapshots and graphs enriched in-process.
-			if f, isFloat := la["timestamp"].(float64); isFloat {
-				ts = int64(f)
-			} else {
-				continue
-			}
-		}
+		ts := la.Timestamp
 		if ts > cutoffSec {
 			continue
 		}
-		email, _ := la["email"].(string)
+		email := la.Email
 		if emailFilter != "" && email != emailFilter {
 			continue
 		}
-		commit, _ := la["commit"].(string)
+		commit := la.Commit
 		ageSec := time.Now().Unix() - ts
 		rows = append(rows, staleRow{
 			ID:        n.ID,
@@ -1069,6 +1068,21 @@ func (s *Server) handleAnalyzeStaleCode(ctx context.Context, req mcp.CallToolReq
 	})
 }
 
+// allowedKindsSlice returns the keys of an analyzer's allowedKinds
+// set so the caller can hand them to scopedNodesByKinds. Kept as a
+// helper rather than inlined at every call site so the order is
+// deterministic — not load-bearing for correctness (the capability
+// dedupes), but it keeps test expectations stable when the IN list
+// is logged.
+func allowedKindsSlice(allowed map[graph.NodeKind]struct{}) []graph.NodeKind {
+	out := make([]graph.NodeKind, 0, len(allowed))
+	for k := range allowed {
+		out = append(out, k)
+	}
+	slices.Sort(out)
+	return out
+}
+
 // parseAnalyzeKindsFilter parses a comma-separated kinds argument
 // into the set used by handleAnalyzeStaleCode. The literal "all"
 // returns the broadest blame-eligible kind set so callers can drop
@@ -1076,7 +1090,7 @@ func (s *Server) handleAnalyzeStaleCode(ctx context.Context, req mcp.CallToolReq
 // fields included too.
 func parseAnalyzeKindsFilter(arg string) map[graph.NodeKind]struct{} {
 	out := map[graph.NodeKind]struct{}{}
-	for _, k := range strings.Split(arg, ",") {
+	for k := range strings.SplitSeq(arg, ",") {
 		k = strings.TrimSpace(strings.ToLower(k))
 		if k == "" {
 			continue
@@ -1144,22 +1158,23 @@ func (s *Server) handleAnalyzeOwnership(ctx context.Context, req mcp.CallToolReq
 	}
 	byEmail := map[string]*ownerStats{}
 
-	for _, n := range s.scopedNodes(ctx) {
-		if _, ok := allowedKinds[n.Kind]; !ok {
-			continue
-		}
+	// Kind pushdown — owners are derived from the blame meta on
+	// function/method (or wider) nodes; the analyzer scans tens of
+	// thousands of irrelevant nodes without it on a disk backend.
+	ownBlame := blameRowsByID(s.graph)
+	for _, n := range s.scopedNodesByKinds(ctx, allowedKindsSlice(allowedKinds)) {
 		if pathPrefix != "" && !strings.HasPrefix(n.FilePath, pathPrefix) {
 			continue
 		}
-		la, ok := n.Meta["last_authored"].(map[string]any)
+		la, ok := lastAuthoredFrom(ownBlame, n)
 		if !ok {
 			continue
 		}
-		email, _ := la["email"].(string)
+		email := la.Email
 		if email == "" {
 			continue
 		}
-		ts := tsFromMeta(la["timestamp"])
+		ts := la.Timestamp
 		if ts == 0 {
 			continue
 		}
@@ -1286,14 +1301,14 @@ func (s *Server) handleAnalyzeCoverageGaps(ctx context.Context, req mcp.CallTool
 		Hit     int     `json:"hit"`
 	}
 	var rows []gapRow
-	for _, n := range s.scopedNodes(ctx) {
-		if _, ok := allowedKinds[n.Kind]; !ok {
-			continue
-		}
+	covRows := s.coverageByID()
+	// Kind pushdown — coverage_pct only ever lands on executable
+	// kinds, so the IN-list IS the candidate set.
+	for _, n := range s.scopedNodesByKinds(ctx, allowedKindsSlice(allowedKinds)) {
 		if pathPrefix != "" && !strings.HasPrefix(n.FilePath, pathPrefix) {
 			continue
 		}
-		pct, ok := n.Meta["coverage_pct"].(float64)
+		pct, ok := coveragePctFrom(covRows, n)
 		if !ok {
 			continue
 		}
@@ -1306,7 +1321,10 @@ func (s *Server) handleAnalyzeCoverageGaps(ctx context.Context, req mcp.CallTool
 			Line: n.StartLine,
 			Pct:  pct,
 		}
-		if cov, ok := n.Meta["coverage"].(map[string]any); ok {
+		if e, ok := covRows[n.ID]; ok {
+			row.NumStmt = e.NumStmt
+			row.Hit = e.Hit
+		} else if cov, ok := n.Meta["coverage"].(map[string]any); ok {
 			if v, ok := cov["num_stmt"].(int); ok {
 				row.NumStmt = v
 			} else if f, ok := cov["num_stmt"].(float64); ok {
@@ -1401,10 +1419,13 @@ func (s *Server) handleAnalyzeStaleFlags(ctx context.Context, req mcp.CallToolRe
 	var rows []staleFlag
 	unscored := 0
 
-	for _, n := range s.scopedNodes(ctx) {
-		if n.Kind != graph.KindFlag {
-			continue
-		}
+	// Kind pushdown — KindFlag is a few hundred nodes max even on
+	// the biggest workspaces, so pulling AllNodes() to find them
+	// was pure overhead. The caller batch below still does per-
+	// flag GetInEdges; pushing that into a single query join is a
+	// separate follow-up since the join semantics differ per flag.
+	flagBlame := blameRowsByID(s.graph)
+	for _, n := range s.scopedNodesByKinds(ctx, []graph.NodeKind{graph.KindFlag}) {
 		provider, _ := n.Meta["provider"].(string)
 		if providerFilter != "" && provider != providerFilter {
 			continue
@@ -1437,11 +1458,11 @@ func (s *Server) handleAnalyzeStaleFlags(ctx context.Context, req mcp.CallToolRe
 			if caller == nil {
 				continue
 			}
-			la, ok := caller.Meta["last_authored"].(map[string]any)
+			la, ok := lastAuthoredFrom(flagBlame, caller)
 			if !ok {
 				continue
 			}
-			ts := tsFromMeta(la["timestamp"])
+			ts := la.Timestamp
 			if ts == 0 {
 				continue
 			}
@@ -1536,10 +1557,9 @@ func (s *Server) handleAnalyzeOrphanTables(ctx context.Context, req mcp.CallTool
 		QueryCount int    `json:"query_count"`
 	}
 	var rows []orphanRow
-	for _, n := range s.scopedNodes(ctx) {
-		if n.Kind != graph.KindTable {
-			continue
-		}
+	// Kind pushdown — only KindTable carries the providers/queries
+	// fan-in we care about; the rest of the node table is noise.
+	for _, n := range s.scopedNodesByKinds(ctx, []graph.NodeKind{graph.KindTable}) {
 		// Walk incoming edges to detect both providers (migrations)
 		// and consumers (query call sites).
 		hasProvider := false
@@ -1617,10 +1637,8 @@ func (s *Server) handleAnalyzeUnreferencedTables(ctx context.Context, req mcp.Ca
 		ProviderCount int    `json:"provider_count"`
 	}
 	var rows []unrefRow
-	for _, n := range s.scopedNodes(ctx) {
-		if n.Kind != graph.KindTable {
-			continue
-		}
+	// Kind pushdown — same story as orphan_tables.
+	for _, n := range s.scopedNodesByKinds(ctx, []graph.NodeKind{graph.KindTable}) {
 		providerCount := 0
 		queryCount := 0
 		for _, e := range s.graph.GetInEdges(n.ID) {
@@ -1703,15 +1721,14 @@ func (s *Server) handleAnalyzeCoverageSummary(ctx context.Context, req mcp.CallT
 		sumPct float64 // running sum, hidden from JSON
 	}
 	byDir := map[string]*dirStats{}
+	covRows := s.coverageByID()
 
-	for _, n := range s.scopedNodes(ctx) {
-		if _, ok := allowedKinds[n.Kind]; !ok {
-			continue
-		}
+	// Kind pushdown — coverage_pct only lives on executable kinds.
+	for _, n := range s.scopedNodesByKinds(ctx, allowedKindsSlice(allowedKinds)) {
 		if pathPrefix != "" && !strings.HasPrefix(n.FilePath, pathPrefix) {
 			continue
 		}
-		pct, ok := n.Meta["coverage_pct"].(float64)
+		pct, ok := coveragePctFrom(covRows, n)
 		if !ok {
 			continue
 		}
@@ -1797,10 +1814,10 @@ func (s *Server) handleAnalyzeInteropUsers(ctx context.Context, req mcp.CallTool
 		ID   string `json:"id"`
 	}
 	var rows []interopFile
-	for _, n := range s.scopedNodes(ctx) {
-		if n.Kind != graph.KindFile {
-			continue
-		}
+	// Kind pushdown — uses_cgo / uses_wasm_bindgen sentinels only
+	// live on file nodes; pulling AllNodes() to find them was pure
+	// overhead on a disk backend.
+	for _, n := range s.scopedNodesByKinds(ctx, []graph.NodeKind{graph.KindFile}) {
 		if v, _ := n.Meta[metaKey].(bool); !v {
 			continue
 		}
@@ -1830,32 +1847,159 @@ func (s *Server) handleAnalyzeInteropUsers(ctx context.Context, req mcp.CallTool
 	})
 }
 
-// handleAnalyzeReleases walks git tags chronologically and stamps
-// meta.added_in on every file node with the earliest tag whose
-// tree contained that file. Symbols inherit indirectly via their
-// owning file — answers "added in v1.4?" with one graph hop from
-// any symbol to its file. Re-runnable: each call re-walks tags
-// and overwrites existing meta.
+// handleAnalyzeReleases reads the pre-computed release timeline from
+// the graph. Inputs come from meta.added_in (stamped on KindFile
+// nodes) and the KindRelease nodes the enricher materialises — one
+// per tag, ordered, carrying file_count metadata. No git subprocess
+// at read time.
+//
+// When nothing in scope carries release metadata the tool returns a
+// structured error pointing the agent at `enrich_releases` (or the
+// `gortex enrich releases` CLI) rather than silently returning an
+// empty result; the latter would look like "this repo has no
+// releases" even when the cause is "you haven't enriched yet".
+//
+// Optional filter `tag` returns only the named release with the list
+// of files whose meta.added_in matches it — answers "what shipped in
+// v1.4?" with a single graph scan.
 func (s *Server) handleAnalyzeReleases(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	roots := s.collectRepoRoots(req.GetString("repo", ""))
-	if len(roots) == 0 {
-		return mcp.NewToolResultError("releases enrichment requires at least one indexed repo with a root path"), nil
+	if s.graph == nil {
+		return mcp.NewToolResultError("graph not initialized"), nil
 	}
-	total := 0
-	perRepo := make(map[string]any, len(roots))
-	for prefix, root := range roots {
-		count, err := releases.EnrichGraphWithRepoPrefix(s.graph, root, prefix)
-		if err != nil {
-			perRepo[prefix] = map[string]any{"root": root, "error": err.Error()}
+	repoFilter := strings.TrimSpace(req.GetString("repo", ""))
+	tagFilter := strings.TrimSpace(req.GetString("tag", ""))
+
+	type releaseRow struct {
+		ID         string   `json:"id"`
+		Tag        string   `json:"tag"`
+		RepoPrefix string   `json:"repo_prefix,omitempty"`
+		FileCount  int      `json:"file_count"`
+		Order      int      `json:"order"`
+		Files      []string `json:"files,omitempty"`
+	}
+	releaseByTag := map[string]*releaseRow{}
+	for _, n := range s.graph.AllNodes() {
+		if n.Kind != graph.KindRelease {
 			continue
 		}
-		total += count
-		perRepo[prefix] = map[string]any{"root": root, "enriched": count}
+		if repoFilter != "" && n.RepoPrefix != repoFilter {
+			continue
+		}
+		row := &releaseRow{
+			ID:         n.ID,
+			Tag:        n.Name,
+			RepoPrefix: n.RepoPrefix,
+		}
+		if n.Meta != nil {
+			row.FileCount = intFromAny(n.Meta["file_count"])
+			row.Order = intFromAny(n.Meta["order"])
+		}
+		key := releaseKey(n.RepoPrefix, n.Name)
+		releaseByTag[key] = row
 	}
-	return s.respondJSONOrTOON(ctx, req, map[string]any{
-		"enriched": total,
-		"per_repo": perRepo,
+
+	if tagFilter != "" {
+		// Caller wants the file list for one release. We surface it
+		// from meta.added_in rather than a tree walk, so the answer
+		// is whatever the last enrich pass observed.
+		row, ok := releaseByTag[releaseKey(repoFilter, tagFilter)]
+		if !ok {
+			// Tolerate the no-prefix form: agents pass "v1.4" without
+			// realising the graph stores multi-repo tags as
+			// "<prefix>/v1.4". Fall back to a tag-name-only match.
+			for k, r := range releaseByTag {
+				if r.Tag == tagFilter {
+					row = r
+					_ = k
+					break
+				}
+			}
+		}
+		if row == nil {
+			return s.respondJSONOrTOON(ctx, req, map[string]any{
+				"error":      fmt.Sprintf("no KindRelease node for tag %q; run `enrich_releases` first", tagFilter),
+				"suggestion": "enrich_releases",
+				"releases":   []releaseRow{},
+				"total":      0,
+			})
+		}
+		relByID := s.releaseByID()
+		for _, n := range s.graph.AllNodes() {
+			if n.Kind != graph.KindFile || n.FilePath == "" {
+				continue
+			}
+			if repoFilter != "" && n.RepoPrefix != repoFilter {
+				continue
+			}
+			added, ok := addedInFrom(relByID, n)
+			if !ok || added != row.Tag {
+				continue
+			}
+			row.Files = append(row.Files, n.FilePath)
+		}
+		sort.Strings(row.Files)
+		return s.respondJSONOrTOON(ctx, req, map[string]any{
+			"releases":  []releaseRow{*row},
+			"total":     1,
+			"tag":       tagFilter,
+			"file_hits": len(row.Files),
+		})
+	}
+
+	// No tag filter: return the timeline. Use `order` (oldest=0) so
+	// callers can flip to newest-first via reverse.
+	if len(releaseByTag) == 0 {
+		// Distinguish "no enrichment yet" from "repo has no tags" by
+		// peeking at any file's meta.added_in. If even one file has
+		// the field set the enrichment ran and produced no releases
+		// (an unlikely combination; surface as an empty timeline);
+		// otherwise return the structured error.
+		hasAnyAddedIn := false
+		if relByID := s.releaseByID(); len(relByID) > 0 {
+			hasAnyAddedIn = true
+		} else {
+			for _, n := range s.graph.AllNodes() {
+				if n.Kind == graph.KindFile && n.Meta != nil {
+					if _, ok := n.Meta["added_in"].(string); ok {
+						hasAnyAddedIn = true
+						break
+					}
+				}
+			}
+		}
+		if !hasAnyAddedIn {
+			return s.respondJSONOrTOON(ctx, req, map[string]any{
+				"error":      "no release timeline in scope; run `enrich_releases` (or `gortex enrich releases`) to populate KindRelease nodes and meta.added_in",
+				"suggestion": "enrich_releases",
+				"releases":   []releaseRow{},
+				"total":      0,
+			})
+		}
+	}
+	rows := make([]releaseRow, 0, len(releaseByTag))
+	for _, r := range releaseByTag {
+		rows = append(rows, *r)
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].Order != rows[j].Order {
+			return rows[i].Order < rows[j].Order
+		}
+		return rows[i].Tag < rows[j].Tag
 	})
+	return s.respondJSONOrTOON(ctx, req, map[string]any{
+		"releases": rows,
+		"total":    len(rows),
+	})
+}
+
+// releaseKey builds the lookup key from a (repoPrefix, tag) pair so
+// the tag-filtered path can compare scoped IDs against the bare
+// agent input.
+func releaseKey(repoPrefix, tag string) string {
+	if repoPrefix == "" {
+		return tag
+	}
+	return repoPrefix + "/" + tag
 }
 
 // handleAnalyzeBlame runs `git blame -p` against the indexed
@@ -2039,7 +2183,12 @@ func (s *Server) handleFindHotspots(ctx context.Context, req mcp.CallToolRequest
 		threshold = v
 	}
 
-	entries := analysis.FindHotspots(s.graph, s.getCommunities(), threshold)
+	var entries []analysis.HotspotEntry
+	if threshold == 0 {
+		entries = s.getHotspots()
+	} else {
+		entries = analysis.FindHotspots(s.graph, s.getCommunities(), threshold)
+	}
 
 	// K17: optional novelty / directional reranking modes. Default
 	// "complexity" preserves the legacy ranking.
@@ -2114,7 +2263,7 @@ func (s *Server) handleFindHotspots(ctx context.Context, req mcp.CallToolRequest
 // multi-repo mode.
 type scaffoldReader struct{ s *Server }
 
-func (r scaffoldReader) Graph() *graph.Graph { return r.s.graph }
+func (r scaffoldReader) Graph() graph.Store { return r.s.graph }
 func (r scaffoldReader) ResolveFilePath(graphPath string) string {
 	abs, err := r.s.resolveGraphPath(graphPath)
 	if err != nil {
@@ -2162,13 +2311,8 @@ func (s *Server) handleScaffold(ctx context.Context, req mcp.CallToolRequest) (*
 				return mcp.NewToolResultError(fmt.Sprintf("could not read %s: %v", edit.FilePath, readErr)), nil
 			}
 			lines := strings.Split(string(content), "\n")
-			insertIdx := edit.InsertionLine - 1
-			if insertIdx < 0 {
-				insertIdx = 0
-			}
-			if insertIdx > len(lines) {
-				insertIdx = len(lines)
-			}
+			insertIdx := max(edit.InsertionLine-1, 0)
+			insertIdx = min(insertIdx, len(lines))
 			newLines := make([]string, 0, len(lines)+strings.Count(edit.Code, "\n")+2)
 			newLines = append(newLines, lines[:insertIdx]...)
 			newLines = append(newLines, "")
@@ -2520,10 +2664,7 @@ func (s *Server) buildIndexHealthPayload() map[string]any {
 		}
 	}
 
-	successfullyIndexed := totalDetected - len(parseErrors)
-	if successfullyIndexed < 0 {
-		successfullyIndexed = 0
-	}
+	successfullyIndexed := max(totalDetected-len(parseErrors), 0)
 
 	var healthScore float64
 	if totalDetected > 0 {
@@ -2886,10 +3027,7 @@ func (s *Server) handleBatchEdit(ctx context.Context, req mcp.CallToolRequest) (
 		for i := 0; i < node.StartLine-1 && i < len(lines); i++ {
 			symbolStart += len(lines[i]) + 1
 		}
-		symbolEnd := symbolStart + len(symbolSource)
-		if symbolEnd > len(fileStr) {
-			symbolEnd = len(fileStr)
-		}
+		symbolEnd := min(symbolStart+len(symbolSource), len(fileStr))
 
 		offset := strings.Index(fileStr[symbolStart:symbolEnd], o.edit.OldSource)
 		if offset < 0 {
@@ -3063,10 +3201,7 @@ func (s *Server) handleGetContracts(ctx context.Context, req mcp.CallToolRequest
 	if contractsOffset > contractsTotal {
 		contractsOffset = contractsTotal
 	}
-	contractsEnd := contractsOffset + contractsLimit
-	if contractsEnd > contractsTotal {
-		contractsEnd = contractsTotal
-	}
+	contractsEnd := min(contractsOffset+contractsLimit, contractsTotal)
 	filtered = filtered[contractsOffset:contractsEnd]
 	contractsTruncated := contractsEnd < contractsTotal
 	contractsNextCursor := ""
@@ -3702,4 +3837,102 @@ func (s *Server) handleAuditAgentConfig(ctx context.Context, req mcp.CallToolReq
 	}
 
 	return s.respondJSONOrTOON(ctx, req, report)
+}
+
+// coverageByID batch-loads the coverage sidecar (change A) into an
+// id->row map; nil when the backend lacks the capability (callers then
+// fall back to Node.Meta). One read per handler call, not per-node.
+func (s *Server) coverageByID() map[string]graph.CoverageEnrichment {
+	r, ok := s.graph.(graph.CoverageEnrichmentReader)
+	if !ok {
+		return nil
+	}
+	rows := r.CoverageRows("")
+	m := make(map[string]graph.CoverageEnrichment, len(rows))
+	for _, e := range rows {
+		m[e.NodeID] = e
+	}
+	return m
+}
+
+// coveragePctFrom returns a node's coverage %, preferring the sidecar map
+// and falling back to Meta["coverage_pct"] for un-migrated DBs.
+func coveragePctFrom(cov map[string]graph.CoverageEnrichment, n *graph.Node) (float64, bool) {
+	if e, ok := cov[n.ID]; ok {
+		return e.CoveragePct, true
+	}
+	if pct, ok := n.Meta["coverage_pct"].(float64); ok {
+		return pct, true
+	}
+	return 0, false
+}
+
+// releaseByID batch-loads the release sidecar (change A) into an
+// id->tag map; nil when the backend lacks the capability.
+func (s *Server) releaseByID() map[string]string {
+	r, ok := s.graph.(graph.ReleaseEnrichmentReader)
+	if !ok {
+		return nil
+	}
+	rows := r.ReleaseRows("")
+	m := make(map[string]string, len(rows))
+	for _, e := range rows {
+		m[e.NodeID] = e.AddedIn
+	}
+	return m
+}
+
+// addedInFrom returns a node's "added_in" tag, preferring the sidecar
+// map and falling back to Meta["added_in"] for un-migrated DBs.
+func addedInFrom(rel map[string]string, n *graph.Node) (string, bool) {
+	if tag, ok := rel[n.ID]; ok {
+		return tag, true
+	}
+	if n.Meta != nil {
+		if tag, ok := n.Meta["added_in"].(string); ok {
+			return tag, true
+		}
+	}
+	return "", false
+}
+
+// blameRowsByID batch-loads the blame sidecar (change A) into an
+// id->row map; nil when the backend lacks the capability.
+func blameRowsByID(g graph.Store) map[string]graph.BlameEnrichment {
+	r, ok := g.(graph.BlameEnrichmentReader)
+	if !ok {
+		return nil
+	}
+	rows := r.BlameRows("")
+	m := make(map[string]graph.BlameEnrichment, len(rows))
+	for _, e := range rows {
+		m[e.NodeID] = e
+	}
+	return m
+}
+
+// lastAuthoredFrom returns a node's blame, preferring the sidecar map and
+// falling back to Meta["last_authored"] for un-migrated DBs.
+func lastAuthoredFrom(blame map[string]graph.BlameEnrichment, n *graph.Node) (graph.BlameEnrichment, bool) {
+	if e, ok := blame[n.ID]; ok {
+		return e, true
+	}
+	if n.Meta != nil {
+		if la, ok := n.Meta["last_authored"].(map[string]any); ok {
+			e := graph.BlameEnrichment{NodeID: n.ID}
+			e.Commit, _ = la["commit"].(string)
+			e.Email, _ = la["email"].(string)
+			e.Timestamp = tsFromMeta(la["timestamp"])
+			return e, true
+		}
+	}
+	return graph.BlameEnrichment{}, false
+}
+
+// lastAuthoredTSFrom is the timestamp-only convenience over lastAuthoredFrom.
+func lastAuthoredTSFrom(blame map[string]graph.BlameEnrichment, n *graph.Node) (int64, bool) {
+	if e, ok := lastAuthoredFrom(blame, n); ok && e.Timestamp != 0 {
+		return e.Timestamp, true
+	}
+	return 0, false
 }

@@ -14,7 +14,7 @@ import (
 // indexAll indexes a single-file Go fixture and runs the global
 // resolve + dataflow materialisation pass. Returns the graph for
 // assertions.
-func indexAll(t *testing.T, src string) *graph.Graph {
+func indexAll(t *testing.T, src string) graph.Store {
 	t.Helper()
 	dir := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "main.go"), []byte(src), 0o644))
@@ -28,7 +28,7 @@ func indexAll(t *testing.T, src string) *graph.Graph {
 }
 
 // findEdges returns all edges matching the predicate.
-func findEdges(g *graph.Graph, kind graph.EdgeKind, match func(*graph.Edge) bool) []*graph.Edge {
+func findEdges(g graph.Store, kind graph.EdgeKind, match func(*graph.Edge) bool) []*graph.Edge {
 	var out []*graph.Edge
 	for _, e := range g.AllEdges() {
 		if e.Kind != kind {
@@ -172,7 +172,7 @@ func Driver(z int) int {
 	}
 }
 
-func findFuncID(t *testing.T, g *graph.Graph, name string) string {
+func findFuncID(t *testing.T, g graph.Store, name string) string {
 	t.Helper()
 	candidates := g.FindNodesByName(name)
 	for _, n := range candidates {
@@ -184,7 +184,7 @@ func findFuncID(t *testing.T, g *graph.Graph, name string) string {
 	return ""
 }
 
-func dumpAllEdges(g *graph.Graph) string {
+func dumpAllEdges(g graph.Store) string {
 	var b strings.Builder
 	for _, e := range g.AllEdges() {
 		b.WriteString(string(e.Kind))

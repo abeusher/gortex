@@ -65,7 +65,7 @@ func (p *Provider) Available() bool {
 	return true
 }
 
-func (p *Provider) Enrich(g *graph.Graph, repoRoot string) (*semantic.EnrichResult, error) {
+func (p *Provider) Enrich(g graph.Store, repoRoot string) (*semantic.EnrichResult, error) {
 	start := time.Now()
 
 	absRoot, err := filepath.Abs(repoRoot)
@@ -245,6 +245,12 @@ func (p *Provider) Enrich(g *graph.Graph, repoRoot string) (*semantic.EnrichResu
 	result.EdgesAdded += p.addMissingImplements(g, pkgs, objToNode, absRoot)
 
 	// Phase 4: Enrich node metadata with type info.
+	// EnrichNodeMeta mutates Node.Meta in place; on disk backends the
+	// node is a per-call GetNode reconstruction, so collect every stamped
+	// node and round-trip it through the store at the end (one AddBatch)
+	// or the semantic_type / return_type stamps are silently discarded on
+	// the disk backend. See semantic.EnrichNodeMeta.
+	var stampedNodes []*graph.Node
 	for _, pkg := range pkgs {
 		if pkg.TypesInfo == nil {
 			continue
@@ -262,10 +268,12 @@ func (p *Provider) Enrich(g *graph.Graph, repoRoot string) (*semantic.EnrichResu
 				continue
 			}
 
+			didStamp := false
 			typeStr := types.TypeString(obj.Type(), nil)
 			if typeStr != "" && typeStr != "invalid type" {
 				semantic.EnrichNodeMeta(node, "semantic_type", typeStr, p.Name())
 				result.NodesEnriched++
+				didStamp = true
 			}
 
 			// Add return type for functions.
@@ -274,18 +282,25 @@ func (p *Provider) Enrich(g *graph.Graph, repoRoot string) (*semantic.EnrichResu
 				if ok && sig.Results().Len() > 0 {
 					retType := types.TypeString(sig.Results(), nil)
 					semantic.EnrichNodeMeta(node, "return_type", retType, p.Name())
+					didStamp = true
 				}
+			}
+			if didStamp {
+				stampedNodes = append(stampedNodes, node)
 			}
 
 			_ = ident // used in range
 		}
+	}
+	if len(stampedNodes) > 0 {
+		g.AddBatch(stampedNodes, nil)
 	}
 
 	result.DurationMs = time.Since(start).Milliseconds()
 	return result, nil
 }
 
-func (p *Provider) EnrichFile(g *graph.Graph, repoRoot, filePath string) (*semantic.EnrichResult, error) {
+func (p *Provider) EnrichFile(g graph.Store, repoRoot, filePath string) (*semantic.EnrichResult, error) {
 	// go/types can do incremental loading per package, but for simplicity
 	// we re-enrich the whole graph. The manager's debounce prevents thrashing.
 	return nil, nil
@@ -528,7 +543,7 @@ func (p *Provider) loadPackages(dir string) ([]*packages.Package, *token.FileSet
 }
 
 // enrichImplements confirms existing EdgeImplements edges using go/types.
-func (p *Provider) enrichImplements(g *graph.Graph, pkgs []*packages.Package, objToNode map[types.Object]string) int {
+func (p *Provider) enrichImplements(g graph.Store, pkgs []*packages.Package, objToNode map[types.Object]string) int {
 	confirmed := 0
 
 	// Collect all interfaces from the loaded packages.
@@ -565,7 +580,7 @@ func (p *Provider) enrichImplements(g *graph.Graph, pkgs []*packages.Package, ob
 }
 
 // addMissingImplements discovers interface implementations that tree-sitter missed.
-func (p *Provider) addMissingImplements(g *graph.Graph, pkgs []*packages.Package, objToNode map[types.Object]string, absRoot string) int {
+func (p *Provider) addMissingImplements(g graph.Store, pkgs []*packages.Package, objToNode map[types.Object]string, absRoot string) int {
 	added := 0
 
 	// Collect interfaces and concrete types.
@@ -619,7 +634,7 @@ func (p *Provider) addMissingImplements(g *graph.Graph, pkgs []*packages.Package
 }
 
 // findContainingFunc finds the Gortex function/method node that contains the given position.
-func findContainingFunc(g *graph.Graph, pkgs []*packages.Package, fset *token.FileSet, absRoot string, pos token.Position) *graph.Node {
+func findContainingFunc(g graph.Store, pkgs []*packages.Package, fset *token.FileSet, absRoot string, pos token.Position) *graph.Node {
 	relPath := relativePath(pos.Filename, absRoot)
 	if relPath == "" {
 		return nil

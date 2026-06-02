@@ -98,7 +98,13 @@ func (p *Pipeline) Rerank(query string, cands []*Candidate, ctx *Context) []*Can
 	if ctx.QueryClass == QueryClassUnknown {
 		ctx.QueryClass = ClassifyQuery(query)
 	}
-	ctx.prepare(cands)
+	// Skip prepare when the caller already invoked Context.Prepare
+	// for per-phase timing on this exact slice — avoids paying the
+	// batched edge fetch twice on the search hot path. Identity check
+	// is intentional: any mutation that reallocates resets it.
+	if !sameSliceHeader(ctx.preparedCands, cands) {
+		ctx.prepare(cands)
+	}
 
 	for _, c := range cands {
 		if c.Signals == nil {
@@ -141,6 +147,17 @@ func (p *Pipeline) Rerank(query string, cands []*Candidate, ctx *Context) []*Can
 		return cands[i].Node.ID < cands[j].Node.ID
 	})
 	return cands
+}
+
+// sameSliceHeader reports whether a and b alias the same underlying
+// candidate slice (same backing array, same length). Used by Rerank to
+// detect "the caller already invoked Prepare on this exact slice" and
+// skip the duplicate prepare pass.
+func sameSliceHeader(a, b []*Candidate) bool {
+	if len(a) == 0 || len(b) == 0 || len(a) != len(b) {
+		return false
+	}
+	return &a[0] == &b[0]
 }
 
 // Nodes is a convenience that unwraps a result slice into the

@@ -64,7 +64,7 @@ func writeFile(t *testing.T, path, content string) {
 	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
 }
 
-func newTestIndexer(g *graph.Graph) *Indexer {
+func newTestIndexer(g graph.Store) *Indexer {
 	reg := parser.NewRegistry()
 	reg.Register(languages.NewGoExtractor())
 	cfg := config.Default().Index

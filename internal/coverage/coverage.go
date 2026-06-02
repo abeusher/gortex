@@ -168,7 +168,7 @@ func (s CoverageStats) Percent() float64 {
 // file paths are repo-relative (`pkg/file.go`). Pass "" to skip
 // the prefix-strip, useful when the profile was generated against
 // raw paths.
-func EnrichGraph(g *graph.Graph, segments []Segment, modulePath string) int {
+func EnrichGraph(g graph.Store, segments []Segment, modulePath string) int {
 	if g == nil || len(segments) == 0 {
 		return 0
 	}
@@ -182,6 +182,19 @@ func EnrichGraph(g *graph.Graph, segments []Segment, modulePath string) int {
 	}
 
 	enriched := 0
+	// Collect every node whose Meta we stamp so we can round-trip it
+	// back through the store at the end. On the in-memory backend the
+	// in-place mutation already persists (n is the canonical node); on
+	// disk backends (SQLite) n is a per-call GetNode/AllNodes
+	// reconstruction, so without the write-back the coverage_pct stamp
+	// is silently discarded the moment AllNodes' slice goes out of
+	// scope — leaving analyze:coverage_gaps / health_score's coverage
+	// axis empty on the disk backend. Mirrors releases.EnrichGraph and
+	// the reach index, which already round-trip Meta through
+	// AddNode/AddBatch.
+	var stamped []*graph.Node
+	covWriter, useCovSidecar := g.(graph.CoverageEnrichmentWriter)
+	var covRows []graph.CoverageEnrichment
 	for _, n := range g.AllNodes() {
 		if !shouldEnrichCoverage(n.Kind) {
 			continue
@@ -205,6 +218,13 @@ func EnrichGraph(g *graph.Graph, segments []Segment, modulePath string) int {
 		n.Meta["coverage"] = map[string]any{
 			"num_stmt": stats.NumStmt,
 			"hit":      stats.Hit,
+		}
+		stamped = append(stamped, n)
+		if useCovSidecar {
+			covRows = append(covRows, graph.CoverageEnrichment{
+				NodeID: n.ID, RepoPrefix: n.RepoPrefix,
+				CoveragePct: pct, NumStmt: stats.NumStmt, Hit: stats.Hit,
+			})
 		}
 		enriched++
 
@@ -239,6 +259,38 @@ func EnrichGraph(g *graph.Graph, segments []Segment, modulePath string) int {
 				},
 			})
 		}
+	}
+	// Persist the stamped node Meta back through the store in one batch
+	// (a no-op-ish re-insert on the in-memory backend, the durable write
+	// on disk backends). Without this the coverage_pct stamps never
+	// survive on the disk backend.
+	// Persist coverage. Prefer the typed sidecar (change A); on success
+	// strip the Meta stamps so the node blob stays lean and skip the
+	// AddBatch. On sidecar write failure, fall back to persisting Meta via
+	// AddBatch so coverage is never lost (the readers' Meta fallback then
+	// serves it).
+	if useCovSidecar && len(covRows) > 0 {
+		persisted := true
+		byPrefix := map[string][]graph.CoverageEnrichment{}
+		for _, r := range covRows {
+			byPrefix[r.RepoPrefix] = append(byPrefix[r.RepoPrefix], r)
+		}
+		for prefix, rr := range byPrefix {
+			if err := covWriter.BulkSetCoverage(prefix, rr); err != nil {
+				persisted = false
+				break
+			}
+		}
+		if persisted {
+			for _, n := range stamped {
+				delete(n.Meta, "coverage_pct")
+				delete(n.Meta, "coverage")
+			}
+		} else if len(stamped) > 0 {
+			g.AddBatch(stamped, nil)
+		}
+	} else if len(stamped) > 0 {
+		g.AddBatch(stamped, nil)
 	}
 	return enriched
 }

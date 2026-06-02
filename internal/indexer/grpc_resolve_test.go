@@ -12,7 +12,7 @@ import (
 )
 
 // outEdgeTo returns the first out-edge of fromID whose target is toID.
-func outEdgeTo(g *graph.Graph, fromID, toID string) *graph.Edge {
+func outEdgeTo(g graph.Store, fromID, toID string) *graph.Edge {
 	for _, e := range g.GetOutEdges(fromID) {
 		if e.To == toID {
 			return e

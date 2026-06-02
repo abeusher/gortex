@@ -37,8 +37,26 @@ import (
 // unavailable. Errors silently produce an empty list — releases
 // enrichment is best-effort like blame.
 func ListTags(repoRoot string) []string {
-	cmd := exec.Command("git", "-C", repoRoot,
-		"for-each-ref", "--sort=creatordate", "--format=%(refname:short)", "refs/tags/")
+	return ListTagsOnBranch(repoRoot, "")
+}
+
+// ListTagsOnBranch is ListTags scoped to tags reachable from `branch`.
+// Empty branch means "every tag in the repo", matching ListTags.
+//
+// Restricting to a single branch is the canonical defence against
+// feature-branch tags polluting the release timeline: tags that were
+// only ever pushed on a topic branch (a "v0.0.0-test" tag from a
+// rebase scratch, for instance) shouldn't appear in the persisted
+// release order. Pass the repo's default branch ("origin/main",
+// "main", …) when callers want that semantic.
+func ListTagsOnBranch(repoRoot, branch string) []string {
+	args := []string{"-C", repoRoot, "for-each-ref",
+		"--sort=creatordate", "--format=%(refname:short)"}
+	if strings.TrimSpace(branch) != "" {
+		args = append(args, "--merged="+branch)
+	}
+	args = append(args, "refs/tags/")
+	cmd := exec.Command("git", args...)
 	out, err := cmd.Output()
 	if err != nil {
 		return nil
@@ -104,7 +122,7 @@ func ReleaseNodeID(repoPrefix, tag string) string {
 //
 // Errors from individual git invocations are tolerated — a broken
 // ref shouldn't kill enrichment for the rest of the tag set.
-func EnrichGraph(g *graph.Graph, repoRoot string) (int, error) {
+func EnrichGraph(g graph.Store, repoRoot string) (int, error) {
 	return EnrichGraphWithRepoPrefix(g, repoRoot, "")
 }
 
@@ -112,11 +130,24 @@ func EnrichGraph(g *graph.Graph, repoRoot string) (int, error) {
 // EnrichGraph. EnrichGraph delegates to it with an empty prefix; the
 // multi-repo enricher passes the per-repo prefix so KindRelease IDs
 // stay collision-free across repos.
-func EnrichGraphWithRepoPrefix(g *graph.Graph, repoRoot, repoPrefix string) (int, error) {
+//
+// Walks every tag in the repo. Use EnrichGraphForBranch when callers
+// want to restrict the timeline to tags reachable from a specific
+// branch — typically the default branch — so topic-branch tags don't
+// pollute the persisted history.
+func EnrichGraphWithRepoPrefix(g graph.Store, repoRoot, repoPrefix string) (int, error) {
+	return EnrichGraphForBranch(g, repoRoot, repoPrefix, "")
+}
+
+// EnrichGraphForBranch is EnrichGraphWithRepoPrefix scoped to tags
+// reachable from `branch`. Empty branch means "every tag", matching
+// the legacy behaviour. Mutations round-trip through g.AddNode so
+// disk-backed stores persist the result.
+func EnrichGraphForBranch(g graph.Store, repoRoot, repoPrefix, branch string) (int, error) {
 	if g == nil || repoRoot == "" {
 		return 0, nil
 	}
-	tags := ListTags(repoRoot)
+	tags := ListTagsOnBranch(repoRoot, branch)
 	if len(tags) == 0 {
 		return 0, nil
 	}
@@ -162,6 +193,8 @@ func EnrichGraphWithRepoPrefix(g *graph.Graph, repoRoot, repoPrefix string) (int
 	}
 
 	enriched := 0
+	relWriter, useRelSidecar := g.(graph.ReleaseEnrichmentWriter)
+	var relRows []graph.ReleaseEnrichment
 	for _, n := range g.AllNodes() {
 		if n.Kind != graph.KindFile {
 			continue
@@ -185,11 +218,24 @@ func EnrichGraphWithRepoPrefix(g *graph.Graph, repoRoot, repoPrefix string) (int
 		if !ok {
 			continue
 		}
-		if n.Meta == nil {
-			n.Meta = map[string]any{}
+		if useRelSidecar {
+			relRows = append(relRows, graph.ReleaseEnrichment{NodeID: n.ID, AddedIn: tag})
+		} else {
+			if n.Meta == nil {
+				n.Meta = map[string]any{}
+			}
+			n.Meta["added_in"] = tag
+			// Re-upsert so disk-backed stores persist the Meta change.
+			g.AddNode(n)
 		}
-		n.Meta["added_in"] = tag
 		enriched++
+	}
+	// Sidecar persist (change A): release "added_in" rides in the typed
+	// release_enrichment table when the backend supports it.
+	if useRelSidecar && len(relRows) > 0 {
+		if err := relWriter.BulkSetReleases(repoPrefix, relRows); err != nil {
+			return enriched, fmt.Errorf("releases: persist sidecar: %w", err)
+		}
 	}
 	return enriched, nil
 }

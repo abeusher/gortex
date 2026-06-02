@@ -130,7 +130,7 @@ func TestMultiRepo_ResolvesCallEdges(t *testing.T) {
 	}
 }
 
-func outEdgeSummaries(g *graph.Graph, id string) []string {
+func outEdgeSummaries(g graph.Store, id string) []string {
 	var out []string
 	for _, e := range g.GetOutEdges(id) {
 		out = append(out, string(e.Kind)+":"+e.To)
@@ -176,9 +176,22 @@ func TestTrackRepoCtx_FirstOfManyStillGetsPrefix(t *testing.T) {
 
 	// Every node must carry a non-empty RepoPrefix and its FilePath must
 	// live under that prefix. Any violation means a code path bypassed
-	// applyRepoPrefix.
+	// applyRepoPrefix. KindModule and KindBuiltin are deliberately
+	// cross-repo singletons (one `module::pypi:requests` /
+	// `builtin::go::type::string` shared across every repo that uses
+	// them) so they're exempt from the per-repo prefix rule.
 	var missingPrefix, badFilePaths []string
 	for _, n := range g.AllNodes() {
+		if n.Kind == graph.KindModule || n.Kind == graph.KindBuiltin {
+			continue
+		}
+		if ext, _ := n.Meta["external"].(bool); ext {
+			// External call targets the resolver materialises as
+			// KindFunction with meta.external=true are cross-repo
+			// singletons (one `stdlib::fmt::Sprintf` shared across
+			// every repo that calls it) — same as KindModule.
+			continue
+		}
 		if n.RepoPrefix == "" {
 			missingPrefix = append(missingPrefix, n.ID)
 			continue

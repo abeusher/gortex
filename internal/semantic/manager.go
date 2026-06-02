@@ -101,7 +101,7 @@ func (m *Manager) LSPRouter() LSPRouter {
 
 // EnrichAll runs all available providers against the graph.
 // For each language, only the highest-priority available provider runs.
-func (m *Manager) EnrichAll(g *graph.Graph, roots map[string]string) ([]*EnrichResult, error) {
+func (m *Manager) EnrichAll(g graph.Store, roots map[string]string) ([]*EnrichResult, error) {
 	if !m.config.Enabled {
 		return nil, nil
 	}
@@ -202,7 +202,7 @@ func (m *Manager) configPriorityFor(name string) (int, bool) {
 // repo root and appends the results. Extracted so EnrichAll can share
 // the logging + lastResults bookkeeping between eager and Router-backed
 // providers.
-func (m *Manager) runEnrichForProvider(g *graph.Graph, roots map[string]string, lang string, provider Provider, results []*EnrichResult) []*EnrichResult {
+func (m *Manager) runEnrichForProvider(g graph.Store, roots map[string]string, lang string, provider Provider, results []*EnrichResult) []*EnrichResult {
 	for repoName, repoRoot := range roots {
 		start := time.Now()
 		m.logger.Info("semantic enrichment starting",
@@ -245,7 +245,7 @@ func (m *Manager) runEnrichForProvider(g *graph.Graph, roots map[string]string, 
 }
 
 // EnrichFile runs incremental enrichment for a single file change.
-func (m *Manager) EnrichFile(g *graph.Graph, repoRoot, filePath string) (*EnrichResult, error) {
+func (m *Manager) EnrichFile(g graph.Store, repoRoot, filePath string) (*EnrichResult, error) {
 	if !m.config.Enabled || !m.config.EnrichOnWatch {
 		return nil, nil
 	}

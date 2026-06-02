@@ -21,11 +21,60 @@ import (
 // target file is not in the graph stay as `external::*` so the
 // module-attribution pass can decide what to do with them.
 func (r *Resolver) resolveRelativeImports() {
+	// Python/Dart relative-import resolution only; skip the File-node +
+	// edge walk when the graph has neither language.
+	if !r.graphHasLanguage("python") && !r.graphHasLanguage("dart") {
+		return
+	}
 	fileLang := r.collectFileLanguages()
-	for _, e := range r.graph.AllEdges() {
-		if e.Kind != graph.EdgeImports {
-			continue
+	var reindexBatch []graph.EdgeReindex
+
+	// Pre-build a map of every KindFile node's ID. The relative-
+	// import resolvers below check 1-2 candidate IDs per edge to
+	// decide whether a target file exists; doing that as a per-edge
+	// GetNode (a per-edge round-trip on a disk backend) is what made
+	// this pass dominate disk-backed resolve time. One NodesByKind scan
+	// materialises the set once at indexed cost; lookups become
+	// O(1) map hits.
+	fileIDs := make(map[string]struct{}, 1024)
+	for n := range r.graph.NodesByKind(graph.KindFile) {
+		if n != nil && n.ID != "" {
+			fileIDs[n.ID] = struct{}{}
 		}
+	}
+	resolvePython := func(stem string) string {
+		if !strings.Contains(stem, "/") {
+			return ""
+		}
+		for _, cand := range []string{stem + ".py", stem + "/__init__.py"} {
+			if _, ok := fileIDs[cand]; ok {
+				return cand
+			}
+		}
+		return ""
+	}
+	resolveDart := func(importingFile, uri string) string {
+		if uri == "" || strings.HasPrefix(uri, "dart:") || strings.HasPrefix(uri, "package:") {
+			return ""
+		}
+		dir := ""
+		if i := strings.LastIndex(importingFile, "/"); i >= 0 {
+			dir = importingFile[:i]
+		}
+		target := joinRelativePath(dir, uri)
+		if target == "" {
+			return ""
+		}
+		if _, ok := fileIDs[target]; ok {
+			return target
+		}
+		return ""
+	}
+
+	// EdgesByKind pushes the "kind = imports" filter into the store;
+	// disk backends only enumerate import edges instead of every
+	// edge in the graph.
+	for e := range r.graph.EdgesByKind(graph.EdgeImports) {
 		lang, ok := fileLang[e.From]
 		if !ok {
 			continue
@@ -38,7 +87,7 @@ func (r *Resolver) resolveRelativeImports() {
 			// Always resolvable via internal-file lookup.
 			path = strings.TrimPrefix(e.To, "unresolved::pyrel::")
 			if lang == "python" {
-				resolved = resolvePythonRelativeImport(r.graph, path)
+				resolved = resolvePython(path)
 			}
 		case strings.HasPrefix(e.To, "external::"):
 			// Fallthrough path for Dart relative URIs the main
@@ -48,9 +97,9 @@ func (r *Resolver) resolveRelativeImports() {
 			path = strings.TrimPrefix(e.To, "external::")
 			switch lang {
 			case "python":
-				resolved = resolvePythonRelativeImport(r.graph, path)
+				resolved = resolvePython(path)
 			case "dart":
-				resolved = resolveDartRelativeImport(r.graph, e.From, path)
+				resolved = resolveDart(e.From, path)
 			}
 		default:
 			continue
@@ -62,57 +111,18 @@ func (r *Resolver) resolveRelativeImports() {
 			if strings.HasPrefix(e.To, "unresolved::pyrel::") {
 				oldTo := e.To
 				e.To = "external::" + path
-				r.graph.ReindexEdge(e, oldTo)
+				reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: e, OldTo: oldTo})
 			}
 			continue
 		}
 		oldTo := e.To
 		e.To = resolved
 		e.Origin = graph.OriginASTResolved
-		r.graph.ReindexEdge(e, oldTo)
+		reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: e, OldTo: oldTo})
 	}
-}
-
-// resolvePythonRelativeImport maps a project-rooted Python file-path
-// stem ("app/util", "pkg/sub") to the matching `KindFile` node ID.
-// Tries `<stem>.py` first, then `<stem>/__init__.py` (package). Returns
-// "" if no candidate exists in the graph or if `stem` doesn't look like
-// a relative-import stem (no slash separator — those are absolute
-// module references handled by attributeNonGoModuleImports).
-func resolvePythonRelativeImport(g *graph.Graph, stem string) string {
-	if !strings.Contains(stem, "/") {
-		return ""
+	if len(reindexBatch) > 0 {
+		r.graph.ReindexEdges(reindexBatch)
 	}
-	for _, cand := range []string{stem + ".py", stem + "/__init__.py"} {
-		if n := g.GetNode(cand); n != nil && n.Kind == graph.KindFile {
-			return n.ID
-		}
-	}
-	return ""
-}
-
-// resolveDartRelativeImport joins a relative Dart import URI against
-// the importing file's directory and returns the matching `KindFile`
-// node ID. Paths starting with `dart:` or `package:` are caller-
-// validated to belong to the module-attribution pass and are skipped
-// here. Returns "" when the resolved path escapes the repo root or
-// when the target file is not in the graph.
-func resolveDartRelativeImport(g *graph.Graph, importingFile, uri string) string {
-	if uri == "" || strings.HasPrefix(uri, "dart:") || strings.HasPrefix(uri, "package:") {
-		return ""
-	}
-	dir := ""
-	if i := strings.LastIndex(importingFile, "/"); i >= 0 {
-		dir = importingFile[:i]
-	}
-	target := joinRelativePath(dir, uri)
-	if target == "" {
-		return ""
-	}
-	if n := g.GetNode(target); n != nil && n.Kind == graph.KindFile {
-		return n.ID
-	}
-	return ""
 }
 
 // joinRelativePath joins a relative URI onto a directory and collapses

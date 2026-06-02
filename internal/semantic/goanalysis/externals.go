@@ -39,11 +39,17 @@ const modulePathStdlib = "stdlib"
 // Statistics counters surface back through ExternalsResult so the caller
 // can report nodes/edges added.
 type externalsAttribution struct {
-	g            *graph.Graph
+	g            graph.Store
 	pkgByPath    map[string]*packages.Package
 	moduleByPath map[string]string
 	extByObj     map[types.Object]string
 	provider     string
+
+	// repoPrefix is the owning repo's prefix, used to namespace stub
+	// IDs (graph.StubID). Empty when the caller doesn't supply one
+	// — in that case stub IDs are emitted in the legacy un-prefixed
+	// form, which graph.IsStdlibStub / friends still recognise.
+	repoPrefix string
 
 	nodesAdded     int
 	edgesAdded     int
@@ -57,7 +63,7 @@ type externalsAttribution struct {
 // roots. Walking pkg.Imports collects every dep — stdlib and module-cache
 // alike — so resolveSymbol can find the owning *packages.Package for an
 // arbitrary types.Object.
-func newExternalsAttribution(g *graph.Graph, roots []*packages.Package, provider string) *externalsAttribution {
+func newExternalsAttribution(g graph.Store, roots []*packages.Package, provider string) *externalsAttribution {
 	pkgByPath := make(map[string]*packages.Package)
 	var visit func(p *packages.Package)
 	visit = func(p *packages.Package) {
@@ -81,7 +87,32 @@ func newExternalsAttribution(g *graph.Graph, roots []*packages.Package, provider
 		moduleByPath: make(map[string]string),
 		extByObj:     make(map[types.Object]string),
 		provider:     provider,
+		repoPrefix:   deriveRepoPrefix(g, roots),
 	}
+}
+
+// deriveRepoPrefix peeks at the first source file across the
+// enrichment roots and reads its RepoPrefix from the graph.
+// All files belonging to a single semantic.Provider.Enrich call
+// share one repo, so a single sample suffices. Returns "" when no
+// matching file node is found — stubs then fall back to the
+// legacy un-prefixed form, which graph.IsStdlibStub still accepts.
+func deriveRepoPrefix(g graph.Store, roots []*packages.Package) string {
+	for _, r := range roots {
+		if r == nil {
+			continue
+		}
+		for _, f := range r.GoFiles {
+			if nodes := g.GetFileNodes(f); len(nodes) > 0 {
+				for _, n := range nodes {
+					if n != nil && n.RepoPrefix != "" {
+						return n.RepoPrefix
+					}
+				}
+			}
+		}
+	}
+	return ""
 }
 
 // resolveSymbol returns the graph node ID for an external go/types object,
@@ -199,7 +230,7 @@ func (e *externalsAttribution) claimAndUpgradeStub(callerID string, importPath s
 // claimByExactStub handles the canonical resolver-shaped targets. Pulled
 // out so the fuzzy pass can layer on top.
 func (e *externalsAttribution) claimByExactStub(callerID string, importPath string, obj types.Object, newTarget string) *graph.Edge {
-	candidates := stubEdgeTargets(importPath, obj)
+	candidates := stubEdgeTargets(e.repoPrefix, importPath, obj)
 	for _, target := range candidates {
 		edge := semantic.FindEdgeByTarget(e.g, callerID, target)
 		if edge == nil {
@@ -276,9 +307,9 @@ func wantedEdgeKind(obj types.Object) graph.EdgeKind {
 // strings the resolver writes for unresolved or external lookups.
 func isStubTarget(to string) bool {
 	switch {
-	case strings.HasPrefix(to, "unresolved::"),
+	case graph.IsUnresolvedTarget(to),
 		strings.HasPrefix(to, "external::"),
-		strings.HasPrefix(to, "stdlib::"),
+		graph.IsStdlibStub(to),
 		strings.HasPrefix(to, "dep::"):
 		return true
 	}
@@ -393,7 +424,12 @@ func (e *externalsAttribution) ensureModuleNode(pkg *packages.Package) string {
 // written for an external obj. Order matches resolver precedence:
 // stdlib::/dep:: are produced post-resolve, unresolved::extern:: is the
 // raw form when resolveExtern wasn't run.
-func stubEdgeTargets(importPath string, obj types.Object) []string {
+//
+// repoPrefix namespaces the stdlib stub form per-repo so two repos
+// pinned to different Go SDK versions don't collide on a single
+// `stdlib::fmt::Errorf` node. An empty repoPrefix yields the legacy
+// un-prefixed form, which the resolver still emits today.
+func stubEdgeTargets(repoPrefix, importPath string, obj types.Object) []string {
 	if obj == nil {
 		return nil
 	}
@@ -402,7 +438,7 @@ func stubEdgeTargets(importPath string, obj types.Object) []string {
 		return nil
 	}
 	return []string{
-		"stdlib::" + importPath + "::" + name,
+		graph.StubID(repoPrefix, graph.StubKindStdlib, importPath, name),
 		"dep::" + importPath + "::" + name,
 		"unresolved::extern::" + importPath + "::" + name,
 	}

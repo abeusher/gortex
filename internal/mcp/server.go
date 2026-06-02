@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"math"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -85,7 +84,7 @@ func (sh *symbolHistory) All() map[string][]SymbolModification {
 type Server struct {
 	mcpServer     *server.MCPServer
 	engine        *query.Engine
-	graph         *graph.Graph
+	graph         graph.Store
 	indexer       *indexer.Indexer
 	watcher       watcherHistory
 	multiIndexer  *indexer.MultiIndexer
@@ -118,7 +117,22 @@ type Server struct {
 	// of the whole graph. nil until the first clusters request;
 	// guarded by analysisMu.
 	leidenCache *analysis.LeidenPartitionCache
-	analysisMu  sync.RWMutex
+	// communitiesToken snapshots the graph identity that backed
+	// s.communities — (NodeCount, EdgeCount, EdgeIdentityRevisions).
+	// handleAnalyzeClusters reads this before calling the incremental
+	// detector: if the token still matches the live graph, the cached
+	// communities are reused without scanning AllNodes / AllEdges to
+	// fingerprint packages. On a disk backend the fingerprint scan alone is
+	// ~140s; the cache check is three scalar reads.
+	communitiesToken communityCacheToken
+	// hotspots is the default-threshold (mean + 2*stddev) hotspot
+	// ranking. FindHotspots' inner ComputeBetweenness pass dominates
+	// the wall clock of get_repo_outline / get_architecture /
+	// gortex_wakeup / the analyze(hotspots) resource — caching it
+	// once per RunAnalysis turn turns repeat calls into a map lookup.
+	// Rebuilt each RunAnalysis pass; guarded by analysisMu.
+	hotspots   []analysis.HotspotEntry
+	analysisMu sync.RWMutex
 
 	// cochange caches the git-history co-change graph. cochangeByFile
 	// maps a file path to its co-changing file paths and association
@@ -446,10 +460,7 @@ type tokenStats struct {
 // returned and fullFile are token counts (cl100k_base via internal/tokens).
 func (ts *tokenStats) record(node *graph.Node, tool string, returned, fullFile int64) {
 	ts.mu.Lock()
-	saved := fullFile - returned
-	if saved < 0 {
-		saved = 0
-	}
+	saved := max(fullFile-returned, 0)
 	ts.tokensSaved += saved
 	ts.tokensReturned += returned
 	ts.callCount++
@@ -724,7 +735,7 @@ const serverInstructions = `Gortex is a code-intelligence graph server — it in
 - Pass format:"gcx" to list-shaped tools for a compact, round-trippable wire format (~27% fewer tokens).`
 
 // NewServer creates an MCP server with all Gortex tools registered.
-func NewServer(engine *query.Engine, g *graph.Graph, idx *indexer.Indexer, watcher *indexer.Watcher, logger *zap.Logger, guardRules []config.GuardRule, opts ...MultiRepoOptions) *Server {
+func NewServer(engine *query.Engine, g graph.Store, idx *indexer.Indexer, watcher *indexer.Watcher, logger *zap.Logger, guardRules []config.GuardRule, opts ...MultiRepoOptions) *Server {
 	s := &Server{
 		engine:     engine,
 		graph:      g,
@@ -836,6 +847,8 @@ func NewServer(engine *query.Engine, g *graph.Graph, idx *indexer.Indexer, watch
 	s.registerGenerateSkillTool()
 	s.registerInspectionsTools()
 	s.registerChurnRateTool()
+	s.registerEnrichChurnTool()
+	s.registerEnrichReleasesTool()
 	s.registerCoChangeTool()
 	s.registerArtifactTools()
 	s.registerCouplingMetricsTool()
@@ -951,13 +964,13 @@ func (s *Server) InitNotebook(repoPath string) {
 
 func (s *Server) InitMemories(cacheDir, repoPath string) {
 	s.memories = newMemoryManager(cacheDir, repoPath)
-	// Mount the user-level global store. Defaults to
-	// ~/.gortex/memories-cache; an absolute $XDG_DATA_HOME relocates it
-	// to <XDG_DATA_HOME>/gortex/memories-cache. Failures (no $HOME,
-	// unreadable home) leave globalMemories nil; tools detect that and
-	// surface a clear error rather than silently dropping global writes.
+	// Mount the user-level global store. Defaults to ~/.gortex/memories;
+	// an absolute $XDG_DATA_HOME relocates it to
+	// <XDG_DATA_HOME>/gortex/memories. Failures (no $HOME, unreadable
+	// home) leave globalMemories nil; tools detect that and surface a
+	// clear error rather than silently dropping global writes.
 	if home, err := os.UserHomeDir(); err == nil && home != "" {
-		s.globalMemories = newMemoryManager(filepath.Join(platform.LegacyDataDir(), "memories-cache"), "global")
+		s.globalMemories = newMemoryManager(platform.MemoriesDir(), "global")
 	}
 }
 
@@ -1139,6 +1152,59 @@ func (s *Server) scopedNodes(ctx context.Context) []*graph.Node {
 	opts := query.QueryOptions{WorkspaceID: sessWS}
 	out := make([]*graph.Node, 0, len(all))
 	for _, n := range all {
+		if opts.ScopeAllows(n) {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// scopedNodesByKinds is the kind-pushdown sibling of scopedNodes for
+// handlers that only need a specific kind set. When the backend
+// implements graph.NodesByKindsScanner the kind predicate runs server-
+// side (one kind-filtered scan over the node table) instead of
+// the legacy AllNodes()-then-Go-side filter. The metadata analyzers
+// (todos, stale_code, stale_flags, ownership, coverage_gaps,
+// coverage_summary, cgo_users, wasm_users, orphan_tables,
+// unreferenced_tables) each keep one or two kinds out of the whole
+// node table; pushing that filter is the entire win.
+//
+// Workspace-bound sessions still narrow Go-side: the capability does
+// not know about ScopeAllows, and adding workspace_id to every analyze
+// query would tie the capability to the session-scope concept. The
+// secondary filter is cheap because the kind pushdown already shrank
+// the row count by 1-2 orders of magnitude.
+//
+// Empty kinds returns nil — defensive against caller bugs that would
+// otherwise drop into the full-AllNodes fallback path.
+func (s *Server) scopedNodesByKinds(ctx context.Context, kinds []graph.NodeKind) []*graph.Node {
+	if len(kinds) == 0 {
+		return nil
+	}
+	var nodes []*graph.Node
+	if scan, ok := s.graph.(graph.NodesByKindsScanner); ok {
+		nodes = scan.NodesByKinds(kinds)
+	} else {
+		// Fallback: same behaviour as scopedNodes, kind-filtered Go-side.
+		all := s.graph.AllNodes()
+		allowed := make(map[graph.NodeKind]struct{}, len(kinds))
+		for _, k := range kinds {
+			allowed[k] = struct{}{}
+		}
+		nodes = make([]*graph.Node, 0, len(all))
+		for _, n := range all {
+			if _, ok := allowed[n.Kind]; ok {
+				nodes = append(nodes, n)
+			}
+		}
+	}
+	sessWS, _, bound := s.sessionScope(ctx)
+	if !bound {
+		return nodes
+	}
+	opts := query.QueryOptions{WorkspaceID: sessWS}
+	out := make([]*graph.Node, 0, len(nodes))
+	for _, n := range nodes {
 		if opts.ScopeAllows(n) {
 			out = append(out, n)
 		}
@@ -1395,6 +1461,25 @@ func (s *Server) ResolveToolScope(toolName string, repo any) (*ScopedRepos, *mcp
 	return ResolveScopedRepos(scope, s.bind, repo)
 }
 
+// communityCacheToken is the per-graph identity tuple
+// handleAnalyzeClusters checks before re-running the incremental
+// detector. EdgeIdentity moves on any structural mutation; NodeCount
+// and EdgeCount cover pure additions / removals that leave the
+// identity counter alone. A zero token is "never populated".
+type communityCacheToken struct {
+	edgeIdentity int
+	nodeCount    int
+	edgeCount    int
+}
+
+func (s *Server) currentCommunityToken() communityCacheToken {
+	return communityCacheToken{
+		edgeIdentity: s.graph.EdgeIdentityRevisions(),
+		nodeCount:    s.graph.NodeCount(),
+		edgeCount:    s.graph.EdgeCount(),
+	}
+}
+
 // RunAnalysis performs community detection and process discovery on
 // the current graph, then pushes a `notifications/resources/updated`
 // for every bootstrap resource so subscribed clients can refresh
@@ -1409,6 +1494,7 @@ func (s *Server) RunAnalysis() {
 	communities, cache, _ := analysis.DetectCommunitiesLeidenIncremental(s.graph, s.leidenCache)
 	s.communities = communities
 	s.leidenCache = cache
+	s.communitiesToken = s.currentCommunityToken()
 	s.processes = analysis.DiscoverProcesses(s.graph)
 	s.pageRank = analysis.ComputePageRank(s.graph)
 	// Auto-concept vocabulary: mine domain phrases from symbol names
@@ -1418,6 +1504,10 @@ func (s *Server) RunAnalysis() {
 	// HITS authority/hub scores -- fed into the search rerank as an
 	// authority signal that complements raw fan-in.
 	s.hits = analysis.ComputeHITS(s.graph)
+	// Default-threshold hotspot ranking — cached because FindHotspots
+	// triggers ComputeBetweenness which is the shared wall-clock
+	// floor for outline / architecture / wakeup / the resource view.
+	s.hotspots = analysis.FindHotspots(s.graph, communities, 0)
 	s.analysisMu.Unlock()
 
 	// Bootstrap-resource payloads (graph_stats, index_health, etc.)
@@ -1444,11 +1534,59 @@ func (s *Server) getCommunities() *analysis.CommunityResult {
 // packages. The cache it returns is stored back under analysisMu so
 // the next clusters request can build on it. The accompanying stats
 // describe whether the fast path or a full recompute ran.
+//
+// Short-circuits when the cached communities are still valid for the
+// live graph: the (NodeCount, EdgeCount, EdgeIdentityRevisions) token
+// captured by the last detector run is compared against the current
+// graph identity in three scalar reads. On a disk backend a match skips the
+// AllNodes / AllEdges fingerprint scan that otherwise dominates the
+// call (~140s on a fresh daemon) and serves the existing partition
+// straight from the cache. The reported stats describe a no-op
+// incremental run (no changed packages, no repartitioned nodes) so
+// callers see the cache hit on the wire.
 func (s *Server) incrementalCommunities() (*analysis.CommunityResult, analysis.IncrementalCommunityStats) {
 	s.analysisMu.Lock()
 	defer s.analysisMu.Unlock()
+	cur := s.currentCommunityToken()
+	if s.communities != nil && s.communitiesToken == cur {
+		stats := analysis.IncrementalCommunityStats{
+			Incremental: true,
+		}
+		if s.leidenCache != nil {
+			stats.TotalPackages = len(s.leidenCache.PackageFingerprints())
+		}
+		if s.logger != nil {
+			s.logger.Debug("incrementalCommunities cache hit",
+				zap.Int("nodes", cur.nodeCount),
+				zap.Int("edges", cur.edgeCount),
+				zap.Int("edge_identity_rev", cur.edgeIdentity))
+		}
+		return s.communities, stats
+	}
+	if s.logger != nil {
+		// INFO-level on the miss path so a regression that re-introduces
+		// a steady-state cache miss is visible without flipping the
+		// daemon to debug. The full token diff is here precisely to
+		// catch background-mutation regressions (some pass keeps drifting
+		// the edge count under the cache and the Leiden walk runs every
+		// call). A real first-call miss is a single line in the log.
+		s.logger.Info("incrementalCommunities cache miss",
+			zap.Bool("communities_nil", s.communities == nil),
+			zap.Int("cached_nodes", s.communitiesToken.nodeCount),
+			zap.Int("cur_nodes", cur.nodeCount),
+			zap.Int("cached_edges", s.communitiesToken.edgeCount),
+			zap.Int("cur_edges", cur.edgeCount),
+			zap.Int("cached_edge_rev", s.communitiesToken.edgeIdentity),
+			zap.Int("cur_edge_rev", cur.edgeIdentity))
+	}
 	result, cache, stats := analysis.DetectCommunitiesLeidenIncremental(s.graph, s.leidenCache)
+	s.communities = result
 	s.leidenCache = cache
+	// Capture the token AFTER the algo finishes — if the graph mutated
+	// during the (potentially slow) detector run, the token reflects
+	// the state the result was actually computed against, and the next
+	// call's token comparison stays meaningful.
+	s.communitiesToken = s.currentCommunityToken()
 	return result, stats
 }
 
@@ -1480,6 +1618,17 @@ func (s *Server) getHITS() *analysis.HITSResult {
 	s.analysisMu.RLock()
 	defer s.analysisMu.RUnlock()
 	return s.hits
+}
+
+// getHotspots returns the default-threshold hotspot ranking computed
+// by the most recent RunAnalysis pass. Nil/empty until the first
+// pass; callers use the live FindHotspots(threshold) path when they
+// need a non-default threshold. Returned slice is shared and must
+// not be mutated by the caller.
+func (s *Server) getHotspots() []analysis.HotspotEntry {
+	s.analysisMu.RLock()
+	defer s.analysisMu.RUnlock()
+	return s.hotspots
 }
 
 // SetArchitecture installs the declarative architecture-rules DSL so

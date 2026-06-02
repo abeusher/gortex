@@ -38,7 +38,7 @@ type SourceReader func(n *graph.Node) ([]byte, bool)
 // their per-repo registries — the transient merged registry MultiIndexer
 // hands in is rebuilt on every ReconcileContractEdges call, so mutations
 // to it don't survive between invocations).
-func InlineWrappers(reg *Registry, g *graph.Graph, read SourceReader) []Contract {
+func InlineWrappers(reg *Registry, g graph.Store, read SourceReader) []Contract {
 	if reg == nil || g == nil || read == nil {
 		return nil
 	}
@@ -145,7 +145,7 @@ type wrapperInfo struct {
 // matching a regex pattern: lines + fileNodes + lang + tree feed
 // EnrichHTTPContractWithTree, which dispatches to the per-language
 // schema_enrich_*.go detectors and (for Go) the AST overlay.
-func enrichInlinedWrapperContract(c *Contract, g *graph.Graph, caller *graph.Node, src []byte) {
+func enrichInlinedWrapperContract(c *Contract, g graph.Store, caller *graph.Node, src []byte) {
 	if c == nil || caller == nil || len(src) == 0 {
 		return
 	}
@@ -195,19 +195,28 @@ func isWrapperPath(path string) bool {
 // contracts list output and in the matcher's graph view. Idempotency
 // matters because ReconcileContractEdges runs on every repo change —
 // without it each track/index would duplicate edges.
-func commitInlinedContractToGraph(g *graph.Graph, c Contract) {
+func commitInlinedContractToGraph(g graph.Store, c Contract) {
 	if g == nil {
 		return
 	}
 	if g.GetNode(c.ID) == nil {
 		g.AddNode(&graph.Node{
-			ID:         c.ID,
-			Kind:       graph.KindContract,
-			Name:       c.ID,
-			FilePath:   c.FilePath,
-			Language:   "contract",
-			RepoPrefix: c.RepoPrefix,
-			Meta:       map[string]any{"type": string(c.Type), "role": string(c.Role)},
+			ID:          c.ID,
+			Kind:        graph.KindContract,
+			Name:        c.ID,
+			FilePath:    c.FilePath,
+			Language:    "contract",
+			RepoPrefix:  c.RepoPrefix,
+			WorkspaceID: c.EffectiveWorkspace(),
+			ProjectID:   c.EffectiveProject(),
+			Meta: map[string]any{
+				"type":          string(c.Type),
+				"role":          string(c.Role),
+				"symbol_id":     c.SymbolID,
+				"line":          c.Line,
+				"confidence":    c.Confidence,
+				"contract_meta": c.Meta,
+			},
 		})
 	}
 	if c.SymbolID == "" {

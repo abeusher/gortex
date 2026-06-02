@@ -72,33 +72,78 @@ const (
 //
 // Pivot sampling is seeded with a fixed seed, so results are
 // reproducible run to run.
-func ComputeBetweenness(g *graph.Graph) *BetweennessResult {
+func ComputeBetweenness(g graph.Store) *BetweennessResult {
 	if g == nil {
 		return &BetweennessResult{Scores: map[string]float64{}}
 	}
-	nodes := g.AllNodes()
-	n := len(nodes)
+	// Betweenness measures shortest-path centrality across the
+	// call / reference subgraph; only function and method nodes carry
+	// those edges. The scoring kernel only ever touches node IDs, so
+	// the unfiltered AllNodes() pull was wasted on the other 90% of
+	// the node table AND on the 9 unused columns of every retained
+	// row. NodeIDsByKinds returns just the id column from a single
+	// query; NodesByKindsScanner is the legacy fallback for
+	// backends that haven't shipped the id projection yet.
+	betweennessKinds := []graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences}
+	bcNodeKinds := []graph.NodeKind{graph.KindFunction, graph.KindMethod}
+	var ids []string
+	if scan, ok := g.(graph.NodeIDsByKinds); ok {
+		ids = scan.NodeIDsByKinds(bcNodeKinds)
+	} else if scan, ok := g.(graph.NodesByKindsScanner); ok {
+		ns := scan.NodesByKinds(bcNodeKinds)
+		ids = make([]string, 0, len(ns))
+		for _, nd := range ns {
+			ids = append(ids, nd.ID)
+		}
+	} else {
+		all := g.AllNodes()
+		ids = make([]string, 0, len(all))
+		for _, nd := range all {
+			if nd.Kind == graph.KindFunction || nd.Kind == graph.KindMethod {
+				ids = append(ids, nd.ID)
+			}
+		}
+	}
+	n := len(ids)
 	if n == 0 {
 		return &BetweennessResult{Scores: map[string]float64{}}
 	}
 
 	// Stable node ordering: betweenness itself is order-independent,
 	// but a deterministic order makes the sampled pivot pick
-	// reproducible regardless of the map-iteration order AllNodes
-	// happens to return.
-	ids := make([]string, n)
-	for i, nd := range nodes {
-		ids[i] = nd.ID
-	}
+	// reproducible regardless of the iteration order
+	// NodeIDsByKinds happens to return.
 	sort.Strings(ids)
 
 	// Forward adjacency over the call / reference subgraph.
+	// EdgeAdjacencyForKinds returns only the (from, to) projection of
+	// function/method endpoints — the disk path collapses to one
+	// join with both endpoint kinds enforced in the store, so
+	// neither the cross-kind edges nor the ~10 unused columns are
+	// ever materialized. Falls back to EdgesByKinds (and then
+	// EdgesByKind per kind) on backends that don't implement the
+	// adjacency capability.
 	adj := make(map[string][]string, n)
-	for _, e := range g.AllEdges() {
-		if e.Kind != graph.EdgeCalls && e.Kind != graph.EdgeReferences {
-			continue
+	if adjScan, ok := g.(graph.EdgeAdjacencyForKinds); ok {
+		for pair := range adjScan.EdgeAdjacencyForKinds(betweennessKinds, bcNodeKinds) {
+			adj[pair[0]] = append(adj[pair[0]], pair[1])
 		}
-		adj[e.From] = append(adj[e.From], e.To)
+	} else if es, ok := g.(graph.EdgesByKindsScanner); ok {
+		for e := range es.EdgesByKinds(betweennessKinds) {
+			if e == nil {
+				continue
+			}
+			adj[e.From] = append(adj[e.From], e.To)
+		}
+	} else {
+		for _, kind := range betweennessKinds {
+			for e := range g.EdgesByKind(kind) {
+				if e == nil {
+					continue
+				}
+				adj[e.From] = append(adj[e.From], e.To)
+			}
+		}
 	}
 
 	score := make(map[string]float64, n)
@@ -156,7 +201,7 @@ func samplePivots(ids []string, k int) []string {
 	rng := rand.New(rand.NewSource(betweennessSeed))
 	perm := rng.Perm(len(ids))
 	out := make([]string, k)
-	for i := 0; i < k; i++ {
+	for i := range k {
 		out[i] = ids[perm[i]]
 	}
 	return out

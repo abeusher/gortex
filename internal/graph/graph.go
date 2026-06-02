@@ -1,6 +1,9 @@
 package graph
 
 import (
+	"iter"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -465,7 +468,58 @@ type Graph struct {
 	allEdgesCacheMu  sync.Mutex
 	allEdgesCache    []*Edge
 	allEdgesCacheGen uint64
+
+	// cloneShingles is the in-memory implementation of the
+	// CloneShingle* capability: per-symbol MinHash shingle sets keyed by
+	// node id, alongside the repo prefix that owns each row so per-repo
+	// reseeds isolate correctly. Guarded by cloneShinglesMu. Slices are
+	// deep-copied on set and on read so callers can't mutate the stored
+	// state. The on-disk backend persists the same shape; the in-memory
+	// store keeps it live so the conformance suite exercises both.
+	cloneShinglesMu sync.Mutex
+	cloneShingles   map[string]cloneShingleEntry
+
+	// churnEnrich is the in-memory churn-enrichment sidecar (change A).
+	churnEnrichMu sync.Mutex
+	churnEnrich   map[string]ChurnEnrichment
+
+	// coverageEnrich is the in-memory coverage-enrichment sidecar.
+	coverageEnrichMu sync.Mutex
+	coverageEnrich   map[string]CoverageEnrichment
+
+	// releaseEnrich is the in-memory release-enrichment sidecar.
+	releaseEnrichMu sync.Mutex
+	releaseEnrich   map[string]ReleaseEnrichment
+
+	// blameEnrich is the in-memory blame-enrichment sidecar.
+	blameEnrichMu sync.Mutex
+	blameEnrich   map[string]BlameEnrichment
 }
+
+// cloneShingleEntry is one in-memory clone_shingles row: the owning
+// repo prefix plus the (already deep-copied) shingle set.
+type cloneShingleEntry struct {
+	repoPrefix string
+	shingles   []uint64
+}
+
+// Compile-time assertions that the in-memory *Graph satisfies the
+// optional per-symbol clone-shingle persistence capabilities, so the
+// conformance suite exercises the same code path against both backends.
+var (
+	_ CloneShingleWriter       = (*Graph)(nil)
+	_ CloneShingleReader       = (*Graph)(nil)
+	_ ChurnEnrichmentWriter    = (*Graph)(nil)
+	_ ChurnEnrichmentReader    = (*Graph)(nil)
+	_ CoverageEnrichmentWriter = (*Graph)(nil)
+	_ CoverageEnrichmentReader = (*Graph)(nil)
+	_ ReleaseEnrichmentWriter  = (*Graph)(nil)
+	_ ReleaseEnrichmentReader  = (*Graph)(nil)
+	_ BlameEnrichmentWriter    = (*Graph)(nil)
+	_ BlameEnrichmentReader    = (*Graph)(nil)
+	_ ReleaseEnrichmentWriter  = (*Graph)(nil)
+	_ ReleaseEnrichmentReader  = (*Graph)(nil)
+)
 
 // New creates an empty graph.
 func New() *Graph {
@@ -482,6 +536,1035 @@ func New() *Graph {
 // the same lock.
 func (g *Graph) ResolveMutex() *sync.Mutex {
 	return &g.resolveMu
+}
+
+// ReindexEdges is the batched sibling of ReindexEdge. The in-memory
+// store has no per-call commit overhead so the implementation is a
+// straight loop; the value of the batch API lives in the disk
+// backends, where it collapses N transaction commits into one.
+func (g *Graph) ReindexEdges(batch []EdgeReindex) {
+	for _, r := range batch {
+		if r.Edge == nil {
+			continue
+		}
+		g.ReindexEdge(r.Edge, r.OldTo)
+	}
+}
+
+// BulkSetCloneShingles is the in-memory implementation of
+// CloneShingleWriter. It records every (nodeID -> shingles) entry for
+// one repo prefix, replacing any prior value in place. Slices are
+// deep-copied on the way in so a later mutation of the caller's slice
+// can't corrupt the stored state. Empty input is a no-op.
+func (g *Graph) BulkSetCloneShingles(repoPrefix string, rows map[string][]uint64) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	g.cloneShinglesMu.Lock()
+	defer g.cloneShinglesMu.Unlock()
+	if g.cloneShingles == nil {
+		g.cloneShingles = make(map[string]cloneShingleEntry, len(rows))
+	}
+	for id, sh := range rows {
+		cp := make([]uint64, len(sh))
+		copy(cp, sh)
+		g.cloneShingles[id] = cloneShingleEntry{repoPrefix: repoPrefix, shingles: cp}
+	}
+	return nil
+}
+
+// DeleteCloneShingles is the in-memory implementation of the
+// CloneShingleWriter delete side. It drops the rows for the supplied
+// node ids. Empty input is a no-op; missing ids are ignored.
+func (g *Graph) DeleteCloneShingles(nodeIDs []string) error {
+	if len(nodeIDs) == 0 {
+		return nil
+	}
+	g.cloneShinglesMu.Lock()
+	defer g.cloneShinglesMu.Unlock()
+	for _, id := range nodeIDs {
+		if id == "" {
+			continue
+		}
+		delete(g.cloneShingles, id)
+	}
+	return nil
+}
+
+// LoadCloneShingles is the in-memory implementation of
+// CloneShingleReader. It returns a fresh map of the shingle sets owned
+// by one repo prefix, deep-copying each slice so callers can't mutate
+// the stored state. Always returns a non-nil (possibly empty) map and
+// never an error.
+func (g *Graph) LoadCloneShingles(repoPrefix string) (map[string][]uint64, error) {
+	g.cloneShinglesMu.Lock()
+	defer g.cloneShinglesMu.Unlock()
+	out := make(map[string][]uint64)
+	for id, entry := range g.cloneShingles {
+		if entry.repoPrefix != repoPrefix {
+			continue
+		}
+		cp := make([]uint64, len(entry.shingles))
+		copy(cp, entry.shingles)
+		out[id] = cp
+	}
+	return out, nil
+}
+
+// BulkSetChurn is the in-memory ChurnEnrichmentWriter. ChurnEnrichment
+// is a flat value type, so a map store needs no deep copy.
+func (g *Graph) BulkSetChurn(repoPrefix string, rows []ChurnEnrichment) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	g.churnEnrichMu.Lock()
+	defer g.churnEnrichMu.Unlock()
+	if g.churnEnrich == nil {
+		g.churnEnrich = make(map[string]ChurnEnrichment, len(rows))
+	}
+	for _, r := range rows {
+		r.RepoPrefix = repoPrefix
+		g.churnEnrich[r.NodeID] = r
+	}
+	return nil
+}
+
+// DeleteChurn is the in-memory ChurnEnrichmentWriter delete side.
+func (g *Graph) DeleteChurn(nodeIDs []string) error {
+	if len(nodeIDs) == 0 {
+		return nil
+	}
+	g.churnEnrichMu.Lock()
+	defer g.churnEnrichMu.Unlock()
+	for _, id := range nodeIDs {
+		if id != "" {
+			delete(g.churnEnrich, id)
+		}
+	}
+	return nil
+}
+
+// ChurnRows is the in-memory ChurnEnrichmentReader. An empty repoPrefix
+// returns all rows across repos.
+func (g *Graph) ChurnRows(repoPrefix string) []ChurnEnrichment {
+	g.churnEnrichMu.Lock()
+	defer g.churnEnrichMu.Unlock()
+	out := make([]ChurnEnrichment, 0, len(g.churnEnrich))
+	for _, r := range g.churnEnrich {
+		if repoPrefix != "" && r.RepoPrefix != repoPrefix {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+// BulkSetCoverage is the in-memory CoverageEnrichmentWriter.
+func (g *Graph) BulkSetCoverage(repoPrefix string, rows []CoverageEnrichment) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	g.coverageEnrichMu.Lock()
+	defer g.coverageEnrichMu.Unlock()
+	if g.coverageEnrich == nil {
+		g.coverageEnrich = make(map[string]CoverageEnrichment, len(rows))
+	}
+	for _, r := range rows {
+		r.RepoPrefix = repoPrefix
+		g.coverageEnrich[r.NodeID] = r
+	}
+	return nil
+}
+
+// DeleteCoverage is the in-memory CoverageEnrichmentWriter delete side.
+func (g *Graph) DeleteCoverage(nodeIDs []string) error {
+	if len(nodeIDs) == 0 {
+		return nil
+	}
+	g.coverageEnrichMu.Lock()
+	defer g.coverageEnrichMu.Unlock()
+	for _, id := range nodeIDs {
+		if id != "" {
+			delete(g.coverageEnrich, id)
+		}
+	}
+	return nil
+}
+
+// ChurnRows-style reader for coverage; empty repoPrefix returns all.
+func (g *Graph) CoverageRows(repoPrefix string) []CoverageEnrichment {
+	g.coverageEnrichMu.Lock()
+	defer g.coverageEnrichMu.Unlock()
+	out := make([]CoverageEnrichment, 0, len(g.coverageEnrich))
+	for _, r := range g.coverageEnrich {
+		if repoPrefix != "" && r.RepoPrefix != repoPrefix {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+// BulkSetReleases is the in-memory ReleaseEnrichmentWriter.
+func (g *Graph) BulkSetReleases(repoPrefix string, rows []ReleaseEnrichment) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	g.releaseEnrichMu.Lock()
+	defer g.releaseEnrichMu.Unlock()
+	if g.releaseEnrich == nil {
+		g.releaseEnrich = make(map[string]ReleaseEnrichment, len(rows))
+	}
+	for _, r := range rows {
+		r.RepoPrefix = repoPrefix
+		g.releaseEnrich[r.NodeID] = r
+	}
+	return nil
+}
+
+// DeleteReleases is the in-memory ReleaseEnrichmentWriter delete side.
+func (g *Graph) DeleteReleases(nodeIDs []string) error {
+	if len(nodeIDs) == 0 {
+		return nil
+	}
+	g.releaseEnrichMu.Lock()
+	defer g.releaseEnrichMu.Unlock()
+	for _, id := range nodeIDs {
+		if id != "" {
+			delete(g.releaseEnrich, id)
+		}
+	}
+	return nil
+}
+
+// ReleaseRows reads release rows; empty repoPrefix returns all.
+func (g *Graph) ReleaseRows(repoPrefix string) []ReleaseEnrichment {
+	g.releaseEnrichMu.Lock()
+	defer g.releaseEnrichMu.Unlock()
+	out := make([]ReleaseEnrichment, 0, len(g.releaseEnrich))
+	for _, r := range g.releaseEnrich {
+		if repoPrefix != "" && r.RepoPrefix != repoPrefix {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+// BulkSetBlame is the in-memory BlameEnrichmentWriter.
+func (g *Graph) BulkSetBlame(repoPrefix string, rows []BlameEnrichment) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	g.blameEnrichMu.Lock()
+	defer g.blameEnrichMu.Unlock()
+	if g.blameEnrich == nil {
+		g.blameEnrich = make(map[string]BlameEnrichment, len(rows))
+	}
+	for _, r := range rows {
+		r.RepoPrefix = repoPrefix
+		g.blameEnrich[r.NodeID] = r
+	}
+	return nil
+}
+
+// DeleteBlame is the in-memory BlameEnrichmentWriter delete side.
+func (g *Graph) DeleteBlame(nodeIDs []string) error {
+	if len(nodeIDs) == 0 {
+		return nil
+	}
+	g.blameEnrichMu.Lock()
+	defer g.blameEnrichMu.Unlock()
+	for _, id := range nodeIDs {
+		if id != "" {
+			delete(g.blameEnrich, id)
+		}
+	}
+	return nil
+}
+
+// BlameRows reads blame rows; empty repoPrefix returns all.
+func (g *Graph) BlameRows(repoPrefix string) []BlameEnrichment {
+	g.blameEnrichMu.Lock()
+	defer g.blameEnrichMu.Unlock()
+	out := make([]BlameEnrichment, 0, len(g.blameEnrich))
+	for _, r := range g.blameEnrich {
+		if repoPrefix != "" && r.RepoPrefix != repoPrefix {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+// EdgesByKind yields every edge whose Kind matches. In-memory
+// implementation iterates the materialised AllEdges() slice and
+// filters; the algorithmic cost is identical to a hand-written
+// "for _, e := range g.AllEdges() { if e.Kind == kind }" loop, which
+// is what most call sites used before the predicate API existed.
+// Disk backends override this with an index-backed scan.
+func (g *Graph) EdgesByKind(kind EdgeKind) iter.Seq[*Edge] {
+	return func(yield func(*Edge) bool) {
+		for _, e := range g.AllEdges() {
+			if e == nil || e.Kind != kind {
+				continue
+			}
+			if !yield(e) {
+				return
+			}
+		}
+	}
+}
+
+// EdgesByKinds is the in-memory reference implementation of
+// EdgesByKindsScanner. Single pass over AllEdges with a small
+// pre-built kind set — same algorithmic cost as the legacy `for _, e
+// := range g.AllEdges() { if e.Kind == X || e.Kind == Y }` loop the
+// edge-driven analyzers used before this capability existed. Disk
+// backends override with a single `WHERE kind IN $kinds` query so the
+// edge-driven analyzers stop firing one EdgesByKind per kind (or
+// worse, scanning AllEdges and filtering Go-side).
+//
+// Empty kinds yields nothing — matches the disk contract.
+func (g *Graph) EdgesByKinds(kinds []EdgeKind) iter.Seq[*Edge] {
+	if len(kinds) == 0 {
+		return func(yield func(*Edge) bool) {}
+	}
+	set := make(map[EdgeKind]struct{}, len(kinds))
+	for _, k := range kinds {
+		if k == "" {
+			continue
+		}
+		set[k] = struct{}{}
+	}
+	if len(set) == 0 {
+		return func(yield func(*Edge) bool) {}
+	}
+	return func(yield func(*Edge) bool) {
+		for _, e := range g.AllEdges() {
+			if e == nil {
+				continue
+			}
+			if _, ok := set[e.Kind]; !ok {
+				continue
+			}
+			if !yield(e) {
+				return
+			}
+		}
+	}
+}
+
+// NodesByKind yields every node whose Kind matches. Same semantics
+// and same in-memory cost story as EdgesByKind.
+func (g *Graph) NodesByKind(kind NodeKind) iter.Seq[*Node] {
+	return func(yield func(*Node) bool) {
+		for _, n := range g.AllNodes() {
+			if n == nil || n.Kind != kind {
+				continue
+			}
+			if !yield(n) {
+				return
+			}
+		}
+	}
+}
+
+// GetNodesByIDs returns a map id→*Node for every input ID that
+// exists in the store. The in-memory implementation loops the
+// existing GetNode — algorithmic cost identical to a hand-written
+// loop in the caller, no concurrency win here. The value of the
+// batched API lives in the disk backends, where it collapses N
+// per-id SQL/bolt queries into one.
+func (g *Graph) GetNodesByIDs(ids []string) map[string]*Node {
+	if len(ids) == 0 {
+		return nil
+	}
+	out := make(map[string]*Node, len(ids))
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		if _, ok := out[id]; ok {
+			continue
+		}
+		if n := g.GetNode(id); n != nil {
+			out[id] = n
+		}
+	}
+	return out
+}
+
+// FindNodesByNames is the batched sibling of FindNodesByName.
+func (g *Graph) FindNodesByNames(names []string) map[string][]*Node {
+	if len(names) == 0 {
+		return nil
+	}
+	out := make(map[string][]*Node, len(names))
+	for _, name := range names {
+		if name == "" {
+			continue
+		}
+		if _, ok := out[name]; ok {
+			continue
+		}
+		matches := g.FindNodesByName(name)
+		if len(matches) > 0 {
+			out[name] = matches
+		}
+	}
+	return out
+}
+
+// EdgesWithUnresolvedTarget yields every edge whose To has the
+// "unresolved::" prefix — the resolver's main pending-edge filter.
+// In-memory iterates all edges and prefix-checks; disk backends back
+// it with a range scan on a to-keyed index.
+func (g *Graph) EdgesWithUnresolvedTarget() iter.Seq[*Edge] {
+	return func(yield func(*Edge) bool) {
+		for _, e := range g.AllEdges() {
+			if e == nil {
+				continue
+			}
+			// IsUnresolvedTarget matches both the bare `unresolved::<name>`
+			// form and the multi-repo `<repoPrefix>::unresolved::<name>`
+			// form that the disk backend's bulk-load rewrite produces. A bare
+			// HasPrefix check silently skipped every prefixed stub, so the
+			// Go resolver never got a second pass at multi-repo edges.
+			if !IsUnresolvedTarget(e.To) {
+				continue
+			}
+			if !yield(e) {
+				return
+			}
+		}
+	}
+}
+
+// DeadCodeCandidates is the in-memory reference implementation of
+// DeadCodeCandidator. Iterates the requested node kinds and filters
+// out anything whose incoming-edge bucket contains an allowlist match
+// — same algorithm the analysis.FindDeadCode loop runs, just exposed
+// as a single capability the disk backend can short-circuit with
+// one query per kind. Pure map / slice walks here; the win lives
+// in the disk backend where the equivalent path materialises the full
+// in-edge map.
+func (g *Graph) DeadCodeCandidates(allowedNodeKinds []NodeKind, allowedInEdgeKinds map[NodeKind][]EdgeKind) []*Node {
+	if len(allowedNodeKinds) == 0 {
+		return nil
+	}
+	// Build a per-kind set so the inner loop can match against a map
+	// instead of re-scanning the allowlist slice for every edge.
+	allowedSet := make(map[NodeKind]map[EdgeKind]struct{}, len(allowedNodeKinds))
+	for _, k := range allowedNodeKinds {
+		set := make(map[EdgeKind]struct{}, len(allowedInEdgeKinds[k]))
+		for _, ek := range allowedInEdgeKinds[k] {
+			set[ek] = struct{}{}
+		}
+		allowedSet[k] = set
+	}
+
+	var out []*Node
+	for _, k := range allowedNodeKinds {
+		allowed, hasAllow := allowedSet[k]
+		anyKindCounts := !hasAllow || len(allowed) == 0
+		for n := range g.NodesByKind(k) {
+			if n == nil {
+				continue
+			}
+			incoming := g.GetInEdges(n.ID)
+			dead := true
+			for _, e := range incoming {
+				if e == nil {
+					continue
+				}
+				if anyKindCounts {
+					dead = false
+					break
+				}
+				if _, ok := allowed[e.Kind]; ok {
+					dead = false
+					break
+				}
+			}
+			if dead {
+				out = append(out, n)
+			}
+		}
+	}
+	return out
+}
+
+// IfaceImplementsRows is the in-memory reference implementation of
+// IfaceImplementsScanner. Joins KindInterface nodes carrying
+// Meta["methods"] with their EdgeImplements predecessors and returns
+// one row per (typeID, ifaceID, ifaceMeta) tuple.
+func (g *Graph) IfaceImplementsRows() []IfaceImplementsRow {
+	// Index interfaces with methods by ID so the edge walk is O(edges)
+	// rather than O(edges × interfaces).
+	ifaceMeta := make(map[string]map[string]any)
+	for n := range g.NodesByKind(KindInterface) {
+		if n == nil || n.Meta == nil {
+			continue
+		}
+		if _, ok := n.Meta["methods"]; !ok {
+			continue
+		}
+		ifaceMeta[n.ID] = n.Meta
+	}
+	if len(ifaceMeta) == 0 {
+		return nil
+	}
+	var out []IfaceImplementsRow
+	for e := range g.EdgesByKind(EdgeImplements) {
+		if e == nil {
+			continue
+		}
+		meta, ok := ifaceMeta[e.To]
+		if !ok {
+			continue
+		}
+		out = append(out, IfaceImplementsRow{
+			TypeID:    e.From,
+			IfaceID:   e.To,
+			IfaceMeta: meta,
+		})
+	}
+	return out
+}
+
+// NodeDegreeCounts is the in-memory reference implementation of
+// NodeDegreeAggregator. Walks the per-node in/out edge buckets the
+// in-memory backend already maintains — same cost as the per-node
+// loop GraphConnectivity ran before this capability landed, just
+// folded into one method call so the analyzer can pick the disk
+// backend's bulk implementation transparently. Missing ids are
+// elided from the result (matching the disk contract).
+func (g *Graph) NodeDegreeCounts(ids []string, usageKinds []EdgeKind) []NodeDegreeRow {
+	if len(ids) == 0 {
+		return nil
+	}
+	usage := make(map[EdgeKind]struct{}, len(usageKinds))
+	for _, k := range usageKinds {
+		usage[k] = struct{}{}
+	}
+	seen := make(map[string]struct{}, len(ids))
+	out := make([]NodeDegreeRow, 0, len(ids))
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		// Skip unknown ids — the disk backend's WHERE n.id IN $ids
+		// clause naturally drops them; mirror that here so both
+		// backends return the same row count.
+		if g.GetNode(id) == nil {
+			continue
+		}
+		in := g.GetInEdges(id)
+		row := NodeDegreeRow{
+			NodeID:   id,
+			InCount:  len(in),
+			OutCount: len(g.GetOutEdges(id)),
+		}
+		if len(usage) > 0 {
+			for _, e := range in {
+				if e == nil {
+					continue
+				}
+				if _, ok := usage[e.Kind]; ok {
+					row.UsageInCount++
+				}
+			}
+		}
+		out = append(out, row)
+	}
+	return out
+}
+
+// FileImporters is the in-memory reference implementation of the
+// FileImporters capability. Iterates EdgeImports via the byKind
+// bucket — same cost as the legacy AllEdges()+filter loop in
+// handleCheckReferences, but exposes the predicate as a single call
+// the disk backend can short-circuit with one query.
+//
+// Matches edges whose To node satisfies filePath == n.FilePath OR
+// filePath == n.ID. The dual match keeps parity with the indexer's
+// two import shapes: file-targeted imports point at the file node
+// (n.ID == filePath), while symbol-targeted imports land on a symbol
+// whose FilePath equals filePath.
+func (g *Graph) FileImporters(filePath string) []FileImporterRow {
+	if filePath == "" {
+		return nil
+	}
+	var out []FileImporterRow
+	for e := range g.EdgesByKind(EdgeImports) {
+		if e == nil {
+			continue
+		}
+		to := g.GetNode(e.To)
+		if to == nil {
+			continue
+		}
+		if to.FilePath != filePath && to.ID != filePath {
+			continue
+		}
+		from := g.GetNode(e.From)
+		if from == nil {
+			continue
+		}
+		out = append(out, FileImporterRow{
+			FromFile: from.FilePath,
+			FromID:   from.ID,
+			FromName: from.Name,
+			FromKind: from.Kind,
+		})
+	}
+	return out
+}
+
+// NodeFanCounts is the in-memory reference implementation of
+// NodeFanAggregator. Two passes over the per-node in/out edge buckets
+// the in-memory backend already maintains, filtered by the caller's
+// kind sets. The disk backend overrides with one query per direction
+// to drop the AllEdges() materialisation FindHotspots / health_score
+// were running every call.
+func (g *Graph) NodeFanCounts(ids []string, fanInKinds []EdgeKind, fanOutKinds []EdgeKind) []NodeFanRow {
+	if len(ids) == 0 {
+		return nil
+	}
+	inSet := make(map[EdgeKind]struct{}, len(fanInKinds))
+	for _, k := range fanInKinds {
+		inSet[k] = struct{}{}
+	}
+	outSet := make(map[EdgeKind]struct{}, len(fanOutKinds))
+	for _, k := range fanOutKinds {
+		outSet[k] = struct{}{}
+	}
+	seen := make(map[string]struct{}, len(ids))
+	out := make([]NodeFanRow, 0, len(ids))
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		if g.GetNode(id) == nil {
+			continue
+		}
+		row := NodeFanRow{NodeID: id}
+		if len(inSet) > 0 {
+			for _, e := range g.GetInEdges(id) {
+				if e == nil {
+					continue
+				}
+				if _, ok := inSet[e.Kind]; ok {
+					row.FanIn++
+				}
+			}
+		}
+		if len(outSet) > 0 {
+			for _, e := range g.GetOutEdges(id) {
+				if e == nil {
+					continue
+				}
+				if _, ok := outSet[e.Kind]; ok {
+					row.FanOut++
+				}
+			}
+		}
+		out = append(out, row)
+	}
+	return out
+}
+
+// InEdgeCountsByKind is the in-memory reference implementation of
+// the InEdgeCounter capability. Walks each requested EdgeKind via
+// the byKind bucket and increments a per-To counter. Same algorithm
+// the AllEdges-bucketing fallback in handleGetUntestedSymbols runs;
+// the win lives in the disk backend where AllEdges() materialises every
+// edge just to bucket by target.
+//
+// Dedupes the kind set up front so a sloppy caller passing the same
+// kind twice doesn't double-count — matches the disk backend's
+// IN-list dedup.
+func (g *Graph) InEdgeCountsByKind(kinds []EdgeKind) map[string]int {
+	if len(kinds) == 0 {
+		return nil
+	}
+	seen := make(map[EdgeKind]struct{}, len(kinds))
+	out := make(map[string]int)
+	for _, k := range kinds {
+		if _, ok := seen[k]; ok {
+			continue
+		}
+		seen[k] = struct{}{}
+		for e := range g.EdgesByKind(k) {
+			if e == nil {
+				continue
+			}
+			out[e.To]++
+		}
+	}
+	return out
+}
+
+// NodesInFilesByKind is the in-memory reference implementation of
+// the NodesInFilesByKindFinder capability. Filters NodesByKind for
+// each requested kind down to the file set. Same algorithm as the
+// Go-side loop in find_declaration's buildDeclFileIndex; the win
+// lives in disk backends where AllNodes() over cgo dwarfs the few
+// hundred surviving rows.
+func (g *Graph) NodesInFilesByKind(files []string, kinds []NodeKind) []*Node {
+	if len(files) == 0 || len(kinds) == 0 {
+		return nil
+	}
+	wanted := make(map[string]struct{}, len(files))
+	for _, f := range files {
+		if f == "" {
+			continue
+		}
+		wanted[f] = struct{}{}
+	}
+	if len(wanted) == 0 {
+		return nil
+	}
+	// Dedup the kinds so a sloppy caller doesn't double-scan.
+	seenKind := make(map[NodeKind]struct{}, len(kinds))
+	var out []*Node
+	for _, k := range kinds {
+		if _, ok := seenKind[k]; ok {
+			continue
+		}
+		seenKind[k] = struct{}{}
+		for n := range g.NodesByKind(k) {
+			if n == nil {
+				continue
+			}
+			if _, ok := wanted[n.FilePath]; !ok {
+				continue
+			}
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// NodesByKinds is the in-memory reference implementation of the
+// NodesByKindsScanner capability. Loops the existing NodesByKind
+// iterator per requested kind — algorithmic cost identical to the
+// hand-written `for _, n := range AllNodes() if n.Kind == K` pattern
+// the metadata analyzers used before. The win lives in the disk
+// backend, where one IN-list query replaces the AllNodes() pull.
+//
+// Dedupes the kind set up front so a sloppy caller passing the same
+// kind twice doesn't double-yield — matches the disk backend's
+// IN-list dedup. Empty kinds returns nil without touching the store.
+func (g *Graph) NodesByKinds(kinds []NodeKind) []*Node {
+	if len(kinds) == 0 {
+		return nil
+	}
+	seen := make(map[NodeKind]struct{}, len(kinds))
+	var out []*Node
+	for _, k := range kinds {
+		if _, ok := seen[k]; ok {
+			continue
+		}
+		seen[k] = struct{}{}
+		for n := range g.NodesByKind(k) {
+			if n == nil {
+				continue
+			}
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// EdgeAdjacencyForKinds is the in-memory reference implementation of
+// the EdgeAdjacencyForKinds capability. One AllEdges scan that yields
+// (from, to) pairs whose Kind is in the supplied edge-kind set AND
+// whose endpoints both have a Kind in the node-kind set — identical
+// shape to the join the disk backend folds into a single
+// query.
+//
+// Empty edgeKinds or empty nodeKinds yields nothing — matches the
+// disk contract.
+func (g *Graph) EdgeAdjacencyForKinds(edgeKinds []EdgeKind, nodeKinds []NodeKind) iter.Seq[[2]string] {
+	if len(edgeKinds) == 0 || len(nodeKinds) == 0 {
+		return func(yield func([2]string) bool) {}
+	}
+	eset := make(map[EdgeKind]struct{}, len(edgeKinds))
+	for _, k := range edgeKinds {
+		if k == "" {
+			continue
+		}
+		eset[k] = struct{}{}
+	}
+	nset := make(map[NodeKind]struct{}, len(nodeKinds))
+	for _, k := range nodeKinds {
+		if k == "" {
+			continue
+		}
+		nset[k] = struct{}{}
+	}
+	if len(eset) == 0 || len(nset) == 0 {
+		return func(yield func([2]string) bool) {}
+	}
+	return func(yield func([2]string) bool) {
+		for _, e := range g.AllEdges() {
+			if e == nil {
+				continue
+			}
+			if _, ok := eset[e.Kind]; !ok {
+				continue
+			}
+			from := g.GetNode(e.From)
+			to := g.GetNode(e.To)
+			if from == nil || to == nil {
+				continue
+			}
+			if _, ok := nset[from.Kind]; !ok {
+				continue
+			}
+			if _, ok := nset[to.Kind]; !ok {
+				continue
+			}
+			if !yield([2]string{e.From, e.To}) {
+				return
+			}
+		}
+	}
+}
+
+// CommunityCrossingsByKind is the in-memory reference implementation
+// of the CommunityCrossingsByKind capability. AllEdges scan with the
+// kind-set filter, then a Go-side community comparison per edge —
+// the exact loop FindHotspots.countCrossings ran before this
+// capability existed.
+//
+// Empty kinds or empty nodeToComm returns nil. Zero-count sources
+// never surface (matches the disk contract — callers probe by
+// existence).
+func (g *Graph) CommunityCrossingsByKind(kinds []EdgeKind, nodeToComm map[string]string) map[string]int {
+	if len(kinds) == 0 || len(nodeToComm) == 0 {
+		return nil
+	}
+	set := make(map[EdgeKind]struct{}, len(kinds))
+	for _, k := range kinds {
+		if k == "" {
+			continue
+		}
+		set[k] = struct{}{}
+	}
+	if len(set) == 0 {
+		return nil
+	}
+	out := make(map[string]int)
+	for _, e := range g.AllEdges() {
+		if e == nil {
+			continue
+		}
+		if _, ok := set[e.Kind]; !ok {
+			continue
+		}
+		from := nodeToComm[e.From]
+		to := nodeToComm[e.To]
+		if from == "" || to == "" || from == to {
+			continue
+		}
+		out[e.From]++
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// NodeIDsByKinds is the in-memory reference implementation of the
+// NodeIDsByKinds capability. Single AllNodes pass with a kind-set
+// filter, deduped on input — same algorithm as NodesByKinds but
+// returns only the ID column. The disk-backend win is the projection
+// drop, not the algorithmic shape.
+func (g *Graph) NodeIDsByKinds(kinds []NodeKind) []string {
+	if len(kinds) == 0 {
+		return nil
+	}
+	seen := make(map[NodeKind]struct{}, len(kinds))
+	for _, k := range kinds {
+		if k == "" {
+			continue
+		}
+		seen[k] = struct{}{}
+	}
+	if len(seen) == 0 {
+		return nil
+	}
+	var out []string
+	for _, n := range g.AllNodes() {
+		if n == nil {
+			continue
+		}
+		if _, ok := seen[n.Kind]; !ok {
+			continue
+		}
+		out = append(out, n.ID)
+	}
+	return out
+}
+
+// EdgeKindCounts is the in-memory reference implementation of the
+// EdgeKindCounter capability. One AllEdges scan with a per-kind
+// tally — the exact loop the get_surprising_connections Go fallback
+// already runs today, just exposed as a single method call so the
+// the disk backend can short-circuit with a server-side GROUP BY.
+//
+// Empty graph returns nil so callers can short-circuit a downstream
+// "kindCounts != nil" gate.
+func (g *Graph) EdgeKindCounts() map[EdgeKind]int {
+	out := map[EdgeKind]int{}
+	for _, e := range g.AllEdges() {
+		if e == nil {
+			continue
+		}
+		out[e.Kind]++
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// CrossRepoEdgeCounts is the in-memory reference implementation of
+// CrossRepoEdgeAggregator. Iterates the four cross_repo_* byKind
+// buckets and groups by (kind, fromRepoPrefix, toRepoPrefix). Same
+// algorithm as the architecture handler's AllEdges loop but exposes
+// it as a single capability so the disk backend can fold the join into
+// one query.
+//
+// Returns nil when the graph carries no cross-repo edges (single-
+// repo mode) so the caller's empty-list rendering kicks in without
+// allocating.
+func (g *Graph) CrossRepoEdgeCounts() []CrossRepoEdgeRow {
+	type key struct {
+		kind     EdgeKind
+		fromRepo string
+		toRepo   string
+	}
+	counts := map[key]int{}
+	for _, k := range []EdgeKind{
+		EdgeCrossRepoCalls,
+		EdgeCrossRepoImplements,
+		EdgeCrossRepoExtends,
+	} {
+		for e := range g.EdgesByKind(k) {
+			if e == nil {
+				continue
+			}
+			from := g.GetNode(e.From)
+			to := g.GetNode(e.To)
+			if from == nil || to == nil {
+				continue
+			}
+			counts[key{kind: e.Kind, fromRepo: from.RepoPrefix, toRepo: to.RepoPrefix}]++
+		}
+	}
+	if len(counts) == 0 {
+		return nil
+	}
+	out := make([]CrossRepoEdgeRow, 0, len(counts))
+	for k, c := range counts {
+		out = append(out, CrossRepoEdgeRow{
+			Kind: k.kind, FromRepo: k.fromRepo, ToRepo: k.toRepo, Count: c,
+		})
+	}
+	return out
+}
+
+// FileImportCounts is the in-memory reference implementation of
+// FileImportAggregator. Iterates the EdgeImports byKind bucket and
+// groups by the target file path — coalescing to To-node FilePath
+// or, when the indexer pointed the import edge at the file node
+// directly, the target ID. Same algorithm as the AllEdges loop in
+// mostImportedFiles; the win lives in disk backends where AllEdges
+// + per-edge GetNode round-trips over cgo dwarf the few hundred
+// surviving rows.
+//
+// scope, when non-nil, bounds the result to edges whose target ID
+// lies in the slice (session-workspace clamp). A nil scope counts
+// every imports edge. An empty (non-nil) scope returns nil — never
+// a whole-graph scan.
+func (g *Graph) FileImportCounts(scope []string) []FileImportCountRow {
+	if scope != nil && len(scope) == 0 {
+		return nil
+	}
+	var allowed map[string]struct{}
+	if scope != nil {
+		allowed = make(map[string]struct{}, len(scope))
+		for _, id := range scope {
+			if id == "" {
+				continue
+			}
+			allowed[id] = struct{}{}
+		}
+		if len(allowed) == 0 {
+			return nil
+		}
+	}
+	counts := map[string]int{}
+	for e := range g.EdgesByKind(EdgeImports) {
+		if e == nil {
+			continue
+		}
+		target := g.GetNode(e.To)
+		if target == nil {
+			continue
+		}
+		if allowed != nil {
+			if _, ok := allowed[target.ID]; !ok {
+				continue
+			}
+		}
+		path := target.FilePath
+		if path == "" {
+			path = target.ID
+		}
+		if path == "" {
+			continue
+		}
+		counts[path]++
+	}
+	if len(counts) == 0 {
+		return nil
+	}
+	out := make([]FileImportCountRow, 0, len(counts))
+	for p, c := range counts {
+		out = append(out, FileImportCountRow{FilePath: p, Count: c})
+	}
+	return out
+}
+
+// SetEdgeProvenanceBatch is the batched sibling of SetEdgeProvenance.
+// Same story as ReindexEdges: per-call in memory, one transaction in
+// the disk backends. Returns the number of edges whose Origin
+// actually changed (matches the sum of per-edge SetEdgeProvenance
+// boolean returns).
+func (g *Graph) SetEdgeProvenanceBatch(batch []EdgeProvenanceUpdate) int {
+	changed := 0
+	for _, u := range batch {
+		if u.Edge == nil {
+			continue
+		}
+		if g.SetEdgeProvenance(u.Edge, u.NewOrigin) {
+			changed++
+		}
+	}
+	return changed
 }
 
 // shardIdx picks the shard index for an ID using FNV-1a. Inlined to
@@ -708,7 +1791,7 @@ func (g *Graph) AddBatch(nodes []*Node, edges []*Edge) {
 		inEdgesByShard[shardIdx(e.To)] = append(inEdgesByShard[shardIdx(e.To)], e)
 	}
 
-	for i := 0; i < numShards; i++ {
+	for i := range numShards {
 		if len(nodesByShard[i]) == 0 && len(outEdgesByShard[i]) == 0 && len(inEdgesByShard[i]) == 0 {
 			continue
 		}
@@ -965,6 +2048,33 @@ func (g *Graph) GetNodeByQualName(qualName string) *Node {
 	return nil
 }
 
+// GetNodesByQualNames is the batch form of GetNodeByQualName — returns
+// only the qual_names that have a node (an absent key means "no node").
+// The in-memory byQual index makes each lookup O(1); the method exists
+// for Store-interface parity with the disk backend, where it collapses
+// N per-edge qual_name scans into a single IN-scan.
+func (g *Graph) GetNodesByQualNames(qualNames []string) map[string]*Node {
+	out := make(map[string]*Node, len(qualNames))
+	for _, q := range qualNames {
+		if q == "" {
+			continue
+		}
+		if _, done := out[q]; done {
+			continue
+		}
+		for _, s := range g.shards {
+			s.mu.RLock()
+			n, ok := s.byQual[q]
+			s.mu.RUnlock()
+			if ok {
+				out[q] = n
+				break
+			}
+		}
+	}
+	return out
+}
+
 // FindNodesByName returns all nodes matching the short name.
 //
 // Implementation walks every shard's byName bucket. The two-pass shape
@@ -1036,6 +2146,40 @@ func (g *Graph) FindNodesByNameInRepo(name, repoPrefix string) []*Node {
 	return out
 }
 
+// FindNodesByNameContaining returns nodes whose Name (case-insensitive)
+// contains substr. The in-memory backend has no name-substring index,
+// so this is a single pass over the byName buckets (which already group
+// nodes by exact name — the same allocation we'd pay for one FindNodesByName
+// call per distinct name). limit caps the slice; 0 means "no limit".
+//
+// Stable order is the caller's responsibility — bucket iteration is
+// deterministic per shard but cross-shard order isn't fixed.
+func (g *Graph) FindNodesByNameContaining(substr string, limit int) []*Node {
+	if substr == "" {
+		return nil
+	}
+	needle := strings.ToLower(substr)
+	var out []*Node
+	for _, s := range g.shards {
+		s.mu.RLock()
+		for name, bucket := range s.byName {
+			if !strings.Contains(strings.ToLower(name), needle) {
+				continue
+			}
+			out = append(out, bucket...)
+			if limit > 0 && len(out) >= limit {
+				s.mu.RUnlock()
+				return out[:limit]
+			}
+		}
+		s.mu.RUnlock()
+	}
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out
+}
+
 // GetFileNodes returns all nodes defined in the given file.
 func (g *Graph) GetFileNodes(filePath string) []*Node {
 	var out []*Node
@@ -1068,6 +2212,48 @@ func (g *Graph) GetInEdges(nodeID string) []*Edge {
 	src := s.inEdges[nodeID]
 	out := make([]*Edge, len(src))
 	copy(out, src)
+	return out
+}
+
+// GetOutEdgesByNodeIDs returns a map id→outgoing edges for every input
+// id. The in-memory backend loops the existing GetOutEdges — cost
+// matches a hand-written loop in the caller. The value of the batched
+// API lives in the disk backend, where it collapses N point lookups into
+// one bulk query. Empty input returns nil; duplicate ids are
+// deduped naturally. Missing ids are absent from the returned map.
+func (g *Graph) GetOutEdgesByNodeIDs(ids []string) map[string][]*Edge {
+	if len(ids) == 0 {
+		return nil
+	}
+	out := make(map[string][]*Edge, len(ids))
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		if _, ok := out[id]; ok {
+			continue
+		}
+		out[id] = g.GetOutEdges(id)
+	}
+	return out
+}
+
+// GetInEdgesByNodeIDs is the inbound sibling of GetOutEdgesByNodeIDs.
+// See that doc-comment for the contract.
+func (g *Graph) GetInEdgesByNodeIDs(ids []string) map[string][]*Edge {
+	if len(ids) == 0 {
+		return nil
+	}
+	out := make(map[string][]*Edge, len(ids))
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		if _, ok := out[id]; ok {
+			continue
+		}
+		out[id] = g.GetInEdges(id)
+	}
 	return out
 }
 
@@ -1316,6 +2502,81 @@ func (g *Graph) AllEdges() []*Edge {
 	return out
 }
 
+// DrainNodes yields every node and FREES the graph's internal node
+// storage shard-by-shard as it goes. After Drain finishes the graph
+// holds zero nodes. Intended for the one-shot persist path where the
+// shadow is about to be discarded: AllNodes would pin the full 11 GB
+// graph for the entire persist phase; Drain releases each shard's
+// node map (and the per-name / per-file / per-repo indexes) as soon
+// as that shard's iteration completes, so GC can reclaim ~700 MB at
+// a time on a Linux-scale graph instead of waiting for the indexer's
+// defer to return.
+//
+// The graph remains structurally consistent during Drain — edges and
+// other indexes are untouched, only the node maps are emptied. If
+// you also need DrainEdges, call them in either order; both are
+// destructive and idempotent (a second call yields nothing).
+func (g *Graph) DrainNodes() iter.Seq[*Node] {
+	return func(yield func(*Node) bool) {
+		for _, s := range g.shards {
+			s.mu.Lock()
+			nodes := s.nodes
+			// Replace with an empty map so the shard's read methods
+			// keep working (return zero) instead of nil-panicking.
+			s.nodes = map[string]*Node{}
+			s.byFile = map[string][]*Node{}
+			s.byName = map[string][]*Node{}
+			s.byQual = map[string]*Node{}
+			s.byRepo = map[string][]*Node{}
+			s.byFileIdx = map[string]map[string]int{}
+			s.byNameIdx = map[string]map[string]int{}
+			s.byRepoIdx = map[string]map[string]int{}
+			s.mu.Unlock()
+			for _, n := range nodes {
+				if !yield(n) {
+					return
+				}
+			}
+			// nodes goes out of scope here — the shard's old map plus
+			// every *Node it referenced is now GC-eligible (assuming
+			// the caller has dropped any remaining reference).
+		}
+	}
+}
+
+// DrainEdges yields every edge and FREES the graph's internal edge
+// storage shard-by-shard. Same semantics as DrainNodes — meant for
+// the persist hand-off, not for general queries.
+func (g *Graph) DrainEdges() iter.Seq[*Edge] {
+	// Invalidate the AllEdges cache so any subsequent caller doesn't
+	// see drained-shard zombies. The cache holds direct *Edge slice
+	// references that DrainEdges is about to start freeing.
+	g.allEdgesCacheMu.Lock()
+	g.allEdgesCache = nil
+	g.allEdgesCacheGen = 0
+	g.allEdgesCacheMu.Unlock()
+	return func(yield func(*Edge) bool) {
+		for _, s := range g.shards {
+			s.mu.Lock()
+			outEdges := s.outEdges
+			s.outEdges = map[string][]*Edge{}
+			s.inEdges = map[string][]*Edge{}
+			s.outEdgeIdx = map[string]map[edgeHash]int{}
+			s.inEdgeIdx = map[string]map[edgeHash]int{}
+			s.outEdgeKeys = map[string][]edgeHash{}
+			s.inEdgeKeys = map[string][]edgeHash{}
+			s.mu.Unlock()
+			for _, edges := range outEdges {
+				for _, e := range edges {
+					if !yield(e) {
+						return
+					}
+				}
+			}
+		}
+	}
+}
+
 // Stats returns summary counts by kind and language.
 func (g *Graph) Stats() GraphStats {
 	g.lockAllRead()
@@ -1358,6 +2619,32 @@ func (g *Graph) GetRepoNodes(repoPrefix string) []*Node {
 		s.mu.RLock()
 		if src := s.byRepo[repoPrefix]; len(src) > 0 {
 			out = append(out, src...)
+		}
+		s.mu.RUnlock()
+	}
+	return out
+}
+
+// GetRepoEdges returns every edge whose source node has the given
+// RepoPrefix — the in-memory reference implementation of the
+// Store-interface method. Walks each shard's byRepo bucket and
+// concatenates that node's outEdges in place (no per-node
+// GetOutEdges call, so no per-call slice copy). Equivalent in
+// observable behaviour to the GetRepoNodes(r) × GetOutEdges loop
+// callers used before this method existed; meant to give disk
+// backends a single-query hook without changing in-memory cost.
+// Empty repoPrefix returns nil (callers use AllEdges() instead).
+func (g *Graph) GetRepoEdges(repoPrefix string) []*Edge {
+	if repoPrefix == "" {
+		return nil
+	}
+	var out []*Edge
+	for _, s := range g.shards {
+		s.mu.RLock()
+		for _, n := range s.byRepo[repoPrefix] {
+			if src := s.outEdges[n.ID]; len(src) > 0 {
+				out = append(out, src...)
+			}
 		}
 		s.mu.RUnlock()
 	}
@@ -1603,4 +2890,668 @@ func (g *Graph) RepoPrefixes() []string {
 		prefixes = append(prefixes, prefix)
 	}
 	return prefixes
+}
+
+// InDegreeForNodes is the in-memory reference implementation of the
+// InDegreeForNodes capability. Walks the per-target in-edge buckets
+// directly — the same arithmetic the disk backend pushes into a single
+// server-side COUNT.
+func (g *Graph) InDegreeForNodes(ids []string) map[string]int {
+	if len(ids) == 0 {
+		return nil
+	}
+	out := make(map[string]int, len(ids))
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		c := len(g.GetInEdges(id))
+		if c == 0 {
+			continue
+		}
+		out[id] = c
+	}
+	return out
+}
+
+// ReachableForwardByKinds is the in-memory reference implementation
+// of the ReachableForwardByKinds capability. Layer-by-layer BFS from
+// the seed frontier, following only edges whose Kind is in the
+// supplied set. Pure map / slice walks here — the win is the disk
+// backend folds the BFS into one variable-length match.
+func (g *Graph) ReachableForwardByKinds(seeds []string, kinds []EdgeKind) map[string]bool {
+	if len(seeds) == 0 {
+		return nil
+	}
+	covered := make(map[string]bool, len(seeds))
+	frontier := make([]string, 0, len(seeds))
+	for _, id := range seeds {
+		if id == "" || covered[id] {
+			continue
+		}
+		covered[id] = true
+		frontier = append(frontier, id)
+	}
+	if len(kinds) == 0 {
+		return covered
+	}
+	allowed := make(map[EdgeKind]struct{}, len(kinds))
+	for _, k := range kinds {
+		allowed[k] = struct{}{}
+	}
+	for len(frontier) > 0 {
+		next := frontier[:0:0]
+		for _, id := range frontier {
+			for _, e := range g.GetOutEdges(id) {
+				if e == nil {
+					continue
+				}
+				if _, ok := allowed[e.Kind]; !ok {
+					continue
+				}
+				if !covered[e.To] {
+					covered[e.To] = true
+					next = append(next, e.To)
+				}
+			}
+		}
+		frontier = next
+	}
+	return covered
+}
+
+// ThrowerErrorSurface is the in-memory reference implementation of
+// the ThrowerErrorSurfacer capability. Walks EdgeThrows once for the
+// per-thrower target dedup, then walks each thrower's out-edges for
+// the EdgeEmits → KindString(context=error_msg) attachment. The disk
+// backend collapses both passes into two server-side GROUP BYs.
+func (g *Graph) ThrowerErrorSurface(pathPrefix string) []ThrowerErrorRow {
+	byThrower := map[string]*ThrowerErrorRow{}
+	addUnique := func(set []string, v string) []string {
+		if slices.Contains(set, v) {
+			return set
+		}
+		return append(set, v)
+	}
+	for e := range g.EdgesByKind(EdgeThrows) {
+		if e == nil {
+			continue
+		}
+		if pathPrefix != "" && !strings.HasPrefix(e.FilePath, pathPrefix) {
+			continue
+		}
+		row, ok := byThrower[e.From]
+		if !ok {
+			file := e.FilePath
+			line := e.Line
+			n := g.GetNode(e.From)
+			if n != nil {
+				if file == "" {
+					file = n.FilePath
+				}
+				if line == 0 {
+					line = n.StartLine
+				}
+			}
+			row = &ThrowerErrorRow{ThrowerID: e.From, FilePath: file, Line: line}
+			byThrower[e.From] = row
+		}
+		row.Throws++
+		row.ErrorTargets = addUnique(row.ErrorTargets, e.To)
+	}
+	for thrower, row := range byThrower {
+		for _, e := range g.GetOutEdges(thrower) {
+			if e == nil || e.Kind != EdgeEmits {
+				continue
+			}
+			n := g.GetNode(e.To)
+			if n == nil || n.Kind != KindString {
+				continue
+			}
+			ctxLabel, _ := n.Meta["context"].(string)
+			if ctxLabel != "error_msg" {
+				continue
+			}
+			row.ErrorMsgs = addUnique(row.ErrorMsgs, n.Name)
+		}
+	}
+	out := make([]ThrowerErrorRow, 0, len(byThrower))
+	for _, r := range byThrower {
+		out = append(out, *r)
+	}
+	return out
+}
+
+// MemberMethodsByType is the in-memory reference implementation of the
+// MemberMethodsByType capability. One EdgesByKind(EdgeMemberOf) walk
+// joined with the in-memory node table to filter Kind == KindMethod
+// and project the four columns the resolver consumes — the exact
+// loop the resolver runs today, just exposed as a single method call
+// so the disk backend can fold the join into one query.
+//
+// Empty graph returns nil. Per-type method lists are deduplicated by
+// MethodID so a method that appears twice in the EdgeMemberOf bucket
+// (defensive against double-insertion) yields a single row.
+func (g *Graph) MemberMethodsByType() map[string][]MemberMethodInfo {
+	out := map[string][]MemberMethodInfo{}
+	seen := map[string]map[string]struct{}{}
+	for e := range g.EdgesByKind(EdgeMemberOf) {
+		if e == nil {
+			continue
+		}
+		m := g.GetNode(e.From)
+		if m == nil || m.Kind != KindMethod {
+			continue
+		}
+		typeID := e.To
+		dedup := seen[typeID]
+		if dedup == nil {
+			dedup = make(map[string]struct{})
+			seen[typeID] = dedup
+		}
+		if _, ok := dedup[m.ID]; ok {
+			continue
+		}
+		dedup[m.ID] = struct{}{}
+		out[typeID] = append(out[typeID], MemberMethodInfo{
+			MethodID:   m.ID,
+			Name:       m.Name,
+			FilePath:   m.FilePath,
+			StartLine:  m.StartLine,
+			RepoPrefix: m.RepoPrefix,
+		})
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// StructuralParentEdges is the in-memory reference implementation of
+// the StructuralParentEdges capability. Single AllEdges scan with the
+// (Extends | Implements | Composes) kind gate and the
+// (Type | Interface) endpoint-kind gate applied per edge.
+//
+// Empty graph or no matching edges returns nil.
+func (g *Graph) StructuralParentEdges() []StructuralParentEdgeRow {
+	var out []StructuralParentEdgeRow
+	for _, e := range g.AllEdges() {
+		if e == nil {
+			continue
+		}
+		switch e.Kind {
+		case EdgeExtends, EdgeImplements, EdgeComposes:
+		default:
+			continue
+		}
+		from := g.GetNode(e.From)
+		to := g.GetNode(e.To)
+		if from == nil || to == nil {
+			continue
+		}
+		if from.Kind != KindType && from.Kind != KindInterface {
+			continue
+		}
+		if to.Kind != KindType && to.Kind != KindInterface {
+			continue
+		}
+		out = append(out, StructuralParentEdgeRow{
+			FromID:   from.ID,
+			ToID:     to.ID,
+			FromKind: from.Kind,
+			ToKind:   to.Kind,
+			Origin:   e.Origin,
+		})
+	}
+	return out
+}
+
+// CrossRepoCandidates is the in-memory reference implementation of the
+// CrossRepoCandidates capability. Single AllEdges scan with the
+// edge-kind gate + the (non-empty, distinct) repo-prefix gate. Returns
+// one row per surviving edge carrying the underlying Edge pointer plus
+// the two RepoPrefix values projected from the endpoints.
+//
+// Empty baseKinds returns nil — matches the disk-backend contract.
+// Single-repo graphs (or graphs whose nodes carry no RepoPrefix)
+// return no rows because the prefix gate filters them out.
+func (g *Graph) CrossRepoCandidates(baseKinds []EdgeKind) []CrossRepoCandidateRow {
+	if len(baseKinds) == 0 {
+		return nil
+	}
+	kset := make(map[EdgeKind]struct{}, len(baseKinds))
+	for _, k := range baseKinds {
+		if k == "" {
+			continue
+		}
+		kset[k] = struct{}{}
+	}
+	if len(kset) == 0 {
+		return nil
+	}
+	var out []CrossRepoCandidateRow
+	for _, e := range g.AllEdges() {
+		if e == nil {
+			continue
+		}
+		if _, ok := kset[e.Kind]; !ok {
+			continue
+		}
+		from := g.GetNode(e.From)
+		to := g.GetNode(e.To)
+		if from == nil || to == nil {
+			continue
+		}
+		if from.RepoPrefix == "" || to.RepoPrefix == "" {
+			continue
+		}
+		if from.RepoPrefix == to.RepoPrefix {
+			continue
+		}
+		out = append(out, CrossRepoCandidateRow{
+			Edge:     e,
+			FromRepo: from.RepoPrefix,
+			ToRepo:   to.RepoPrefix,
+		})
+	}
+	return out
+}
+
+// ExtractCandidates is the in-memory reference implementation of
+// ExtractCandidatesScanner. Walks NodesByKind for function + method,
+// applies the threshold gates locally, and counts distinct in-edge
+// From / out-edge To values restricted to the requested edge kinds.
+func (g *Graph) ExtractCandidates(
+	kinds []EdgeKind,
+	minLines, minCallers, minFanOut int,
+	pathPrefix string,
+) []ExtractCandidateRow {
+	if len(kinds) == 0 {
+		return nil
+	}
+	kset := make(map[EdgeKind]struct{}, len(kinds))
+	for _, k := range kinds {
+		if k == "" {
+			continue
+		}
+		kset[k] = struct{}{}
+	}
+	if len(kset) == 0 {
+		return nil
+	}
+	var out []ExtractCandidateRow
+	for _, n := range g.NodesByKinds([]NodeKind{KindFunction, KindMethod}) {
+		if n == nil {
+			continue
+		}
+		if pathPrefix != "" && !strings.HasPrefix(n.FilePath, pathPrefix) {
+			continue
+		}
+		if n.StartLine == 0 || n.EndLine == 0 {
+			continue
+		}
+		lineCount := n.EndLine - n.StartLine + 1
+		if lineCount < minLines {
+			continue
+		}
+		callerSet := make(map[string]struct{})
+		for _, e := range g.GetInEdges(n.ID) {
+			if e == nil {
+				continue
+			}
+			if _, ok := kset[e.Kind]; !ok {
+				continue
+			}
+			callerSet[e.From] = struct{}{}
+		}
+		if len(callerSet) < minCallers {
+			continue
+		}
+		calleeSet := make(map[string]struct{})
+		for _, e := range g.GetOutEdges(n.ID) {
+			if e == nil {
+				continue
+			}
+			if _, ok := kset[e.Kind]; !ok {
+				continue
+			}
+			calleeSet[e.To] = struct{}{}
+		}
+		if len(calleeSet) < minFanOut {
+			continue
+		}
+		out = append(out, ExtractCandidateRow{
+			NodeID:      n.ID,
+			Name:        n.Name,
+			FilePath:    n.FilePath,
+			StartLine:   n.StartLine,
+			EndLine:     n.EndLine,
+			LineCount:   lineCount,
+			CallerCount: len(callerSet),
+			FanOut:      len(calleeSet),
+		})
+	}
+	return out
+}
+
+// FileSymbolNamesByPaths is the in-memory reference implementation of
+// the FileSymbolNamesByPaths capability. Walks GetFileNodes for every
+// input path, keeps the requested kinds, and emits one row per
+// (path, name) pair. Duplicates within a file collapse to a single
+// row (a method declared once per file emits once regardless of how
+// many times the indexer touched it).
+func (g *Graph) FileSymbolNamesByPaths(paths []string, kinds []NodeKind) []FileSymbolNameRow {
+	if len(paths) == 0 {
+		return nil
+	}
+	kset := make(map[NodeKind]struct{}, len(kinds))
+	for _, k := range kinds {
+		if k == "" {
+			continue
+		}
+		kset[k] = struct{}{}
+	}
+	seen := make(map[string]struct{})
+	dedupKey := func(p, name string) string { return p + "\x00" + name }
+	var out []FileSymbolNameRow
+	for _, p := range paths {
+		if p == "" {
+			continue
+		}
+		for _, n := range g.GetFileNodes(p) {
+			if n == nil || n.Name == "" {
+				continue
+			}
+			if len(kset) > 0 {
+				if _, ok := kset[n.Kind]; !ok {
+					continue
+				}
+			}
+			k := dedupKey(p, n.Name)
+			if _, ok := seen[k]; ok {
+				continue
+			}
+			seen[k] = struct{}{}
+			out = append(out, FileSymbolNameRow{FilePath: p, Name: n.Name})
+		}
+	}
+	return out
+}
+
+// ClassHierarchyTraverse is the in-memory reference implementation of
+// ClassHierarchyTraverser. Performs the same BFS as
+// query.ClassHierarchy, but stops at the kind/depth gates and returns
+// the full Path + EdgeKinds for each terminal node reached so the
+// disk backend's variable-length match can be a drop-in
+// replacement. Direction "up" follows out-edges; "down" follows
+// in-edges.
+func (g *Graph) ClassHierarchyTraverse(
+	seedID string,
+	direction string,
+	kinds []EdgeKind,
+	depth int,
+) []ClassHierarchyRow {
+	if seedID == "" || depth <= 0 || len(kinds) == 0 {
+		return nil
+	}
+	kset := make(map[EdgeKind]struct{}, len(kinds))
+	for _, k := range kinds {
+		if k == "" {
+			continue
+		}
+		kset[k] = struct{}{}
+	}
+	if len(kset) == 0 {
+		return nil
+	}
+	if g.GetNode(seedID) == nil {
+		return nil
+	}
+	walkUp := direction == "up"
+	walkDown := direction == "down"
+	if !walkUp && !walkDown {
+		return nil
+	}
+	type queued struct {
+		id        string
+		path      []string
+		edgeKinds []EdgeKind
+		hops      int
+	}
+	visited := map[string]struct{}{seedID: {}}
+	queue := []queued{{id: seedID, path: nil, edgeKinds: nil, hops: 0}}
+	var out []ClassHierarchyRow
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		if cur.hops >= depth {
+			continue
+		}
+		var edges []*Edge
+		if walkUp {
+			edges = g.GetOutEdges(cur.id)
+		} else {
+			edges = g.GetInEdges(cur.id)
+		}
+		for _, e := range edges {
+			if e == nil {
+				continue
+			}
+			if _, ok := kset[e.Kind]; !ok {
+				continue
+			}
+			var nb string
+			if walkUp {
+				nb = e.To
+			} else {
+				nb = e.From
+			}
+			if nb == "" {
+				continue
+			}
+			if _, ok := visited[nb]; ok {
+				continue
+			}
+			visited[nb] = struct{}{}
+			newPath := append([]string(nil), cur.path...)
+			newPath = append(newPath, nb)
+			newKinds := append([]EdgeKind(nil), cur.edgeKinds...)
+			newKinds = append(newKinds, e.Kind)
+			out = append(out, ClassHierarchyRow{
+				Path:      newPath,
+				EdgeKinds: newKinds,
+			})
+			queue = append(queue, queued{id: nb, path: newPath, edgeKinds: newKinds, hops: cur.hops + 1})
+		}
+	}
+	return out
+}
+
+// FileEditingContext is the in-memory reference implementation of the
+// FileEditingContext capability. Performs the equivalent of
+// GetFileSymbols + per-function GetCallers/GetCallChain but bounded
+// to the call/method node set, so the disk backend's batched query
+// returns the same projection. The kinds parameter is the set of
+// kinds treated as call targets (function + method).
+func (g *Graph) FileEditingContext(filePath string, kinds []NodeKind) *FileEditingContextResult {
+	if filePath == "" {
+		return nil
+	}
+	nodes := g.GetFileNodes(filePath)
+	if len(nodes) == 0 {
+		return nil
+	}
+	kset := make(map[NodeKind]struct{}, len(kinds))
+	for _, k := range kinds {
+		if k == "" {
+			continue
+		}
+		kset[k] = struct{}{}
+	}
+	res := &FileEditingContextResult{}
+	var fileNodeID string
+	var defNodeIDs []string
+	for _, n := range nodes {
+		if n == nil {
+			continue
+		}
+		if n.Kind == KindFile {
+			res.FileNode = n
+			fileNodeID = n.ID
+			continue
+		}
+		res.Defines = append(res.Defines, n)
+		if _, ok := kset[n.Kind]; ok {
+			defNodeIDs = append(defNodeIDs, n.ID)
+		}
+	}
+	if fileNodeID != "" {
+		for _, e := range g.GetOutEdges(fileNodeID) {
+			if e == nil {
+				continue
+			}
+			if e.Kind == EdgeImports {
+				res.Imports = append(res.Imports, e)
+			}
+		}
+	}
+	if len(defNodeIDs) == 0 {
+		return res
+	}
+	inEdges := g.GetInEdgesByNodeIDs(defNodeIDs)
+	outEdges := g.GetOutEdgesByNodeIDs(defNodeIDs)
+	callerIDSet := make(map[string]struct{})
+	calleeIDSet := make(map[string]struct{})
+	for _, id := range defNodeIDs {
+		for _, e := range inEdges[id] {
+			if e == nil || e.Kind != EdgeCalls {
+				continue
+			}
+			if e.From == "" {
+				continue
+			}
+			callerIDSet[e.From] = struct{}{}
+		}
+		for _, e := range outEdges[id] {
+			if e == nil || e.Kind != EdgeCalls {
+				continue
+			}
+			if e.To == "" {
+				continue
+			}
+			calleeIDSet[e.To] = struct{}{}
+		}
+	}
+	callerIDs := make([]string, 0, len(callerIDSet))
+	for id := range callerIDSet {
+		callerIDs = append(callerIDs, id)
+	}
+	calleeIDs := make([]string, 0, len(calleeIDSet))
+	for id := range calleeIDSet {
+		calleeIDs = append(calleeIDs, id)
+	}
+	callerNodes := g.GetNodesByIDs(callerIDs)
+	calleeNodes := g.GetNodesByIDs(calleeIDs)
+	for _, id := range callerIDs {
+		n := callerNodes[id]
+		if n == nil || n.FilePath == filePath {
+			continue
+		}
+		res.CalledBy = append(res.CalledBy, n)
+	}
+	for _, id := range calleeIDs {
+		n := calleeNodes[id]
+		if n == nil || n.FilePath == filePath {
+			continue
+		}
+		res.Calls = append(res.Calls, n)
+	}
+	return res
+}
+
+// GetFileSubGraph is the in-memory reference implementation of the
+// FileSubGraphReader capability. Iterates the existing per-file
+// byFile bucket and the per-node outEdges / inEdges shards — the
+// same lookups Engine.GetFileSymbols' fallback path already runs,
+// just collapsed behind one method so the disk backend can push the
+// whole walk into a single query.
+func (g *Graph) GetFileSubGraph(filePath string) ([]*Node, []*Edge) {
+	if filePath == "" {
+		return nil, nil
+	}
+	nodes := g.GetFileNodes(filePath)
+	if len(nodes) == 0 {
+		return nil, nil
+	}
+	ids := make([]string, 0, len(nodes))
+	for _, n := range nodes {
+		if n != nil && n.ID != "" {
+			ids = append(ids, n.ID)
+		}
+	}
+	outByID := g.GetOutEdgesByNodeIDs(ids)
+	inByID := g.GetInEdgesByNodeIDs(ids)
+	type edgeKey struct {
+		from string
+		to   string
+		kind EdgeKind
+	}
+	seen := make(map[edgeKey]struct{}, 2*len(ids))
+	edges := make([]*Edge, 0, 2*len(ids))
+	add := func(e *Edge) {
+		if e == nil {
+			return
+		}
+		k := edgeKey{from: e.From, to: e.To, kind: e.Kind}
+		if _, ok := seen[k]; ok {
+			return
+		}
+		seen[k] = struct{}{}
+		edges = append(edges, e)
+	}
+	for _, id := range ids {
+		for _, e := range outByID[id] {
+			add(e)
+		}
+		for _, e := range inByID[id] {
+			add(e)
+		}
+	}
+	return nodes, edges
+}
+
+// GetFileSubGraphCounts is the in-memory reference implementation of
+// FileSubGraphCountReader. The per-node bucket reads are already
+// O(1) so it just walks GetFileSubGraph and reports len(edges); the
+// row-materialisation win belongs to disk backends.
+func (g *Graph) GetFileSubGraphCounts(filePath string) ([]*Node, int) {
+	nodes, edges := g.GetFileSubGraph(filePath)
+	return nodes, len(edges)
+}
+
+// NodeDegreeByKinds is the in-memory reference implementation of the
+// NodeDegreeByKinds capability. Walks NodesByKinds and reads each
+// node's in/out edge buckets — the disk backend overrides with one
+// kind-filtered aggregation per direction so the IN-list of node IDs
+// the legacy NodeDegreeCounts path needed is avoided altogether.
+func (g *Graph) NodeDegreeByKinds(kinds []NodeKind, pathPrefix string) []NodeDegreeRow {
+	if len(kinds) == 0 {
+		return nil
+	}
+	pool := g.NodesByKinds(kinds)
+	out := make([]NodeDegreeRow, 0, len(pool))
+	for _, n := range pool {
+		if n == nil {
+			continue
+		}
+		if pathPrefix != "" && !strings.HasPrefix(n.FilePath, pathPrefix) {
+			continue
+		}
+		out = append(out, NodeDegreeRow{
+			NodeID:   n.ID,
+			InCount:  len(g.GetInEdges(n.ID)),
+			OutCount: len(g.GetOutEdges(n.ID)),
+		})
+	}
+	return out
 }

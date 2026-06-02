@@ -14,10 +14,15 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/zzet/gortex/internal/blame"
+	"github.com/zzet/gortex/internal/churn"
+	"github.com/zzet/gortex/internal/cochange"
 	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/coverage"
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/releases"
 	"github.com/zzet/gortex/internal/search"
 	"github.com/zzet/gortex/internal/semantic/lsp"
 )
@@ -31,7 +36,7 @@ import (
 // otherwise. The mutex is coarse; finer locking is a later optimization.
 type realController struct {
 	mu            sync.Mutex
-	graph         *graph.Graph
+	graph         graph.Store
 	indexer       *indexer.Indexer
 	multiIndexer  *indexer.MultiIndexer
 	configManager *config.ConfigManager
@@ -76,7 +81,7 @@ func (c *realController) Track(ctx context.Context, p daemon.TrackParams) (json.
 
 	// Project association from TrackParams.Project isn't wired yet — the
 	// config package doesn't expose an AddRepoToProject helper. Callers
-	// who need project scoping can edit ~/.config/gortex/config.yaml and
+	// who need project scoping can edit ~/.gortex/config.yaml and
 	// run `gortex daemon reload`; track from the daemon-v1 surface just
 	// adds to the top-level repo list.
 
@@ -110,6 +115,244 @@ func (c *realController) Track(ctx context.Context, p daemon.TrackParams) (json.
 		"node_count": result.NodeCount,
 		"edge_count": result.EdgeCount,
 	})
+}
+
+// EnrichChurn runs the churn enricher in-process against the daemon's
+// graph. We hold c.mu for the duration so a concurrent Track/Untrack
+// can't reshape the set of files while the enricher walks them. The
+// caller (CLI / git hook) picks the params; an empty Path means "every
+// tracked repo", an empty Branch means "resolve each repo's default
+// branch from its working tree".
+func (c *realController) EnrichChurn(ctx context.Context, p daemon.EnrichChurnParams) (daemon.EnrichChurnResult, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.graph == nil {
+		return daemon.EnrichChurnResult{}, fmt.Errorf("graph not initialized")
+	}
+	if c.multiIndexer == nil {
+		return daemon.EnrichChurnResult{}, fmt.Errorf("multi-repo indexer not initialized")
+	}
+
+	// Resolve the set of repo roots the call targets. Empty Path =
+	// every tracked repo. A path or prefix narrows to one.
+	type target struct {
+		prefix string
+		root   string
+	}
+	var targets []target
+	want := strings.TrimSpace(p.Path)
+	for prefix, meta := range c.multiIndexer.AllMetadata() {
+		if want != "" && want != prefix && want != meta.RootPath {
+			continue
+		}
+		targets = append(targets, target{prefix: prefix, root: meta.RootPath})
+	}
+	if len(targets) == 0 {
+		return daemon.EnrichChurnResult{}, fmt.Errorf("no tracked repo matches %q", p.Path)
+	}
+
+	started := time.Now()
+	var combined daemon.EnrichChurnResult
+	for _, t := range targets {
+		branch := strings.TrimSpace(p.Branch)
+		if branch == "" {
+			branch = gitDefaultBranch(t.root)
+		}
+		if branch == "" {
+			c.logger.Warn("enrich churn: no default branch resolved",
+				zap.String("prefix", t.prefix), zap.String("root", t.root))
+			continue
+		}
+		res, err := churn.EnrichGraph(ctx, c.graph, t.root, churn.Options{Branch: branch})
+		if err != nil {
+			return daemon.EnrichChurnResult{}, fmt.Errorf("enrich %s: %w", t.prefix, err)
+		}
+		combined.Files += res.Files
+		combined.Symbols += res.Symbols
+		combined.Branch = res.Branch
+		combined.HeadSHA = res.HeadSHA
+	}
+	combined.DurationMS = time.Since(started).Milliseconds()
+	return combined, nil
+}
+
+// EnrichReleases runs the per-file release enricher against the
+// daemon's graph. Mirrors EnrichChurn — c.mu is held for the duration,
+// targets resolve via the multi-indexer, and an empty Branch lets
+// each repo's default branch be resolved on demand (so feature-branch
+// tags don't leak into the timeline).
+func (c *realController) EnrichReleases(ctx context.Context, p daemon.EnrichReleasesParams) (daemon.EnrichReleasesResult, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.graph == nil {
+		return daemon.EnrichReleasesResult{}, fmt.Errorf("graph not initialized")
+	}
+	if c.multiIndexer == nil {
+		return daemon.EnrichReleasesResult{}, fmt.Errorf("multi-repo indexer not initialized")
+	}
+
+	type target struct {
+		prefix string
+		root   string
+	}
+	var targets []target
+	want := strings.TrimSpace(p.Path)
+	for prefix, meta := range c.multiIndexer.AllMetadata() {
+		if want != "" && want != prefix && want != meta.RootPath {
+			continue
+		}
+		targets = append(targets, target{prefix: prefix, root: meta.RootPath})
+	}
+	if len(targets) == 0 {
+		return daemon.EnrichReleasesResult{}, fmt.Errorf("no tracked repo matches %q", p.Path)
+	}
+	_ = ctx // graph mutation is synchronous; no cancellation surface today
+
+	started := time.Now()
+	var combined daemon.EnrichReleasesResult
+	for _, t := range targets {
+		branch := strings.TrimSpace(p.Branch)
+		if branch == "" {
+			branch = gitDefaultBranch(t.root)
+			// Empty branch is still legal — releases.EnrichGraphForBranch
+			// treats "" as "every tag", which is the right default when
+			// no default branch can be resolved (e.g. a clone without
+			// origin/HEAD set yet).
+		}
+		count, err := releases.EnrichGraphForBranch(c.graph, t.root, t.prefix, branch)
+		if err != nil {
+			return daemon.EnrichReleasesResult{}, fmt.Errorf("enrich %s: %w", t.prefix, err)
+		}
+		combined.Files += count
+		combined.Branch = branch
+	}
+	combined.DurationMS = time.Since(started).Milliseconds()
+	return combined, nil
+}
+
+// enrichTarget is one (prefix, root) pair the enrichers run against.
+type enrichTarget struct {
+	prefix string
+	root   string
+}
+
+// resolveEnrichTargets maps the caller-supplied path scope onto the set
+// of tracked repos to enrich. An empty path means "every tracked repo";
+// a non-empty path narrows to the one repo whose prefix or root matches.
+// Returns an error when nothing matches so the control caller gets a
+// clear "no tracked repo" message rather than a silent zero-count
+// success. Caller must hold c.mu.
+func (c *realController) resolveEnrichTargets(path string) ([]enrichTarget, error) {
+	if c.graph == nil {
+		return nil, fmt.Errorf("graph not initialized")
+	}
+	if c.multiIndexer == nil {
+		return nil, fmt.Errorf("multi-repo indexer not initialized")
+	}
+	var targets []enrichTarget
+	want := strings.TrimSpace(path)
+	for prefix, meta := range c.multiIndexer.AllMetadata() {
+		if meta == nil || meta.RootPath == "" {
+			continue
+		}
+		if want != "" && want != prefix && want != meta.RootPath {
+			continue
+		}
+		targets = append(targets, enrichTarget{prefix: prefix, root: meta.RootPath})
+	}
+	if len(targets) == 0 {
+		return nil, fmt.Errorf("no tracked repo matches %q", path)
+	}
+	return targets, nil
+}
+
+// EnrichBlame runs the git-blame authorship enricher against the
+// daemon's graph. Mirrors EnrichChurn — c.mu is held for the duration
+// and targets resolve via the multi-indexer.
+func (c *realController) EnrichBlame(_ context.Context, p daemon.EnrichBlameParams) (daemon.EnrichBlameResult, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	targets, err := c.resolveEnrichTargets(p.Path)
+	if err != nil {
+		return daemon.EnrichBlameResult{}, err
+	}
+
+	started := time.Now()
+	var combined daemon.EnrichBlameResult
+	for _, t := range targets {
+		count, err := blame.EnrichGraph(c.graph, t.root)
+		if err != nil {
+			return daemon.EnrichBlameResult{}, fmt.Errorf("enrich %s: %w", t.prefix, err)
+		}
+		combined.Nodes += count
+	}
+	combined.DurationMS = time.Since(started).Milliseconds()
+	return combined, nil
+}
+
+// EnrichCoverage projects the caller-parsed cover-profile segments onto
+// the daemon's graph. The CLI parses the profile (the path is relative
+// to the caller's cwd, not the daemon's), so the daemon only needs the
+// segments and resolves each repo's module path from its working tree.
+func (c *realController) EnrichCoverage(_ context.Context, p daemon.EnrichCoverageParams) (daemon.EnrichCoverageResult, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	targets, err := c.resolveEnrichTargets(p.Path)
+	if err != nil {
+		return daemon.EnrichCoverageResult{}, err
+	}
+
+	segments := make([]coverage.Segment, len(p.Segments))
+	for i, s := range p.Segments {
+		segments[i] = coverage.Segment{
+			File:      s.File,
+			StartLine: s.StartLine,
+			EndLine:   s.EndLine,
+			NumStmt:   s.NumStmt,
+			Count:     s.Count,
+		}
+	}
+
+	started := time.Now()
+	var combined daemon.EnrichCoverageResult
+	combined.Segments = len(segments)
+	for _, t := range targets {
+		modulePath := coverage.ReadModulePath(t.root)
+		combined.Symbols += coverage.EnrichGraph(c.graph, segments, modulePath)
+	}
+	combined.DurationMS = time.Since(started).Milliseconds()
+	return combined, nil
+}
+
+// EnrichCochange mines co-change edges against the daemon's graph.
+// Mirrors EnrichChurn — c.mu is held for the duration and targets
+// resolve via the multi-indexer. The repo prefix scopes the file-node
+// match in multi-repo graphs.
+func (c *realController) EnrichCochange(ctx context.Context, p daemon.EnrichCochangeParams) (daemon.EnrichCochangeResult, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	targets, err := c.resolveEnrichTargets(p.Path)
+	if err != nil {
+		return daemon.EnrichCochangeResult{}, err
+	}
+	_ = ctx // mining is synchronous; no cancellation surface today
+
+	started := time.Now()
+	var combined daemon.EnrichCochangeResult
+	for _, t := range targets {
+		count, err := cochange.EnrichGraph(c.graph, t.root, t.prefix)
+		if err != nil {
+			return daemon.EnrichCochangeResult{}, fmt.Errorf("enrich %s: %w", t.prefix, err)
+		}
+		combined.Edges += count
+	}
+	combined.DurationMS = time.Since(started).Milliseconds()
+	return combined, nil
 }
 
 // Untrack evicts a repo from the graph and drops it from config.

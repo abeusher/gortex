@@ -312,6 +312,7 @@ func runTodosInspection(s *Server, scope inspectionScope) []inspectionViolation 
 
 func runCoverageGapsInspection(s *Server, scope inspectionScope) []inspectionViolation {
 	out := make([]inspectionViolation, 0)
+	covRows := s.coverageByID()
 	for _, n := range s.graph.AllNodes() {
 		if n.Kind != graph.KindFunction && n.Kind != graph.KindMethod {
 			continue
@@ -319,7 +320,7 @@ func runCoverageGapsInspection(s *Server, scope inspectionScope) []inspectionVio
 		if !scope.keep(n.FilePath) {
 			continue
 		}
-		pct, ok := n.Meta["coverage_pct"].(float64)
+		pct, ok := coveragePctFrom(covRows, n)
 		if !ok || pct >= 100.0 {
 			continue
 		}

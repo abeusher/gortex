@@ -3,8 +3,6 @@ package mcp
 import (
 	"context"
 	"encoding/json"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +11,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/persistence"
 )
 
 func newNotebookTestServer(t *testing.T) (*Server, string) {
@@ -47,8 +46,8 @@ func callNotebookHandler(t *testing.T, h func(context.Context, mcp.CallToolReque
 	return m
 }
 
-func TestNotebook_SaveCreatesFile(t *testing.T) {
-	s, dir := newNotebookTestServer(t)
+func TestNotebook_SavePersists(t *testing.T) {
+	s, _ := newNotebookTestServer(t)
 	out := callNotebookHandler(t, s.handleNotebookSave, map[string]any{
 		"title": "auth invariant",
 		"body":  "Bar must hold the mutex.",
@@ -57,12 +56,15 @@ func TestNotebook_SaveCreatesFile(t *testing.T) {
 
 	id := out["id"].(string)
 	require.NotEmpty(t, id)
-	path := filepath.Join(dir, ".gortex", "notebook", id+".md")
-	body, err := os.ReadFile(path)
-	require.NoError(t, err)
-	assert.Contains(t, string(body), "title: auth invariant")
-	assert.Contains(t, string(body), "Bar must hold the mutex")
-	assert.Contains(t, string(body), "tags: [invariant, auth]")
+
+	// The entry round-trips through the sidecar DB (no markdown file).
+	shown := callNotebookHandler(t, s.handleNotebookShow, map[string]any{"id": id})
+	assert.Equal(t, "auth invariant", shown["title"])
+	assert.Contains(t, shown["body"], "Bar must hold the mutex")
+	tags, _ := shown["tags"].([]any)
+	require.Len(t, tags, 2)
+	assert.Equal(t, "invariant", tags[0])
+	assert.Equal(t, "auth", tags[1])
 }
 
 func TestNotebook_UpdatePreservesCreated(t *testing.T) {
@@ -152,7 +154,7 @@ func TestNotebook_ShowReturnsBody(t *testing.T) {
 	id := created["id"].(string)
 
 	out := callNotebookHandler(t, s.handleNotebookShow, map[string]any{"id": id})
-	assert.Equal(t, "the full markdown body here\n", out["body"], "show returns full body including trailing newline")
+	assert.Equal(t, "the full markdown body here", out["body"], "show returns the verbatim body")
 }
 
 func TestNotebook_ShowUnknownIDErrors(t *testing.T) {
@@ -228,18 +230,23 @@ func TestNotebook_PrunesByTTL(t *testing.T) {
 	dir := t.TempDir()
 	nm := newNotebookManager(dir)
 	nm.ttl = 1 * time.Millisecond
-	// Write an entry with Updated far in the past so the prune
-	// purges it on the next save.
-	stale := notebookEntry{ID: "stale", Title: "stale", Updated: time.Now().Add(-time.Hour)}
-	_ = os.MkdirAll(filepath.Join(dir, ".gortex", "notebook"), 0o755)
-	_ = os.WriteFile(filepath.Join(dir, ".gortex", "notebook", "stale.md"), []byte(notebookMarshal(stale)), 0o644)
+	require.NotNil(t, nm.sidecar)
+	// Insert a row with Updated far in the past directly into the
+	// sidecar so the next Save's prune sweeps it.
+	require.NoError(t, nm.sidecar.UpsertNotebook(nm.repoKey, persistence.NotebookRow{
+		ID:      "stale",
+		Title:   "stale",
+		Updated: time.Now().UTC().Add(-time.Hour),
+	}))
 
 	// Trigger a save which fires the prune.
-	_, _ = nm.Save(notebookEntry{Title: "fresh", Body: "x"})
+	_, err := nm.Save(notebookEntry{Title: "fresh", Body: "x"})
+	require.NoError(t, err)
 
-	// stale.md should be gone.
-	_, err := os.Stat(filepath.Join(dir, ".gortex", "notebook", "stale.md"))
-	assert.True(t, os.IsNotExist(err), "TTL-expired entry pruned")
+	// The stale entry should be gone; the fresh one survives.
+	_, ok := nm.Get("stale")
+	assert.False(t, ok, "TTL-expired entry pruned")
+	assert.Len(t, nm.List(), 1, "only the fresh entry remains")
 }
 
 func TestNotebook_DeleteIdempotent(t *testing.T) {

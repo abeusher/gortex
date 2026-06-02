@@ -14,7 +14,7 @@ import (
 // either a Go register-call edge or a Java @ActivityInterface +
 // EdgeImplements chain that names the activity.
 type temporalTestGraph struct {
-	g *graph.Graph
+	g graph.Store
 }
 
 func newTemporalTestGraph() *temporalTestGraph { return &temporalTestGraph{g: graph.New()} }

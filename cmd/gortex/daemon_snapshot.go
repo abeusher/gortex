@@ -338,7 +338,12 @@ func migrateSnapshotFile(path string, fromVersion int) (io.Reader, error) {
 // The vec argument carries the workspace-global vector-search index so
 // a default-on daemon does not re-embed the whole graph on restart.
 func saveSnapshot(g *graph.Graph, repos []snapshotRepo, snapContracts []snapshotContract, vec snapshotVector, version string, logger *zap.Logger) {
-	_ = saveSnapshotTo(g, repos, snapContracts, vec, version, daemon.SnapshotPath(), logger)
+	// Memory backend: the gob+gzip dump IS the persistence layer, so
+	// route to the per-backend path so a future disk-backed daemon
+	// can't accidentally pick up this snapshot at startup. See
+	// daemon.BackendSnapshotPath for the memory ↔ disk-backend switch
+	// rationale.
+	_ = saveSnapshotTo(g, repos, snapContracts, vec, version, daemon.BackendSnapshotPath("memory"), logger)
 }
 
 // saveSnapshotTo writes the snapshot to an explicit path. Used by
@@ -585,6 +590,14 @@ func fromSnapshotContract(s snapshotContract) contracts.Contract {
 // trades "one bad byte poisons the entire cache" for "N bad records
 // cost at most N files being re-indexed on next warmup."
 func loadSnapshot(g *graph.Graph, logger *zap.Logger) (snapshotLoadResult, error) {
+	// Memory backend reads from its own backend-tagged path. Falls
+	// back transparently to the legacy unsuffixed daemon.gob.gz when
+	// the override env is set or the new file doesn't exist yet, so
+	// users upgrading across this change don't have to re-warm.
+	res, err := loadSnapshotFrom(g, daemon.BackendSnapshotPath("memory"), logger)
+	if err == nil && (res.Loaded || res.Partial) {
+		return res, nil
+	}
 	return loadSnapshotFrom(g, daemon.SnapshotPath(), logger)
 }
 
@@ -592,7 +605,7 @@ func loadSnapshot(g *graph.Graph, logger *zap.Logger) (snapshotLoadResult, error
 // Used by `gortex server --snapshot <path>` so a per-workspace
 // process can boot from a specific snapshot file produced by the
 // cloud indexer worker.
-func loadSnapshotFrom(g *graph.Graph, path string, logger *zap.Logger) (snapshotLoadResult, error) {
+func loadSnapshotFrom(g graph.Store, path string, logger *zap.Logger) (snapshotLoadResult, error) {
 	// Allocate Contracts up front so every early-return path (missing
 	// file, gzip error, header decode error, schema mismatch) hands the
 	// caller a safe-to-read zero-value instead of a nil map. The warmup
@@ -664,7 +677,7 @@ func loadSnapshotFrom(g *graph.Graph, path string, logger *zap.Logger) (snapshot
 	// rewrites edges whose source file's mtime changed, and most files
 	// stay untouched across daemon restarts). Bumping any resolver
 	// behaviour without bumping snapshotSchemaVersion silently degrades
-	// query quality until the user thinks to wipe ~/.cache/gortex.
+	// query quality until the user thinks to wipe ~/.gortex/cache.
 	//
 	// Cheap fix: if the binary that wrote the snapshot has a different
 	// version string than the binary loading it, discard. Cost is one

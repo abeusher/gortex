@@ -497,13 +497,20 @@ func encodeSubGraph(tool string, sg *query.SubGraph) ([]byte, error) {
 }
 
 // encodeFileSummary emits one row per symbol in a file plus a trailing
-// edge-distribution comment.
+// edge-distribution comment. Pulls the edge total from sg.TotalEdges
+// rather than len(sg.Edges) so the count-only handler path (which
+// leaves the Edge slice nil to avoid materialising every adjacent
+// edge over cgo) still reports the right number.
 func encodeFileSummary(sg *query.SubGraph, etag string) ([]byte, error) {
 	var buf bytes.Buffer
+	totalEdges := sg.TotalEdges
+	if totalEdges == 0 {
+		totalEdges = len(sg.Edges)
+	}
 	enc := newGCX(&buf, "get_file_summary",
 		[]string{"id", "kind", "name", "line", "sig"},
 		"total_nodes", fmt.Sprintf("%d", sg.TotalNodes),
-		"total_edges", fmt.Sprintf("%d", len(sg.Edges)),
+		"total_edges", fmt.Sprintf("%d", totalEdges),
 		"truncated", boolString(sg.Truncated),
 		"etag", etag,
 	)

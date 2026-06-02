@@ -63,18 +63,23 @@ func TestAnalyzeBlame_StampsLastAuthored(t *testing.T) {
 	}
 
 	// Spot-check at least one symbol got authorship metadata.
+	// blame now persists in the typed sidecar (change A), not Node.Meta.
 	found := false
-	for _, n := range srv.graph.AllNodes() {
-		if n.Kind != graph.KindFunction && n.Kind != graph.KindMethod {
-			continue
+	if r, ok := srv.graph.(graph.BlameEnrichmentReader); ok {
+		for _, e := range r.BlameRows("") {
+			if e.Email == "test@example.com" {
+				found = true
+				break
+			}
 		}
-		la, ok := n.Meta["last_authored"].(map[string]any)
-		if !ok {
-			continue
-		}
-		if la["email"] == "test@example.com" {
-			found = true
-			break
+	}
+	if !found {
+		// Fallback for capability-less backends: scan Meta.
+		for _, n := range srv.graph.AllNodes() {
+			if la, ok := n.Meta["last_authored"].(map[string]any); ok && la["email"] == "test@example.com" {
+				found = true
+				break
+			}
 		}
 	}
 	if !found {

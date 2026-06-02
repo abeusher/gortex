@@ -113,7 +113,7 @@ func (s *Server) handleResourceReport(ctx context.Context, req mcp.ReadResourceR
 
 	var hotspotCount int
 	if len(scoped) >= 10 {
-		for _, h := range analysis.FindHotspots(s.graph, s.getCommunities(), 0) {
+		for _, h := range s.getHotspots() {
 			if inScope == nil || inScope[h.ID] {
 				hotspotCount++
 			}
@@ -173,7 +173,7 @@ func (s *Server) handleResourceGodNodes(_ context.Context, req mcp.ReadResourceR
 		})
 	}
 
-	entries := analysis.FindHotspots(s.graph, s.getCommunities(), 0)
+	entries := s.getHotspots()
 	totalCount := len(entries)
 	truncated := false
 	if len(entries) > 20 {
@@ -205,7 +205,7 @@ func (s *Server) handleResourceSurprises(_ context.Context, req mcp.ReadResource
 
 	var topHubs []analysis.HotspotEntry
 	if s.graph.NodeCount() >= 10 {
-		hot := analysis.FindHotspots(s.graph, communities, 0)
+		hot := s.getHotspots()
 		// Top hubs == hotspots with at least one community crossing.
 		for _, h := range hot {
 			if h.CommunityCrossings > 0 {

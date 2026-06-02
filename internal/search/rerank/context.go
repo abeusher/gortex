@@ -121,6 +121,131 @@ type Context struct {
 	// runs once per file rather than once per candidate. Bounded by
 	// the candidate set's file count.
 	pathPenaltyCache map[string]float64
+
+	// outEdgeCache / inEdgeCache hold the per-candidate edge slices
+	// fetched in one batched round-trip from Graph at prepare() time.
+	// FanInSignal / FanOutSignal / MinHashSignal read from these
+	// instead of calling Graph.GetIn/OutEdges per-candidate, which on
+	// a disk backend collapses ~6N per-search round-trips
+	// (~150 calls × 14ms ≈ 2 s) into 2. Empty when Graph is nil.
+	// Callers must use the inEdges / outEdges accessors so signals
+	// stay graph-agnostic.
+	outEdgeCache map[string][]*graph.Edge
+	inEdgeCache  map[string][]*graph.Edge
+
+	// preparedCands is the candidate slice identity prepare() was last
+	// called against. Pipeline.Rerank skips re-prepare when the same
+	// slice header is seen back-to-back so callers that pre-call
+	// Prepare for per-phase timing do not pay for it twice. The check
+	// is identity-only (same slice, same length) — any mutation that
+	// reallocates resets it.
+	preparedCands []*Candidate
+
+	// cachePreSeeded is the caller's promise (via SeedEdgeCaches with
+	// preSeeded=true) that outEdgeCache / inEdgeCache already cover
+	// the candidate set the next Prepare call will see. When set,
+	// prepare() skips the batched edge fetch entirely — the bundle
+	// path's edges are authoritative and a second fetch is pure
+	// overhead. Reset by the caller (typically the engine, after each
+	// Search) to keep the flag from leaking across reranks.
+	cachePreSeeded bool
+}
+
+// Prepare populates the internal scratch fields used by every signal
+// once per Rerank call. Exposed so callers that want to time prepare
+// separately (the search hot path) can call it explicitly; in that
+// case the subsequent Rerank call detects the prepared state and
+// skips the duplicate work. Safe to call multiple times against the
+// same slice — it's a full reset on each call.
+func (c *Context) Prepare(cands []*Candidate) { c.prepare(cands) }
+
+// SeedEdgeCaches installs pre-fetched in/out edge maps the caller
+// already gathered (today: from the SymbolBundleSearcherBackend hot
+// path). The maps are merged into the context — IDs already in the
+// cache keep their existing entry, new IDs append. The accompanying
+// flag tells prepare() the caches are authoritative for the
+// candidate set so it can skip its own batched edge fetch on the
+// next Prepare call.
+//
+// IDs missing from the caller's bundle (vector-channel hits, fallback
+// substring matches) still get fetched the slow per-candidate way
+// through the outEdges / inEdges accessors when a signal asks for
+// them — the seed is a best-effort fast path, not a contract that
+// every candidate's edges are present. Callers MUST set
+// cachePreSeeded only when the seed covers the expected candidate set
+// (i.e. when the bundle backend returned a result for every BM25
+// hit in the merged candidate slice).
+func (c *Context) SeedEdgeCaches(inEdges, outEdges map[string][]*graph.Edge, preSeeded bool) {
+	if c.outEdgeCache == nil {
+		c.outEdgeCache = make(map[string][]*graph.Edge, len(outEdges))
+	}
+	for id, es := range outEdges {
+		if _, dup := c.outEdgeCache[id]; dup {
+			continue
+		}
+		c.outEdgeCache[id] = es
+	}
+	if c.inEdgeCache == nil {
+		c.inEdgeCache = make(map[string][]*graph.Edge, len(inEdges))
+	}
+	for id, es := range inEdges {
+		if _, dup := c.inEdgeCache[id]; dup {
+			continue
+		}
+		c.inEdgeCache[id] = es
+	}
+	if preSeeded {
+		c.cachePreSeeded = true
+	}
+}
+
+// CachePreSeeded reports whether the caller has signaled (via
+// SeedEdgeCaches with preSeeded=true) that the edge caches cover the
+// candidate set the next Prepare call will see. Exposed so the
+// MCP handler can report a cache-hit-rate / cache-pre-seeded boolean
+// in its debug log without grepping internal state.
+func (c *Context) CachePreSeeded() bool { return c.cachePreSeeded }
+
+// InheritEdgeCacheFrom shares the source context's edge caches +
+// cachePreSeeded flag onto c. Used by the engine to give per-call
+// inner reranks access to the handler-built bundle cache without
+// inheriting the handler's session-aware signals (locality, combo,
+// frecency, feedback). Cheap pointer-copy of the map references; the
+// inner rerank's prepare() reads through them and any backfills it
+// triggers land in the SHARED map so subsequent calls benefit. Pass
+// nil to clear.
+func (c *Context) InheritEdgeCacheFrom(src *Context) {
+	if c == nil || src == nil {
+		return
+	}
+	c.outEdgeCache = src.outEdgeCache
+	c.inEdgeCache = src.inEdgeCache
+	c.cachePreSeeded = src.cachePreSeeded
+}
+
+// EdgeCacheHitRate reports the fraction of nodeIDs that have an entry
+// in the in OR out edge cache. 0.0 when the caches are empty; 1.0 when
+// every input id has a cache entry on both sides. Used by the
+// MCP handler to surface "did the bundle path actually catch?" on
+// the search_symbols debug log without exposing internal state.
+func (c *Context) EdgeCacheHitRate(ids []string) float64 {
+	if len(ids) == 0 {
+		return 0
+	}
+	hits := 0
+	for _, id := range ids {
+		// An id counts as a hit if BOTH the in-edge cache and the
+		// out-edge cache have an entry for it — that's the contract
+		// the bundle pre-seed promises. A half-seeded id (only one
+		// side cached) is a near-miss the prepare() pass would still
+		// have to satisfy by fetching the missing side.
+		_, hasOut := c.outEdgeCache[id]
+		_, hasIn := c.inEdgeCache[id]
+		if hasOut && hasIn {
+			hits++
+		}
+	}
+	return float64(hits) / float64(len(ids))
 }
 
 // now returns the active timestamp (test-injectable when Now != 0).
@@ -133,7 +258,23 @@ func (c *Context) now() int64 {
 
 // prepare populates the internal scratch fields once per Rerank call.
 // Idempotent — safe to call again after mutating the candidate slice.
+//
+// Edge fetches happen in two batched round-trips (one inbound, one
+// outbound) collected from every candidate's ID up front. On a disk
+// backend each per-candidate GetInEdges / GetOutEdges call
+// costs ~14ms; batching collapses ~150 round-trips per Rerank
+// into 2.
+//
+// Bundle pre-seed fast path: when the caller has set cachePreSeeded
+// (via SeedEdgeCaches with preSeeded=true), prepare keeps the existing
+// caches in place and skips the batched edge fetch entirely. The
+// fanInMax / fanOutMax stats are computed from the already-cached
+// maps — same numbers, no cgo. This is the load-bearing skip the
+// SymbolBundleSearcherBackend path depends on: the bundle's edges
+// were already gathered server-side; a second round-trip here would
+// pure-overhead the win.
 func (c *Context) prepare(cands []*Candidate) {
+	c.preparedCands = cands
 	c.communityCount = make(map[string]int, len(cands))
 	c.maxCommunityCount = 0
 	c.candidateIDs = make(map[string]struct{}, len(cands))
@@ -144,12 +285,23 @@ func (c *Context) prepare(cands []*Candidate) {
 	c.fileScoreSum = make(map[string]float64, len(cands))
 	c.maxFileScoreSum = 0
 	c.pathPenaltyCache = make(map[string]float64, len(cands))
+	// Preserve the seeded edge caches when the caller signaled
+	// cachePreSeeded; the legacy reset path below the candidate walk
+	// only runs when the caches are NOT authoritative.
+	if !c.cachePreSeeded {
+		c.outEdgeCache = nil
+		c.inEdgeCache = nil
+	}
 
+	// First pass: collect candidate IDs (the input to the batched edge
+	// fetch) and populate the non-edge scratch fields.
+	ids := make([]string, 0, len(cands))
 	for _, cand := range cands {
 		if cand == nil || cand.Node == nil {
 			continue
 		}
 		c.candidateIDs[cand.Node.ID] = struct{}{}
+		ids = append(ids, cand.Node.ID)
 
 		if c.CommunityOf != nil {
 			com := c.CommunityOf(cand.Node.ID)
@@ -158,17 +310,6 @@ func (c *Context) prepare(cands []*Candidate) {
 				if c.communityCount[com] > c.maxCommunityCount {
 					c.maxCommunityCount = c.communityCount[com]
 				}
-			}
-		}
-
-		if c.Graph != nil {
-			fi := len(c.Graph.GetInEdges(cand.Node.ID))
-			fo := len(c.Graph.GetOutEdges(cand.Node.ID))
-			if fi > c.fanInMax {
-				c.fanInMax = fi
-			}
-			if fo > c.fanOutMax {
-				c.fanOutMax = fo
 			}
 		}
 
@@ -192,6 +333,102 @@ func (c *Context) prepare(cands []*Candidate) {
 			}
 		}
 	}
+
+	// Second pass: one batched in-edge + one out-edge round-trip
+	// against Graph, scoped to the IDs that are NOT yet cached.
+	// When cachePreSeeded covers every candidate (the bundle hot
+	// path's typical shape), the missing slice is empty and the
+	// round-trips are skipped entirely — pure cache-served fan-in /
+	// fan-out. When the bundle only covers some IDs (vector or
+	// fallback hits get appended without bundle edges), we fetch
+	// only the uncovered tail and merge into the existing cache.
+	// Skipped when Graph is nil — fan signals contribute 0.
+	if c.Graph != nil && len(ids) > 0 {
+		missingOut := missingEdgeIDs(ids, c.outEdgeCache)
+		missingIn := missingEdgeIDs(ids, c.inEdgeCache)
+		// Backfill — when the cache already covers everything, both
+		// missing slices are empty and no cgo round-trip fires.
+		if len(missingOut) > 0 {
+			fetched := c.Graph.GetOutEdgesByNodeIDs(missingOut)
+			if c.outEdgeCache == nil {
+				c.outEdgeCache = make(map[string][]*graph.Edge, len(fetched))
+			}
+			for id, es := range fetched {
+				c.outEdgeCache[id] = es
+			}
+		}
+		if len(missingIn) > 0 {
+			fetched := c.Graph.GetInEdgesByNodeIDs(missingIn)
+			if c.inEdgeCache == nil {
+				c.inEdgeCache = make(map[string][]*graph.Edge, len(fetched))
+			}
+			for id, es := range fetched {
+				c.inEdgeCache[id] = es
+			}
+		}
+	}
+	for _, id := range ids {
+		if fi := len(c.inEdgeCache[id]); fi > c.fanInMax {
+			c.fanInMax = fi
+		}
+		if fo := len(c.outEdgeCache[id]); fo > c.fanOutMax {
+			c.fanOutMax = fo
+		}
+	}
+}
+
+// missingEdgeIDs returns the subset of ids whose edge slice is NOT
+// already in cache. Used by prepare's backfill: when the bundle path
+// pre-seeded most candidates but not all (vector / fallback hits get
+// appended without bundle edges), only the uncovered ids cross the
+// engine boundary. An empty result means the cache is complete — the
+// fetch round-trip can be skipped entirely.
+func missingEdgeIDs(ids []string, cache map[string][]*graph.Edge) []string {
+	if cache == nil {
+		// No pre-seed at all — caller has to fetch the full set; return
+		// the input unchanged so the existing batched fetch path runs.
+		return ids
+	}
+	missing := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if _, ok := cache[id]; !ok {
+			missing = append(missing, id)
+		}
+	}
+	return missing
+}
+
+// outEdges returns the prepared outgoing-edge slice for nodeID. Reads
+// from the prepare()-populated cache when available; falls back to a
+// direct Graph.GetOutEdges call when prepare did not cache the node
+// (a signal calling outside the candidate set, or Graph was nil at
+// prepare time but a later mutation set it). Signals must use this
+// accessor instead of calling Graph directly so the batched-fetch
+// invariant holds.
+func (c *Context) outEdges(nodeID string) []*graph.Edge {
+	if c.outEdgeCache != nil {
+		if edges, ok := c.outEdgeCache[nodeID]; ok {
+			return edges
+		}
+	}
+	if c.Graph == nil {
+		return nil
+	}
+	return c.Graph.GetOutEdges(nodeID)
+}
+
+// inEdges is the inbound sibling of outEdges. See that doc-comment
+// for the contract.
+func (c *Context) inEdges(nodeID string) []*graph.Edge {
+	if c.inEdgeCache != nil {
+		if edges, ok := c.inEdgeCache[nodeID]; ok {
+			return edges
+		}
+	}
+	if c.Graph == nil {
+		return nil
+	}
+	return c.Graph.GetInEdges(nodeID)
 }
 
 // churnFor consults the ChurnOf hook, then Node.Meta["churn"], then

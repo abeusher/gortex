@@ -178,8 +178,14 @@ func (s *Server) buildASTTargets(language, pathPrefix string, allowedRepos map[s
 		return nil, fmt.Errorf("search_ast: no graph available")
 	}
 	out := make([]astquery.Target, 0, 256)
-	for _, n := range s.graph.AllNodes() {
-		if n.Kind != graph.KindFile {
+	// File nodes are a fraction of the node table; iterating the
+	// KindFile bucket via NodesByKind lets the backend stream only
+	// those rows instead of materialising the full table over cgo.
+	// Repo / language / path filters compose AND, so they stay Go-
+	// side — they can't be projected onto the bucket index without
+	// duplicating the predicate set across both call sites.
+	for n := range s.graph.NodesByKind(graph.KindFile) {
+		if n == nil {
 			continue
 		}
 		if allowedRepos != nil && n.RepoPrefix != "" && !allowedRepos[n.RepoPrefix] {
@@ -227,7 +233,7 @@ func (s *Server) buildASTTargets(language, pathPrefix string, allowedRepos map[s
 // than `min` incoming edges. Without an enclosing symbol, the
 // match is preserved (we'd otherwise silently swallow file-level
 // matches that legitimately have no caller graph).
-func filterByMinFanIn(g *graph.Graph, matches []astquery.Match, min int) []astquery.Match {
+func filterByMinFanIn(g graph.Store, matches []astquery.Match, min int) []astquery.Match {
 	if g == nil || min <= 0 {
 		return matches
 	}

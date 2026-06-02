@@ -63,7 +63,7 @@ func openAndScan(conn *Conn, statement string) error {
 }
 `
 
-func similarToEdges(g *graph.Graph) []*graph.Edge {
+func similarToEdges(g graph.Store) []*graph.Edge {
 	var out []*graph.Edge
 	for _, e := range g.AllEdges() {
 		if e.Kind == graph.EdgeSimilarTo {
@@ -169,12 +169,12 @@ func TestDetectClonesAndEmitEdges(t *testing.T) {
 		FilePath: "c.go", StartLine: 1, Language: "go",
 	})
 
-	stats := detectClonesAndEmitEdges(g, 0)
+	stats := detectClonesAndEmitEdges(g, "", 0)
 	assert.Equal(t, 1, stats.Pairs)
 	assert.Equal(t, 2, stats.Edges)
 
 	// Idempotent: a second run dedupes via graph.AddEdge.
-	detectClonesAndEmitEdges(g, 0)
+	detectClonesAndEmitEdges(g, "", 0)
 	assert.Len(t, similarToEdges(g), 2, "second pass must not duplicate edges")
 }
 

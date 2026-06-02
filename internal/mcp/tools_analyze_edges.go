@@ -20,6 +20,8 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"iter"
+	"slices"
 	"sort"
 	"strings"
 
@@ -68,10 +70,9 @@ func (s *Server) handleAnalyzeChannelOps(ctx context.Context, req mcp.CallToolRe
 		return row
 	}
 
-	for _, e := range s.graph.AllEdges() {
-		if e.Kind != graph.EdgeSends && e.Kind != graph.EdgeRecvs {
-			continue
-		}
+	// One scan over Sends+Recvs only — replaces the legacy AllEdges()
+	// walk that pulled every edge over cgo just to keep two kinds.
+	for e := range edgesByKinds(s.graph, graph.EdgeSends, graph.EdgeRecvs) {
 		if pathPrefix != "" && !strings.HasPrefix(e.FilePath, pathPrefix) {
 			continue
 		}
@@ -156,10 +157,7 @@ func (s *Server) handleAnalyzeGoroutineSpawns(ctx context.Context, req mcp.CallT
 	}
 	byTarget := map[string]*spawnRow{}
 
-	for _, e := range s.graph.AllEdges() {
-		if e.Kind != graph.EdgeSpawns {
-			continue
-		}
+	for e := range edgesByKinds(s.graph, graph.EdgeSpawns) {
 		mode, _ := e.Meta["mode"].(string)
 		key := e.To + "|" + mode
 		row, ok := byTarget[key]
@@ -271,10 +269,7 @@ func (s *Server) handleAnalyzeFieldWriters(ctx context.Context, req mcp.CallTool
 	}
 	byField := map[string]*writerRow{}
 
-	for _, e := range s.graph.AllEdges() {
-		if e.Kind != graph.EdgeWrites {
-			continue
-		}
+	for e := range edgesByKinds(s.graph, graph.EdgeWrites) {
 		if idFilter != "" && e.To != idFilter {
 			continue
 		}
@@ -379,8 +374,8 @@ func (s *Server) handleAnalyzeAnnotationUsers(ctx context.Context, req mcp.CallT
 			Args   string `json:"args,omitempty"`
 		}
 		var rows []annotatedRow
-		for _, e := range s.graph.AllEdges() {
-			if e.Kind != graph.EdgeAnnotated || e.To != idFilter {
+		for e := range edgesByKinds(s.graph, graph.EdgeAnnotated) {
+			if e.To != idFilter {
 				continue
 			}
 			argsStr, _ := e.Meta["args"].(string)
@@ -433,10 +428,7 @@ func (s *Server) handleAnalyzeAnnotationUsers(ctx context.Context, req mcp.CallT
 		Users int    `json:"users"`
 	}
 	byID := map[string]*annoRow{}
-	for _, e := range s.graph.AllEdges() {
-		if e.Kind != graph.EdgeAnnotated {
-			continue
-		}
+	for e := range edgesByKinds(s.graph, graph.EdgeAnnotated) {
 		row, ok := byID[e.To]
 		if !ok {
 			n := s.graph.GetNode(e.To)
@@ -523,10 +515,7 @@ func (s *Server) handleAnalyzeConfigReaders(ctx context.Context, req mcp.CallToo
 		Reads   int      `json:"reads"`
 	}
 	byKey := map[string]*configRow{}
-	for _, e := range s.graph.AllEdges() {
-		if e.Kind != graph.EdgeReadsConfig {
-			continue
-		}
+	for e := range edgesByKinds(s.graph, graph.EdgeReadsConfig) {
 		row, ok := byKey[e.To]
 		if !ok {
 			n := s.graph.GetNode(e.To)
@@ -636,10 +625,7 @@ func (s *Server) handleAnalyzeEnvVarUsers(ctx context.Context, req mcp.CallToolR
 		Reads   int      `json:"reads"`
 	}
 	byKey := map[string]*envRow{}
-	for _, e := range s.graph.AllEdges() {
-		if e.Kind != graph.EdgeReadsConfig {
-			continue
-		}
+	for e := range edgesByKinds(s.graph, graph.EdgeReadsConfig) {
 		row, ok := byKey[e.To]
 		if !ok {
 			n := s.graph.GetNode(e.To)
@@ -727,10 +713,7 @@ func (s *Server) handleAnalyzeEventEmitters(ctx context.Context, req mcp.CallToo
 		Emitters []string `json:"emitters,omitempty"`
 	}
 	byEvent := map[string]*eventRow{}
-	for _, e := range s.graph.AllEdges() {
-		if e.Kind != graph.EdgeEmits {
-			continue
-		}
+	for e := range edgesByKinds(s.graph, graph.EdgeEmits) {
 		// Level filter: an emit edge stores the method on the edge
 		// (e.g. "Errorf"); the event node may carry an event_kind.
 		// We accept either source so both per-event and per-call
@@ -880,7 +863,7 @@ func (s *Server) handleAnalyzePubsub(ctx context.Context, req mcp.CallToolReques
 		return row
 	}
 
-	for _, e := range s.graph.AllEdges() {
+	for e := range edgesByKinds(s.graph, graph.EdgeEmits, graph.EdgeListensOn) {
 		switch e.Kind {
 		case graph.EdgeEmits:
 			row := ensureRow(e.To)
@@ -987,61 +970,74 @@ func (s *Server) handleAnalyzeErrorSurface(ctx context.Context, req mcp.CallTool
 		Errors    []string `json:"errors"`
 		ErrorMsgs []string `json:"error_msgs,omitempty"`
 	}
-	byThrower := map[string]*throwerRow{}
-	for _, e := range s.graph.AllEdges() {
-		if e.Kind != graph.EdgeThrows {
-			continue
+	rows := make([]*throwerRow, 0)
+	if surfacer, ok := s.graph.(graph.ThrowerErrorSurfacer); ok {
+		// Server-side path: one server-side aggregate for the per-thrower
+		// throws+targets dedup, one for the per-thrower error-msg
+		// attachment. No per-thrower GetOutEdges fanout.
+		for _, r := range surfacer.ThrowerErrorSurface(pathPrefix) {
+			row := &throwerRow{
+				Symbol:    r.ThrowerID,
+				File:      r.FilePath,
+				Line:      r.Line,
+				Throws:    r.Throws,
+				Errors:    append([]string(nil), r.ErrorTargets...),
+				ErrorMsgs: append([]string(nil), r.ErrorMsgs...),
+			}
+			sort.Strings(row.Errors)
+			sort.Strings(row.ErrorMsgs)
+			rows = append(rows, row)
 		}
-		if pathPrefix != "" && !strings.HasPrefix(e.FilePath, pathPrefix) {
-			continue
-		}
-		row, ok := byThrower[e.From]
-		if !ok {
-			n := s.graph.GetNode(e.From)
-			file := e.FilePath
-			line := e.Line
-			if n != nil {
-				if file == "" {
-					file = n.FilePath
+	} else {
+		byThrower := map[string]*throwerRow{}
+		for e := range edgesByKinds(s.graph, graph.EdgeThrows) {
+			if pathPrefix != "" && !strings.HasPrefix(e.FilePath, pathPrefix) {
+				continue
+			}
+			row, ok := byThrower[e.From]
+			if !ok {
+				n := s.graph.GetNode(e.From)
+				file := e.FilePath
+				line := e.Line
+				if n != nil {
+					if file == "" {
+						file = n.FilePath
+					}
+					if line == 0 {
+						line = n.StartLine
+					}
 				}
-				if line == 0 {
-					line = n.StartLine
+				row = &throwerRow{Symbol: e.From, File: file, Line: line}
+				byThrower[e.From] = row
+			}
+			row.Throws++
+			row.Errors = appendUnique(row.Errors, e.To)
+		}
+		// For every thrower, also surface the error_msg KindString
+		// literals it emits. EdgeThrows targets error types; the
+		// data-side companion (errors.New("…") → string::error_msg::…)
+		// carries the literal message.
+		for thrower, row := range byThrower {
+			for _, e := range s.graph.GetOutEdges(thrower) {
+				if e == nil || e.Kind != graph.EdgeEmits {
+					continue
 				}
+				n := s.graph.GetNode(e.To)
+				if n == nil || n.Kind != graph.KindString {
+					continue
+				}
+				ctxLabel, _ := n.Meta["context"].(string)
+				if ctxLabel != "error_msg" {
+					continue
+				}
+				row.ErrorMsgs = appendUnique(row.ErrorMsgs, n.Name)
 			}
-			row = &throwerRow{Symbol: e.From, File: file, Line: line}
-			byThrower[e.From] = row
 		}
-		row.Throws++
-		row.Errors = appendUnique(row.Errors, e.To)
-	}
-	// For every thrower, also surface the error_msg KindString
-	// literals it emits. EdgeThrows targets error types; the
-	// data-side companion (errors.New("…") → string::error_msg::…)
-	// carries the literal message. Joining both gives an agent both
-	// "what error types propagate" and "what literal messages
-	// originate here" in one row.
-	for thrower, row := range byThrower {
-		for _, e := range s.graph.GetOutEdges(thrower) {
-			if e == nil || e.Kind != graph.EdgeEmits {
-				continue
-			}
-			n := s.graph.GetNode(e.To)
-			if n == nil || n.Kind != graph.KindString {
-				continue
-			}
-			ctxLabel, _ := n.Meta["context"].(string)
-			if ctxLabel != "error_msg" {
-				continue
-			}
-			row.ErrorMsgs = appendUnique(row.ErrorMsgs, n.Name)
+		for _, r := range byThrower {
+			sort.Strings(r.Errors)
+			sort.Strings(r.ErrorMsgs)
+			rows = append(rows, r)
 		}
-	}
-
-	rows := make([]*throwerRow, 0, len(byThrower))
-	for _, r := range byThrower {
-		sort.Strings(r.Errors)
-		sort.Strings(r.ErrorMsgs)
-		rows = append(rows, r)
 	}
 	sort.Slice(rows, func(i, j int) bool {
 		// Throwers with the most distinct error targets surface
@@ -1163,7 +1159,11 @@ func (s *Server) handleAnalyzeCrossRepo(ctx context.Context, req mcp.CallToolReq
 		return ""
 	}
 
-	for _, e := range s.graph.AllEdges() {
+	for e := range edgesByKinds(s.graph,
+		graph.EdgeCrossRepoCalls,
+		graph.EdgeCrossRepoImplements,
+		graph.EdgeCrossRepoExtends,
+	) {
 		base, ok := graph.BaseKindForCrossRepo(e.Kind)
 		if !ok {
 			continue
@@ -1262,6 +1262,41 @@ func (s *Server) handleAnalyzeCrossRepo(ctx context.Context, req mcp.CallToolReq
 // shared helpers
 // ---------------------------------------------------------------------------
 
+// edgesByKinds streams every edge whose Kind is in the supplied set
+// using the EdgesByKindsScanner capability when the backend
+// implements it (one round-trip with a `kind IN (…)` filter), or
+// falls back to per-kind EdgesByKind iteration otherwise.
+//
+// The edge-driven analyzers below use it instead of `for _, e := range
+// s.graph.AllEdges() { switch e.Kind … }` so the disk backends stop
+// materialising the full edge table over cgo for a handful of kinds.
+// Pass each kind as a separate argument — kinds typed inline as a
+// variadic so call sites read as `edgesByKinds(g, EdgeEmits,
+// EdgeListensOn)` rather than constructing a slice each time.
+//
+// Empty kinds yields nothing — matches both the capability contract
+// and the original semantics (no kinds requested means no rows).
+func edgesByKinds(g graph.Store, kinds ...graph.EdgeKind) iter.Seq[*graph.Edge] {
+	if len(kinds) == 0 {
+		return func(yield func(*graph.Edge) bool) {}
+	}
+	if scanner, ok := g.(graph.EdgesByKindsScanner); ok {
+		return scanner.EdgesByKinds(kinds)
+	}
+	return func(yield func(*graph.Edge) bool) {
+		for _, k := range kinds {
+			if k == "" {
+				continue
+			}
+			for e := range g.EdgesByKind(k) {
+				if !yield(e) {
+					return
+				}
+			}
+		}
+	}
+}
+
 // appendUnique returns dst with v added if not already present.
 // Used by every analyzer above to dedupe the From-side caller list
 // without falling back to a map (the lists are small per row, so a
@@ -1270,10 +1305,8 @@ func appendUnique(dst []string, v string) []string {
 	if v == "" {
 		return dst
 	}
-	for _, x := range dst {
-		if x == v {
-			return dst
-		}
+	if slices.Contains(dst, v) {
+		return dst
 	}
 	return append(dst, v)
 }

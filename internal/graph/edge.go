@@ -3,7 +3,18 @@ package graph
 type EdgeKind string
 
 const (
-	EdgeImports      EdgeKind = "imports"
+	EdgeImports EdgeKind = "imports"
+	// EdgeContains links a file node to its non-symbol children — import
+	// nodes today, and a natural home for future side-band kinds
+	// (todos, fixtures) that "belong to" a file without being defined
+	// by it. EdgeDefines is the wrong fit for these because the file
+	// does not semantically *define* an import; it *contains* the
+	// import statement. Splitting the kinds lets walkers that want
+	// "real definitions" follow EdgeDefines and walkers that want the
+	// full file neighbourhood union both. The disk-backed
+	// GetFileSubGraph relies on this union to fetch every file
+	// neighbour in one pass.
+	EdgeContains     EdgeKind = "contains"
 	EdgeDefines      EdgeKind = "defines"
 	EdgeCalls        EdgeKind = "calls"
 	EdgeInstantiates EdgeKind = "instantiates"
@@ -228,9 +239,17 @@ const (
 	// dataflow without materialising a graph node per local variable,
 	// edges target a synthetic ID of the form:
 	//
-	//   <ownerID>#local:<name>@<line>
+	//   <ownerID>#local:<name>@+<offsetFromOwnerStartLine>
 	//
-	// where ownerID is the enclosing function/method/closure node.
+	// where ownerID is the enclosing function/method/closure node
+	// and the offset is the local's 1-based line minus the owner's
+	// declaration line (leading `+` flags the value as a relative
+	// offset). The offset-based ID keeps locals stable across edits
+	// that shift the function as a whole — only edits inside the
+	// function above a binding shift that binding's ID. Each ID is
+	// also materialised as a KindLocal node linked to the owner
+	// via EdgeMemberOf; the search index excludes KindLocal so
+	// these per-binding nodes don't pollute name lookups.
 	// These IDs are valid edge endpoints — BFS traverses them — but
 	// no graph node is created, keeping search results free of
 	// every transient binding in every function body.
@@ -472,6 +491,15 @@ func BaseKindForCrossRepo(cr EdgeKind) (EdgeKind, bool) {
 	return "", false
 }
 
+// BaseKindsForCrossRepo returns the set of base edge kinds that have a
+// parallel cross_repo_* variant. The slice is the single source of
+// truth for callers (DetectCrossRepoEdges, the CrossRepoCandidates
+// storage capability) that need the kind list without iterating
+// CrossRepoKindFor over every edge.
+func BaseKindsForCrossRepo() []EdgeKind {
+	return []EdgeKind{EdgeCalls, EdgeImplements, EdgeExtends}
+}
+
 type Edge struct {
 	From     string   `json:"from"`
 	To       string   `json:"to"`
@@ -605,7 +633,7 @@ func DefaultOriginFor(kind EdgeKind, confidence float64, semanticSource string) 
 	}
 	// Structural AST edges are unambiguous by construction.
 	switch kind {
-	case EdgeDefines, EdgeImports, EdgeExtends, EdgeMemberOf,
+	case EdgeDefines, EdgeImports, EdgeContains, EdgeExtends, EdgeMemberOf,
 		EdgeImplements, EdgeProvides, EdgeConsumes, EdgeMatches,
 		// Coverage structural edges: the extractor produces an
 		// unambiguous source→target binding for each, so they share
@@ -656,7 +684,7 @@ func DefaultOriginFor(kind EdgeKind, confidence float64, semanticSource string) 
 func ConfidenceLabelFor(kind EdgeKind, confidence float64) string {
 	// Structural edges from AST are always extracted.
 	switch kind {
-	case EdgeDefines, EdgeImports, EdgeExtends, EdgeMemberOf, EdgeImplements,
+	case EdgeDefines, EdgeImports, EdgeContains, EdgeExtends, EdgeMemberOf, EdgeImplements,
 		EdgeProvides, EdgeConsumes, EdgeMatches,
 		EdgeParamOf, EdgeAliases, EdgeComposes, EdgeOverrides, EdgeLicensedAs,
 		EdgeOwns, EdgeAuthored, EdgeGeneratedBy, EdgeDependsOnModule,

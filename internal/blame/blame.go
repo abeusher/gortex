@@ -46,13 +46,27 @@ type Author struct {
 	Timestamp time.Time // author-time
 }
 
-// Run executes `git blame -p` on the file and returns a map from
-// 1-based line number to Author. errors include both git invocation
-// failures (file not in repo, repo not initialised) and parse
-// failures. Callers may treat any error as "skip this file" — the
-// enrichment pass is best-effort.
+// Run executes `git blame -p` on the file at the current worktree
+// (HEAD) and returns a map from 1-based line number to Author. errors
+// include both git invocation failures (file not in repo, repo not
+// initialised) and parse failures. Callers may treat any error as
+// "skip this file" — the enrichment pass is best-effort.
 func Run(repoRoot, relPath string) (map[int]Author, error) {
-	cmd := exec.Command("git", "-C", repoRoot, "blame", "-p", "--", relPath)
+	return RunAt(repoRoot, "", relPath)
+}
+
+// RunAt is Run with an explicit revision (branch / tag / SHA). Pass
+// "" for HEAD. Used by enrichments that must blame the default branch
+// regardless of the user's current checkout — e.g. the churn enricher
+// pinning to `origin/main` so feature-branch work-in-progress doesn't
+// pollute the persisted data.
+func RunAt(repoRoot, rev, relPath string) (map[int]Author, error) {
+	args := []string{"-C", repoRoot, "blame", "-p"}
+	if rev != "" {
+		args = append(args, rev)
+	}
+	args = append(args, "--", relPath)
+	cmd := exec.Command("git", args...)
 	out, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("git blame %s: %w", relPath, err)
@@ -189,7 +203,7 @@ func PersonNodeID(email string) string {
 	return "team::" + strings.ToLower(strings.TrimSpace(email))
 }
 
-func EnrichGraph(g *graph.Graph, repoRoot string) (int, error) {
+func EnrichGraph(g graph.Store, repoRoot string) (int, error) {
 	if g == nil || repoRoot == "" {
 		return 0, nil
 	}
@@ -212,6 +226,20 @@ func EnrichGraph(g *graph.Graph, repoRoot string) (int, error) {
 	}
 
 	enriched := 0
+	// Symbol nodes we stamp meta.last_authored on. They must be
+	// round-tripped back through the store at the end: on the in-memory
+	// backend the in-place mutation already persists (n is canonical),
+	// but on disk backends (SQLite) n is a per-call AllNodes
+	// reconstruction, so without the write-back the last_authored stamp
+	// is silently discarded — leaving stale_code / ownership /
+	// health_score's recency axis empty on the disk backend even after
+	// a successful `gortex enrich blame`. (The person nodes and
+	// EdgeAuthored edges below already persist via AddNode/AddEdge; only
+	// the symbol-node Meta was being dropped.) Mirrors the reach index,
+	// coverage, and releases enrichers.
+	var stamped []*graph.Node
+	blameWriter, useBlameSidecar := g.(graph.BlameEnrichmentWriter)
+	var blameRows []graph.BlameEnrichment
 	// Person nodes are deduplicated within this enrichment pass.
 	// IDs are repo-scoped: in multi-repo mode the same email touching
 	// two repos becomes two distinct KindTeam nodes so per-repo
@@ -227,13 +255,22 @@ func EnrichGraph(g *graph.Graph, repoRoot string) (int, error) {
 			if latest == nil {
 				continue
 			}
-			if n.Meta == nil {
-				n.Meta = map[string]any{}
-			}
-			n.Meta["last_authored"] = map[string]any{
-				"commit":    latest.Commit,
-				"email":     latest.Email,
-				"timestamp": latest.Timestamp.Unix(),
+			if useBlameSidecar {
+				blameRows = append(blameRows, graph.BlameEnrichment{
+					NodeID: n.ID, RepoPrefix: n.RepoPrefix,
+					Commit: latest.Commit, Email: latest.Email,
+					Timestamp: latest.Timestamp.Unix(),
+				})
+			} else {
+				if n.Meta == nil {
+					n.Meta = map[string]any{}
+				}
+				n.Meta["last_authored"] = map[string]any{
+					"commit":    latest.Commit,
+					"email":     latest.Email,
+					"timestamp": latest.Timestamp.Unix(),
+				}
+				stamped = append(stamped, n)
 			}
 			enriched++
 
@@ -276,6 +313,22 @@ func EnrichGraph(g *graph.Graph, repoRoot string) (int, error) {
 			}
 			g.AddEdge(edge)
 		}
+	}
+	// Persist the symbol-node last_authored stamps in one batch (the
+	// durable write on disk backends; an idempotent re-insert on the
+	// in-memory backend).
+	if useBlameSidecar && len(blameRows) > 0 {
+		byPrefix := map[string][]graph.BlameEnrichment{}
+		for _, r := range blameRows {
+			byPrefix[r.RepoPrefix] = append(byPrefix[r.RepoPrefix], r)
+		}
+		for prefix, rr := range byPrefix {
+			if err := blameWriter.BulkSetBlame(prefix, rr); err != nil {
+				return enriched, fmt.Errorf("blame: persist sidecar: %w", err)
+			}
+		}
+	} else if len(stamped) > 0 {
+		g.AddBatch(stamped, nil)
 	}
 	return enriched, nil
 }

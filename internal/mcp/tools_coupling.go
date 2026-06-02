@@ -14,9 +14,9 @@ import (
 // classic Robert C. Martin metrics computed per package or
 // community.
 //
-//   Ca (afferent coupling)  — how many external units depend on us
-//   Ce (efferent coupling)  — how many external units we depend on
-//   I  (instability)        — Ce / (Ca + Ce). 0 = max stable, 1 = max unstable
+//	Ca (afferent coupling)  — how many external units depend on us
+//	Ce (efferent coupling)  — how many external units we depend on
+//	I  (instability)        — Ce / (Ca + Ce). 0 = max stable, 1 = max unstable
 //
 // The painful packages are the ones with **high Ca + high I** —
 // load-bearing and changing all the time. The tool returns rows
@@ -97,25 +97,45 @@ func (s *Server) handleGetCouplingMetrics(ctx context.Context, req mcp.CallToolR
 		stats[u] = &units{ca: map[string]bool{}, ce: map[string]bool{}}
 	}
 
-	for _, e := range s.graph.AllEdges() {
-		if !isCouplingEdge(e.Kind) {
-			continue
-		}
-		fromUnit, fromOK := nodeToUnit[e.From]
-		toUnit, toOK := nodeToUnit[e.To]
-		if !fromOK || !toOK {
-			continue
-		}
-		if fromUnit == toUnit {
-			stats[fromUnit].internal++
+	// Iterate the coupling-edge buckets directly via EdgesByKind
+	// instead of AllEdges() + a Go-side filter — the disk backend's
+	// EdgesByKind runs one indexed query per kind and ships only
+	// the matching rows. Structural edges (defines / member_of /
+	// contains-file-of-symbol) which dominate edge counts on large
+	// repos drop out before they cross the storage boundary. Order is fixed so the
+	// loop body stays trivially identical to the legacy AllEdges
+	// branch.
+	for _, k := range []graph.EdgeKind{
+		graph.EdgeCalls,
+		graph.EdgeImports,
+		graph.EdgeImplements,
+		graph.EdgeExtends,
+		graph.EdgeReferences,
+		graph.EdgeInstantiates,
+		graph.EdgeCrossRepoCalls,
+		graph.EdgeCrossRepoImplements,
+		graph.EdgeCrossRepoExtends,
+	} {
+		for e := range s.graph.EdgesByKind(k) {
+			if e == nil {
+				continue
+			}
+			fromUnit, fromOK := nodeToUnit[e.From]
+			toUnit, toOK := nodeToUnit[e.To]
+			if !fromOK || !toOK {
+				continue
+			}
+			if fromUnit == toUnit {
+				stats[fromUnit].internal++
+				stats[fromUnit].total++
+				continue
+			}
+			// Cross-unit: counts as ce for the source unit, ca for the target.
+			stats[fromUnit].ce[toUnit] = true
 			stats[fromUnit].total++
-			continue
+			stats[toUnit].ca[fromUnit] = true
+			stats[toUnit].total++
 		}
-		// Cross-unit: counts as ce for the source unit, ca for the target.
-		stats[fromUnit].ce[toUnit] = true
-		stats[fromUnit].total++
-		stats[toUnit].ca[fromUnit] = true
-		stats[toUnit].total++
 	}
 
 	rows := make([]couplingRow, 0, len(stats))
@@ -178,11 +198,11 @@ func (s *Server) handleGetCouplingMetrics(ctx context.Context, req mcp.CallToolR
 	}
 
 	return s.respondJSONOrTOON(ctx, req, map[string]any{
-		"units":       rows,
-		"total":       len(rows),
-		"truncated":   truncated,
-		"unit_kind":   unitKind,
-		"sort_by":     sortBy,
+		"units":     rows,
+		"total":     len(rows),
+		"truncated": truncated,
+		"unit_kind": unitKind,
+		"sort_by":   sortBy,
 	})
 }
 
@@ -211,23 +231,4 @@ func packageOfPath(path string, depth int) string {
 		return strings.Join(parts, "/")
 	}
 	return strings.Join(parts[:depth], "/")
-}
-
-// isCouplingEdge identifies edges that signal real dependency
-// — calls, imports, implements, extends, references, instantiates.
-// Structural edges (defines, member_of) don't count.
-func isCouplingEdge(k graph.EdgeKind) bool {
-	switch k {
-	case graph.EdgeCalls,
-		graph.EdgeImports,
-		graph.EdgeImplements,
-		graph.EdgeExtends,
-		graph.EdgeReferences,
-		graph.EdgeInstantiates,
-		graph.EdgeCrossRepoCalls,
-		graph.EdgeCrossRepoImplements,
-		graph.EdgeCrossRepoExtends:
-		return true
-	}
-	return false
 }

@@ -15,7 +15,7 @@ import (
 // Resolution order (highest priority first):
 //
 //  1. RepoEntry.Workspace — user-level override in
-//     `~/.config/gortex/config.yaml`. Lets users pin OSS / read-only
+//     `~/.gortex/config.yaml`. Lets users pin OSS / read-only
 //     repos to a workspace without leaving a `.gortex.yaml` artifact
 //     in the repo itself, and lets users override a workspace the
 //     repo author chose (the OSS author's slug shouldn't pollute the
@@ -278,6 +278,7 @@ func (mi *MultiIndexer) RunGlobalResolve() {
 		return
 	}
 	cr := resolver.NewCrossRepo(mi.graph)
+	cr.SetLogger(mi.logger)
 	cr.SetCrossWorkspaceDepLookup(mi.crossWorkspaceLookup())
 	cr.SetNpmAliasResolver(mi.npmAliasResolver())
 	cr.SetWorkspaceMembership(mi.workspaceMembershipResolver())

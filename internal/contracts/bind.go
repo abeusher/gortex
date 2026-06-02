@@ -31,7 +31,7 @@ import (
 //  4. Tiebreak: prefer candidates in files that mention a registration
 //     call like `pb.Register{Service}Server(` or `r.{HTTPVerb}(`.
 //  5. Uniquely bind or skip (never guess among multiple).
-func BindProviderSymbols(reg *Registry, g *graph.Graph) int {
+func BindProviderSymbols(reg *Registry, g graph.Store) int {
 	if reg == nil || g == nil {
 		return 0
 	}
@@ -83,7 +83,7 @@ func BindProviderSymbols(reg *Registry, g *graph.Graph) int {
 //     `Register{Service}Server(` call.
 //  4. Same method name, any receiver — only if there's exactly one
 //     candidate in the repo.
-func bindGRPCProvider(c Contract, g *graph.Graph) string {
+func bindGRPCProvider(c Contract, g graph.Store) string {
 	method, _ := c.Meta["method"].(string)
 	service, _ := c.Meta["service"].(string)
 	if method == "" || service == "" {
@@ -123,7 +123,7 @@ func bindGRPCProvider(c Contract, g *graph.Graph) string {
 // widely, this is lower-confidence than gRPC binding; a stricter
 // implementation would also check the Gin/Echo route registration
 // file, but v1 just name-matches. Returns "" if no unambiguous bind.
-func bindOpenAPIProvider(c Contract, g *graph.Graph) string {
+func bindOpenAPIProvider(c Contract, g graph.Store) string {
 	op, _ := c.Meta["operationId"].(string)
 	if op == "" {
 		// Fall back to the last path segment; OpenAPI specs

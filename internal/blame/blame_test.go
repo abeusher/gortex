@@ -156,19 +156,26 @@ func TestEnrichGraph_StampsLastAuthored(t *testing.T) {
 		t.Errorf("expected 1 enriched node, got %d", count)
 	}
 
-	n := g.GetNode("main.go::Hello")
-	la, ok := n.Meta["last_authored"].(map[string]any)
+	// last_authored now persists in the typed sidecar (change A), not Meta.
+	byID := map[string]graph.BlameEnrichment{}
+	for _, e := range g.BlameRows("") {
+		byID[e.NodeID] = e
+	}
+	la, ok := byID["main.go::Hello"]
 	if !ok {
-		t.Fatalf("last_authored missing or wrong shape: %+v", n.Meta)
+		t.Fatalf("blame row for main.go::Hello missing from sidecar; rows=%+v", byID)
 	}
-	if la["email"] != "test@example.com" {
-		t.Errorf("email = %v", la["email"])
+	if la.Email != "test@example.com" {
+		t.Errorf("email = %v", la.Email)
 	}
-	if _, ok := la["commit"].(string); !ok {
-		t.Errorf("commit not a string: %v", la["commit"])
+	if la.Commit == "" {
+		t.Errorf("commit empty")
 	}
-	if _, ok := la["timestamp"].(int64); !ok {
-		t.Errorf("timestamp not int64: %T %v", la["timestamp"], la["timestamp"])
+	if la.Timestamp == 0 {
+		t.Errorf("timestamp zero")
+	}
+	if _, present := g.GetNode("main.go::Hello").Meta["last_authored"]; present {
+		t.Errorf("last_authored must not remain in Node.Meta after sidecar migration")
 	}
 }
 

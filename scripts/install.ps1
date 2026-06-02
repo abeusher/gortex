@@ -4,7 +4,8 @@
 
 .DESCRIPTION
     Downloads the signed Windows release archive, verifies its SHA-256
-    checksum, installs the binary, and puts it on the user PATH.
+    checksum, installs the self-contained gortex.exe, and puts the install
+    directory on the user PATH.
 
     Usage:
         irm https://get.gortex.dev/install.ps1 | iex
@@ -127,8 +128,9 @@ function Main {
         }
 
         Write-Info 'extracting'
-        Expand-Archive -Path $zipPath -DestinationPath $tmp -Force
-        $extracted = Join-Path $tmp $BinName
+        $staging = Join-Path $tmp 'extract'
+        Expand-Archive -Path $zipPath -DestinationPath $staging -Force
+        $extracted = Join-Path $staging $BinName
         if (-not (Test-Path $extracted)) {
             Die "archive did not contain a $BinName binary"
         }
@@ -140,7 +142,10 @@ function Main {
             Write-Info "backing up existing binary to $backup"
             Move-Item -Path $target -Destination $backup -Force
         }
-        Move-Item -Path $extracted -Destination $target -Force
+        # gortex.exe is a single self-contained binary — the mingw C/C++
+        # runtime is statically linked into it — so install is a one-file
+        # copy with nothing else to place beside it.
+        Copy-Item -Path $extracted -Destination $target -Force
         Write-Ok "installed $target"
 
         if (-not $env:GORTEX_NO_PATH) {

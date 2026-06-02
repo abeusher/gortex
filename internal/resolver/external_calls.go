@@ -67,7 +67,7 @@ const externalCallPrefix = "external-call::"
 // the external hop visible. Enabled is the opt-in gate
 // (`.gortex.yaml::index::synthesize_external_calls`); when false the
 // pass is a no-op and the graph is untouched.
-func SynthesizeExternalCalls(g *graph.Graph, enabled bool) int {
+func SynthesizeExternalCalls(g graph.Store, enabled bool) int {
 	if g == nil || !enabled {
 		return 0
 	}
@@ -81,8 +81,20 @@ func SynthesizeExternalCalls(g *graph.Graph, enabled bool) int {
 	defer mu.Unlock()
 
 	synthesized := 0
-	for _, e := range g.AllEdges() {
-		if e == nil || !isCallLikeEdge(e.Kind) {
+	var reindexBatch []graph.EdgeReindex
+	// First sweep: collect every candidate edge and the From IDs we'll
+	// need to read Language off. Narrow to the call-like edge kinds
+	// server-side via EdgesByKinds — AllEdges scanned the whole bucket
+	// just to filter Kind Go-side.
+	type candidate struct {
+		edge                  *graph.Edge
+		ecosystem, importPath string
+	}
+	var candidates []candidate
+	fromIDSet := map[string]struct{}{}
+	callKinds := []graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences}
+	for e := range edgesByKinds(g, callKinds) {
+		if e == nil {
 			continue
 		}
 		// Already pointing at a synthetic node — a prior run of this
@@ -97,17 +109,35 @@ func SynthesizeExternalCalls(g *graph.Graph, enabled bool) int {
 		if !ok {
 			continue
 		}
-		callerLang := edgeCallerLanguage(g, e)
-		if isLanguageStdlib(callerLang, importPath) {
+		candidates = append(candidates, candidate{edge: e, ecosystem: ecosystem, importPath: importPath})
+		if e.From != "" {
+			fromIDSet[e.From] = struct{}{}
+		}
+	}
+	fromList := make([]string, 0, len(fromIDSet))
+	for id := range fromIDSet {
+		fromList = append(fromList, id)
+	}
+	callerNodes := g.GetNodesByIDs(fromList)
+
+	for _, c := range candidates {
+		e := c.edge
+		callerLang := ""
+		if from := callerNodes[e.From]; from != nil && from.Language != "" {
+			callerLang = from.Language
+		} else {
+			callerLang = langFamilyFromExt(e.FilePath)
+		}
+		if isLanguageStdlib(callerLang, c.importPath) {
 			// Language built-in / standard library — noise. Leave the
 			// edge on its bookkeeping-string terminal; a stdlib hop is
 			// not a cross-system call worth a call-chain node.
 			continue
 		}
 
-		nodeID := externalCallNodeID(ecosystem, importPath)
+		nodeID := externalCallNodeID(c.ecosystem, c.importPath)
 		if g.GetNode(nodeID) == nil {
-			g.AddNode(newExternalCallNode(nodeID, ecosystem, importPath, callerLang))
+			g.AddNode(newExternalCallNode(nodeID, c.ecosystem, c.importPath, callerLang))
 		}
 
 		oldTo := e.To
@@ -124,8 +154,11 @@ func SynthesizeExternalCalls(g *graph.Graph, enabled bool) int {
 			e.Meta = map[string]any{}
 		}
 		e.Meta["external_call"] = true
-		g.ReindexEdge(e, oldTo)
+		reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: e, OldTo: oldTo})
 		synthesized++
+	}
+	if len(reindexBatch) > 0 {
+		g.ReindexEdges(reindexBatch)
 	}
 	return synthesized
 }
@@ -155,8 +188,11 @@ func parseExternalCallTarget(target string) (ecosystem, importPath string, ok bo
 			return "", "", false
 		}
 		return "dep", path, true
-	case strings.HasPrefix(target, "stdlib::"):
-		path := importPathOfExtern(strings.TrimPrefix(target, "stdlib::"))
+	case graph.IsStdlibStub(target):
+		// Handles both legacy `stdlib::<path>::<sym>` and the
+		// per-repo-prefixed `<repo>::stdlib::<path>::<sym>` shape
+		// (see internal/graph/stub.go).
+		path := importPathOfExtern(graph.StubRest(target))
 		if path == "" {
 			return "", "", false
 		}
@@ -216,16 +252,6 @@ func newExternalCallNode(nodeID, ecosystem, importPath, callerLang string) *grap
 			"ecosystem":     ecosystem,
 		},
 	}
-}
-
-// edgeCallerLanguage returns the source language of the node that owns
-// the call edge's From end, falling back to the file extension of the
-// edge's own FilePath when the caller node carries no Language.
-func edgeCallerLanguage(g *graph.Graph, e *graph.Edge) string {
-	if from := g.GetNode(e.From); from != nil && from.Language != "" {
-		return from.Language
-	}
-	return langFamilyFromExt(e.FilePath)
 }
 
 // langFamilyFromExt maps a file extension to the coarse language label

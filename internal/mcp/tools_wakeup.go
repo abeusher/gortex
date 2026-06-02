@@ -41,6 +41,13 @@ type WakeupOptions struct {
 	TopCommunities int
 	TopHotspots    int
 	TopEntryPoints int
+	// PrecomputedHotspots, when non-nil, is the default-threshold
+	// hotspot ranking the caller has already paid for. Threaded by
+	// the MCP handler from the server-wide cache so the wakeup turn
+	// skips a redundant FindHotspots (and its ComputeBetweenness
+	// pass). nil means BuildWakeup computes it fresh — the CLI
+	// `gortex wakeup` path.
+	PrecomputedHotspots []analysis.HotspotEntry
 }
 
 // DefaultWakeupOptions returns the defaults the MCP handler uses.
@@ -58,7 +65,7 @@ func DefaultWakeupOptions() WakeupOptions {
 // communities. Returns the markdown body and an approximate token
 // count (bytes / 4). Exposed so CLI and MCP paths share one
 // implementation.
-func BuildWakeup(g *graph.Graph, communities *analysis.CommunityResult, opts WakeupOptions) (markdown string, tokensEst int) {
+func BuildWakeup(g graph.Store, communities *analysis.CommunityResult, opts WakeupOptions) (markdown string, tokensEst int) {
 	if opts.MaxTokens <= 0 {
 		opts.MaxTokens = 500
 	}
@@ -72,16 +79,23 @@ func BuildWakeup(g *graph.Graph, communities *analysis.CommunityResult, opts Wak
 		opts.TopEntryPoints = 5
 	}
 
-	nodes := g.AllNodes()
+	// Wakeup is a whole-repo digest — language tally + hotspot list +
+	// entry-point list, with no session scoping. The lang count can
+	// come from Stats() (one indexed groupby on disk backends);
+	// hotspots and entry points already iterate the function/method
+	// subset via the analyzers / NodesByKindsScanner path, so the
+	// AllNodes() pull the legacy build used to feed the lang summary
+	// just adds a redundant 107k-row trip on a disk backend.
+	stats := g.Stats()
 	var b strings.Builder
 	b.WriteString("# Codebase wakeup\n\n")
 
-	// Summary line: total nodes, top 3 languages.
 	langCounts := map[string]int{}
-	for _, n := range nodes {
-		if n.Language != "" {
-			langCounts[n.Language]++
+	for lang, c := range stats.ByLanguage {
+		if lang == "" {
+			continue
 		}
+		langCounts[lang] = c
 	}
 	type langRow struct {
 		name  string
@@ -105,8 +119,9 @@ func BuildWakeup(g *graph.Graph, communities *analysis.CommunityResult, opts Wak
 	for _, l := range topLangs {
 		langSummary = append(langSummary, fmt.Sprintf("%s (%d)", l.name, l.count))
 	}
+	fileCount := stats.ByKind[string(graph.KindFile)]
 	fmt.Fprintf(&b, "**Scale.** %d indexed symbols across %d files. Primary: %s.\n\n",
-		len(nodes), countFileNodes(nodes), strings.Join(langSummary, ", "))
+		stats.TotalNodes, fileCount, strings.Join(langSummary, ", "))
 
 	// Communities.
 	if communities != nil && len(communities.Communities) > 0 {
@@ -131,7 +146,12 @@ func BuildWakeup(g *graph.Graph, communities *analysis.CommunityResult, opts Wak
 	}
 
 	// Hotspots.
-	hotspots := analysis.FindHotspots(g, communities, 0)
+	var hotspots []analysis.HotspotEntry
+	if opts.PrecomputedHotspots != nil {
+		hotspots = opts.PrecomputedHotspots
+	} else {
+		hotspots = analysis.FindHotspots(g, communities, 0)
+	}
 	if len(hotspots) > opts.TopHotspots {
 		hotspots = hotspots[:opts.TopHotspots]
 	}
@@ -144,7 +164,7 @@ func BuildWakeup(g *graph.Graph, communities *analysis.CommunityResult, opts Wak
 	}
 
 	// Entry points.
-	entries := wakeupEntryPoints(nodes, g, opts.TopEntryPoints)
+	entries := wakeupEntryPoints(g, opts.TopEntryPoints)
 	if len(entries) > 0 {
 		b.WriteString("**Entry points.**\n")
 		for _, e := range entries {
@@ -158,42 +178,79 @@ func BuildWakeup(g *graph.Graph, communities *analysis.CommunityResult, opts Wak
 	return out, len(out) / 4
 }
 
-func countFileNodes(nodes []*graph.Node) int {
-	n := 0
-	for _, x := range nodes {
-		if x.Kind == graph.KindFile {
-			n++
+// wakeupEntryPoints returns functions/methods with zero incoming
+// edges and at least one outgoing edge, ranked by out-degree.
+//
+// Uses NodeDegreeAggregator when the backend implements it (one
+// batched in/out count instead of up to 3N GetInEdges/GetOutEdges
+// round-trips on a disk backend — the sort path called GetOutEdges
+// twice per candidate, the worst single hot spot in this file). We
+// stash the fan-out alongside each node so the sort never has to
+// re-query.
+func wakeupEntryPoints(g graph.Store, top int) []*graph.Node {
+	type entry struct {
+		node   *graph.Node
+		fanOut int
+	}
+	// Pull only the callable subset via NodesByKindsScanner so disk
+	// backends never materialise the whole node table for an entry-
+	// point candidate set that only ranges across function + method.
+	var pool []*graph.Node
+	if scan, ok := g.(graph.NodesByKindsScanner); ok {
+		pool = scan.NodesByKinds([]graph.NodeKind{graph.KindFunction, graph.KindMethod})
+	} else {
+		all := g.AllNodes()
+		pool = make([]*graph.Node, 0, len(all))
+		for _, n := range all {
+			if n.Kind == graph.KindFunction || n.Kind == graph.KindMethod {
+				pool = append(pool, n)
+			}
 		}
 	}
-	return n
-}
-
-func wakeupEntryPoints(nodes []*graph.Node, g *graph.Graph, top int) []*graph.Node {
-	candidates := make([]*graph.Node, 0)
-	for _, n := range nodes {
-		if n.Kind != graph.KindFunction && n.Kind != graph.KindMethod {
-			continue
+	entries := make([]entry, 0, len(pool))
+	if agg, ok := g.(graph.NodeDegreeAggregator); ok && len(pool) > 0 {
+		ids := make([]string, 0, len(pool))
+		byID := make(map[string]*graph.Node, len(pool))
+		for _, n := range pool {
+			ids = append(ids, n.ID)
+			byID[n.ID] = n
 		}
-		if len(g.GetInEdges(n.ID)) > 0 {
-			continue
+		for _, r := range agg.NodeDegreeCounts(ids, nil) {
+			if r.InCount > 0 || r.OutCount == 0 {
+				continue
+			}
+			n := byID[r.NodeID]
+			if n == nil {
+				continue
+			}
+			entries = append(entries, entry{node: n, fanOut: r.OutCount})
 		}
-		if len(g.GetOutEdges(n.ID)) == 0 {
-			continue
+	} else {
+		for _, n := range pool {
+			if len(g.GetInEdges(n.ID)) > 0 {
+				continue
+			}
+			out := len(g.GetOutEdges(n.ID))
+			if out == 0 {
+				continue
+			}
+			entries = append(entries, entry{node: n, fanOut: out})
 		}
-		candidates = append(candidates, n)
 	}
-	sort.Slice(candidates, func(i, j int) bool {
-		oi := len(g.GetOutEdges(candidates[i].ID))
-		oj := len(g.GetOutEdges(candidates[j].ID))
-		if oi != oj {
-			return oi > oj
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].fanOut != entries[j].fanOut {
+			return entries[i].fanOut > entries[j].fanOut
 		}
-		return candidates[i].ID < candidates[j].ID
+		return entries[i].node.ID < entries[j].node.ID
 	})
-	if len(candidates) > top {
-		candidates = candidates[:top]
+	if len(entries) > top {
+		entries = entries[:top]
 	}
-	return candidates
+	out := make([]*graph.Node, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, e.node)
+	}
+	return out
 }
 
 // trimToTokens caps the markdown to the requested approximate token
@@ -226,6 +283,7 @@ func (s *Server) handleGortexWakeup(ctx context.Context, req mcp.CallToolRequest
 		opts.TopEntryPoints = v
 	}
 
+	opts.PrecomputedHotspots = s.getHotspots()
 	md, est := BuildWakeup(s.graph, s.getCommunities(), opts)
 
 	format := strings.ToLower(strings.TrimSpace(req.GetString("format", "markdown")))

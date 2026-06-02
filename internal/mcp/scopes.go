@@ -1,13 +1,13 @@
 package mcp
 
 import (
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 
+	"github.com/zzet/gortex/internal/persistence"
 	"github.com/zzet/gortex/internal/platform"
 )
 
@@ -27,21 +27,22 @@ type SavedScope struct {
 	Paths []string `json:"paths,omitempty"`
 }
 
-// scopeStore is a small JSON-file-backed registry of SavedScopes. It
-// survives daemon restarts. All exported methods are safe for concurrent
-// use.
+// scopeStore is a small registry of SavedScopes backed by the SQLite
+// sidecar DB. It survives daemon restarts. Scopes are global (not
+// repo-scoped). The in-memory byName map mirrors the scopes table so
+// reads stay lock-cheap; mutations write through to the sidecar. All
+// exported methods are safe for concurrent use.
 type scopeStore struct {
-	mu     sync.Mutex
-	path   string
-	byName map[string]SavedScope
+	mu      sync.Mutex
+	sidecar *persistence.SidecarStore
+	byName  map[string]SavedScope
 }
 
-// scopesFilePath returns the on-disk location of the saved-scope store,
-// honouring GORTEX_SCOPES_PATH (used by tests) over the cache default.
-//
-// An absolute $XDG_CACHE_HOME wins; otherwise the store stays under
-// os.UserCacheDir() — the historical location, kept so an existing
-// scopes file is not orphaned.
+// scopesFilePath returns the legacy on-disk location of the saved-scope
+// store, honouring GORTEX_SCOPES_PATH (used by tests) over the cache
+// default. The sidecar DB lives next to it (<dir>/sidecar.sqlite); a
+// pre-existing scopes.json at this path is imported once, then renamed
+// to scopes.json.bak.
 func scopesFilePath() string {
 	if p := strings.TrimSpace(os.Getenv("GORTEX_SCOPES_PATH")); p != "" {
 		return p
@@ -49,46 +50,32 @@ func scopesFilePath() string {
 	return filepath.Join(platform.OSCacheDir(), "scopes.json")
 }
 
-// newScopeStore builds a store at path and loads any persisted scopes.
-func newScopeStore(path string) *scopeStore {
-	st := &scopeStore{path: path, byName: map[string]SavedScope{}}
-	st.load()
-	return st
+// newScopeStore builds a store whose sidecar DB lives next to the given
+// legacy scopes.json path. Any scopes.json present is imported once,
+// then the in-memory map is hydrated from the sidecar. A nil sidecar
+// (open failure) yields an in-memory-only store.
+func newScopeStore(legacyPath string) *scopeStore {
+	sidecarPath := persistence.DefaultSidecarPath(filepath.Dir(legacyPath))
+	sidecar, _ := persistence.OpenSidecar(sidecarPath)
+	return newScopeStoreFromSidecar(sidecar, legacyPath)
 }
 
-// load reads persisted scopes; a missing or unreadable file leaves the
-// store empty. Called only from the constructor, so it takes no lock.
-func (st *scopeStore) load() {
-	data, err := os.ReadFile(st.path)
-	if err != nil {
-		return
-	}
-	var scopes []SavedScope
-	if json.Unmarshal(data, &scopes) != nil {
-		return
-	}
-	for _, sc := range scopes {
-		if sc.Name != "" {
-			st.byName[sc.Name] = sc
+// newScopeStoreFromSidecar builds a scope store bound to an already-open
+// sidecar, importing legacyPath/scopes.json once. Used by the daemon
+// path where the sidecar is opened once and shared.
+func newScopeStoreFromSidecar(sidecar *persistence.SidecarStore, legacyPath string) *scopeStore {
+	st := &scopeStore{sidecar: sidecar, byName: map[string]SavedScope{}}
+	if sidecar != nil {
+		_ = sidecar.MigrateLegacyScopes(legacyPath)
+		if rows, err := sidecar.LoadScopes(); err == nil {
+			for _, r := range rows {
+				if r.Name != "" {
+					st.byName[r.Name] = SavedScope{Name: r.Name, Description: r.Description, Repos: r.Repos, Paths: r.Paths}
+				}
+			}
 		}
 	}
-}
-
-// save persists the store. Callers hold st.mu.
-func (st *scopeStore) save() error {
-	scopes := make([]SavedScope, 0, len(st.byName))
-	for _, sc := range st.byName {
-		scopes = append(scopes, sc)
-	}
-	sort.Slice(scopes, func(i, j int) bool { return scopes[i].Name < scopes[j].Name })
-	data, err := json.MarshalIndent(scopes, "", "  ")
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(st.path), 0o755); err != nil {
-		return err
-	}
-	return os.WriteFile(st.path, data, 0o644)
+	return st
 }
 
 func (st *scopeStore) get(name string) (SavedScope, bool) {
@@ -113,7 +100,12 @@ func (st *scopeStore) put(sc SavedScope) error {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	st.byName[sc.Name] = sc
-	return st.save()
+	if st.sidecar == nil {
+		return nil
+	}
+	return st.sidecar.UpsertScope(persistence.ScopeRow{
+		Name: sc.Name, Description: sc.Description, Repos: sc.Repos, Paths: sc.Paths,
+	})
 }
 
 func (st *scopeStore) remove(name string) (bool, error) {
@@ -123,7 +115,10 @@ func (st *scopeStore) remove(name string) (bool, error) {
 		return false, nil
 	}
 	delete(st.byName, name)
-	return true, st.save()
+	if st.sidecar == nil {
+		return true, nil
+	}
+	return true, st.sidecar.DeleteScope(name)
 }
 
 // scopeStoreOrInit lazily constructs the per-server saved-scope store.

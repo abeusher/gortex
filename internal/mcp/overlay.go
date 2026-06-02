@@ -11,6 +11,7 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 	mcpserver "github.com/mark3labs/mcp-go/server"
+	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/daemon"
 )
@@ -73,7 +74,28 @@ func (s *Server) wrapToolHandler(h mcpserver.ToolHandlerFunc) mcpserver.ToolHand
 	// Prompt-injection screening sits closest to the handler so it
 	// sees the real arguments and the real result (see sanitize.go).
 	h = s.sanitizeToolHandler(h)
-	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	return func(ctx context.Context, req mcp.CallToolRequest) (res *mcp.CallToolResult, retErr error) {
+		// Last-resort panic firewall around EVERY tool handler. A Go
+		// panic in any handler (e.g. when the store surfaces a fatal
+		// engine error) would otherwise unwind past the mcp-go server
+		// loop and crash the whole daemon — dropping every session's
+		// MCP transport, not just the offending call. Convert it to a
+		// structured tool error so the panicking tool fails in
+		// isolation and the daemon survives. This supersedes the
+		// per-handler recover that get_file_summary carried; every
+		// tool now gets the same protection.
+		defer func() {
+			if r := recover(); r != nil {
+				if s.logger != nil {
+					s.logger.Error("tool handler panic recovered",
+						zap.String("tool", req.Params.Name),
+						zap.Any("panic", r),
+						zap.Stack("stack"))
+				}
+				res = mcp.NewToolResultError(fmt.Sprintf("tool %q internal error: %v", req.Params.Name, r))
+				retErr = nil
+			}
+		}()
 		// Tolerate hallucinated / mistyped parameter names before the
 		// handler reads arguments (e.g. "symbol" accepted as "id").
 		s.reconcileToolParams(&req)

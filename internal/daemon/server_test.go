@@ -33,6 +33,12 @@ type fakeController struct {
 	searchCalls   []SearchSymbolsParams
 	searchHits    []SymbolHit
 	searchErr     error
+
+	enrichChurnCalls    []EnrichChurnParams
+	enrichReleasesCalls []EnrichReleasesParams
+	enrichBlameCalls    []EnrichBlameParams
+	enrichCoverageCalls []EnrichCoverageParams
+	enrichCochangeCalls []EnrichCochangeParams
 }
 
 func (f *fakeController) Track(_ context.Context, p TrackParams) (json.RawMessage, error) {
@@ -82,6 +88,41 @@ func (f *fakeController) SearchSymbols(_ context.Context, p SearchSymbolsParams)
 		return SearchSymbolsResult{}, f.searchErr
 	}
 	return SearchSymbolsResult{Hits: f.searchHits}, nil
+}
+
+func (f *fakeController) EnrichChurn(_ context.Context, p EnrichChurnParams) (EnrichChurnResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.enrichChurnCalls = append(f.enrichChurnCalls, p)
+	return EnrichChurnResult{Files: 1, Symbols: 2, Branch: p.Branch}, nil
+}
+
+func (f *fakeController) EnrichReleases(_ context.Context, p EnrichReleasesParams) (EnrichReleasesResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.enrichReleasesCalls = append(f.enrichReleasesCalls, p)
+	return EnrichReleasesResult{Files: 3, Branch: p.Branch}, nil
+}
+
+func (f *fakeController) EnrichBlame(_ context.Context, p EnrichBlameParams) (EnrichBlameResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.enrichBlameCalls = append(f.enrichBlameCalls, p)
+	return EnrichBlameResult{Nodes: 5}, nil
+}
+
+func (f *fakeController) EnrichCoverage(_ context.Context, p EnrichCoverageParams) (EnrichCoverageResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.enrichCoverageCalls = append(f.enrichCoverageCalls, p)
+	return EnrichCoverageResult{Symbols: 7, Segments: len(p.Segments)}, nil
+}
+
+func (f *fakeController) EnrichCochange(_ context.Context, p EnrichCochangeParams) (EnrichCochangeResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.enrichCochangeCalls = append(f.enrichCochangeCalls, p)
+	return EnrichCochangeResult{Edges: 11}, nil
 }
 
 // newDaemon spins up a Server on a short socket path + Fake controller.
@@ -160,6 +201,80 @@ func TestDaemon_ControlTrackUntrack(t *testing.T) {
 	assert.Equal(t, "/tmp/myapp", ctrl.trackCalls[0].Path)
 	require.Len(t, ctrl.untrackCalls, 1)
 	assert.Equal(t, "myapp", ctrl.untrackCalls[0].PathOrPrefix)
+}
+
+// TestDaemon_ControlEnrichDispatch exercises the control dispatch for
+// every enrich verb — confirming each routes to the matching Controller
+// method, round-trips its Params, and decodes the typed Result. This is
+// the contract the `gortex enrich` CLI relies on when it forwards to a
+// running daemon.
+func TestDaemon_ControlEnrichDispatch(t *testing.T) {
+	ctrl := &fakeController{}
+	_, socket := newDaemon(t, ctrl)
+
+	c, err := DialTo(socket, Handshake{Mode: ModeControl, ClientName: "cli"})
+	require.NoError(t, err)
+	defer func() { _ = c.Close() }()
+
+	// churn
+	churnResp, err := c.Control(ControlEnrichChurn, EnrichChurnParams{Path: "/r", Branch: "main"})
+	require.NoError(t, err)
+	require.True(t, churnResp.OK, "churn: %+v", churnResp)
+	var churnOut EnrichChurnResult
+	require.NoError(t, json.Unmarshal(churnResp.Result, &churnOut))
+	assert.Equal(t, 1, churnOut.Files)
+	assert.Equal(t, 2, churnOut.Symbols)
+	assert.Equal(t, "main", churnOut.Branch)
+
+	// releases
+	relResp, err := c.Control(ControlEnrichReleases, EnrichReleasesParams{Path: "/r", Branch: "main"})
+	require.NoError(t, err)
+	require.True(t, relResp.OK, "releases: %+v", relResp)
+	var relOut EnrichReleasesResult
+	require.NoError(t, json.Unmarshal(relResp.Result, &relOut))
+	assert.Equal(t, 3, relOut.Files)
+
+	// blame
+	blameResp, err := c.Control(ControlEnrichBlame, EnrichBlameParams{Path: "/r"})
+	require.NoError(t, err)
+	require.True(t, blameResp.OK, "blame: %+v", blameResp)
+	var blameOut EnrichBlameResult
+	require.NoError(t, json.Unmarshal(blameResp.Result, &blameOut))
+	assert.Equal(t, 5, blameOut.Nodes)
+
+	// coverage
+	covResp, err := c.Control(ControlEnrichCoverage, EnrichCoverageParams{
+		Path: "/r",
+		Segments: []EnrichCoverageSegment{
+			{File: "a.go", StartLine: 1, EndLine: 3, NumStmt: 2, Count: 1},
+			{File: "a.go", StartLine: 4, EndLine: 6, NumStmt: 1, Count: 0},
+		},
+	})
+	require.NoError(t, err)
+	require.True(t, covResp.OK, "coverage: %+v", covResp)
+	var covOut EnrichCoverageResult
+	require.NoError(t, json.Unmarshal(covResp.Result, &covOut))
+	assert.Equal(t, 7, covOut.Symbols)
+	assert.Equal(t, 2, covOut.Segments)
+
+	// cochange
+	coResp, err := c.Control(ControlEnrichCochange, EnrichCochangeParams{Path: "/r"})
+	require.NoError(t, err)
+	require.True(t, coResp.OK, "cochange: %+v", coResp)
+	var coOut EnrichCochangeResult
+	require.NoError(t, json.Unmarshal(coResp.Result, &coOut))
+	assert.Equal(t, 11, coOut.Edges)
+
+	ctrl.mu.Lock()
+	defer ctrl.mu.Unlock()
+	require.Len(t, ctrl.enrichChurnCalls, 1)
+	assert.Equal(t, "/r", ctrl.enrichChurnCalls[0].Path)
+	require.Len(t, ctrl.enrichReleasesCalls, 1)
+	require.Len(t, ctrl.enrichBlameCalls, 1)
+	assert.Equal(t, "/r", ctrl.enrichBlameCalls[0].Path)
+	require.Len(t, ctrl.enrichCoverageCalls, 1)
+	assert.Len(t, ctrl.enrichCoverageCalls[0].Segments, 2)
+	require.Len(t, ctrl.enrichCochangeCalls, 1)
 }
 
 func TestDaemon_ProtocolMismatchRejected(t *testing.T) {

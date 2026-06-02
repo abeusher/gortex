@@ -3,6 +3,7 @@ package analysis
 import (
 	"math"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"unicode"
@@ -21,14 +22,14 @@ type DeadCodeEntry struct {
 
 // HotspotEntry represents a symbol with disproportionately high complexity metrics.
 type HotspotEntry struct {
-	ID                 string  `json:"id"`
-	Name               string  `json:"name"`
-	Kind               string  `json:"kind"`
-	FilePath           string  `json:"file_path"`
-	Line               int     `json:"start_line"`
-	FanIn              int     `json:"fan_in"`
-	FanOut             int     `json:"fan_out"`
-	CommunityCrossings int     `json:"community_crossings"`
+	ID                 string `json:"id"`
+	Name               string `json:"name"`
+	Kind               string `json:"kind"`
+	FilePath           string `json:"file_path"`
+	Line               int    `json:"start_line"`
+	FanIn              int    `json:"fan_in"`
+	FanOut             int    `json:"fan_out"`
+	CommunityCrossings int    `json:"community_crossings"`
 	// Betweenness is the node's betweenness-centrality score
 	// normalized to 0-100 — how often it sits on a shortest path
 	// between other symbols. A bottleneck the call graph routes
@@ -210,23 +211,48 @@ func isEntryPointNode(n *graph.Node) bool {
 	return v
 }
 
+// candidateNodeKinds enumerates the node kinds FindDeadCode is willing
+// to flag (modulo the opt-in switches for fields / variables /
+// constants). Used both for the per-kind allowlist handed to the
+// DeadCodeCandidator capability and as the source of truth for the
+// Go-fallback loop. Kept in lockstep with neverDeadCodeKinds: a kind
+// MUST appear in exactly one of the two lists.
+var candidateNodeKinds = []graph.NodeKind{
+	graph.KindFunction,
+	graph.KindMethod,
+	graph.KindType,
+	graph.KindInterface,
+	graph.KindField,
+	graph.KindVariable,
+	graph.KindConstant,
+}
+
 // FindDeadCode returns all symbols with zero incoming calls or references,
 // excluding entry points, test functions, exported symbols, and user-excluded patterns.
 // By default, variables are excluded (see FindDeadCodeOptions for rationale).
-func FindDeadCode(g *graph.Graph, processes *ProcessResult, excludePatterns []string, opts ...FindDeadCodeOptions) []DeadCodeEntry {
+func FindDeadCode(g graph.Store, processes *ProcessResult, excludePatterns []string, opts ...FindDeadCodeOptions) []DeadCodeEntry {
 	var opt FindDeadCodeOptions
 	if len(opts) > 0 {
 		opt = opts[0]
 	}
 
-	nodes := g.AllNodes()
-	allEdges := g.AllEdges()
-
 	// Build set of interface-required method names per type.
 	// If a type implements an interface, all methods that the interface
 	// requires are alive even if never called directly (they satisfy the
 	// contract).  We index: typeID → set of required method names.
-	ifaceRequiredMethods := buildIfaceRequiredMethods(g, nodes, allEdges)
+	// Backends that implement graph.IfaceImplementsScanner serve this
+	// from one join; the fallback walks NodesByKind + EdgesByKind
+	// just like before.
+	ifaceRequiredMethods := buildIfaceRequiredMethods(g)
+
+	// Pick the candidate-set source. When the backend implements
+	// DeadCodeCandidator, the "no incoming usage edge" filter runs
+	// inside the store and only the surviving ~hundreds of true
+	// candidates are materialized — see graph.DeadCodeCandidator's
+	// doc-comment for the 1.3M-row-vs-hundreds rationale. Otherwise
+	// the legacy AllNodes + GetInEdgesByNodeIDs fallback runs,
+	// identical to the pre-capability path.
+	candidates, incomingByID := collectDeadCodeCandidates(g, opt)
 
 	// Build set of entry point node IDs from processes
 	entryPoints := make(map[string]bool)
@@ -242,20 +268,43 @@ func FindDeadCode(g *graph.Graph, processes *ProcessResult, excludePatterns []st
 
 	// Files holding a framework entry point (Alembic migrations,
 	// Next.js pages, ASP.NET host files) — every symbol inside is
-	// reachable from a runtime, not application-dead.
+	// reachable from a runtime, not application-dead. Computed via
+	// NodesByKind(KindFile) so on disk backends we don't have to
+	// materialise AllNodes() just to find the entry-point files.
 	entryPointFiles := make(map[string]bool)
-	for _, n := range nodes {
-		if n.Kind == graph.KindFile && isEntryPointNode(n) {
+	for n := range g.NodesByKind(graph.KindFile) {
+		if n != nil && isEntryPointNode(n) {
 			entryPointFiles[n.FilePath] = true
 		}
 	}
 
 	var result []DeadCodeEntry
-	for _, n := range nodes {
+	for _, n := range candidates {
 		// Skip kinds the analyzer never reports — structural,
 		// extracted metadata, infra, function-shape, and value-only
 		// nodes. See neverDeadCodeKinds for the full list and why.
+		// (The server-side candidator only ships nodes whose kind is
+		// in candidateNodeKinds, but the Go fallback path scans
+		// AllNodes so we keep the explicit gate.)
 		if neverDeadCodeKinds[n.Kind] {
+			continue
+		}
+
+		// Synthetic external-symbol / stub nodes are NOT first-party
+		// code. The external-call attribution pass materialises imported
+		// stdlib / dependency / external symbols as KindFunction /
+		// KindMethod nodes (IDs like "stdlib::fmt::Sprintf",
+		// "dep::<mod>::Sym", "external::<path>::Sym") stamped with
+		// Meta["external"]=true; the stub layer mints "<kind>::*" IDs for
+		// stdlib/external_call/builtin/module targets. By construction
+		// these carry only inbound import / member_of links — never a
+		// call/reference usage edge — so they ALWAYS look dead. Reporting
+		// them buried the real first-party signal under thousands of
+		// stdlib/dep entries. Drop them unconditionally.
+		if graph.IsStub(n.ID) {
+			continue
+		}
+		if ext, _ := n.Meta["external"].(bool); ext {
 			continue
 		}
 
@@ -311,20 +360,19 @@ func FindDeadCode(g *graph.Graph, processes *ProcessResult, excludePatterns []st
 			continue
 		}
 
-		// Count incoming edges that indicate the symbol is used.
-		// The allowlist is per-kind: fields/variables/constants are
-		// exercised by Reads/Writes; functions/methods by Calls/
-		// References; types by References/Instantiates/MemberOf/
-		// Implements/Extends/Composes/TypedAs. See incomingUsageKinds
-		// for the rationale.
-		allowed := incomingUsageKinds(n.Kind)
-		inEdges := g.GetInEdges(n.ID)
+		// Re-check the per-kind incoming-edge allowlist when we still
+		// have the in-edge map from the Go fallback path. The
+		// server-side DeadCodeCandidator has already applied the
+		// equivalent filter, so incomingByID is nil for that path and
+		// the count check short-circuits to 0 (matching the
+		// candidator's contract).
 		incomingCount := 0
-		for _, e := range inEdges {
-			for _, k := range allowed {
-				if e.Kind == k {
+		if incomingByID != nil {
+			allowed := incomingUsageKinds(n.Kind)
+			inEdges := incomingByID[n.ID]
+			for _, e := range inEdges {
+				if slices.Contains(allowed, e.Kind) {
 					incomingCount++
-					break
 				}
 			}
 		}
@@ -413,35 +461,83 @@ func FindDeadCode(g *graph.Graph, processes *ProcessResult, excludePatterns []st
 	return result
 }
 
+// collectDeadCodeCandidates is the candidate-set splitter for
+// FindDeadCode. When the backend implements DeadCodeCandidator the
+// WHERE-NOT-EXISTS filter runs server-side and we never materialise
+// the in-edge map (returned nil). Otherwise we fall back to today's
+// AllNodes + batched-GetInEdgesByNodeIDs path, identical pre-Part-2
+// behaviour. The post-filter loop in FindDeadCode handles both shapes
+// uniformly — incomingByID==nil means "filter already applied".
+func collectDeadCodeCandidates(g graph.Store, opt FindDeadCodeOptions) (candidates []*graph.Node, incomingByID map[string][]*graph.Edge) {
+	if dc, ok := g.(graph.DeadCodeCandidator); ok {
+		kinds := candidateNodeKinds[:0:0]
+		for _, k := range candidateNodeKinds {
+			// Honour the IncludeFields / IncludeVariables / IncludeConstants
+			// opt-in switches at the candidate-source: kinds the caller
+			// explicitly excluded never need to cross cgo. The post-
+			// filter loop still re-checks these for the fallback path
+			// (which sees every kind) so the contract holds either way.
+			switch k {
+			case graph.KindField:
+				if !opt.IncludeFields {
+					continue
+				}
+			case graph.KindVariable:
+				if !opt.IncludeVariables {
+					continue
+				}
+			case graph.KindConstant:
+				if !opt.IncludeConstants {
+					continue
+				}
+			}
+			kinds = append(kinds, k)
+		}
+		allowed := make(map[graph.NodeKind][]graph.EdgeKind, len(kinds))
+		for _, k := range kinds {
+			allowed[k] = incomingUsageKinds(k)
+		}
+		return dc.DeadCodeCandidates(kinds, allowed), nil
+	}
+
+	// Fallback: pull every node and the batched in-edge map up front.
+	// Same shape as before the DeadCodeCandidator capability landed.
+	nodes := g.AllNodes()
+	nodeIDs := make([]string, 0, len(nodes))
+	for _, n := range nodes {
+		nodeIDs = append(nodeIDs, n.ID)
+	}
+	return nodes, g.GetInEdgesByNodeIDs(nodeIDs)
+}
+
 // buildIfaceRequiredMethods returns a map from type ID → set of method names
 // that the type must implement to satisfy its interfaces.  This is computed by:
 //  1. Collecting all interfaces with their required method names (from Meta["methods"]).
 //  2. Collecting all EdgeImplements edges (type → interface).
 //  3. For each type that implements an interface, merging all required method names.
-func buildIfaceRequiredMethods(g *graph.Graph, nodes []*graph.Node, edges []*graph.Edge) map[string]map[string]bool {
-	// Step 1: interface ID → required method names
+//
+// On backends that implement graph.IfaceImplementsScanner this is a
+// single join; otherwise the fallback iterates
+// NodesByKind(KindInterface) + EdgesByKind(EdgeImplements). Both paths
+// produce the same map.
+func buildIfaceRequiredMethods(g graph.Store) map[string]map[string]bool {
+	if scanner, ok := g.(graph.IfaceImplementsScanner); ok {
+		return buildIfaceRequiredMethodsFromRows(scanner.IfaceImplementsRows())
+	}
+
+	// Fallback: walk interfaces + EdgeImplements edges Go-side. Uses
+	// NodesByKind(KindInterface) so disk backends still issue one
+	// scan per kind instead of pulling AllNodes.
 	ifaceMethods := make(map[string]map[string]bool)
-	for _, n := range nodes {
-		if n.Kind != graph.KindInterface || n.Meta == nil {
+	for n := range g.NodesByKind(graph.KindInterface) {
+		if n == nil || n.Meta == nil {
 			continue
 		}
 		raw, ok := n.Meta["methods"]
 		if !ok {
 			continue
 		}
-		methods := make(map[string]bool)
-		switch v := raw.(type) {
-		case []string:
-			for _, m := range v {
-				methods[m] = true
-			}
-		case []any:
-			for _, m := range v {
-				if s, ok := m.(string); ok {
-					methods[s] = true
-				}
-			}
-		}
+		methods := decodeMethodNames(raw)
 		if len(methods) > 0 {
 			ifaceMethods[n.ID] = methods
 		}
@@ -451,12 +547,8 @@ func buildIfaceRequiredMethods(g *graph.Graph, nodes []*graph.Node, edges []*gra
 		return nil
 	}
 
-	// Step 2: type ID → set of required method names (from all implemented interfaces)
 	result := make(map[string]map[string]bool)
-	for _, e := range edges {
-		if e.Kind != graph.EdgeImplements {
-			continue
-		}
+	for e := range g.EdgesByKind(graph.EdgeImplements) {
 		// EdgeImplements: From=type, To=interface
 		iface, ok := ifaceMethods[e.To]
 		if !ok {
@@ -471,6 +563,67 @@ func buildIfaceRequiredMethods(g *graph.Graph, nodes []*graph.Node, edges []*gra
 	}
 
 	return result
+}
+
+// buildIfaceRequiredMethodsFromRows reduces the server-side
+// IfaceImplementsScanner row set to the typeID → method-name-set
+// shape the rest of FindDeadCode consumes. Same join logic as the
+// fallback path, just folded over rows that already carry the
+// interface Meta.
+func buildIfaceRequiredMethodsFromRows(rows []graph.IfaceImplementsRow) map[string]map[string]bool {
+	if len(rows) == 0 {
+		return nil
+	}
+	// Cache decoded method-name sets per interface so repeated rows
+	// (one per implementing type) don't re-decode the same Meta.
+	ifaceMethods := make(map[string]map[string]bool)
+	result := make(map[string]map[string]bool)
+	for _, r := range rows {
+		methods, ok := ifaceMethods[r.IfaceID]
+		if !ok {
+			raw, hasRaw := r.IfaceMeta["methods"]
+			if !hasRaw {
+				ifaceMethods[r.IfaceID] = nil
+				continue
+			}
+			methods = decodeMethodNames(raw)
+			ifaceMethods[r.IfaceID] = methods
+		}
+		if len(methods) == 0 {
+			continue
+		}
+		if result[r.TypeID] == nil {
+			result[r.TypeID] = make(map[string]bool)
+		}
+		for m := range methods {
+			result[r.TypeID][m] = true
+		}
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
+// decodeMethodNames normalises a Node.Meta["methods"] value into a
+// set of method names. Accepts []string (in-memory backend) and
+// []any (decoded payload from the disk backend); anything else is
+// treated as "no methods declared".
+func decodeMethodNames(raw any) map[string]bool {
+	methods := make(map[string]bool)
+	switch v := raw.(type) {
+	case []string:
+		for _, m := range v {
+			methods[m] = true
+		}
+	case []any:
+		for _, m := range v {
+			if s, ok := m.(string); ok {
+				methods[s] = true
+			}
+		}
+	}
+	return methods
 }
 
 // hotspotBetweennessWeight scales the betweenness component of a
@@ -488,9 +641,34 @@ const hotspotBetweennessWeight = 0.4
 // centrality component — how often the symbol lies on a shortest path between
 // other symbols — that augments the fan-in/out signals rather than replacing them.
 // If threshold <= 0, the default threshold is mean + 2*stddev.
-func FindHotspots(g *graph.Graph, communities *CommunityResult, threshold float64) []HotspotEntry {
-	nodes := g.AllNodes()
-	edges := g.AllEdges()
+func FindHotspots(g graph.Store, communities *CommunityResult, threshold float64) []HotspotEntry {
+	// Pull only function/method node IDs — the hotspots ranking is
+	// callable-only, and the scoring math doesn't touch any column
+	// beyond the id. NodeIDsByKinds returns the projection from a
+	// single query (one id per row instead of the ~10
+	// columns NodesByKinds would ship). The full *Node rows are
+	// fetched in one batched GetNodesByIDs call AFTER the threshold
+	// filter, so a typical run materialises ~100 survivors rather
+	// than the whole ~4k function/method bucket.
+	hotspotKinds := []graph.NodeKind{graph.KindFunction, graph.KindMethod}
+	var candidateIDs []string
+	if scan, ok := g.(graph.NodeIDsByKinds); ok {
+		candidateIDs = scan.NodeIDsByKinds(hotspotKinds)
+	} else if scan, ok := g.(graph.NodesByKindsScanner); ok {
+		ns := scan.NodesByKinds(hotspotKinds)
+		candidateIDs = make([]string, 0, len(ns))
+		for _, n := range ns {
+			candidateIDs = append(candidateIDs, n.ID)
+		}
+	} else {
+		all := g.AllNodes()
+		candidateIDs = make([]string, 0, len(all))
+		for _, n := range all {
+			if n.Kind == graph.KindFunction || n.Kind == graph.KindMethod {
+				candidateIDs = append(candidateIDs, n.ID)
+			}
+		}
+	}
 
 	// Build lookup maps for community membership
 	nodeToComm := make(map[string]string)
@@ -498,30 +676,44 @@ func FindHotspots(g *graph.Graph, communities *CommunityResult, threshold float6
 		nodeToComm = communities.NodeToComm
 	}
 
-	// Build edge maps for fan-in and fan-out computation
-	// fan_in: incoming calls + references
-	// fan_out: outgoing calls
-	fanIn := make(map[string]int)
-	fanOut := make(map[string]int)
+	// Restrict the fan-count pass to the kinds hotspots cares about
+	// (function + method). NodeFanAggregator expects the candidate id
+	// list -- it never returns rows for ids the caller didn't ask
+	// for, so the cgo payload stays bounded by the candidate count
+	// rather than the whole graph.
+	fanIn, fanOut := CollectFanCounts(g, candidateIDs,
+		[]graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences},
+		[]graph.EdgeKind{graph.EdgeCalls},
+	)
 
-	for _, e := range edges {
-		if e.Kind == graph.EdgeCalls || e.Kind == graph.EdgeReferences {
-			fanIn[e.To]++
-		}
-		if e.Kind == graph.EdgeCalls {
-			fanOut[e.From]++
-		}
+	// Community crossings per node: outgoing edges (Calls or
+	// References) whose target sits in a different community than
+	// the source. CommunityCrossingsByKind ships only the (from, to)
+	// projection from a single IN-list join — the disk path stops
+	// re-materialising the full edge row per kind. Backends that
+	// don't implement the capability fall back to the per-kind
+	// EdgesByKind walk that mirrors the in-memory reference.
+	crossingKinds := []graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences}
+	var crossings map[string]int
+	if cc, ok := g.(graph.CommunityCrossingsByKind); ok {
+		crossings = cc.CommunityCrossingsByKind(crossingKinds, nodeToComm)
 	}
-
-	// Compute community crossings per node: outgoing edges to nodes in different communities
-	crossings := make(map[string]int)
-	for _, e := range edges {
-		if e.Kind == graph.EdgeCalls || e.Kind == graph.EdgeReferences {
-			fromComm := nodeToComm[e.From]
-			toComm := nodeToComm[e.To]
-			if fromComm != "" && toComm != "" && fromComm != toComm {
-				crossings[e.From]++
+	if crossings == nil {
+		crossings = make(map[string]int)
+		countCrossings := func(kind graph.EdgeKind) {
+			for e := range g.EdgesByKind(kind) {
+				if e == nil {
+					continue
+				}
+				fromComm := nodeToComm[e.From]
+				toComm := nodeToComm[e.To]
+				if fromComm != "" && toComm != "" && fromComm != toComm {
+					crossings[e.From]++
+				}
 			}
+		}
+		for _, k := range crossingKinds {
+			countCrossings(k)
 		}
 	}
 
@@ -536,9 +728,13 @@ func FindHotspots(g *graph.Graph, communities *CommunityResult, threshold float6
 		}
 	}
 
-	// Compute raw scores for function/method nodes only
+	// Compute raw scores for function/method nodes only. Keyed by id
+	// so the full *Node fetch is deferred until after the threshold
+	// filter — on a ~4k candidate set the surviving share is the top
+	// few percent, so this materialises ~100 nodes instead of the
+	// whole bucket.
 	type rawEntry struct {
-		node        *graph.Node
+		id          string
 		fanIn       int
 		fanOut      int
 		crossing    int
@@ -546,20 +742,16 @@ func FindHotspots(g *graph.Graph, communities *CommunityResult, threshold float6
 		rawScore    float64
 	}
 
-	var entries []rawEntry
-	for _, n := range nodes {
-		if n.Kind != graph.KindFunction && n.Kind != graph.KindMethod {
-			continue
-		}
-
-		fi := fanIn[n.ID]
-		fo := fanOut[n.ID]
-		cc := crossings[n.ID]
-		bw := betweenness[n.ID]
+	entries := make([]rawEntry, 0, len(candidateIDs))
+	for _, id := range candidateIDs {
+		fi := fanIn[id]
+		fo := fanOut[id]
+		cc := crossings[id]
+		bw := betweenness[id]
 		raw := float64(fi)*2.0 + float64(fo)*1.5 + float64(cc)*3.0 + bw*hotspotBetweennessWeight
 
 		entries = append(entries, rawEntry{
-			node:        n,
+			id:          id,
 			fanIn:       fi,
 			fanOut:      fo,
 			crossing:    cc,
@@ -607,25 +799,49 @@ func FindHotspots(g *graph.Graph, communities *CommunityResult, threshold float6
 		threshold = mean + 2.0*stddev
 	}
 
-	// Filter and build result
-	var result []HotspotEntry
-	for i, e := range entries {
+	// Filter by threshold first to identify the surviving id set, so
+	// the full *Node materialisation is bounded by the result size,
+	// not the candidate count.
+	type survivor struct {
+		entryIdx int
+		score    float64
+	}
+	survivors := make([]survivor, 0, len(entries))
+	for i := range entries {
 		score := math.Round(normalized[i]*100) / 100 // round to 2 decimal places
 		if score < threshold {
 			continue
 		}
+		survivors = append(survivors, survivor{entryIdx: i, score: score})
+	}
+	if len(survivors) == 0 {
+		return nil
+	}
 
+	survivorIDs := make([]string, 0, len(survivors))
+	for _, s := range survivors {
+		survivorIDs = append(survivorIDs, entries[s.entryIdx].id)
+	}
+	nodesByID := g.GetNodesByIDs(survivorIDs)
+
+	result := make([]HotspotEntry, 0, len(survivors))
+	for _, s := range survivors {
+		e := entries[s.entryIdx]
+		n := nodesByID[e.id]
+		if n == nil {
+			continue
+		}
 		result = append(result, HotspotEntry{
-			ID:                 e.node.ID,
-			Name:               e.node.Name,
-			Kind:               string(e.node.Kind),
-			FilePath:           e.node.FilePath,
-			Line:               e.node.StartLine,
+			ID:                 n.ID,
+			Name:               n.Name,
+			Kind:               string(n.Kind),
+			FilePath:           n.FilePath,
+			Line:               n.StartLine,
 			FanIn:              e.fanIn,
 			FanOut:             e.fanOut,
 			CommunityCrossings: e.crossing,
 			Betweenness:        math.Round(e.betweenness*100) / 100,
-			ComplexityScore:    score,
+			ComplexityScore:    s.score,
 		})
 	}
 
@@ -810,4 +1026,91 @@ func matchesExcludePattern(filePath, nodeID string, patterns []string) bool {
 		}
 	}
 	return false
+}
+
+// CollectFanCounts returns per-id fan-in / fan-out counts filtered by
+// edge kind. Backends that implement graph.NodeFanAggregator serve
+// both counts from one bulk pass per direction (~candidateCount
+// rows instead of the full edge set); the fallback path
+// streams the requested kinds via EdgesByKind, accumulating into the
+// fan maps Go-side -- still no AllEdges materialisation, just an
+// in-memory walk of the per-kind edge buckets.
+//
+// Used by FindHotspots and the health_score analyzer. Both pass the
+// same fanInKinds / fanOutKinds pair today; the function signature
+// keeps them per-call so a future analyzer with a different kind
+// split can share the same plumbing.
+func CollectFanCounts(g graph.Store, ids []string, fanInKinds []graph.EdgeKind, fanOutKinds []graph.EdgeKind) (fanIn, fanOut map[string]int) {
+	fanIn = make(map[string]int, len(ids))
+	fanOut = make(map[string]int, len(ids))
+	if len(ids) == 0 {
+		return fanIn, fanOut
+	}
+	if agg, ok := g.(graph.NodeFanAggregator); ok {
+		for _, r := range agg.NodeFanCounts(ids, fanInKinds, fanOutKinds) {
+			if r.FanIn != 0 {
+				fanIn[r.NodeID] = r.FanIn
+			}
+			if r.FanOut != 0 {
+				fanOut[r.NodeID] = r.FanOut
+			}
+		}
+		return fanIn, fanOut
+	}
+
+	// Fallback path: stream the requested kinds via EdgesByKind and
+	// tally Go-side. ID-set membership keeps the maps bounded to
+	// candidate ids, matching the capability contract.
+	idSet := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if id != "" {
+			idSet[id] = struct{}{}
+		}
+	}
+	streamed := make(map[graph.EdgeKind]struct{}, len(fanInKinds)+len(fanOutKinds))
+	stream := func(kind graph.EdgeKind, toIn, toOut bool) {
+		if _, ok := streamed[kind]; ok {
+			return
+		}
+		streamed[kind] = struct{}{}
+		for e := range g.EdgesByKind(kind) {
+			if e == nil {
+				continue
+			}
+			if toIn {
+				if _, ok := idSet[e.To]; ok {
+					fanIn[e.To]++
+				}
+			}
+			if toOut {
+				if _, ok := idSet[e.From]; ok {
+					fanOut[e.From]++
+				}
+			}
+		}
+	}
+	inKinds := make(map[graph.EdgeKind]struct{}, len(fanInKinds))
+	for _, k := range fanInKinds {
+		inKinds[k] = struct{}{}
+	}
+	outKinds := make(map[graph.EdgeKind]struct{}, len(fanOutKinds))
+	for _, k := range fanOutKinds {
+		outKinds[k] = struct{}{}
+	}
+	allKinds := make([]graph.EdgeKind, 0, len(inKinds)+len(outKinds))
+	for k := range inKinds {
+		allKinds = append(allKinds, k)
+	}
+	for k := range outKinds {
+		if _, dup := inKinds[k]; dup {
+			continue
+		}
+		allKinds = append(allKinds, k)
+	}
+	for _, k := range allKinds {
+		_, toIn := inKinds[k]
+		_, toOut := outKinds[k]
+		stream(k, toIn, toOut)
+	}
+	return fanIn, fanOut
 }

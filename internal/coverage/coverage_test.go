@@ -48,7 +48,7 @@ github.com/x/y/pkg/b.go:1.13,3.2 1 1
 
 func TestProjectStats(t *testing.T) {
 	segments := []Segment{
-		{StartLine: 5, EndLine: 8, NumStmt: 2, Count: 1},  // covered
+		{StartLine: 5, EndLine: 8, NumStmt: 2, Count: 1},   // covered
 		{StartLine: 10, EndLine: 15, NumStmt: 4, Count: 0}, // uncovered
 		{StartLine: 20, EndLine: 22, NumStmt: 1, Count: 1}, // outside range
 	}
@@ -101,15 +101,19 @@ func TestEnrichGraph_StampsMetaCoveragePct(t *testing.T) {
 		t.Errorf("expected 2 enriched, got %d", enriched)
 	}
 
-	foo := g.GetNode("pkg/a.go::Foo")
-	pct, _ := foo.Meta["coverage_pct"].(float64)
-	if pct < 33.32 || pct > 33.34 {
+	// Coverage now persists in the typed sidecar (change A), not Node.Meta.
+	byID := map[string]graph.CoverageEnrichment{}
+	for _, e := range g.CoverageRows("") {
+		byID[e.NodeID] = e
+	}
+	if pct := byID["pkg/a.go::Foo"].CoveragePct; pct < 33.32 || pct > 33.34 {
 		t.Errorf("Foo pct = %v, want ~33.33", pct)
 	}
-	bar := g.GetNode("pkg/a.go::Bar")
-	pct, _ = bar.Meta["coverage_pct"].(float64)
-	if pct != 100 {
+	if pct := byID["pkg/a.go::Bar"].CoveragePct; pct != 100 {
 		t.Errorf("Bar pct = %v, want 100", pct)
+	}
+	if _, present := g.GetNode("pkg/a.go::Foo").Meta["coverage_pct"]; present {
+		t.Errorf("coverage_pct must not remain in Node.Meta after sidecar migration")
 	}
 }
 

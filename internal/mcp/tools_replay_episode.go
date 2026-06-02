@@ -30,13 +30,13 @@ func (s *Server) registerReplayEpisodeTool() {
 }
 
 type replayTimelineRow struct {
-	ID             string `json:"id"`
-	Name           string `json:"name"`
-	FilePath       string `json:"file_path"`
-	LastCommitAt   string `json:"last_commit_at,omitempty"`
-	LastAuthor     string `json:"last_author,omitempty"`
-	SessionEdits   int    `json:"session_edits,omitempty"`
-	SignatureFlux  bool   `json:"signature_flux,omitempty"`
+	ID            string `json:"id"`
+	Name          string `json:"name"`
+	FilePath      string `json:"file_path"`
+	LastCommitAt  string `json:"last_commit_at,omitempty"`
+	LastAuthor    string `json:"last_author,omitempty"`
+	SessionEdits  int    `json:"session_edits,omitempty"`
+	SignatureFlux bool   `json:"signature_flux,omitempty"`
 }
 
 type replayCallerRow struct {
@@ -95,13 +95,13 @@ func (s *Server) handleReplayEpisode(ctx context.Context, req mcp.CallToolReques
 			"name":      anchorNode.Name,
 			"file_path": anchorNode.FilePath,
 		},
-		"window_days":    windowDays,
-		"depth":          depth,
-		"radius_size":    len(radius),
-		"timeline":       timeline,
-		"callers":        callers,
-		"coverage_gaps":  coverage,
-		"memories":       memories,
+		"window_days":   windowDays,
+		"depth":         depth,
+		"radius_size":   len(radius),
+		"timeline":      timeline,
+		"callers":       callers,
+		"coverage_gaps": coverage,
+		"memories":      memories,
 	})
 }
 
@@ -137,9 +137,17 @@ func (s *Server) replayTimeline(radius map[string]int, windowDays, limit int) []
 	if windowDays > 0 {
 		cutoff = time.Now().Add(-time.Duration(windowDays) * 24 * time.Hour)
 	}
+	// Batch-fetch every node in the radius; the radius is the BFS
+	// frontier (often hundreds of IDs), and per-id GetNode on a disk
+	// backend would issue that many round-trips per replay call.
+	ids := make([]string, 0, len(radius))
+	for id := range radius {
+		ids = append(ids, id)
+	}
+	nodeByID := s.graph.GetNodesByIDs(ids)
 	rows := make([]replayTimelineRow, 0, len(radius))
 	for id := range radius {
-		n := s.graph.GetNode(id)
+		n := nodeByID[id]
 		if n == nil {
 			continue
 		}
@@ -197,12 +205,23 @@ func (s *Server) replayTimeline(radius map[string]int, windowDays, limit int) []
 }
 
 func (s *Server) replayCallers(radius map[string]int, anchor string, limit int) []replayCallerRow {
+	// Batch-fetch the radius minus the anchor; same rationale as
+	// replayTimeline — per-id GetNode on a disk backend costs one
+	// round-trip per BFS node.
+	ids := make([]string, 0, len(radius))
+	for id := range radius {
+		if id == anchor {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	nodeByID := s.graph.GetNodesByIDs(ids)
 	rows := make([]replayCallerRow, 0, len(radius))
 	for id, d := range radius {
 		if id == anchor {
 			continue
 		}
-		n := s.graph.GetNode(id)
+		n := nodeByID[id]
 		if n == nil {
 			continue
 		}
@@ -226,13 +245,20 @@ func (s *Server) replayCallers(radius map[string]int, anchor string, limit int) 
 }
 
 func (s *Server) replayCoverageGaps(radius map[string]int, limit int) []replayCoverageRow {
+	// Batch-fetch the radius — same rationale as replayTimeline.
+	ids := make([]string, 0, len(radius))
+	for id := range radius {
+		ids = append(ids, id)
+	}
+	nodeByID := s.graph.GetNodesByIDs(ids)
+	covRows := s.coverageByID()
 	rows := make([]replayCoverageRow, 0)
 	for id := range radius {
-		n := s.graph.GetNode(id)
+		n := nodeByID[id]
 		if n == nil {
 			continue
 		}
-		pct, has := n.Meta["coverage_pct"].(float64)
+		pct, has := coveragePctFrom(covRows, n)
 		if has && pct >= 100.0 {
 			continue
 		}

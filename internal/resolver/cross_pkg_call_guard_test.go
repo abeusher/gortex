@@ -14,7 +14,7 @@ import (
 // faithful end-to-end harness for the resolver tests below: a real
 // extractor produces the unresolved edges, then ResolveAll runs against
 // them exactly as it does on a live index.
-func buildGraphFromSources(t *testing.T, files map[string]string) *graph.Graph {
+func buildGraphFromSources(t *testing.T, files map[string]string) graph.Store {
 	t.Helper()
 	g := graph.New()
 	ts := languages.NewTypeScriptExtractor()
@@ -50,7 +50,7 @@ func buildGraphFromSources(t *testing.T, files map[string]string) *graph.Graph {
 // callEdgeTo returns the resolved To-end of the call/reference edge that
 // leaves fromID at the given 1-based line. Empty string when no such
 // edge exists.
-func callEdgeTo(g *graph.Graph, fromID string, line int) string {
+func callEdgeTo(g graph.Store, fromID string, line int) string {
 	for _, e := range g.GetOutEdges(fromID) {
 		if (e.Kind == graph.EdgeCalls || e.Kind == graph.EdgeReferences) && e.Line == line {
 			return e.To

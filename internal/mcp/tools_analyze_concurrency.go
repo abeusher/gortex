@@ -72,10 +72,7 @@ func (s *Server) handleAnalyzeRaceWrites(ctx context.Context, req mcp.CallToolRe
 	}
 	var rows []raceRow
 
-	for _, e := range s.graph.AllEdges() {
-		if e.Kind != graph.EdgeWrites {
-			continue
-		}
+	for e := range edgesByKinds(s.graph, graph.EdgeWrites) {
 		if !goroutineReachable[e.From] {
 			continue
 		}
@@ -162,10 +159,7 @@ func (s *Server) handleAnalyzeRaceWrites(ctx context.Context, req mcp.CallToolRe
 func (s *Server) buildGoroutineReachableSet() map[string]bool {
 	reach := map[string]bool{}
 	var roots []string
-	for _, e := range s.graph.AllEdges() {
-		if e.Kind != graph.EdgeSpawns {
-			continue
-		}
+	for e := range edgesByKinds(s.graph, graph.EdgeSpawns) {
 		if !reach[e.To] {
 			reach[e.To] = true
 			roots = append(roots, e.To)
@@ -282,10 +276,7 @@ func (s *Server) handleAnalyzeUnclosedChannels(ctx context.Context, req mcp.Call
 	// channel"; the channel arg isn't tracked so the membership test
 	// is per-function, not per-channel.
 	closesIn := map[string]bool{}
-	for _, e := range s.graph.AllEdges() {
-		if e.Kind != graph.EdgeCalls {
-			continue
-		}
+	for e := range edgesByKinds(s.graph, graph.EdgeCalls) {
 		if callTargetName(e) != "close" {
 			continue
 		}
@@ -303,10 +294,7 @@ func (s *Server) handleAnalyzeUnclosedChannels(ctx context.Context, req mcp.Call
 		Line      int
 	}
 	byChannel := map[string]*channelInfo{}
-	for _, e := range s.graph.AllEdges() {
-		if e.Kind != graph.EdgeSends && e.Kind != graph.EdgeRecvs {
-			continue
-		}
+	for e := range edgesByKinds(s.graph, graph.EdgeSends, graph.EdgeRecvs) {
 		info := byChannel[e.To]
 		if info == nil {
 			info = &channelInfo{
@@ -366,7 +354,7 @@ func (s *Server) handleAnalyzeUnclosedChannels(ctx context.Context, req mcp.Call
 		if anyCloser {
 			continue
 		}
-		risk, reason := classifyUnclosed(info.Sends, len(info.Senders), info.Recvs)
+		risk, reason := classifyUnclosed(len(info.Senders), info.Recvs)
 		rows = append(rows, unclosedRow{
 			Channel:  info.Channel,
 			FilePath: info.FilePath,
@@ -434,7 +422,7 @@ func (s *Server) handleAnalyzeUnclosedChannels(ctx context.Context, req mcp.Call
 // receivers — the receiver may or may not range; without arg flow
 // we can't tell. Low: senders without receivers, almost always a
 // fire-and-forget signal.
-func classifyUnclosed(sends, senders, recvs int) (string, string) {
+func classifyUnclosed(senders, recvs int) (string, string) {
 	switch {
 	case senders >= 2 && recvs >= 1:
 		return "high", "multiple senders with consumer(s) and no detected close — receivers will hang on range"

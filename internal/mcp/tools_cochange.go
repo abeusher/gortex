@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"go.uber.org/zap"
 	"sort"
 	"strings"
 
@@ -63,28 +64,48 @@ func (s *Server) handleFindCoChangingSymbols(ctx context.Context, req mcp.CallTo
 	scores := s.coChangeScores(targetFile)
 	counts := s.coChangeCounts(targetFile)
 
-	rows := make([]coChangeRow, 0, len(scores))
+	// Two-phase build: first collect (file, score, count) tuples that
+	// survive the minScore gate, then sort + truncate to the requested
+	// limit, then batch-resolve the per-file symbol names. The Symbols
+	// lookup is the only graph-touching work in this handler — pulling
+	// it through one capability call instead of N GetFileNodes round-
+	// trips is the entire disk-backend win.
+	type pending struct {
+		file  string
+		score float64
+		count int
+	}
+	pendings := make([]pending, 0, len(scores))
 	for file, score := range scores {
 		if score < minScore {
 			continue
 		}
-		rows = append(rows, coChangeRow{
-			File:    file,
-			Score:   roundScore(score),
-			Count:   counts[file],
-			Symbols: s.symbolNamesInFile(file),
-		})
+		pendings = append(pendings, pending{file: file, score: score, count: counts[file]})
 	}
-	sort.Slice(rows, func(i, j int) bool {
-		if rows[i].Score != rows[j].Score {
-			return rows[i].Score > rows[j].Score
+	sort.Slice(pendings, func(i, j int) bool {
+		if pendings[i].score != pendings[j].score {
+			return pendings[i].score > pendings[j].score
 		}
-		return rows[i].File < rows[j].File
+		return pendings[i].file < pendings[j].file
 	})
 	truncated := false
-	if len(rows) > limit {
-		rows = rows[:limit]
+	if len(pendings) > limit {
+		pendings = pendings[:limit]
 		truncated = true
+	}
+	keepFiles := make([]string, 0, len(pendings))
+	for _, p := range pendings {
+		keepFiles = append(keepFiles, p.file)
+	}
+	symbolsByFile := s.symbolNamesByFiles(keepFiles)
+	rows := make([]coChangeRow, 0, len(pendings))
+	for _, p := range pendings {
+		rows = append(rows, coChangeRow{
+			File:    p.file,
+			Score:   roundScore(p.score),
+			Count:   p.count,
+			Symbols: symbolsByFile[p.file],
+		})
 	}
 
 	result := map[string]any{
@@ -96,25 +117,106 @@ func (s *Server) handleFindCoChangingSymbols(ctx context.Context, req mcp.CallTo
 	if symbolID != "" {
 		result["symbol_id"] = symbolID
 	}
+	// When the cache is empty AND the background mine has not finished
+	// yet, surface an in-progress marker so the caller can distinguish
+	// "this file has no co-change data" from "the daemon hasn't built
+	// the data yet". The mine is fired at daemon-ready by RunAnalysis;
+	// a fresh daemon on a disk backend takes tens of seconds before the cache is
+	// populated.
+	if len(rows) == 0 && !s.coChangeReady() {
+		result["mining_in_progress"] = true
+		result["note"] = "co-change graph is still being mined; retry shortly"
+	}
 	return s.respondJSONOrTOON(ctx, req, result)
 }
 
-// ensureCoChange mines the co-change graph exactly once per daemon
-// lifetime. Safe for concurrent callers — later callers block until
-// the first mine completes, then return immediately.
+// ensureCoChange triggers the co-change mine if it has not run yet
+// and returns IMMEDIATELY — the mine itself runs asynchronously.
+//
+// Why async? On a disk backend with no pre-existing
+// EdgeCoChange edges, mineCoChange spends 60+ seconds in
+// cochange.AddEdges: an AllNodes full-table scan plus thousands of
+// per-pair AddEdge round-trips. Wrapping that in sync.Once.Do
+// turned every queued tool call into a blocked-for-60s caller. The
+// async shape keeps the request path off the slow path.
+//
+// PrewarmCoChange (called from RunAnalysis at daemon-ready) fires
+// the mine ahead of any user-visible call so the cache is already
+// populated by the time the first find_co_changing_symbols arrives.
+//
+// Returning immediately means the first user call may see an empty
+// cache when the prewarm goroutine has not yet completed. That is
+// the deliberate trade-off — the alternative is a 60s blocked tool
+// call. The handler surfaces an `in_progress` flag when the cache is
+// empty so callers know to retry rather than treating the file as
+// genuinely uncoupled.
 func (s *Server) ensureCoChange() {
-	s.cochangeOnce.Do(s.mineCoChange)
+	s.cochangeOnce.Do(func() {
+		go s.mineCoChange()
+	})
+}
+
+// PrewarmCoChange triggers the co-change mine in the background so a
+// later find_co_changing_symbols / search rerank call sees a
+// populated cache without blocking. Safe to call multiple times — the
+// underlying sync.Once still gates the work to one execution.
+//
+// Returns immediately whether mining is in progress, completed, or
+// freshly started.
+func (s *Server) PrewarmCoChange() {
+	go s.cochangeOnce.Do(s.mineCoChange)
+}
+
+// coChangeReady reports whether the mine has completed and the cache
+// is populated. Used by the handler to set an `in_progress` flag
+// when the cache is empty but mining is still running.
+func (s *Server) coChangeReady() bool {
+	s.cochangeMu.RLock()
+	defer s.cochangeMu.RUnlock()
+	return s.cochangeByFile != nil
 }
 
 // mineCoChange populates the co-change caches. It prefers EdgeCoChange
 // edges already present in the graph (an enriched snapshot); only when
-// none exist does it mine `git log` and materialise the edges.
+// none exist does it mine `git log`.
+//
+// The mine populates the in-memory caches AND persists the mined
+// pairs as EdgeCoChange edges (cochange.AddEdges) so a subsequent daemon
+// start takes the coChangeFromEdges fast path instead of re-mining
+// `git log` (the 5-15s restart cost).
+//
+// The earlier version deliberately skipped the persist to avoid the
+// analyze[clusters] partition cache (keyed on NodeCount/EdgeCount/
+// EdgeIdentityRevisions) being invalidated by edge-count drift. That
+// concern was about CONTINUOUS drift; here the persist is bounded —
+// mineCoChange runs once per process (sync.Once) and the fast path skips
+// the mine once edges exist — so the edge count (and the clusters token)
+// moves at most ONCE per graph, triggering a single recompute rather
+// than per-restart thrash. Co-change edges are partition-irrelevant
+// (edgeWeight 0; both endpoints are KindFile nodes, filtered out of
+// community detection), so that one recompute yields the same partition.
+//
+// Reads are unaffected: find_co_changing_symbols and the search rerank's
+// CoChangeOf hook both read the in-memory cache. The CLI cochange.EnrichGraph
+// path already persisted via AddEdges; this aligns the lazy daemon path
+// with it. Refreshing stale co-change after a HEAD move is still a manual
+// `gortex enrich cochange` (or a cold reindex) — the lazy path does not
+// auto-re-mine once edges exist.
 func (s *Server) mineCoChange() {
 	scores := map[string]map[string]float64{}
 	counts := map[string]map[string]int{}
 
 	if s.coChangeFromEdges(scores, counts) {
 		s.storeCoChange(scores, counts)
+		// The co-change graph COULD be refreshed by re-mining git log,
+		// but was NOT: persisted EdgeCoChange edges already exist, so the
+		// lazy path serves them as-is. If history advanced since the last
+		// mine these counts are stale until an explicit refresh. Surface
+		// that rather than silently serving possibly-stale data.
+		if s.logger != nil {
+			s.logger.Info("co-change served from persisted edges; not re-mined (could be updated, but was not) — run `gortex enrich cochange` to refresh after history changes",
+				zap.Int("file_relations", len(scores)))
+		}
 		return
 	}
 
@@ -123,7 +225,6 @@ func (s *Server) mineCoChange() {
 		if len(res.Pairs) == 0 {
 			continue
 		}
-		cochange.AddEdges(s.graph, res.Pairs, prefix)
 		for _, p := range res.Pairs {
 			fa, fb := p.FileA, p.FileB
 			if prefix != "" {
@@ -133,6 +234,13 @@ func (s *Server) mineCoChange() {
 			addCoChangeLink(scores, counts, fa, fb, p.Score, p.Count)
 			addCoChangeLink(scores, counts, fb, fa, p.Score, p.Count)
 		}
+		// Persist the mined pairs as EdgeCoChange edges so a later daemon
+		// start takes the coChangeFromEdges fast path instead of re-mining
+		// git log (the 5-15s restart cost). Bounded: mineCoChange runs once
+		// per process (sync.Once) and the fast path above skips the mine
+		// once edges exist, so this persist (and its one clusters-cache
+		// token bump) happens at most once per graph, not per restart.
+		cochange.AddEdges(s.graph, res.Pairs, prefix)
 	}
 	s.storeCoChange(scores, counts)
 }
@@ -141,18 +249,27 @@ func (s *Server) mineCoChange() {
 // edges already in the graph. Returns true when at least one edge was
 // found — the signal that an enriched snapshot is loaded and no fresh
 // git mine is needed.
+//
+// EdgesByKind streams only the CoChange edges; the endpoint nodes are
+// fetched in one batched GetNodesByIDs call instead of two GetNode
+// round-trips per edge. On disk backends that drops the
+// whole-graph AllEdges materialisation plus the per-edge
+// GetNode trips that loaded the file paths.
 func (s *Server) coChangeFromEdges(scores map[string]map[string]float64, counts map[string]map[string]int) bool {
-	found := false
-	for _, e := range s.graph.AllEdges() {
-		if e.Kind != graph.EdgeCoChange {
+	// First pass: collect CoChange edges + the set of node IDs they
+	// reference. Both can stream from EdgesByKind in one
+	// round-trip on disk backends.
+	type ccEdge struct {
+		from, to string
+		score    float64
+		count    int
+	}
+	var edges []ccEdge
+	idSet := make(map[string]struct{})
+	for e := range s.graph.EdgesByKind(graph.EdgeCoChange) {
+		if e == nil {
 			continue
 		}
-		from := s.graph.GetNode(e.From)
-		to := s.graph.GetNode(e.To)
-		if from == nil || to == nil {
-			continue
-		}
-		found = true
 		score := e.Confidence
 		if e.Meta != nil {
 			if v, ok := e.Meta["score"].(float64); ok {
@@ -170,9 +287,35 @@ func (s *Server) coChangeFromEdges(scores map[string]map[string]float64, counts 
 				count = int(v)
 			}
 		}
-		addCoChangeLink(scores, counts, from.FilePath, to.FilePath, score, count)
+		edges = append(edges, ccEdge{from: e.From, to: e.To, score: score, count: count})
+		idSet[e.From] = struct{}{}
+		idSet[e.To] = struct{}{}
 	}
-	return found
+	if len(edges) == 0 {
+		return false
+	}
+
+	// Batched endpoint resolution — one batched id-IN query vs.
+	// 2 * len(edges) per-row GetNode trips. On a workspace with
+	// thousands of co-change edges this is the bulk of the latency.
+	ids := make([]string, 0, len(idSet))
+	for id := range idSet {
+		ids = append(ids, id)
+	}
+	nodes := s.graph.GetNodesByIDs(ids)
+
+	for _, e := range edges {
+		from, ok := nodes[e.from]
+		if !ok || from == nil {
+			continue
+		}
+		to, ok := nodes[e.to]
+		if !ok || to == nil {
+			continue
+		}
+		addCoChangeLink(scores, counts, from.FilePath, to.FilePath, e.score, e.count)
+	}
+	return true
 }
 
 // addCoChangeLink records one directed co-change relationship.

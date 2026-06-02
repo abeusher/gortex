@@ -10,7 +10,7 @@ import (
 
 // addDepNode is a tiny helper to materialise a dep::<module> contract
 // node the way GoModExtractor + commitInlinedContractToGraph would.
-func addDepNode(t *testing.T, g *graph.Graph, repoPrefix, modulePath string) {
+func addDepNode(t *testing.T, g graph.Store, repoPrefix, modulePath string) {
 	t.Helper()
 	g.AddNode(&graph.Node{
 		ID:         "dep::" + modulePath,

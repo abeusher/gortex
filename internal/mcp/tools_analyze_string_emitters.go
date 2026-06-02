@@ -34,10 +34,7 @@ func (s *Server) handleAnalyzeStringEmitters(ctx context.Context, req mcp.CallTo
 		Emitters []string `json:"emitters,omitempty"`
 	}
 	byString := map[string]*stringRow{}
-	for _, e := range s.graph.AllEdges() {
-		if e.Kind != graph.EdgeEmits {
-			continue
-		}
+	for e := range edgesByKinds(s.graph, graph.EdgeEmits) {
 		n := s.graph.GetNode(e.To)
 		if n == nil || n.Kind != graph.KindString {
 			continue

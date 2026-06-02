@@ -34,11 +34,11 @@ func (s *Server) registerKnowledgeGapsTool() {
 // edges. Almost always either dead code or an isolated utility
 // nobody wired up.
 type gapDisconnected struct {
-	ID       string `json:"id"`
-	Name     string `json:"name"`
-	Kind     string `json:"kind"`
-	File     string `json:"file"`
-	Line     int    `json:"line"`
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	Kind string `json:"kind"`
+	File string `json:"file"`
+	Line int    `json:"line"`
 }
 
 // gapCommunity — for thin and single-file communities the caller
@@ -56,13 +56,13 @@ type gapCommunity struct {
 // gate so we surface load-bearing nodes even in small repos where
 // the analyzer is conservative.
 type gapUntestedHotspot struct {
-	ID         string  `json:"id"`
-	Name       string  `json:"name"`
-	File       string  `json:"file"`
-	Line       int     `json:"line"`
-	FanIn      int     `json:"fan_in"`
-	Coverage   float64 `json:"coverage_pct"`
-	HasCoverage bool   `json:"has_coverage"`
+	ID          string  `json:"id"`
+	Name        string  `json:"name"`
+	File        string  `json:"file"`
+	Line        int     `json:"line"`
+	FanIn       int     `json:"fan_in"`
+	Coverage    float64 `json:"coverage_pct"`
+	HasCoverage bool    `json:"has_coverage"`
 }
 
 func (s *Server) handleGetKnowledgeGaps(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -78,11 +78,17 @@ func (s *Server) handleGetKnowledgeGaps(ctx context.Context, req mcp.CallToolReq
 	perCategoryLimit := max(req.GetInt("limit_per_category", 20), 1)
 	pathPrefix := strings.TrimSpace(req.GetString("path_prefix", ""))
 
-	scoped := s.scopedNodes(ctx)
+	// degreeByID maps node id -> (in, out) edge counts for every
+	// function/method in scope, computed once via the backend's
+	// NodeDegreeByKinds path when available. The legacy
+	// NodeDegreeCounts route shipped a 30k-element IN-list per call
+	// on a disk backend; NodeDegreeByKinds runs the same aggregate over the
+	// kind-filtered node set so the planner never builds the list.
+	degreeByID, scoped := s.scopedFunctionDegrees(ctx, pathPrefix)
 
-	disconnected := s.collectDisconnected(scoped, pathPrefix, perCategoryLimit)
+	disconnected := s.collectDisconnected(scoped, pathPrefix, perCategoryLimit, degreeByID)
 	thin, singleFile := s.collectCommunityGaps(thinSize, pathPrefix, perCategoryLimit)
-	untested := s.collectUntestedHotspots(scoped, pathPrefix, hotspotLimit, minCov, perCategoryLimit)
+	untested := s.collectUntestedHotspots(scoped, pathPrefix, hotspotLimit, minCov, perCategoryLimit, degreeByID)
 
 	return s.respondJSONOrTOON(ctx, req, map[string]any{
 		"disconnected_nodes":      disconnected,
@@ -104,27 +110,102 @@ func (s *Server) handleGetKnowledgeGaps(ctx context.Context, req mcp.CallToolReq
 	})
 }
 
+// scopedFunctionDegrees returns the per-node in/out degree map and
+// the scoped function/method node list, in two pushdown calls.
+// NodeDegreeByKinds runs server-side over the kind-filtered node
+// table — the previous path fed NodeDegreeCounts a 30k-element
+// IN-list, which the planner had to materialise before joining. The
+// scoped node list is built from NodesByKinds (or AllNodes when the
+// backend has no NodesByKindsScanner) and post-filtered for the
+// session workspace, matching scopedNodesByKinds' contract.
+func (s *Server) scopedFunctionDegrees(ctx context.Context, pathPrefix string) (map[string]graph.NodeDegreeRow, []*graph.Node) {
+	kinds := []graph.NodeKind{graph.KindFunction, graph.KindMethod}
+	scoped := s.scopedNodesByKinds(ctx, kinds)
+	var degByID map[string]graph.NodeDegreeRow
+	if dk, ok := s.graph.(graph.NodeDegreeByKinds); ok {
+		rows := dk.NodeDegreeByKinds(kinds, pathPrefix)
+		degByID = make(map[string]graph.NodeDegreeRow, len(rows))
+		for _, r := range rows {
+			degByID[r.NodeID] = r
+		}
+	}
+	return degByID, scoped
+}
+
 // collectDisconnected returns function/method nodes with zero
 // incoming and zero outgoing edges in the scoped subgraph. The
 // kind filter mirrors handleAnalyzeCoverageGaps' default — variables
 // and constants always look disconnected, so including them would
 // flood the result.
-func (s *Server) collectDisconnected(scoped []*graph.Node, pathPrefix string, limit int) []gapDisconnected {
-	out := make([]gapDisconnected, 0)
+//
+// Reads from the prebuilt degree map when present (the storage
+// backend computed it once in scopedFunctionDegrees), falls back to
+// per-node GetInEdges / GetOutEdges otherwise. The legacy
+// NodeDegreeAggregator path is kept as a tertiary fallback for
+// backends that publish NodeDegreeCounts but not NodeDegreeByKinds.
+func (s *Server) collectDisconnected(scoped []*graph.Node, pathPrefix string, limit int, degreeByID map[string]graph.NodeDegreeRow) []gapDisconnected {
+	candidates := make([]*graph.Node, 0, len(scoped))
 	for _, n := range scoped {
-		if n.Kind != graph.KindFunction && n.Kind != graph.KindMethod {
-			continue
-		}
 		if pathPrefix != "" && !strings.HasPrefix(n.FilePath, pathPrefix) {
 			continue
 		}
-		if len(s.graph.GetInEdges(n.ID)) > 0 || len(s.graph.GetOutEdges(n.ID)) > 0 {
-			continue
+		candidates = append(candidates, n)
+	}
+
+	out := make([]gapDisconnected, 0)
+	switch {
+	case degreeByID != nil:
+		for _, n := range candidates {
+			r, ok := degreeByID[n.ID]
+			if !ok {
+				// Absent from the aggregate => zero edges, by
+				// definition of the kind-filtered aggregate.
+				out = append(out, gapDisconnected{
+					ID: n.ID, Name: n.Name, Kind: string(n.Kind),
+					File: n.FilePath, Line: n.StartLine,
+				})
+				continue
+			}
+			if r.InCount > 0 || r.OutCount > 0 {
+				continue
+			}
+			out = append(out, gapDisconnected{
+				ID: n.ID, Name: n.Name, Kind: string(n.Kind),
+				File: n.FilePath, Line: n.StartLine,
+			})
 		}
-		out = append(out, gapDisconnected{
-			ID: n.ID, Name: n.Name, Kind: string(n.Kind),
-			File: n.FilePath, Line: n.StartLine,
-		})
+	default:
+		if agg, ok := s.graph.(graph.NodeDegreeAggregator); ok && len(candidates) > 0 {
+			ids := make([]string, 0, len(candidates))
+			byID := make(map[string]*graph.Node, len(candidates))
+			for _, n := range candidates {
+				ids = append(ids, n.ID)
+				byID[n.ID] = n
+			}
+			for _, r := range agg.NodeDegreeCounts(ids, nil) {
+				if r.InCount > 0 || r.OutCount > 0 {
+					continue
+				}
+				n := byID[r.NodeID]
+				if n == nil {
+					continue
+				}
+				out = append(out, gapDisconnected{
+					ID: n.ID, Name: n.Name, Kind: string(n.Kind),
+					File: n.FilePath, Line: n.StartLine,
+				})
+			}
+		} else {
+			for _, n := range candidates {
+				if len(s.graph.GetInEdges(n.ID)) > 0 || len(s.graph.GetOutEdges(n.ID)) > 0 {
+					continue
+				}
+				out = append(out, gapDisconnected{
+					ID: n.ID, Name: n.Name, Kind: string(n.Kind),
+					File: n.FilePath, Line: n.StartLine,
+				})
+			}
+		}
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].File != out[j].File {
@@ -193,20 +274,50 @@ func (s *Server) collectCommunityGaps(thinSize int, pathPrefix string, limit int
 // coverage_pct < minCov or no coverage data at all. Independent of
 // analyze hotspots (which gates on mean+2σ) so it still surfaces
 // load-bearing nodes in small repos.
-func (s *Server) collectUntestedHotspots(scoped []*graph.Node, pathPrefix string, hotspotLimit int, minCov float64, limit int) []gapUntestedHotspot {
+//
+// Reads from the prebuilt NodeDegreeByKinds aggregate when present;
+// falls back to NodeDegreeAggregator (the older IN-list shape) for
+// backends that only publish that one, and finally to per-node
+// GetInEdges for everyone else.
+func (s *Server) collectUntestedHotspots(scoped []*graph.Node, pathPrefix string, hotspotLimit int, minCov float64, limit int, degreeByID map[string]graph.NodeDegreeRow) []gapUntestedHotspot {
 	type ranked struct {
 		node  *graph.Node
 		fanIn int
 	}
-	candidates := make([]ranked, 0, len(scoped))
+	pool := make([]*graph.Node, 0, len(scoped))
 	for _, n := range scoped {
-		if n.Kind != graph.KindFunction && n.Kind != graph.KindMethod {
-			continue
-		}
 		if pathPrefix != "" && !strings.HasPrefix(n.FilePath, pathPrefix) {
 			continue
 		}
-		candidates = append(candidates, ranked{node: n, fanIn: len(s.graph.GetInEdges(n.ID))})
+		pool = append(pool, n)
+	}
+	candidates := make([]ranked, 0, len(pool))
+	switch {
+	case degreeByID != nil:
+		for _, n := range pool {
+			r := degreeByID[n.ID]
+			candidates = append(candidates, ranked{node: n, fanIn: r.InCount})
+		}
+	default:
+		if agg, ok := s.graph.(graph.NodeDegreeAggregator); ok && len(pool) > 0 {
+			ids := make([]string, 0, len(pool))
+			byID := make(map[string]*graph.Node, len(pool))
+			for _, n := range pool {
+				ids = append(ids, n.ID)
+				byID[n.ID] = n
+			}
+			for _, r := range agg.NodeDegreeCounts(ids, nil) {
+				n := byID[r.NodeID]
+				if n == nil {
+					continue
+				}
+				candidates = append(candidates, ranked{node: n, fanIn: r.InCount})
+			}
+		} else {
+			for _, n := range pool {
+				candidates = append(candidates, ranked{node: n, fanIn: len(s.graph.GetInEdges(n.ID))})
+			}
+		}
 	}
 	sort.Slice(candidates, func(i, j int) bool {
 		return candidates[i].fanIn > candidates[j].fanIn
@@ -216,6 +327,7 @@ func (s *Server) collectUntestedHotspots(scoped []*graph.Node, pathPrefix string
 	}
 
 	out := make([]gapUntestedHotspot, 0)
+	covRows := s.coverageByID()
 	for _, c := range candidates {
 		// A "hotspot" with zero callers isn't a hotspot — drop it.
 		// Disconnected functions are already covered by the
@@ -223,7 +335,7 @@ func (s *Server) collectUntestedHotspots(scoped []*graph.Node, pathPrefix string
 		if c.fanIn == 0 {
 			continue
 		}
-		pct, has := c.node.Meta["coverage_pct"].(float64)
+		pct, has := coveragePctFrom(covRows, c.node)
 		if has && pct >= minCov {
 			continue
 		}

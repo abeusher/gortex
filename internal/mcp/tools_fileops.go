@@ -237,7 +237,7 @@ func (s *Server) resolveNodePath(node *graph.Node) (string, error) {
 		if root, ok := s.multiIndexer.RepoRoot(node.RepoPrefix); ok {
 			// applyRepoPrefix stamps `<repoPrefix>/` onto node.FilePath
 			// at index time, so a node's FilePath looks like
-			// `gortex/internal/exporter/cypher.go`. RepoRoot returns
+			// `gortex/internal/mcp/tools_fileops.go`. RepoRoot returns
 			// the on-disk path that ALREADY corresponds to the repo
 			// (e.g. `/Users/zzet/code/my/gortex/gortex`). Joining as-is
 			// duplicates the prefix segment when the repo's basename

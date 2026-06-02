@@ -31,7 +31,7 @@ import (
 // Languages other than TS / JS are skipped — Go disambiguates
 // bare-name collisions via package qualification (`pkg.Type`) and the
 // in-file resolveTypeInFile pass already handles those.
-func (mi *MultiIndexer) disambiguateBareTypesViaImports(cr *contracts.Registry, g *graph.Graph) {
+func (mi *MultiIndexer) disambiguateBareTypesViaImports(cr *contracts.Registry, g graph.Store) {
 	srcCache := map[string][]byte{}
 	importCache := map[string]map[string]string{}
 
@@ -74,7 +74,7 @@ func (mi *MultiIndexer) disambiguateBareTypesViaImports(cr *contracts.Registry, 
 // (so the caller leaves the bare name in place).
 func (mi *MultiIndexer) resolveBareTypeViaImports(
 	srcFile, name string,
-	g *graph.Graph,
+	g graph.Store,
 	srcCache map[string][]byte,
 	importCache map[string]map[string]string,
 ) string {

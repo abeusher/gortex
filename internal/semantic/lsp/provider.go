@@ -177,7 +177,7 @@ func (p *Provider) Close() error {
 	return nil
 }
 
-func (p *Provider) Enrich(g *graph.Graph, repoRoot string) (*semantic.EnrichResult, error) {
+func (p *Provider) Enrich(g graph.Store, repoRoot string) (*semantic.EnrichResult, error) {
 	start := time.Now()
 
 	absRoot, err := filepath.Abs(repoRoot)
@@ -268,6 +268,11 @@ func (p *Provider) Enrich(g *graph.Graph, repoRoot string) (*semantic.EnrichResu
 
 	// Query hover info for nodes to enrich metadata.
 	enrichedNodes := make(map[string]bool)
+	// EnrichNodeMeta mutates Node.Meta in place; on disk backends n is a
+	// per-call AllNodes reconstruction, so collect stamped nodes and
+	// round-trip them through the store at the end or the semantic_type
+	// stamp is discarded on the disk backend. See semantic.EnrichNodeMeta.
+	var stampedNodes []*graph.Node
 	for _, n := range g.AllNodes() {
 		if n.Kind == graph.KindFile || n.Kind == graph.KindImport {
 			continue
@@ -300,12 +305,16 @@ func (p *Provider) Enrich(g *graph.Graph, repoRoot string) (*semantic.EnrichResu
 		typeInfo := extractTypeFromHover(hoverResult.Contents.Value)
 		if typeInfo != "" {
 			semantic.EnrichNodeMeta(n, "semantic_type", typeInfo, p.Name())
+			stampedNodes = append(stampedNodes, n)
 			if !enrichedNodes[n.ID] {
 				result.NodesEnriched++
 				result.SymbolsCovered++
 				enrichedNodes[n.ID] = true
 			}
 		}
+	}
+	if len(stampedNodes) > 0 {
+		g.AddBatch(stampedNodes, nil)
 	}
 
 	// Query implementations for interface nodes.
@@ -406,7 +415,7 @@ func (p *Provider) Enrich(g *graph.Graph, repoRoot string) (*semantic.EnrichResu
 	return result, nil
 }
 
-func (p *Provider) EnrichFile(g *graph.Graph, repoRoot, filePath string) (*semantic.EnrichResult, error) {
+func (p *Provider) EnrichFile(g graph.Store, repoRoot, filePath string) (*semantic.EnrichResult, error) {
 	// LSP supports incremental updates, but for simplicity we skip it.
 	// The full Enrich pass handles this.
 	return nil, nil
@@ -1157,7 +1166,7 @@ func (p *Provider) Source(repoRoot, relPath string) []byte {
 // matching ast_inferred / text_matched EdgeCalls to lsp_resolved, or
 // add a fresh EdgeCalls when the AST extractor missed the link
 // (cross-file calls in languages without compile-unit info).
-func (p *Provider) enrichCallHierarchy(g *graph.Graph, absRoot string, result *semantic.EnrichResult) {
+func (p *Provider) enrichCallHierarchy(g graph.Store, absRoot string, result *semantic.EnrichResult) {
 	for _, n := range g.AllNodes() {
 		if n.Kind != graph.KindFunction && n.Kind != graph.KindMethod {
 			continue
@@ -1191,7 +1200,7 @@ func (p *Provider) enrichCallHierarchy(g *graph.Graph, absRoot string, result *s
 // asOutgoing=true means "this node calls other"; false means "other
 // calls this node" (incoming-calls direction). Existing edges get
 // promoted to lsp_resolved; missing edges get added.
-func (p *Provider) recordHierarchyCall(g *graph.Graph, absRoot string, n *graph.Node, other CallHierarchyItem, asOutgoing bool, result *semantic.EnrichResult) {
+func (p *Provider) recordHierarchyCall(g graph.Store, absRoot string, n *graph.Node, other CallHierarchyItem, asOutgoing bool, result *semantic.EnrichResult) {
 	otherPath := uriToPath(other.URI, absRoot)
 	if otherPath == "" {
 		return
@@ -1232,7 +1241,7 @@ func (p *Provider) recordHierarchyCall(g *graph.Graph, absRoot string, n *graph.
 //     T → super when the super is an interface kind.
 //   - subtypes(T) = the children of T. Emits EdgeImplements child
 //     → T when T is an interface; EdgeExtends otherwise.
-func (p *Provider) enrichTypeHierarchy(g *graph.Graph, absRoot string, result *semantic.EnrichResult) {
+func (p *Provider) enrichTypeHierarchy(g graph.Store, absRoot string, result *semantic.EnrichResult) {
 	for _, n := range g.AllNodes() {
 		if n.Kind != graph.KindType && n.Kind != graph.KindInterface {
 			continue
@@ -1267,7 +1276,7 @@ func (p *Provider) enrichTypeHierarchy(g *graph.Graph, absRoot string, result *s
 // whose name matches a method on the parent — closing the
 // method-level half of the type hierarchy (Joern calls these
 // CONTAINS + OVERRIDES).
-func (p *Provider) linkTypeHierarchy(g *graph.Graph, absRoot string, cur *graph.Node, other TypeHierarchyItem, asSupertype bool, result *semantic.EnrichResult) {
+func (p *Provider) linkTypeHierarchy(g graph.Store, absRoot string, cur *graph.Node, other TypeHierarchyItem, asSupertype bool, result *semantic.EnrichResult) {
 	otherPath := uriToPath(other.URI, absRoot)
 	if otherPath == "" {
 		return
@@ -1313,7 +1322,7 @@ func (p *Provider) linkTypeHierarchy(g *graph.Graph, absRoot string, cur *graph.
 // origin lets the caller stamp the edges with lsp_dispatch (LSP-
 // confirmed parent), ast_resolved (AST-confirmed parent in the same
 // compilation unit), or ast_inferred (parent is a heuristic match).
-func addOverrideEdges(g *graph.Graph, child, parent *graph.Node, provider, origin string, result *semantic.EnrichResult) {
+func addOverrideEdges(g graph.Store, child, parent *graph.Node, provider, origin string, result *semantic.EnrichResult) {
 	if child == nil || parent == nil || child.ID == parent.ID {
 		return
 	}

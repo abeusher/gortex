@@ -1,11 +1,16 @@
 package resolver
 
 import (
+	"iter"
 	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
+
+	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/graph"
 )
@@ -35,7 +40,8 @@ type ResolveStats struct {
 // Indexer.IndexFile) crash the daemon with "concurrent map writes"
 // in buildDirIndexes.
 type Resolver struct {
-	graph        *graph.Graph
+	graph        graph.Store
+	logger       *zap.Logger
 	dirIndex     map[string][]*graph.Node
 	lastDirIndex map[string][]*graph.Node
 	// providesForIdx maps `provides_for: AbstractName` (from @Module
@@ -68,13 +74,27 @@ type Resolver struct {
 	// pass, torn down at the end.
 	depModuleIndex map[string][]depModuleEntry
 	// mu serialises resolution phases against the shared graph.
-	// Pointer so every Resolver built from the same *graph.Graph
+	// Pointer so every Resolver built from the same graph.Store
 	// locks the same mutex — necessary for MultiIndexer's per-repo
 	// goroutines, each of which spawns its own Resolver instance.
 	// Without the shared lock, concurrent ResolveAll passes race on
 	// edge mutations (resolveImport writes e.To while another
 	// goroutine iterates via graph.AllEdges()).
 	mu *sync.Mutex
+
+	// lookupCache holds per-pass batched results from GetNodesByIDs /
+	// FindNodesByNames. Populated by ResolveAll/ResolveFile before
+	// the worker fan-out and cleared on return. Workers consult these
+	// maps first; misses fall through to the underlying Store.
+	//
+	// Without the cache, the resolver fires ~3-10 store point lookups
+	// per pending edge — across 10-30k unresolved edges that's 100k+
+	// queries, each one a round trip on disk backends (~ms each).
+	// With the cache the same information lands in two batched
+	// queries per pass.
+	nodeByID        map[string]*graph.Node
+	nodesByName     map[string][]*graph.Node
+	nodesByQualName map[string]*graph.Node
 
 	// lspHelper, when non-nil, is consulted before falling back to
 	// AST heuristics for cross-file dispatch in languages whose
@@ -121,12 +141,50 @@ type depModuleEntry struct {
 	node       *graph.Node
 }
 
-// New creates a Resolver for the given graph. The returned Resolver
-// shares graph.ResolveMutex() with every other Resolver built from
-// the same Graph, so their ResolveAll / ResolveFile calls serialise
-// end-to-end.
-func New(g *graph.Graph) *Resolver {
-	return &Resolver{graph: g, mu: g.ResolveMutex()}
+// New creates a Resolver for the given store. The returned Resolver
+// shares store.ResolveMutex() with every other Resolver built from
+// the same Store, so their ResolveAll / ResolveFile calls serialise
+// end-to-end across cross-repo / temporal / external passes.
+func New(g graph.Store) *Resolver {
+	return &Resolver{graph: g, mu: g.ResolveMutex(), logger: zap.NewNop()}
+}
+
+// SetLogger attaches a logger so ResolveAll emits pass-progress
+// (pending count, periodic compute progress, compute/apply elapsed).
+// A nil logger is replaced with a no-op so the resolver never panics
+// when constructed without one (every direct caller of New gets Nop).
+func (r *Resolver) SetLogger(l *zap.Logger) {
+	if l == nil {
+		l = zap.NewNop()
+	}
+	r.logger = l
+}
+
+// SetGraph retargets the Resolver at a different Store. The indexer's
+// in-memory shadow-swap path needs this: the Resolver is constructed
+// against the disk Store at indexer-New time, but during IndexCtx the
+// indexer reassigns its own graph pointer to an in-memory shadow.
+// Without SetGraph the Resolver kept reading the (empty) disk Store
+// and short-circuited on len(pending) == 0, silently disabling every
+// resolver pass for backends that opt into the shadow swap.
+//
+// Holds the resolve mutex so a concurrent ResolveAll / ResolveFile
+// can't observe a half-rotated graph reference, and switches mu to
+// the new store's resolve mutex so subsequent passes serialise
+// against any Resolver built directly on the new Store.
+func (r *Resolver) SetGraph(g graph.Store) {
+	if g == nil {
+		return
+	}
+	oldMu := r.mu
+	if oldMu != nil {
+		oldMu.Lock()
+	}
+	r.graph = g
+	r.mu = g.ResolveMutex()
+	if oldMu != nil {
+		oldMu.Unlock()
+	}
 }
 
 // ResolveAll resolves all unresolved edges in the graph.
@@ -159,19 +217,78 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 	defer r.clearReachabilityIndex()
 	defer r.clearLSPIndex()
 
-	edges := r.graph.AllEdges()
-	// Pre-filter to the unresolved subset so workers don't burn time
-	// re-walking the whole edge slice — ~95% of edges in a settled
-	// graph are already resolved.
-	pending := edges[:0:0]
-	for _, e := range edges {
-		if strings.HasPrefix(e.To, unresolvedPrefix) {
-			pending = append(pending, e)
+	// Backend-delegated resolution: when the store implements
+	// graph.BackendResolver, drain the bulk-tractable subset of the
+	// resolver's work via a sequence of queries that run
+	// inside the backend engine. ON BY DEFAULT — opt out with
+	// GORTEX_BACKEND_RESOLVER=0 (see backendResolverEnabled). ResolveAllBulk
+	// chains the per-rule methods (SameFile → SamePackage → ImportAware → …)
+	// in precision-descending order, so higher-precision rules bind first
+	// and unique-name fallback only resolves what nothing more specific
+	// covered.
+	//
+	// This is the disk-only / large-repo path: without it the Go worker
+	// pool's ~100k+ per-edge round trips dominate wall time. The bulk pass
+	// drains the name-equality-tractable edges in-engine before the Go pool
+	// runs on whatever's left. Errors are non-fatal — the Go resolver
+	// re-runs on the remainder.
+	if backendResolverEnabled() {
+		if br, ok := r.graph.(graph.BackendResolver); ok {
+			bulkStart := time.Now()
+			n, err := br.ResolveAllBulk()
+			r.logger.Info("resolver: backend bulk pass",
+				zap.Int("resolved", n),
+				zap.Duration("elapsed", time.Since(bulkStart)),
+				zap.Error(err))
 		}
+	}
+
+	// Use the predicate-shaped Store method so disk backends scan
+	// only the contiguous "unresolved::*" slice instead of pulling
+	// the whole edges table back to the client and filtering in Go.
+	// In-memory keeps the same cost as the old AllEdges()+prefix-check
+	// loop.
+	var pending []*graph.Edge
+	for e := range r.graph.EdgesWithUnresolvedTarget() {
+		pending = append(pending, e)
 	}
 	if len(pending) == 0 {
 		return &ResolveStats{}
 	}
+
+	passStart := time.Now()
+	r.logger.Info("resolver: pass start",
+		zap.Int("pending", len(pending)),
+		zap.Bool("backend_bulk", backendResolverEnabled()))
+	var processed atomic.Int64
+	progressDone := make(chan struct{})
+	go func() {
+		t := time.NewTicker(3 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-progressDone:
+				return
+			case <-t.C:
+				r.logger.Info("resolver: compute progress",
+					zap.Int64("processed", processed.Load()),
+					zap.Int("pending", len(pending)),
+					zap.Duration("elapsed", time.Since(passStart)))
+			}
+		}
+	}()
+
+	// Pre-warm the per-pass lookup cache. The resolver workers below
+	// will call store.GetNode for endpoints and store.FindNodesByName
+	// for resolution candidates — across 10-30k pending edges that's
+	// 100k+ individual queries on a disk backend
+	// (hundreds of seconds wall time). Collecting the
+	// IDs / names upfront and batch-loading them collapses those
+	// queries to ~10 chunked SELECT IN statements. Cleared on return
+	// via defer so callers outside ResolveAll see the empty caches and
+	// fall through to the underlying store on every lookup.
+	r.warmLookupCache(pending)
+	defer r.clearLookupCache()
 
 	workers := runtime.NumCPU()
 	if workers < 1 {
@@ -206,6 +323,7 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 			for _, e := range slice {
 				clone := cloneEdgeForResolve(e)
 				oldTo, changed := r.resolveEdge(clone, ws)
+				processed.Add(1)
 				if changed {
 					jobs = append(jobs, reindexJob{
 						edge:       e,
@@ -228,6 +346,8 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 		}(w, pending[start:end])
 	}
 	wg.Wait()
+	close(progressDone)
+	computeElapsed := time.Since(passStart)
 
 	// Apply mutations + ReindexEdge serially. Mutating e.To inside
 	// a worker would race with the bucket-maintenance reads inside
@@ -237,6 +357,18 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 	// the race entirely; it costs ~5% of resolver wall time on a
 	// 12k-edge vscode pass and buys a clean -race run plus simpler
 	// reasoning.
+	// Collect every mutation across all workers into one slice and hand
+	// the whole batch to ReindexEdges. Disk-backed stores commit per
+	// chunk inside the implementation; the in-memory store loops
+	// through the existing per-edge code. Per-edge ReindexEdge was the
+	// resolver's bottleneck against bbolt (10k+ ACID round-trips); the
+	// batch form folds it to ≤(N/5000) commits without changing any
+	// observable semantics.
+	totalJobs := 0
+	for i := range perWorkerJobs {
+		totalJobs += len(perWorkerJobs[i])
+	}
+	reindexBatch := make([]graph.EdgeReindex, 0, totalJobs)
 	for i := range perWorkerJobs {
 		for _, j := range perWorkerJobs[i] {
 			j.edge.To = j.newTo
@@ -245,9 +377,18 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 			j.edge.Confidence = j.confidence
 			j.edge.Origin = j.origin
 			j.edge.Meta = j.meta
-			r.graph.ReindexEdge(j.edge, j.oldTo)
+			reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: j.edge, OldTo: j.oldTo})
 		}
 	}
+	r.logger.Info("resolver: compute done",
+		zap.Int("pending", len(pending)),
+		zap.Int("reindex_batch", len(reindexBatch)),
+		zap.Duration("elapsed", computeElapsed))
+	applyStart := time.Now()
+	r.graph.ReindexEdges(reindexBatch)
+	r.logger.Info("resolver: apply done",
+		zap.Int("edges", len(reindexBatch)),
+		zap.Duration("elapsed", time.Since(applyStart)))
 
 	// Cross-package name-match guard. The heuristic fallbacks above can
 	// resolve a call by name alone to a candidate in a package the
@@ -262,6 +403,54 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 			guarded += r.guardCrossPackageCallEdges(perWorkerJobs[i], closure)
 		}
 	}
+
+	// Rebind cross-file Go method receivers onto the canonical type
+	// node ID. The Go extractor builds the EdgeMemberOf target as
+	// `<methodfile>::TypeName` because it parses one file at a time;
+	// methods declared in files other than the type's defining file
+	// point at a phantom ID until this pass collapses them onto the
+	// real `<typefile>::TypeName` node. See rebindGoMethodReceivers
+	// for the full rationale (InferImplements + find_implementations
+	// + class_hierarchy correctness all ride on this).
+	r.rebindGoMethodReceivers()
+
+	// Scope-aware bare-name binding. Walks `unresolved::<name>` edges
+	// whose source is inside a function and rewrites them onto the
+	// matching KindLocal / KindParam node when exactly one in-scope
+	// binding wins under the Go shadowing rules. Without this pass
+	// the worker-pool fallback would scan FindNodesByName(name)
+	// across the whole graph and fall through to `unresolved::*` for
+	// every common identifier (err / data / src / ...). The bind
+	// uses #77's KindLocal nodes — pre-#77 there was nothing to
+	// bind to.
+	r.bindBareNameScopeRefs()
+
+	// Bind in-body references to a function's own generic type
+	// parameters (`var x T`, `func F[T any]() T { ... }`) onto the
+	// pre-existing KindGenericParam nodes — without this pass they
+	// stayed as `unresolved::T` even though the parser had already
+	// materialised the tparam node.
+	r.bindGenericParamRefs()
+
+	// Attribute Go language intrinsics (append / len / make / string
+	// / int / ...) to canonical `builtin::go::*` IDs and materialise
+	// one KindBuiltin node per unique builtin. Eliminates ~50k of
+	// the bare-name `unresolved::*` population on a Go-heavy
+	// codebase and turns the analytics queries that need these
+	// targets (`find_usages(builtin::go::type::float64)` for
+	// type-drift analysis) into one-hop lookups.
+	r.attributeGoBuiltins()
+
+	// Materialise stdlib / dep / external call targets as
+	// KindFunction nodes with KindModule parents so cross-package
+	// queries (`find_usages(stdlib::fmt::Sprintf)`,
+	// `get_callers(dep::github.com/stretchr/testify/assert::True)`,
+	// "what's our usage surface on encoding/json") become one-hop
+	// lookups. Must run AFTER resolveExtern (which classifies
+	// `unresolved::extern::*` into the stdlib/dep/external buckets)
+	// so we materialise the post-classification state, not the
+	// pre-classification shape.
+	r.attributeGoExternalCalls()
 
 	// Relative-import resolution for Python and Dart files. Runs
 	// before module attribution so internal-target stems never get
@@ -301,13 +490,11 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 //   - lastDirIndex keys on the last path component of that directory
 //     so an import of "logger" matches any file under .../logger/.
 func (r *Resolver) buildDirIndexes() {
-	nodes := r.graph.AllNodes()
-	r.dirIndex = make(map[string][]*graph.Node, len(nodes)/4)
-	r.lastDirIndex = make(map[string][]*graph.Node, len(nodes)/4)
-	for _, n := range nodes {
-		if n.Kind != graph.KindFile {
-			continue
-		}
+	r.dirIndex = make(map[string][]*graph.Node, 128)
+	r.lastDirIndex = make(map[string][]*graph.Node, 128)
+	// NodesByKind pushes the file-kind filter into the store; disk
+	// backends iterate just the file nodes instead of every node.
+	for n := range r.graph.NodesByKind(graph.KindFile) {
 		dir := filepath.Dir(n.FilePath)
 		r.dirIndex[dir] = append(r.dirIndex[dir], n)
 		last := lastPathComponent(dir)
@@ -320,6 +507,206 @@ func (r *Resolver) buildDirIndexes() {
 func (r *Resolver) clearDirIndexes() {
 	r.dirIndex = nil
 	r.lastDirIndex = nil
+}
+
+// warmLookupCache batches the per-edge GetNode / FindNodesByName
+// queries the worker loop would otherwise fire serially. We collect
+// every From/To node ID across the pending slice and the bare
+// identifier name embedded in each `unresolved::*` target, then issue
+// the two batched queries the Store exposes. Workers consult the
+// resulting maps via cachedGetNode / cachedFindNodesByName; misses
+// fall through to the underlying store.
+func (r *Resolver) warmLookupCache(pending []*graph.Edge) {
+	if len(pending) == 0 {
+		return
+	}
+	idSet := make(map[string]struct{}, len(pending)*2)
+	nameSet := make(map[string]struct{}, len(pending))
+	qualNameSet := make(map[string]struct{})
+	for _, e := range pending {
+		if e == nil {
+			continue
+		}
+		if e.From != "" {
+			idSet[e.From] = struct{}{}
+		}
+		// e.To still carries the "unresolved::" (or multi-repo
+		// "<repoPrefix>::unresolved::") prefix. Strip it with
+		// UnresolvedName, then reduce to the bare identifier the cascade
+		// resolvers actually look up ("*.m" -> "m", "extern::p::S" ->
+		// "S"). Seeding the embedded identifier — NOT the raw stub id,
+		// which matches no node — is what lets the worker's
+		// cachedFindNodesByName(InRepo) HIT instead of firing one
+		// FindNodesByName(InRepo) query per edge (the warmup storm).
+		if name := identifierFromTarget(graph.UnresolvedName(e.To)); name != "" {
+			nameSet[name] = struct{}{}
+		}
+		// Receiver types drive the method/field disambiguation passes
+		// (receiverIsInterface, same-receiver field/method preference);
+		// seed them too so those lookups hit the cache (or its
+		// authoritative negative) instead of falling through to a
+		// per-edge FindNodesByName.
+		if rt := edgeReceiverType(e); rt != "" {
+			nameSet[rt] = struct{}{}
+		}
+		// Import targets resolve by qualified name: resolveImport's first
+		// lookup is GetNodeByQualName(importPath), an unindexed scan per
+		// import edge on a disk backend. Seed the import path so it hits the
+		// qual-name cache (or its authoritative negative) instead.
+		if t := graph.UnresolvedName(e.To); strings.HasPrefix(t, "import::") {
+			if qn := strings.TrimPrefix(t, "import::"); qn != "" {
+				qualNameSet[qn] = struct{}{}
+			}
+		}
+	}
+	ids := make([]string, 0, len(idSet))
+	for id := range idSet {
+		ids = append(ids, id)
+	}
+	names := make([]string, 0, len(nameSet))
+	for n := range nameSet {
+		names = append(names, n)
+	}
+	r.nodeByID = r.graph.GetNodesByIDs(ids)
+	r.nodesByName = r.graph.FindNodesByNames(names)
+	// Authoritative negatives: a name we queried that has NO node in the
+	// graph (stdlib / external method calls — *.QueryRow, *.Errorf,
+	// *.Fatalf, *.StringVar, … — dominate the pending set) must be
+	// recorded as an empty result, not left absent. Absence means "not
+	// pre-warmed" so the cached lookup falls through to a per-edge
+	// FindNodesByName scan of the unindexed name column; across 200k+
+	// external-method stubs that fall-through IS the warmup hang.
+	// Backfilling the negative makes the pre-warmed name set
+	// authoritative — the lookup returns empty without touching the store.
+	if r.nodesByName == nil {
+		r.nodesByName = make(map[string][]*graph.Node, len(nameSet))
+	}
+	for n := range nameSet {
+		if _, ok := r.nodesByName[n]; !ok {
+			r.nodesByName[n] = nil
+		}
+	}
+	// Fold every candidate node returned by the name lookup into the
+	// id cache too: when a worker picks a candidate and the
+	// downstream guard (cross_pkg / cross_repo) calls GetNode on the
+	// chosen target, the cache should hit instead of falling through
+	// to a per-id store call.
+	if r.nodeByID == nil && len(r.nodesByName) > 0 {
+		r.nodeByID = make(map[string]*graph.Node, len(r.nodesByName))
+	}
+	for _, hits := range r.nodesByName {
+		for _, n := range hits {
+			if n == nil || n.ID == "" {
+				continue
+			}
+			if _, ok := r.nodeByID[n.ID]; !ok {
+				r.nodeByID[n.ID] = n
+			}
+		}
+	}
+	// Pre-warm the import qual-name cache + record authoritative negatives,
+	// so resolveImport's GetNodeByQualName hits the cache instead of
+	// scanning the unindexed qual_name column once per import edge.
+	if len(qualNameSet) > 0 {
+		qns := make([]string, 0, len(qualNameSet))
+		for q := range qualNameSet {
+			qns = append(qns, q)
+		}
+		r.nodesByQualName = r.graph.GetNodesByQualNames(qns)
+		if r.nodesByQualName == nil {
+			r.nodesByQualName = make(map[string]*graph.Node, len(qualNameSet))
+		}
+		for q := range qualNameSet {
+			if _, ok := r.nodesByQualName[q]; !ok {
+				r.nodesByQualName[q] = nil
+			}
+		}
+	}
+}
+
+func (r *Resolver) clearLookupCache() {
+	r.nodeByID = nil
+	r.nodesByName = nil
+	r.nodesByQualName = nil
+}
+
+// cachedGetNode returns the node for id, consulting the per-pass
+// lookup cache first and falling through to the underlying store on
+// miss. The cache is a positive-only fast path — absence means "not
+// pre-warmed", not "doesn't exist", so a miss still asks the store.
+// Outside a ResolveAll pass the cache is nil and every call goes
+// straight to the store.
+func (r *Resolver) cachedGetNode(id string) *graph.Node {
+	if id == "" {
+		return nil
+	}
+	if r.nodeByID != nil {
+		if n, ok := r.nodeByID[id]; ok {
+			return n
+		}
+	}
+	return r.graph.GetNode(id)
+}
+
+// cachedFindNodesByName returns the candidates for name, consulting
+// the per-pass cache first and falling through to the store on miss.
+// Returns the in-cache slice directly when hit — callers MUST treat
+// the result as read-only.
+func (r *Resolver) cachedFindNodesByName(name string) []*graph.Node {
+	if name == "" {
+		return nil
+	}
+	if r.nodesByName != nil {
+		if hits, ok := r.nodesByName[name]; ok {
+			return hits
+		}
+	}
+	return r.graph.FindNodesByName(name)
+}
+
+// cachedGetNodeByQualName serves resolveImport's qual-name lookup from the
+// per-pass cache. A pre-warmed qual_name with no node returns nil
+// (authoritative negative — most import paths have no matching package
+// node, and the unindexed per-edge GetNodeByQualName scan for them was a
+// cold-warmup compute storm); a qual_name absent from the cache falls
+// through to the store.
+func (r *Resolver) cachedGetNodeByQualName(qualName string) *graph.Node {
+	if qualName == "" {
+		return nil
+	}
+	if r.nodesByQualName != nil {
+		if n, ok := r.nodesByQualName[qualName]; ok {
+			return n
+		}
+	}
+	return r.graph.GetNodeByQualName(qualName)
+}
+
+// cachedFindNodesByNameInRepo is the repo-scoped twin of
+// cachedFindNodesByName: name-matched candidates whose RepoPrefix == repo,
+// served from the per-pass name cache (filtered in Go) so the
+// method/function/type/field cascade doesn't fire one
+// FindNodesByNameInRepo query per pending edge — the warmup storm that
+// the multi-repo prefixed-stub population (100k+ edges) turned into a
+// hang. Falls through to the store on a cache miss, preserving
+// correctness; the cache is positive-only (absence means "not
+// pre-warmed", not "doesn't exist").
+func (r *Resolver) cachedFindNodesByNameInRepo(name, repo string) []*graph.Node {
+	if name == "" {
+		return nil
+	}
+	if r.nodesByName != nil {
+		if hits, ok := r.nodesByName[name]; ok {
+			var out []*graph.Node
+			for _, n := range hits {
+				if n != nil && n.RepoPrefix == repo {
+					out = append(out, n)
+				}
+			}
+			return out
+		}
+	}
+	return r.graph.FindNodesByNameInRepo(name, repo)
 }
 
 // buildDepModuleIndex collects every dep::<module-path> contract node
@@ -335,12 +722,8 @@ func (r *Resolver) clearDirIndexes() {
 // repo — those resolve through the cross-repo file graph instead and
 // have no module path embedded in the ID.
 func (r *Resolver) buildDepModuleIndex() {
-	nodes := r.graph.AllNodes()
 	by := make(map[string][]depModuleEntry)
-	for _, n := range nodes {
-		if n.Kind != graph.KindContract {
-			continue
-		}
+	for n := range r.graph.NodesByKind(graph.KindContract) {
 		if !strings.HasPrefix(n.ID, "dep::") {
 			continue
 		}
@@ -396,20 +779,24 @@ func (r *Resolver) ResolveFile(filePath string) *ResolveStats {
 	stats := &ResolveStats{}
 
 	// Get all nodes in the file, then check their outgoing edges.
-	// Single-threaded path — apply ReindexEdge inline as before.
-	// Resolved edges are also recorded as jobs so the cross-package
-	// guard can re-check (and, if needed, revert) the weak-tier ones.
+	// Single-threaded path — collect mutations into a batch and flush
+	// in one ReindexEdges call after the file's edges are walked, so a
+	// per-file ResolveFile pass produces one Tx commit on disk
+	// backends instead of one per resolved edge. Resolved edges are
+	// also recorded as jobs so the cross-package guard can re-check
+	// (and, if needed, revert) the weak-tier ones.
 	var jobs []reindexJob
+	var reindexBatch []graph.EdgeReindex
 	nodes := r.graph.GetFileNodes(filePath)
 	for _, n := range nodes {
 		edges := r.graph.GetOutEdges(n.ID)
 		for _, e := range edges {
-			if !strings.HasPrefix(e.To, unresolvedPrefix) {
+			if !graph.IsUnresolvedTarget(e.To) {
 				continue
 			}
 			oldTo, changed := r.resolveEdge(e, stats)
 			if changed {
-				r.graph.ReindexEdge(e, oldTo)
+				reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: e, OldTo: oldTo})
 				jobs = append(jobs, reindexJob{
 					edge:       e,
 					oldTo:      oldTo,
@@ -420,6 +807,9 @@ func (r *Resolver) ResolveFile(filePath string) *ResolveStats {
 				})
 			}
 		}
+	}
+	if len(reindexBatch) > 0 {
+		r.graph.ReindexEdges(reindexBatch)
 	}
 
 	// Cross-package name-match guard — same contract as in ResolveAll.
@@ -435,7 +825,127 @@ func (r *Resolver) ResolveFile(filePath string) *ResolveStats {
 			}
 		}
 	}
+
+	// Re-run the attribution passes that ResolveAll runs. ResolveFile
+	// handles incremental updates — a re-parse of one file emits
+	// fresh `unresolved::<name>` edges that haven't been seen by these
+	// passes yet, so without re-running them the incremental graph
+	// diverges from a cold re-index (caught by
+	// TestIncrementalReindex_ConvergesToFullIndex). Each pass is
+	// idempotent on already-rewritten edges (the `unresolved::`
+	// prefix check makes a second sweep a no-op).
+	r.rebindGoMethodReceivers()
+	r.bindBareNameScopeRefs()
+	r.bindGenericParamRefs()
+	r.attributeGoBuiltins()
+	r.attributeGoExternalCalls()
+
 	return stats
+}
+
+// ResolveIncomingForFile is the reverse of ResolveFile: instead of
+// resolving the file's own OUTGOING references, it binds pending
+// `unresolved::<Name>` edges in OTHER files that reference a symbol
+// (re)defined in this file. After a definition is added or re-indexed,
+// callers elsewhere still point at an unresolved stub — either one
+// emitted at their own extraction time, or one restubIncomingRefs
+// re-created when this file's prior concrete node was evicted. This
+// rebinds them, scoped to this file's symbol names, so it costs
+// O(references to those names), not a whole-graph ResolveAll. It uses
+// the same reachability / import gates as ResolveFile (via resolveEdge),
+// so an ambiguous name binds no differently and unsafe matches stay
+// pending for the periodic ResolveAll.
+func (r *Resolver) ResolveIncomingForFile(filePath string) *ResolveStats {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.buildDirIndexes()
+	defer r.clearDirIndexes()
+	r.buildDepModuleIndex()
+	defer r.clearDepModuleIndex()
+	r.buildProvidesForIndex()
+	defer r.clearProvidesForIndex()
+	r.buildReachabilityIndex()
+	defer r.clearReachabilityIndex()
+	defer r.clearLSPIndex()
+
+	stats := &ResolveStats{}
+	r.resolveIncomingLocked(filePath, stats)
+	return stats
+}
+
+// resolveIncomingLocked is the core of the reverse pass. Caller holds
+// r.mu and has built the per-pass indexes. For each distinct
+// referenceable symbol name defined in filePath it looks up the pending
+// edges parked under that name's unresolved-stub id — GetInEdges keyed
+// by the `unresolved::<Name>` target, so no new index is needed: the
+// stub id IS the in-edge bucket key — and runs the normal per-edge
+// resolution against them. Both the bare and the `<repoPrefix>::`
+// multi-repo stub forms are probed.
+func (r *Resolver) resolveIncomingLocked(filePath string, stats *ResolveStats) {
+	defNodes := r.graph.GetFileNodes(filePath)
+	if len(defNodes) == 0 {
+		return
+	}
+	seen := make(map[string]struct{}, len(defNodes))
+	var stubKeys []string
+	for _, n := range defNodes {
+		if n == nil || n.Name == "" || !graph.IsReferenceableSymbol(n.Kind) {
+			continue
+		}
+		if _, dup := seen[n.Name]; dup {
+			continue
+		}
+		seen[n.Name] = struct{}{}
+		stubKeys = append(stubKeys, graph.UnresolvedMarker+n.Name)
+		if n.RepoPrefix != "" {
+			stubKeys = append(stubKeys, n.RepoPrefix+"::"+graph.UnresolvedMarker+n.Name)
+		}
+	}
+	if len(stubKeys) == 0 {
+		return
+	}
+
+	var reindexBatch []graph.EdgeReindex
+	var jobs []reindexJob
+	for _, key := range stubKeys {
+		for _, e := range r.graph.GetInEdges(key) {
+			if e == nil || !graph.IsUnresolvedTarget(e.To) {
+				continue
+			}
+			oldTo, changed := r.resolveEdge(e, stats)
+			if changed {
+				reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: e, OldTo: oldTo})
+				jobs = append(jobs, reindexJob{
+					edge:       e,
+					oldTo:      oldTo,
+					newTo:      e.To,
+					kind:       e.Kind,
+					confidence: e.Confidence,
+					origin:     e.Origin,
+				})
+			}
+		}
+	}
+	if len(reindexBatch) > 0 {
+		r.graph.ReindexEdges(reindexBatch)
+	}
+
+	// Same cross-package name-match guard ResolveFile applies: revert a
+	// weak-tier call edge whose freshly-bound target lives in a package
+	// the caller never imports.
+	if len(jobs) > 0 {
+		if closure := r.buildImportClosure(); len(closure) > 0 {
+			if guarded := r.guardCrossPackageCallEdges(jobs, closure); guarded > 0 {
+				if stats.Resolved >= guarded {
+					stats.Resolved -= guarded
+				} else {
+					stats.Resolved = 0
+				}
+				stats.Unresolved += guarded
+			}
+		}
+	}
 }
 
 // reindexJob captures the resolved state for an edge whose target
@@ -524,7 +1034,18 @@ func releaseResolverClone(clone *graph.Edge) {
 // ResolveAll). When nothing changed the returned bool is false.
 func (r *Resolver) resolveEdge(e *graph.Edge, stats *ResolveStats) (oldTo string, changed bool) {
 	oldTo = e.To
-	target := strings.TrimPrefix(e.To, unresolvedPrefix)
+	// graph.UnresolvedName handles both `unresolved::Name` (legacy)
+	// and `<repoPrefix>::unresolved::Name` (multi-repo COPY rewrite).
+	// strings.TrimPrefix only stripped the bare form, leaving every
+	// multi-repo edge with target=full-id and no downstream pattern
+	// match — that was the root cause of find_usages returning zero
+	// callers across the whole gortex repo.
+	target := graph.UnresolvedName(e.To)
+	if target == "" {
+		// Not an unresolved stub at all — fall through with the raw
+		// id so the pattern dispatch below sees the original value.
+		target = strings.TrimPrefix(e.To, unresolvedPrefix)
+	}
 
 	// Resolve-time LSP hot-path. Consulted for TS/JS/JSX/TSX files
 	// (and any other languages a future helper claims via
@@ -633,7 +1154,7 @@ func (r *Resolver) resolveEdge(e *graph.Edge, stats *ResolveStats) (oldTo string
 			// every CLI-wired command and command-table entry looks
 			// like dead code.
 			if e.Kind == graph.EdgeReads && e.To != before {
-				if n := r.graph.GetNode(e.To); n != nil && (n.Kind == graph.KindFunction || n.Kind == graph.KindMethod) {
+				if n := r.cachedGetNode(e.To); n != nil && (n.Kind == graph.KindFunction || n.Kind == graph.KindMethod) {
 					e.Kind = graph.EdgeReferences
 				}
 			}
@@ -671,8 +1192,11 @@ func (r *Resolver) resolveExtern(e *graph.Edge, spec string, stats *ResolveStats
 
 	// Pass 1: does the symbol live in a file under this import path?
 	// Reuse dirIndex populated by buildDirIndexes — no extra scan.
+	// cachedFindNodesByName lands in the per-pass batch cache for
+	// the common worker hot path; falls through to the store when
+	// called outside ResolveAll.
 	callerRepo := r.callerRepoPrefix(e)
-	candidates := r.graph.FindNodesByName(symbol)
+	candidates := r.cachedFindNodesByName(symbol)
 	for _, c := range candidates {
 		if c.Kind != graph.KindFunction && c.Kind != graph.KindMethod && c.Kind != graph.KindType && c.Kind != graph.KindInterface {
 			continue
@@ -702,12 +1226,15 @@ func (r *Resolver) resolveExtern(e *graph.Edge, spec string, stats *ResolveStats
 	// Pass 2: classify the import path. "stdlib::" when the path looks
 	// like a Go stdlib package (no dot in the first segment and not a
 	// known module vendor prefix). "dep::" otherwise. Callers can treat
-	// both as external for edge-walk purposes.
-	prefix := "dep::"
+	// both as external for edge-walk purposes. The stdlib stub carries
+	// the caller's repo prefix (see internal/graph/stub.go) so two repos
+	// pinned to different Go SDK versions get distinct fmt::Errorf nodes
+	// instead of one shared, version-conflated terminal.
 	if isStdlibLike(importPath) {
-		prefix = "stdlib::"
+		e.To = graph.StubID(callerRepo, graph.StubKindStdlib, importPath, symbol)
+	} else {
+		e.To = "dep::" + importPath + "::" + symbol
 	}
-	e.To = prefix + importPath + "::" + symbol
 	stats.External++
 }
 
@@ -737,7 +1264,7 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 	importPath, npmAliased := rewriteNpmAliasImport(r.npmAlias, e.FilePath, importPath)
 
 	// Look for a package node with matching qualified name.
-	node := r.graph.GetNodeByQualName(importPath)
+	node := r.cachedGetNodeByQualName(importPath)
 	if node != nil {
 		e.To = node.ID
 		if callerRepo != "" && node.RepoPrefix != "" && node.RepoPrefix != callerRepo {
@@ -805,10 +1332,7 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 			}
 		}
 	} else {
-		for _, n := range r.graph.AllNodes() {
-			if n.Kind != graph.KindFile {
-				continue
-			}
+		for n := range r.graph.NodesByKind(graph.KindFile) {
 			dir := filepath.Dir(n.FilePath)
 			if strings.HasSuffix(dir, lastPathComponent(importPath)) || dir == importPath {
 				consider(n)
@@ -857,7 +1381,7 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 	// sub-module the importer reached for.
 	if npmAliased {
 		if pkg := npmPackagePrefix(importPath); pkg != "" {
-			if node := r.graph.GetNodeByQualName(pkg); node != nil {
+			if node := r.cachedGetNodeByQualName(pkg); node != nil {
 				e.To = node.ID
 				if callerRepo != "" && node.RepoPrefix != "" && node.RepoPrefix != callerRepo {
 					e.CrossRepo = true
@@ -875,7 +1399,7 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 
 func (r *Resolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *ResolveStats) {
 	callerRepo := r.callerRepoPrefix(e)
-	candidates := r.graph.FindNodesByNameInRepo(funcName, callerRepo)
+	candidates := r.cachedFindNodesByNameInRepo(funcName, callerRepo)
 	if len(candidates) == 0 {
 		// No same-repo candidate. A genuine cross-repo callee is left
 		// unresolved here for CrossRepoResolver — which alone carries the
@@ -935,7 +1459,7 @@ func (r *Resolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *Re
 // genuine cross-repo case with import-reachability evidence.
 func (r *Resolver) resolveTypeOrFunc(e *graph.Edge, name string, stats *ResolveStats) {
 	callerRepo := r.callerRepoPrefix(e)
-	candidates := r.graph.FindNodesByNameInRepo(name, callerRepo)
+	candidates := r.cachedFindNodesByNameInRepo(name, callerRepo)
 	if len(candidates) == 0 {
 		stats.Unresolved++
 		return
@@ -996,7 +1520,7 @@ func (r *Resolver) resolveTypeRef(e *graph.Edge, name string, stats *ResolveStat
 	// the `*.` and resolve on the bare type name.
 	name = strings.TrimPrefix(name, "*.")
 	callerRepo := r.callerRepoPrefix(e)
-	candidates := r.graph.FindNodesByNameInRepo(name, callerRepo)
+	candidates := r.cachedFindNodesByNameInRepo(name, callerRepo)
 	if len(candidates) == 0 {
 		stats.Unresolved++
 		return
@@ -1030,7 +1554,7 @@ func (r *Resolver) resolveTypeRef(e *graph.Edge, name string, stats *ResolveStat
 // write but the runtime target is actually a method/property).
 func (r *Resolver) resolveFieldRef(e *graph.Edge, fieldName string, stats *ResolveStats) bool {
 	receiverType := edgeReceiverType(e)
-	candidates := r.graph.FindNodesByNameInRepo(fieldName, r.callerRepoPrefix(e))
+	candidates := r.cachedFindNodesByNameInRepo(fieldName, r.callerRepoPrefix(e))
 	if len(candidates) == 0 {
 		return false
 	}
@@ -1060,7 +1584,7 @@ func (r *Resolver) resolveFieldRef(e *graph.Edge, fieldName string, stats *Resol
 	}
 
 	// Pass 3: caller is a method on type T, prefer a same-T field.
-	if callerNode := r.graph.GetNode(e.From); callerNode != nil && callerNode.Kind == graph.KindMethod {
+	if callerNode := r.cachedGetNode(e.From); callerNode != nil && callerNode.Kind == graph.KindMethod {
 		callerRecv := nodeReceiverType(callerNode)
 		if callerRecv != "" {
 			for _, c := range candidates {
@@ -1092,7 +1616,7 @@ func (r *Resolver) resolveMethodCall(e *graph.Edge, methodName string, stats *Re
 	// method call across a repo boundary by name. A cross-repo method
 	// call is left unresolved for CrossRepoResolver, which carries the
 	// import-reachability + workspace-boundary evidence.
-	rawCandidates := r.graph.FindNodesByNameInRepo(methodName, r.callerRepoPrefix(e))
+	rawCandidates := r.cachedFindNodesByNameInRepo(methodName, r.callerRepoPrefix(e))
 	if len(rawCandidates) == 0 {
 		if r.applyBuiltinIfKnown(e, methodName, stats) {
 			return
@@ -1183,7 +1707,7 @@ func (r *Resolver) resolveMethodCall(e *graph.Edge, methodName string, stats *Re
 	// If the caller is a method on type X and there's a candidate method on
 	// type X with the same name, prefer it.  This handles e.extractFunctions()
 	// where the type env doesn't have a hint for parameter-bound receivers.
-	callerNode := r.graph.GetNode(e.From)
+	callerNode := r.cachedGetNode(e.From)
 	if callerNode != nil && callerNode.Kind == graph.KindMethod {
 		callerRecv := nodeReceiverType(callerNode)
 		if callerRecv != "" {
@@ -1303,7 +1827,7 @@ func (r *Resolver) receiverIsInterface(receiverType string) bool {
 	if receiverType == "" {
 		return false
 	}
-	for _, n := range r.graph.FindNodesByName(receiverType) {
+	for _, n := range r.cachedFindNodesByName(receiverType) {
 		if n.Kind == graph.KindInterface {
 			return true
 		}
@@ -1325,7 +1849,7 @@ func (r *Resolver) applyBuiltinIfKnown(e *graph.Edge, methodName string, stats *
 	if !ok {
 		return false
 	}
-	e.To = "builtin::" + lang + "::" + category + "::" + methodName
+	e.To = graph.StubID(r.callerRepoPrefix(e), graph.StubKindBuiltin, lang, category, methodName)
 	stats.External++
 	return true
 }
@@ -1341,7 +1865,7 @@ func (r *Resolver) resolveTokenRef(e *graph.Edge, name string, stats *ResolveSta
 	// repos ("TOKEN", "CONFIG", …); a cross-repo first-candidate pick
 	// is a name-only guess. CrossRepoResolver handles genuine cross-repo
 	// token references.
-	candidates := r.graph.FindNodesByNameInRepo(name, r.callerRepoPrefix(e))
+	candidates := r.cachedFindNodesByNameInRepo(name, r.callerRepoPrefix(e))
 	if len(candidates) == 0 {
 		stats.Unresolved++
 		return
@@ -1372,8 +1896,8 @@ func (r *Resolver) resolveTokenRef(e *graph.Edge, name string, stats *ResolveSta
 // comparisons that found nothing (vscode has zero NestJS modules).
 func (r *Resolver) buildProvidesForIndex() {
 	idx := make(map[string]map[string]struct{})
-	for _, ed := range r.graph.AllEdges() {
-		if ed.Kind != graph.EdgeProvides || ed.Meta == nil {
+	for ed := range r.graph.EdgesByKind(graph.EdgeProvides) {
+		if ed.Meta == nil {
 			continue
 		}
 		pf, _ := ed.Meta["provides_for"].(string)
@@ -1385,8 +1909,8 @@ func (r *Resolver) buildProvidesForIndex() {
 		}
 		to := ed.To
 		var name string
-		if strings.HasPrefix(to, "unresolved::") {
-			name = strings.TrimPrefix(to, "unresolved::")
+		if graph.IsUnresolvedTarget(to) {
+			name = graph.UnresolvedName(to)
 		} else if cut := strings.LastIndex(to, "::"); cut >= 0 {
 			name = to[cut+2:]
 		} else {
@@ -1430,21 +1954,15 @@ func (r *Resolver) buildReachabilityIndex() {
 	}
 
 	// Seed with each indexed file's own directory.
-	for _, n := range r.graph.AllNodes() {
-		if n.Kind != graph.KindFile {
-			continue
-		}
+	for n := range r.graph.NodesByKind(graph.KindFile) {
 		addDir(n.ID, filepath.Dir(n.FilePath))
 	}
 
-	for _, e := range r.graph.AllEdges() {
-		if e.Kind != graph.EdgeImports {
-			continue
-		}
+	for e := range r.graph.EdgesByKind(graph.EdgeImports) {
 		var importedDir string
 		switch {
-		case strings.HasPrefix(e.To, "unresolved::import::"):
-			path := strings.TrimPrefix(e.To, "unresolved::import::")
+		case graph.IsUnresolvedTarget(e.To) && strings.HasPrefix(graph.UnresolvedName(e.To), "import::"):
+			path := strings.TrimPrefix(graph.UnresolvedName(e.To), "import::")
 			if files := r.dirIndex[path]; len(files) > 0 {
 				importedDir = filepath.Dir(files[0].FilePath)
 			} else if last := lastPathComponent(path); last != "" {
@@ -1531,6 +2049,202 @@ func nodeReceiverType(n *graph.Node) string {
 	return ""
 }
 
+// memberMethodInfosByType returns the storage layer's per-type member
+// method projection verbatim. Routed through MemberMethodsByType when
+// the backend implements it; falls back to an EdgesByKind +
+// per-edge GetNode walk that synthesises matching info rows.
+func memberMethodInfosByType(g graph.Store) map[string][]graph.MemberMethodInfo {
+	if cap, ok := g.(graph.MemberMethodsByType); ok {
+		return cap.MemberMethodsByType()
+	}
+	out := map[string][]graph.MemberMethodInfo{}
+	for e := range g.EdgesByKind(graph.EdgeMemberOf) {
+		method := g.GetNode(e.From)
+		if method == nil || method.Kind != graph.KindMethod {
+			continue
+		}
+		out[e.To] = append(out[e.To], graph.MemberMethodInfo{
+			MethodID:   method.ID,
+			Name:       method.Name,
+			FilePath:   method.FilePath,
+			StartLine:  method.StartLine,
+			RepoPrefix: method.RepoPrefix,
+		})
+	}
+	return out
+}
+
+// edgesByKinds yields every edge whose Kind is in the given set,
+// using the EdgesByKindsScanner capability when the backend
+// implements it (one query — an IN-list scan) and falling back to a
+// chain of per-kind EdgesByKind iterators otherwise.
+func edgesByKinds(g graph.Store, kinds []graph.EdgeKind) iter.Seq[*graph.Edge] {
+	if scan, ok := g.(graph.EdgesByKindsScanner); ok {
+		return scan.EdgesByKinds(kinds)
+	}
+	return func(yield func(*graph.Edge) bool) {
+		for _, k := range kinds {
+			for e := range g.EdgesByKind(k) {
+				if !yield(e) {
+					return
+				}
+			}
+		}
+	}
+}
+
+// nodesByKindsOrAll returns every node whose Kind is in the given
+// set, using the NodesByKindsScanner capability when the backend
+// implements it (a single kind-IN scan) and falling back to
+// AllNodes + Go-side filter otherwise.
+func nodesByKindsOrAll(g graph.Store, kinds ...graph.NodeKind) []*graph.Node {
+	if scan, ok := g.(graph.NodesByKindsScanner); ok {
+		return scan.NodesByKinds(kinds)
+	}
+	set := make(map[graph.NodeKind]struct{}, len(kinds))
+	for _, k := range kinds {
+		set[k] = struct{}{}
+	}
+	var out []*graph.Node
+	for _, n := range g.AllNodes() {
+		if n == nil {
+			continue
+		}
+		if _, ok := set[n.Kind]; ok {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// memberMethodsByType returns typeID → method-name-set for every
+// EdgeMemberOf edge whose source is a KindMethod node. Routed through
+// the storage layer's MemberMethodsByType capability when the backend
+// implements it (one query — a join, server-side), falling back to the
+// EdgesByKind + per-edge GetNode loop the resolver used before the
+// capability landed. Used by InferImplements (and shaped to match its
+// existing map[string]map[string]bool API).
+func memberMethodsByType(g graph.Store) map[string]map[string]bool {
+	if cap, ok := g.(graph.MemberMethodsByType); ok {
+		raw := cap.MemberMethodsByType()
+		if len(raw) == 0 {
+			return nil
+		}
+		out := make(map[string]map[string]bool, len(raw))
+		for typeID, methods := range raw {
+			set := make(map[string]bool, len(methods))
+			for _, m := range methods {
+				set[m.Name] = true
+			}
+			out[typeID] = set
+		}
+		return out
+	}
+	out := map[string]map[string]bool{}
+	for e := range g.EdgesByKind(graph.EdgeMemberOf) {
+		methodNode := g.GetNode(e.From)
+		if methodNode == nil || methodNode.Kind != graph.KindMethod {
+			continue
+		}
+		if out[e.To] == nil {
+			out[e.To] = make(map[string]bool)
+		}
+		out[e.To][methodNode.Name] = true
+	}
+	return out
+}
+
+// memberMethodNodesByType returns typeID → name → method-node for
+// every EdgeMemberOf edge whose source is a KindMethod node. Routed
+// through the storage layer's MemberMethodsByType capability when the
+// backend implements it (the projection ships only the four columns
+// the consumer reads — ID / Name / FilePath / StartLine — packed into
+// a synthetic *Node that carries no Meta / QualName / Language); falls
+// back to the EdgesByKind + per-edge GetNode loop otherwise. Used by
+// InferOverrides which keys methods by name and reads ID/FilePath/
+// StartLine off the node when it emits an EdgeOverrides edge.
+func memberMethodNodesByType(g graph.Store) map[string]map[string]*graph.Node {
+	if cap, ok := g.(graph.MemberMethodsByType); ok {
+		raw := cap.MemberMethodsByType()
+		if len(raw) == 0 {
+			return nil
+		}
+		out := make(map[string]map[string]*graph.Node, len(raw))
+		for typeID, methods := range raw {
+			set := make(map[string]*graph.Node, len(methods))
+			for _, m := range methods {
+				set[m.Name] = &graph.Node{
+					ID:         m.MethodID,
+					Kind:       graph.KindMethod,
+					Name:       m.Name,
+					FilePath:   m.FilePath,
+					StartLine:  m.StartLine,
+					RepoPrefix: m.RepoPrefix,
+				}
+			}
+			out[typeID] = set
+		}
+		return out
+	}
+	out := map[string]map[string]*graph.Node{}
+	for e := range g.EdgesByKind(graph.EdgeMemberOf) {
+		method := g.GetNode(e.From)
+		if method == nil || method.Kind != graph.KindMethod {
+			continue
+		}
+		set := out[e.To]
+		if set == nil {
+			set = make(map[string]*graph.Node)
+			out[e.To] = set
+		}
+		set[method.Name] = method
+	}
+	return out
+}
+
+// structuralParentEdges returns every EdgeExtends / EdgeImplements /
+// EdgeComposes edge whose endpoints are both KindType / KindInterface,
+// projected as the (FromID, ToID, Origin) tuples InferOverrides
+// consumes. Routed through the storage layer's StructuralParentEdges
+// capability when the backend implements it (one query — a join with
+// kind filters on both sides — no per-edge GetNode); falls back to
+// the AllEdges + per-edge GetNode walk otherwise.
+func structuralParentEdges(g graph.Store) []graph.StructuralParentEdgeRow {
+	if cap, ok := g.(graph.StructuralParentEdges); ok {
+		return cap.StructuralParentEdges()
+	}
+	parentKinds := map[graph.EdgeKind]bool{
+		graph.EdgeExtends:    true,
+		graph.EdgeImplements: true,
+		graph.EdgeComposes:   true,
+	}
+	var out []graph.StructuralParentEdgeRow
+	for _, e := range g.AllEdges() {
+		if e == nil || !parentKinds[e.Kind] {
+			continue
+		}
+		from := g.GetNode(e.From)
+		to := g.GetNode(e.To)
+		if from == nil || to == nil {
+			continue
+		}
+		if from.Kind != graph.KindType && from.Kind != graph.KindInterface {
+			continue
+		}
+		if to.Kind != graph.KindType && to.Kind != graph.KindInterface {
+			continue
+		}
+		out = append(out, graph.StructuralParentEdgeRow{
+			FromID:   from.ID,
+			ToID:     to.ID,
+			FromKind: from.Kind,
+			ToKind:   to.Kind,
+			Origin:   e.Origin,
+		})
+	}
+	return out
+}
+
 // InferImplements detects structural interface satisfaction by comparing
 // method sets and adds EdgeImplements edges from types to interfaces.
 // Returns the number of edges added.
@@ -1543,11 +2257,7 @@ func (r *Resolver) InferImplements() int {
 	}
 	var ifaces []ifaceInfo
 
-	allNodes := r.graph.AllNodes()
-	for _, n := range allNodes {
-		if n.Kind != graph.KindInterface {
-			continue
-		}
+	for n := range r.graph.NodesByKind(graph.KindInterface) {
 		if n.Meta == nil {
 			continue
 		}
@@ -1580,23 +2290,7 @@ func (r *Resolver) InferImplements() int {
 	}
 
 	// Step 2: Build map of type ID -> set of method names via EdgeMemberOf edges.
-	typeMethods := make(map[string]map[string]bool)
-	allEdges := r.graph.AllEdges()
-	for _, e := range allEdges {
-		if e.Kind != graph.EdgeMemberOf {
-			continue
-		}
-		// EdgeMemberOf: From=method, To=type
-		methodNode := r.graph.GetNode(e.From)
-		if methodNode == nil || methodNode.Kind != graph.KindMethod {
-			continue
-		}
-		typeID := e.To
-		if typeMethods[typeID] == nil {
-			typeMethods[typeID] = make(map[string]bool)
-		}
-		typeMethods[typeID][methodNode.Name] = true
-	}
+	typeMethods := memberMethodsByType(r.graph)
 
 	// Step 3: For each type, check if its method set satisfies each interface.
 	//
@@ -1615,6 +2309,12 @@ func (r *Resolver) InferImplements() int {
 	for tid := range typeMethods {
 		typeList = append(typeList, tid)
 	}
+
+	// Prefetch every type node referenced by EdgeMemberOf in one batch
+	// before the workers spin up — on disk backends a per-worker
+	// GetNode(typeID) was an N+1 over cgo that the workers' parallelism
+	// could not hide.
+	typeNodes := r.graph.GetNodesByIDs(typeList)
 
 	workers := runtime.NumCPU()
 	if workers < 1 {
@@ -1645,7 +2345,7 @@ func (r *Resolver) InferImplements() int {
 			var out []pair
 			for _, typeID := range slice {
 				methods := typeMethods[typeID]
-				typeNode := r.graph.GetNode(typeID)
+				typeNode := typeNodes[typeID]
 				if typeNode == nil || (typeNode.Kind != graph.KindType && typeNode.Kind != graph.KindInterface) {
 					continue
 				}
@@ -1723,22 +2423,7 @@ func (r *Resolver) InferOverrides() int {
 	defer r.mu.Unlock()
 
 	// Step 1: index methods by their owning type via EdgeMemberOf.
-	typeMembers := make(map[string]map[string]*graph.Node) // typeID → name → method node
-	for _, e := range r.graph.AllEdges() {
-		if e.Kind != graph.EdgeMemberOf {
-			continue
-		}
-		method := r.graph.GetNode(e.From)
-		if method == nil || method.Kind != graph.KindMethod {
-			continue
-		}
-		set := typeMembers[e.To]
-		if set == nil {
-			set = make(map[string]*graph.Node)
-			typeMembers[e.To] = set
-		}
-		set[method.Name] = method
-	}
+	typeMembers := memberMethodNodesByType(r.graph) // typeID → name → method node
 	if len(typeMembers) == 0 {
 		return 0
 	}
@@ -1747,33 +2432,17 @@ func (r *Resolver) InferOverrides() int {
 	// edge, walk the child's methods and emit EdgeOverrides where the
 	// parent has a same-named method. Skip if the override edge
 	// already exists.
-	parentKinds := map[graph.EdgeKind]bool{
-		graph.EdgeExtends:    true,
-		graph.EdgeImplements: true,
-		graph.EdgeComposes:   true,
-	}
 	type overridePair struct {
 		from, to *graph.Node
 		origin   string
 	}
 	var pending []overridePair
-	for _, e := range r.graph.AllEdges() {
-		if !parentKinds[e.Kind] {
+	for _, row := range structuralParentEdges(r.graph) {
+		if row.FromID == row.ToID {
 			continue
 		}
-		child := r.graph.GetNode(e.From)
-		parent := r.graph.GetNode(e.To)
-		if child == nil || parent == nil || child.ID == parent.ID {
-			continue
-		}
-		if child.Kind != graph.KindType && child.Kind != graph.KindInterface {
-			continue
-		}
-		if parent.Kind != graph.KindType && parent.Kind != graph.KindInterface {
-			continue
-		}
-		childMethods := typeMembers[child.ID]
-		parentMethods := typeMembers[parent.ID]
+		childMethods := typeMembers[row.FromID]
+		parentMethods := typeMembers[row.ToID]
 		if len(childMethods) == 0 || len(parentMethods) == 0 {
 			continue
 		}
@@ -1781,10 +2450,10 @@ func (r *Resolver) InferOverrides() int {
 		// the override edge so blast-radius queries can filter by
 		// min_tier consistently.
 		origin := graph.OriginASTInferred
-		if e.Origin == graph.OriginASTResolved {
+		if row.Origin == graph.OriginASTResolved {
 			origin = graph.OriginASTResolved
-		} else if rank := graph.OriginRank(e.Origin); rank >= graph.OriginRank(graph.OriginLSPDispatch) {
-			origin = e.Origin
+		} else if rank := graph.OriginRank(row.Origin); rank >= graph.OriginRank(graph.OriginLSPDispatch) {
+			origin = row.Origin
 		}
 		for name, cm := range childMethods {
 			pm, ok := parentMethods[name]
@@ -1796,6 +2465,7 @@ func (r *Resolver) InferOverrides() int {
 	}
 
 	added := 0
+	var provBatch []graph.EdgeProvenanceUpdate
 	for _, p := range pending {
 		// Skip when the edge already exists.
 		dup := false
@@ -1803,11 +2473,13 @@ func (r *Resolver) InferOverrides() int {
 			if existing.Kind == graph.EdgeOverrides && existing.To == p.to.ID {
 				dup = true
 				// Upgrade the provenance of the existing override edge
-				// through SetEdgeProvenance so the identity change is
-				// counted — a bare existing.Origin write would bypass
-				// the revision counter.
+				// through SetEdgeProvenanceBatch so the identity change
+				// is counted — a bare existing.Origin write would
+				// bypass the revision counter. Batched so a large
+				// hierarchy pass commits its provenance bumps in
+				// chunks on disk backends.
 				if graph.OriginRank(existing.Origin) < graph.OriginRank(p.origin) {
-					r.graph.SetEdgeProvenance(existing, p.origin)
+					provBatch = append(provBatch, graph.EdgeProvenanceUpdate{Edge: existing, NewOrigin: p.origin})
 				}
 				break
 			}
@@ -1826,6 +2498,9 @@ func (r *Resolver) InferOverrides() int {
 			Origin:          p.origin,
 		})
 		added++
+	}
+	if len(provBatch) > 0 {
+		r.graph.SetEdgeProvenanceBatch(provBatch)
 	}
 	return added
 }
@@ -1859,7 +2534,10 @@ func dirMatchesImport(dir, importPath string) bool {
 
 // callerRepoPrefix returns the RepoPrefix of the node that owns the edge's From field.
 func (r *Resolver) callerRepoPrefix(e *graph.Edge) string {
-	fromNode := r.graph.GetNode(e.From)
+	// cachedGetNode: the pre-warm batch-loads every pending edge's From
+	// id, so this is a map hit during ResolveAll instead of one GetNode
+	// query per edge.
+	fromNode := r.cachedGetNode(e.From)
 	if fromNode != nil {
 		return fromNode.RepoPrefix
 	}

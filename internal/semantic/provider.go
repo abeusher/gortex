@@ -20,12 +20,12 @@ type Provider interface {
 	// Enrich performs a full enrichment pass over the graph for the given repo root.
 	// It upgrades edge confidence, adds missing edges, and fills Node.Meta fields.
 	// Called after tree-sitter indexing + resolver pass completes.
-	Enrich(g *graph.Graph, repoRoot string) (*EnrichResult, error)
+	Enrich(g graph.Store, repoRoot string) (*EnrichResult, error)
 
 	// EnrichFile performs a targeted enrichment for a single file and its
 	// immediate dependents. Used in watch mode for incremental updates.
 	// Returns nil result if incremental enrichment is not supported.
-	EnrichFile(g *graph.Graph, repoRoot string, filePath string) (*EnrichResult, error)
+	EnrichFile(g graph.Store, repoRoot string, filePath string) (*EnrichResult, error)
 
 	// Close releases any resources held by the provider (daemon processes,
 	// temp files, connections).

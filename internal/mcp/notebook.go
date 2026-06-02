@@ -5,13 +5,14 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/zzet/gortex/internal/persistence"
 )
 
 // notebookEntry is a single repository-local persistent notebook
@@ -33,44 +34,113 @@ type notebookEntry struct {
 	Body       string
 }
 
-// notebookManager owns the on-disk notebook store. The directory is
-// the repo's .gortex/notebook/ tree; an empty dir yields a no-op
-// manager so test fixtures and single-shot CLI calls don't fail.
+// notebookManager owns the repository notebook store, now backed by
+// the SQLite sidecar DB (the sidecar lives at <repoPath>/.gortex/
+// sidecar.sqlite, co-located with the repo as the markdown layout was).
+// A nil sidecar yields a no-op manager so test fixtures and
+// single-shot CLI calls don't fail. The notebookEntry shape is
+// unchanged; only the persistence layer moved from per-entry markdown
+// files to sqlite rows.
 type notebookManager struct {
-	mu  sync.Mutex
-	dir string
+	mu      sync.Mutex
+	sidecar *persistence.SidecarStore
+	repoKey string
+	// legacyDir is the historical <repoPath>/.gortex/notebook/ markdown
+	// directory, kept so the one-shot migration can find + rename old
+	// <id>.md files. Empty when uninitialised.
+	legacyDir string
 	// ttl applies to LastUsed when set: entries unused for longer
 	// than ttl are pruned at save time. 0 disables pruning.
 	ttl time.Duration
 }
 
-// newNotebookManager returns a manager rooted at <repoPath>/.gortex/
-// notebook/. Empty repoPath yields a no-disk manager (the methods
-// are still safe to call, they just no-op the persistence).
+// newNotebookManager returns a manager whose sidecar DB lives at
+// <repoPath>/.gortex/sidecar.sqlite. Empty repoPath yields a no-disk
+// manager (the methods are still safe to call, they just no-op the
+// persistence and Save returns an honest "not initialised" error). Any
+// legacy <repoPath>/.gortex/notebook/<id>.md files are imported once,
+// then renamed to <id>.md.bak.
 func newNotebookManager(repoPath string) *notebookManager {
 	if repoPath == "" {
 		return &notebookManager{}
 	}
+	gortexDir := filepath.Join(repoPath, ".gortex")
+	sidecar, err := persistence.OpenSidecar(persistence.DefaultSidecarPath(gortexDir))
+	if err != nil || sidecar == nil {
+		return &notebookManager{}
+	}
+	repoKey := persistence.RepoCacheKey(repoPath)
+	legacyDir := filepath.Join(gortexDir, "notebook")
+	_ = sidecar.MigrateLegacyNotebook(repoKey, legacyDir, importLegacyNotebookMD)
 	return &notebookManager{
-		dir: filepath.Join(repoPath, ".gortex", "notebook"),
-		ttl: 30 * 24 * time.Hour,
+		sidecar:   sidecar,
+		repoKey:   repoKey,
+		legacyDir: legacyDir,
+		ttl:       30 * 24 * time.Hour,
+	}
+}
+
+// importLegacyNotebookMD parses a markdown notebook file's contents
+// into a sidecar NotebookRow for the one-shot migration.
+func importLegacyNotebookMD(id, contents string) (persistence.NotebookRow, bool) {
+	e, err := notebookUnmarshal(contents)
+	if err != nil {
+		return persistence.NotebookRow{}, false
+	}
+	return persistence.NotebookRow{
+		ID:        id,
+		Title:     e.Title,
+		Body:      e.Body,
+		Tags:      e.Tags,
+		UsedCount: e.UsedCount,
+		LastUsed:  e.LastUsed,
+		Created:   e.Created,
+		Updated:   e.Updated,
+	}, true
+}
+
+// rowToEntry / entryToRow convert between the public notebookEntry and
+// the sidecar NotebookRow.
+func rowToEntry(r persistence.NotebookRow) notebookEntry {
+	return notebookEntry{
+		ID:        r.ID,
+		Title:     r.Title,
+		Tags:      r.Tags,
+		Created:   r.Created,
+		Updated:   r.Updated,
+		LastUsed:  r.LastUsed,
+		UsedCount: r.UsedCount,
+		Body:      r.Body,
+	}
+}
+
+func entryToRow(e notebookEntry) persistence.NotebookRow {
+	return persistence.NotebookRow{
+		ID:        e.ID,
+		Title:     e.Title,
+		Body:      e.Body,
+		Tags:      e.Tags,
+		UsedCount: e.UsedCount,
+		LastUsed:  e.LastUsed,
+		Created:   e.Created,
+		Updated:   e.Updated,
 	}
 }
 
 // Save persists a notebook entry. Generates an ID when missing.
-// Returns the entry as it landed on disk (id + timestamps set).
+// Returns the entry as it landed in the sidecar (id + timestamps set).
 //
-// Errors when the manager has no backing directory — the daemon's
-// multi-repo path historically called InitNotebook("") which left
-// nm.dir empty, and the old behaviour was to *silently succeed*: the
-// caller got an ID and timestamps back but no entry ever landed on
-// disk, so notebook_list / notebook_find / notebook_show / notebook_used
-// all returned empty afterwards. Honest failure beats phantom success.
+// Errors when the manager has no backing sidecar — the daemon's
+// multi-repo path historically called InitNotebook("") which left the
+// manager empty, and the old behaviour was to *silently succeed*: the
+// caller got an ID and timestamps back but no entry ever persisted, so
+// notebook_list / notebook_find / notebook_show / notebook_used all
+// returned empty afterwards. Honest failure beats phantom success.
 func (nm *notebookManager) Save(entry notebookEntry) (notebookEntry, error) {
 	nm.mu.Lock()
 	defer nm.mu.Unlock()
 
-	if nm.dir == "" {
+	if nm.sidecar == nil {
 		return notebookEntry{}, errors.New("notebook is not initialised")
 	}
 
@@ -83,10 +153,7 @@ func (nm *notebookManager) Save(entry notebookEntry) (notebookEntry, error) {
 	}
 	entry.Updated = now
 
-	if err := os.MkdirAll(nm.dir, 0o755); err != nil {
-		return entry, fmt.Errorf("mkdir notebook: %w", err)
-	}
-	if err := os.WriteFile(nm.entryPath(entry.ID), []byte(notebookMarshal(entry)), 0o644); err != nil {
+	if err := nm.sidecar.UpsertNotebook(nm.repoKey, entryToRow(entry)); err != nil {
 		return entry, fmt.Errorf("write notebook: %w", err)
 	}
 	// Best-effort TTL prune. Failures don't fail the save — the
@@ -96,43 +163,34 @@ func (nm *notebookManager) Save(entry notebookEntry) (notebookEntry, error) {
 }
 
 // Get loads a single entry by id. Returns (entry, true) on hit,
-// (zero, false) when the file is missing.
+// (zero, false) when the entry is missing.
 func (nm *notebookManager) Get(id string) (notebookEntry, bool) {
 	nm.mu.Lock()
 	defer nm.mu.Unlock()
-	if nm.dir == "" {
+	if nm.sidecar == nil {
 		return notebookEntry{}, false
 	}
-	body, err := os.ReadFile(nm.entryPath(id))
-	if err != nil {
+	row, ok := nm.sidecar.GetNotebookRow(nm.repoKey, id)
+	if !ok {
 		return notebookEntry{}, false
 	}
-	entry, err := notebookUnmarshal(string(body))
-	if err != nil {
-		return notebookEntry{}, false
-	}
-	entry.ID = id
-	return entry, true
+	return rowToEntry(row), true
 }
 
-// Delete removes an entry from disk. Missing files are not errors —
-// callers can use Delete unconditionally.
+// Delete removes an entry. Missing entries are not errors — callers
+// can use Delete unconditionally.
 func (nm *notebookManager) Delete(id string) error {
 	nm.mu.Lock()
 	defer nm.mu.Unlock()
-	if nm.dir == "" {
+	if nm.sidecar == nil {
 		return nil
 	}
-	err := os.Remove(nm.entryPath(id))
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	return nil
+	return nm.sidecar.DeleteNotebook(nm.repoKey, id)
 }
 
-// List returns every entry on disk sorted by Updated DESC. Cheap
-// enough for typical notebook sizes (hundreds of entries); the cap
-// at the call site keeps responses bounded.
+// List returns every entry sorted by Updated DESC. Cheap enough for
+// typical notebook sizes (hundreds of entries); the cap at the call
+// site keeps responses bounded.
 func (nm *notebookManager) List() []notebookEntry {
 	nm.mu.Lock()
 	defer nm.mu.Unlock()
@@ -140,28 +198,16 @@ func (nm *notebookManager) List() []notebookEntry {
 }
 
 func (nm *notebookManager) listLocked() []notebookEntry {
-	if nm.dir == "" {
+	if nm.sidecar == nil {
 		return nil
 	}
-	entries, err := os.ReadDir(nm.dir)
+	rows, err := nm.sidecar.LoadNotebookRows(nm.repoKey)
 	if err != nil {
 		return nil
 	}
-	out := make([]notebookEntry, 0, len(entries))
-	for _, de := range entries {
-		if de.IsDir() || !strings.HasSuffix(de.Name(), ".md") {
-			continue
-		}
-		body, err := os.ReadFile(filepath.Join(nm.dir, de.Name()))
-		if err != nil {
-			continue
-		}
-		e, err := notebookUnmarshal(string(body))
-		if err != nil {
-			continue
-		}
-		e.ID = strings.TrimSuffix(de.Name(), ".md")
-		out = append(out, e)
+	out := make([]notebookEntry, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, rowToEntry(r))
 	}
 	sort.Slice(out, func(i, j int) bool {
 		return out[i].Updated.After(out[j].Updated)
@@ -204,52 +250,35 @@ func (nm *notebookManager) Find(query string) []notebookEntry {
 func (nm *notebookManager) MarkUsed(id string) (notebookEntry, error) {
 	nm.mu.Lock()
 	defer nm.mu.Unlock()
-	if nm.dir == "" {
+	if nm.sidecar == nil {
 		return notebookEntry{}, fmt.Errorf("notebook is not initialised")
 	}
-	body, err := os.ReadFile(nm.entryPath(id))
-	if err != nil {
-		return notebookEntry{}, err
+	row, ok := nm.sidecar.GetNotebookRow(nm.repoKey, id)
+	if !ok {
+		return notebookEntry{}, fmt.Errorf("notebook entry %q not found", id)
 	}
-	entry, err := notebookUnmarshal(string(body))
-	if err != nil {
-		return notebookEntry{}, err
-	}
-	entry.ID = id
+	entry := rowToEntry(row)
 	entry.UsedCount++
 	entry.LastUsed = time.Now().UTC()
-	if err := os.WriteFile(nm.entryPath(id), []byte(notebookMarshal(entry)), 0o644); err != nil {
+	if err := nm.sidecar.UpsertNotebook(nm.repoKey, entryToRow(entry)); err != nil {
 		return notebookEntry{}, err
 	}
 	return entry, nil
 }
 
 // pruneLocked removes entries whose LastUsed (or Updated, when never
-// used) is older than the TTL. Best-effort — silent on individual
-// errors so a permission glitch on one file doesn't poison the
-// rest of the call.
+// used) is older than the TTL via a bounded DELETE on the sidecar.
+// Best-effort — a failure is silent so the next call retries.
 func (nm *notebookManager) pruneLocked() {
-	if nm.dir == "" || nm.ttl <= 0 {
+	if nm.sidecar == nil || nm.ttl <= 0 {
 		return
 	}
 	cutoff := time.Now().UTC().Add(-nm.ttl)
-	for _, e := range nm.listLocked() {
-		ref := e.LastUsed
-		if ref.IsZero() {
-			ref = e.Updated
-		}
-		if ref.Before(cutoff) {
-			_ = os.Remove(nm.entryPath(e.ID))
-		}
-	}
+	_ = nm.sidecar.NotebookPrune(nm.repoKey, cutoff)
 }
 
-func (nm *notebookManager) entryPath(id string) string {
-	return filepath.Join(nm.dir, id+".md")
-}
-
-// newNotebookID returns a short random hex string suitable for a
-// file basename. 16 chars = 8 bytes = ample collision resistance
+// newNotebookID returns a short random hex string suitable for an
+// entry id. 16 chars = 8 bytes = ample collision resistance
 // for a per-repo notebook.
 func newNotebookID() string {
 	var buf [8]byte

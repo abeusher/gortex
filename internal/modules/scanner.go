@@ -948,7 +948,7 @@ func BuildGraphArtifacts(filePath string, specs []Spec) ([]*graph.Node, []*graph
 // dependencies. Multi-version imports (Go's `module/v2` shape)
 // match the longest spec; a manifest declaring both `bar` and
 // `bar/v2` will resolve `import bar/v2/sub` to the v2 spec.
-func LinkImports(g *graph.Graph, specs []Spec, ownModulePath string) int {
+func LinkImports(g graph.Store, specs []Spec, ownModulePath string) int {
 	if g == nil {
 		return 0
 	}
@@ -961,7 +961,7 @@ func LinkImports(g *graph.Graph, specs []Spec, ownModulePath string) int {
 // in multi-repo mode should pass the repo's own KindImport nodes (e.g.
 // from g.GetRepoNodes(repoPrefix) filtered by Kind) so each pass stays
 // O(repo size).
-func LinkImportsIn(g *graph.Graph, importNodes []*graph.Node, specs []Spec, ownModulePath string) int {
+func LinkImportsIn(g graph.Store, importNodes []*graph.Node, specs []Spec, ownModulePath string) int {
 	if g == nil || len(specs) == 0 || len(importNodes) == 0 {
 		return 0
 	}

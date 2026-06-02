@@ -75,9 +75,18 @@ type IndexResult struct {
 	// (MaxExtractMillis). Each is recorded in the graph as a synthetic
 	// file node carrying skipped_due_to_size / skipped_due_to_timeout
 	// telemetry. Zero unless one of those caps is set.
-	SkippedFiles int          `json:"skipped_files,omitempty"`
-	DurationMs   int64        `json:"duration_ms"`
-	Errors       []IndexError `json:"errors,omitempty"`
+	SkippedFiles int `json:"skipped_files,omitempty"`
+	// DeletedFileCount is the number of previously-indexed files that
+	// were evicted this pass because they no longer exist on disk (only
+	// populated by IncrementalReindex). Together with StaleFileCount it
+	// lets a batch caller — the daemon warmup loop in particular — decide
+	// whether a repo actually changed since the last shutdown: when both
+	// are zero across every repo, the persisted graph already carries
+	// every resolved / derived edge and the global resolution passes can
+	// be skipped entirely (the warm-restart fast path).
+	DeletedFileCount int          `json:"deleted_file_count,omitempty"`
+	DurationMs       int64        `json:"duration_ms"`
+	Errors           []IndexError `json:"errors,omitempty"`
 }
 
 // EdgeSanityViolated reports the post-reindex sanity-check failure: an
@@ -101,7 +110,14 @@ type IndexError struct {
 
 // Indexer walks a repository and populates the graph.
 type Indexer struct {
-	graph         *graph.Graph
+	graph graph.Store
+	// indexCount tracks how many IndexCtx calls this Indexer has
+	// completed. Gates the cold-start shadow-swap: each per-repo
+	// Indexer in MultiIndexer is fresh (indexCount==0), so all of
+	// them take the shadow path regardless of what sibling repos
+	// have already drained into the shared disk store. Per-repo-
+	// prefixed stub IDs make the concurrent drains conflict-free.
+	indexCount    atomic.Int32
 	registry      *parser.Registry
 	resolver      *resolver.Resolver
 	search        search.Backend
@@ -273,6 +289,15 @@ type Indexer struct {
 	// absent file produces empty rules and a no-op pass.
 	codeownersOnce  sync.Once
 	codeownersRules []codeowners.Rule
+
+	// cloneIndex maintains the clone-detection CMS + length-stratified
+	// LSH live across single-file edits, so a steady-state reindex
+	// updates EdgeSimilarTo edges in O(edited file) instead of the
+	// whole-graph detectClonesAndEmitEdges recompute. Constructed empty
+	// (built=false) — a batch/global clone pass calls Rebuild to seed it,
+	// after which indexFile drives EvictFuncs/UpdateFuncs. While un-built
+	// indexFile falls back to the whole-graph pass.
+	cloneIndex *incrementalCloneIndex
 }
 
 // contractCacheEntry is a cached contract-extraction result for one file.
@@ -281,8 +306,12 @@ type contractCacheEntry struct {
 	contracts []contracts.Contract
 }
 
-// New creates an Indexer.
-func New(g *graph.Graph, reg *parser.Registry, cfg config.IndexConfig, logger *zap.Logger) *Indexer {
+// New creates an Indexer that writes through the supplied graph.Store.
+// Any backend (in-memory, SQLite-on-disk, remote) is acceptable — the
+// indexer's mutation paths go through the Store interface methods only,
+// so swapping backends is a zero-code-change configuration choice for
+// callers.
+func New(g graph.Store, reg *parser.Registry, cfg config.IndexConfig, logger *zap.Logger) *Indexer {
 	idx := &Indexer{
 		graph:    g,
 		registry: reg,
@@ -291,12 +320,21 @@ func New(g *graph.Graph, reg *parser.Registry, cfg config.IndexConfig, logger *z
 		// corpus sizes can happen in a background goroutine without
 		// racing with concurrent searches. Subsequent reassignments to
 		// idx.search (Hybrid wrap, etc.) should use swap helpers below.
-		search:        search.NewSwappable(search.NewAuto()),
+		//
+		// When the backing store implements graph.SymbolSearcher
+		// (today only store_sqlite), the initial backend is a thin
+		// adapter that forwards Search to the store's native FTS.
+		// The in-process Bleve / BM25 build path is then bypassed
+		// entirely — saving ~100MB heap on a Vscode-scale repo and
+		// putting search in the same address space as the rest of
+		// the graph queries.
+		search:        search.NewSwappable(initialSearchBackend(g)),
 		config:        cfg,
 		transforms:    newTransformPipeline(cfg.Transforms, logger),
 		logger:        logger,
 		fileMtimes:    make(map[string]int64),
 		contractCache: make(map[string]*contractCacheEntry),
+		cloneIndex:    newIncrementalCloneIndex(),
 	}
 	// Resolve JS/TS imports declared through an npm alias against the
 	// local index. The index is built lazily on first use — the repo
@@ -345,6 +383,87 @@ func searchIndexFields(n *graph.Node) []string {
 	return []string{n.Name, n.FilePath, sig}
 }
 
+// vectorSearcherDelegate is the search.VectorDelegate-shaped
+// adapter the indexer hands to VectorBackend.SetDelegate when the
+// underlying store implements graph.VectorSearcher. SimilarTo just
+// forwards — search.VectorDelegate is defined to return
+// graph.VectorHit slices directly, so there's no translation work
+// here, just a small struct so the in-process search package
+// doesn't depend on graph.VectorSearcher's full surface.
+type vectorSearcherDelegate struct {
+	s graph.VectorSearcher
+}
+
+func (d *vectorSearcherDelegate) SimilarTo(vec []float32, limit int) ([]graph.VectorHit, error) {
+	if d == nil || d.s == nil {
+		return nil, nil
+	}
+	return d.s.SimilarTo(vec, limit)
+}
+
+// initialSearchBackend picks the search.Backend the indexer wraps
+// in its Swappable on construction. When the underlying store
+// implements graph.SymbolSearcher (today only store_sqlite), a
+// thin adapter routes Search calls through the store's native FTS
+// — the in-process BM25 / Bleve build path is bypassed entirely.
+// Otherwise falls through to search.NewAuto which picks BM25 for
+// small corpora and auto-upgrades to Bleve once the size warrants
+// it.
+func initialSearchBackend(g graph.Store) search.Backend {
+	if s, ok := g.(graph.SymbolSearcher); ok {
+		return search.NewSymbolSearcherBackend(s)
+	}
+	return search.NewAuto()
+}
+
+// isSymbolSearcherBackend reports whether the swappable's currently
+// active backend is the SymbolSearcher adapter. Used to suppress
+// the Bleve auto-upgrade goroutine — if the active backend is
+// already a native FTS, upgrading to Bleve would re-index the same
+// corpus into a parallel in-process Bleve and silently swap it in,
+// defeating the FTS path and pinning the ~100MB heap the FTS
+// integration was meant to release.
+func isSymbolSearcherBackend(b search.Backend) bool {
+	if b == nil {
+		return false
+	}
+	if sw, ok := b.(*search.Swappable); ok {
+		b = sw.Inner()
+	}
+	_, ok := b.(*search.SymbolSearcherBackend)
+	return ok
+}
+
+// ftsTokensFor produces the pre-tokenised text the backend FTS path
+// indexes. Mirrors searchIndexFields' field selection but joins
+// every field through search.Tokenize (camelCase / snake_case /
+// path-segment splitter) so the resulting token list matches the
+// in-process BM25 corpus contract — the same query produces the
+// same recall against either backend. Joined with spaces so the
+// downstream COPY FROM sees a single STRING column value.
+func ftsTokensFor(n *graph.Node) string {
+	fields := searchIndexFields(n)
+	if n.QualName != "" {
+		// QualName carries the dotted form (`pkg.Sub.Type.Method`)
+		// that adds qualifier-hop recall ("auth" matching
+		// "auth.ValidateToken"). searchIndexFields omits it for
+		// the legacy BM25 path (which folds qual into the
+		// name-token bag separately), so we add it explicitly here.
+		fields = append(fields, n.QualName)
+	}
+	tokens := make([]string, 0, 16)
+	for _, f := range fields {
+		if f == "" {
+			continue
+		}
+		tokens = append(tokens, search.Tokenize(f)...)
+	}
+	if len(tokens) == 0 {
+		return ""
+	}
+	return strings.Join(tokens, " ")
+}
+
 // shouldIndexForSearch reports whether a node should be added to the
 // text search index (BM25/Bleve). File and Import nodes are never
 // searchable symbols. Beyond that, config.SkipSearch filters out
@@ -355,6 +474,22 @@ func searchIndexFields(n *graph.Node) []string {
 // this predicate so they can't drift.
 func (idx *Indexer) shouldIndexForSearch(n *graph.Node) bool {
 	if n.Kind == graph.KindFile || n.Kind == graph.KindImport {
+		return false
+	}
+	// KindLocal nodes are intra-function bindings emitted to satisfy
+	// rel-table FK constraints on the dataflow edges that target
+	// locals. They have a real Name (the variable identifier) but
+	// surfacing them in BM25 would flood every search for common
+	// names like `err`, `data`, `n`, `i`. Excluded unconditionally.
+	if n.Kind == graph.KindLocal {
+		return false
+	}
+	// KindBuiltin nodes are language intrinsics (append / len /
+	// string / int / ...). Surfacing them in name search would
+	// drown every other hit on common identifiers — agents already
+	// know `string` / `append`. They remain queryable by kind and
+	// by ID for the analytics passes that care.
+	if n.Kind == graph.KindBuiltin {
 		return false
 	}
 	// Prose-section nodes are searchable only when prose indexing is
@@ -485,7 +620,7 @@ func (idx *Indexer) upgradeSearchToBleve(snapshot []bleveUpgradeEntry) {
 }
 
 // Graph returns the underlying graph.
-func (idx *Indexer) Graph() *graph.Graph { return idx.graph }
+func (idx *Indexer) Graph() graph.Store { return idx.graph }
 
 // Search returns the search backend.
 func (idx *Indexer) Search() search.Backend { return idx.search }
@@ -560,7 +695,7 @@ func (idx *Indexer) RunGlobalGraphPasses(ctx context.Context) {
 		)
 	}
 	reporter.Report("clone detection pass (global)", 0, 0)
-	if cs := detectClonesAndEmitEdgesCtx(ctx, idx.graph, idx.cloneThreshold()); cs.Items > 0 {
+	if cs := detectClonesAndEmitEdgesCtx(ctx, idx.graph, idx.repoPrefix, idx.cloneThreshold()); cs.Items > 0 {
 		idx.logger.Info("clone edges emitted (global)",
 			zap.Int("items", cs.Items),
 			zap.Int("clone_pairs", cs.Pairs),
@@ -570,6 +705,12 @@ func (idx *Indexer) RunGlobalGraphPasses(ctx context.Context) {
 			zap.Int("diffused_pairs", cs.DiffusedPairs),
 			zap.Int("diffused_edges", cs.DiffusedEdges),
 		)
+	}
+	// Seed the incremental clone index from the freshly-baselined
+	// signatures + sidecar so steady-state single-file edits after this
+	// batch go incremental instead of re-running the whole-graph pass.
+	if idx.cloneIndex != nil {
+		idx.cloneIndex.Rebuild(idx.graph, idx.repoPrefix)
 	}
 	// gRPC stub-call resolution. Runs after InferImplements (the
 	// interface-satisfaction fallback signal depends on its
@@ -644,12 +785,16 @@ func (idx *Indexer) RunDeferredPasses(ctx context.Context) {
 		return
 	}
 	reporter := progress.FromContext(ctx)
+	tphase := time.Now()
+	var dGoMod, dResolve, dEnrich, dContract time.Duration
 
 	// Materialise dep::<module> contract nodes from go.mod BEFORE
 	// ResolveAll so the resolver's import bridge can re-target Go
 	// imports of declared modules to their dep contract node instead
 	// of producing an `external::` stub.
 	idx.extractGoModContracts(idx.pendingContractReg)
+	dGoMod = time.Since(tphase)
+	tphase = time.Now()
 
 	// Per-repo resolver.ResolveAll walks the entire shared graph; with R
 	// repos and E edges that's O(R · E). The MultiIndexer batch driver
@@ -661,6 +806,8 @@ func (idx *Indexer) RunDeferredPasses(ctx context.Context) {
 		reporter.Report("resolving references", 0, 0)
 		idx.resolver.ResolveAll()
 	}
+	dResolve = time.Since(tphase)
+	tphase = time.Now()
 
 	if idx.semanticMgr != nil && idx.semanticMgr.Enabled() && idx.semanticMgr.HasProviders() {
 		reporter.Report("semantic enrichment", 0, 0)
@@ -682,6 +829,9 @@ func (idx *Indexer) RunDeferredPasses(ctx context.Context) {
 		}
 	}
 
+	dEnrich = time.Since(tphase)
+	tphase = time.Now()
+
 	reporter.Report("extracting contracts", 0, 0)
 	// extractGoModContracts already ran (see above) so dep nodes
 	// were available during ResolveAll's import-bridge pass.
@@ -689,6 +839,13 @@ func (idx *Indexer) RunDeferredPasses(ctx context.Context) {
 	idx.extractDIContracts(idx.pendingContractReg)
 	idx.commitContracts(idx.pendingContractReg)
 	idx.pendingContractReg = nil
+	dContract = time.Since(tphase)
+	idx.logger.Info("DEFERRED-TIMING per-repo",
+		zap.String("repo", idx.repoPrefix),
+		zap.Duration("gomod", dGoMod),
+		zap.Duration("resolve", dResolve),
+		zap.Duration("enrich", dEnrich),
+		zap.Duration("contract_commit", dContract))
 }
 
 // RootPath returns the root path used for relative path computation.
@@ -1506,7 +1663,7 @@ func (idx *Indexer) Index(root string) (*IndexResult, error) {
 // is pulled from ctx via progress.FromContext — attach one with
 // progress.WithReporter to receive stage updates. If no reporter is attached,
 // stage calls are silently dropped.
-func (idx *Indexer) IndexCtx(ctx context.Context, root string) (*IndexResult, error) {
+func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexResult, retErr error) {
 	start := time.Now()
 	reporter := progress.FromContext(ctx)
 
@@ -1584,6 +1741,213 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (*IndexResult, er
 	}
 	reporter.Report("walking files", len(files), len(files))
 
+	// In-memory shadow for cold-start indexing on disk-backed stores.
+	// Disk backends pay ms-level per-call cost on every read; running
+	// the resolver against the disk store turns its ~100k+ point
+	// lookups into many minutes of wall time. Instead, swap idx.graph
+	// to an in-memory *Graph for the whole IndexCtx pipeline — parse,
+	// resolve, all subpasses, every per-edge MERGE/MATCH stays in
+	// memory at nanosecond latency. At the end, dump the final state
+	// to the disk backend via one BulkLoad cycle, so the disk has the
+	// post-resolve graph and the bench's query workload runs against
+	// the persisted state.
+	//
+	// Guards:
+	//   - Backend must implement graph.BulkLoader (the on-disk backend opts in).
+	//   - Store must be empty (NodeCount == 0 && EdgeCount == 0). The
+	//     final dump is BulkLoad's INSERT-only fast path — running it
+	//     against a non-empty store would corrupt or duplicate.
+	//     Incremental / re-index flows fall through to the per-call
+	//     AddBatch path against the disk store directly.
+	//   - File count is below the shadow-max threshold (see
+	//     shadowMaxFileCount). Above the threshold the shadow's RAM
+	//     footprint would exceed available memory — Linux / Firefox
+	//     at full scale (~10M+ edges) would push the shadow past
+	//     20GB. Override with GORTEX_SHADOW_MAX_FILES.
+	//   - The swap happens before the parse worker pool starts and is
+	//     committed before IndexCtx returns. retErr from the named
+	//     return suppresses the commit when the pipeline errored —
+	//     the disk store stays empty rather than capturing partial
+	//     state.
+	var diskTarget graph.Store
+	var inMemShadow *graph.Graph
+	bl, blOK := idx.graph.(graph.BulkLoader)
+	// Per-Indexer sentinel: each *Indexer is constructed fresh
+	// (per-repo in MultiIndexer, once in single-repo daemons), so
+	// "this Indexer has indexed before" is the right question to
+	// gate the shadow-swap on. The legacy gate looked at the
+	// disk store's NodeCount, but in MultiIndexer the disk store
+	// holds data from sibling repos that already drained — the
+	// gate would mis-fire and force the big repo onto the per-row
+	// path. With per-repo-prefixed stub IDs (internal/graph/stub.go)
+	// concurrent shadow drains no longer conflict on PRIMARY KEY,
+	// so disk-non-empty is safe.
+	firstIndex := idx.indexCount.Load() == 0
+	belowShadowMax := len(files) <= shadowMaxFileCount()
+	preNodes := idx.graph.NodeCount()
+	preEdges := idx.graph.EdgeCount()
+	idx.logger.Info("indexer: shadow-swap decision",
+		zap.String("repo", idx.RepoPrefix()),
+		zap.Bool("bulk_loader", blOK),
+		zap.Bool("first_index", firstIndex),
+		zap.Int("pre_nodes", preNodes),
+		zap.Int("pre_edges", preEdges),
+		zap.Int("files", len(files)),
+		zap.Int("shadow_max_files", shadowMaxFileCount()),
+		zap.Bool("below_shadow_max", belowShadowMax),
+		zap.Bool("shadow_taken", blOK && firstIndex && belowShadowMax),
+	)
+	if blOK && firstIndex && belowShadowMax {
+		// Warm-restart safety. `firstIndex` is a PER-INDEXER sentinel, and
+		// a fresh per-repo Indexer is constructed on every daemon restart,
+		// so firstIndex is true on every restart — even when the
+		// persistent disk store already holds this repo's nodes from a
+		// prior run. The shadow drain below ends in BulkLoad's INSERT-only
+		// COPY, which (per this function's own contract) "running against a
+		// non-empty store would corrupt or duplicate". A duplicate-primary-
+		// key bulk load against the persisted rows would fail warmup, and
+		// because the repo's mtimes never get persisted when warmup dies
+		// first, the failure re-fires on the next restart: a crash loop.
+		// Evicting the repo's existing rows first makes the bulk load land
+		// on a clean slate. EvictRepo self-guards with a count query, so this is a
+		// cheap no-op for the genuine first-index cases (true cold start,
+		// a newly-tracked repo) where the disk store has no rows for this
+		// prefix. preNodes>0 short-circuits the call entirely on the
+		// first repo of a cold start (empty store).
+		if preNodes > 0 {
+			if n, e := idx.graph.EvictRepo(idx.RepoPrefix()); n > 0 || e > 0 {
+				idx.logger.Info("indexer: evicted stale repo rows before bulk reload (warm restart)",
+					zap.String("repo", idx.RepoPrefix()),
+					zap.Int("nodes", n), zap.Int("edges", e))
+			}
+		}
+		idx.indexCount.Add(1)
+		diskTarget = idx.graph
+		inMemShadow = graph.New()
+		idx.graph = inMemShadow
+		// The resolver was constructed at indexer.New with the disk
+		// Store. Redirect it at the shadow too, otherwise ResolveAll
+		// reads from the empty disk Store, finds no pending edges,
+		// and short-circuits — silently disabling every resolver pass
+		// (module attribution, relative imports, edge in-place
+		// resolution, …) for any backend that takes the shadow path.
+		if idx.resolver != nil {
+			idx.resolver.SetGraph(inMemShadow)
+		}
+		defer func() {
+			if retErr != nil {
+				idx.graph = diskTarget
+				if idx.resolver != nil {
+					idx.resolver.SetGraph(diskTarget)
+				}
+				return
+			}
+			reporter.Report("persisting bulk graph", 0, 0)
+			drainStart := time.Now()
+			shadowNodeCount := inMemShadow.NodeCount()
+			shadowEdgeCount := inMemShadow.EdgeCount()
+			idx.logger.Info("indexer: drain start (shadow → disk)",
+				zap.String("repo", idx.RepoPrefix()),
+				zap.Int("shadow_nodes", shadowNodeCount),
+				zap.Int("shadow_edges", shadowEdgeCount),
+			)
+			bl.BeginBulkLoad()
+			// Drain the shadow shard-by-shard so the indexer's hold on
+			// the 11-GB Linux-scale graph is released progressively
+			// instead of pinned until persist returns. The drain
+			// iterators free each shard's node/edge maps as they
+			// advance, so peak RAM during the persist window is
+			// roughly the chunk buffer + the backend's working set,
+			// not full shadow + the disk backend's bulk-COPY buffer.
+			//
+			// Collect (id, tokens) for every search-eligible node as
+			// the drain yields them — feeds the backend's native FTS
+			// at FlushBulk time when the store implements
+			// graph.SymbolSearcher. Nodes that fail
+			// shouldIndexForSearch (KindFile / KindImport /
+			// KindLocal / KindBuiltin / skip-search lang+kind pairs)
+			// are excluded so the FTS corpus matches the in-process
+			// BM25 corpus exactly.
+			searcher, hasFTS := diskTarget.(graph.SymbolSearcher)
+			var ftsItems []graph.SymbolFTSItem
+			if hasFTS {
+				// Pre-size to the shadow's node count to avoid grow
+				// churn on a 600k-node Vscode-shape repo.
+				ftsItems = make([]graph.SymbolFTSItem, 0, inMemShadow.NodeCount())
+			}
+			const persistChunk = 100000
+			nodeBuf := make([]*graph.Node, 0, persistChunk)
+			for n := range inMemShadow.DrainNodes() {
+				if hasFTS && idx.shouldIndexForSearch(n) {
+					ftsItems = append(ftsItems, graph.SymbolFTSItem{
+						NodeID: n.ID,
+						Tokens: ftsTokensFor(n),
+					})
+				}
+				nodeBuf = append(nodeBuf, n)
+				if len(nodeBuf) >= persistChunk {
+					diskTarget.AddBatch(nodeBuf, nil)
+					nodeBuf = nodeBuf[:0]
+				}
+			}
+			if len(nodeBuf) > 0 {
+				diskTarget.AddBatch(nodeBuf, nil)
+				nodeBuf = nil
+			}
+			edgeBuf := make([]*graph.Edge, 0, persistChunk)
+			for e := range inMemShadow.DrainEdges() {
+				edgeBuf = append(edgeBuf, e)
+				if len(edgeBuf) >= persistChunk {
+					diskTarget.AddBatch(nil, edgeBuf)
+					edgeBuf = edgeBuf[:0]
+				}
+			}
+			if len(edgeBuf) > 0 {
+				diskTarget.AddBatch(nil, edgeBuf)
+				edgeBuf = nil
+			}
+			flushStart := time.Now()
+			idx.logger.Info("indexer: FlushBulk start",
+				zap.String("repo", idx.RepoPrefix()),
+				zap.Duration("drain_elapsed", flushStart.Sub(drainStart)),
+			)
+			if ferr := bl.FlushBulk(); ferr != nil {
+				retErr = fmt.Errorf("indexer: persist bulk graph: %w", ferr)
+			}
+			idx.logger.Info("indexer: FlushBulk complete",
+				zap.String("repo", idx.RepoPrefix()),
+				zap.Duration("flush_elapsed", time.Since(flushStart)),
+				zap.Duration("total_drain", time.Since(drainStart)),
+				zap.Int("nodes", shadowNodeCount),
+				zap.Int("edges", shadowEdgeCount),
+			)
+			// Build the backend FTS after the bulk load completes so
+			// CREATE_FTS_INDEX has the full corpus to scan in one
+			// pass. BulkUpsertSymbolFTS does its own
+			// extension-install dance, so this is the only place the
+			// indexer needs to know about SymbolSearcher.
+			if hasFTS && len(ftsItems) > 0 {
+				reporter.Report("building symbol fts", 0, 0)
+				if ferr := searcher.BulkUpsertSymbolFTS(idx.RepoPrefix(), ftsItems); ferr != nil {
+					idx.logger.Warn("indexer: bulk symbol FTS upsert failed",
+						zap.Error(ferr))
+				} else if ferr := searcher.BuildSymbolIndex(); ferr != nil {
+					idx.logger.Warn("indexer: backend FTS build failed",
+						zap.Error(ferr))
+				}
+				reporter.Report("building symbol fts", 1, 1)
+			}
+			reporter.Report("persisting bulk graph", 1, 1)
+			idx.graph = diskTarget
+		}()
+	} else if diskTarget == nil && idx.graph.NodeCount() == 0 && idx.graph.EdgeCount() == 0 {
+		if _, isBulk := idx.graph.(graph.BulkLoader); isBulk && len(files) > shadowMaxFileCount() {
+			idx.logger.Info("indexer: skipping in-memory shadow above threshold",
+				zap.Int("files", len(files)),
+				zap.Int("threshold", shadowMaxFileCount()))
+		}
+	}
+
 	// Worker pool.
 	workers := idx.config.Workers
 	if workers <= 0 {
@@ -1623,7 +1987,6 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (*IndexResult, er
 	contractReg := contracts.NewRegistry()
 	var contractMu sync.Mutex
 
-	fileCh := make(chan walkedFile, workers*4)
 	var errMu sync.Mutex
 	var errors []IndexError
 	var processed int64
@@ -1631,156 +1994,201 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (*IndexResult, er
 	var skippedByTimeout int64
 	var skippedByMinified int64
 
-	var wg sync.WaitGroup
-	for range workers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			var localContracts []contracts.Contract
-			for wf := range fileCh {
-				path := wf.path
-				p := atomic.AddInt64(&processed, 1)
-				if p == 1 || p%parseReportEvery == 0 {
-					reporter.Report("parsing", int(p), totalFiles)
-				}
-
-				src, err := os.ReadFile(path)
-				if err != nil {
-					errMu.Lock()
-					errors = append(errors, IndexError{FilePath: path, Error: err.Error()})
-					errMu.Unlock()
-					continue
-				}
-
-				relPath, _ := filepath.Rel(absRoot, path)
-				// Reuse the walk-time language. The walk's
-				// effectiveLanguage call already consulted shebang
-				// bytes via readSniffPrefix (512-byte probe), so a
-				// re-detect against the full src would change the
-				// answer only on the vanishingly rare case where a
-				// language marker lives past byte 512 — and any such
-				// case is content-sniffing-by-luck rather than spec'd
-				// behaviour. The fallback below covers the truly
-				// pathological case where the walk-time language has
-				// no extractor registered (effectively dead code).
-				lang := wf.lang
-				ext, _ := idx.registry.GetByLanguage(lang)
-				if ext == nil {
-					if relang, ok := idx.effectiveLanguage(path, src); ok {
-						lang = relang
-						ext, _ = idx.registry.GetByLanguage(lang)
+	// parseChunk runs the per-file worker pool over the supplied
+	// slice. Closure over outer state (errors, counters, contract
+	// registry, parsePool, quarantine) so it can be called multiple
+	// times — once for the non-streaming path, repeatedly for the
+	// streaming-flush large-repo path where each call processes a
+	// bounded slice into a per-chunk in-memory shadow.
+	parseChunk := func(chunkFiles []walkedFile) {
+		fileCh := make(chan walkedFile, workers*4)
+		var wg sync.WaitGroup
+		for range workers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				var localContracts []contracts.Contract
+				for wf := range fileCh {
+					path := wf.path
+					p := atomic.AddInt64(&processed, 1)
+					if p == 1 || p%parseReportEvery == 0 {
+						reporter.Report("parsing", int(p), totalFiles)
 					}
-				}
-				if ext == nil {
-					continue
-				}
 
-				// Pre-ingestion transforms: rewrite the bytes before
-				// extraction (BOM strip, minified-bundle expansion, a
-				// PDF→markdown command, …).
-				src = idx.transforms.run(relPath, src)
-
-				result, skipped, err := idx.extractFile(parsePool, quarantine, path, relPath, lang, ext, src)
-				if err != nil {
-					errMu.Lock()
-					errors = append(errors, IndexError{FilePath: path, Error: err.Error()})
-					errMu.Unlock()
-				}
-				if result == nil {
-					continue
-				}
-				if skipped && len(result.Nodes) > 0 {
-					if _, ok := result.Nodes[0].Meta["skipped_due_to_timeout"]; ok {
-						atomic.AddInt64(&skippedByTimeout, 1)
+					src, err := os.ReadFile(path)
+					if err != nil {
+						errMu.Lock()
+						errors = append(errors, IndexError{FilePath: path, Error: err.Error()})
+						errMu.Unlock()
+						continue
 					}
-					if _, ok := result.Nodes[0].Meta["skipped_due_to_minified"]; ok {
-						atomic.AddInt64(&skippedByMinified, 1)
-					}
-				}
 
-				// Append coverage artifacts (todos / licenses /
-				// ownership) before applyRepoPrefix so they get the
-				// same multi-repo namespacing treatment as
-				// language-extractor output. Skipped for quarantined /
-				// timed-out files — the coverage scanners would re-read
-				// a source the parser could not survive.
-				if !skipped {
-					idx.applyCoverageDomains(relPath, lang, src, result)
-				}
-
-				idx.applyRepoPrefix(result.Nodes, result.Edges)
-
-				// Find the file node (if the extractor produced one)
-				// and collect its outgoing edges — contract extractors
-				// take the file-scope edge set (imports, etc.), not
-				// every intra-file edge.
-				var fileNodeID, fileGraphPath string
-				for _, n := range result.Nodes {
-					if n.Kind == graph.KindFile {
-						fileNodeID = n.ID
-						fileGraphPath = n.FilePath
-						break
-					}
-				}
-				var fileScopeEdges []*graph.Edge
-				if fileNodeID != "" {
-					for _, e := range result.Edges {
-						if e.From == fileNodeID {
-							fileScopeEdges = append(fileScopeEdges, e)
+					relPath, _ := filepath.Rel(absRoot, path)
+					// Reuse the walk-time language. The walk's
+					// effectiveLanguage call already consulted shebang
+					// bytes via readSniffPrefix (512-byte probe), so a
+					// re-detect against the full src would change the
+					// answer only on the vanishingly rare case where a
+					// language marker lives past byte 512 — and any such
+					// case is content-sniffing-by-luck rather than spec'd
+					// behaviour. The fallback below covers the truly
+					// pathological case where the walk-time language has
+					// no extractor registered (effectively dead code).
+					lang := wf.lang
+					ext, _ := idx.registry.GetByLanguage(lang)
+					if ext == nil {
+						if relang, ok := idx.effectiveLanguage(path, src); ok {
+							lang = relang
+							ext, _ = idx.registry.GetByLanguage(lang)
 						}
 					}
-				}
+					if ext == nil {
+						continue
+					}
 
-				// Batch the per-file insert into one shard-grouped pass
-				// so each shard's lock is acquired at most once per
-				// file instead of N + 2·E times. Profiling showed 69
-				// of 102 workers blocked on lockTwoWrite under the
-				// per-edge path during cold-start warmup.
-				idx.graph.AddBatch(result.Nodes, result.Edges)
+					// Pre-ingestion transforms: rewrite the bytes before
+					// extraction (BOM strip, minified-bundle expansion, a
+					// PDF→markdown command, …).
+					src = idx.transforms.run(relPath, src)
 
-				if !skipped && fileGraphPath != "" {
-					exts := contractExtractorsByLang[lang]
-					if len(exts) > 0 {
-						c := idx.runContractExtractorsForFile(
-							fileGraphPath, src, result.Nodes, fileScopeEdges, exts, result.Tree)
-						localContracts = append(localContracts, c...)
+					result, skipped, err := idx.extractFile(parsePool, quarantine, path, relPath, lang, ext, src)
+					if err != nil {
+						errMu.Lock()
+						errors = append(errors, IndexError{FilePath: path, Error: err.Error()})
+						errMu.Unlock()
+					}
+					if result == nil {
+						continue
+					}
+					if skipped && len(result.Nodes) > 0 {
+						if _, ok := result.Nodes[0].Meta["skipped_due_to_timeout"]; ok {
+							atomic.AddInt64(&skippedByTimeout, 1)
+						}
+						if _, ok := result.Nodes[0].Meta["skipped_due_to_minified"]; ok {
+							atomic.AddInt64(&skippedByMinified, 1)
+						}
+					}
 
-						// Populate the per-file contract cache so a
-						// later IncrementalReindex can skip this file
-						// on a cache hit. Mtime comes from the walk-
-						// time d.Info() — no extra stat here.
-						if wf.mtimeNano > 0 {
-							idx.contractCacheMu.Lock()
-							idx.contractCache[fileGraphPath] = &contractCacheEntry{
-								mtimeNano: wf.mtimeNano,
-								contracts: c,
+					// Append coverage artifacts (todos / licenses /
+					// ownership) before applyRepoPrefix so they get the
+					// same multi-repo namespacing treatment as
+					// language-extractor output. Skipped for quarantined /
+					// timed-out files — the coverage scanners would re-read
+					// a source the parser could not survive.
+					if !skipped {
+						idx.applyCoverageDomains(relPath, lang, src, result)
+					}
+
+					idx.applyRepoPrefix(result.Nodes, result.Edges)
+
+					// Find the file node (if the extractor produced one)
+					// and collect its outgoing edges — contract extractors
+					// take the file-scope edge set (imports, etc.), not
+					// every intra-file edge.
+					var fileNodeID, fileGraphPath string
+					for _, n := range result.Nodes {
+						if n.Kind == graph.KindFile {
+							fileNodeID = n.ID
+							fileGraphPath = n.FilePath
+							break
+						}
+					}
+					var fileScopeEdges []*graph.Edge
+					if fileNodeID != "" {
+						for _, e := range result.Edges {
+							if e.From == fileNodeID {
+								fileScopeEdges = append(fileScopeEdges, e)
 							}
-							idx.contractCacheMu.Unlock()
 						}
 					}
+
+					// Batch the per-file insert into one shard-grouped pass
+					// so each shard's lock is acquired at most once per
+					// file instead of N + 2·E times. Profiling showed 69
+					// of 102 workers blocked on lockTwoWrite under the
+					// per-edge path during cold-start warmup.
+					idx.graph.AddBatch(result.Nodes, result.Edges)
+
+					if !skipped && fileGraphPath != "" {
+						exts := contractExtractorsByLang[lang]
+						if len(exts) > 0 {
+							c := idx.runContractExtractorsForFile(
+								fileGraphPath, src, result.Nodes, fileScopeEdges, exts, result.Tree)
+							localContracts = append(localContracts, c...)
+
+							// Populate the per-file contract cache so a
+							// later IncrementalReindex can skip this file
+							// on a cache hit. Mtime comes from the walk-
+							// time d.Info() — no extra stat here.
+							if wf.mtimeNano > 0 {
+								idx.contractCacheMu.Lock()
+								idx.contractCache[fileGraphPath] = &contractCacheEntry{
+									mtimeNano: wf.mtimeNano,
+									contracts: c,
+								}
+								idx.contractCacheMu.Unlock()
+							}
+						}
+					}
+					// Release the parse tree now that the per-file
+					// contract pass is done. Post-passes that need a
+					// tree for this file (cross-file handler resolution)
+					// re-parse on demand. Nil-safe.
+					result.Tree.Release()
+					atomic.AddInt64(&fileCount, 1)
 				}
-				// Release the parse tree now that the per-file
-				// contract pass is done. Post-passes that need a
-				// tree for this file (cross-file handler resolution)
-				// re-parse on demand. Nil-safe.
-				result.Tree.Release()
-				atomic.AddInt64(&fileCount, 1)
-			}
-			if len(localContracts) > 0 {
-				contractMu.Lock()
-				for _, c := range localContracts {
-					contractReg.Add(c)
+				if len(localContracts) > 0 {
+					contractMu.Lock()
+					for _, c := range localContracts {
+						contractReg.Add(c)
+					}
+					contractMu.Unlock()
 				}
-				contractMu.Unlock()
-			}
-		}()
+			}()
+		}
+
+		for _, f := range chunkFiles {
+			fileCh <- f
+		}
+		close(fileCh)
+		wg.Wait()
 	}
 
-	for _, f := range files {
-		fileCh <- f
+	// Streaming-flush path: above shadowMaxFileCount with a
+	// BulkLoader-capable backend, we can't fit the whole shadow in
+	// RAM but we can still amortise the per-file disk-write cost by
+	// chunking. Each chunk runs against its own throwaway shadow,
+	// then flushes via BulkLoad to disk. Resolve runs against the
+	// disk store afterwards (per-call, slower than the shadow path
+	// but bounded RAM). Activated by GORTEX_STREAMING_FLUSH=1; off
+	// by default since it requires the disk-only resolver path
+	// (~tens of minutes on huge repos) that we haven't yet
+	// optimised end-to-end.
+	if diskTarget == nil && streamingFlushActive(idx.graph, len(files)) {
+		bl, _ := idx.graph.(graph.BulkLoader)
+		streamingDisk := idx.graph
+		chunkSize := streamingChunkSize()
+		idx.logger.Info("indexer: streaming-flush parse",
+			zap.Int("files", len(files)),
+			zap.Int("chunk_size", chunkSize))
+		for chunkStart := 0; chunkStart < len(files); chunkStart += chunkSize {
+			chunkEnd := min(chunkStart+chunkSize, len(files))
+			chunkShadow := graph.New()
+			idx.graph = chunkShadow
+			parseChunk(files[chunkStart:chunkEnd])
+			// Flush chunk to disk.
+			bl.BeginBulkLoad()
+			streamingDisk.AddBatch(chunkShadow.AllNodes(), chunkShadow.AllEdges())
+			if err := bl.FlushBulk(); err != nil {
+				return nil, fmt.Errorf("indexer: streaming-flush chunk %d..%d: %w", chunkStart, chunkEnd, err)
+			}
+		}
+		// After all chunks, idx.graph points at the disk store so
+		// the resolver and subpasses read/mutate the merged state.
+		idx.graph = streamingDisk
+	} else {
+		parseChunk(files)
 	}
-	close(fileCh)
-	wg.Wait()
 
 	if processed > 0 {
 		reporter.Report("parsing", int(processed), totalFiles)
@@ -1803,7 +2211,57 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (*IndexResult, er
 			idx.fileMtimes[idx.relKey(f.path)] = f.mtimeNano
 		}
 	}
+	mtimeSnapshot := make(map[string]int64, len(idx.fileMtimes))
+	for k, v := range idx.fileMtimes {
+		mtimeSnapshot[k] = v
+	}
 	idx.mtimeMu.Unlock()
+
+	// Persist the per-file mtimes through the store's optional
+	// FileMtime sidecar table. On the on-disk backend this lets warm
+	// restarts seed ReconcileRepoCtx without having to read them back
+	// out of the gob+gzip metadata snapshot; on the in-memory
+	// backend the capability isn't implemented and the assertion
+	// short-circuits.
+	//
+	// Multi-repo bug: when the shadow-swap path is active, idx.graph
+	// is the in-memory shadow graph at this point — graph.Graph does
+	// NOT implement FileMtimeWriter, so the type assertion fails and
+	// persistence is silently skipped. The actual disk store is
+	// the local diskTarget variable; checking it first ensures warm-
+	// restart-skip-reindex actually works. The defer that swaps
+	// idx.graph back to diskTarget runs LATER, when IndexCtx returns,
+	// so we can't rely on it here. Falls through to idx.graph for the
+	// non-shadow path.
+	mtimeTarget := graph.Store(idx.graph)
+	if diskTarget != nil {
+		mtimeTarget = diskTarget
+	}
+	// Full-index persist is AUTHORITATIVE: replace the repo's entire mtime
+	// set so files deleted since the last index are pruned. An upsert-only
+	// write (BulkSetFileMtimes) leaves deleted-file rows behind, and warm-
+	// restart reconcile then detects them as phantom deletions on every
+	// restart — forcing a full re-track that never converges. Prefer the
+	// replace capability; fall back to upsert for backends without it.
+	if len(mtimeSnapshot) > 0 {
+		var perr error
+		persisted := false
+		if r, ok := mtimeTarget.(graph.FileMtimeReplacer); ok {
+			perr, persisted = r.ReplaceFileMtimes(idx.repoPrefix, mtimeSnapshot), true
+		} else if w, ok := mtimeTarget.(graph.FileMtimeWriter); ok {
+			perr, persisted = w.BulkSetFileMtimes(idx.repoPrefix, mtimeSnapshot), true
+		}
+		if persisted {
+			if perr != nil {
+				idx.logger.Warn("persist file mtimes failed",
+					zap.String("repo", idx.repoPrefix), zap.Error(perr))
+			} else {
+				idx.logger.Info("persisted file mtimes",
+					zap.String("repo", idx.repoPrefix),
+					zap.Int("count", len(mtimeSnapshot)))
+			}
+		}
+	}
 
 	// Retain parse errors and record index metadata.
 	idx.parseErrors = errors
@@ -1888,7 +2346,7 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (*IndexResult, er
 				)
 			}
 			reporter.Report("clone detection pass", 0, 0)
-			if cs := detectClonesAndEmitEdgesCtx(ctx, idx.graph, idx.cloneThreshold()); cs.Items > 0 {
+			if cs := detectClonesAndEmitEdgesCtx(ctx, idx.graph, idx.repoPrefix, idx.cloneThreshold()); cs.Items > 0 {
 				idx.logger.Info("clone edges emitted",
 					zap.Int("items", cs.Items),
 					zap.Int("clone_pairs", cs.Pairs),
@@ -1898,6 +2356,14 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (*IndexResult, er
 					zap.Int("diffused_pairs", cs.DiffusedPairs),
 					zap.Int("diffused_edges", cs.DiffusedEdges),
 				)
+			}
+			// Seed the incremental clone index from the freshly-baselined
+			// signatures + sidecar so steady-state single-file edits go
+			// incremental (EvictFuncs/UpdateFuncs) instead of re-running
+			// this whole-graph pass per file. The batch pass remains the
+			// re-baseline (corrects CMS drift) and owns diffusion.
+			if idx.cloneIndex != nil {
+				idx.cloneIndex.Rebuild(idx.graph, idx.repoPrefix)
 			}
 			// gRPC stub-call resolution — runs once the call graph and
 			// interface inference are final. Skipped under
@@ -1949,7 +2415,16 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (*IndexResult, er
 	// upgradeOnce gates the spawn so multi-repo warmup, which calls
 	// IndexCtx once per tracked repo, doesn't launch one upgrade
 	// goroutine per post-threshold repo. One per indexer lifetime.
-	if idx.search.Count() >= search.AutoThreshold {
+	//
+	// Skip the upgrade when the active search backend is the
+	// SymbolSearcher adapter: the disk store's native FTS is
+	// already serving search at engine-native latency, and
+	// spawning a parallel Bleve build would (a) waste ~100MB heap
+	// re-indexing the same corpus and (b) silently swap the
+	// adapter out for Bleve on completion — defeating the whole
+	// FTS path. The Swappable's current backend tells us which
+	// branch we're on.
+	if !isSymbolSearcherBackend(idx.search) && idx.search.Count() >= search.AutoThreshold {
 		idx.upgradeOnce.Do(func() {
 			reporter.Report("scheduling search backend upgrade", 0, 0)
 			idx.upgradeSpawnedMu.Lock()
@@ -1988,7 +2463,7 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (*IndexResult, er
 	idx.indexGen.Add(1) // invalidate the trigram search cache
 
 	nodes, edges := idx.repoNodeEdgeCount()
-	result := &IndexResult{
+	result = &IndexResult{
 		NodeCount:        nodes,
 		EdgeCount:        edges,
 		FileCount:        int(fileCount),
@@ -2061,13 +2536,32 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 	// In multi-repo mode, the graph stores prefixed file paths.
 	graphPath := idx.prefixPath(relPath)
 
-	// Evict existing data for this file (graph + search).
-	for _, n := range idx.graph.GetFileNodes(graphPath) {
-		if n.Kind != graph.KindFile && n.Kind != graph.KindImport {
-			idx.search.Remove(n.ID)
+	// Parse-then-swap: we must NOT evict the file's existing nodes/edges
+	// and search entries until we hold a usable parse result. Evicting
+	// first leaves the file at zero nodes whenever the on-disk bytes are
+	// transiently unparseable (a save mid-edit) — a failed extraction
+	// then returns early and the symbols stay nuked. Capturing the old
+	// state up front and deferring the actual eviction to evictExisting()
+	// keeps the file stale-but-present on failure (stale beats empty) and
+	// shrinks the no-nodes window to the gap between evict and AddBatch.
+	//
+	// oldFuncIDs holds this file's function/method node IDs so the
+	// incremental clone index can drop their CMS/LSH contributions —
+	// EvictFile removes the nodes (and their clone_sig) from the graph,
+	// so it must be captured before evictExisting runs.
+	var oldFuncIDs []string
+	evictExisting := func() {
+		for _, n := range idx.graph.GetFileNodes(graphPath) {
+			if n.Kind != graph.KindFile && n.Kind != graph.KindImport {
+				idx.search.Remove(n.ID)
+			}
+			if n.Kind == graph.KindFunction || n.Kind == graph.KindMethod {
+				oldFuncIDs = append(oldFuncIDs, n.ID)
+			}
 		}
+		idx.restubIncomingRefs(graphPath)
+		idx.graph.EvictFile(graphPath)
 	}
-	idx.graph.EvictFile(graphPath)
 
 	src, err := os.ReadFile(absPath)
 	if err != nil {
@@ -2085,12 +2579,14 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 
 	// Honour the size cap on the incremental path too: an over-cap
 	// file gets a synthetic skip node, not a parse — matching the
-	// bulk IndexCtx walk.
+	// bulk IndexCtx walk. This IS a successful result, so it evicts the
+	// prior state and installs the synthetic node, same as before.
 	if maxSize := idx.config.MaxFileSize; maxSize > 0 && int64(len(src)) > maxSize {
 		n := sizeSkipNode(skippedFile{
 			relPath: filepath.ToSlash(relPath), lang: lang, size: int64(len(src)),
 		}, maxSize)
 		idx.applyRepoPrefix([]*graph.Node{n}, nil)
+		evictExisting()
 		idx.graph.AddBatch([]*graph.Node{n}, nil)
 		return nil
 	}
@@ -2112,8 +2608,16 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 		_ = quarantine.Save()
 	}
 	if result == nil {
+		// No usable parse result (transient parse failure, quarantine,
+		// timeout). Do NOT evict — the file's prior nodes/edges/search
+		// entries stay intact. A stale-but-present file beats an empty
+		// one, and the next successful re-index swaps cleanly.
 		return err
 	}
+
+	// We hold a usable result: evict the old state now, then add the
+	// new — the window where the file has no nodes is just this gap.
+	evictExisting()
 
 	// Coverage extractors (todos, licenses, ownership). Same call
 	// site exists in the bulk IndexCtx worker pool — see
@@ -2128,29 +2632,59 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 
 	// Add new symbols to search index. shouldIndexForSearch enforces
 	// the same SkipSearch filter used by the bulk and upgrade paths.
+	// When the backing store implements graph.SymbolSearcher we
+	// also mirror each upsert into its native FTS, so an
+	// incremental reindex doesn't fall out of sync with the
+	// bulk-built corpus.
+	searcher, _ := idx.graph.(graph.SymbolSearcher)
 	for _, n := range result.Nodes {
 		if !idx.shouldIndexForSearch(n) {
 			continue
 		}
 		idx.search.Add(n.ID, searchIndexFields(n)...)
+		if searcher != nil {
+			if err := searcher.UpsertSymbolFTS(n.ID, ftsTokensFor(n)); err != nil {
+				idx.logger.Debug("indexer: backend FTS upsert failed",
+					zap.String("id", n.ID),
+					zap.Error(err))
+			}
+		}
 	}
 
 	if resolve {
 		idx.resolver.ResolveFile(graphPath)
+		// Reverse pass: bind callers in OTHER files that reference a
+		// symbol (re)defined here. ResolveFile above only fixed this
+		// file's OUTGOING edges; a symbol newly defined or changed here
+		// leaves callers elsewhere pointing at the unresolved stub
+		// restubIncomingRefs left when the prior concrete node was
+		// evicted. Scoped to this file's names — not a whole-graph
+		// ResolveAll.
+		idx.resolver.ResolveIncomingForFile(graphPath)
 		// CPG-lite dataflow placeholders for this file: inter-
 		// procedural callees may have just been lifted by
 		// ResolveFile, so re-run the dataflow materialisation pass
 		// to keep arg_of / returns_to edges in sync with the
-		// freshly resolved EdgeCalls graph.
-		idx.materializeDataflowParams()
+		// freshly resolved EdgeCalls graph. Scoped to this file's
+		// out-edges — not a whole-graph AllEdges scan — so an
+		// incremental edit stays O(file), not O(all edges).
+		idx.materializeDataflowParamsForFile(graphPath, result.Edges)
 		// Clone detection. EvictFile above removed this file's
-		// EdgeSimilarTo edges in both directions; a full recompute
-		// restores the correct set against the freshly stamped
-		// signatures. Skipped under deferGlobalPasses — a batch
-		// caller (ReconcileAll, warmup) runs the global pass once at
-		// the end instead of paying the O(functions) walk per file.
+		// EdgeSimilarTo edges in both directions. When the incremental
+		// clone index is built, re-bank just this file's bodies
+		// (EvictFuncs the old ids, UpdateFuncs the fresh nodes) — an
+		// O(edited file) update that restores the same edge set the
+		// whole-graph pass would. Until a batch/global pass has seeded
+		// the index (built=false) we fall back to the full recompute.
+		// Skipped under deferGlobalPasses — a batch caller (ReconcileAll,
+		// warmup) runs the global pass once at the end.
 		if !idx.deferGlobalPasses {
-			detectClonesAndEmitEdges(idx.graph, idx.cloneThreshold())
+			if idx.cloneIndex != nil && idx.cloneIndex.built {
+				idx.cloneIndex.EvictFuncs(idx.graph, oldFuncIDs)
+				idx.cloneIndex.UpdateFuncs(idx.graph, idx.repoPrefix, cloneFuncNodes(result.Nodes), idx.cloneThreshold())
+			} else {
+				detectClonesAndEmitEdges(idx.graph, idx.repoPrefix, idx.cloneThreshold())
+			}
 		}
 	}
 
@@ -2158,9 +2692,18 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 	// key (relKey applied slash + NFC), so the mtime entry lines up
 	// with the graph file-node key and with the bulk-walk mtimes.
 	if info, err := os.Stat(absPath); err == nil {
+		mtime := info.ModTime().UnixNano()
 		idx.mtimeMu.Lock()
-		idx.fileMtimes[relPath] = info.ModTime().UnixNano()
+		idx.fileMtimes[relPath] = mtime
 		idx.mtimeMu.Unlock()
+		// Also persist through the store's FileMtime sidecar so the
+		// next warm restart sees this incremental update without
+		// having to wait for the periodic gob snapshot to roll it.
+		// Per-file write is ~1ms on the on-disk backend; trivial under
+		// steady-state file-watcher load.
+		if w, ok := idx.graph.(graph.FileMtimeWriter); ok {
+			_ = w.BulkSetFileMtimes(idx.repoPrefix, map[string]int64{relPath: mtime})
+		}
 	}
 
 	return nil
@@ -2303,7 +2846,88 @@ func (idx *Indexer) EvictFile(filePath string) (int, int) {
 			idx.search.Remove(n.ID)
 		}
 	}
+	idx.restubIncomingRefs(graphPath)
+	idx.evictEnrichment(graphPath)
 	return idx.graph.EvictFile(graphPath)
+}
+
+// restubIncomingRefs rewrites every resolved reference edge that points
+// INTO a symbol of graphPath from a surviving (other-file) source back
+// to an `unresolved::<Name>` stub, in place, BEFORE the file's nodes are
+// evicted. Graph eviction otherwise drops those incoming caller edges
+// wholesale (it removes the edge from the surviving source's out-edge
+// bucket) and nothing recreates them until a cold reindex — so editing
+// or deleting a definition silently strips its callers' edges and
+// find_usages / get_callers go blank. Re-stubbing detaches the edges
+// from the soon-to-be-evicted nodes so they survive as pending stubs;
+// ResolveIncomingForFile (after a re-index) rebinds them to the file's
+// fresh symbols, or they stay unresolved — the correct state once the
+// symbol is gone. Only name-resolvable reference kinds are re-stubbed;
+// structural and enrichment edges are left to be dropped. Backend-
+// agnostic: GetInEdges + ReindexEdges are the same Store primitives the
+// resolver uses, so this behaves identically on the in-memory and disk
+// stores.
+// evictEnrichment drops the per-node enrichment sidecar rows (churn,
+// coverage, release, blame — change A) for a file's nodes on the
+// delete/rename paths only, so a removed file leaves no orphan
+// enrichment. Capability-gated. A modify re-indexes the same node IDs
+// (enrichment stays valid) so it is NOT cascaded there.
+func (idx *Indexer) evictEnrichment(graphPath string) {
+	nodes := idx.graph.GetFileNodes(graphPath)
+	if len(nodes) == 0 {
+		return
+	}
+	ids := make([]string, 0, len(nodes))
+	for _, n := range nodes {
+		ids = append(ids, n.ID)
+	}
+	if w, ok := idx.graph.(graph.ChurnEnrichmentWriter); ok {
+		_ = w.DeleteChurn(ids)
+	}
+	if w, ok := idx.graph.(graph.CoverageEnrichmentWriter); ok {
+		_ = w.DeleteCoverage(ids)
+	}
+	if w, ok := idx.graph.(graph.ReleaseEnrichmentWriter); ok {
+		_ = w.DeleteReleases(ids)
+	}
+	if w, ok := idx.graph.(graph.BlameEnrichmentWriter); ok {
+		_ = w.DeleteBlame(ids)
+	}
+}
+
+func (idx *Indexer) restubIncomingRefs(graphPath string) {
+	nodes := idx.graph.GetFileNodes(graphPath)
+	if len(nodes) == 0 {
+		return
+	}
+	evicted := make(map[string]struct{}, len(nodes))
+	for _, n := range nodes {
+		evicted[n.ID] = struct{}{}
+	}
+	var batch []graph.EdgeReindex
+	for _, n := range nodes {
+		if n.Name == "" || !graph.IsReferenceableSymbol(n.Kind) {
+			continue
+		}
+		stub := graph.UnresolvedMarker + n.Name
+		for _, e := range idx.graph.GetInEdges(n.ID) {
+			if e == nil || !graph.IsResolvableRefEdge(e.Kind) {
+				continue
+			}
+			if _, fromEvicted := evicted[e.From]; fromEvicted {
+				continue // intra-file edge: the source is evicted too
+			}
+			if graph.IsUnresolvedTarget(e.To) {
+				continue // already a pending stub
+			}
+			oldTo := e.To
+			e.To = stub
+			batch = append(batch, graph.EdgeReindex{Edge: e, OldTo: oldTo})
+		}
+	}
+	if len(batch) > 0 {
+		idx.graph.ReindexEdges(batch)
+	}
 }
 
 // embeddingDimsOrDefault returns the embedder's reported vector width,
@@ -2786,9 +3410,38 @@ func (idx *Indexer) buildSearchIndex() {
 	}
 
 	vecBackend := search.NewVector(dims)
+	// VectorSearcher capability bridging: if the underlying store
+	// has a native HNSW, install it as the in-process backend's
+	// delegate — Add becomes a no-op, Search forwards to the
+	// engine, and we don't allocate `dim × 4 × N` bytes of heap
+	// for a parallel in-process HNSW. The indexer still drives
+	// the writes (BulkUpsertEmbeddings below) so the engine
+	// index lands with the same corpus the in-process one would
+	// have built.
+	vecSearcher, _ := idx.graph.(graph.VectorSearcher)
+	var backendItems []graph.VectorItem
+	if vecSearcher != nil {
+		vecBackend.SetDelegate(&vectorSearcherDelegate{s: vecSearcher})
+		backendItems = make([]graph.VectorItem, 0, len(vectors))
+	}
 	for i, vec := range vectors {
 		if vec != nil {
 			vecBackend.Add(ids[i], vec)
+			if vecSearcher != nil {
+				backendItems = append(backendItems, graph.VectorItem{
+					NodeID: ids[i],
+					Vec:    vec,
+				})
+			}
+		}
+	}
+	if vecSearcher != nil && len(backendItems) > 0 {
+		if err := vecSearcher.BulkUpsertEmbeddings(backendItems); err != nil {
+			idx.logger.Warn("indexer: backend vector bulk upsert failed",
+				zap.Error(err))
+		} else if err := vecSearcher.BuildVectorIndex(dims); err != nil {
+			idx.logger.Warn("indexer: backend vector index build failed",
+				zap.Error(err))
 		}
 	}
 	// Install the chunk → parent-symbol mapping so HybridBackend can
@@ -2906,6 +3559,24 @@ func (idx *Indexer) RefreshFileMtime(filePath string) {
 		idx.fileMtimes[key] = info.ModTime().UnixNano()
 	}
 	idx.mtimeMu.Unlock()
+}
+
+// pruneDeletedFileMtimes drops the persisted mtime rows for files the
+// incremental reindex just confirmed deleted. The in-memory map is already
+// pruned by the caller; this keeps the store's FileMtime sidecar in step so
+// a later warm restart does not re-discover them as phantom deletions and
+// force a full re-track. A no-op when the backend lacks the capability
+// (the in-memory backend) or the list is empty.
+func (idx *Indexer) pruneDeletedFileMtimes(deleted []string) {
+	if len(deleted) == 0 {
+		return
+	}
+	if d, ok := idx.graph.(graph.FileMtimeDeleter); ok {
+		if err := d.DeleteFileMtimes(idx.repoPrefix, deleted); err != nil {
+			idx.logger.Warn("prune deleted file mtimes failed",
+				zap.String("repo", idx.repoPrefix), zap.Error(err))
+		}
+	}
 }
 
 // SetFileMtimes restores the file modification time map from a persisted snapshot.
@@ -3093,11 +3764,17 @@ func (idx *Indexer) IncrementalReindexPaths(root string, paths []string) (*Index
 
 	for _, relPath := range deletedFiles {
 		graphPath := idx.prefixPath(relPath)
+		idx.restubIncomingRefs(graphPath)
+		idx.evictEnrichment(graphPath)
 		idx.graph.EvictFile(graphPath)
 		idx.mtimeMu.Lock()
 		delete(idx.fileMtimes, relPath)
 		idx.mtimeMu.Unlock()
 	}
+	// Prune the persisted mtime rows for deleted files too, so the next
+	// warm restart does not see them as phantom deletions (the in-memory
+	// delete above does not reach the store's sidecar table).
+	idx.pruneDeletedFileMtimes(deletedFiles)
 
 	// Re-index stale files with the same one-shot retry as the
 	// whole-root path — a file locked or mid-write when the walk caught
@@ -3133,7 +3810,19 @@ func (idx *Indexer) IncrementalReindexPaths(root string, paths []string) (*Index
 		resolver.SynthesizeExternalCalls(idx.graph, idx.externalCallSynthesisEnabled())
 	}
 
-	idx.buildSearchIndex()
+	// Skip the search-index rebuild on a zero-change reconcile when the
+	// backend already persists its search structures (the on-disk
+	// backend keeps its FTS index and vector embeddings on disk).
+	// buildSearchIndex re-reads every node (GetRepoNodes) and re-embeds
+	// them, then BulkUpsertEmbeddings re-writes the embedding rows. On a
+	// warm restart that work is pure recompute of already-persisted data.
+	// When nothing changed there is nothing to re-embed, so skip it
+	// entirely — the persisted index is authoritative. The in-memory
+	// backends (BM25 / Bleve) must still rebuild from the replayed
+	// snapshot, so they keep the unconditional path.
+	if len(staleFiles) > 0 || len(deletedFiles) > 0 || !isSymbolSearcherBackend(idx.search) {
+		idx.buildSearchIndex()
+	}
 
 	if len(staleFiles) > 0 || len(deletedFiles) > 0 {
 		idx.extractContracts()
@@ -3142,12 +3831,13 @@ func (idx *Indexer) IncrementalReindexPaths(root string, paths []string) (*Index
 
 	nodes, edges := idx.repoNodeEdgeCount()
 	result := &IndexResult{
-		NodeCount:      nodes,
-		EdgeCount:      edges,
-		FileCount:      len(diskFiles),
-		StaleFileCount: len(staleFiles),
-		FailedFiles:    failedFiles,
-		DurationMs:     time.Since(start).Milliseconds(),
+		NodeCount:        nodes,
+		EdgeCount:        edges,
+		FileCount:        len(diskFiles),
+		StaleFileCount:   len(staleFiles),
+		DeletedFileCount: len(deletedFiles),
+		FailedFiles:      failedFiles,
+		DurationMs:       time.Since(start).Milliseconds(),
 	}
 	idx.warnIfEdgeSanityViolated(result)
 	return result, nil
@@ -3278,11 +3968,17 @@ func (idx *Indexer) IncrementalReindex(root string) (*IndexResult, error) {
 	// Evict only files that are truly absent from disk.
 	for _, relPath := range deletedFiles {
 		graphPath := idx.prefixPath(relPath)
+		idx.restubIncomingRefs(graphPath)
+		idx.evictEnrichment(graphPath)
 		idx.graph.EvictFile(graphPath)
 		idx.mtimeMu.Lock()
 		delete(idx.fileMtimes, relPath)
 		idx.mtimeMu.Unlock()
 	}
+	// Prune the persisted mtime rows for deleted files too, so the next
+	// warm restart does not see them as phantom deletions (the in-memory
+	// delete above does not reach the store's sidecar table).
+	idx.pruneDeletedFileMtimes(deletedFiles)
 
 	// Re-index stale files. A file that fails — most often because it
 	// was locked or mid-write when the walk caught it — is collected
@@ -3335,8 +4031,14 @@ func (idx *Indexer) IncrementalReindex(root string) (*IndexResult, error) {
 		// the global clone pass once at the end.
 	}
 
-	// Rebuild search index to ensure consistency.
-	idx.buildSearchIndex()
+	// Rebuild search index to ensure consistency — but skip it on a
+	// zero-change reconcile against a backend that persists its search
+	// structures natively (the on-disk backend). See the matching guard
+	// in the other incremental path: re-embedding is wasted work and
+	// there is nothing to rebuild when no file changed.
+	if len(staleFiles) > 0 || len(deletedFiles) > 0 || !isSymbolSearcherBackend(idx.search) {
+		idx.buildSearchIndex()
+	}
 
 	// Update totalDetected so index_health reports correctly after cache restore.
 	if idx.totalDetected == 0 {
@@ -3351,12 +4053,13 @@ func (idx *Indexer) IncrementalReindex(root string) (*IndexResult, error) {
 
 	nodes, edges := idx.repoNodeEdgeCount()
 	result := &IndexResult{
-		NodeCount:      nodes,
-		EdgeCount:      edges,
-		FileCount:      len(diskFiles),
-		StaleFileCount: len(staleFiles),
-		FailedFiles:    failedFiles,
-		DurationMs:     time.Since(start).Milliseconds(),
+		NodeCount:        nodes,
+		EdgeCount:        edges,
+		FileCount:        len(diskFiles),
+		StaleFileCount:   len(staleFiles),
+		DeletedFileCount: len(deletedFiles),
+		FailedFiles:      failedFiles,
+		DurationMs:       time.Since(start).Milliseconds(),
 	}
 	idx.warnIfEdgeSanityViolated(result)
 	return result, nil
@@ -3514,51 +4217,76 @@ func (idx *Indexer) commitContracts(reg *contracts.Registry) {
 	// the wire format.
 	idx.inlineEnvelopeShapes(reg)
 
-	for _, c := range reg.All() {
-		contractNode := &graph.Node{
-			ID:       c.ID,
-			Kind:     graph.KindContract,
-			Name:     c.ID,
-			FilePath: c.FilePath,
-			Language: "contract",
-			Meta:     map[string]any{"type": string(c.Type), "role": string(c.Role)},
+	all := reg.All()
+	nodes := make([]*graph.Node, 0, len(all))
+	edges := make([]*graph.Edge, 0, len(all))
+	for _, c := range all {
+		// dep::<module> nodes were materialised by extractGoModContracts
+		// before ResolveAll (so the import bridge could find them);
+		// re-emitting them here would PK-collide on backends whose bulk
+		// load is INSERT-only (the on-disk backend). The pre-pass is the single
+		// writer for that contract type.
+		if c.Type == contracts.ContractDependency {
+			continue
 		}
-		idx.graph.AddNode(contractNode)
+		nodes = append(nodes, &graph.Node{
+			ID:          c.ID,
+			Kind:        graph.KindContract,
+			Name:        c.ID,
+			FilePath:    c.FilePath,
+			Language:    "contract",
+			RepoPrefix:  c.RepoPrefix,
+			WorkspaceID: c.EffectiveWorkspace(),
+			ProjectID:   c.EffectiveProject(),
+			Meta: map[string]any{
+				"type":          string(c.Type),
+				"role":          string(c.Role),
+				"symbol_id":     c.SymbolID,
+				"line":          c.Line,
+				"confidence":    c.Confidence,
+				"contract_meta": c.Meta,
+			},
+		})
 
+		if c.SymbolID == "" {
+			continue
+		}
 		edgeKind := graph.EdgeProvides
 		if c.Role == contracts.RoleConsumer {
 			edgeKind = graph.EdgeConsumes
 		}
-		if c.SymbolID != "" {
-			idx.graph.AddEdge(&graph.Edge{
+		edges = append(edges, &graph.Edge{
+			From:     c.SymbolID,
+			To:       c.ID,
+			Kind:     edgeKind,
+			FilePath: c.FilePath,
+			Line:     c.Line,
+		})
+		// Framework-layer EdgeHandlesRoute. Emitted alongside
+		// EdgeProvides for HTTP / gRPC / WS / GraphQL / topic
+		// providers so `analyze kind=routes` and other
+		// framework-aware tools walk one targeted edge instead
+		// of filtering EdgeProvides by contract type. Consumers
+		// (callers of routes) and non-route contract types (env,
+		// OpenAPI specs, DI tokens) intentionally skip this
+		// edge — they aren't route handlers.
+		if c.Role == contracts.RoleProvider && isRouteContractType(c.Type) {
+			edges = append(edges, &graph.Edge{
 				From:     c.SymbolID,
 				To:       c.ID,
-				Kind:     edgeKind,
+				Kind:     graph.EdgeHandlesRoute,
 				FilePath: c.FilePath,
 				Line:     c.Line,
+				Meta: map[string]any{
+					"contract_type": string(c.Type),
+				},
 			})
-			// Framework-layer EdgeHandlesRoute. Emitted alongside
-			// EdgeProvides for HTTP / gRPC / WS / GraphQL / topic
-			// providers so `analyze kind=routes` and other
-			// framework-aware tools walk one targeted edge instead
-			// of filtering EdgeProvides by contract type. Consumers
-			// (callers of routes) and non-route contract types (env,
-			// OpenAPI specs, DI tokens) intentionally skip this
-			// edge — they aren't route handlers.
-			if c.Role == contracts.RoleProvider && isRouteContractType(c.Type) {
-				idx.graph.AddEdge(&graph.Edge{
-					From:     c.SymbolID,
-					To:       c.ID,
-					Kind:     graph.EdgeHandlesRoute,
-					FilePath: c.FilePath,
-					Line:     c.Line,
-					Meta: map[string]any{
-						"contract_type": string(c.Type),
-					},
-				})
-			}
 		}
 	}
+
+	bulkStart := time.Now()
+	idx.bulkCommit(nodes, edges)
+	bulkElapsed := time.Since(bulkStart)
 
 	idx.contractRegistry = reg
 	repo := idx.rootPath
@@ -3567,7 +4295,24 @@ func (idx *Indexer) commitContracts(reg *contracts.Registry) {
 	}
 	idx.logger.Info("contracts extracted",
 		zap.String("repo", repo),
-		zap.Int("count", len(reg.All())))
+		zap.Int("count", len(all)),
+		zap.Duration("commit_bulk_elapsed", bulkElapsed))
+}
+
+// bulkCommit writes nodes + edges in one AddBatch call. The bulk
+// load path is intentionally NOT used here: contract IDs often
+// coincide with existing source-symbol IDs (a route handler shows
+// up as both a Go function and an HTTP-contract anchor), and the
+// on-disk backend's bulk load is INSERT-only on the node table so
+// any collision fails the whole batch. AddBatch's non-bulk path
+// upserts every row so duplicates are absorbed in place; the
+// per-call cost is amortised by the chunked write path the backend
+// uses internally.
+func (idx *Indexer) bulkCommit(nodes []*graph.Node, edges []*graph.Edge) {
+	if len(nodes) == 0 && len(edges) == 0 {
+		return
+	}
+	idx.graph.AddBatch(nodes, edges)
 }
 
 // isRouteContractType reports whether a ContractType corresponds to a
@@ -4933,6 +5678,7 @@ func (idx *Indexer) extractGoModContracts(reg *contracts.Registry) {
 	found := goModExtractor.Extract(goModFilePath, goModSrc, nil, nil)
 	reg.AddAllScoped(found, idx.repoPrefix, idx.workspaceID, idx.projectID)
 
+	var nodes []*graph.Node
 	for i := range found {
 		c := found[i]
 		if c.Type != contracts.ContractDependency {
@@ -4941,7 +5687,7 @@ func (idx *Indexer) extractGoModContracts(reg *contracts.Registry) {
 		if idx.graph.GetNode(c.ID) != nil {
 			continue
 		}
-		idx.graph.AddNode(&graph.Node{
+		nodes = append(nodes, &graph.Node{
 			ID:         c.ID,
 			Kind:       graph.KindContract,
 			Name:       c.ID,
@@ -4950,6 +5696,9 @@ func (idx *Indexer) extractGoModContracts(reg *contracts.Registry) {
 			RepoPrefix: idx.repoPrefix,
 			Meta:       map[string]any{"type": string(c.Type), "role": string(c.Role)},
 		})
+	}
+	if len(nodes) > 0 {
+		idx.graph.AddBatch(nodes, nil)
 	}
 }
 
@@ -4977,6 +5726,33 @@ func (idx *Indexer) extractContracts() {
 		nodes = idx.graph.GetRepoNodes(idx.repoPrefix)
 	} else {
 		nodes = idx.graph.AllNodes()
+	}
+
+	// Pre-bucket the already-fetched node slice by FilePath so the
+	// per-file body can look up its co-located nodes in O(1) instead
+	// of firing a fresh GetFileNodes query per file. Likewise pre-
+	// fetch every out-edge whose source is in this repo as ONE backend
+	// call and bucket by From so the per-file body can replace
+	// GetOutEdges(fileNode.ID) — on disk backends the per-file query
+	// path was the second-largest source of round-trips in
+	// deferred_passes (after the DI walk).
+	nodesByFile := make(map[string][]*graph.Node, len(nodes))
+	for _, n := range nodes {
+		if n == nil {
+			continue
+		}
+		nodesByFile[n.FilePath] = append(nodesByFile[n.FilePath], n)
+	}
+	var edgesByFrom map[string][]*graph.Edge
+	if idx.repoPrefix != "" {
+		repoEdges := idx.graph.GetRepoEdges(idx.repoPrefix)
+		edgesByFrom = make(map[string][]*graph.Edge, len(nodes))
+		for _, e := range repoEdges {
+			if e == nil {
+				continue
+			}
+			edgesByFrom[e.From] = append(edgesByFrom[e.From], e)
+		}
 	}
 
 	for _, fileNode := range nodes {
@@ -5022,8 +5798,15 @@ func (idx *Indexer) extractContracts() {
 			continue
 		}
 
-		fileNodes := idx.graph.GetFileNodes(fileNode.FilePath)
-		fileEdges := idx.graph.GetOutEdges(fileNode.ID)
+		var fileNodes []*graph.Node
+		var fileEdges []*graph.Edge
+		if idx.repoPrefix != "" {
+			fileNodes = nodesByFile[fileNode.FilePath]
+			fileEdges = edgesByFrom[fileNode.ID]
+		} else {
+			fileNodes = idx.graph.GetFileNodes(fileNode.FilePath)
+			fileEdges = idx.graph.GetOutEdges(fileNode.ID)
+		}
 
 		// Language-filtered dispatch: skip extractors that don't list
 		// this file's language in SupportedLanguages(). On big repos
@@ -5074,6 +5857,84 @@ func (idx *Indexer) extractContracts() {
 // Unicode form than fileMtimes was keyed with still resolves — without
 // the fold the lookup would miss and the file be reported permanently
 // stale, re-indexing it under a second key on every pass.
+// HasChangesSinceMtimes reports whether any indexable file under root
+// changed (mtime differs or is new) or was deleted, relative to the
+// indexer's currently-loaded fileMtimes. It runs the SAME walk +
+// staleness + deletion logic as IncrementalReindex but writes nothing.
+//
+// The daemon warmup uses it to choose a reconcile strategy for a
+// reopened repo: a repo with zero changes takes the fast no-op
+// IncrementalReindex path, while a repo that changed while the daemon
+// was down is routed through the shadow/bulk re-track path instead.
+// That routing matters because IncrementalReindex re-resolves changed
+// files through per-edge graph.ReindexEdges, and the per-edge write
+// path against a freshly reopened disk store is slow and unreliable.
+// The shadow path resolves entirely in an in-memory graph and commits
+// the result in one bulk load, so it never issues a per-edge write to
+// the reopened store. It re-indexes the whole repo (more work than a
+// true incremental pass), but it is reliable, and only repos that
+// actually changed during downtime pay the cost.
+//
+// Conservative on error: anything it can't determine (bad root, walk
+// error) returns true so the caller re-indexes rather than silently
+// serving a stale graph.
+func (idx *Indexer) HasChangesSinceMtimes(root string) bool {
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return true
+	}
+	idx.rootPath = absRoot
+
+	diskFiles := make(map[string]bool)
+	errStop := errors.New("stop-walk")
+	walkErr := filepath.WalkDir(absRoot, func(path string, d os.DirEntry, werr error) error {
+		if werr != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if idx.shouldExclude(path, absRoot, true) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if _, ok := idx.effectiveLanguage(path, nil); !ok {
+			return nil
+		}
+		if idx.shouldExclude(path, absRoot, false) {
+			return nil
+		}
+		rel := idx.relKey(path)
+		diskFiles[rel] = true
+		if idx.IsStale(rel) {
+			return errStop // a single changed/new file is enough
+		}
+		return nil
+	})
+	if errors.Is(walkErr, errStop) {
+		return true
+	}
+	if walkErr != nil {
+		return true
+	}
+
+	// Deletion check: a previously-indexed file absent from the walk and
+	// confirmed gone from disk counts as a change (its edges must drop).
+	idx.mtimeMu.RLock()
+	var candidates []string
+	for rel := range idx.fileMtimes {
+		if !diskFiles[rel] {
+			candidates = append(candidates, rel)
+		}
+	}
+	idx.mtimeMu.RUnlock()
+	for _, rel := range candidates {
+		if _, err := os.Stat(filepath.Join(absRoot, filepath.FromSlash(rel))); errors.Is(err, os.ErrNotExist) {
+			return true
+		}
+	}
+	return false
+}
+
 func (idx *Indexer) IsStale(relPath string) bool {
 	relPath = pathkey.Normalize(filepath.ToSlash(relPath))
 

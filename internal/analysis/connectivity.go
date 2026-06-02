@@ -109,7 +109,14 @@ const connectivityNote = "Connectivity health is a graph-EXTRACTION diagnostic, 
 // fileLimit caps how many files DeadWeightByFile carries — files are
 // ranked by dead-weight descending, ties broken by path; pass 0 or a
 // negative value for no cap.
-func GraphConnectivity(g *graph.Graph, nodes []*graph.Node, fileLimit int) GraphConnectivityReport {
+//
+// Backends that implement graph.NodeDegreeAggregator serve every
+// per-node count from one bulk pass; the fallback path runs
+// the legacy per-node GetInEdges + GetOutEdges + ClassifyZeroEdge
+// trio. The arithmetic is identical either way — the capability
+// inlines ClassifyZeroEdge's "no incoming usage edge" check into the
+// same row.
+func GraphConnectivity(g graph.Store, nodes []*graph.Node, fileLimit int) GraphConnectivityReport {
 	report := GraphConnectivityReport{Note: connectivityNote}
 	if g == nil {
 		return report
@@ -127,6 +134,14 @@ func GraphConnectivity(g *graph.Graph, nodes []*graph.Node, fileLimit int) Graph
 	byKind := map[graph.NodeKind]*kindAgg{}
 	byFile := map[string]*fileAgg{}
 
+	// Bulk per-node count fetch when the backend supports it; one
+	// bulk pair vs. 3N per-node round-trips for the legacy path
+	// (the killer on a disk backend — see the NodeDegreeAggregator doc-comment
+	// for the workspace-scale numbers). Returns a map keyed on node ID
+	// or nil when the capability isn't available; the fallback path
+	// re-queries per node via the closure below.
+	counts := collectConnectivityCounts(g, nodes)
+
 	for _, n := range nodes {
 		if n == nil {
 			continue
@@ -140,8 +155,15 @@ func GraphConnectivity(g *graph.Graph, nodes []*graph.Node, fileLimit int) Graph
 		}
 		ka.total++
 
-		inCount := len(g.GetInEdges(n.ID))
-		outCount := len(g.GetOutEdges(n.ID))
+		var inCount, outCount int
+		if counts != nil {
+			row := counts[n.ID]
+			inCount = row.InCount
+			outCount = row.OutCount
+		} else {
+			inCount = len(g.GetInEdges(n.ID))
+			outCount = len(g.GetOutEdges(n.ID))
+		}
 		degree := inCount + outCount
 
 		if degree > 0 {
@@ -149,10 +171,12 @@ func GraphConnectivity(g *graph.Graph, nodes []*graph.Node, fileLimit int) Graph
 		}
 
 		// Isolated == zero edges of any kind. ClassifyZeroEdge returns
-		// ZeroEdgePossibleExtractionGap for exactly this case, so the
-		// "isolated" definition stays bound to the shared zero-edge
-		// classification used for per-symbol caveats.
-		isolated := graph.ClassifyZeroEdge(g, n.ID) == graph.ZeroEdgePossibleExtractionGap
+		// ZeroEdgePossibleExtractionGap for exactly this case (for a
+		// known node), so the "isolated" definition stays bound to the
+		// shared zero-edge classification used for per-symbol caveats.
+		// We derive it from the counts directly; the underlying
+		// classifier's check is in == 0 && out == 0 for a known id.
+		isolated := degree == 0
 		leaf := degree == 1
 
 		if isolated {
@@ -229,4 +253,37 @@ func GraphConnectivity(g *graph.Graph, nodes []*graph.Node, fileLimit int) Graph
 	}
 
 	return report
+}
+
+// collectConnectivityCounts returns per-node in/out/usage counts for
+// the supplied node slice via the backend's NodeDegreeAggregator
+// capability. Returns nil when the backend doesn't implement the
+// capability — GraphConnectivity then falls back to the legacy
+// per-node g.GetInEdges/g.GetOutEdges path so semantics never differ.
+//
+// We pass UsageInboundEdgeKinds so the server fills UsageInCount —
+// today GraphConnectivity only consumes In/Out totals, but the usage
+// count rides on the same row at no extra round-trip cost and makes
+// the capability self-contained for callers that need it next.
+func collectConnectivityCounts(g graph.Store, nodes []*graph.Node) map[string]graph.NodeDegreeRow {
+	agg, ok := g.(graph.NodeDegreeAggregator)
+	if !ok {
+		return nil
+	}
+	ids := make([]string, 0, len(nodes))
+	for _, n := range nodes {
+		if n == nil || n.ID == "" {
+			continue
+		}
+		ids = append(ids, n.ID)
+	}
+	if len(ids) == 0 {
+		return map[string]graph.NodeDegreeRow{}
+	}
+	rows := agg.NodeDegreeCounts(ids, graph.UsageInboundEdgeKinds())
+	out := make(map[string]graph.NodeDegreeRow, len(rows))
+	for _, r := range rows {
+		out[r.NodeID] = r
+	}
+	return out
 }

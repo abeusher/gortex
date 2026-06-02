@@ -10,6 +10,7 @@ import (
 
 	mcp "github.com/mark3labs/mcp-go/mcp"
 
+	"github.com/zzet/gortex/internal/analysis"
 	"github.com/zzet/gortex/internal/graph"
 )
 
@@ -60,13 +61,13 @@ const (
 // healthRollupRow is one per-file / per-repo aggregate row produced
 // when `roll_up` selects a non-symbol scope.
 type healthRollupRow struct {
-	Scope      string  `json:"scope"`           // "file" | "repo"
-	Key        string  `json:"key"`             // file path or repo prefix
-	AvgScore   float64 `json:"avg_score"`
-	MinScore   float64 `json:"min_score"`
-	MaxScore   float64 `json:"max_score"`
-	Symbols    int     `json:"symbols"`
-	Grade      string  `json:"grade"`           // derived from AvgScore
+	Scope      string         `json:"scope"` // "file" | "repo"
+	Key        string         `json:"key"`   // file path or repo prefix
+	AvgScore   float64        `json:"avg_score"`
+	MinScore   float64        `json:"min_score"`
+	MaxScore   float64        `json:"max_score"`
+	Symbols    int            `json:"symbols"`
+	Grade      string         `json:"grade"` // derived from AvgScore
 	GradeCount map[string]int `json:"grade_counts"`
 }
 
@@ -90,28 +91,28 @@ type healthDistribution struct {
 // input it was derived from, so the consumer can both rank and
 // explain the score.
 type healthScoreRow struct {
-	ID    string `json:"id"`
-	Name  string `json:"name"`
-	Kind  string `json:"kind"`
-	File  string `json:"file"`
-	Line  int    `json:"line"`
+	ID    string  `json:"id"`
+	Name  string  `json:"name"`
+	Kind  string  `json:"kind"`
+	File  string  `json:"file"`
+	Line  int     `json:"line"`
 	Score float64 `json:"score"`
 	Grade string  `json:"grade"`
 
 	// Axes — "_pct" suffix is the 0..100 health value; "_raw" is
 	// the underlying input. Pointers because "no data" is a real
 	// signal distinct from "score is zero".
-	CoveragePct  *float64 `json:"coverage_pct,omitempty"`
+	CoveragePct   *float64 `json:"coverage_pct,omitempty"`
 	ComplexityPct *float64 `json:"complexity_pct,omitempty"`
-	RecencyPct   *float64 `json:"recency_pct,omitempty"`
-	ChurnPct     *float64 `json:"churn_pct,omitempty"`
+	RecencyPct    *float64 `json:"recency_pct,omitempty"`
+	ChurnPct      *float64 `json:"churn_pct,omitempty"`
 
-	FanIn      int     `json:"fan_in"`
-	FanOut     int     `json:"fan_out"`
-	Crossings  int     `json:"community_crossings"`
-	AgeDays    *int    `json:"age_days,omitempty"`
-	Mods       int     `json:"session_mods"`
-	AxesUsed   int     `json:"axes_used"`
+	FanIn     int  `json:"fan_in"`
+	FanOut    int  `json:"fan_out"`
+	Crossings int  `json:"community_crossings"`
+	AgeDays   *int `json:"age_days,omitempty"`
+	Mods      int  `json:"session_mods"`
+	AxesUsed  int  `json:"axes_used"`
 }
 
 // handleAnalyzeHealthScore aggregates the shipped enrichment into one
@@ -120,15 +121,15 @@ type healthScoreRow struct {
 // Filters:
 //   - path_prefix   — keep only symbols whose file path starts with this.
 //   - kinds         — comma-separated (default function,method); "all"
-//                     keeps every blame-eligible kind.
+//     keeps every blame-eligible kind.
 //   - grade         — comma-separated A..F subset; keeps only matching rows.
 //   - min_score     — drop rows whose composite score is below this.
 //   - max_score     — drop rows whose composite score is above this.
 //   - min_axes      — drop rows backed by fewer than this many axes
-//                     (default 1; raise to 2-3 to demand multi-signal
-//                     confidence at the cost of fewer rows).
+//     (default 1; raise to 2-3 to demand multi-signal
+//     confidence at the cost of fewer rows).
 //   - limit         — cap rows (default 200). Total still reports
-//                     pre-truncation count.
+//     pre-truncation count.
 func (s *Server) handleAnalyzeHealthScore(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args := req.GetArguments()
 	pathPrefix := strings.TrimSpace(stringArg(args, "path_prefix"))
@@ -156,25 +157,52 @@ func (s *Server) handleAnalyzeHealthScore(ctx context.Context, req mcp.CallToolR
 		allowedKinds = parseAnalyzeKindsFilter(k)
 	}
 
-	// Build fan-in / fan-out / community-crossing maps in one edge
-	// pass. Same arithmetic shape as FindHotspots — we read the
-	// raw axes here rather than calling FindHotspots so the per-
-	// node fan-in is available for symbols below its threshold.
+	// Build fan-in / fan-out / community-crossing maps. Same
+	// arithmetic shape as FindHotspots -- we read the raw axes here
+	// rather than calling FindHotspots so the per-node fan-in is
+	// available for symbols below its threshold.
+	//
+	// Fan-in / fan-out go through analysis.CollectFanCounts, which
+	// uses the NodeFanAggregator capability when the backend
+	// supports it (one bulk query per direction over the candidate
+	// id set) and falls back to a per-kind EdgesByKind stream
+	// otherwise. Crossings still need per-edge (from, to) for the
+	// Calls + References kinds -- streamed via EdgesByKind so even
+	// the fallback path never materialises the full edge set.
 	nodeToComm := map[string]string{}
 	if c := s.getCommunities(); c != nil {
 		nodeToComm = c.NodeToComm
 	}
-	fanIn := map[string]int{}
-	fanOut := map[string]int{}
+
+	// Pull only the candidate kinds from the store — most workspaces
+	// keep ~5-15% of nodes as functions/methods, so the kind pushdown
+	// drops the AllNodes materialisation by 1-2 orders of magnitude.
+	kindList := make([]graph.NodeKind, 0, len(allowedKinds))
+	for k := range allowedKinds {
+		kindList = append(kindList, k)
+	}
+	scoped := s.scopedNodesByKinds(ctx, kindList)
+	candidateIDs := make([]string, 0, len(scoped))
+	for _, n := range scoped {
+		if n == nil {
+			continue
+		}
+		if pathPrefix != "" && !strings.HasPrefix(n.FilePath, pathPrefix) {
+			continue
+		}
+		candidateIDs = append(candidateIDs, n.ID)
+	}
+	fanIn, fanOut := analysis.CollectFanCounts(s.graph, candidateIDs,
+		[]graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences},
+		[]graph.EdgeKind{graph.EdgeCalls},
+	)
+
 	crossings := map[string]int{}
-	for _, e := range s.graph.AllEdges() {
-		if e.Kind == graph.EdgeCalls || e.Kind == graph.EdgeReferences {
-			fanIn[e.To]++
-		}
-		if e.Kind == graph.EdgeCalls {
-			fanOut[e.From]++
-		}
-		if e.Kind == graph.EdgeCalls || e.Kind == graph.EdgeReferences {
+	for _, kind := range []graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences} {
+		for e := range s.graph.EdgesByKind(kind) {
+			if e == nil {
+				continue
+			}
 			from := nodeToComm[e.From]
 			to := nodeToComm[e.To]
 			if from != "" && to != "" && from != to {
@@ -190,9 +218,11 @@ func (s *Server) handleAnalyzeHealthScore(ctx context.Context, req mcp.CallToolR
 
 	now := time.Now()
 
+	covRows := s.coverageByID()
+	blame := blameRowsByID(s.graph)
 	rows := make([]healthScoreRow, 0, 128)
-	for _, n := range s.scopedNodes(ctx) {
-		if _, ok := allowedKinds[n.Kind]; !ok {
+	for _, n := range scoped {
+		if n == nil {
 			continue
 		}
 		if pathPrefix != "" && !strings.HasPrefix(n.FilePath, pathPrefix) {
@@ -215,7 +245,7 @@ func (s *Server) handleAnalyzeHealthScore(ctx context.Context, req mcp.CallToolR
 
 		// Coverage axis — direct mapping (coverage_pct is already
 		// 0..100, higher is healthier).
-		if pct, ok := n.Meta["coverage_pct"].(float64); ok {
+		if pct, ok := coveragePctFrom(covRows, n); ok {
 			covHealth := clamp01(pct)
 			row.CoveragePct = &covHealth
 			weighted += covHealth * healthWeightCoverage
@@ -243,11 +273,8 @@ func (s *Server) handleAnalyzeHealthScore(ctx context.Context, req mcp.CallToolR
 		// Linear piecewise: fresh (≤30d) = 100; ok-zone
 		// (30..365d) = 100→50; stale-zone (365..1095d) = 50→0;
 		// dead (>1095d) = 0.
-		if ts, ok := extractTimestamp(n.Meta); ok {
-			ageDays := int(now.Sub(time.Unix(ts, 0)).Hours() / 24)
-			if ageDays < 0 {
-				ageDays = 0
-			}
+		if ts, ok := lastAuthoredTSFrom(blame, n); ok {
+			ageDays := max(int(now.Sub(time.Unix(ts, 0)).Hours()/24), 0)
 			row.AgeDays = &ageDays
 			recHealth := recencyScore(ageDays)
 			row.RecencyPct = &recHealth
@@ -492,7 +519,7 @@ func computeHealthDistribution(rows []healthScoreRow) healthDistribution {
 // ascending slice of non-negative values. 0 = perfectly equal;
 // approaches 1 = maximally unequal. Standard formula:
 //
-//   G = ( 2 · Σ i·x_i / (n · Σ x_i) ) − (n+1)/n
+//	G = ( 2 · Σ i·x_i / (n · Σ x_i) ) − (n+1)/n
 //
 // Bails to 0 on the trivial cases (empty / all-zero) since dividing
 // by zero would produce NaN and the consumer reads "0" as the
@@ -587,7 +614,6 @@ func repoPrefixForPath(s *Server, path string) string {
 	return path
 }
 
-
 // recencyScore maps days-since-last-commit to a 0..100 health value.
 // Piecewise linear so the curve is predictable to a human auditor;
 // no exponential decay because the threshold cliffs already encode
@@ -627,24 +653,6 @@ func scoreGrade(score float64) string {
 	default:
 		return "F"
 	}
-}
-
-// extractTimestamp pulls the `timestamp` field out of meta.last_authored.
-// Accepts both int64 (in-process enrichment) and float64 (json/gob
-// round-trip lands integers as float64). Same shape recovery the
-// stale-code analyzer uses.
-func extractTimestamp(meta map[string]any) (int64, bool) {
-	la, ok := meta["last_authored"].(map[string]any)
-	if !ok {
-		return 0, false
-	}
-	if ts, ok := la["timestamp"].(int64); ok {
-		return ts, true
-	}
-	if f, ok := la["timestamp"].(float64); ok {
-		return int64(f), true
-	}
-	return 0, false
 }
 
 func clamp01(v float64) float64 {

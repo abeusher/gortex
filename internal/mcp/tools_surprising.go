@@ -32,16 +32,16 @@ func (s *Server) registerSurprisingConnectionsTool() {
 // decide whether the anomaly is real or expected without an extra
 // get_symbol_source round-trip.
 type surprisingEdgeRow struct {
-	From        string             `json:"from"`
-	FromName    string             `json:"from_name,omitempty"`
-	FromFile    string             `json:"from_file,omitempty"`
-	To          string             `json:"to"`
-	ToName      string             `json:"to_name,omitempty"`
-	ToFile      string             `json:"to_file,omitempty"`
-	Kind        string             `json:"kind"`
-	Score       float64            `json:"score"`
-	Signals     map[string]float64 `json:"signals"`
-	Reasons     []string           `json:"reasons"`
+	From     string             `json:"from"`
+	FromName string             `json:"from_name,omitempty"`
+	FromFile string             `json:"from_file,omitempty"`
+	To       string             `json:"to"`
+	ToName   string             `json:"to_name,omitempty"`
+	ToFile   string             `json:"to_file,omitempty"`
+	Kind     string             `json:"kind"`
+	Score    float64            `json:"score"`
+	Signals  map[string]float64 `json:"signals"`
+	Reasons  []string           `json:"reasons"`
 }
 
 func (s *Server) handleGetSurprisingConnections(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -61,27 +61,55 @@ func (s *Server) handleGetSurprisingConnections(ctx context.Context, req mcp.Cal
 		nodeToComm = cr.NodeToComm
 	}
 
-	// Build a fast scoped-node index and an in-edge counter for
-	// the hub check. Counting once is cheaper than calling
-	// GetInEdges per edge.
+	// Build a fast scoped-node index. We still need ALL kinds here —
+	// edges in the surprise tally can land on any node, not just
+	// function/method. Use scopedNodes' single bulk pull rather than
+	// the per-edge GetNode lookups the legacy path fell back to.
 	scopedSet := make(map[string]*graph.Node, 1024)
 	for _, n := range s.scopedNodes(ctx) {
 		scopedSet[n.ID] = n
 	}
 
-	allEdges := s.graph.AllEdges()
-	inDegree := make(map[string]int, len(scopedSet))
+	// Kind tally — short-circuit the AllEdges scan when the backend
+	// implements EdgeKindCounter (returns one row per distinct kind,
+	// not one per edge — a few-dozen-row response replaces a ~286k
+	// edge round-trip on a disk backend). The total edge count then comes
+	// from the per-kind sum so we don't need a second backend call.
 	kindCounts := make(map[graph.EdgeKind]int, 16)
+	totalEdges := 0
+	var allEdges []*graph.Edge
+	if counter, ok := s.graph.(graph.EdgeKindCounter); ok {
+		for k, c := range counter.EdgeKindCounts() {
+			kindCounts[k] = c
+			totalEdges += c
+		}
+	} else {
+		allEdges = s.graph.AllEdges()
+		for _, e := range allEdges {
+			kindCounts[e.Kind]++
+		}
+		totalEdges = len(allEdges)
+	}
+
+	// In-degree still walks edges Go-side — the per-edge anomaly walk
+	// further down already pulls the full edge stream, so bucketing
+	// fan-in during that traversal is free. The InDegreeForNodes
+	// capability runs one COUNT { … } per id; on the gortex workspace
+	// the scoped set is ~30k function/method nodes, and tens of
+	// thousands of indexed subqueries are noticeably slower than the
+	// single AllEdges materialisation the anomaly walk already pays.
+	if allEdges == nil {
+		allEdges = s.graph.AllEdges()
+	}
+	inDegree := make(map[string]int, len(scopedSet))
 	for _, e := range allEdges {
 		if _, ok := scopedSet[e.To]; ok {
 			inDegree[e.To]++
 		}
-		kindCounts[e.Kind]++
 	}
 
 	// Determine which edge kinds are "unusual" — share of total
 	// edges is at or below rare_kind_pct. Recomputed once per call.
-	totalEdges := len(allEdges)
 	rareKinds := make(map[graph.EdgeKind]bool, len(kindCounts))
 	if totalEdges > 0 {
 		thresholdFrac := rareKindPct / 100.0

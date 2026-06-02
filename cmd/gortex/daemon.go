@@ -34,11 +34,14 @@ var (
 	// (the function has no *cobra.Command of its own) to decide whether
 	// the flag overrides the `embedding:` config block. Set once in
 	// runDaemonStart before buildDaemonState runs.
-	daemonEmbeddingsChanged bool
-	daemonStatusWatch       bool
-	daemonStatusInterval    time.Duration
-	daemonHTTPAddr          string
-	daemonHTTPAuthToken     string
+	daemonEmbeddingsChanged   bool
+	daemonStatusWatch         bool
+	daemonStatusInterval      time.Duration
+	daemonHTTPAddr            string
+	daemonHTTPAuthToken       string
+	daemonBackend             string
+	daemonBackendPath         string
+	daemonBackendBufferPoolMB uint64
 )
 
 var daemonCmd = &cobra.Command{
@@ -97,6 +100,12 @@ func init() {
 		"also expose the MCP 2026 Streamable HTTP transport on this TCP address (e.g. 127.0.0.1:7411); empty disables")
 	daemonStartCmd.Flags().StringVar(&daemonHTTPAuthToken, "http-auth-token", "",
 		"bearer token required on every Streamable HTTP request (default: read $GORTEX_DAEMON_HTTP_TOKEN; empty allows unauthenticated localhost binds)")
+	daemonStartCmd.Flags().StringVar(&daemonBackend, "backend", "sqlite",
+		"storage backend: sqlite (default — pure-Go embedded SQL, persists to --backend-path so warm restarts skip re-indexing) | memory (in-process, no persistence — fastest per-op but pays the full cold-warmup cost on every restart)")
+	daemonStartCmd.Flags().StringVar(&daemonBackendPath, "backend-path", "",
+		"directory where the on-disk backend persists its store. Required when --backend != memory. Default: ~/.gortex/store/<backend>.store")
+	daemonStartCmd.Flags().Uint64Var(&daemonBackendBufferPoolMB, "backend-buffer-pool-mb", 0,
+		"advisory page-cache cap (MiB) for on-disk backends. 0 reads $GORTEX_DAEMON_BUFFER_POOL_MB or lets the backend choose its own default; backends that manage their own cache (e.g. sqlite) ignore it")
 	daemonLogsCmd.Flags().IntVarP(&daemonTail, "tail", "n", 50,
 		"show only the last N log lines")
 	daemonStatusCmd.Flags().BoolVarP(&daemonStatusWatch, "watch", "w", false,
@@ -120,6 +129,17 @@ func init() {
 func runDaemonStart(cmd *cobra.Command, _ []string) error {
 	if daemon.IsRunning() {
 		return fmt.Errorf("daemon already running (socket: %s)", daemon.SocketPath())
+	}
+	// IsRunning only probes the socket. A daemon that is mid-shutdown — or
+	// one whose socket wedged — still owns the PID file and, crucially, still
+	// holds the store's on-disk lock. Starting over the top of it makes the
+	// backend open fail with an opaque "failed to open database" lock
+	// conflict, so refuse early with the PID and an actionable next step. The
+	// detached child reaches here too, but it hasn't written its own PID file
+	// yet (that happens in the serve loop), so this can't false-positive on
+	// the daemon we're in the middle of starting.
+	if pid, ok := daemon.RunningPID(); ok {
+		return fmt.Errorf("daemon already running (pid %d) — stop it with `gortex daemon stop`, or use `gortex daemon restart`", pid)
 	}
 	if daemonDetach && os.Getenv("GORTEX_DAEMON_CHILD") != "1" {
 		return spawnDetachedDaemon()
@@ -174,7 +194,18 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		if mw != nil {
 			_ = mw.Stop()
 		}
-		saveSnapshot(state.graph, collectSnapshotRepos(state.multiIndexer), collectSnapshotContracts(state.multiIndexer), collectSnapshotVector(state.multiIndexer), version, logger)
+		if mg, ok := state.graph.(*graph.Graph); ok {
+			// Memory backend — snapshot the full in-memory graph;
+			// the next warmup replays nodes/edges from the gob+gzip
+			// dump because there's no other persistence layer.
+			saveSnapshot(mg, collectSnapshotRepos(state.multiIndexer), collectSnapshotContracts(state.multiIndexer), collectSnapshotVector(state.multiIndexer), version, logger)
+		}
+		// Persistent backends (sqlite) no longer write a metadata
+		// snapshot: per-file mtimes live in the FileMtime sidecar
+		// table, contract records ride on KindContract.Meta, and the
+		// vector index is persisted by the backend itself. Warm
+		// restart reads everything it needs from the on-disk store —
+		// no gob+gzip round-trip required.
 		if state.mcpServer != nil {
 			_ = state.mcpServer.FlushSavings()
 		}
@@ -309,7 +340,15 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 	// the GC then has to clean up. Skipping snapshots until ready cleared
 	// a stall observed in profile #5 where saveSnapshotTo was the only
 	// runnable goroutine on a daemon mid-warmup.
-	stopSnapshotter := startPeriodicSnapshots(state.graph, state.multiIndexer, version, 10*time.Minute, controller.IsReady, logger)
+	// Periodic snapshots fire only for the memory backend — that's
+	// the path that has no other persistence layer for the graph
+	// itself. Persistent backends (sqlite) rely on the backend's own
+	// durability (graph + FileMtimes + contracts + vectors all live
+	// on disk) so the gob+gzip snapshot is dead weight in that mode.
+	stopSnapshotter := func() {}
+	if mg, ok := state.graph.(*graph.Graph); ok {
+		stopSnapshotter = startPeriodicSnapshots(mg, state.multiIndexer, version, 10*time.Minute, controller.IsReady, logger)
+	}
 	defer stopSnapshotter()
 
 	// Periodic savings flush — 5 minute interval. Bounds on-crash data
@@ -364,6 +403,16 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		// first" against a fully populated state.
 		if state.mcpServer != nil {
 			state.mcpServer.RunAnalysis()
+			// Co-change pre-warm: fire the git-history mine in the
+			// background so the first user-visible
+			// find_co_changing_symbols / search-rerank call sees a
+			// populated cache. On a persistent backend the mine is
+			// dominated by the AllNodes + per-pair AddEdge disk-persist
+			// step that mineCoChange already defers into its own
+			// goroutine — but even the git log itself can take 10–30s
+			// on a large history, and we want that off every request
+			// path.
+			state.mcpServer.PrewarmCoChange()
 		}
 		elapsed := time.Since(start)
 		controller.MarkReady(elapsed)
@@ -609,6 +658,13 @@ func emitDaemonStartSummary(w io.Writer, pid int, elapsed time.Duration) {
 func runDaemonStop(cmd *cobra.Command, _ []string) error {
 	w := cmd.ErrOrStderr()
 	if !daemon.IsRunning() {
+		// The socket is gone, but a process may still be alive and holding
+		// the store lock — a daemon mid-shutdown, or one whose socket wedged.
+		// killByPID terminates it AND blocks until it has actually exited,
+		// which is what `daemon restart` relies on to not race the lock.
+		if _, ok := daemon.RunningPID(); ok {
+			return killByPID()
+		}
 		emitDaemonStopAlreadyDown(w)
 		return nil
 	}
@@ -617,6 +673,13 @@ func runDaemonStop(cmd *cobra.Command, _ []string) error {
 	// post-stop summary (the socket file vanishes on clean shutdown).
 	socket := daemon.SocketPath()
 	uptime := daemonUptimeBeforeStop()
+	// Capture the PID too. ControlShutdown only *acks* — the daemon then
+	// flushes and closes the store (releasing its on-disk lock) and exits
+	// asynchronously (see server.go: the handler Shutdown()s ~100ms later in
+	// a goroutine). We must block until that process is gone, or a following
+	// `daemon start` races the still-held lock and dies with the opaque
+	// "failed to open database with status 1".
+	pid, havePID := daemon.RunningPID()
 
 	c, err := daemon.Dial(daemon.Handshake{Mode: daemon.ModeControl, ClientName: "cli"})
 	if err != nil {
@@ -632,8 +695,37 @@ func runDaemonStop(cmd *cobra.Command, _ []string) error {
 	if !resp.OK {
 		return fmt.Errorf("shutdown rejected: %s %s", resp.ErrorCode, resp.ErrorMsg)
 	}
+	if havePID {
+		waitForDaemonExit(pid)
+	}
 	emitDaemonStopSummary(w, socket, uptime)
 	return nil
+}
+
+// waitForDaemonExit blocks until the daemon process pid has exited — and thus
+// released the store's on-disk lock — force-killing it if a graceful shutdown
+// stalls. This is what makes `daemon stop` honest: when it returns, the store
+// is free for the next process, which is the foundation `daemon restart`
+// stands on. Polls cheaply; the common case (a clean flush) clears in well
+// under a second.
+func waitForDaemonExit(pid int) {
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if !platform.ProcessAlive(pid) {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	// Graceful shutdown stalled (e.g. a wedged cgo call). Don't leave a
+	// half-exited daemon clutching the lock — force it, then clean up the
+	// socket/PID so the next start isn't tripped by stale files.
+	fmt.Fprintln(os.Stderr, "[gortex daemon] graceful shutdown timed out — force-killing")
+	_ = platform.KillProcess(pid)
+	for i := 0; i < 60 && platform.ProcessAlive(pid); i++ {
+		time.Sleep(50 * time.Millisecond)
+	}
+	_ = os.Remove(daemon.PIDFilePath())
+	_ = os.Remove(daemon.SocketPath())
 }
 
 // daemonUptimeBeforeStop best-effort-fetches the daemon's reported uptime via
@@ -709,14 +801,16 @@ func runDaemonRestart(cmd *cobra.Command, args []string) error {
 
 	emitDaemonRestartBanner(cmd.ErrOrStderr())
 
-	// Stop is idempotent when not running.
+	// Stop is idempotent when not running and now blocks until the old
+	// process has fully exited — releasing the store's on-disk lock — before
+	// returning. That's what lets the start below reuse the store without
+	// racing the lock. The old code polled `daemon.IsRunning()` here, which
+	// watched the wrong resource: the socket is torn down ~100ms after the
+	// shutdown ack, long before the process exits and the lock clears, so the
+	// poll fell through early and the restart died on "failed to open
+	// database with status 1".
 	if err := runDaemonStop(cmd, args); err != nil {
 		return err
-	}
-	// Give the OS a moment to release the socket file.
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) && daemon.IsRunning() {
-		time.Sleep(50 * time.Millisecond)
 	}
 	daemonDetach = true
 	return runDaemonStart(cmd, args)
@@ -812,8 +906,10 @@ func renderDaemonHeader(w io.Writer, st daemon.StatusResponse) {
 	t.AppendRow(table.Row{"socket", st.SocketPath})
 	t.AppendRow(table.Row{"uptime", formatDuration(time.Duration(st.UptimeSeconds) * time.Second)})
 	if st.Ready {
-		t.AppendRow(table.Row{"state",
-			fmt.Sprintf("ready (warmup %s)", formatDuration(time.Duration(st.WarmupSeconds)*time.Second))})
+		t.AppendRow(table.Row{
+			"state",
+			fmt.Sprintf("ready (warmup %s)", formatDuration(time.Duration(st.WarmupSeconds)*time.Second)),
+		})
 	} else {
 		t.AppendRow(table.Row{"state", "warming up (socket reachable, background re-index in progress)"})
 	}
@@ -1129,6 +1225,21 @@ func daemonControlClient() (*daemon.Client, error) {
 		return nil, fmt.Errorf("daemon not reachable (%v) — is it running? Try `gortex daemon start`", err)
 	}
 	return c, nil
+}
+
+// resolveDaemonBufferPoolMB returns the effective buffer-pool cap.
+// Precedence: --backend-buffer-pool-mb flag > GORTEX_DAEMON_BUFFER_POOL_MB env > 0
+// (which Open then maps to DefaultBufferPoolMB inside the store).
+func resolveDaemonBufferPoolMB() uint64 {
+	if daemonBackendBufferPoolMB != 0 {
+		return daemonBackendBufferPoolMB
+	}
+	if env := strings.TrimSpace(os.Getenv("GORTEX_DAEMON_BUFFER_POOL_MB")); env != "" {
+		if v, err := strconv.ParseUint(env, 10, 64); err == nil {
+			return v
+		}
+	}
+	return 0
 }
 
 // killByPID is the fallback stop path for stale daemons that have a PID

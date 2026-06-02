@@ -26,7 +26,7 @@ type Retriever interface {
 	// The caller passes the graph (so retrievers can do graph
 	// walks without owning a reference). ctx is honoured for
 	// cancellation — long-running retrievers must respect it.
-	Retrieve(ctx context.Context, g *graph.Graph, query string, limit int) ([]*Candidate, error)
+	Retrieve(ctx context.Context, g graph.Store, query string, limit int) ([]*Candidate, error)
 }
 
 // GraphCompletion is a Retriever that uses an upstream Retriever for
@@ -46,7 +46,7 @@ type Retriever interface {
 type GraphCompletion struct {
 	// Seeder produces the initial candidate set the 1-hop expansion
 	// will fan out from. Required.
-	Seeder func(ctx context.Context, g *graph.Graph, query string, limit int) ([]*Candidate, error)
+	Seeder func(ctx context.Context, g graph.Store, query string, limit int) ([]*Candidate, error)
 
 	// MaxSeedExpansion caps the number of new candidates produced
 	// per seed. Defaults to 8 — large enough to surface typical
@@ -69,7 +69,7 @@ func (gc *GraphCompletion) Name() string { return "graph_completion" }
 // merged: the seed copy wins and keeps its rank fields. New nodes
 // added by expansion have TextRank=-1 / VectorRank=-1 so the
 // downstream rerank knows they came from graph expansion.
-func (gc *GraphCompletion) Retrieve(ctx context.Context, g *graph.Graph, query string, limit int) ([]*Candidate, error) {
+func (gc *GraphCompletion) Retrieve(ctx context.Context, g graph.Store, query string, limit int) ([]*Candidate, error) {
 	if gc.Seeder == nil {
 		return nil, errNilSeeder
 	}
@@ -91,6 +91,7 @@ func (gc *GraphCompletion) Retrieve(ctx context.Context, g *graph.Graph, query s
 
 	out := make([]*Candidate, 0, len(seeds)*2)
 	seen := make(map[string]*Candidate, len(seeds)*2)
+	seedIDs := make([]string, 0, len(seeds))
 	for _, c := range seeds {
 		if c == nil || c.Node == nil {
 			continue
@@ -100,14 +101,38 @@ func (gc *GraphCompletion) Retrieve(ctx context.Context, g *graph.Graph, query s
 		}
 		seen[c.Node.ID] = c
 		out = append(out, c)
+		seedIDs = append(seedIDs, c.Node.ID)
 	}
 
-	for _, seed := range seeds {
-		if seed == nil || seed.Node == nil {
-			continue
+	// One batched out-edge round-trip across every seed instead of
+	// one query per seed. On the disk backend this drops ~30
+	// round-trips into 1 for a typical search_symbols completion pass.
+	outEdges := g.GetOutEdgesByNodeIDs(seedIDs)
+
+	// Collect every distinct target id, then materialise the target
+	// nodes in one batched GetNodesByIDs call — same shape, same win.
+	toIDs := make([]string, 0, len(outEdges)*4)
+	toSeen := make(map[string]struct{}, len(outEdges)*4)
+	for _, seedID := range seedIDs {
+		for _, e := range outEdges[seedID] {
+			if !keepAll && !allowed[e.Kind] {
+				continue
+			}
+			if _, dup := seen[e.To]; dup {
+				continue
+			}
+			if _, dup := toSeen[e.To]; dup {
+				continue
+			}
+			toSeen[e.To] = struct{}{}
+			toIDs = append(toIDs, e.To)
 		}
+	}
+	toNodes := g.GetNodesByIDs(toIDs)
+
+	for _, seedID := range seedIDs {
 		added := 0
-		for _, e := range g.GetOutEdges(seed.Node.ID) {
+		for _, e := range outEdges[seedID] {
 			if !keepAll && !allowed[e.Kind] {
 				continue
 			}
@@ -117,7 +142,7 @@ func (gc *GraphCompletion) Retrieve(ctx context.Context, g *graph.Graph, query s
 			if _, dup := seen[e.To]; dup {
 				continue
 			}
-			toNode := g.GetNode(e.To)
+			toNode := toNodes[e.To]
 			if toNode == nil {
 				continue
 			}

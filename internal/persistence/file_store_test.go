@@ -276,10 +276,21 @@ func TestFileStore_ConcurrentReadWrite(t *testing.T) {
 				return
 			default:
 			}
+			var e error
 			if i%2 == 0 {
-				errs <- fs.Save(snap)
+				e = fs.Save(snap)
 			} else {
-				errs <- fs.Evict(snap.RepoPath, snap.Branch, snap.CommitHash)
+				e = fs.Evict(snap.RepoPath, snap.Branch, snap.CommitHash)
+			}
+			// Honour stop while sending: errs is buffered, and the
+			// writer outruns the buffer in microseconds. Without the
+			// stop arm here the writer blocks on a full errs channel,
+			// never re-checks stop, and wg.Wait() deadlocks (the buffer
+			// only drains after wg.Wait()).
+			select {
+			case errs <- e:
+			case <-stop:
+				return
 			}
 		}
 	}()

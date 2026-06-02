@@ -29,6 +29,12 @@ import (
 // per-pass set so a second invocation in the same ResolveAll burst
 // emits no duplicate EdgeDependsOnModule edges.
 func (r *Resolver) attributeNonGoModuleImports() {
+	// Python/Dart-only attribution (nonGoImportToModuleID handles exactly
+	// those two ecosystems). Skip the EdgeImports scan when the graph has
+	// neither language.
+	if !r.graphHasLanguage("python") && !r.graphHasLanguage("dart") {
+		return
+	}
 	fileLang := r.collectFileLanguages()
 	type pendingEdge struct {
 		edge     *graph.Edge
@@ -39,10 +45,7 @@ func (r *Resolver) attributeNonGoModuleImports() {
 	moduleSeeds := map[string]moduleSeed{}
 	dependsSeen := map[string]map[string]struct{}{} // fileID → set of moduleIDs
 
-	for _, e := range r.graph.AllEdges() {
-		if e.Kind != graph.EdgeImports {
-			continue
-		}
+	for e := range r.graph.EdgesByKind(graph.EdgeImports) {
 		if !strings.HasPrefix(e.To, "external::") {
 			continue
 		}
@@ -72,21 +75,46 @@ func (r *Resolver) attributeNonGoModuleImports() {
 	}
 
 	// Materialise module nodes first; later loops assume the
-	// node exists when we add EdgeDependsOnModule.
+	// node exists when we add EdgeDependsOnModule. Batch the
+	// presence check via GetNodesByIDs so disk backends do one
+	// indexed SELECT IN (...) instead of one per-seed GetNode.
+	seedIDs := make([]string, 0, len(moduleSeeds))
+	for id := range moduleSeeds {
+		seedIDs = append(seedIDs, id)
+	}
+	existing := r.graph.GetNodesByIDs(seedIDs)
 	for _, seed := range moduleSeeds {
-		if r.graph.GetNode(seed.id) != nil {
+		if _, ok := existing[seed.id]; ok {
 			continue
 		}
 		r.graph.AddNode(buildNonGoModuleNode(seed))
 	}
 
-	// Rewrite each EdgeImports target and re-bucket via
-	// ReindexEdge so find_usages on the new module sees the
-	// caller file.
+	// Pre-build a set of every (fileID, moduleID) pair the graph
+	// already has an EdgeDependsOnModule edge for. The old code
+	// called hasDependsOnModule per rewrite, which on a disk backend
+	// fans out to N per-file GetOutEdges queries (50k+ on a
+	// gortex-scale pass). One EdgesByKind scan is an indexed range
+	// read on every backend, plus a Go-side map build that turns
+	// the per-rewrite check into a constant-time lookup.
+	existingDepends := make(map[string]map[string]struct{})
+	for e := range r.graph.EdgesByKind(graph.EdgeDependsOnModule) {
+		set := existingDepends[e.From]
+		if set == nil {
+			set = make(map[string]struct{})
+			existingDepends[e.From] = set
+		}
+		set[e.To] = struct{}{}
+	}
+
+	// Rewrite each EdgeImports target and collect the re-bucket
+	// jobs into one batch so disk backends commit in chunks rather
+	// than once per import rewrite.
+	reindexBatch := make([]graph.EdgeReindex, 0, len(rewrites))
 	for _, p := range rewrites {
 		p.edge.To = p.moduleID
 		p.edge.Origin = graph.OriginASTResolved
-		r.graph.ReindexEdge(p.edge, p.oldTo)
+		reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: p.edge, OldTo: p.oldTo})
 
 		set, ok := dependsSeen[p.edge.From]
 		if !ok {
@@ -99,9 +127,12 @@ func (r *Resolver) attributeNonGoModuleImports() {
 		set[p.moduleID] = struct{}{}
 		// Avoid emitting a duplicate EdgeDependsOnModule when an
 		// earlier pass already wired one (e.g. cold + warm
-		// indexing of the same file).
-		if r.hasDependsOnModule(p.edge.From, p.moduleID) {
-			continue
+		// indexing of the same file). Constant-time map lookup
+		// against the pre-built existingDepends index.
+		if existing, ok := existingDepends[p.edge.From]; ok {
+			if _, dup := existing[p.moduleID]; dup {
+				continue
+			}
 		}
 		r.graph.AddEdge(&graph.Edge{
 			From:            p.edge.From,
@@ -114,29 +145,19 @@ func (r *Resolver) attributeNonGoModuleImports() {
 			Origin:          graph.OriginASTResolved,
 		})
 	}
+	if len(reindexBatch) > 0 {
+		r.graph.ReindexEdges(reindexBatch)
+	}
 }
 
 // collectFileLanguages walks KindFile nodes once and returns
 // (file ID → language) for the per-edge dispatch above.
 func (r *Resolver) collectFileLanguages() map[string]string {
 	out := map[string]string{}
-	for _, n := range r.graph.AllNodes() {
-		if n.Kind == graph.KindFile {
-			out[n.ID] = n.Language
-		}
+	for n := range r.graph.NodesByKind(graph.KindFile) {
+		out[n.ID] = n.Language
 	}
 	return out
-}
-
-// hasDependsOnModule reports whether the file already has an
-// outgoing EdgeDependsOnModule pointing at moduleID.
-func (r *Resolver) hasDependsOnModule(fileID, moduleID string) bool {
-	for _, e := range r.graph.GetOutEdges(fileID) {
-		if e.Kind == graph.EdgeDependsOnModule && e.To == moduleID {
-			return true
-		}
-	}
-	return false
 }
 
 // nonGoImportToModuleID maps a (language, importPath) pair to its
@@ -261,106 +282,106 @@ type moduleSeed struct {
 // the list covers everything the typical app reaches into, and
 // false negatives at most degrade the audit's separation of concerns.
 var pythonStdlibTops = map[string]struct{}{
-	"abc":            {},
-	"argparse":       {},
-	"array":          {},
-	"ast":            {},
-	"asyncio":        {},
-	"base64":         {},
-	"binascii":       {},
-	"bisect":         {},
-	"builtins":       {},
-	"calendar":       {},
-	"cmath":          {},
-	"collections":    {},
-	"concurrent":     {},
-	"configparser":   {},
-	"contextlib":     {},
-	"contextvars":    {},
-	"copy":           {},
-	"csv":            {},
-	"ctypes":         {},
-	"dataclasses":    {},
-	"datetime":       {},
-	"decimal":        {},
-	"difflib":        {},
-	"dis":            {},
-	"email":          {},
-	"enum":           {},
-	"errno":          {},
-	"fnmatch":        {},
-	"fractions":      {},
-	"functools":      {},
-	"gc":             {},
-	"getopt":         {},
-	"gettext":        {},
-	"glob":           {},
-	"gzip":           {},
-	"hashlib":        {},
-	"heapq":          {},
-	"hmac":           {},
-	"html":           {},
-	"http":           {},
-	"imaplib":        {},
-	"importlib":      {},
-	"inspect":        {},
-	"io":             {},
-	"ipaddress":      {},
-	"itertools":      {},
-	"json":           {},
-	"keyword":        {},
-	"linecache":      {},
-	"locale":         {},
-	"logging":        {},
-	"math":           {},
-	"mimetypes":      {},
+	"abc":             {},
+	"argparse":        {},
+	"array":           {},
+	"ast":             {},
+	"asyncio":         {},
+	"base64":          {},
+	"binascii":        {},
+	"bisect":          {},
+	"builtins":        {},
+	"calendar":        {},
+	"cmath":           {},
+	"collections":     {},
+	"concurrent":      {},
+	"configparser":    {},
+	"contextlib":      {},
+	"contextvars":     {},
+	"copy":            {},
+	"csv":             {},
+	"ctypes":          {},
+	"dataclasses":     {},
+	"datetime":        {},
+	"decimal":         {},
+	"difflib":         {},
+	"dis":             {},
+	"email":           {},
+	"enum":            {},
+	"errno":           {},
+	"fnmatch":         {},
+	"fractions":       {},
+	"functools":       {},
+	"gc":              {},
+	"getopt":          {},
+	"gettext":         {},
+	"glob":            {},
+	"gzip":            {},
+	"hashlib":         {},
+	"heapq":           {},
+	"hmac":            {},
+	"html":            {},
+	"http":            {},
+	"imaplib":         {},
+	"importlib":       {},
+	"inspect":         {},
+	"io":              {},
+	"ipaddress":       {},
+	"itertools":       {},
+	"json":            {},
+	"keyword":         {},
+	"linecache":       {},
+	"locale":          {},
+	"logging":         {},
+	"math":            {},
+	"mimetypes":       {},
 	"multiprocessing": {},
-	"numbers":        {},
-	"operator":       {},
-	"os":             {},
-	"pathlib":        {},
-	"pickle":         {},
-	"platform":       {},
-	"posixpath":      {},
-	"pprint":         {},
-	"queue":          {},
-	"random":         {},
-	"re":             {},
-	"secrets":        {},
-	"shutil":         {},
-	"signal":         {},
-	"smtplib":        {},
-	"socket":         {},
-	"sqlite3":        {},
-	"ssl":            {},
-	"stat":           {},
-	"statistics":     {},
-	"string":         {},
-	"struct":         {},
-	"subprocess":     {},
-	"sys":            {},
-	"sysconfig":      {},
-	"tarfile":        {},
-	"tempfile":       {},
-	"textwrap":       {},
-	"threading":      {},
-	"time":           {},
-	"timeit":         {},
-	"tokenize":       {},
-	"traceback":      {},
-	"types":          {},
-	"typing":         {},
-	"unicodedata":    {},
-	"unittest":       {},
-	"urllib":         {},
-	"uuid":           {},
-	"warnings":       {},
-	"weakref":        {},
-	"xml":            {},
-	"xmlrpc":         {},
-	"zipfile":        {},
-	"zlib":           {},
-	"zoneinfo":       {},
+	"numbers":         {},
+	"operator":        {},
+	"os":              {},
+	"pathlib":         {},
+	"pickle":          {},
+	"platform":        {},
+	"posixpath":       {},
+	"pprint":          {},
+	"queue":           {},
+	"random":          {},
+	"re":              {},
+	"secrets":         {},
+	"shutil":          {},
+	"signal":          {},
+	"smtplib":         {},
+	"socket":          {},
+	"sqlite3":         {},
+	"ssl":             {},
+	"stat":            {},
+	"statistics":      {},
+	"string":          {},
+	"struct":          {},
+	"subprocess":      {},
+	"sys":             {},
+	"sysconfig":       {},
+	"tarfile":         {},
+	"tempfile":        {},
+	"textwrap":        {},
+	"threading":       {},
+	"time":            {},
+	"timeit":          {},
+	"tokenize":        {},
+	"traceback":       {},
+	"types":           {},
+	"typing":          {},
+	"unicodedata":     {},
+	"unittest":        {},
+	"urllib":          {},
+	"uuid":            {},
+	"warnings":        {},
+	"weakref":         {},
+	"xml":             {},
+	"xmlrpc":          {},
+	"zipfile":         {},
+	"zlib":            {},
+	"zoneinfo":        {},
 }
 
 func isPythonStdlibTop(name string) bool {

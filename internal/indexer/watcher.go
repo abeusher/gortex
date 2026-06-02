@@ -94,6 +94,29 @@ type Watcher struct {
 	// down in Stop alongside the fsnotify backend. nil when the
 	// per-repo watcher is disabled via WatchConfig.Enabled.
 	poller *Poller
+
+	// reconcileMu guards the overflow-driven full-tree reconcile.
+	// reconcilePending coalesces a burst of overflow / dropped-event
+	// signals into at most one reconcile in flight: the kernel inotify
+	// queue can overflow (EventOverflow) or the backend can drop events
+	// under backpressure (the Dropped() channel), and either means we
+	// may have lost a create/modify with no path to re-index. macOS
+	// FSEvents self-heals (it re-scans on UserDropped/KernelDropped),
+	// but Linux inotify does not — without this the lost event waits on
+	// the up-to-1h janitor. reconcileFn is a test seam: nil in
+	// production (the real IncrementalReindex runs).
+	reconcileMu      sync.Mutex
+	reconcilePending bool
+	reconcileFn      func()
+
+	// pendingScanDirs coalesces newly-created directories awaiting a
+	// scoped subtree re-index — the new-subdir race (see enqueueDirScan).
+	// dirScanActive guards a single in-flight drainer goroutine; scanFn
+	// is a test seam, nil in production (the real IncrementalReindexPaths
+	// runs). All three are guarded by reconcileMu.
+	pendingScanDirs map[string]struct{}
+	dirScanActive   bool
+	scanFn          func(map[string]struct{})
 }
 
 const maxHistory = 1000
@@ -375,6 +398,7 @@ func (w *Watcher) loop() {
 		return
 	}
 	eventsCh := w.fsw.Events()
+	droppedCh := w.fsw.Dropped()
 	for {
 		select {
 		case <-w.done:
@@ -384,11 +408,189 @@ func (w *Watcher) loop() {
 				return
 			}
 			w.handleEvent(event)
+		case _, ok := <-droppedCh:
+			if !ok {
+				// Backend tore down its dropped channel; keep
+				// draining Events only.
+				droppedCh = nil
+				continue
+			}
+			// The backend dropped an event under backpressure (the
+			// main Events channel was full). We don't know which path
+			// was lost, so reconcile the whole tree.
+			w.triggerOverflowReconcile("dropped-event")
 		}
 	}
 }
 
+// guardWatcherPanic recovers a panic in a watcher background goroutine —
+// a debounced patch, a storm drain, an overflow reconcile, or a
+// new-directory scan. Those goroutines call into the graph store, and
+// store_sqlite turns a fatal storage error (a closed DB during a daemon
+// restart, a busy/locked DB, disk-full) into a panic via panicOnFatal.
+// The MCP tool path has its own firewall (wrapToolHandler); these
+// fsnotify-driven goroutines don't route through it, so without this a
+// single transient store error during a restart or rebuild takes the
+// whole daemon down. Recovering aborts just that unit of work — the file
+// stays stale until the next event or the reconcile janitor — instead of
+// crashing the process.
+func (w *Watcher) guardWatcherPanic(op string) {
+	if r := recover(); r != nil && w.logger != nil {
+		w.logger.Error("watcher: recovered from panic in background re-index",
+			zap.String("op", op),
+			zap.Any("panic", r),
+			zap.Stack("stack"))
+	}
+}
+
+// triggerOverflowReconcile schedules a single coalesced full-tree
+// reconcile in response to a lost-event signal (a kernel inotify queue
+// overflow or a backpressure-dropped event). A burst of signals
+// collapses into at most one reconcile in flight: the first caller sets
+// reconcilePending and runs the reconcile off the event loop; concurrent
+// callers observe the flag and return immediately. Best-effort and
+// logged — the event loop is never blocked.
+func (w *Watcher) triggerOverflowReconcile(reason string) {
+	w.reconcileMu.Lock()
+	if w.reconcilePending {
+		w.reconcileMu.Unlock()
+		return
+	}
+	w.reconcilePending = true
+	fn := w.reconcileFn
+	w.reconcileMu.Unlock()
+
+	if w.logger != nil {
+		w.logger.Warn("watcher: event signal lost — scheduling full-tree reconcile",
+			zap.String("reason", reason),
+			zap.String("root", w.indexer.rootPath))
+	}
+
+	go func() {
+		defer func() {
+			w.reconcileMu.Lock()
+			w.reconcilePending = false
+			w.reconcileMu.Unlock()
+		}()
+		defer w.guardWatcherPanic("overflow-reconcile")
+		if fn != nil {
+			fn()
+			return
+		}
+		if _, err := w.indexer.IncrementalReindex(w.indexer.rootPath); err != nil {
+			if w.logger != nil {
+				w.logger.Warn("watcher: overflow reconcile failed",
+					zap.String("reason", reason),
+					zap.Error(err))
+			}
+		}
+	}()
+}
+
+// dirScanEscalateCap bounds the scoped new-directory scan: a burst that
+// creates more than this many directories (a large checkout or unpack)
+// escalates to a single full-tree reconcile instead of fanning out into
+// that many scoped subtree walks.
+const dirScanEscalateCap = 64
+
+// enqueueDirScan schedules a scoped re-index of a newly-created
+// directory's subtree, closing the new-subdir race: on Linux inotify a
+// file written into a directory before its watch attaches fires no
+// event. A burst of directory creates coalesces into a single in-flight
+// drainer (mirrors triggerOverflowReconcile) — the first caller starts
+// the goroutine, concurrent callers add their directory to
+// pendingScanDirs and return. The drainer loops until the set is empty,
+// so a directory enqueued while a scan is in flight is still picked up;
+// nothing is lost and there is no debounce-timing race.
+func (w *Watcher) enqueueDirScan(dir string) {
+	w.reconcileMu.Lock()
+	if w.pendingScanDirs == nil {
+		w.pendingScanDirs = make(map[string]struct{})
+	}
+	w.pendingScanDirs[dir] = struct{}{}
+	if w.dirScanActive {
+		w.reconcileMu.Unlock()
+		return
+	}
+	w.dirScanActive = true
+	w.reconcileMu.Unlock()
+
+	go func() {
+		for {
+			w.reconcileMu.Lock()
+			dirs := w.pendingScanDirs
+			w.pendingScanDirs = nil
+			if len(dirs) == 0 {
+				w.dirScanActive = false
+				w.reconcileMu.Unlock()
+				return
+			}
+			fn := w.scanFn
+			w.reconcileMu.Unlock()
+			func() {
+				defer w.guardWatcherPanic("dir-scan")
+				w.runDirScan(dirs, fn)
+			}()
+		}
+	}()
+}
+
+// runDirScan re-indexes the accumulated new directories. A large burst
+// escalates to one full-tree reconcile (dirScanEscalateCap); otherwise
+// the scoped subtrees are walked in a single IncrementalReindexPaths
+// call, which IsStale-gates each file so already-current files cost only
+// a stat. fn is the test seam.
+func (w *Watcher) runDirScan(dirs map[string]struct{}, fn func(map[string]struct{})) {
+	if fn != nil {
+		fn(dirs)
+		return
+	}
+	if len(dirs) > dirScanEscalateCap {
+		if w.logger != nil {
+			w.logger.Info("watcher: large new-directory burst — full-tree reconcile",
+				zap.Int("dirs", len(dirs)), zap.String("root", w.indexer.rootPath))
+		}
+		if _, err := w.indexer.IncrementalReindex(w.indexer.rootPath); err != nil && w.logger != nil {
+			w.logger.Warn("watcher: new-directory reconcile failed", zap.Error(err))
+		}
+		return
+	}
+	paths := make([]string, 0, len(dirs))
+	for d := range dirs {
+		paths = append(paths, d)
+	}
+	if _, err := w.indexer.IncrementalReindexPaths(w.indexer.rootPath, paths); err != nil && w.logger != nil {
+		w.logger.Warn("watcher: new-directory scan failed",
+			zap.Strings("dirs", paths), zap.Error(err))
+	}
+}
+
+// hasEventType reports whether the aggregated event-type set contains want.
+func hasEventType(types []fswatcher.EventType, want fswatcher.EventType) bool {
+	for _, t := range types {
+		if t == want {
+			return true
+		}
+	}
+	return false
+}
+
 func (w *Watcher) handleEvent(event fswatcher.WatchEvent) {
+	// Kernel queue overflow arrives as a pathless EventOverflow on the
+	// Events channel: the Linux inotify and Windows backends emit it when
+	// the kernel drops events and cannot tell us which paths were lost.
+	// macOS FSEvents never emits it — the darwin backend absorbs
+	// UserDropped/KernelDropped by re-scanning the affected subtree
+	// internally — so this branch is effectively Linux/Windows-only. With
+	// no path to re-index, trigger a coalesced full-tree reconcile and
+	// stop; every path-based step below would misfire on the empty path.
+	for _, t := range event.Types {
+		if t == fswatcher.EventOverflow {
+			w.triggerOverflowReconcile("queue-overflow")
+			return
+		}
+	}
+
 	path := normalizeEventPath(event.Path, w.indexer.rootPath)
 
 	// Probe artifacts: sentinel files Start writes to confirm the
@@ -416,11 +618,24 @@ func (w *Watcher) handleEvent(event fswatcher.WatchEvent) {
 		return
 	}
 
-	// fswatcher with WatchNested is recursive on every backend, so we
-	// don't need to manually re-attach watches on directory creates;
-	// drop dir events before they reach indexer logic.
+	// Directory events. fswatcher with WatchNested attaches the watch
+	// for a new directory itself, so we never re-attach. But on Linux
+	// inotify that watch lands only AFTER the directory's create event is
+	// read, so a file written into the directory in that gap fires no
+	// event and would stay invisible until the hourly janitor. When the
+	// event carries a Create, scan the new directory's subtree on disk so
+	// those pre-watch files are picked up regardless of whether an event
+	// ever fired ("watch first, then scan": files created after the watch
+	// fire normal events, files created before are caught by the scan,
+	// and the overlap is at worst a redundant idempotent re-index). A dir
+	// event without a Create — a bare mtime bump on an existing dir —
+	// needs no scan: entry changes inside it fire their own file events.
+	// Either way the directory event itself reaches no indexer logic.
 	if kind == ChangeCreated || kind == ChangeModified {
 		if info, err := os.Stat(path); err == nil && info.IsDir() {
+			if hasEventType(event.Types, fswatcher.EventCreate) {
+				w.enqueueDirScan(path)
+			}
 			return
 		}
 	}
@@ -451,10 +666,15 @@ func (w *Watcher) handleEvent(event fswatcher.WatchEvent) {
 	}
 	debounce := time.Duration(w.config.DebounceMs) * time.Millisecond
 	w.pending[path] = time.AfterFunc(debounce, func() {
+		// Clean up the pending entry even if the patch panics, then
+		// recover so a fatal store error can't crash the daemon.
+		defer func() {
+			w.mu.Lock()
+			delete(w.pending, path)
+			w.mu.Unlock()
+		}()
+		defer w.guardWatcherPanic("patch " + path)
 		w.patchGraph(path, kind)
-		w.mu.Lock()
-		delete(w.pending, path)
-		w.mu.Unlock()
 	})
 	w.mu.Unlock()
 }
@@ -526,6 +746,7 @@ func (w *Watcher) recordInStorm(path string, kind ChangeKind) {
 // then one global ResolveAll at the end. Cuts a 500-file checkout
 // from "resolver runs 500 times" to "resolver runs once."
 func (w *Watcher) drainStorm() {
+	defer w.guardWatcherPanic("storm-drain")
 	w.stormMu.Lock()
 	batch := w.stormBatch
 	w.stormBatch = make(map[string]ChangeKind)
@@ -627,15 +848,30 @@ func (w *Watcher) patchGraph(path string, kind ChangeKind) {
 			return
 		}
 
-		nr, er := w.indexer.EvictFile(path)
-		nodesRemoved = nr
-		edgesRemoved = er
+		// Do NOT pre-evict. IndexFile parse-then-swaps internally: it
+		// evicts the file's prior nodes and re-adds the new ones only on a
+		// successful parse, and leaves the prior nodes intact on a parse
+		// failure. Pre-evicting here was the node-loss bug — a transiently
+		// unparseable save (mid-edit) dropped the file's symbols from the
+		// graph until the next clean save. Capture the file's prior node
+		// count first (still present pre-swap) so removed/added telemetry
+		// stays gross: a rename removes one node and adds one even though
+		// the net node delta is zero.
+		priorFileNodes := len(w.indexer.graph.GetFileNodes(relPath))
 		if err := w.indexer.IndexFile(path); err != nil {
 			w.logger.Warn("reindex file failed", zap.String("path", path), zap.Error(err))
 			return
 		}
-		nodesAdded = w.indexer.graph.NodeCount() - (nodesBefore - nr)
-		edgesAdded = w.indexer.graph.EdgeCount() - (edgesBefore - er)
+		nodesRemoved = priorFileNodes
+		nodesAdded = len(w.indexer.graph.GetFileNodes(relPath))
+		// Edge churn as the net graph-wide delta — per-file edge counting
+		// would need a subgraph walk, which this watch-patch telemetry
+		// doesn't need.
+		if edgesAfter := w.indexer.graph.EdgeCount(); edgesAfter >= edgesBefore {
+			edgesAdded = edgesAfter - edgesBefore
+		} else {
+			edgesRemoved = edgesBefore - edgesAfter
+		}
 
 		// Notify callback with old and new symbols.
 		w.symbolChangeCbMu.RLock()

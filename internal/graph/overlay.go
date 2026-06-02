@@ -331,6 +331,45 @@ func (v *OverlaidView) GetNode(id string) *Node {
 	return v.base.GetNode(id)
 }
 
+// GetNodesByIDs returns the overlay-aware *Node for each input ID.
+// Overlay-owned IDs short-circuit to the per-session layer (and may
+// resolve to nil when the overlay deleted the node); the remainder
+// fans out as a single batched lookup against the base store. Missing
+// IDs are simply absent from the returned map.
+func (v *OverlaidView) GetNodesByIDs(ids []string) map[string]*Node {
+	if len(ids) == 0 {
+		return nil
+	}
+	out := make(map[string]*Node, len(ids))
+	baseIDs := ids[:0:0] // fresh backing array — never aliases caller's slice
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		if _, dup := out[id]; dup {
+			continue
+		}
+		if v.layer != nil && v.nodeBelongsToOverlay(id) {
+			if n := v.layer.nodeByID[id]; n != nil {
+				out[id] = n
+			}
+			// Overlay tombstone — ID is hidden, do not fall back to base.
+			continue
+		}
+		// Track for the single base round-trip; reserve a slot in `out`
+		// only after the batched lookup returns.
+		baseIDs = append(baseIDs, id)
+	}
+	if len(baseIDs) > 0 && v.base != nil {
+		for id, n := range v.base.GetNodesByIDs(baseIDs) {
+			if n != nil {
+				out[id] = n
+			}
+		}
+	}
+	return out
+}
+
 // GetNodeByQualName: overlay first, then base. Base hits are filtered
 // to drop entries whose file is overlaid (the overlay's view wins).
 func (v *OverlaidView) GetNodeByQualName(qualName string) *Node {
@@ -349,6 +388,27 @@ func (v *OverlaidView) GetNodeByQualName(qualName string) *Node {
 		return nil
 	}
 	return n
+}
+
+// GetNodesByQualNames resolves each name through GetNodeByQualName so the
+// overlay's layer-first / shadowed-file filtering applies — an inherited
+// base batch would bypass the overlay. Per-name is fine: an interactive
+// overlay's working set is small (the batch form exists for the
+// cold-warmup scale on the base store, not here). Returns only hits.
+func (v *OverlaidView) GetNodesByQualNames(qualNames []string) map[string]*Node {
+	out := make(map[string]*Node, len(qualNames))
+	for _, q := range qualNames {
+		if q == "" {
+			continue
+		}
+		if _, done := out[q]; done {
+			continue
+		}
+		if n := v.GetNodeByQualName(q); n != nil {
+			out[q] = n
+		}
+	}
+	return out
 }
 
 // FindNodesByName merges base hits (filtered to drop nodes in
@@ -379,6 +439,60 @@ func (v *OverlaidView) FindNodesByName(name string) []*Node {
 			}
 		}
 		out = append(out, n)
+	}
+	return out
+}
+
+// FindNodesByNameContaining merges overlay-touched name hits with the
+// base result, then re-applies the per-overlay-file masking the same
+// way FindNodesByName does. Order is overlay-first, then base; the
+// limit caps the merged total. Empty substr or both layers nil
+// returns nil.
+func (v *OverlaidView) FindNodesByNameContaining(substr string, limit int) []*Node {
+	if substr == "" {
+		return nil
+	}
+	needle := strings.ToLower(substr)
+	var out []*Node
+	// Overlay-side: walk the layer's nodesByName index — the same
+	// bucket FindNodesByName reads from — and accept any name whose
+	// lowercase form contains the needle.
+	if v.layer != nil {
+		for name, bucket := range v.layer.nodesByName {
+			if strings.Contains(strings.ToLower(name), needle) {
+				out = append(out, bucket...)
+				if limit > 0 && len(out) >= limit {
+					return out[:limit]
+				}
+			}
+		}
+	}
+	if v.base == nil {
+		return out
+	}
+	// Base-side: fetch with an inflated limit so overlay-mask drops
+	// don't leave a short page. Then re-apply the same overlaid-file
+	// + name-removed mask FindNodesByName uses.
+	fetch := limit
+	if fetch > 0 {
+		fetch *= 2
+	}
+	for _, n := range v.base.FindNodesByNameContaining(substr, fetch) {
+		if v.layer != nil {
+			if v.layer.HasFile(IDFile(n.ID)) {
+				continue
+			}
+			if v.layer.nameRemoved[n.Name] != nil && v.layer.nameRemoved[n.Name][n.ID] {
+				continue
+			}
+		}
+		out = append(out, n)
+		if limit > 0 && len(out) >= limit {
+			return out[:limit]
+		}
+	}
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
 	}
 	return out
 }
@@ -483,6 +597,113 @@ func (v *OverlaidView) GetInEdges(nodeID string) []*Edge {
 		}
 	}
 	out = append(out, v.layer.inEdges[nodeID]...)
+	return out
+}
+
+// GetOutEdgesByNodeIDs returns the overlay-aware outgoing-edge map for
+// every input id. Overlay-owned ids short-circuit to the per-session
+// layer; the remainder fans out as a single batched lookup against
+// the base store. Output mirrors GetOutEdges's per-id semantics
+// (target-side overlay deletions filtered out), but in one cgo
+// round-trip per direction instead of N.
+func (v *OverlaidView) GetOutEdgesByNodeIDs(ids []string) map[string][]*Edge {
+	if len(ids) == 0 {
+		return nil
+	}
+	out := make(map[string][]*Edge, len(ids))
+	baseIDs := ids[:0:0]
+	seen := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		if v.layer != nil && v.nodeBelongsToOverlay(id) {
+			src := v.layer.outEdges[id]
+			cp := make([]*Edge, len(src))
+			copy(cp, src)
+			out[id] = cp
+			continue
+		}
+		baseIDs = append(baseIDs, id)
+	}
+	if len(baseIDs) > 0 && v.base != nil {
+		base := v.base.GetOutEdgesByNodeIDs(baseIDs)
+		for id, edges := range base {
+			if v.layer == nil {
+				out[id] = edges
+				continue
+			}
+			filtered := edges[:0:0]
+			for _, e := range edges {
+				if v.layer.HasFile(IDFile(e.To)) {
+					if v.layer.nodeByID[e.To] == nil {
+						continue // target deleted in overlay
+					}
+				}
+				filtered = append(filtered, e)
+			}
+			out[id] = filtered
+		}
+	}
+	return out
+}
+
+// GetInEdgesByNodeIDs is the inbound sibling of GetOutEdgesByNodeIDs.
+// Merges base in-edges (filtered to drop edges sourced in overlaid
+// files) with overlay-introduced in-edges for each input id, all in a
+// single batched base round-trip.
+func (v *OverlaidView) GetInEdgesByNodeIDs(ids []string) map[string][]*Edge {
+	if len(ids) == 0 {
+		return nil
+	}
+	out := make(map[string][]*Edge, len(ids))
+	seen := make(map[string]struct{}, len(ids))
+	uniq := ids[:0:0]
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		uniq = append(uniq, id)
+	}
+	if len(uniq) == 0 {
+		return out
+	}
+	if v.base != nil {
+		base := v.base.GetInEdgesByNodeIDs(uniq)
+		for _, id := range uniq {
+			edges := base[id]
+			if v.layer == nil {
+				out[id] = edges
+				continue
+			}
+			filtered := edges[:0:0]
+			for _, e := range edges {
+				if v.layer.HasFile(IDFile(e.From)) {
+					continue // source is overlaid — overlay's version wins
+				}
+				if v.layer.HasFile(IDFile(e.To)) && v.layer.nodeByID[e.To] == nil {
+					continue // target was deleted by overlay
+				}
+				filtered = append(filtered, e)
+			}
+			out[id] = filtered
+		}
+	}
+	if v.layer != nil {
+		for _, id := range uniq {
+			if extras := v.layer.inEdges[id]; len(extras) > 0 {
+				out[id] = append(out[id], extras...)
+			}
+		}
+	}
 	return out
 }
 

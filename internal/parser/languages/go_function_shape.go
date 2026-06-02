@@ -24,7 +24,7 @@ import (
 // declLine is the 1-based line of the declaration, used as the
 // anchor for nodes/edges that don't have a finer-grained AST
 // position to reference.
-func emitGoFunctionShape(ownerID string, defNode *sitter.Node, paramsCap, resultCap *parser.CapturedNode, src []byte, filePath string, declLine int, result *parser.ExtractionResult) {
+func emitGoFunctionShape(ownerID string, defNode *sitter.Node, paramsCap, resultCap *parser.CapturedNode, src []byte, filePath string, declLine int, imports map[string]string, result *parser.ExtractionResult) {
 	if defNode == nil {
 		return
 	}
@@ -32,15 +32,21 @@ func emitGoFunctionShape(ownerID string, defNode *sitter.Node, paramsCap, result
 	emitGoReturnEdges(ownerID, resultCap, src, filePath, declLine, result)
 	emitGoGenericParamNodes(ownerID, defNode, src, filePath, declLine, result)
 	if body := goFuncBody(defNode); body != nil {
-		emitGoClosureNodes(ownerID, body, src, filePath, result)
+		emitGoClosureNodes(ownerID, declLine, body, src, filePath, result)
 		emitGoChannelOps(ownerID, body, src, filePath, result)
 		// CPG-lite intra-procedural dataflow: emits EdgeValueFlow,
 		// EdgeArgOf, and EdgeReturnsTo placeholders. Inter-procedural
 		// targets are lifted by the indexer's
 		// MaterializeDataflowParams pass once the call resolver
-		// has landed every callee.
+		// has landed every callee. declLine anchors local-binding
+		// IDs as offsets so edits above the function don't churn
+		// every binding inside. imports are the file's package
+		// aliases so selector-expression cases inside the walker
+		// can rewrite `pkg.Method` calls to the proper
+		// `unresolved::extern::<importPath>::<Method>` shape
+		// instead of dropping the qualifier.
 		paramsByName := goParamNamesFromCapture(paramsCap, src)
-		emitGoDataflow(ownerID, body, paramsByName, src, filePath, result)
+		emitGoDataflow(ownerID, declLine, body, paramsByName, imports, src, filePath, result)
 	}
 }
 
@@ -388,7 +394,7 @@ func emitGoGenericParamNodes(ownerID string, defNode *sitter.Node, src []byte, f
 // enclosing function. Re-attributing them would require teaching
 // the call-emit walker to recognise closure boundaries — tracked as
 // a Phase 1.5 follow-up.
-func emitGoClosureNodes(ownerID string, body *sitter.Node, src []byte, filePath string, result *parser.ExtractionResult) {
+func emitGoClosureNodes(ownerID string, ownerStartLine int, body *sitter.Node, src []byte, filePath string, result *parser.ExtractionResult) {
 	if body == nil {
 		return
 	}
@@ -398,7 +404,15 @@ func emitGoClosureNodes(ownerID string, body *sitter.Node, src []byte, filePath 
 			return true
 		}
 		startLine := int(n.StartPoint().Row) + 1
-		closureID := ownerID + "#closure@" + strconv.Itoa(startLine)
+		// ID anchors on the owner-relative offset (+ prefix) so edits
+		// above the enclosing function don't churn the closure's ID.
+		// Name keeps the absolute line for human readability in search
+		// results / outlines.
+		offset := startLine
+		if ownerStartLine > 0 {
+			offset = startLine - ownerStartLine + 1
+		}
+		closureID := ownerID + "#closure@+" + strconv.Itoa(offset)
 		// If two anonymous functions start on the same line, append a
 		// stable suffix so IDs stay unique. Rare in practice but
 		// defensive.

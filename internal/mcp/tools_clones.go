@@ -83,10 +83,16 @@ func (s *Server) handleFindClones(ctx context.Context, req mcp.CallToolRequest) 
 	// Walk EdgeSimilarTo edges. The graph holds them symmetrically
 	// (fA→fB and fB→fA); canonicalise to A<B and dedupe so each clone
 	// pair is counted once.
+	//
+	// EdgesByKind streams only the SimilarTo edges -- on disk backends
+	// that is one kind-filtered edge query instead of the full AllEdges
+	// scan we used to pay for. ~500k edge rows materialised over the
+	// storage boundary dropped to the SimilarTo-bearing
+	// subset (~hundreds-to-thousands on a normal workspace).
 	seen := make(map[[2]string]struct{})
 	var pairs []clones.Pair
-	for _, e := range s.graph.AllEdges() {
-		if e.Kind != graph.EdgeSimilarTo {
+	for e := range s.graph.EdgesByKind(graph.EdgeSimilarTo) {
+		if e == nil {
 			continue
 		}
 		a, b := e.From, e.To

@@ -44,7 +44,13 @@ func (r *Resolver) guardCrossPackageCallEdges(jobs []reindexJob, closure map[str
 	if len(jobs) == 0 {
 		return 0
 	}
-	reverted := 0
+	// Collect both mutation lists across the whole pass and apply them
+	// via the batched Store methods at the end. Per-edge
+	// SetEdgeProvenance + ReindexEdge in the body would otherwise pay
+	// two ACID round-trips per reverted edge against disk backends —
+	// catastrophic on a 30k-job pass.
+	var provBatch []graph.EdgeProvenanceUpdate
+	var reindexBatch []graph.EdgeReindex
 	for i := range jobs {
 		j := &jobs[i]
 		if !isCallLikeEdge(j.kind) {
@@ -71,7 +77,7 @@ func (r *Resolver) guardCrossPackageCallEdges(jobs []reindexJob, closure map[str
 			continue
 		}
 		callerFile := r.edgeCallerFile(j.edge)
-		target := r.graph.GetNode(j.newTo)
+		target := r.cachedGetNode(j.newTo)
 		if callerFile == "" || target == nil {
 			continue
 		}
@@ -80,19 +86,24 @@ func (r *Resolver) guardCrossPackageCallEdges(jobs []reindexJob, closure map[str
 		}
 		// Not reachable — revert to the unresolved placeholder and
 		// re-index against the resolved target we are abandoning.
-		// Drop the resolution provenance through SetEdgeProvenance so
-		// the reverted edge's identity change is counted; the logical
-		// key still carries the resolved target at this point, which
-		// is fine — SetEdgeProvenance keys the revision on Origin
-		// alone. The target revert + re-bucket follows.
+		// SetEdgeProvenance("") drops the resolution provenance so
+		// the reverted edge's identity change is counted; the target
+		// revert + re-bucket follows. Both go in their respective
+		// batches so the whole pass commits in two chunks instead of
+		// 2×N per-edge transactions.
 		oldResolved := j.edge.To
-		r.graph.SetEdgeProvenance(j.edge, "")
+		provBatch = append(provBatch, graph.EdgeProvenanceUpdate{Edge: j.edge, NewOrigin: ""})
 		j.edge.To = j.oldTo
 		j.edge.Confidence = 0
-		r.graph.ReindexEdge(j.edge, oldResolved)
-		reverted++
+		reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: j.edge, OldTo: oldResolved})
 	}
-	return reverted
+	if len(provBatch) > 0 {
+		r.graph.SetEdgeProvenanceBatch(provBatch)
+	}
+	if len(reindexBatch) > 0 {
+		r.graph.ReindexEdges(reindexBatch)
+	}
+	return len(reindexBatch)
 }
 
 // isBareNameCallTarget reports whether an unresolved edge target is a
@@ -127,8 +138,13 @@ func isCallLikeEdge(k graph.EdgeKind) bool {
 
 // edgeCallerFile returns the file path of the node that owns the edge's
 // From end. Empty when the caller node is unknown.
+//
+// Hot path: called once per cross-package-guarded edge. The pre-warmed
+// per-pass cache populated in ResolveAll holds every From ID across the
+// pending slice, so this call is a map lookup during a ResolveAll pass
+// and a direct store call elsewhere.
 func (r *Resolver) edgeCallerFile(e *graph.Edge) string {
-	if n := r.graph.GetNode(e.From); n != nil && n.FilePath != "" {
+	if n := r.cachedGetNode(e.From); n != nil && n.FilePath != "" {
 		return n.FilePath
 	}
 	return e.FilePath
@@ -180,26 +196,49 @@ func (r *Resolver) buildImportClosure() map[string]map[string]struct{} {
 		}
 		set[dir] = struct{}{}
 	}
-	for _, n := range r.graph.AllNodes() {
-		if n.Kind == graph.KindFile && n.FilePath != "" {
+	for n := range r.graph.NodesByKind(graph.KindFile) {
+		if n.FilePath != "" {
 			add(n.FilePath, filepath.Dir(n.FilePath))
 		}
 	}
-	for _, e := range r.graph.AllEdges() {
-		if e.Kind != graph.EdgeImports {
-			continue
-		}
+	// Materialise the resolved import edges and batch-load their endpoints
+	// (caller file + target) in one GetNodesByIDs — a per-edge GetNode here
+	// is a query round-trip per import on a disk backend. Inlines
+	// edgeCallerFile's cached-node logic against the batch map.
+	var imports []*graph.Edge
+	ids := make(map[string]struct{})
+	for e := range r.graph.EdgesByKind(graph.EdgeImports) {
 		// Skip imports still pointing at an unresolved placeholder or an
 		// out-of-repo stub — neither names an in-repo directory that a
 		// name-only call candidate could legitimately live in.
 		if strings.HasPrefix(e.To, unresolvedPrefix) ||
 			strings.HasPrefix(e.To, "external::") ||
-			strings.HasPrefix(e.To, "stdlib::") ||
+			graph.IsStdlibStub(e.To) ||
 			strings.HasPrefix(e.To, "dep::") {
 			continue
 		}
-		callerFile := r.edgeCallerFile(e)
-		if target := r.graph.GetNode(e.To); target != nil && target.FilePath != "" {
+		imports = append(imports, e)
+		if e.From != "" {
+			ids[e.From] = struct{}{}
+		}
+		if e.To != "" {
+			ids[e.To] = struct{}{}
+		}
+	}
+	if len(imports) == 0 {
+		return closure
+	}
+	idList := make([]string, 0, len(ids))
+	for id := range ids {
+		idList = append(idList, id)
+	}
+	nodes := r.graph.GetNodesByIDs(idList)
+	for _, e := range imports {
+		callerFile := e.FilePath
+		if n := nodes[e.From]; n != nil && n.FilePath != "" {
+			callerFile = n.FilePath
+		}
+		if target := nodes[e.To]; target != nil && target.FilePath != "" {
 			add(callerFile, filepath.Dir(target.FilePath))
 		}
 	}

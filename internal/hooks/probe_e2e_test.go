@@ -38,6 +38,21 @@ func (f *fakeController) Shutdown(_ context.Context) error { return nil }
 func (f *fakeController) SearchSymbols(_ context.Context, _ daemon.SearchSymbolsParams) (daemon.SearchSymbolsResult, error) {
 	return daemon.SearchSymbolsResult{Hits: f.hits}, nil
 }
+func (f *fakeController) EnrichChurn(_ context.Context, _ daemon.EnrichChurnParams) (daemon.EnrichChurnResult, error) {
+	return daemon.EnrichChurnResult{}, nil
+}
+func (f *fakeController) EnrichReleases(_ context.Context, _ daemon.EnrichReleasesParams) (daemon.EnrichReleasesResult, error) {
+	return daemon.EnrichReleasesResult{}, nil
+}
+func (f *fakeController) EnrichBlame(_ context.Context, _ daemon.EnrichBlameParams) (daemon.EnrichBlameResult, error) {
+	return daemon.EnrichBlameResult{}, nil
+}
+func (f *fakeController) EnrichCoverage(_ context.Context, _ daemon.EnrichCoverageParams) (daemon.EnrichCoverageResult, error) {
+	return daemon.EnrichCoverageResult{}, nil
+}
+func (f *fakeController) EnrichCochange(_ context.Context, _ daemon.EnrichCochangeParams) (daemon.EnrichCochangeResult, error) {
+	return daemon.EnrichCochangeResult{}, nil
+}
 
 // startTestDaemon spins up a real daemon on a short-path unix socket and
 // points GORTEX_DAEMON_SOCKET at it so daemon.Dial finds it.

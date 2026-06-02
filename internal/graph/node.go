@@ -40,6 +40,35 @@ const (
 	// node, not its enclosing function. EdgeMemberOf links to the
 	// enclosing function. EdgeCaptures lists outer bindings closed over.
 	KindClosure NodeKind = "closure"
+	// KindLocal represents an intra-function binding — a variable
+	// declared inside a function body via `x := …` / `var x = …` / a
+	// range clause / a type-switch / a for-init clause. ID convention:
+	// `<ownerID>#local:<name>@+<offsetFromOwnerStartLine>` (the
+	// leading `+` flags the value as a relative offset so the IDs
+	// stay stable when the enclosing function moves as a whole).
+	// EdgeMemberOf links each binding to its enclosing function or
+	// method. KindLocal is excluded from the BM25 search index by
+	// shouldIndexForSearch — surfacing `err` / `data` / `n` / `i`
+	// from every function would flood every name lookup. The data-
+	// flow analysis (flow_between, taint_paths, ...) traverses the
+	// EdgeValueFlow / EdgeArgOf / EdgeReturnsTo edges that target
+	// these nodes; consumers that want the locals can ask for them
+	// by kind explicitly.
+	KindLocal NodeKind = "local"
+	// KindBuiltin represents a language intrinsic — a function /
+	// type / constant that's part of the language itself, not
+	// declared in any indexed source file. ID convention:
+	// `builtin::<lang>::<name>` for functions (`builtin::go::append`,
+	// `builtin::py::len`) and `builtin::<lang>::type::<name>` for
+	// types (`builtin::go::type::string`). Meta.builtin_kind ∈
+	// "func" | "type" | "const". KindBuiltin is excluded from the
+	// BM25 search index — surfacing `string` / `int` / `append`
+	// would flood every name lookup. They participate in normal
+	// graph queries: `find_usages(builtin::go::type::float64)`
+	// answers "every variable typed as float64 in this codebase",
+	// which is the load-bearing query for type-drift / dataflow
+	// analyses.
+	KindBuiltin NodeKind = "builtin"
 	// KindConstant peels off `const`, `iota`, top-level immutable
 	// bindings, and language-specific constant declarations from
 	// KindVariable. Existing variable-kind nodes are re-classified on

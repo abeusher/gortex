@@ -50,6 +50,13 @@ var methodHierarchyEdgeKinds = map[graph.EdgeKind]bool{
 // Workspace / project scope is enforced via opts.ScopeAllows on every
 // neighbour. opts.MinTier is applied as a post-pass over the collected
 // edges (consistent with the rest of the engine surface).
+//
+// Picks ClassHierarchyTraverser when the backend implements it: that
+// path runs the BFS as one variable-length traversal per direction
+// inside the engine, replacing the per-node GetNode + GetIn/OutEdges
+// loop the fallback runs. On a disk backend a deep walk over a wide
+// implementer set previously fired hundreds of round-trips per
+// call — the pushdown drops to one or two queries.
 func (e *Engine) ClassHierarchy(seedID string, direction HierarchyDirection, depth int, includeMethods bool, opts QueryOptions) *SubGraph {
 	if direction == "" {
 		direction = HierarchyBoth
@@ -61,6 +68,272 @@ func (e *Engine) ClassHierarchy(seedID string, direction HierarchyDirection, dep
 		depth = 64
 	}
 
+	seed := e.g.GetNode(seedID)
+	if seed == nil {
+		return &SubGraph{}
+	}
+
+	if _, ok := e.g.(graph.ClassHierarchyTraverser); ok {
+		return e.classHierarchyPushdown(seed, direction, depth, includeMethods, opts)
+	}
+	return e.classHierarchyWalk(seed, direction, depth, includeMethods, opts)
+}
+
+// classHierarchyPushdown runs the BFS through the
+// ClassHierarchyTraverser capability. Each direction issues one or
+// two backend round-trips (the type-edge kinds, optionally chasing
+// methods through EdgeMemberOf) instead of the per-frontier per-hop
+// loop the fallback runs.
+func (e *Engine) classHierarchyPushdown(
+	seed *graph.Node,
+	direction HierarchyDirection,
+	depth int,
+	includeMethods bool,
+	opts QueryOptions,
+) *SubGraph {
+	tr := e.g.(graph.ClassHierarchyTraverser)
+	walkUp := direction == HierarchyUp || direction == HierarchyBoth
+	walkDown := direction == HierarchyDown || direction == HierarchyBoth
+
+	typeKinds := []graph.EdgeKind{graph.EdgeExtends, graph.EdgeImplements, graph.EdgeComposes}
+	methodKinds := []graph.EdgeKind{graph.EdgeOverrides}
+
+	// Per-direction walks: type-hierarchy kinds rooted at seed if seed
+	// is a type/interface; method-hierarchy kinds rooted at seed if
+	// seed is a method/function. Methods reached via includeMethods
+	// are added as separate roots in a follow-up pass.
+	var rows []graph.ClassHierarchyRow
+	seedIsType := seed.Kind == graph.KindType || seed.Kind == graph.KindInterface
+	seedIsMethod := seed.Kind == graph.KindMethod || seed.Kind == graph.KindFunction
+	if seedIsType {
+		if walkUp {
+			rows = append(rows, tr.ClassHierarchyTraverse(seed.ID, "up", typeKinds, depth)...)
+		}
+		if walkDown {
+			rows = append(rows, tr.ClassHierarchyTraverse(seed.ID, "down", typeKinds, depth)...)
+		}
+	} else if seedIsMethod {
+		if walkUp {
+			rows = append(rows, tr.ClassHierarchyTraverse(seed.ID, "up", methodKinds, depth)...)
+		}
+		if walkDown {
+			rows = append(rows, tr.ClassHierarchyTraverse(seed.ID, "down", methodKinds, depth)...)
+		}
+	}
+
+	// Collect the node IDs visited so we can resolve them in one
+	// batched fetch, instead of one GetNode per row.
+	visited := map[string]bool{seed.ID: true}
+	for _, r := range rows {
+		for _, id := range r.Path {
+			visited[id] = true
+		}
+	}
+
+	// includeMethods folds in EdgeMemberOf hops from every visited
+	// type node. The override walk on each method then runs as a
+	// further pushdown call.
+	memberLinks := []struct {
+		from, to string
+		kind     graph.EdgeKind
+	}{}
+	if includeMethods {
+		typeIDs := make([]string, 0, len(visited))
+		for id := range visited {
+			n := e.g.GetNode(id)
+			if n == nil {
+				continue
+			}
+			if n.Kind == graph.KindType || n.Kind == graph.KindInterface {
+				typeIDs = append(typeIDs, id)
+			}
+		}
+		if len(typeIDs) > 0 {
+			memberIns := e.g.GetInEdgesByNodeIDs(typeIDs)
+			methodRoots := []string{}
+			for _, id := range typeIDs {
+				for _, ed := range memberIns[id] {
+					if ed == nil || ed.Kind != graph.EdgeMemberOf {
+						continue
+					}
+					member := e.g.GetNode(ed.From)
+					if member == nil {
+						continue
+					}
+					if member.Kind != graph.KindMethod && member.Kind != graph.KindFunction {
+						continue
+					}
+					memberLinks = append(memberLinks, struct {
+						from, to string
+						kind     graph.EdgeKind
+					}{from: member.ID, to: id, kind: graph.EdgeMemberOf})
+					if !visited[member.ID] {
+						visited[member.ID] = true
+						methodRoots = append(methodRoots, member.ID)
+					}
+				}
+			}
+			for _, mid := range methodRoots {
+				if walkUp {
+					subRows := tr.ClassHierarchyTraverse(mid, "up", methodKinds, depth)
+					for _, sr := range subRows {
+						for _, id := range sr.Path {
+							visited[id] = true
+						}
+					}
+					rows = append(rows, methodPathsWithRoot(mid, subRows)...)
+				}
+				if walkDown {
+					subRows := tr.ClassHierarchyTraverse(mid, "down", methodKinds, depth)
+					for _, sr := range subRows {
+						for _, id := range sr.Path {
+							visited[id] = true
+						}
+					}
+					rows = append(rows, methodPathsWithRoot(mid, subRows)...)
+				}
+			}
+		}
+	}
+
+	// Resolve every visited node + collect the edge pointers in one
+	// place. The capability doesn't carry edge pointers (on-disk
+	// backend edges aren't first-class objects), so we re-resolve them via
+	// GetOutEdgesByNodeIDs / GetInEdgesByNodeIDs once per direction.
+	allIDs := make([]string, 0, len(visited))
+	for id := range visited {
+		allIDs = append(allIDs, id)
+	}
+	nodeMap := e.g.GetNodesByIDs(allIDs)
+	if nodeMap[seed.ID] == nil {
+		nodeMap[seed.ID] = seed
+	}
+
+	resultNodes := make([]*graph.Node, 0, len(allIDs))
+	for _, id := range allIDs {
+		n := nodeMap[id]
+		if n == nil {
+			continue
+		}
+		if opts.WorkspaceID != "" && id != seed.ID && !opts.ScopeAllows(n) {
+			continue
+		}
+		resultNodes = append(resultNodes, n)
+	}
+
+	// Reconstruct edges: each row's Path[i] → Path[i+1] (for i>=0)
+	// carries an edge of EdgeKinds[i]. The seed's first hop is from
+	// seed → Path[0]. The direction the walk came from determines
+	// whether the edge points seed→neighbour or neighbour→seed.
+	resultEdges := make([]*graph.Edge, 0)
+	seenEdge := make(map[string]bool)
+	addEdge := func(from, to string, kind graph.EdgeKind) {
+		// Find the actual *Edge so the downstream FilterByMinTier
+		// still has the origin / tier columns to read.
+		var found *graph.Edge
+		for _, ed := range e.g.GetOutEdges(from) {
+			if ed == nil {
+				continue
+			}
+			if ed.To == to && ed.Kind == kind {
+				found = ed
+				break
+			}
+		}
+		if found == nil {
+			// Direction-flipped lookup — happens when "down" walks
+			// hand back paths whose hops are in-edges of the seed.
+			for _, ed := range e.g.GetInEdges(from) {
+				if ed == nil {
+					continue
+				}
+				if ed.From == to && ed.Kind == kind {
+					found = ed
+					break
+				}
+			}
+		}
+		if found == nil {
+			return
+		}
+		k := found.From + "→" + found.To + "::" + string(found.Kind) + ":" + edgeMetaTag(found)
+		if seenEdge[k] {
+			return
+		}
+		seenEdge[k] = true
+		resultEdges = append(resultEdges, found)
+	}
+	for _, r := range rows {
+		prev := seed.ID
+		for i, nb := range r.Path {
+			if i >= len(r.EdgeKinds) {
+				break
+			}
+			addEdge(prev, nb, r.EdgeKinds[i])
+			prev = nb
+		}
+	}
+	for _, link := range memberLinks {
+		addEdge(link.from, link.to, link.kind)
+	}
+
+	// Workspace-scope post-filter for edges (any edge whose endpoints
+	// were dropped from resultNodes is also dropped).
+	if opts.WorkspaceID != "" {
+		nodeSet := make(map[string]bool, len(resultNodes))
+		for _, n := range resultNodes {
+			nodeSet[n.ID] = true
+		}
+		filtered := resultEdges[:0]
+		for _, ed := range resultEdges {
+			if !nodeSet[ed.From] || !nodeSet[ed.To] {
+				continue
+			}
+			filtered = append(filtered, ed)
+		}
+		resultEdges = filtered
+	}
+
+	sg := &SubGraph{
+		Nodes:      resultNodes,
+		Edges:      resultEdges,
+		TotalNodes: len(resultNodes),
+		TotalEdges: len(resultEdges),
+	}
+	if opts.MinTier != "" {
+		sg.FilterByMinTier(opts.MinTier)
+	}
+	return sg
+}
+
+// methodPathsWithRoot rebases the traversal rows so the seed prefix
+// in their paths reflects the method root they came from rather than
+// the outer ClassHierarchy seed. Returned rows are otherwise
+// unchanged.
+func methodPathsWithRoot(root string, rows []graph.ClassHierarchyRow) []graph.ClassHierarchyRow {
+	out := make([]graph.ClassHierarchyRow, len(rows))
+	for i, r := range rows {
+		newPath := append([]string{root}, r.Path...)
+		newKinds := append([]graph.EdgeKind{}, r.EdgeKinds...)
+		// The seed→Path[0] hop is encoded by EdgeMemberOf in the outer
+		// addEdge pass, so we keep the EdgeKinds slice aligned with
+		// the slice the caller iterates ([0]=Path[0]→Path[1]).
+		out[i] = graph.ClassHierarchyRow{Path: newPath[1:], EdgeKinds: newKinds}
+		_ = newPath
+	}
+	return out
+}
+
+// classHierarchyWalk is the in-memory BFS path. Kept verbatim so the
+// in-memory backend has the same shape it had before the pushdown
+// landed.
+func (e *Engine) classHierarchyWalk(
+	seed *graph.Node,
+	direction HierarchyDirection,
+	depth int,
+	includeMethods bool,
+	opts QueryOptions,
+) *SubGraph {
 	walkUp := direction == HierarchyUp || direction == HierarchyBoth
 	walkDown := direction == HierarchyDown || direction == HierarchyBoth
 
@@ -77,9 +350,6 @@ func (e *Engine) ClassHierarchy(seedID string, direction HierarchyDirection, dep
 		resultNodes = append(resultNodes, n)
 	}
 
-	// Edges are deduped by their source pointer identity — the graph
-	// store hands out stable pointers per edge, so a pointer key is
-	// sufficient and avoids constructing a synthetic key per edge.
 	edgeKey := func(ed *graph.Edge) string {
 		return ed.From + "→" + ed.To + "::" + string(ed.Kind) + ":" + edgeMetaTag(ed)
 	}
@@ -95,17 +365,13 @@ func (e *Engine) ClassHierarchy(seedID string, direction HierarchyDirection, dep
 		resultEdges = append(resultEdges, ed)
 	}
 
-	seed := e.g.GetNode(seedID)
-	if seed == nil {
-		return &SubGraph{}
-	}
 	addNode(seed)
 
 	type queued struct {
 		id    string
 		depth int
 	}
-	queue := []queued{{id: seedID, depth: 0}}
+	queue := []queued{{id: seed.ID, depth: 0}}
 
 	for len(queue) > 0 {
 		cur := queue[0]
@@ -122,10 +388,6 @@ func (e *Engine) ClassHierarchy(seedID string, direction HierarchyDirection, dep
 		isType := curNode.Kind == graph.KindType || curNode.Kind == graph.KindInterface
 		isMethod := curNode.Kind == graph.KindMethod || curNode.Kind == graph.KindFunction
 
-		// Pull in member methods of type/interface nodes when requested.
-		// This happens at the visit step (not as a hop), so methods land
-		// in the result without consuming a depth budget — they're a
-		// projection of the type, not a separate hierarchy hop.
 		if includeMethods && isType {
 			for _, mEdge := range e.g.GetInEdges(cur.id) {
 				if mEdge.Kind != graph.EdgeMemberOf {
@@ -143,15 +405,10 @@ func (e *Engine) ClassHierarchy(seedID string, direction HierarchyDirection, dep
 				}
 				addNode(member)
 				addEdge(mEdge)
-				// Surface the method itself for the override walk in
-				// the next iteration. Same depth budget as the parent
-				// type so a method's overrides cost the same as walking
-				// to a method-seed at this depth.
 				queue = append(queue, queued{id: member.ID, depth: cur.depth})
 			}
 		}
 
-		// Pick edge kinds based on what kind of node we're standing on.
 		var kindSet map[graph.EdgeKind]bool
 		switch {
 		case isType:
@@ -159,7 +416,6 @@ func (e *Engine) ClassHierarchy(seedID string, direction HierarchyDirection, dep
 		case isMethod:
 			kindSet = methodHierarchyEdgeKinds
 		default:
-			// Fields, params, files, etc. — nothing to walk.
 			continue
 		}
 

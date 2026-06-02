@@ -116,7 +116,7 @@ func TestNpmAliasIndex_NilRootsYieldsNil(t *testing.T) {
 // addPackageNode registers a KindPackage node with the given qualified
 // name — this is what CrossRepoResolver.resolveImport matches an
 // import path against (mirrors the existing cross-repo import tests).
-func addPackageNode(g *graph.Graph, repo, file, qualName string) {
+func addPackageNode(g graph.Store, repo, file, qualName string) {
 	g.AddNode(&graph.Node{
 		ID: file, Kind: graph.KindPackage, Name: qualName, QualName: qualName,
 		FilePath: file, Language: "typescript", RepoPrefix: repo,

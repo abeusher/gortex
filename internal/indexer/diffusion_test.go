@@ -12,7 +12,7 @@ import (
 
 // semanticallyRelatedEdges collects every EdgeSemanticallyRelated edge
 // in the graph — the diffusion-pass output surface.
-func semanticallyRelatedEdges(g *graph.Graph) []*graph.Edge {
+func semanticallyRelatedEdges(g graph.Store) []*graph.Edge {
 	var out []*graph.Edge
 	for _, e := range g.AllEdges() {
 		if e.Kind == graph.EdgeSemanticallyRelated {
@@ -24,7 +24,7 @@ func semanticallyRelatedEdges(g *graph.Graph) []*graph.Edge {
 
 // addFnNode registers a bare function node so diffuseSimilarityEdges
 // has real endpoints to attach edges to.
-func addFnNode(g *graph.Graph, id string) {
+func addFnNode(g graph.Store, id string) {
 	g.AddNode(&graph.Node{
 		ID: id, Kind: graph.KindFunction, Name: id,
 		FilePath: id, StartLine: 1, Language: "go",
@@ -169,7 +169,7 @@ func TestDiffuseSimilarityEdges_Chain(t *testing.T) {
 
 // diffusedScoreFor returns the similarity carried by the directed
 // semantically_related edge from→to, and whether such an edge exists.
-func diffusedScoreFor(g *graph.Graph, from, to string) (float64, bool) {
+func diffusedScoreFor(g graph.Store, from, to string) (float64, bool) {
 	for _, e := range semanticallyRelatedEdges(g) {
 		if e.From == from && e.To == to {
 			return e.Meta["similarity"].(float64), true
@@ -357,7 +357,7 @@ func TestDetectClonesAndEmitEdges_DiffusionWiring(t *testing.T) {
 		Meta: map[string]any{cloneSigMetaKey: encAB},
 	})
 
-	stats := detectClonesAndEmitEdges(g, 0)
+	stats := detectClonesAndEmitEdges(g, "", 0)
 	// A, B, C all share a signature: three direct clone pairs, so the
 	// only diffusable pairs are themselves direct clones — diffusion
 	// correctly emits nothing (partition invariant).

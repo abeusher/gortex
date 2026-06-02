@@ -20,9 +20,8 @@ type Cycle struct {
 // DetectCycles finds all dependency cycles in the graph using Tarjan's SCC algorithm.
 // If scope is non-empty, only nodes whose FilePath starts with scope are considered.
 // Cycles are classified by edge type and community membership, then sorted by severity descending.
-func DetectCycles(g *graph.Graph, communities *CommunityResult, scope string) []Cycle {
+func DetectCycles(g graph.Store, communities *CommunityResult, scope string) []Cycle {
 	nodes := g.AllNodes()
-	edges := g.AllEdges()
 
 	// Build set of in-scope node IDs
 	inScope := make(map[string]bool, len(nodes))
@@ -36,24 +35,35 @@ func DetectCycles(g *graph.Graph, communities *CommunityResult, scope string) []
 		inScope[n.ID] = true
 	}
 
-	// Build adjacency list and track edge kinds between pairs
+	// Build adjacency list and track edge kinds between pairs.
+	//
+	// Edge collection streams only EdgeImports + EdgeCalls via
+	// EdgesByKind (two MATCH (...)-[e:Edge {kind: $kind}]->(...) on
+	// disk backends) instead of materialising every edge in the graph
+	// just to filter for two kinds -- ~500k edge rows over cgo dropped
+	// to the import-and-call subset (a few tens of thousands on the
+	// gortex workspace).
 	adj := make(map[string][]string)
 	edgeKinds := make(map[edgePair][]graph.EdgeKind)
 
-	for _, e := range edges {
-		if e.Kind != graph.EdgeImports && e.Kind != graph.EdgeCalls {
-			continue
+	collect := func(kind graph.EdgeKind) {
+		for e := range g.EdgesByKind(kind) {
+			if e == nil {
+				continue
+			}
+			if !inScope[e.From] || !inScope[e.To] {
+				continue
+			}
+			pair := edgePair{e.From, e.To}
+			// Avoid duplicate adjacency entries
+			if _, exists := edgeKinds[pair]; !exists {
+				adj[e.From] = append(adj[e.From], e.To)
+			}
+			edgeKinds[pair] = append(edgeKinds[pair], kind)
 		}
-		if !inScope[e.From] || !inScope[e.To] {
-			continue
-		}
-		pair := edgePair{e.From, e.To}
-		// Avoid duplicate adjacency entries
-		if _, exists := edgeKinds[pair]; !exists {
-			adj[e.From] = append(adj[e.From], e.To)
-		}
-		edgeKinds[pair] = append(edgeKinds[pair], e.Kind)
 	}
+	collect(graph.EdgeImports)
+	collect(graph.EdgeCalls)
 
 	// Run Tarjan's SCC
 	sccs := tarjanSCC(inScope, adj)
@@ -89,7 +99,7 @@ func DetectCycles(g *graph.Graph, communities *CommunityResult, scope string) []
 // WouldCreateCycle checks if adding an edge from fromID to toID would create a cycle.
 // It performs DFS from toID to see if fromID is reachable. If so, adding fromID→toID
 // would close a cycle. Returns the cycle path from toID to fromID when found.
-func WouldCreateCycle(g *graph.Graph, fromID, toID string) (bool, []string) {
+func WouldCreateCycle(g graph.Store, fromID, toID string) (bool, []string) {
 	edges := g.AllEdges()
 
 	// Build adjacency from calls and imports edges

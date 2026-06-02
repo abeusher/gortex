@@ -63,12 +63,6 @@ func (s *Server) handleAnalyzeClusters(ctx context.Context, req mcp.CallToolRequ
 		})
 	}
 
-	scoped := s.scopedNodes(ctx)
-	scopedSet := make(map[string]*graph.Node, len(scoped))
-	for _, n := range scoped {
-		scopedSet[n.ID] = n
-	}
-
 	type clusterRow struct {
 		ID           string         `json:"id"`
 		Label        string         `json:"label"`
@@ -82,8 +76,18 @@ func (s *Server) handleAnalyzeClusters(ctx context.Context, req mcp.CallToolRequ
 		MemberSample []string       `json:"member_sample,omitempty"`
 	}
 
-	rows := make([]clusterRow, 0, len(cr.Communities))
-	for _, c := range cr.Communities {
+	// First pass: keep only the clusters that survive size + path-prefix
+	// gates, then sort + truncate to the requested limit. The density,
+	// language-mix, and top-files work below is bounded by the truncated
+	// row count instead of every community in the partition — important
+	// on a disk backend where each member touches the graph store.
+	type pending struct {
+		c   *analysis.Community
+		row clusterRow
+	}
+	survivors := make([]pending, 0, len(cr.Communities))
+	for i := range cr.Communities {
+		c := &cr.Communities[i]
 		if c.Size < minSize {
 			continue
 		}
@@ -99,30 +103,77 @@ func (s *Server) handleAnalyzeClusters(ctx context.Context, req mcp.CallToolRequ
 				continue
 			}
 		}
-
 		row := clusterRow{
 			ID: c.ID, Label: c.Label, Hub: c.Hub, Size: c.Size,
 			Files:     len(c.Files),
 			Languages: map[string]int{},
 		}
-
-		// File-spread = files-per-member; 1.0 means every member
-		// lives in its own file (boundary-heavy), close to 0 means
-		// many members per file (file-bound cluster).
 		if c.Size > 0 {
 			row.FileSpread = roundScore(float64(len(c.Files)) / float64(c.Size))
 		}
-
-		// Density requires the intra-cluster edge count. Use the
-		// member set + graph in-place; cheap on cluster-sized
-		// node lists.
-		memberSet := make(map[string]bool, len(c.Members))
-		for _, m := range c.Members {
-			memberSet[m] = true
+		survivors = append(survivors, pending{c: c, row: row})
+	}
+	sort.Slice(survivors, func(i, j int) bool {
+		if survivors[i].c.Size != survivors[j].c.Size {
+			return survivors[i].c.Size > survivors[j].c.Size
 		}
+		return survivors[i].c.ID < survivors[j].c.ID
+	})
+	truncated := false
+	if len(survivors) > limit {
+		survivors = survivors[:limit]
+		truncated = true
+	}
+
+	// Batch every surviving cluster's member ids and pull their nodes +
+	// outgoing edges in two calls — one round-trip each on
+	// a disk backend, against the per-member GetNode / GetOutEdges loop the
+	// previous shape ran (N members × 2 round-trips). Members from
+	// communities that didn't survive the truncate above never reach
+	// the store.
+	//
+	// Per-cluster member cap: communities can hold thousands of nodes
+	// each. On a disk backend, fetching tens of thousands of nodes + edges per
+	// call is several seconds of cost — the rendered response only
+	// uses these to compute density / language mix / top files, all of
+	// which converge on a representative sample long before they need
+	// every member. With a default 50-cluster limit and ~200 sampled
+	// members per cluster, the IN-list stays under 10k IDs and the
+	// rendering stays sub-second. The exact `size` field still reflects
+	// the true cluster size because it comes from c.Size, not from the
+	// sampled set.
+	const sampleCap = 200
+	sampleMemberIDs := make([]string, 0, len(survivors)*sampleCap)
+	sampleSets := make([]map[string]bool, 0, len(survivors))
+	for _, p := range survivors {
+		members := p.c.Members
+		if len(members) > sampleCap {
+			members = members[:sampleCap]
+		}
+		set := make(map[string]bool, len(members))
+		for _, m := range members {
+			set[m] = true
+		}
+		sampleSets = append(sampleSets, set)
+		sampleMemberIDs = append(sampleMemberIDs, members...)
+	}
+	memberNodes := s.graph.GetNodesByIDs(sampleMemberIDs)
+	memberOutEdges := s.graph.GetOutEdgesByNodeIDs(sampleMemberIDs)
+
+	rows := make([]clusterRow, 0, len(survivors))
+	for i, p := range survivors {
+		c := p.c
+		row := p.row
+		memberSet := sampleSets[i]
+		sampleSize := len(memberSet)
+
+		// Density on the sample, normalised against (sampleSize ·
+		// (sampleSize-1)) to keep the ratio meaningful when only part
+		// of the cluster was inspected. Intra-sample edges restricted
+		// to the call / reference kinds the clusterer cares about.
 		intra := 0
-		for _, m := range c.Members {
-			for _, e := range s.graph.GetOutEdges(m) {
+		for m := range memberSet {
+			for _, e := range memberOutEdges[m] {
 				if e.Kind != graph.EdgeCalls && e.Kind != graph.EdgeReferences {
 					continue
 				}
@@ -131,16 +182,14 @@ func (s *Server) handleAnalyzeClusters(ctx context.Context, req mcp.CallToolRequ
 				}
 			}
 		}
-		// Density = intra-edges / possible-directed-pairs.
-		if c.Size > 1 {
-			possible := c.Size * (c.Size - 1)
+		if sampleSize > 1 {
+			possible := sampleSize * (sampleSize - 1)
 			row.Density = roundScore(float64(intra) / float64(possible))
 		}
 
-		// Language mix + top files.
 		fileCounts := map[string]int{}
-		for _, m := range c.Members {
-			n := scopedSet[m]
+		for m := range memberSet {
+			n := memberNodes[m]
 			if n == nil {
 				continue
 			}
@@ -155,17 +204,6 @@ func (s *Server) handleAnalyzeClusters(ctx context.Context, req mcp.CallToolRequ
 		row.MemberSample = sliceFirstN(c.Members, 5)
 
 		rows = append(rows, row)
-	}
-	sort.Slice(rows, func(i, j int) bool {
-		if rows[i].Size != rows[j].Size {
-			return rows[i].Size > rows[j].Size
-		}
-		return rows[i].ID < rows[j].ID
-	})
-	truncated := false
-	if len(rows) > limit {
-		rows = rows[:limit]
-		truncated = true
 	}
 
 	resp := map[string]any{

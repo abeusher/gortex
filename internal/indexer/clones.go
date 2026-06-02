@@ -60,9 +60,18 @@ const cloneShinglesMetaKey = "clone_shingles"
 // bodies (e.g. trivial controller / DTO wrappers) land here.
 const (
 	cmsBoilerplateRatio  = 0.01
-	cmsMinCorpus         = 2000
 	minSurvivingShingles = 8
 )
+
+// cmsMinCorpus is the body-count floor below which the CMS boilerplate
+// filter is disabled (useFilter=false) and the pass falls back to
+// unfiltered MinHash — see the doc comment above for the rationale and
+// default. It is a package-level var (not a const) purely so the clone
+// equivalence tests can temporarily lower it to force useFilter=true on a
+// small fixture and exercise the filtered batch/incremental paths; restore
+// it via t.Cleanup. Production never mutates it — the default semantics are
+// unchanged.
+var cmsMinCorpus = 2000
 
 // applyCloneSignatures is the per-file half of clone detection. It runs
 // inside applyCoverageDomains (gated on the "clones" coverage domain),
@@ -209,6 +218,49 @@ func bodyText(lines []string, startLine, endLine int) string {
 	return b.String()
 }
 
+// computeCloneSigFromShingles is the per-body signature kernel shared by
+// the whole-graph finalise pass (finaliseCloneSignatures) and the
+// incremental maintainer (incrementalCloneIndex.UpdateFuncs). Both paths
+// MUST route through this function so a body's signature is byte-identical
+// regardless of which path stamped it — that is what lets the equivalence
+// test assert exact set equality between the batch and incremental clone
+// edges.
+//
+// cms is the corpus Count-Min Sketch; threshold is the boilerplate cutoff
+// (a shingle whose CMS count exceeds it is dropped). useFilter selects the
+// branch:
+//
+//   - useFilter true: exclude high-frequency shingles, then require the
+//     surviving set to clear minSurvivingShingles before computing MinHash.
+//   - useFilter false: keep every shingle and apply no floor (legacy
+//     small-corpus behaviour) — cms may be nil in this branch.
+//
+// Returns the signature and ok=false when the body is dropped from clone
+// detection (empty / below the surviving floor) — the caller then leaves
+// the node without a clone_sig, exactly as the batch pass does.
+func computeCloneSigFromShingles(cms *clones.CMS, threshold uint32, useFilter bool, shingles []uint64) (clones.Signature, bool) {
+	var filtered []uint64
+	if useFilter {
+		filtered = make([]uint64, 0, len(shingles))
+		for _, sh := range shingles {
+			if cms.Count(sh) > threshold {
+				continue
+			}
+			filtered = append(filtered, sh)
+		}
+	} else {
+		filtered = shingles
+	}
+	floor := minSurvivingShingles
+	if !useFilter {
+		// Without filtering, every shingle survives — fall back to the
+		// legacy gate so we don't silently drop bodies the old code
+		// would have kept.
+		floor = 0
+	}
+	return clones.SignatureFromShingles(filtered, floor)
+}
+
 // finaliseCloneSignatures runs after every file's shingles have been
 // stamped on its function / method nodes (by applyCloneSignatures
 // during the per-file parse). It builds a Count-Min Sketch of shingle
@@ -234,13 +286,27 @@ func bodyText(lines []string, startLine, endLine int) string {
 // (deletes clone_shingles, sets clone_sig) across nodes that other
 // graph-wide passes (markTestSymbolsAndEmitEdges, ResolveTemporalCalls,
 // reach.BuildIndex) also touch under the same mutex.
-func finaliseCloneSignatures(g *graph.Graph) {
+//
+// Repo-scoped: only bodies whose n.RepoPrefix == repoPrefix enter the
+// CMS / signature passes, so a multi-repo graph computes each repo's
+// boilerplate sketch and per-body signatures from that repo's bodies
+// alone — clone detection is per-repository. A standalone single-repo
+// Indexer uses repoPrefix == "" and its nodes carry RepoPrefix == "",
+// so the equality matches every node and behaviour is unchanged.
+// (GetRepoNodes can't be used here: GetRepoNodes("") is empty for the
+// in-memory / single-repo store — see incrementalCloneIndex.Rebuild —
+// so the AllNodes + equality filter is the form that works for both
+// regimes, since "" == "" matches every node.)
+func finaliseCloneSignatures(g graph.Store, repoPrefix string) {
 	// First pass: collect every body that has stashed shingles. We
 	// capture the *graph.Node pointers up front so the CMS-build pass
 	// and the signature-compute pass don't both re-walk g.AllNodes().
 	bodies := make([]*graph.Node, 0, 8192)
 	for _, n := range g.AllNodes() {
 		if n == nil || n.Meta == nil {
+			continue
+		}
+		if n.RepoPrefix != repoPrefix {
 			continue
 		}
 		if n.Kind != graph.KindFunction && n.Kind != graph.KindMethod {
@@ -275,32 +341,51 @@ func finaliseCloneSignatures(g *graph.Graph) {
 		}
 	}
 
+	// Persist each body's raw shingle set to the clone_shingles sidecar
+	// BEFORE deleting it from Meta. This loop walks EVERY body in the
+	// corpus — both the survivors (which get a clone_sig below) and the
+	// boilerplate-dropped bodies (which do not) — persisting any with a
+	// non-empty shingle set. That is deliberate: incrementalCloneIndex.
+	// Rebuild reseeds its CMS + corpus from these rows and must mirror
+	// the bodies set this pass used to build its own CMS / threshold,
+	// which is ALL eligible bodies, not just survivors. Persisting only
+	// survivors here would under-seed Rebuild's sketch and skew the
+	// incremental threshold away from the batch one. Meta stays lean
+	// (the shingle set is large and only the CMS pass needs it), but the
+	// durable sidecar copy lets a warm restart rebuild the incremental
+	// CMS without re-parsing every body. Accumulate per node.RepoPrefix
+	// so a multi-repo graph reseeds each repo's CMS in isolation.
+	// Backends that don't implement CloneShingleWriter (no on-disk store)
+	// simply skip this — the in-session incremental index caches shingles
+	// in memory regardless.
+	if w, ok := g.(graph.CloneShingleWriter); ok {
+		byPrefix := make(map[string]map[string][]uint64)
+		for _, n := range bodies {
+			shingles, _ := n.Meta[cloneShinglesMetaKey].([]uint64)
+			if len(shingles) == 0 {
+				continue
+			}
+			rows := byPrefix[n.RepoPrefix]
+			if rows == nil {
+				rows = make(map[string][]uint64)
+				byPrefix[n.RepoPrefix] = rows
+			}
+			rows[n.ID] = shingles
+		}
+		for prefix, rows := range byPrefix {
+			_ = w.BulkSetCloneShingles(prefix, rows)
+		}
+	}
+
 	// Second pass: signature computation. Each body either lands a
 	// fresh clone_sig (signature over surviving shingles) or is
 	// dropped entirely (no clone_sig, never enters detection items
-	// list). In both cases clone_shingles is removed from Meta.
+	// list). In both cases clone_shingles is removed from Meta. The
+	// per-body kernel is computeCloneSigFromShingles — the incremental
+	// maintainer calls the same kernel so signatures match exactly.
 	for _, n := range bodies {
 		shingles, _ := n.Meta[cloneShinglesMetaKey].([]uint64)
-		var filtered []uint64
-		if useFilter {
-			filtered = make([]uint64, 0, len(shingles))
-			for _, sh := range shingles {
-				if cms.Count(sh) > threshold {
-					continue
-				}
-				filtered = append(filtered, sh)
-			}
-		} else {
-			filtered = shingles
-		}
-		floor := minSurvivingShingles
-		if !useFilter {
-			// Without filtering, every shingle survives — fall back
-			// to the legacy gate so we don't silently drop bodies the
-			// old code would have kept.
-			floor = 0
-		}
-		sig, ok := clones.SignatureFromShingles(filtered, floor)
+		sig, ok := computeCloneSigFromShingles(cms, threshold, useFilter, shingles)
 		delete(n.Meta, cloneShinglesMetaKey)
 		if !ok {
 			// Boilerplate-dominated or empty after filter — drop
@@ -342,8 +427,15 @@ type CloneDetectionStats struct {
 // edges cannot survive — when either endpoint's file is reindexed,
 // EvictFile removes that node's edges in both directions before this
 // pass re-runs.
-func detectClonesAndEmitEdges(g *graph.Graph, threshold float64) CloneDetectionStats {
-	return detectClonesAndEmitEdgesCtx(context.Background(), g, threshold)
+//
+// repoPrefix scopes the pass to one repository's nodes: every whole-graph
+// walk it drives (finalise, item gather, diffusion) is filtered to
+// n.RepoPrefix == repoPrefix so no cross-repo candidate pair is ever
+// formed. A standalone single-repo Indexer passes "" and its nodes carry
+// RepoPrefix == "", so the equality matches all nodes and the single-repo
+// result is unchanged.
+func detectClonesAndEmitEdges(g graph.Store, repoPrefix string, threshold float64) CloneDetectionStats {
+	return detectClonesAndEmitEdgesCtx(context.Background(), g, repoPrefix, threshold)
 }
 
 // detectClonesAndEmitEdgesCtx is the context-aware sibling of
@@ -353,7 +445,7 @@ func detectClonesAndEmitEdges(g *graph.Graph, threshold float64) CloneDetectionS
 // without intra-stage reporters an operator sees just one
 // "clone detection pass" marker followed by minutes of silence — no
 // way to tell finalise-signatures from LSH from edge-emission.
-func detectClonesAndEmitEdgesCtx(ctx context.Context, g *graph.Graph, threshold float64) CloneDetectionStats {
+func detectClonesAndEmitEdgesCtx(ctx context.Context, g graph.Store, repoPrefix string, threshold float64) CloneDetectionStats {
 	var stats CloneDetectionStats
 	if g == nil {
 		return stats
@@ -384,12 +476,17 @@ func detectClonesAndEmitEdgesCtx(ctx context.Context, g *graph.Graph, threshold 
 	// (delete clone_shingles, set clone_sig) don't race the AllNodes
 	// walk below.
 	reporter.Report("clones: CMS-finalise signatures", 0, 0)
-	finaliseCloneSignatures(g)
+	finaliseCloneSignatures(g, repoPrefix)
 
 	reporter.Report("clones: gather items", 0, 0)
 	var items []clones.Item
 	for _, n := range g.AllNodes() {
 		if n == nil || n.Meta == nil {
+			continue
+		}
+		// Scope to this repo's nodes so no cross-repo candidate pair is
+		// ever formed. "" matches every node (single-repo / in-memory).
+		if n.RepoPrefix != repoPrefix {
 			continue
 		}
 		if n.Kind != graph.KindFunction && n.Kind != graph.KindMethod {
@@ -527,7 +624,7 @@ type diffusionEdge struct {
 // directPairs carries the canonicalised clone pairs already emitted as
 // EdgeSimilarTo; any pair in that set is skipped so semantically_related
 // and similar_to partition cleanly.
-func diffuseSimilarityEdges(g *graph.Graph, pairs []clones.Pair, directPairs map[[2]string]struct{}) (diffusedPairs, diffusedEdges int) {
+func diffuseSimilarityEdges(g graph.Store, pairs []clones.Pair, directPairs map[[2]string]struct{}) (diffusedPairs, diffusedEdges int) {
 	if g == nil || len(pairs) < 2 {
 		return 0, 0
 	}
@@ -633,7 +730,7 @@ func diffuseSimilarityEdges(g *graph.Graph, pairs []clones.Pair, directPairs map
 // node's file/line for locality. Origin is ast_inferred — the
 // relationship is a statistical estimate over normalised tokens, not a
 // structural fact.
-func emitSimilarEdge(g *graph.Graph, from, to *graph.Node, similarity float64) {
+func emitSimilarEdge(g graph.Store, from, to *graph.Node, similarity float64) {
 	g.AddEdge(&graph.Edge{
 		From:       from.ID,
 		To:         to.ID,
@@ -651,7 +748,7 @@ func emitSimilarEdge(g *graph.Graph, from, to *graph.Node, similarity float64) {
 // edge is anchored at the source node's file/line and origin is
 // ast_inferred — the score is a statistical estimate over normalised
 // tokens, here additionally smoothed across the similarity graph.
-func emitSemanticallyRelatedEdge(g *graph.Graph, from, to *graph.Node, similarity float64) {
+func emitSemanticallyRelatedEdge(g graph.Store, from, to *graph.Node, similarity float64) {
 	g.AddEdge(&graph.Edge{
 		From:       from.ID,
 		To:         to.ID,

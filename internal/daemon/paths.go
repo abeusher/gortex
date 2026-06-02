@@ -15,8 +15,8 @@ import (
 // unset the location stays at the historical default so an existing
 // daemon state directory is not orphaned:
 //
-//   - Windows: %LocalAppData%\gortex (via os.UserCacheDir).
-//   - macOS / Linux: $HOME/.cache/gortex.
+//   - Windows: %USERPROFILE%\.gortex\cache (via os.UserCacheDir).
+//   - macOS / Linux: $HOME/.gortex/cache.
 //
 // The boolean is false when the home / cache directory can't be
 // resolved at all, in which case callers fall back to the temp dir.
@@ -45,8 +45,8 @@ func stateDir() (string, bool) {
 //  1. $GORTEX_DAEMON_SOCKET — explicit override (tests, custom deployments).
 //  2. $XDG_RUNTIME_DIR/gortex.sock — Linux standard for user runtime files.
 //     This path is cleaned automatically on logout and has sensible perms.
-//  3. The per-user state dir — $HOME/.cache/gortex on macOS/Linux,
-//     %LocalAppData%\gortex on Windows.
+//  3. The per-user state dir — $HOME/.gortex/cache on macOS/Linux,
+//     %USERPROFILE%\.gortex\cache on Windows.
 //
 // AF_UNIX socket paths have a length limit (~104 bytes on macOS, 108 on
 // Linux and Windows). We don't enforce that here — the listener fails
@@ -93,8 +93,12 @@ func LogFilePath() string {
 	return filepath.Join(os.TempDir(), "gortex-daemon.log")
 }
 
-// SnapshotPath returns the path the daemon saves graph snapshots to on
-// periodic saves and clean shutdown. Loaded on startup for fast cold starts.
+// SnapshotPath returns the legacy backend-agnostic snapshot path —
+// `daemon.gob.gz` under the state dir. Kept for callers that haven't
+// moved to backend-tagged storage yet (cloud indexer worker, ad-hoc
+// `gortex index --snapshot` runs). The daemon itself routes through
+// BackendSnapshotPath so a memory ↔ disk-backend switch can't read the
+// other backend's snapshot — see that function's doc.
 func SnapshotPath() string {
 	if override := os.Getenv("GORTEX_DAEMON_SNAPSHOT"); override != "" {
 		return override
@@ -105,10 +109,55 @@ func SnapshotPath() string {
 	return filepath.Join(os.TempDir(), "gortex-daemon.gob.gz")
 }
 
+// BackendSnapshotPath returns a backend-tagged snapshot path so the
+// memory and disk backends use distinct files. The memory backend
+// snapshot is a full gob+gzip of the in-memory graph; the disk
+// backend snapshot is metadata-only (FileMtimes, contracts, vector
+// index) because the graph itself lives in the on-disk store. Loading
+// the memory backend's snapshot into a disk-backed daemon (or vice
+// versa) silently produced wrong state — empty graph after disk→memory
+// switch, decode-and-discard nodes after memory→disk — so a fresh
+// daemon now picks the right file by backend tag.
+//
+// Empty backend tag falls back to SnapshotPath() so embedded callers
+// that don't know the backend (the cloud indexer worker) keep working.
+//
+// GORTEX_DAEMON_SNAPSHOT overrides every backend tag — the override
+// is an explicit "use exactly this path" signal.
+func BackendSnapshotPath(backend string) string {
+	if override := os.Getenv("GORTEX_DAEMON_SNAPSHOT"); override != "" {
+		return override
+	}
+	tag := normalizeBackendTag(backend)
+	if tag == "" {
+		return SnapshotPath()
+	}
+	filename := "daemon-" + tag + ".gob.gz"
+	if dir, ok := stateDir(); ok {
+		return filepath.Join(dir, filename)
+	}
+	return filepath.Join(os.TempDir(), "gortex-"+filename)
+}
+
+// normalizeBackendTag canonicalizes a backend identifier into the
+// short tag used in the snapshot filename — "memory" / "sqlite" /
+// etc. Empty / unknown input returns the empty string so the caller
+// can fall back to the legacy unsuffixed path.
+func normalizeBackendTag(backend string) string {
+	switch backend {
+	case "memory", "mem", "in-memory":
+		return "memory"
+	case "sqlite", "sqlite3":
+		return "sqlite"
+	default:
+		return ""
+	}
+}
+
 // EnsureParentDir creates the parent directory of path with permissions
 // 0o700 (user only). Daemon state files live under the user's cache dir
 // and should not be world-readable. The mode is advisory on Windows,
-// where filesystem ACLs already scope %LocalAppData% to the user.
+// where filesystem ACLs already scope %USERPROFILE% to the user.
 func EnsureParentDir(path string) error {
 	dir := filepath.Dir(path)
 	return os.MkdirAll(dir, 0o700)

@@ -61,6 +61,24 @@ var usageEdgeKinds = map[EdgeKind]bool{
 	EdgeTests:        true,
 }
 
+// UsageInboundEdgeKinds returns the canonical list of incoming edge
+// kinds that classify a symbol as "used" by ClassifyZeroEdge. Exposed
+// for capability callers (NodeDegreeAggregator) that need to mirror
+// the in-graph usage filter server-side. Order is stable so the slice
+// is safe to pass directly to a query parameter binding.
+func UsageInboundEdgeKinds() []EdgeKind {
+	return []EdgeKind{
+		EdgeCalls,
+		EdgeReferences,
+		EdgeInstantiates,
+		EdgeImplements,
+		EdgeExtends,
+		EdgeReads,
+		EdgeWrites,
+		EdgeTests,
+	}
+}
+
 // ClassifyZeroEdge inspects a symbol's incoming and outgoing edges and
 // returns how an empty usage/caller/impact query for it should be read.
 //
@@ -75,7 +93,7 @@ var usageEdgeKinds = map[EdgeKind]bool{
 // An unknown symbol ID is reported as an extraction gap: a query whose
 // target is not even in the graph is exactly as untrustworthy as one
 // whose target was never wired up.
-func ClassifyZeroEdge(g *Graph, symbolID string) ZeroEdgeClass {
+func ClassifyZeroEdge(g Store, symbolID string) ZeroEdgeClass {
 	if g == nil || symbolID == "" {
 		return ZeroEdgePossibleExtractionGap
 	}
@@ -113,7 +131,7 @@ var zeroEdgeMessages = map[ZeroEdgeClass]string{
 // query result on symbolID. It returns nil when the symbol has
 // incoming usage edges (ZeroEdgeNone) — a non-empty result carries no
 // caveat — so callers can attach the return value unconditionally.
-func CaveatForZeroEdge(g *Graph, symbolID string) *ZeroEdgeCaveat {
+func CaveatForZeroEdge(g Store, symbolID string) *ZeroEdgeCaveat {
 	class := ClassifyZeroEdge(g, symbolID)
 	if class == ZeroEdgeNone {
 		return nil

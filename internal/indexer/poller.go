@@ -205,9 +205,16 @@ func (p *Poller) pollGitHead() bool {
 	}
 	p.mu.Lock()
 	oldSHA := p.lastSHA
-	p.lastSHA = newSHA
 	p.mu.Unlock()
-	if oldSHA == "" || oldSHA == newSHA {
+	if oldSHA == "" {
+		// First observation: seed lastSHA and don't diff against a
+		// phantom range. There is no prior commit to reconcile from.
+		p.mu.Lock()
+		p.lastSHA = newSHA
+		p.mu.Unlock()
+		return false
+	}
+	if oldSHA == newSHA {
 		return false
 	}
 
@@ -215,6 +222,9 @@ func (p *Poller) pollGitHead() bool {
 	defer cancel()
 	changes, err := pollerDiffNameStatus(ctx, p.rootPath, oldSHA, newSHA)
 	if err != nil {
+		// Leave lastSHA at oldSHA so the next cycle retries this exact
+		// range. Advancing it here would permanently skip the
+		// un-reconciled oldSHA..newSHA span on a transient diff failure.
 		if p.logger != nil {
 			p.logger.Debug("watcher: poller git diff failed",
 				zap.String("from", oldSHA), zap.String("to", newSHA),
@@ -222,6 +232,15 @@ func (p *Poller) pollGitHead() bool {
 		}
 		return false
 	}
+
+	// Diff succeeded — the range is now safe to mark reconciled. Advance
+	// lastSHA before dispatching so a concurrent poll doesn't re-diff the
+	// same span; dispatch failures of individual files are best-effort
+	// and don't warrant re-running the whole diff.
+	p.mu.Lock()
+	p.lastSHA = newSHA
+	p.mu.Unlock()
+
 	n := 0
 	for _, c := range changes {
 		switch c.Status {

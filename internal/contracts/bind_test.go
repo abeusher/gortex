@@ -11,7 +11,7 @@ import (
 // bindGRPCProvider.
 func newBindTestGraph(repoPrefix string, methods []struct {
 	id, name, recv string
-}) *graph.Graph {
+}) graph.Store {
 	g := graph.New()
 	for _, m := range methods {
 		n := &graph.Node{

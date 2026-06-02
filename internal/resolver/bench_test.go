@@ -8,7 +8,7 @@ import (
 )
 
 // buildResolverGraph creates a graph with unresolved edges for benchmarking.
-func buildResolverGraph(files, symsPerFile int) (*graph.Graph, *Resolver) {
+func buildResolverGraph(files, symsPerFile int) (graph.Store, *Resolver) {
 	g := graph.New()
 
 	// Create file nodes with functions, types, and methods.

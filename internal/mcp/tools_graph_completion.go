@@ -85,12 +85,12 @@ func (s *Server) handleGraphCompletionSearch(ctx context.Context, req mcp.CallTo
 	}
 
 	return s.respondJSONOrTOON(ctx, req, map[string]any{
-		"results":      rows,
-		"total":        len(rows),
-		"retriever":    retriever.Name(),
-		"seed_count":   countSeeds(cands),
-		"expanded":     len(cands) - countSeeds(cands),
-		"edge_kinds":   edgeKindStrings(edgeKinds),
+		"results":    rows,
+		"total":      len(rows),
+		"retriever":  retriever.Name(),
+		"seed_count": countSeeds(cands),
+		"expanded":   len(cands) - countSeeds(cands),
+		"edge_kinds": edgeKindStrings(edgeKinds),
 	})
 }
 
@@ -100,14 +100,22 @@ func (s *Server) handleGraphCompletionSearch(ctx context.Context, req mcp.CallTo
 // substring (case-insensitive). Replaceable by callers who plug in
 // vector search or another retrieval scheme via the public Retriever
 // interface.
-func (s *Server) nameMatchSeeder(ctx context.Context, g *graph.Graph, query string, limit int) ([]*rerank.Candidate, error) {
-	q := strings.ToLower(query)
-	out := make([]*rerank.Candidate, 0, limit)
-	for _, n := range g.AllNodes() {
-		if ctx.Err() != nil {
-			return out, ctx.Err()
-		}
-		if !strings.Contains(strings.ToLower(n.Name), q) {
+func (s *Server) nameMatchSeeder(ctx context.Context, g graph.Store, query string, limit int) ([]*rerank.Candidate, error) {
+	// FindNodesByNameContaining pushes the case-insensitive substring
+	// filter into the backend — on a disk backend that's an indexed
+	// substring filter against the name column, so only matching rows
+	// cross the storage boundary instead of the legacy AllNodes()
+	// materialisation + per-row Go string check. The in-memory backend
+	// already had a tight implementation behind the same surface, so
+	// this is a strict win on disk backends and matches today's cost
+	// in-memory.
+	matches := g.FindNodesByNameContaining(query, limit)
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	out := make([]*rerank.Candidate, 0, len(matches))
+	for _, n := range matches {
+		if n == nil {
 			continue
 		}
 		out = append(out, &rerank.Candidate{Node: n, TextRank: len(out)})

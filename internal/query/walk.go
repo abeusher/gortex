@@ -204,7 +204,7 @@ func (e *Engine) WalkBudgeted(startID string, opts WalkOptions) *SubGraph {
 				neighborID = edge.From
 			}
 
-			if strings.HasPrefix(neighborID, "unresolved::") ||
+			if graph.IsUnresolvedTarget(neighborID) ||
 				strings.HasPrefix(neighborID, "external::") {
 				continue
 			}

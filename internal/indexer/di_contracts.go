@@ -36,15 +36,17 @@ func (idx *Indexer) extractDIContracts(reg *contracts.Registry) {
 
 	var discovered []contracts.Contract
 	if idx.repoPrefix != "" {
-		// Multi-repo: walk only this repo's outgoing edges.
-		for _, n := range idx.graph.GetRepoNodes(idx.repoPrefix) {
-			for _, e := range idx.graph.GetOutEdges(n.ID) {
-				c, ok := diContractFromEdge(e)
-				if !ok {
-					continue
-				}
-				discovered = append(discovered, c)
+		// Multi-repo: walk only this repo's outgoing edges via a
+		// single backend query. The previous GetRepoNodes ×
+		// GetOutEdges nested walk was O(repo_nodes) per-node round-
+		// trips on disk backends — at ~68k repo nodes that meant
+		// 68k backend queries per pass on a disk backend.
+		for _, e := range idx.graph.GetRepoEdges(idx.repoPrefix) {
+			c, ok := diContractFromEdge(e)
+			if !ok {
+				continue
 			}
+			discovered = append(discovered, c)
 		}
 	} else {
 		// Single-repo: every edge belongs to this repo.
@@ -96,10 +98,11 @@ func (idx *Indexer) linkSpringBeans() {
 	}
 
 	if idx.repoPrefix != "" {
-		for _, n := range idx.graph.GetRepoNodes(idx.repoPrefix) {
-			for _, e := range idx.graph.GetOutEdges(n.ID) {
-				collectBean(e)
-			}
+		// Single backend query instead of one GetOutEdges per
+		// repo node — see extractDIContracts above for the round-
+		// trip math.
+		for _, e := range idx.graph.GetRepoEdges(idx.repoPrefix) {
+			collectBean(e)
 		}
 	} else {
 		for _, e := range idx.graph.AllEdges() {
