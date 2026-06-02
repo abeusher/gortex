@@ -2847,6 +2847,7 @@ func (idx *Indexer) EvictFile(filePath string) (int, int) {
 		}
 	}
 	idx.restubIncomingRefs(graphPath)
+	idx.evictEnrichment(graphPath)
 	return idx.graph.EvictFile(graphPath)
 }
 
@@ -2866,6 +2867,34 @@ func (idx *Indexer) EvictFile(filePath string) (int, int) {
 // agnostic: GetInEdges + ReindexEdges are the same Store primitives the
 // resolver uses, so this behaves identically on the in-memory and disk
 // stores.
+// evictEnrichment drops the per-node enrichment sidecar rows (churn,
+// coverage, release, blame — change A) for a file's nodes on the
+// delete/rename paths only, so a removed file leaves no orphan
+// enrichment. Capability-gated. A modify re-indexes the same node IDs
+// (enrichment stays valid) so it is NOT cascaded there.
+func (idx *Indexer) evictEnrichment(graphPath string) {
+	nodes := idx.graph.GetFileNodes(graphPath)
+	if len(nodes) == 0 {
+		return
+	}
+	ids := make([]string, 0, len(nodes))
+	for _, n := range nodes {
+		ids = append(ids, n.ID)
+	}
+	if w, ok := idx.graph.(graph.ChurnEnrichmentWriter); ok {
+		_ = w.DeleteChurn(ids)
+	}
+	if w, ok := idx.graph.(graph.CoverageEnrichmentWriter); ok {
+		_ = w.DeleteCoverage(ids)
+	}
+	if w, ok := idx.graph.(graph.ReleaseEnrichmentWriter); ok {
+		_ = w.DeleteReleases(ids)
+	}
+	if w, ok := idx.graph.(graph.BlameEnrichmentWriter); ok {
+		_ = w.DeleteBlame(ids)
+	}
+}
+
 func (idx *Indexer) restubIncomingRefs(graphPath string) {
 	nodes := idx.graph.GetFileNodes(graphPath)
 	if len(nodes) == 0 {
@@ -3736,6 +3765,7 @@ func (idx *Indexer) IncrementalReindexPaths(root string, paths []string) (*Index
 	for _, relPath := range deletedFiles {
 		graphPath := idx.prefixPath(relPath)
 		idx.restubIncomingRefs(graphPath)
+		idx.evictEnrichment(graphPath)
 		idx.graph.EvictFile(graphPath)
 		idx.mtimeMu.Lock()
 		delete(idx.fileMtimes, relPath)
@@ -3939,6 +3969,7 @@ func (idx *Indexer) IncrementalReindex(root string) (*IndexResult, error) {
 	for _, relPath := range deletedFiles {
 		graphPath := idx.prefixPath(relPath)
 		idx.restubIncomingRefs(graphPath)
+		idx.evictEnrichment(graphPath)
 		idx.graph.EvictFile(graphPath)
 		idx.mtimeMu.Lock()
 		delete(idx.fileMtimes, relPath)

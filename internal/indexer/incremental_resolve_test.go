@@ -96,3 +96,29 @@ func TestIncrementalReindex_PreservesIncomingCallerEdges(t *testing.T) {
 	assert.Equal(t, rebound, callTargetFrom(t, g, barID),
 		"re-adding Foo must rebind Bar's pending caller edge via the reverse pass")
 }
+
+// TestEvictFile_DropsEnrichmentSidecars proves the change-A eviction
+// cascade: deleting a file drops its nodes' churn/coverage/blame
+// sidecar rows, leaving no orphan enrichment.
+func TestEvictFile_DropsEnrichmentSidecars(t *testing.T) {
+	idx, _ := newToggleIndexer(t)
+	dir := t.TempDir()
+	idx.SetRootPath(dir)
+	g := idx.graph
+
+	g.AddBatch([]*graph.Node{
+		{ID: "main.fk", Kind: graph.KindFile, Name: "main.fk", FilePath: "main.fk"},
+		{ID: "main.fk::Foo", Kind: graph.KindFunction, Name: "Foo", FilePath: "main.fk"},
+	}, nil)
+	require.NoError(t, g.(graph.ChurnEnrichmentWriter).BulkSetChurn("", []graph.ChurnEnrichment{{NodeID: "main.fk::Foo", CommitCount: 3}}))
+	require.NoError(t, g.(graph.CoverageEnrichmentWriter).BulkSetCoverage("", []graph.CoverageEnrichment{{NodeID: "main.fk::Foo", CoveragePct: 50}}))
+	require.NoError(t, g.(graph.BlameEnrichmentWriter).BulkSetBlame("", []graph.BlameEnrichment{{NodeID: "main.fk::Foo", Email: "x@y"}}))
+
+	require.NotEmpty(t, g.(graph.ChurnEnrichmentReader).ChurnRows(""), "churn seeded")
+
+	idx.EvictFile("main.fk")
+
+	assert.Empty(t, g.(graph.ChurnEnrichmentReader).ChurnRows(""), "churn rows must be evicted with the file")
+	assert.Empty(t, g.(graph.CoverageEnrichmentReader).CoverageRows(""), "coverage rows must be evicted")
+	assert.Empty(t, g.(graph.BlameEnrichmentReader).BlameRows(""), "blame rows must be evicted")
+}
