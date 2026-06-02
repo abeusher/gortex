@@ -1102,6 +1102,30 @@ func isTestFile(path string) bool {
 	return strings.Contains(path, "__tests__/") || strings.Contains(path, "/test/")
 }
 
+// partitionProductionFirst returns a stable partition of nodes with
+// every production-code symbol ahead of every test symbol, preserving
+// the relative order within each group. Used to bias the limited
+// smart_context source-embed slots toward implementation over the
+// tests that exercise it without disturbing the upstream rerank order.
+func partitionProductionFirst(nodes []*graph.Node) []*graph.Node {
+	if len(nodes) < 2 {
+		return nodes
+	}
+	prod := make([]*graph.Node, 0, len(nodes))
+	tests := make([]*graph.Node, 0)
+	for _, n := range nodes {
+		if n != nil && isTestFile(n.FilePath) {
+			tests = append(tests, n)
+			continue
+		}
+		prod = append(prod, n)
+	}
+	if len(tests) == 0 {
+		return nodes
+	}
+	return append(prod, tests...)
+}
+
 func (s *Server) handleGetTestTargets(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	idsStr, err := req.RequireString("ids")
 	if err != nil {
@@ -1729,6 +1753,13 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 			}
 		}
 	}
+
+	// 3d-bias. Bias production code ahead of tests. A stable partition
+	// keeps the rerank order within each group but pulls every
+	// non-test symbol in front of every test symbol, so the limited
+	// full-source embed slots and the head of files_to_edit favour the
+	// implementation over the test that exercises it.
+	relevantSymbols = partitionProductionFirst(relevantSymbols)
 
 	// 3e. Re-pin the resolved entry point at the head: a caller that
 	// named an entry_point wants it first regardless of rerank order.
