@@ -156,3 +156,121 @@ func TestChunkSymbol_LongPythonFuncSplits(t *testing.T) {
 	}
 	assert.Equal(t, src, rejoined.String())
 }
+
+// assertSplitsAndRejoins is the shared body for the new-language
+// sub-chunking tests: a large symbol must split into more than one
+// window, every chunk carries the parent ID and a sequential
+// WindowIndex, and the rejoined windows reproduce the source exactly.
+func assertSplitsAndRejoins(t *testing.T, src, lang, parentID string) {
+	t.Helper()
+	chunks := ChunkSymbol([]byte(src), lang, parentID, ChunkOptions{ThresholdLines: 10, WindowLines: 10})
+	require.Greaterf(t, len(chunks), 1, "a long %s symbol must split into more than one window", lang)
+	rejoined := strings.Builder{}
+	for i, c := range chunks {
+		assert.Equal(t, parentID, c.ParentID, "every chunk carries the parent ID")
+		assert.Equal(t, i, c.WindowIndex, "WindowIndex must be sequential from 0")
+		rejoined.WriteString(c.Text)
+	}
+	assert.Equalf(t, src, rejoined.String(),
+		"concatenating the %s windows must reproduce the symbol source byte-for-byte", lang)
+}
+
+// TestChunkSymbol_LongRubyMethodSplits exercises the Ruby splitter: a
+// long method's body_statement children are the split points.
+func TestChunkSymbol_LongRubyMethodSplits(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("def big(x)\n")
+	for i := 0; i < 40; i++ {
+		b.WriteString("  y = x + 1\n")
+	}
+	b.WriteString("end")
+	assertSplitsAndRejoins(t, b.String(), "ruby", "x.rb::big")
+}
+
+// TestChunkSymbol_LongRubyClassSplits asserts a large Ruby class splits
+// on its body_statement members.
+func TestChunkSymbol_LongRubyClassSplits(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("class Big\n")
+	for i := 0; i < 40; i++ {
+		b.WriteString("  def m; 1; end\n")
+	}
+	b.WriteString("end")
+	assertSplitsAndRejoins(t, b.String(), "ruby", "x.rb::Big")
+}
+
+// TestChunkSymbol_LongPHPMethodSplits exercises the PHP splitter: a long
+// function's compound_statement children are the split points.
+func TestChunkSymbol_LongPHPMethodSplits(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("<?php\nfunction big($x) {\n")
+	for i := 0; i < 40; i++ {
+		b.WriteString("  $y = $x + 1;\n")
+	}
+	b.WriteString("}")
+	assertSplitsAndRejoins(t, b.String(), "php", "x.php::big")
+}
+
+// TestChunkSymbol_LongKotlinFuncSplits exercises the Kotlin splitter: a
+// function's function_body -> statements children are the split points.
+func TestChunkSymbol_LongKotlinFuncSplits(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("fun big(x: Int): Int {\n")
+	for i := 0; i < 40; i++ {
+		b.WriteString("  val y = x + 1\n")
+	}
+	b.WriteString("  return x\n}")
+	assertSplitsAndRejoins(t, b.String(), "kotlin", "x.kt::big")
+}
+
+// TestChunkSymbol_LongKotlinClassSplits asserts a large Kotlin class
+// splits on its class_body members.
+func TestChunkSymbol_LongKotlinClassSplits(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("class Big {\n")
+	for i := 0; i < 40; i++ {
+		b.WriteString("  fun m(): Int { return 1 }\n")
+	}
+	b.WriteString("}")
+	assertSplitsAndRejoins(t, b.String(), "kotlin", "x.kt::Big")
+}
+
+// TestChunkSymbol_LongSwiftFuncSplits exercises the Swift splitter: a
+// function's function_body -> statements children are the split points.
+func TestChunkSymbol_LongSwiftFuncSplits(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("func big(x: Int) -> Int {\n")
+	for i := 0; i < 40; i++ {
+		b.WriteString("  let y = x + 1\n")
+	}
+	b.WriteString("  return x\n}")
+	assertSplitsAndRejoins(t, b.String(), "swift", "x.swift::big")
+}
+
+// TestChunkSymbol_LongSwiftClassSplits asserts a large Swift class
+// splits on its class_body members.
+func TestChunkSymbol_LongSwiftClassSplits(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("class Big {\n")
+	for i := 0; i < 40; i++ {
+		b.WriteString("  func m() -> Int { return 1 }\n")
+	}
+	b.WriteString("}")
+	assertSplitsAndRejoins(t, b.String(), "swift", "x.swift::Big")
+}
+
+// TestChunkSymbol_NewLanguagesFailSoft asserts the new-language
+// splitters preserve the exact fail-soft contract: a span that fails to
+// parse still yields windows whose rejoin reproduces the input.
+func TestChunkSymbol_NewLanguagesFailSoft(t *testing.T) {
+	garbage := strings.Repeat("}{ ][ <<>> ;;;\n", 100)
+	for _, lang := range []string{"ruby", "php", "kotlin", "swift"} {
+		chunks := ChunkSymbol([]byte(garbage), lang, "x::junk", ChunkOptions{ThresholdLines: 10, WindowLines: 5})
+		require.GreaterOrEqualf(t, len(chunks), 1, "%s parse failure must still yield a chunk", lang)
+		rejoined := strings.Builder{}
+		for _, c := range chunks {
+			rejoined.WriteString(c.Text)
+		}
+		assert.Equalf(t, garbage, rejoined.String(), "%s windows must cover the whole input", lang)
+	}
+}

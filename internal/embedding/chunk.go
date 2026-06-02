@@ -11,8 +11,12 @@ import (
 	golang "github.com/zzet/gortex/internal/parser/tsitter/golang"
 	javalang "github.com/zzet/gortex/internal/parser/tsitter/java"
 	jslang "github.com/zzet/gortex/internal/parser/tsitter/javascript"
+	kotlinlang "github.com/zzet/gortex/internal/parser/tsitter/kotlin"
+	phplang "github.com/zzet/gortex/internal/parser/tsitter/php"
 	pylang "github.com/zzet/gortex/internal/parser/tsitter/python"
+	rubylang "github.com/zzet/gortex/internal/parser/tsitter/ruby"
 	rustlang "github.com/zzet/gortex/internal/parser/tsitter/rust"
+	swiftlang "github.com/zzet/gortex/internal/parser/tsitter/swift"
 	tsxlang "github.com/zzet/gortex/internal/parser/tsitter/tsx"
 	tslang "github.com/zzet/gortex/internal/parser/tsitter/typescript"
 )
@@ -322,9 +326,94 @@ func chunkSpecFor(language string) *chunkSpec {
 			grammar:       pylang.GetLanguage,
 			findContainer: pythonContainer,
 		}
+	case "ruby", "rb":
+		return &chunkSpec{
+			grammar:       rubylang.GetLanguage,
+			findContainer: rubyContainer,
+		}
+	case "php":
+		return &chunkSpec{
+			grammar: phplang.GetLanguage,
+			findContainer: braceContainer(
+				containerSpec{decl: "method_declaration", body: "compound_statement", bodyField: "body"},
+				containerSpec{decl: "function_definition", body: "compound_statement", bodyField: "body"},
+				containerSpec{decl: "class_declaration", body: "declaration_list", bodyField: "body"},
+			),
+		}
+	case "kotlin", "kt":
+		return &chunkSpec{
+			grammar:       kotlinlang.GetLanguage,
+			findContainer: kotlinSwiftContainer,
+		}
+	case "swift":
+		return &chunkSpec{
+			grammar:       swiftlang.GetLanguage,
+			findContainer: kotlinSwiftContainer,
+		}
 	default:
 		return nil
 	}
+}
+
+// rubyContainer finds the splittable container in a parsed Ruby span: a
+// method / singleton_method body, or a class / module body. The
+// tree-sitter-ruby grammar models the body as a `body_statement` named
+// child (not a field) whose own named children are the statements —
+// the split points.
+func rubyContainer(root *sitter.Node) *sitter.Node {
+	decls := map[string]struct{}{
+		"method":           {},
+		"singleton_method": {},
+		"class":            {},
+		"module":           {},
+	}
+	var found *sitter.Node
+	walkNodes(root, func(n *sitter.Node) bool {
+		if found != nil {
+			return false
+		}
+		if _, ok := decls[n.Type()]; ok {
+			if body := firstNamedChildOfKind(n, map[string]struct{}{"body_statement": {}}); body != nil {
+				found = body
+				return false
+			}
+		}
+		return true
+	})
+	return found
+}
+
+// kotlinSwiftContainer finds the splittable container in a parsed
+// Kotlin or Swift span. Both grammars share the same shape: a
+// `function_declaration` wraps its block body in a `function_body`
+// node whose single `statements` named child holds the real split
+// points, and a `class_declaration` exposes a `class_body` whose named
+// children (functions, properties) are the split points. The function
+// path returns the inner `statements` node so topLevelChildRanges sees
+// the statements directly; the class path returns `class_body`.
+func kotlinSwiftContainer(root *sitter.Node) *sitter.Node {
+	var found *sitter.Node
+	walkNodes(root, func(n *sitter.Node) bool {
+		if found != nil {
+			return false
+		}
+		switch n.Type() {
+		case "function_declaration":
+			if body := firstNamedChildOfKind(n, map[string]struct{}{"function_body": {}}); body != nil {
+				if stmts := firstNamedChildOfKind(body, map[string]struct{}{"statements": {}}); stmts != nil {
+					found = stmts
+					return false
+				}
+			}
+		case "class_declaration":
+			if body := firstNamedChildOfKind(n, map[string]struct{}{"class_body": {}}); body != nil {
+				found = body
+				return false
+			}
+		}
+		return true
+	})
+	return found
 }
 
 // containerSpec names a declaration node kind and the body node kind
