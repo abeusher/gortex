@@ -112,6 +112,23 @@ type QueryOptions struct {
 	// node, so the FindNodesByName query round-trip is wasted work.
 	// The primary query still runs the splice.
 	SkipExactNameSplice bool `json:"-"`
+
+	// CosineRerank, when true, runs the post-rerank exact-cosine
+	// refinement stage after SearchSymbolsRanked's per-call rerank:
+	// the top candidates are re-ordered by exact cosine similarity
+	// between the query embedding and each candidate's stored
+	// embedding, recovering the precise semantic distance the
+	// rank-based SemanticSignal discards. The stage is a strict no-op
+	// when the vector channel is inactive (no embedder, no stored
+	// vectors, query fails to embed), so it can never regress a
+	// text-only search. Honoured only when the engine has not been
+	// asked to skip its inner rerank — the production handler runs
+	// the refinement itself against its merged candidate set.
+	CosineRerank bool `json:"-"`
+
+	// CosineTopN bounds how many of the top ranked candidates the
+	// cosine refinement re-scores. Zero uses the package default.
+	CosineTopN int `json:"-"`
 }
 
 // SearchTimings carries per-phase wall-clock measurements collected
@@ -429,6 +446,20 @@ type WalkOptions struct {
 	// are dropped along with the edge that reached them.
 	WorkspaceID string
 	ProjectID   string
+	// CommunityID, when non-empty, constrains the walk to a single
+	// detected community: a neighbour is admitted only when it has no
+	// community membership (a structural node Leiden never partitioned
+	// — file / import / param) OR its membership equals CommunityID.
+	// A neighbour with a *different* membership is dropped along with
+	// the edge that reached it. NodeToComm must be supplied for the
+	// filter to engage; an empty CommunityID disables it entirely.
+	CommunityID string
+	// NodeToComm maps node ID to its community ID, as produced by the
+	// community-detection pass. Only nodes Leiden partitioned over the
+	// call / reference graph appear here; an absent entry means "no
+	// defined membership" and the CommunityID filter lets such a node
+	// pass (it never had a community to be excluded from).
+	NodeToComm map[string]string
 }
 
 // scopeAllows reports whether n passes this walk's workspace/project

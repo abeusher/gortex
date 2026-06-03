@@ -124,7 +124,24 @@ func (p *Pipeline) Rerank(query string, cands []*Candidate, ctx *Context) []*Can
 				raw = 1
 			}
 			c.Signals[sig.Name()] = raw
-			total += w * ClassWeightMultiplier(ctx.QueryClass, sig.Name()) * raw
+			// The bm25↔semantic balance uses the continuous α lever
+			// when the caller set Context.Alpha, else the discrete
+			// per-class table. classMult is 1.0 for every other signal.
+			var classMult float64
+			if ctx.Alpha > 0 {
+				classMult = continuousClassMultiplier(ctx.Alpha, sig.Name())
+			} else {
+				classMult = ClassWeightMultiplier(ctx.QueryClass, sig.Name())
+			}
+			// Prose profile rides on its own lever, composed
+			// multiplicatively with the class / α multiplier so a docs
+			// query keeps its query-shape blend while the structural
+			// code-only signals are suppressed for the prose corpus.
+			// 1.0 (no-op) for every code query.
+			if ctx.ProseMode {
+				classMult *= proseWeightMultiplier(sig.Name())
+			}
+			total += w * classMult * raw
 		}
 		c.Score = total
 	}
@@ -190,6 +207,8 @@ func DefaultSignals() []Signal {
 		FileCoherenceSignal{},
 		PathPenaltySignal{},
 		DefinitionBiasSignal{},
+		SourceBiasSignal{},
+		ProvenanceSignal{},
 	}
 }
 
@@ -224,6 +243,8 @@ func DefaultWeights() map[string]float64 {
 		SignalFileCoherence:  0.30,
 		SignalPathPenalty:    0.40,
 		SignalDefinitionBias: 0.60,
+		SignalSourceBias:     0.25,
+		SignalProvenance:     0.15,
 	}
 }
 
@@ -246,6 +267,8 @@ const (
 	SignalFileCoherence  = "file_coherence"
 	SignalPathPenalty    = "path_penalty"
 	SignalDefinitionBias = "definition_bias"
+	SignalSourceBias     = "source_bias"
+	SignalProvenance     = "provenance"
 )
 
 // AllSignalNames lists every canonical signal name. Useful for config
@@ -268,5 +291,7 @@ func AllSignalNames() []string {
 		SignalFileCoherence,
 		SignalPathPenalty,
 		SignalDefinitionBias,
+		SignalSourceBias,
+		SignalProvenance,
 	}
 }

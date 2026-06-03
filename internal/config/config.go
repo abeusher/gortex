@@ -881,6 +881,30 @@ type SearchConfig struct {
 	// by default (a nil pointer means "on"). Set false to keep prose
 	// out of the index entirely.
 	IndexProse *bool `mapstructure:"index_prose" yaml:"index_prose,omitempty"`
+
+	// VocabAnchoredExpansion sets the server-wide default for the
+	// search_symbols `vocab_anchored` argument: when on, the LLM
+	// query-expander's freely-invented synonyms are post-filtered to
+	// the words that actually appear in this repo's symbol names
+	// before they feed the BM25 OR-merge, so a model that hallucinates
+	// a plausible-but-absent term can't dilute the candidate pool. Off
+	// by default (a nil pointer means "off") -- the per-call argument
+	// is the primary control; this only changes the default when the
+	// argument is omitted. Degrades to unconstrained expansion when
+	// the repo's mined vocabulary is empty.
+	VocabAnchoredExpansion *bool `mapstructure:"vocab_anchored_expansion" yaml:"vocab_anchored_expansion,omitempty"`
+
+	// CosineRerank enables the post-rerank exact-cosine refinement
+	// stage: after the 11-signal rerank produces the ranked order,
+	// the top results are re-scored by exact cosine similarity
+	// between the query's embedding and each candidate's stored
+	// embedding, recovering the precise semantic distance the
+	// rank-based SemanticSignal discards. On by default (a nil
+	// pointer means "on"); the stage is a no-op whenever the vector
+	// channel is inactive (no embedder, no stored vectors, or the
+	// query fails to embed), so enabling it can never regress a
+	// text-only search. Set false to keep the pure rank-fusion order.
+	CosineRerank *bool `mapstructure:"cosine_rerank" yaml:"cosine_rerank,omitempty"`
 }
 
 // Keyword-soup rewrite modes for SearchConfig.KeywordSoupRewrite.
@@ -902,6 +926,24 @@ func (c SearchConfig) EquivalenceClassesEnabled() bool {
 // (the unset state) means enabled.
 func (c SearchConfig) IndexProseEnabled() bool {
 	return c.IndexProse == nil || *c.IndexProse
+}
+
+// CosineRerankEnabled reports whether the post-rerank exact-cosine
+// refinement stage is on. Defaults to true -- a nil CosineRerank
+// pointer (the unset state) means enabled. The stage still no-ops
+// when the vector channel is unavailable, so "enabled" is a
+// permission, not a guarantee that it runs.
+func (c SearchConfig) CosineRerankEnabled() bool {
+	return c.CosineRerank == nil || *c.CosineRerank
+}
+
+// VocabAnchoredExpansionDefault reports the server-wide default for
+// the search_symbols `vocab_anchored` argument when the caller omits
+// it. Defaults to false -- a nil VocabAnchoredExpansion pointer (the
+// unset state) means off, so expansion stays unconstrained unless a
+// caller (or this config) opts in.
+func (c SearchConfig) VocabAnchoredExpansionDefault() bool {
+	return c.VocabAnchoredExpansion != nil && *c.VocabAnchoredExpansion
 }
 
 // EffectiveKeywordSoupRewrite folds the empty default into the
@@ -978,6 +1020,17 @@ type EmbeddingConfig struct {
 	// in-process transformer backends serialize on an inference mutex,
 	// so the pool would give them no speedup.
 	APIConcurrency int `mapstructure:"api_concurrency" yaml:"api_concurrency,omitempty"`
+
+	// Variant names a specific local transformer model to load when
+	// Provider is `local` -- a key from embedding.KnownHugotVariants
+	// (e.g. `fp32`, `bge_small`, `jina_code`). A non-empty Variant
+	// pins that exact model instead of the auto-selected default
+	// backend. Empty preserves the current default-selection
+	// behaviour. Ignored for the `static` and `api` providers.
+	// A variant change alters the embedding dimension, which the
+	// indexer's dims-mismatch guard detects -- stale vectors of the
+	// old width are discarded and the corpus is re-embedded.
+	Variant string `mapstructure:"variant" yaml:"variant,omitempty"`
 }
 
 // EmbeddingEnabledOrDefault resolves the tri-state Enabled flag against

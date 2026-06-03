@@ -39,6 +39,13 @@ func TestTokenizeQuery(t *testing.T) {
 
 // runBackendTests runs the same test suite on any Backend implementation.
 func runBackendTests(t *testing.T, name string, backend Backend) {
+	// This conformance suite asserts baseline exact-match / no-match
+	// semantics shared by every backend. The opt-in sub-word n-gram gate
+	// deliberately adds fuzzy recall paths that would turn a "no match"
+	// assertion into a match, so pin it off here regardless of any
+	// ambient GORTEX_SPARSE_NGRAM — sub-word recall is exercised in the
+	// dedicated sparse-ngram tests, not here.
+	withSparseNgram(t, false)
 	t.Run(name+"/BasicSearch", func(t *testing.T) {
 		backend.Add("auth/token.go::validateToken", "validateToken", "auth/token.go")
 		backend.Add("auth/token.go::parseJWT", "parseJWT", "auth/token.go")

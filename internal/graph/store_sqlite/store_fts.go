@@ -39,8 +39,9 @@ import (
 // implements them, routing search_symbols through on-disk FTS5 instead
 // of the in-process BM25 index.
 var (
-	_ graph.SymbolSearcher       = (*Store)(nil)
-	_ graph.SymbolBundleSearcher = (*Store)(nil)
+	_ graph.SymbolSearcher        = (*Store)(nil)
+	_ graph.SymbolBundleSearcher  = (*Store)(nil)
+	_ graph.BundleFingerprintSink = (*Store)(nil)
 )
 
 // ftsInsertChunkRows bounds the rows per multi-row INSERT. Each row
@@ -329,24 +330,60 @@ func (s *Store) SearchSymbolBundles(query string, limit int) ([]graph.SymbolBund
 		return nil, nil
 	}
 
-	nodes := s.GetNodesByIDs(ids)
-	out := s.GetOutEdgesByNodeIDs(ids)
-	in := s.GetInEdgesByNodeIDs(ids)
+	// Content-addressed cache: serve cached bundles for IDs whose
+	// package fingerprint is unchanged and fetch only the misses. The
+	// cache is nil until the daemon wires fingerprints, in which case
+	// every ID is a miss and the path is exactly the legacy fetch.
+	cached := make(map[string]graph.SymbolBundle, len(ids))
+	missIDs := ids
+	if s.bundles != nil {
+		missIDs = missIDs[:0:0]
+		for _, id := range ids {
+			if b, ok := s.bundles.lookup(id); ok {
+				cached[id] = b
+				continue
+			}
+			missIDs = append(missIDs, id)
+		}
+	}
+
+	// Fetch the misses' nodes + in/out edges in one batched round-trip
+	// each. A full cache hit skips all three fetches entirely.
+	var nodes map[string]*graph.Node
+	var out, in map[string][]*graph.Edge
+	if len(missIDs) > 0 {
+		nodes = s.GetNodesByIDs(missIDs)
+		out = s.GetOutEdgesByNodeIDs(missIDs)
+		in = s.GetInEdgesByNodeIDs(missIDs)
+	}
 
 	bundles := make([]graph.SymbolBundle, 0, len(ids))
 	for _, id := range ids {
+		if b, ok := cached[id]; ok {
+			// The cached bundle's score is whatever it was first cached
+			// with; the live FTS score for THIS query is authoritative,
+			// so re-stamp it (the score is query-specific, the node +
+			// edges are not).
+			b.Score = scoreByID[id]
+			bundles = append(bundles, b)
+			continue
+		}
 		n := nodes[id]
 		if n == nil {
 			// Hit references a node evicted between the search and the
 			// node fetch — skip; the caller does its own dedup / filter.
 			continue
 		}
-		bundles = append(bundles, graph.SymbolBundle{
+		b := graph.SymbolBundle{
 			Node:     n,
 			Score:    scoreByID[id],
 			OutEdges: out[id],
 			InEdges:  in[id],
-		})
+		}
+		if s.bundles != nil {
+			s.bundles.store(b)
+		}
+		bundles = append(bundles, b)
 	}
 	return bundles, nil
 }

@@ -803,6 +803,7 @@ func (s *Server) registerCoreTools() {
 			mcp.WithString("query_class", mcp.Description("Advisory hint that tunes the bm25-vs-semantic balance of the rerank: \"auto\" (default — detect from query shape), \"symbol\" (identifier / API lookup — BM25-heavy), \"concept\" (natural-language description — balanced), \"path\" (file-path query — most BM25-heavy), \"signature\" (type/function-signature fragment — BM25-leaning), \"keyword_soup\" (a degenerate boolean OR-list \u2014 suppresses LLM expansion and splits the soup into per-disjunct BM25 fetches; a `query_advice` nudge rides on the response). The class actually used is echoed back as `query_class` in the response.")),
 			mcp.WithString("expand", mcp.Description("Query-expansion channels: \"both\" (default \u2014 LLM expansion when the assist gate engages, plus the deterministic equivalence-class table), \"equivalence\" (only the LLM-free curated synonym table + per-repo auto-mined concepts), \"llm\" (only LLM expansion), \"off\" (pure BM25, no expansion). Equivalence expansion bridges query vocabulary to the words a symbol uses (auth->login, delete->remove) and runs even with no LLM provider configured. For identifier queries (query_class symbol / path / signature) the server auto-disables expansion + vector even when expand is set \u2014 these classes match best on BM25 + exact-name alone.")),
 			mcp.WithString("corpus", mcp.Description("Which corpus to search: \"code\" (default \u2014 code symbols only), \"docs\" (only Markdown prose-section nodes \u2014 the heading-delimited documentation sections), \"all\" (both). With docs/all a prose query matches the right README / guide section by its body text.")),
+			mcp.WithBoolean("vocab_anchored", mcp.Description("When true, the LLM query-expander's returned synonyms are post-filtered to the words that actually appear in this repo's symbol names before they feed the BM25 OR-merge -- so a hallucinated-but-plausible term can't dilute the candidate pool. Robust and model-agnostic. Degrades to unconstrained expansion when the repo's mined vocabulary is empty (e.g. a cold index). Default false; the server may set a different default via search.vocab_anchored_expansion. No effect when the LLM expansion channel is off.")),
 			mcp.WithNumber("max_per_file", mcp.Description("Cap how many results a single source file may contribute to the diverse head of the result set (default 3). Hits beyond the cap are demoted below not-yet-capped results — never dropped — so the top of the list spans more files. Set 0 to disable diversification.")),
 		),
 		s.handleSearchSymbols,
@@ -1220,6 +1221,7 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	// gating uses the same validated value the rerank below uses;
 	// invalid input is rejected before the engine runs.
 	queryClass := rerank.ClassifyQuery(q)
+	qcPinned := false
 	if qcArg := strings.TrimSpace(req.GetString("query_class", "")); qcArg != "" {
 		parsed, ok := rerank.ParseQueryClass(qcArg)
 		if !ok {
@@ -1227,6 +1229,7 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 		}
 		if parsed != rerank.QueryClassUnknown {
 			queryClass = parsed
+			qcPinned = true
 		}
 	}
 	identifierFastPath := !isSoup && isIdentifierClass(queryClass)
@@ -1250,6 +1253,17 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	// query. The explicit arg pin still wins for soup / concept.
 	if identifierFastPath {
 		expand = expandOff
+	}
+	// Vocabulary-anchored expansion: post-filter the LLM expander's
+	// returned synonyms to the words this repo's symbol names actually
+	// use, so a hallucinated-but-plausible term can't dilute the BM25
+	// pool. The explicit `vocab_anchored` argument wins; when omitted,
+	// the server-wide config default applies. GetArguments is consulted
+	// directly so an absent argument falls through to the config
+	// default instead of GetBool's hard-coded false.
+	vocabAnchored := s.searchConfig().VocabAnchoredExpansionDefault()
+	if v, ok := req.GetArguments()["vocab_anchored"].(bool); ok {
+		vocabAnchored = v
 	}
 	engage := shouldEngageAssist(assist, q) && s.llmService != nil && s.llmService.Enabled()
 	if isSoup || !expand.allowsLLMExpansion() {
@@ -1282,7 +1296,7 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	// overlapping channels never double-count a candidate.
 	var llmTerms, soupFragments, equivTerms []string
 	if engage {
-		llmTerms = expandSearchTerms(ctx, s, q)
+		llmTerms = expandSearchTerms(ctx, s, q, vocabAnchored)
 	}
 	if isSoup && soupMode == config.KeywordSoupSplit {
 		soupFragments = rerank.SplitSoupFragments(q)
@@ -1303,6 +1317,16 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	rctx := s.buildRerankContext(ctx, q)
 	scope.RerankContext = rctx
 
+	// Corpus selection: `code` (default) keeps only code symbols,
+	// `docs` keeps only prose-section (KindDoc) nodes, `all` keeps
+	// both. Parsed BEFORE the fetch so the docs corpus can drive its
+	// own retrieval channel (below) rather than relying purely on a
+	// post-filter over the single code-shaped fetch.
+	corpus, corpusErr := parseCorpus(req)
+	if corpusErr != nil {
+		return mcp.NewToolResultError(corpusErr.Error()), nil
+	}
+
 	var nodes []*graph.Node
 	var primaryCount int
 	if len(expandedTerms) > 0 {
@@ -1313,6 +1337,20 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 		timings.BM25PrimaryMS += time.Since(bm25Start).Milliseconds()
 		primaryCount = len(nodes)
 	}
+
+	// Docs retrieval channel: when the corpus admits prose, the single
+	// code-shaped fetch above is not enough -- a relevant doc section
+	// can rank just past fetchLimit behind code symbols that share the
+	// query's tokens and never enter the candidate pool at all, so the
+	// corpus post-filter has nothing to keep. Issue a parallel,
+	// wider-limit fetch and merge in its KindDoc hits before the
+	// corpus filter runs, so prose competes on its own terms. The
+	// merge dedupes by node ID; ranking among the merged set is settled
+	// by the rerank pass downstream.
+	if corpus.includesDocs() {
+		nodes = s.mergeDocChannel(ctx, q, nodes, fetchLimit, scope, timings)
+	}
+
 	candsAfterGather := len(nodes)
 	mergedCount := len(nodes) // pre-filter; comparable to primaryCount
 
@@ -1321,8 +1359,6 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	if filterErr != nil {
 		return mcp.NewToolResultError(filterErr.Error()), nil
 	}
-	nodes = filterNodes(nodes, allowed)
-
 	// kind filter so callers can scope to a single new node kind
 	// (todo, license, team, module, …). Comma-separated list —
 	// case-insensitive — applied post-search so BM25 ranking is
@@ -1332,31 +1368,33 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	if kindArg == "" {
 		kindArg = fq.Kind
 	}
-	if kindArg != "" {
-		nodes = filterNodesByKind(nodes, kindArg)
-	}
-	// lang: / path: / repo: clauses from the field-qualified syntax.
-	nodes = applyFieldFilters(nodes, fq)
+	pathFilter := s.resolvePathFilter(req, fq)
 
-	// Sub-path scoping: anchored, slash-segment prefix narrowing
-	// below the repository grain. The filter set unions the `path`
-	// argument, the inline `path:` clause, and any `scope:`-named
-	// saved scope's Paths. Distinct from the loose `path:` substring
-	// match in applyFieldFilters -- this is a directory-boundary
-	// anchored prefix test.
-	if pathFilter := s.resolvePathFilter(req, fq); len(pathFilter) > 0 {
-		nodes = applyPathFilter(nodes, pathFilter)
+	// applyAllPostFilters runs the full post-search filter sequence
+	// (repo / kind / lang+path clauses / sub-path scope / corpus) over
+	// a candidate slice in the order the primary path uses it. Lifted
+	// into a closure so the zero-result decomposition fallback applies
+	// identical filtering to its re-fetched candidates — a fallback
+	// that skipped any of these would surface results the caller's
+	// scope was supposed to exclude.
+	applyAllPostFilters := func(cands []*graph.Node) []*graph.Node {
+		cands = filterNodes(cands, allowed)
+		if kindArg != "" {
+			cands = filterNodesByKind(cands, kindArg)
+		}
+		// lang: / path: / repo: clauses from the field-qualified syntax.
+		cands = applyFieldFilters(cands, fq)
+		// Sub-path scoping: anchored, slash-segment prefix narrowing
+		// below the repository grain. Distinct from the loose `path:`
+		// substring match in applyFieldFilters -- this is a
+		// directory-boundary anchored prefix test.
+		if len(pathFilter) > 0 {
+			cands = applyPathFilter(cands, pathFilter)
+		}
+		cands = filterNodesByCorpus(cands, corpus)
+		return cands
 	}
-
-	// Corpus selection: `code` (default) keeps only code symbols,
-	// `docs` keeps only prose-section (KindDoc) nodes, `all` keeps
-	// both. Runs after the path filter so a scoped docs query stays
-	// inside its sub-path.
-	corpus, corpusErr := parseCorpus(req)
-	if corpusErr != nil {
-		return mcp.NewToolResultError(corpusErr.Error()), nil
-	}
-	nodes = filterNodesByCorpus(nodes, corpus)
+	nodes = applyAllPostFilters(nodes)
 
 	// Fuzzy fallback: a field-qualified query that filtered down to
 	// nothing retries on the free text alone (still inside the
@@ -1368,6 +1406,27 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 		if len(relaxed) > 0 {
 			nodes = relaxed
 			filtersRelaxed = true
+		}
+	}
+
+	// Leaf-decomposition fallback: a compound / dotted / CamelCase
+	// query that found nothing — even after the field-clause relax
+	// above — is decomposed into its leaf symbol-name tokens
+	// ("UserService.FindUser" -> user / service / find) which are
+	// re-fetched through the same BM25 OR-merge path the expansion
+	// uses. Gated on the query carrying a separator so a prose miss
+	// (which has no leaves to split into) never pays the extra fetch.
+	// All post-filters are re-applied so the rescued candidates honour
+	// the caller's repo / kind / lang / path / corpus scope.
+	decomposed := false
+	if len(nodes) == 0 && queryHasDecomposableSeparator(q) {
+		if leaves := decomposeQueryToLeaves(q); len(leaves) > 0 {
+			rescued, _ := fetchAndMergeBM25Timed(s.engineFor(ctx), "", leaves, fetchLimit, scope, timings)
+			rescued = applyAllPostFilters(rescued)
+			if len(rescued) > 0 {
+				nodes = rescued
+				decomposed = true
+			}
 		}
 	}
 
@@ -1411,6 +1470,23 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	}
 	if rctx != nil {
 		rctx.QueryClass = queryClass
+		// Continuous α lever: when the class was auto-detected — not
+		// pinned by the caller and not a keyword-soup (which keeps its
+		// discrete split-disjunct treatment) — score the bm25↔semantic
+		// balance on a continuous query-shape axis instead of snapping
+		// to a discrete class bucket.
+		if !qcPinned && !isSoup {
+			rctx.Alpha = rerank.AlphaForContinuous(q)
+		}
+		// Prose-tuned reranking: a docs-only query scores prose-section
+		// nodes that have no call graph, signature, or definition
+		// keyword, so suppress the code-structural signals and lift the
+		// text + semantic channels. corpusAll still mixes code, so the
+		// prose profile engages only for the docs-only corpus where
+		// every candidate is a prose section.
+		if corpus == corpusDocs {
+			rctx.ProseMode = true
+		}
 	}
 	candsAfterFilter := len(nodes)
 	// Capture the post-filter candidate ID set so we can ask the rctx
@@ -1429,6 +1505,30 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	var rerankBreakdown []*rerank.Candidate
 	var rerankPrepare, rerankSignals time.Duration
 	nodes, rerankPrepare, rerankSignals = applyRerankBoostsTimed(s, nodes, q, rctx, &rerankBreakdown)
+
+	// Post-rerank exact-cosine refinement. The merged rerank above
+	// scores the semantic channel by RRF rank and discards the raw
+	// cosine the vector store computed; this stage recovers it by
+	// embedding the query once and re-ordering the ranked head against
+	// the candidates' stored vectors. Skipped for identifier-shape
+	// queries (the vector channel never ran) and strictly a no-op when
+	// the vector channel is otherwise inactive, so it can never regress
+	// a text-only search. rerankBreakdown is the candidate slice in the
+	// final rerank order; refining it and rebuilding nodes keeps the
+	// two aligned for the diversification pass below.
+	if !scope.SkipVectorChannel && s.searchConfig().CosineRerankEnabled() && len(rerankBreakdown) > 1 {
+		refined := s.engineFor(ctx).RefineByCosine(q, rerankBreakdown, 0)
+		rerankBreakdown = refined
+		refinedNodes := make([]*graph.Node, 0, len(refined))
+		for _, c := range refined {
+			if c != nil && c.Node != nil {
+				refinedNodes = append(refinedNodes, c.Node)
+			}
+		}
+		if len(refinedNodes) == len(nodes) {
+			nodes = refinedNodes
+		}
+	}
 
 	// Per-file diversification: keep one file's many symbols from
 	// monopolising the head of the result set. Runs after the rerank
@@ -1495,6 +1595,9 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	}
 	if filtersRelaxed {
 		resp["filters_relaxed"] = true
+	}
+	if decomposed {
+		resp["decomposed"] = true
 	}
 	// query_advice nudges the agent toward a cleaner query when the
 	// input was detected as keyword-soup. In "split" mode the search

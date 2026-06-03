@@ -50,6 +50,43 @@ func budgetForNodeCount(nodes int) int {
 	}
 }
 
+// smartContextSeedCount maps repo size (graph node count) to the default
+// number of symbols smart_context embeds when the caller does not name a
+// max_symbols. A tiny repo rarely has more than a handful of relevant
+// symbols, so a small seed keeps the pack lean; a large monorepo
+// benefits from a wider net before the agent has to follow up. Buckets
+// mirror budgetForNodeCount so the two scale together.
+func smartContextSeedCount(nodes int) int {
+	switch {
+	case nodes < 2_000:
+		return 4
+	case nodes < 40_000:
+		return 6
+	case nodes < 120_000:
+		return 8
+	default:
+		return 10
+	}
+}
+
+// manifestBudgetForNodeCount maps repo size (graph node count) to the
+// default graded-manifest token budget when the caller does not name a
+// token_budget. A small repo packs fewer relevant symbols, so a tighter
+// budget avoids padding the pack with marginal context; a large monorepo
+// has more genuinely relevant neighbours worth embedding. The mid bucket
+// holds the historical defaultManifestBudget so existing mid-size repos
+// see no change.
+func manifestBudgetForNodeCount(nodes int) int {
+	switch {
+	case nodes < 2_000:
+		return 4_000
+	case nodes < 120_000:
+		return defaultManifestBudget
+	default:
+		return 16_000
+	}
+}
+
 // toolBudgetSuffix returns the sentence appended to exploration tools'
 // descriptions — a project-size-scaled cap on exploration calls so the
 // model self-throttles. Computed once from the graph node count; empty

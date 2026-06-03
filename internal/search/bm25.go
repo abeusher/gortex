@@ -14,6 +14,43 @@ type BM25Backend struct {
 	inverted map[string][]posting // term -> postings list
 	totalLen int                  // sum of all doc lengths (for avgLen)
 	bigrams  *bigramIndex         // side index for typo-tolerant fallback recall
+	// ngrams is the optional learned sub-word boundary source consulted
+	// by the sparse-ngram emission stage. nil until SetNgramBoundaries
+	// wires one in; the stage degrades to fixed character n-grams while
+	// it is nil. Read under mu alongside the postings so Add and Search
+	// always see the same source — the symmetry the sparse-ngram gate
+	// depends on. The whole stage is a no-op unless GORTEX_SPARSE_NGRAM
+	// is set.
+	ngrams NgramBoundaries
+}
+
+// SetNgramBoundaries installs the learned sub-word boundary source the
+// sparse-ngram stage consults. Passing nil (or an empty source) reverts
+// the stage to fixed character n-grams. Safe to call while the backend
+// is live; it takes the write lock so an in-flight Search never sees a
+// half-swapped source. Callers that rebuild the table on every index
+// pass (mirroring auto-concept mining) re-install it here.
+//
+// NOTE: when the gate is on, changing the boundary source changes which
+// sub-word grams a token emits. To keep the index and query paths in
+// lockstep the source should be installed before the backend is
+// populated and then left stable for the backend's lifetime — exactly
+// how the per-repo table is built once per RunAnalysis pass and handed
+// to a freshly (re)built backend.
+func (b *BM25Backend) SetNgramBoundaries(src NgramBoundaries) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.ngrams = src
+}
+
+// boundarySource returns the currently installed sub-word boundary
+// source under the read lock, so the sparse-ngram stage on the index
+// and query paths reads a consistent value even if SetNgramBoundaries
+// races with an in-flight Add / Search.
+func (b *BM25Backend) boundarySource() NgramBoundaries {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.ngrams
 }
 
 type doc struct {
@@ -88,6 +125,13 @@ func (b *BM25Backend) Add(id string, fields ...string) {
 	// raw-against-raw stays consistent there.
 	ftsTokens := NormalizeFTSTokens(allTokens)
 
+	// Optional sub-word n-gram expansion. Search() runs the identical
+	// stage on the same normalized tokens with the same boundary source,
+	// so n-grammed postings are always probed with n-grammed query
+	// terms. A no-op unless GORTEX_SPARSE_NGRAM is set; the original
+	// word tokens are preserved, so an exact match still scores.
+	ftsTokens = ExpandSparseNgrams(ftsTokens, b.boundarySource())
+
 	termFreq := make(map[string]int)
 	for _, t := range ftsTokens {
 		termFreq[t]++
@@ -149,6 +193,11 @@ func (b *BM25Backend) removeLocked(id string) {
 
 func (b *BM25Backend) Search(query string, limit int) []SearchResult {
 	queryTokens := NormalizeFTSTokens(TokenizeQuery(query))
+	// Mirror the index path's sub-word n-gram expansion exactly — same
+	// stage, same normalized tokens, same boundary source — so a query
+	// probes the same n-grammed terms that Add wrote into the postings.
+	// A no-op unless GORTEX_SPARSE_NGRAM is set.
+	queryTokens = ExpandSparseNgrams(queryTokens, b.boundarySource())
 	if len(queryTokens) == 0 {
 		return nil
 	}

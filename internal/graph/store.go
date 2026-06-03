@@ -507,6 +507,14 @@ type VectorHit struct {
 //   - SimilarTo runs an ANN query: given a vector, return the k
 //     closest stored vectors ordered by ascending distance.
 //
+//   - GetEmbeddings reads back the stored vectors for an explicit
+//     set of node IDs in one batch. Unlike SimilarTo it does not
+//     score or rank — it hands the raw vectors to the caller so a
+//     post-rerank refinement stage can recompute exact cosine
+//     against the query embedding. IDs with no stored vector are
+//     simply absent from the returned map (never an error); an
+//     empty input yields an empty map.
+//
 //   - Close is implied by graph.Store.Close — no separate
 //     teardown method here.
 type VectorSearcher interface {
@@ -514,6 +522,7 @@ type VectorSearcher interface {
 	BulkUpsertEmbeddings(items []VectorItem) error
 	BuildVectorIndex(dims int) error
 	SimilarTo(vec []float32, limit int) ([]VectorHit, error)
+	GetEmbeddings(ids []string) map[string][]float32
 }
 
 // PageRankOpts tunes the PageRank computation. Zero values request
@@ -567,6 +576,24 @@ type PageRankHit struct {
 //   - Close is implied by graph.Store.Close.
 type PageRanker interface {
 	PageRank(opts PageRankOpts) ([]PageRankHit, error)
+}
+
+// BundleFingerprintSink is an optional capability a backend MAY
+// implement to accept an authoritative per-package content-fingerprint
+// map for its SearchSymbolBundles cache. The daemon calls
+// SetBundleFingerprints after every analysis pass with the fresh
+// fingerprints derived from the live graph; the backend retires any
+// cached bundle whose package fingerprint changed and serves the rest.
+// Backends without a bundle cache simply do not implement this — the
+// daemon's type assertion no-ops.
+//
+// fps is keyed by package key (the directory the package's files live
+// in, repo-prefixed in multi-repo because the stored node file paths
+// are). The fingerprints must be edge-aware — fold in the package's
+// nodes AND the edges touching them — so a cross-file edge change
+// invalidates the bundles whose in/out edges it altered.
+type BundleFingerprintSink interface {
+	SetBundleFingerprints(fps map[string]uint64)
 }
 
 // CommunityOpts tunes Louvain community detection over a projected

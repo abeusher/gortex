@@ -51,12 +51,12 @@ Returned tools are auto-promoted (`promote:false` opts out) and the server fires
 | Tool | Description |
 |------|-------------|
 | `graph_stats` | Node/edge counts by kind, language, per-repo stats, session token savings, and an `edge_identity_revisions` counter (edges re-keyed when their provenance changed) |
-| `search_symbols` | Find symbols by name (replaces Grep). Inline `kind:`/`lang:`/`path:` field clauses + `query_class` / `max_per_file` tuning; accepts `repo`, `project`, `ref`, `scope` params |
-| `search_text` | Trigram-accelerated literal code search across the repo — the alt grep backbone. Returns file/line/text rows |
+| `search_symbols` | Find symbols by name (replaces Grep). Inline `kind:`/`lang:`/`path:` field clauses + `query_class` / `max_per_file` tuning; accepts `repo`, `project`, `ref`, `scope` params. `corpus: code\|docs\|all` selects the corpus (`docs` has its own retrieval channel + prose-tuned ranking); `vocab_anchored: true` constrains LLM expansion to the repo's own vocabulary; a zero-result identifier query is auto-decomposed into leaf terms (`decomposed: true`) |
+| `search_text` | Trigram-accelerated literal (or `regexp: true`) code search across the repo — the alt grep backbone. Returns file/line/text rows, each carrying the enclosing symbol (`symbol_id` / `symbol_name`) |
 | `winnow_symbols` | Structured constraint-chain retrieval — `kind`, `language`, `community`, `path_prefix`, `min_fan_in`, `min_fan_out`, `min_churn`, `text_match` with per-axis score contributions |
 | `get_symbol` | Symbol location and signature (replaces Read). Accepts `repo`, `project`, `ref` params |
 | `get_file_summary` | All symbols and imports in a file. Accepts `repo`, `project`, `ref`, `max_bytes` / `max_tokens` budget caps |
-| `get_editing_context` | **Primary pre-edit tool** — symbols, signatures, callers, callees. Accepts `max_bytes` / `max_tokens` budget caps |
+| `get_editing_context` | **Primary pre-edit tool** — symbols, signatures, callers, callees. Accepts `max_bytes` / `max_tokens` budget caps; `compress_bodies` stubs bodies, and `fidelity_globs` (e.g. `internal/**:full,*_test.go:omit,vendor/**:compress`) sets a per-glob full/compress/omit tier |
 | `get_repo_outline` | Narrative single-call repo overview — top languages, communities, hotspots, most-imported files, entry points |
 | `plan_turn` | Opening-move router — returns ranked next calls with pre-filled args for a task description (~200 tokens) |
 
@@ -79,7 +79,8 @@ Returned tools are auto-promoted (`promote:false` opts out) and the server fires
 | Tool | Description |
 |------|-------------|
 | `find_declaration` | Use-site → declaration resolver. Accepts a literal substring or (with `regex: true`) a regex matching a use site like `fooBar(`; returns the declaration node plus the matching use locations. Trigram-prefiltered. Optional `path_prefix` / `kind` filters |
-| `walk_graph` | Token-budgeted free-form graph traversal — walks arbitrary `edge_kinds` (CSV) outward / inward / both from a starting symbol; auto-stops at `token_budget`. Surfaces `budget_hit` / `stopped_at_depth` on the response |
+| `walk_graph` | Token-budgeted free-form graph traversal — walks arbitrary `edge_kinds` (CSV) outward / inward / both from a starting symbol; auto-stops at `token_budget`. Surfaces `budget_hit` / `stopped_at_depth` on the response. `community` (ID or label) confines the walk to a detected community |
+| `context_closure` | Dependency-closure context selection — given a set of seed files / symbols, walks the transitive import / dependency closure and packs it under one `token_budget` (reusing the graded-manifest tiers), ranked by graph distance from the nearest seed or, with `rank: "proximity"`, by seeded random-walk proximity |
 | `graph_query` | Ad-hoc graph-query escape hatch — small read-only DSL with `nodes` / `traverse` / `filter` stages joined by `\|`, e.g. `nodes kind=interface name~Handler \| traverse implements in \| filter path=internal/mcp/`. Bounded by `limit` and a five-stage cap |
 | `nav` | Per-session symbol cursor — verb-dispatched via `action`: `goto` / `into` (a callee) / `up` (a caller) / `sibling` / `back` / `where` / `read`. Adjacency preview rides on every response; the cursor lives in session state and resets on disconnect |
 
@@ -147,7 +148,7 @@ Four additional push channels modeled on `subscribe_diagnostics` — per-session
 
 | Tool | Description |
 |------|-------------|
-| `smart_context` | Task-aware minimal context — replaces 5-10 exploration calls. `fidelity: "graded"` returns a graph-distance-tiered `context_manifest` under one `token_budget`; `estimate: true` projects token cost without fetching; `if_none_match` dedups an unchanged pack to `not_modified` |
+| `smart_context` | Task-aware minimal context — replaces 5-10 exploration calls. The working set is ranked through the full rerank pipeline. Always emits a `blast_radius` block (callers grouped by file + covering tests + a `no covering tests found` warning) and a file-clustered `working_set`; seed count and `token_budget` scale with graph size when unset. `fidelity: "graded"` returns a graph-distance-tiered `context_manifest` (large interchangeable symbol families are skeletonized to one representative) under one `token_budget`; `estimate: true` projects token cost without fetching; `if_none_match` dedups an unchanged pack to `not_modified` |
 | `get_edit_plan` | Dependency-ordered edit sequence for multi-file refactors |
 | `get_test_targets` | Maps changed symbols to test files and run commands |
 | `get_untested_symbols` | Inverse of `get_test_targets` — functions/methods not reached from any test file, ranked by fan-in |

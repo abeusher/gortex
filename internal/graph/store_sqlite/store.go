@@ -56,6 +56,14 @@ type Store struct {
 
 	edgeIdentityRevs atomic.Int64
 
+	// bundles is the content-addressed package-scoped cache over
+	// SearchSymbolBundles: a query serves cached Node + in/out edges for
+	// packages whose content fingerprint is unchanged and skips the node
+	// + edge fan-out for them. nil until SetBundleFingerprints is first
+	// called (the daemon wires it from the analysis pass); a nil cache
+	// makes SearchSymbolBundles fall through to the uncached path.
+	bundles *bundleCache
+
 	// Prepared statements (compiled once in Open, closed in Close).
 	stmtInsertNode         *sql.Stmt
 	stmtGetNode            *sql.Stmt
@@ -142,6 +150,15 @@ func Open(path string) (*Store, error) {
 	}
 
 	s := &Store{db: db}
+	// Initialise the bundle cache at construction so its pointer is
+	// never written after Open — concurrent SearchSymbolBundles reads
+	// and SetBundleFingerprints writes then race only on the cache's
+	// own mutex-guarded maps, not on the Store field. The cache stays
+	// inert (every lookup a miss) until the daemon supplies fingerprints.
+	s.bundles = &bundleCache{
+		fingerprints: map[string]uint64{},
+		entries:      map[string]*bundleCacheEntry{},
+	}
 	if err := s.prepare(); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("sqlite prepare: %w", err)

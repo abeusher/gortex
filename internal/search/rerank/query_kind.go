@@ -254,9 +254,101 @@ func looksLikePath(q string) bool {
 }
 
 // AlphaFor returns the recommended α blend value for the query. It
-// classifies the query, then defers to AlphaForClass.
+// scores the query shape on a continuous identifier↔natural-language
+// axis (see AlphaForContinuous) rather than snapping to a discrete
+// class bucket, so a half-identifier query like "validateToken
+// handler" lands between AlphaSymbol and AlphaNL instead of jumping a
+// whole tier. The discrete AlphaForClass remains for callers that
+// have already classified.
 func AlphaFor(query string) float64 {
-	return AlphaForClass(ClassifyQuery(query))
+	return AlphaForContinuous(query)
+}
+
+// queryStopwords are the relationship / question words that mark a
+// query as natural-language intent rather than an identifier list.
+// Deliberately excludes code-ish verbs (get/set/find/parse) which are
+// real symbol-name fragments. Kept local to rerank so the package
+// stays free of an internal/search import cycle.
+var queryStopwords = map[string]struct{}{
+	"how": {}, "does": {}, "do": {}, "the": {}, "a": {}, "an": {}, "of": {},
+	"to": {}, "is": {}, "are": {}, "in": {}, "on": {}, "for": {}, "and": {},
+	"or": {}, "with": {}, "where": {}, "what": {}, "when": {}, "why": {},
+	"which": {}, "this": {}, "that": {}, "from": {}, "by": {}, "as": {},
+	"about": {}, "into": {}, "via": {},
+}
+
+// AlphaForContinuous returns a continuous α blend in [AlphaPath,
+// AlphaNL] derived from the query's shape rather than a discrete
+// class. Hard structural shapes (signature, path, keyword-soup) still
+// pin to their class α — they are unambiguous and the discrete value
+// is already correct, and keyword-soup carries non-α side effects
+// (LLM suppression, per-disjunct fetch) that must stay class-based.
+// Everything else interpolates between AlphaSymbol (a single
+// identifier-shaped token) and AlphaNL (multi-word prose) by how
+// identifier-like the query reads.
+//
+// The extreme points match the discrete table — AlphaForContinuous of
+// a bare CamelCase token equals AlphaSymbol and of a prose phrase
+// equals AlphaNL — so it is a strict refinement, not a re-tuning.
+func AlphaForContinuous(query string) float64 {
+	q := strings.TrimSpace(query)
+	if q == "" {
+		return AlphaNL
+	}
+	if soup, _ := LooksLikeKeywordSoup(q); soup {
+		return AlphaForClass(QueryClassKeywordSoup)
+	}
+	if looksLikeSignature(q) {
+		return AlphaSignature
+	}
+	if looksLikePath(q) {
+		return AlphaPath
+	}
+	// score in [0,1]: 1 == fully identifier-shaped, 0 == prose.
+	score := identifierScore(q)
+	// AlphaSymbol < AlphaNL, so a higher identifier score pulls α down
+	// toward the BM25-leaning end.
+	return AlphaNL + score*(AlphaSymbol-AlphaNL)
+}
+
+// identifierScore rates how identifier-like a (non-path, non-signature)
+// query is, in [0,1]. A single CamelCase/snake/dotted token scores 1;
+// a single plain word or any stopword-heavy phrase scores 0; a mixed
+// multi-word query interpolates by the fraction of identifier-shaped
+// tokens, discounted by stopword density and a gentle length penalty
+// (longer queries read more like prose).
+func identifierScore(q string) float64 {
+	tokens := strings.Fields(q)
+	n := len(tokens)
+	if n == 0 {
+		return 0
+	}
+	if n == 1 {
+		if IsSymbolQuery(tokens[0]) {
+			return 1.0
+		}
+		return 0
+	}
+	idCount, stopCount := 0, 0
+	for _, t := range tokens {
+		if IsSymbolQuery(t) {
+			idCount++
+		}
+		if _, ok := queryStopwords[strings.ToLower(t)]; ok {
+			stopCount++
+		}
+	}
+	idFrac := float64(idCount) / float64(n)
+	stopFrac := float64(stopCount) / float64(n)
+	lengthPenalty := 0.12 * float64(n-2)
+	score := idFrac - stopFrac - lengthPenalty
+	if score < 0 {
+		return 0
+	}
+	if score > 1 {
+		return 1
+	}
+	return score
 }
 
 // AlphaForClass returns the α blend for a known class. The α-fusion
@@ -317,6 +409,76 @@ func ClassWeightMultiplier(c QueryClass, signal string) float64 {
 		return cw.bm25
 	case SignalSemantic:
 		return cw.semantic
+	default:
+		return 1.0
+	}
+}
+
+// proseWeightTable is the per-signal multiplier applied on top of the
+// class / α weighting when Context.ProseMode is set — a documentation
+// (prose-section) query. It mirrors the shape of classWeightTable /
+// ClassWeightMultiplier but lives on its own lever, independent of
+// Alpha, so a docs query gets BOTH its query-shape blend and this
+// prose profile.
+//
+// The profile lifts the two signals that actually discriminate prose
+// (bm25 and semantic — a prose section has body text and an embedding,
+// little else) and zeroes the code-structural signals that are
+// meaningless for a KindDoc node: api_signature and type_signature
+// (a prose section has no signature) and definition_bias (no
+// definition keyword to match). A signal absent from the table keeps
+// its weight unchanged (multiplier 1.0), so the structural / session
+// signals that still make sense for prose (recency, feedback,
+// file_coherence) are untouched.
+var proseWeightTable = map[string]float64{
+	SignalBM25:           1.25,
+	SignalSemantic:       1.30,
+	SignalAPISignature:   0.0,
+	SignalTypeSignature:  0.0,
+	SignalDefinitionBias: 0.0,
+}
+
+// proseWeightMultiplier returns the prose-profile multiplier for a
+// signal. Signals not in proseWeightTable return 1.0 (unchanged).
+// Applied by Pipeline.Rerank only when Context.ProseMode is set, and
+// composed multiplicatively with the class / α multiplier so the two
+// levers stay independent.
+func proseWeightMultiplier(signal string) float64 {
+	if m, ok := proseWeightTable[signal]; ok {
+		return m
+	}
+	return 1.0
+}
+
+// continuousClassMultiplier is the continuous analogue of
+// ClassWeightMultiplier: it maps a continuous α (as produced by
+// AlphaForContinuous) onto the bm25 / semantic weight multipliers,
+// interpolating smoothly between the natural-language anchor
+// (α=AlphaNL → 1.0/1.0, the neutral baseline) and the most
+// BM25-leaning anchor (α=AlphaPath → the path class's 1.25/0.45).
+// The endpoints reproduce the discrete classWeightTable exactly, so a
+// query that snaps to a class scores as it always did and only the
+// in-between queries see the interpolation. Pipeline.Rerank uses this
+// in place of ClassWeightMultiplier when Context.Alpha is set.
+func continuousClassMultiplier(alpha float64, signal string) float64 {
+	a := alpha
+	if a < AlphaPath {
+		a = AlphaPath
+	}
+	if a > AlphaNL {
+		a = AlphaNL
+	}
+	// frac: 0 at the NL anchor, 1 at the most BM25-leaning anchor.
+	frac := (AlphaNL - a) / (AlphaNL - AlphaPath)
+	// The BM25-leaning anchor's multipliers come from the path class,
+	// the most exact-token-reliant of the discrete buckets.
+	maxBM25 := classWeightTable[QueryClassPath].bm25
+	minSem := classWeightTable[QueryClassPath].semantic
+	switch signal {
+	case SignalBM25:
+		return 1.0 + frac*(maxBM25-1.0)
+	case SignalSemantic:
+		return 1.0 - frac*(1.0-minSem)
 	default:
 		return 1.0
 	}

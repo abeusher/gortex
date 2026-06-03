@@ -39,6 +39,12 @@ func TestBM25_BigramCandidates_ExplicitAPI(t *testing.T) {
 	// Feature is opt-in via GORTEX_BIGRAM_TYPOS — default-off backends
 	// allocate no bigram index and return nil from BigramCandidates.
 	t.Setenv("GORTEX_BIGRAM_TYPOS", "1")
+	// This test asserts the strict-Search contract: a clean BM25 miss
+	// returns empty. The sub-word n-gram gate deliberately relaxes that
+	// (a typo shares sub-word grams with the symbol), so pin it off here
+	// regardless of any ambient GORTEX_SPARSE_NGRAM — the same hermetic
+	// pattern withStemming uses for the FTS gate.
+	withSparseNgram(t, false)
 
 	b := NewBM25()
 	defer b.Close()

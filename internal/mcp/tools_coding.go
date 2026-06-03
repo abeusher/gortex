@@ -14,6 +14,7 @@ import (
 	"github.com/zzet/gortex/internal/elide"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/query"
+	"github.com/zzet/gortex/internal/search/rerank"
 	"github.com/zzet/gortex/internal/tokens"
 )
 
@@ -29,6 +30,7 @@ func (s *Server) registerCodingTools() {
 			mcp.WithString("if_none_match", mcp.Description("ETag from a previous response — returns not_modified if content unchanged")),
 			mcp.WithBoolean("compress_bodies", mcp.Description("Also return a source_compressed view of the whole file with every function/method body replaced by a `{ /* N lines elided */ }` stub. Signatures, imports, types, and comments are preserved verbatim. Roughly 60-70% fewer tokens than raw source. Composable with format:\"gcx\". Default: false.")),
 			mcp.WithString("keep", mcp.Description("Comma-separated symbol names, IDs, or node kinds (function / method / type) whose bodies stay verbatim when compress_bodies is set — every other body in the file is still stubbed. Use to keep the symbols you are about to edit at full source while compressing the rest. Ignored unless compress_bodies is true.")),
+			mcp.WithString("fidelity_globs", mcp.Description(fidelityGlobsParamDescription)),
 		),
 		s.handleGetEditingContext,
 	)
@@ -124,6 +126,7 @@ func (s *Server) registerCodingTools() {
 			mcp.WithString("path", mcp.Required(), mcp.Description("Absolute path, or repo-prefixed / repo-root-relative path")),
 			mcp.WithBoolean("compress_bodies", mcp.Description("Replace function/method bodies with elided stubs (default: false)")),
 			mcp.WithString("keep", mcp.Description("Comma-separated symbol names, IDs, or node kinds whose bodies stay verbatim when compress_bodies is set — every other body in the file is still stubbed. Ignored unless compress_bodies is true.")),
+			mcp.WithString("fidelity_globs", mcp.Description(fidelityGlobsParamDescription)),
 			mcp.WithNumber("max_lines", mcp.Description("When the file exceeds this many lines, collapse runs of leaf statements inside function bodies into `… N lines elided …` markers while keeping declarations and the control-flow skeleton. Falls back to a plain head cut for non-code files. Omit or 0 to disable.")),
 			mcp.WithNumber("max_bytes", mcp.Description("Cap the marshaled response at this many bytes; truncation flag rides on the response. Omit for no cap.")),
 			mcp.WithString("if_none_match", mcp.Description("ETag from a previous response — returns not_modified if content unchanged")),
@@ -505,7 +508,8 @@ func (s *Server) handleGetEditingContext(ctx context.Context, req mcp.CallToolRe
 				keepNodes := s.editingContextSymbolNodes(fp, out.Defines)
 				keepPred, resolved := resolveKeepPredicate(req.GetString("keep", ""), keepNodes)
 				keptSymbols = resolved
-				if compressed, cerr := elide.CompressWith(fileBytes, language, elide.Options{Keep: keepPred}); cerr == nil {
+				decide := fidelityDecideForPath(parseFidelityGlobs(req.GetString("fidelity_globs", "")), fp)
+				if compressed, cerr := elide.CompressWith(fileBytes, language, elide.Options{Keep: keepPred, Decide: decide}); cerr == nil {
 					sourceCompressed = string(compressed)
 				}
 			}
@@ -1101,6 +1105,73 @@ func isTestFile(path string) bool {
 	return strings.Contains(path, "__tests__/") || strings.Contains(path, "/test/")
 }
 
+// partitionProductionFirst returns a stable partition of nodes with
+// every production-code symbol ahead of every test symbol, preserving
+// the relative order within each group. Used to bias the limited
+// smart_context source-embed slots toward implementation over the
+// tests that exercise it without disturbing the upstream rerank order.
+func partitionProductionFirst(nodes []*graph.Node) []*graph.Node {
+	if len(nodes) < 2 {
+		return nodes
+	}
+	prod := make([]*graph.Node, 0, len(nodes))
+	tests := make([]*graph.Node, 0)
+	for _, n := range nodes {
+		if n != nil && isTestFile(n.FilePath) {
+			tests = append(tests, n)
+			continue
+		}
+		prod = append(prod, n)
+	}
+	if len(tests) == 0 {
+		return nodes
+	}
+	return append(prod, tests...)
+}
+
+// buildWorkingSetClusters groups a smart_context working set by source
+// file, production files first, returning one entry per file as
+// {file, symbols:[ids], is_test}. Symbol IDs within a file and the file
+// groups themselves are sorted so the block is byte-stable and feeds a
+// deterministic pack root.
+func buildWorkingSetClusters(nodes []*graph.Node) []map[string]any {
+	if len(nodes) == 0 {
+		return nil
+	}
+	byFile := make(map[string][]string)
+	isTest := make(map[string]bool)
+	for _, n := range nodes {
+		if n == nil {
+			continue
+		}
+		byFile[n.FilePath] = append(byFile[n.FilePath], n.ID)
+		isTest[n.FilePath] = isTestFile(n.FilePath)
+	}
+	prodFiles := make([]string, 0, len(byFile))
+	testFiles := make([]string, 0)
+	for f := range byFile {
+		if isTest[f] {
+			testFiles = append(testFiles, f)
+			continue
+		}
+		prodFiles = append(prodFiles, f)
+	}
+	sort.Strings(prodFiles)
+	sort.Strings(testFiles)
+	ordered := append(prodFiles, testFiles...)
+	clusters := make([]map[string]any, 0, len(ordered))
+	for _, f := range ordered {
+		ids := byFile[f]
+		sort.Strings(ids)
+		clusters = append(clusters, map[string]any{
+			"file":    f,
+			"symbols": ids,
+			"is_test": isTest[f],
+		})
+	}
+	return clusters
+}
+
 func (s *Server) handleGetTestTargets(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	idsStr, err := req.RequireString("ids")
 	if err != nil {
@@ -1585,8 +1656,31 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 	}
 
 	entryPoint := req.GetString("entry_point", "")
+	// Seed count defaults adaptively to repo size — req.GetInt can't
+	// tell an absent argument from an explicit value, so detect
+	// presence on the raw arguments map and only scale when the caller
+	// left it out.
 	maxSymbols := req.GetInt("max_symbols", 5)
+	if _, present := req.GetArguments()["max_symbols"]; !present {
+		nodes := 0
+		if s.graph != nil {
+			nodes = s.graph.NodeCount()
+		}
+		maxSymbols = smartContextSeedCount(nodes)
+	}
 	graded := req.GetString("fidelity", "") == "graded"
+
+	// Token budget for the graded manifest defaults adaptively to repo
+	// size — same absent-vs-explicit detection as max_symbols, since
+	// req.GetInt can't distinguish them.
+	tokenBudget := req.GetInt("token_budget", defaultManifestBudget)
+	if _, present := req.GetArguments()["token_budget"]; !present {
+		nodes := 0
+		if s.graph != nil {
+			nodes = s.graph.NodeCount()
+		}
+		tokenBudget = manifestBudgetForNodeCount(nodes)
+	}
 
 	result := map[string]any{
 		"task": task,
@@ -1655,26 +1749,11 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 		relevantSymbols = applyPathFilter(relevantSymbols, pathFilter)
 	}
 
-	// 3c. Feedback-aware reranking (when feedback data exists).
-	if s.feedback != nil && s.feedback.HasData() && len(relevantSymbols) > 0 {
-		type scored struct {
-			node  *graph.Node
-			score float64
-		}
-		scoredSyms := make([]scored, len(relevantSymbols))
-		for i, sym := range relevantSymbols {
-			baseScore := 1.0 / float64(i+1) // BM25 rank-based score
-			fbScore := s.feedback.GetSymbolScore(sym.ID)
-			scoredSyms[i] = scored{node: sym, score: baseScore + fbScore*0.3}
-		}
-		sort.Slice(scoredSyms, func(i, j int) bool {
-			return scoredSyms[i].score > scoredSyms[j].score
-		})
-		for i, ss := range scoredSyms {
-			relevantSymbols[i] = ss.node
-		}
-
-		// Inject frequently-missed symbols that match task keywords.
+	// 3c. Fold frequently-missed symbols (that match task keywords)
+	// into the working set before ranking, so feedback can pull a
+	// previously-dropped result back into the embedded slots — not
+	// just append it at the tail.
+	if s.feedback != nil && s.feedback.HasData() {
 		missed := s.feedback.MissedSymbols(3)
 		injected := 0
 		for _, missedID := range missed {
@@ -1688,7 +1767,6 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 			if missedNode == nil {
 				continue
 			}
-			// Check if the missed symbol name matches any keyword.
 			nameLower := strings.ToLower(missedNode.Name)
 			for _, kw := range keywords {
 				if strings.Contains(nameLower, strings.ToLower(kw)) {
@@ -1699,6 +1777,70 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 				}
 			}
 		}
+	}
+
+	// 3d. Rank the deduped working set through the full rerank
+	// pipeline — the same churn / HITS / community / co-change /
+	// frecency / feedback / path-penalty / source-bias / provenance
+	// scoring that powers search_symbols and winnow. The keyword-merge
+	// order seeds TextRank so BM25 provenance survives into the rerank.
+	// The pipeline is nil in the test harness (Rerank disabled); fall
+	// back to the legacy feedback-aware local sort there so ordering
+	// stays sensible without a pipeline.
+	if len(relevantSymbols) > 0 {
+		pipeline := s.engineFor(ctx).Rerank()
+		if pipeline != nil {
+			cands := make([]*rerank.Candidate, len(relevantSymbols))
+			idxByID := make(map[string]int, len(relevantSymbols))
+			for i, sym := range relevantSymbols {
+				cands[i] = &rerank.Candidate{Node: sym, TextRank: i, VectorRank: -1}
+				idxByID[sym.ID] = i
+			}
+			rctx := s.buildRerankContext(ctx, task)
+			pipeline.Rerank(task, cands, rctx)
+			ordered := make([]*graph.Node, 0, len(cands))
+			for _, cand := range cands {
+				ordered = append(ordered, relevantSymbols[idxByID[cand.Node.ID]])
+			}
+			relevantSymbols = ordered
+		} else if s.feedback != nil && s.feedback.HasData() {
+			type scored struct {
+				node  *graph.Node
+				score float64
+			}
+			scoredSyms := make([]scored, len(relevantSymbols))
+			for i, sym := range relevantSymbols {
+				baseScore := 1.0 / float64(i+1) // BM25 rank-based score
+				fbScore := s.feedback.GetSymbolScore(sym.ID)
+				scoredSyms[i] = scored{node: sym, score: baseScore + fbScore*0.3}
+			}
+			sort.SliceStable(scoredSyms, func(i, j int) bool {
+				return scoredSyms[i].score > scoredSyms[j].score
+			})
+			for i, ss := range scoredSyms {
+				relevantSymbols[i] = ss.node
+			}
+		}
+	}
+
+	// 3d-bias. Bias production code ahead of tests. A stable partition
+	// keeps the rerank order within each group but pulls every
+	// non-test symbol in front of every test symbol, so the limited
+	// full-source embed slots and the head of files_to_edit favour the
+	// implementation over the test that exercises it.
+	relevantSymbols = partitionProductionFirst(relevantSymbols)
+
+	// 3e. Re-pin the resolved entry point at the head: a caller that
+	// named an entry_point wants it first regardless of rerank order.
+	if entryNode != nil && len(relevantSymbols) > 0 && relevantSymbols[0].ID != entryNode.ID {
+		reordered := make([]*graph.Node, 0, len(relevantSymbols))
+		reordered = append(reordered, entryNode)
+		for _, sym := range relevantSymbols {
+			if sym.ID != entryNode.ID {
+				reordered = append(reordered, sym)
+			}
+		}
+		relevantSymbols = reordered
 	}
 
 	// 4. Limit to top N most relevant symbols. In graded-fidelity mode
@@ -1717,7 +1859,7 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 		estResult := map[string]any{
 			"task": task,
 			"estimate": s.buildSmartContextEstimate(
-				ctx, graded, req.GetInt("token_budget", defaultManifestBudget),
+				ctx, graded, tokenBudget,
 				relevantSymbols, outlineCandidates),
 		}
 		if s.isGCX(ctx, req) {
@@ -1770,7 +1912,7 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 	// under one token budget.
 	if graded {
 		result["context_manifest"] = s.buildContextManifest(
-			ctx, relevantSymbols, outlineCandidates, req.GetInt("token_budget", defaultManifestBudget))
+			ctx, relevantSymbols, outlineCandidates, tokenBudget)
 	}
 
 	// 5b. Include cross-repo dependencies when in multi-repo mode.
@@ -1883,6 +2025,24 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 	}
 	result["files_to_edit"] = filesToEdit
 
+	// 8b. Clustered working set — the same symbols grouped by their
+	// source file (production files first), so an agent sees which
+	// files carry the relevant symbols and which are tests without
+	// re-deriving it from the flat files_to_edit list. files_to_edit
+	// is kept for back-compat.
+	if ws := buildWorkingSetClusters(relevantSymbols); len(ws) > 0 {
+		result["working_set"] = ws
+	}
+
+	// 9. Fused blast radius — computed for every call, not just when an
+	// entry point is named. Groups the working set's callers by their
+	// source file and lists the tests that cover the working set via
+	// the exact EdgeTests inverse walk, so an agent sees what its edit
+	// can break and what guards it before it touches a line.
+	if br := s.buildBlastRadius(ctx, relevantSymbols); br != nil {
+		result["blast_radius"] = br
+	}
+
 	// Pack-root dedup: hash the assembled context pack. When the
 	// caller passes back the pack root it already holds and nothing
 	// the pack covers has changed, return not_modified instead of
@@ -1900,6 +2060,103 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 		return returnTOON(result)
 	}
 	return s.respondJSONOrTOON(ctx, req, result)
+}
+
+// buildBlastRadius assembles the always-on blast-radius block for a
+// smart_context working set: callers grouped by their source file and
+// the tests that cover the set. Callers come from a one-hop GetCallers
+// walk; covering tests come from the exact EdgeTests inverse walk
+// (Engine.GetTesters) — the same edge get_test_targets trusts — not the
+// path-name heuristic. Every list is sorted so the block is byte-stable
+// and feeds a deterministic pack root. Returns nil when there is no
+// graph/engine to walk.
+func (s *Server) buildBlastRadius(ctx context.Context, workingSet []*graph.Node) map[string]any {
+	eng := s.engineFor(ctx)
+	if eng == nil || s.graph == nil || len(workingSet) == 0 {
+		return nil
+	}
+
+	// Callers grouped by the file each caller lives in.
+	callersByFile := make(map[string]map[string]bool)
+	for _, sym := range workingSet {
+		if sym == nil {
+			continue
+		}
+		callers := eng.GetCallers(sym.ID, query.QueryOptions{Depth: 1, Limit: ringScanLimit, Detail: "brief"})
+		for _, cn := range callers.Nodes {
+			if cn.ID == sym.ID || cn.Kind == graph.KindFile {
+				continue
+			}
+			set, ok := callersByFile[cn.FilePath]
+			if !ok {
+				set = make(map[string]bool)
+				callersByFile[cn.FilePath] = set
+			}
+			set[cn.ID] = true
+		}
+	}
+	callerFiles := make([]string, 0, len(callersByFile))
+	for f := range callersByFile {
+		callerFiles = append(callerFiles, f)
+	}
+	sort.Strings(callerFiles)
+	callerGroups := make([]map[string]any, 0, len(callerFiles))
+	for _, f := range callerFiles {
+		ids := make([]string, 0, len(callersByFile[f]))
+		for id := range callersByFile[f] {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		callerGroups = append(callerGroups, map[string]any{
+			"file":    f,
+			"callers": ids,
+		})
+	}
+
+	// Covering tests via the exact EdgeTests inverse walk.
+	type testRef struct{ file, function string }
+	testSeen := make(map[string]bool)
+	var tests []testRef
+	anyTesters := false
+	for _, sym := range workingSet {
+		if sym == nil {
+			continue
+		}
+		for _, tn := range eng.GetTesters(sym.ID) {
+			if tn == nil {
+				continue
+			}
+			anyTesters = true
+			key := tn.FilePath + "\x1f" + tn.Name
+			if testSeen[key] {
+				continue
+			}
+			testSeen[key] = true
+			tests = append(tests, testRef{file: tn.FilePath, function: tn.Name})
+		}
+	}
+	sort.Slice(tests, func(i, j int) bool {
+		if tests[i].file != tests[j].file {
+			return tests[i].file < tests[j].file
+		}
+		return tests[i].function < tests[j].function
+	})
+	coveringTests := make([]map[string]any, 0, len(tests))
+	for _, tr := range tests {
+		coveringTests = append(coveringTests, map[string]any{
+			"file":     tr.file,
+			"function": tr.function,
+		})
+	}
+
+	br := map[string]any{
+		"callers_by_file": callerGroups,
+		"covering_tests":  coveringTests,
+	}
+	if !anyTesters {
+		br["warning"] = "no covering tests found"
+	}
+	return br
 }
 
 // extractKeywords splits a task description into searchable keywords.

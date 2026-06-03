@@ -152,6 +152,66 @@ func computePackRoot(result map[string]any) string {
 		}
 		h.Write([]byte{1})
 	}
+
+	// The blast-radius block is part of the pack's identity: when the
+	// working set's callers or covering tests change, the pack root
+	// must change so if_none_match returns the fresh block instead of a
+	// stale not_modified. The block is already built from sorted
+	// lists, so hashing it in order is deterministic.
+	if br, ok := result["blast_radius"].(map[string]any); ok {
+		if groups, ok := br["callers_by_file"].([]map[string]any); ok {
+			for _, g := range groups {
+				file, _ := g["file"].(string)
+				h.Write([]byte(file))
+				h.Write([]byte{0})
+				if ids, ok := g["callers"].([]string); ok {
+					for _, id := range ids {
+						h.Write([]byte(id))
+						h.Write([]byte{0})
+					}
+				}
+				h.Write([]byte{2})
+			}
+		}
+		h.Write([]byte{1})
+		if tests, ok := br["covering_tests"].([]map[string]any); ok {
+			for _, tr := range tests {
+				file, _ := tr["file"].(string)
+				fn, _ := tr["function"].(string)
+				h.Write([]byte(file))
+				h.Write([]byte{0})
+				h.Write([]byte(fn))
+				h.Write([]byte{0})
+			}
+		}
+		h.Write([]byte{1})
+		if warning, ok := br["warning"].(string); ok {
+			h.Write([]byte(warning))
+		}
+		h.Write([]byte{1})
+	}
+
+	// The clustered working set carries the per-file grouping and the
+	// is_test flag — both part of the pack's identity, both already
+	// sorted, so hashing them in order keeps the root deterministic.
+	if ws, ok := result["working_set"].([]map[string]any); ok {
+		for _, c := range ws {
+			file, _ := c["file"].(string)
+			h.Write([]byte(file))
+			h.Write([]byte{0})
+			if isTest, ok := c["is_test"].(bool); ok && isTest {
+				h.Write([]byte{'t'})
+			}
+			if ids, ok := c["symbols"].([]string); ok {
+				for _, id := range ids {
+					h.Write([]byte(id))
+					h.Write([]byte{0})
+				}
+			}
+			h.Write([]byte{2})
+		}
+		h.Write([]byte{1})
+	}
 	sum := h.Sum(nil)
 	return hex.EncodeToString(sum[:8])
 }

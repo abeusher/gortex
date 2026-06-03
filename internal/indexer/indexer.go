@@ -3260,6 +3260,15 @@ func (idx *Indexer) buildSearchIndex() {
 		nodes = idx.graph.AllNodes()
 	}
 
+	// Install the learned sub-word boundary table on the BM25 layer
+	// before populating postings, so the optional sparse-ngram
+	// tokenizer's split points are data-driven and — crucially —
+	// identical on the index path here and the query path later. The
+	// table must be in place before the first Add for postings and
+	// queries to agree; it is a no-op for non-BM25 backends and a no-op
+	// for search overall unless GORTEX_SPARSE_NGRAM is set.
+	search.InstallNgramBoundaries(idx.search, search.BuildNgramBoundaries(idx.graph))
+
 	// Build text index. The SkipSearch filter (wired through
 	// idx.shouldIndexForSearch) drops config-key-style variable nodes
 	// that would only pad the index — see docs on IndexConfig.SkipSearch.

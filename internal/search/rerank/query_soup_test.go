@@ -20,6 +20,12 @@ func TestLooksLikeKeywordSoup(t *testing.T) {
 		{"three quoted fragments", "'no access' 'rate limit' 'denied here'", true},
 		{"long keyword list with operator", "parse marshal serialize encode decode unmarshal deserialize OR transform", true},
 
+		// --- Operator-free keyword lists: should be flagged. ---
+		{"bare space keyword bag", "parse decode unmarshal token jwt cache", true},
+		{"bare space keyword bag long", "parse decode encode marshal unmarshal serialize deserialize", true},
+		{"comma separated terms", "parse, decode, unmarshal, token", true},
+		{"comma separated multiword terms", "rate limit, auth token, session cache, retry backoff", true},
+
 		// --- Not soup: legitimate queries. ---
 		{"plain symbol", "validateToken", false},
 		{"natural language", "how do we validate the auth token", false},
@@ -31,6 +37,14 @@ func TestLooksLikeKeywordSoup(t *testing.T) {
 		{"signature query", "func(ctx) error", false},
 		{"empty", "", false},
 		{"one operator only", "auth OR login", false},
+		// Operator-free NL queries that MUST stay concept: the
+		// stop-word spine and the short token count keep them out of
+		// the operator-free list bucket.
+		{"long NL no operator", "how does the session token cache get flushed", false},
+		{"NL six content words", "validate the user auth token cache", false},
+		{"prose with one comma aside", "the cache, which holds the value, is flushed", false},
+		{"short keyword pair", "parse decode", false},
+		{"five keyword bag below threshold", "parse decode unmarshal token jwt", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -83,6 +97,21 @@ func TestSplitSoupFragments(t *testing.T) {
 			name:  "dedup case insensitive",
 			query: "Auth OR auth OR AUTH",
 			want:  []string{"Auth"},
+		},
+		{
+			name:  "comma separated terms",
+			query: "parse, decode, unmarshal, token",
+			want:  []string{"parse", "decode", "unmarshal", "token"},
+		},
+		{
+			name:  "comma separated multiword terms",
+			query: "rate limit, auth token, session cache",
+			want:  []string{"rate limit", "auth token", "session cache"},
+		},
+		{
+			name:  "operator-free bag splits per token",
+			query: "parse decode unmarshal token jwt cache",
+			want:  []string{"parse", "decode", "unmarshal", "token", "jwt", "cache"},
 		},
 		{
 			name:  "empty",

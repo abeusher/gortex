@@ -26,6 +26,30 @@ type Context struct {
 	// search_symbols query_class argument — may pin it instead.
 	QueryClass QueryClass
 
+	// Alpha, when > 0, switches the bm25/semantic weight scaling from
+	// the discrete per-class classWeightTable to the continuous
+	// interpolation continuousClassMultiplier(Alpha, …). Callers set
+	// it to AlphaForContinuous(query) so a half-identifier query gets
+	// an in-between blend instead of a hard class bucket. The zero
+	// value preserves the legacy discrete behaviour, so any caller
+	// that does not opt in (and every direct-Rerank test) is
+	// unaffected.
+	Alpha float64
+
+	// ProseMode tunes the rerank for a documentation query -- one that
+	// searches the prose-section (KindDoc) corpus. When set,
+	// Pipeline.Rerank applies the proseWeightTable on top of the
+	// per-signal weights: it lifts the bm25 and semantic channels
+	// (the only signals that score prose well) and suppresses the
+	// code-structural signals (api_signature / type_signature /
+	// definition_bias) that are meaningless for a prose section with
+	// no call graph, no signature, and no definition keyword. The
+	// adjustment is INDEPENDENT of the Alpha / class lever -- it
+	// multiplies whatever class-scaled weight those produce -- so a
+	// docs query still gets its query-shape blend AND the prose
+	// profile. The zero value is off; every code query is unaffected.
+	ProseMode bool
+
 	// CommunityOf maps a node ID to its detected community ID. When
 	// nil, the community signal contributes 0.
 	CommunityOf func(nodeID string) string
@@ -121,6 +145,12 @@ type Context struct {
 	// runs once per file rather than once per candidate. Bounded by
 	// the candidate set's file count.
 	pathPenaltyCache map[string]float64
+
+	// testNameStems holds the normalised name stems of every test
+	// candidate in the batch (TestValidateToken -> validatetoken).
+	// SourceBiasSignal reads it to promote a production symbol over
+	// its test only when both co-occur in the result set.
+	testNameStems map[string]struct{}
 
 	// outEdgeCache / inEdgeCache hold the per-candidate edge slices
 	// fetched in one batched round-trip from Graph at prepare() time.
@@ -285,6 +315,7 @@ func (c *Context) prepare(cands []*Candidate) {
 	c.fileScoreSum = make(map[string]float64, len(cands))
 	c.maxFileScoreSum = 0
 	c.pathPenaltyCache = make(map[string]float64, len(cands))
+	c.testNameStems = make(map[string]struct{}, len(cands))
 	// Preserve the seeded edge caches when the caller signaled
 	// cachePreSeeded; the legacy reset path below the candidate walk
 	// only runs when the caches are NOT authoritative.
@@ -329,6 +360,13 @@ func (c *Context) prepare(cands []*Candidate) {
 				c.fileScoreSum[fp] += w
 				if c.fileScoreSum[fp] > c.maxFileScoreSum {
 					c.maxFileScoreSum = c.fileScoreSum[fp]
+				}
+			}
+			// Record test-candidate name stems so SourceBiasSignal can
+			// detect a co-occurring source/test pair without re-scanning.
+			if isTestPath(fp) {
+				if stem := testNameStem(cand.Node.Name); stem != "" {
+					c.testNameStems[stem] = struct{}{}
 				}
 			}
 		}

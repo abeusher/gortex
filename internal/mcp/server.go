@@ -131,8 +131,20 @@ type Server struct {
 	// gortex_wakeup / the analyze(hotspots) resource — caching it
 	// once per RunAnalysis turn turns repeat calls into a map lookup.
 	// Rebuilt each RunAnalysis pass; guarded by analysisMu.
-	hotspots   []analysis.HotspotEntry
-	analysisMu sync.RWMutex
+	hotspots []analysis.HotspotEntry
+	// adjacency is the compact CSR snapshot of the call / reference
+	// graph, built once per RunAnalysis pass so seeded random-walk
+	// queries (context_closure proximity ranking) never re-scan
+	// AllNodes / AllEdges. nil until the first RunAnalysis; guarded by
+	// analysisMu and read via getAdjacency.
+	adjacency *analysis.AdjacencySnapshot
+	// adjacencyToken snapshots the graph identity that backed
+	// s.adjacency, on the same (NodeCount, EdgeCount,
+	// EdgeIdentityRevisions) discipline as communitiesToken — so a
+	// consumer can tell whether the snapshot still matches the live
+	// graph before trusting it.
+	adjacencyToken communityCacheToken
+	analysisMu     sync.RWMutex
 
 	// cochange caches the git-history co-change graph. cochangeByFile
 	// maps a file path to its co-changing file paths and association
@@ -858,6 +870,7 @@ func NewServer(engine *query.Engine, g graph.Store, idx *indexer.Indexer, watche
 	s.registerGraphCompletionTool()
 	s.registerWikiTools()
 	s.registerWalkGraphTool()
+	s.registerContextClosureTool()
 	s.registerGraphQueryTool()
 	s.registerNavTool()
 	s.registerFindDeclarationTool()
@@ -1495,8 +1508,26 @@ func (s *Server) RunAnalysis() {
 	s.communities = communities
 	s.leidenCache = cache
 	s.communitiesToken = s.currentCommunityToken()
+	// Feed the freshly computed per-package fingerprints to the
+	// backend's bundle cache so it retires bundles for packages whose
+	// content changed since the last pass and keeps the rest. The
+	// fingerprints are edge-aware (DetectCommunitiesLeidenIncremental
+	// folds each package's nodes and the edges touching them), so this
+	// is the correct staleness signal for cached node + in/out edges.
+	// A backend without a bundle cache simply doesn't satisfy the
+	// interface and this no-ops.
+	if sink, ok := s.backendStore().(graph.BundleFingerprintSink); ok && cache != nil {
+		sink.SetBundleFingerprints(cache.PackageFingerprints())
+	}
 	s.processes = analysis.DiscoverProcesses(s.graph)
 	s.pageRank = analysis.ComputePageRank(s.graph)
+	// Compact CSR adjacency over the same call / reference edge set
+	// PageRank uses — the substrate for seeded random-walk proximity
+	// queries. Built once here so per-query walks never re-scan the
+	// graph; stamped with the current graph identity for the same
+	// invalidation discipline as the community cache.
+	s.adjacency = analysis.BuildAdjacencySnapshot(s.graph)
+	s.adjacencyToken = s.currentCommunityToken()
 	// Auto-concept vocabulary: mine domain phrases from symbol names
 	// so equivalence-class expansion can bridge repo-specific terms
 	// even with no LLM provider configured.
@@ -1600,6 +1631,16 @@ func (s *Server) getPageRank() *analysis.PageRankResult {
 	s.analysisMu.RLock()
 	defer s.analysisMu.RUnlock()
 	return s.pageRank
+}
+
+// getAdjacency returns the cached CSR adjacency snapshot built by the
+// last RunAnalysis pass, or nil before the first pass. The snapshot is
+// immutable after construction, so the caller may run seeded walks over
+// it after releasing the read lock.
+func (s *Server) getAdjacency() *analysis.AdjacencySnapshot {
+	s.analysisMu.RLock()
+	defer s.analysisMu.RUnlock()
+	return s.adjacency
 }
 
 // getAutoConcepts returns the per-repo auto-mined concept

@@ -157,3 +157,70 @@ func TestPathPenaltySignal_NilSafety(t *testing.T) {
 		t.Errorf("nil context got %v, want %v (neutral)", got, PathPenaltyUncatched)
 	}
 }
+
+// addFileNode adds a node whose FilePath is indexed at AddNode time so
+// GetFileNodes can find it — the peer lookup the generated gate uses.
+func addFileNode(g *graph.Graph, filePath, name string, kind graph.NodeKind) *graph.Node {
+	n := &graph.Node{ID: filePath + "::" + name, Name: name, Kind: kind, FilePath: filePath}
+	g.AddNode(n)
+	return n
+}
+
+func TestPathPenaltySignal_GeneratedGatedOnPeer(t *testing.T) {
+	g := newTestGraph()
+	// Generated stub WITH a real hand-written same-named peer →
+	// penalised so the implementation wins.
+	genWithPeer := addFileNode(g, "api/user.pb.go", "User", graph.KindType)
+	addFileNode(g, "api/user.go", "User", graph.KindType) // the peer
+	// Generated stub WITHOUT a peer → left neutral (sole definition).
+	genNoPeer := addFileNode(g, "rpc/svc.pb.go", "Svc", graph.KindType)
+	// A Go mock with its real peer present → penalised.
+	mockWithPeer := addFileNode(g, "store/mock_store.go", "Store", graph.KindType)
+	addFileNode(g, "store/store.go", "Store", graph.KindType)
+
+	cands := []*Candidate{
+		candidateFor(genWithPeer, 0, -1),
+		candidateFor(genNoPeer, 1, -1),
+		candidateFor(mockWithPeer, 2, -1),
+	}
+	ctx := &Context{Graph: g}
+	ctx.prepare(cands)
+	sig := PathPenaltySignal{}
+
+	if got := sig.Contribute("User", cands[0], ctx); got != PathPenaltyGenerated {
+		t.Errorf("generated-with-peer got %v, want %v", got, PathPenaltyGenerated)
+	}
+	if got := sig.Contribute("Svc", cands[1], ctx); got != PathPenaltyUncatched {
+		t.Errorf("generated-no-peer got %v, want %v (sole definition unpenalised)", got, PathPenaltyUncatched)
+	}
+	if got := sig.Contribute("Store", cands[2], ctx); got != PathPenaltyGenerated {
+		t.Errorf("mock-with-peer got %v, want %v", got, PathPenaltyGenerated)
+	}
+}
+
+func TestPathPenaltySignal_GeneratedNoGraphNoGate(t *testing.T) {
+	// With no graph the peer lookup can't run, so generated files are
+	// left neutral — the gate degrades safely to a no-op.
+	n := &graph.Node{ID: "api/user.pb.go::User", Name: "User", Kind: graph.KindType, FilePath: "api/user.pb.go"}
+	c := candidateFor(n, 0, -1)
+	ctx := &Context{} // Graph nil
+	ctx.prepare([]*Candidate{c})
+	if got := (PathPenaltySignal{}).Contribute("User", c, ctx); got != PathPenaltyUncatched {
+		t.Errorf("generated w/o graph got %v, want %v", got, PathPenaltyUncatched)
+	}
+}
+
+func TestPathPenaltySignal_GeneratedInTestDirKeepsTestTier(t *testing.T) {
+	// A generated file that ALSO sits in a test tree keeps the heavier
+	// test penalty: generated only fires in the Uncatched branch, so
+	// "most aggressive wins" holds.
+	g := newTestGraph()
+	gen := addFileNode(g, "tests/user.pb.go", "User", graph.KindType)
+	addFileNode(g, "tests/user.go", "User", graph.KindType)
+	c := candidateFor(gen, 0, -1)
+	ctx := &Context{Graph: g}
+	ctx.prepare([]*Candidate{c})
+	if got := (PathPenaltySignal{}).Contribute("User", c, ctx); got != PathPenaltyTest {
+		t.Errorf("generated-in-tests got %v, want %v (test wins)", got, PathPenaltyTest)
+	}
+}
