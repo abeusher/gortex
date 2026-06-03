@@ -712,24 +712,17 @@ func (idx *Indexer) RunGlobalGraphPasses(ctx context.Context) {
 	if idx.cloneIndex != nil {
 		idx.cloneIndex.Rebuild(idx.graph, idx.repoPrefix)
 	}
-	// gRPC stub-call resolution. Runs after InferImplements (the
-	// interface-satisfaction fallback signal depends on its
-	// EdgeImplements edges) and before DetectCrossRepoEdges so a
-	// cross-repo gRPC call gets its parallel cross_repo_calls edge.
-	reporter.Report("gRPC stub resolution (global)", 0, 0)
-	if grpcResolved := resolver.ResolveGRPCStubCalls(idx.graph); grpcResolved > 0 {
-		idx.logger.Info("gRPC stub calls resolved (global)",
-			zap.Int("edges", grpcResolved),
-		)
-	}
-	// Temporal workflow → activity stub-call resolution. Same ordering
-	// constraints as gRPC: needs InferImplements (Java interface chain)
-	// to have run; runs before DetectCrossRepoEdges so cross-repo
-	// Temporal dispatch gets its parallel cross_repo_calls edge.
-	reporter.Report("Temporal stub resolution (global)", 0, 0)
-	if temporalResolved := resolver.ResolveTemporalCalls(idx.graph); temporalResolved > 0 {
-		idx.logger.Info("Temporal stub calls resolved (global)",
-			zap.Int("edges", temporalResolved),
+	// Framework dynamic-dispatch synthesis (gRPC stubs, Temporal
+	// workflow→activity, in-process / native event channels, native
+	// bridges). Runs after InferImplements/InferOverrides (the
+	// interface-satisfaction signals several synthesizers depend on) and
+	// before DetectCrossRepoEdges so a cross-repo synthesized call gets
+	// its parallel cross_repo_calls edge.
+	reporter.Report("framework dispatch synthesis (global)", 0, 0)
+	if rep := resolver.RunFrameworkSynthesizers(idx.graph); rep.Total > 0 {
+		idx.logger.Info("framework dispatch calls synthesized (global)",
+			zap.Int("edges", rep.Total),
+			zap.Any("per_synthesizer", rep.Per),
 		)
 	}
 	// External-call placeholder synthesis (opt-in). Runs after the
@@ -2365,21 +2358,15 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 			if idx.cloneIndex != nil {
 				idx.cloneIndex.Rebuild(idx.graph, idx.repoPrefix)
 			}
-			// gRPC stub-call resolution — runs once the call graph and
-			// interface inference are final. Skipped under
+			// Framework dynamic-dispatch synthesis — runs once the call
+			// graph and interface inference are final. Skipped under
 			// deferGlobalPasses; the batch caller folds it into
 			// RunGlobalGraphPasses.
-			reporter.Report("gRPC stub resolution", 0, 0)
-			if grpcResolved := resolver.ResolveGRPCStubCalls(idx.graph); grpcResolved > 0 {
-				idx.logger.Info("gRPC stub calls resolved",
-					zap.Int("edges", grpcResolved),
-				)
-			}
-			// Temporal stub-call resolution — same staging as gRPC.
-			reporter.Report("Temporal stub resolution", 0, 0)
-			if temporalResolved := resolver.ResolveTemporalCalls(idx.graph); temporalResolved > 0 {
-				idx.logger.Info("Temporal stub calls resolved",
-					zap.Int("edges", temporalResolved),
+			reporter.Report("framework dispatch synthesis", 0, 0)
+			if rep := resolver.RunFrameworkSynthesizers(idx.graph); rep.Total > 0 {
+				idx.logger.Info("framework dispatch calls synthesized",
+					zap.Int("edges", rep.Total),
+					zap.Any("per_synthesizer", rep.Per),
 				)
 			}
 			// External-call placeholder synthesis (opt-in) — runs after
@@ -2806,12 +2793,10 @@ func (idx *Indexer) ResolveAll() {
 	idx.resolver.ResolveAll()
 	idx.resolver.InferImplements()
 	idx.resolver.InferOverrides()
-	// gRPC stub-call resolution depends on InferImplements (its
-	// interface-satisfaction fallback signal) having run first.
-	resolver.ResolveGRPCStubCalls(idx.graph)
-	// Temporal stub-call resolution piggybacks on the same staging —
-	// Java interface→impl propagation depends on EdgeImplements.
-	resolver.ResolveTemporalCalls(idx.graph)
+	// Framework dynamic-dispatch synthesis (gRPC / Temporal / event
+	// channels / native bridges) depends on InferImplements (the
+	// interface-satisfaction signals) having run first.
+	resolver.RunFrameworkSynthesizers(idx.graph)
 	// External-call placeholder synthesis (opt-in) — runs after the
 	// resolver and stub passes so only genuinely un-indexed external
 	// targets remain to materialise.
@@ -3814,8 +3799,7 @@ func (idx *Indexer) IncrementalReindexPaths(root string, paths []string) (*Index
 	if !idx.deferGlobalPasses && (len(staleFiles) > 0 || len(deletedFiles) > 0) {
 		idx.resolver.InferImplements()
 		idx.resolver.InferOverrides()
-		resolver.ResolveGRPCStubCalls(idx.graph)
-		resolver.ResolveTemporalCalls(idx.graph)
+		resolver.RunFrameworkSynthesizers(idx.graph)
 		resolver.SynthesizeExternalCalls(idx.graph, idx.externalCallSynthesisEnabled())
 	}
 
@@ -4022,12 +4006,11 @@ func (idx *Indexer) IncrementalReindex(root string) (*IndexResult, error) {
 	if !idx.deferGlobalPasses {
 		idx.resolver.InferImplements()
 		idx.resolver.InferOverrides()
-		// gRPC stub-call resolution — re-run because eviction may have
-		// dropped a handler or a registration edge, and the handler
-		// index must be rebuilt against the fresh graph.
-		resolver.ResolveGRPCStubCalls(idx.graph)
-		// Temporal stub-call resolution — same re-run rationale.
-		resolver.ResolveTemporalCalls(idx.graph)
+		// Framework dynamic-dispatch synthesis — re-run because eviction
+		// may have dropped a handler, a registration edge, or an emit /
+		// listen edge, and each synthesizer's index must be rebuilt
+		// against the fresh graph. Every pass is a full recompute.
+		resolver.RunFrameworkSynthesizers(idx.graph)
 		// External-call placeholder synthesis (opt-in) — re-run for the
 		// same reason: eviction can leave a previously-synthetic edge
 		// pointing at a stale terminal. The pass is a full recompute.
