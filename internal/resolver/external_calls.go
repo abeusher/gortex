@@ -314,6 +314,32 @@ func isLanguageStdlib(lang, importPath string) bool {
 			return true
 		}
 		return false
+	case "java", "kotlin", "scala":
+		// JVM platform packages: the JDK (java.* / javax.*), the Jakarta
+		// EE successor (jakarta.*), and the JDK-internal trees (jdk.* /
+		// sun.* / com.sun.*). Everything else — including Kotlin/Scala
+		// stdlibs, which ship as ordinary Maven artifacts — is treated as
+		// a genuine dependency.
+		return hasDottedPrefix(importPath, "java", "javax", "jakarta", "jdk", "sun") ||
+			strings.HasPrefix(importPath, "com.sun.")
+	case "csharp", "fsharp":
+		// The .NET base class library: System.* and Microsoft.* (the
+		// framework-shipped namespaces) plus the legacy mscorlib. Third
+		// party NuGet packages live under their own vendor namespaces.
+		return hasDottedPrefix(importPath, "System", "Microsoft", "mscorlib", "netstandard")
+	}
+	return false
+}
+
+// hasDottedPrefix reports whether importPath equals one of roots or has
+// it as a dotted-namespace prefix (`java` matches `java` and `java.util`
+// but not `javafx`). Used by the JVM / .NET stdlib filters where the
+// platform namespace is the first dotted component.
+func hasDottedPrefix(importPath string, roots ...string) bool {
+	for _, r := range roots {
+		if importPath == r || strings.HasPrefix(importPath, r+".") {
+			return true
+		}
 	}
 	return false
 }
