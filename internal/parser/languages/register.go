@@ -29,11 +29,13 @@ func RegisterAll(reg *parser.Registry) {
 	reg.Register(NewDockerfileExtractor())
 	reg.Register(NewCSharpExtractor())
 	reg.Register(NewXAMLExtractor())
-	// MyBatis shares the .xml extension with the generic XML extractor;
-	// it is registered before registerForestLanguages (which re-claims
-	// .xml for "xml" as the default) and routed only for mapper documents
-	// via the content sniff in detect_content.go.
+	// MyBatis and Spring both share the .xml extension with the generic
+	// XML extractor; they are registered before registerForestLanguages
+	// (which re-claims .xml for "xml" as the default) and routed only for
+	// their respective documents via the content sniff in
+	// detect_content.go.
 	reg.Register(NewMyBatisExtractor())
+	reg.Register(NewSpringContextExtractor())
 	reg.Register(NewMarkdownExtractor())
 	reg.Register(NewOrgModeExtractor())
 	reg.Register(NewDartExtractor())

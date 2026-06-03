@@ -23,6 +23,7 @@ func ambiguityRegistry() *Registry {
 	// content-routed to "mybatis" (which claims no extension here, so it
 	// never overrides the .xml default).
 	r.Register(&mockExtractor{lang: "mybatis"})
+	r.Register(&mockExtractor{lang: "spring"})
 	r.Register(&mockExtractor{lang: "xml", exts: []string{".xml"}})
 	return r
 }
@@ -151,6 +152,15 @@ func TestDetectLanguageContent_MyBatisMapper(t *testing.T) {
 	lang, ok := r.DetectLanguageContent("UserMapper.xml", mapper)
 	assert.True(t, ok)
 	assert.Equal(t, "mybatis", lang, "a mapper document routes to the mybatis extractor")
+
+	// A Spring beans XML routes to the spring extractor.
+	beans := []byte(`<?xml version="1.0"?>
+<beans xmlns="http://www.springframework.org/schema/beans">
+  <bean id="svc" class="com.app.Svc"/>
+</beans>`)
+	lang, ok = r.DetectLanguageContent("applicationContext.xml", beans)
+	assert.True(t, ok)
+	assert.Equal(t, "spring", lang)
 
 	// A generic XML document keeps the xml default.
 	lang, ok = r.DetectLanguageContent("config.xml", []byte(`<?xml version="1.0"?><config><name>x</name></config>`))
