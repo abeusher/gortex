@@ -578,6 +578,24 @@ type PageRanker interface {
 	PageRank(opts PageRankOpts) ([]PageRankHit, error)
 }
 
+// BundleFingerprintSink is an optional capability a backend MAY
+// implement to accept an authoritative per-package content-fingerprint
+// map for its SearchSymbolBundles cache. The daemon calls
+// SetBundleFingerprints after every analysis pass with the fresh
+// fingerprints derived from the live graph; the backend retires any
+// cached bundle whose package fingerprint changed and serves the rest.
+// Backends without a bundle cache simply do not implement this — the
+// daemon's type assertion no-ops.
+//
+// fps is keyed by package key (the directory the package's files live
+// in, repo-prefixed in multi-repo because the stored node file paths
+// are). The fingerprints must be edge-aware — fold in the package's
+// nodes AND the edges touching them — so a cross-file edge change
+// invalidates the bundles whose in/out edges it altered.
+type BundleFingerprintSink interface {
+	SetBundleFingerprints(fps map[string]uint64)
+}
+
 // CommunityOpts tunes Louvain community detection over a projected
 // subgraph. Zero values request the backend default
 // (maxPhases=20, maxIterations=20). NodeKinds / EdgeKinds

@@ -1508,6 +1508,17 @@ func (s *Server) RunAnalysis() {
 	s.communities = communities
 	s.leidenCache = cache
 	s.communitiesToken = s.currentCommunityToken()
+	// Feed the freshly computed per-package fingerprints to the
+	// backend's bundle cache so it retires bundles for packages whose
+	// content changed since the last pass and keeps the rest. The
+	// fingerprints are edge-aware (DetectCommunitiesLeidenIncremental
+	// folds each package's nodes and the edges touching them), so this
+	// is the correct staleness signal for cached node + in/out edges.
+	// A backend without a bundle cache simply doesn't satisfy the
+	// interface and this no-ops.
+	if sink, ok := s.backendStore().(graph.BundleFingerprintSink); ok && cache != nil {
+		sink.SetBundleFingerprints(cache.PackageFingerprints())
+	}
 	s.processes = analysis.DiscoverProcesses(s.graph)
 	s.pageRank = analysis.ComputePageRank(s.graph)
 	// Compact CSR adjacency over the same call / reference edge set
