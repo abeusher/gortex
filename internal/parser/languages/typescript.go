@@ -416,6 +416,11 @@ func (e *TypeScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 		func(line int) string { return findEnclosingFunc(funcRanges, line) },
 		filePath, "typescript", result)
 
+	// SQL function call sites (Supabase/PostgREST .rpc('fn')).
+	emitSQLCallsiteEdges(src, "typescript",
+		func(line int) string { return findEnclosingFunc(funcRanges, line) },
+		filePath, result)
+
 	// --- React Native native-module bridge calls ---
 	rnVars := rnNativeModuleVars(src)
 	for _, c := range calls {
