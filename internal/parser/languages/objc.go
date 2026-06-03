@@ -101,6 +101,29 @@ func (e *ObjCExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 		add(name, graph.KindFunction, line, findBlockEnd(lines, line))
 	}
 
+	// React Native native-module exports: RCT_EXPORT_MODULE declares the
+	// JS-visible module, RCT_EXPORT_METHOD / RCT_REMAP_METHOD expose a
+	// method to JS. Emit a method node per export carrying rn_module /
+	// rn_method so the React-Native bridge synthesizer can land a JS
+	// `NativeModules.<module>.<method>()` call on this native impl.
+	for _, rx := range extractObjCRNExports(src) {
+		id := filePath + "::" + rx.selector
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		result.Nodes = append(result.Nodes, &graph.Node{
+			ID: id, Kind: graph.KindMethod, Name: rx.selector,
+			FilePath: filePath, StartLine: rx.line, EndLine: findBlockEnd(lines, rx.line),
+			Language: "objc",
+			Meta:     map[string]any{"rn_module": rx.module, "rn_method": rx.jsName},
+		})
+		result.Edges = append(result.Edges, &graph.Edge{
+			From: fileNode.ID, To: id, Kind: graph.EdgeDefines,
+			FilePath: filePath, Line: rx.line,
+		})
+	}
+
 	emitImport := func(mod string, line int) {
 		if mod == "" {
 			return
@@ -194,6 +217,162 @@ func objcIsKeyword(s string) bool {
 		return true
 	}
 	return false
+}
+
+// objcRNExport is one React Native method export discovered in a file:
+// its full ObjC selector, the JS-visible method name, the JS module name
+// (the enclosing @implementation's RCT_EXPORT_MODULE name, defaulting to
+// the class name), and the source line.
+type objcRNExport struct {
+	selector string
+	jsName   string
+	module   string
+	line     int
+}
+
+var (
+	objcRCTModuleRe = regexp.MustCompile(`RCT_EXPORT_MODULE(?:_NO_LOAD)?\s*\(\s*([A-Za-z_]\w*)?\s*\)`)
+	objcRCTMethodRe = regexp.MustCompile(`RCT_(EXPORT|REMAP)_METHOD\s*\(`)
+)
+
+// extractObjCRNExports scans for React Native module/method export
+// macros and resolves each exported method to its JS module + method
+// name. Module attribution walks the enclosing @implementation block:
+// RCT_EXPORT_MODULE(arg) sets the JS name (arg, or the class name when
+// the macro has no argument).
+func extractObjCRNExports(src []byte) []objcRNExport {
+	type block struct {
+		name        string
+		start, end  int
+		moduleName  string
+		moduleKnown bool
+	}
+	var blocks []block
+	implIdx := objcImplRe.FindAllSubmatchIndex(src, -1)
+	for i, m := range implIdx {
+		start := m[0]
+		end := len(src)
+		if i+1 < len(implIdx) {
+			end = implIdx[i+1][0]
+		}
+		if e := objcKeywordEndOffset(src, m[1], "@end"); e >= 0 && e < end {
+			end = e
+		}
+		blocks = append(blocks, block{name: string(src[m[2]:m[3]]), start: start, end: end, moduleName: string(src[m[2]:m[3]])})
+	}
+	blockFor := func(off int) *block {
+		for i := range blocks {
+			if off >= blocks[i].start && off < blocks[i].end {
+				return &blocks[i]
+			}
+		}
+		return nil
+	}
+
+	// RCT_EXPORT_MODULE: set the JS module name for its block.
+	for _, m := range objcRCTModuleRe.FindAllSubmatchIndex(src, -1) {
+		b := blockFor(m[0])
+		if b == nil {
+			continue
+		}
+		if m[2] >= 0 {
+			if arg := strings.TrimSpace(string(src[m[2]:m[3]])); arg != "" {
+				b.moduleName = arg
+			}
+		}
+		b.moduleKnown = true
+	}
+
+	var out []objcRNExport
+	for _, loc := range objcRCTMethodRe.FindAllSubmatchIndex(src, -1) {
+		kind := string(src[loc[2]:loc[3]]) // EXPORT | REMAP
+		openParen := loc[1] - 1            // the '(' the regex ended on
+		inner, ok := objcBalancedParen(src, openParen)
+		if !ok {
+			continue
+		}
+		module := ""
+		if b := blockFor(loc[0]); b != nil {
+			module = b.moduleName
+		}
+		var selector, jsName string
+		if kind == "REMAP" {
+			// RCT_REMAP_METHOD(jsName, selectorParts...)
+			js, rest := objcSplitFirstComma(inner)
+			jsName = strings.TrimSpace(js)
+			selector = objcBuildSelector(rest)
+		} else {
+			selector = objcBuildSelector(inner)
+			jsName = selector
+			if i := strings.IndexByte(jsName, ':'); i >= 0 {
+				jsName = jsName[:i]
+			}
+		}
+		if selector == "" || jsName == "" || module == "" {
+			continue
+		}
+		out = append(out, objcRNExport{
+			selector: selector,
+			jsName:   jsName,
+			module:   module,
+			line:     lineAt(src, loc[0]),
+		})
+	}
+	return out
+}
+
+// objcBalancedParen returns the text between the '(' at openIdx and its
+// matching ')', honouring nested parentheses (ObjC type casts like
+// `(NSString *)`). ok is false when no balanced close is found.
+func objcBalancedParen(src []byte, openIdx int) (inner string, ok bool) {
+	if openIdx < 0 || openIdx >= len(src) || src[openIdx] != '(' {
+		return "", false
+	}
+	depth := 0
+	for i := openIdx; i < len(src); i++ {
+		switch src[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return string(src[openIdx+1 : i]), true
+			}
+		}
+	}
+	return "", false
+}
+
+// objcSplitFirstComma splits s at the first top-level comma (depth-0),
+// used to peel the JS name off an RCT_REMAP_METHOD's first argument.
+func objcSplitFirstComma(s string) (first, rest string) {
+	depth := 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '(', '[', '{':
+			depth++
+		case ')', ']', '}':
+			if depth > 0 {
+				depth--
+			}
+		case ',':
+			if depth == 0 {
+				return s[:i], s[i+1:]
+			}
+		}
+	}
+	return s, ""
+}
+
+// objcKeywordEndOffset returns the byte offset just past the first line
+// containing keyword at or after `from`, or -1 if none. Used to bound an
+// @implementation block at its @end.
+func objcKeywordEndOffset(src []byte, from int, keyword string) int {
+	idx := strings.Index(string(src[from:]), keyword)
+	if idx < 0 {
+		return -1
+	}
+	return from + idx + len(keyword)
 }
 
 var _ parser.Extractor = (*ObjCExtractor)(nil)

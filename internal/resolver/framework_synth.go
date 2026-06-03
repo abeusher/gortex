@@ -112,6 +112,7 @@ func defaultFrameworkSynthesizers() []FrameworkSynthesizer {
 		synthFunc{name: SynthTemporalStub, fn: ResolveTemporalCalls},
 		synthFunc{name: SynthEventChannel, fn: ResolveEventChannelCalls},
 		synthFunc{name: SynthSwiftObjC, fn: ResolveSwiftObjCBridge},
+		synthFunc{name: SynthReactNative, fn: ResolveReactNativeBridge},
 	}
 }
 

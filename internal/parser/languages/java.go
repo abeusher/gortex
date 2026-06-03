@@ -118,7 +118,8 @@ func (e *JavaExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 
 	seen := make(map[string]bool)
 	annotationSeen := make(map[string]bool)
-	ifaceMethods := make(map[string][]string) // interface name → declared method names
+	ifaceMethods := make(map[string][]string)  // interface name → declared method names
+	rnModules := extractJavaRNModuleNames(src) // class → React Native JS module name
 
 	var calls []javaDeferredCall
 	var varBuf []javaDeferredVar
@@ -136,7 +137,7 @@ func (e *JavaExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 			e.emitEnum(m, filePath, fileID, src, result, seen, annotationSeen)
 
 		case m.Captures["method.def"] != nil:
-			e.emitMethod(m, filePath, fileID, src, result, seen, annotationSeen, ifaceMethods)
+			e.emitMethod(m, filePath, fileID, src, result, seen, annotationSeen, ifaceMethods, rnModules)
 
 		case m.Captures["ctor.def"] != nil:
 			e.emitConstructor(m, filePath, fileID, src, result, seen)
@@ -416,7 +417,7 @@ func (e *JavaExtractor) emitEnumMember(m parser.QueryResult, filePath string, sr
 	})
 }
 
-func (e *JavaExtractor) emitMethod(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen, annotationSeen map[string]bool, ifaceMethods map[string][]string) {
+func (e *JavaExtractor) emitMethod(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen, annotationSeen map[string]bool, ifaceMethods map[string][]string, rnModules map[string]string) {
 	name := m.Captures["method.name"].Text
 	def := m.Captures["method.def"]
 	startLine1 := def.StartLine + 1
@@ -466,6 +467,17 @@ func (e *JavaExtractor) emitMethod(m parser.QueryResult, filePath, fileID string
 				if c := JavaComplexity(body); c > 1 {
 					node.Meta["complexity"] = c
 				}
+			}
+		}
+		// React Native: an @ReactMethod method is callable from JS as
+		// NativeModules.<module>.<method>(...). Stamp the JS module +
+		// method so the bridge synthesizer can land the JS call here.
+		if def.Node != nil && javaHasReactMethod(javaCollectAnnotations(def.Node, src)) {
+			node.Meta["rn_method"] = name
+			if mod := rnModules[className]; mod != "" {
+				node.Meta["rn_module"] = mod
+			} else {
+				node.Meta["rn_module"] = className
 			}
 		}
 		result.Nodes = append(result.Nodes, node)
