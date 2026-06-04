@@ -145,6 +145,118 @@ func TestMarkTestSymbolsAndEmitEdges_DropsTestToTestCalls(t *testing.T) {
 	}
 }
 
+func TestMarkTestSymbolsAndEmitEdges_RustInlineCfgTest(t *testing.T) {
+	g := graph.New()
+
+	// A production-path Rust file: src/lib.rs is NOT a test file by name
+	// or directory, but it holds an inline `#[cfg(test)] mod tests`
+	// whose functions carry #[test].
+	g.AddNode(&graph.Node{ID: "src/lib.rs", Kind: graph.KindFile, Name: "src/lib.rs", FilePath: "src/lib.rs", Language: "rust"})
+	g.AddNode(&graph.Node{ID: "src/lib.rs::add", Kind: graph.KindFunction, Name: "add", FilePath: "src/lib.rs", Language: "rust"})
+	g.AddNode(&graph.Node{ID: "src/lib.rs::it_adds", Kind: graph.KindFunction, Name: "it_adds", FilePath: "src/lib.rs", Language: "rust"})
+	g.AddNode(&graph.Node{ID: "src/lib.rs::bench_add", Kind: graph.KindFunction, Name: "bench_add", FilePath: "src/lib.rs", Language: "rust"})
+
+	// Annotation nodes + EdgeAnnotated edges, as emitRustAnnotationEdges
+	// would emit them. #[test] → annotation::rust::test; #[bench] →
+	// annotation::rust::bench; #[cfg(test)] on the module → annotation::rust::cfg.
+	g.AddNode(&graph.Node{ID: "annotation::rust::test", Kind: graph.KindType, Name: "test", FilePath: "src/lib.rs", Language: "rust", Meta: map[string]any{"kind": "annotation", "synthetic": true}})
+	g.AddNode(&graph.Node{ID: "annotation::rust::bench", Kind: graph.KindType, Name: "bench", FilePath: "src/lib.rs", Language: "rust", Meta: map[string]any{"kind": "annotation", "synthetic": true}})
+	g.AddNode(&graph.Node{ID: "annotation::rust::cfg", Kind: graph.KindType, Name: "cfg", FilePath: "src/lib.rs", Language: "rust", Meta: map[string]any{"kind": "annotation", "synthetic": true}})
+	g.AddEdge(&graph.Edge{From: "src/lib.rs::it_adds", To: "annotation::rust::test", Kind: graph.EdgeAnnotated, FilePath: "src/lib.rs", Line: 12})
+	g.AddEdge(&graph.Edge{From: "src/lib.rs::bench_add", To: "annotation::rust::bench", Kind: graph.EdgeAnnotated, FilePath: "src/lib.rs", Line: 18})
+
+	// The test calls the subject under test.
+	g.AddEdge(&graph.Edge{From: "src/lib.rs::it_adds", To: "src/lib.rs::add", Kind: graph.EdgeCalls, FilePath: "src/lib.rs", Line: 13})
+
+	marked, emitted := markTestSymbolsAndEmitEdges(g)
+
+	if marked != 2 {
+		t.Fatalf("expected 2 annotation-driven test symbols marked, got %d", marked)
+	}
+	if emitted != 1 {
+		t.Fatalf("expected 1 EdgeTests (it_adds→add), got %d", emitted)
+	}
+
+	itAdds := g.GetNode("src/lib.rs::it_adds")
+	if v, _ := itAdds.Meta["is_test"].(bool); !v {
+		t.Fatalf("it_adds (#[test] in prod file) should be flagged is_test")
+	}
+	if r, _ := itAdds.Meta["test_role"].(string); r != "test" {
+		t.Errorf("it_adds test_role = %q, want test", r)
+	}
+	if r, _ := itAdds.Meta["test_runner"].(string); r != "cargo-test" {
+		t.Errorf("it_adds test_runner = %q, want cargo-test", r)
+	}
+
+	bench := g.GetNode("src/lib.rs::bench_add")
+	if r, _ := bench.Meta["test_role"].(string); r != "benchmark" {
+		t.Errorf("bench_add test_role = %q, want benchmark", r)
+	}
+
+	// The non-test production function must NOT be flagged.
+	if v, _ := g.GetNode("src/lib.rs::add").Meta["is_test"].(bool); v {
+		t.Fatalf("add (no test annotation) must not be flagged is_test")
+	}
+
+	// EdgeTests must point it_adds → add.
+	var found bool
+	for _, e := range g.AllEdges() {
+		if e.Kind == graph.EdgeTests && e.From == "src/lib.rs::it_adds" && e.To == "src/lib.rs::add" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("EdgeTests it_adds→add not found")
+	}
+}
+
+func TestMarkTestSymbolsAndEmitEdges_JavaAtTestInProdPathFile(t *testing.T) {
+	g := graph.New()
+
+	// Service.java is a production-path file (no Test/Tests suffix) but
+	// holds a @Test method — JUnit discovers it by annotation.
+	g.AddNode(&graph.Node{ID: "src/Service.java", Kind: graph.KindFile, Name: "src/Service.java", FilePath: "src/Service.java", Language: "java"})
+	g.AddNode(&graph.Node{ID: "src/Service.java::Service.handle", Kind: graph.KindMethod, Name: "handle", FilePath: "src/Service.java", Language: "java"})
+	g.AddNode(&graph.Node{ID: "src/Service.java::Service.shouldHandle", Kind: graph.KindMethod, Name: "shouldHandle", FilePath: "src/Service.java", Language: "java"})
+
+	g.AddNode(&graph.Node{ID: "annotation::java::Test", Kind: graph.KindType, Name: "Test", FilePath: "src/Service.java", Language: "java", Meta: map[string]any{"kind": "annotation", "synthetic": true}})
+	g.AddEdge(&graph.Edge{From: "src/Service.java::Service.shouldHandle", To: "annotation::java::Test", Kind: graph.EdgeAnnotated, FilePath: "src/Service.java", Line: 20})
+	g.AddEdge(&graph.Edge{From: "src/Service.java::Service.shouldHandle", To: "src/Service.java::Service.handle", Kind: graph.EdgeCalls, FilePath: "src/Service.java", Line: 21})
+
+	marked, emitted := markTestSymbolsAndEmitEdges(g)
+	if marked != 1 {
+		t.Fatalf("expected 1 @Test method marked, got %d", marked)
+	}
+	if emitted != 1 {
+		t.Fatalf("expected 1 EdgeTests, got %d", emitted)
+	}
+	m := g.GetNode("src/Service.java::Service.shouldHandle")
+	if v, _ := m.Meta["is_test"].(bool); !v {
+		t.Fatalf("@Test method should be flagged is_test")
+	}
+	if r, _ := m.Meta["test_runner"].(string); r != "junit" {
+		t.Errorf("test_runner = %q, want junit", r)
+	}
+	// A plain @Component / non-test annotation must not flag the symbol.
+	if v, _ := g.GetNode("src/Service.java::Service.handle").Meta["is_test"].(bool); v {
+		t.Fatalf("non-annotated production method must not be flagged is_test")
+	}
+}
+
+func TestMarkTestSymbolsAndEmitEdges_NonTestAnnotationIgnored(t *testing.T) {
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "src/m.rs", Kind: graph.KindFile, Name: "src/m.rs", FilePath: "src/m.rs", Language: "rust"})
+	g.AddNode(&graph.Node{ID: "src/m.rs::Widget", Kind: graph.KindType, Name: "Widget", FilePath: "src/m.rs", Language: "rust"})
+	// #[derive(Debug)] is an annotation but not a test.
+	g.AddNode(&graph.Node{ID: "annotation::rust::Debug", Kind: graph.KindType, Name: "Debug", FilePath: "src/m.rs", Language: "rust", Meta: map[string]any{"kind": "annotation", "synthetic": true}})
+	g.AddEdge(&graph.Edge{From: "src/m.rs::Widget", To: "annotation::rust::Debug", Kind: graph.EdgeAnnotated, FilePath: "src/m.rs", Line: 3})
+
+	marked, _ := markTestSymbolsAndEmitEdges(g)
+	if marked != 0 {
+		t.Fatalf("non-test annotation must not flag any symbol, got %d marked", marked)
+	}
+}
+
 func TestMarkTestSymbolsAndEmitEdges_DedupesParallelCalls(t *testing.T) {
 	g := graph.New()
 	g.AddNode(&graph.Node{ID: "x_test.go", Kind: graph.KindFile, Name: "x_test.go", FilePath: "x_test.go", Language: "go"})
