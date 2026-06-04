@@ -488,9 +488,7 @@ func (e *JavaExtractor) emitMethod(m parser.QueryResult, filePath, fileID string
 		}
 		if def.Node != nil {
 			if body := def.Node.ChildByFieldName("body"); body != nil {
-				if c := JavaComplexity(body); c > 1 {
-					node.Meta["complexity"] = c
-				}
+				StampFunctionMetrics(node, body, "java")
 			}
 		}
 		// React Native: an @ReactMethod method is callable from JS as

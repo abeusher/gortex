@@ -475,9 +475,8 @@ func (e *TypeScriptExtractor) emitFunction(m parser.QueryResult, filePath, fileI
 		meta["type_params"] = tp
 	}
 	if body := tsFunctionBody(def.Node); body != nil {
-		if c := TSComplexity(body); c > 1 {
-			meta["complexity"] = c
-		}
+		c, cg, ld := BodyComplexityMetrics(body, "typescript")
+		ApplyComplexityMeta(meta, c, cg, ld)
 	}
 	result.Nodes = append(result.Nodes, &graph.Node{
 		ID: id, Kind: graph.KindFunction, Name: name,
@@ -914,9 +913,7 @@ func (e *TypeScriptExtractor) emitMethod(m parser.QueryResult, filePath string, 
 	}
 	node.Meta["visibility"] = tsMemberVisibility(def.Node, src)
 	if body := tsFunctionBody(def.Node); body != nil {
-		if c := TSComplexity(body); c > 1 {
-			node.Meta["complexity"] = c
-		}
+		StampFunctionMetrics(node, body, "typescript")
 	}
 	result.Nodes = append(result.Nodes, node)
 	result.Edges = append(result.Edges, &graph.Edge{

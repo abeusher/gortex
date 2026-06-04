@@ -867,9 +867,7 @@ func (e *GoExtractor) emitFunction(m parser.QueryResult, filePath, fileID string
 	}
 	node.Meta["visibility"] = VisibilityByCase(name)
 	if body := goFuncBody(def.Node); body != nil {
-		if c := GoComplexity(body); c > 1 {
-			node.Meta["complexity"] = c
-		}
+		StampFunctionMetrics(node, body, "go")
 	}
 	scanGoPragmas(src, def.StartLine, node)
 	result.Nodes = append(result.Nodes, node)
@@ -945,9 +943,7 @@ func (e *GoExtractor) emitMethod(m parser.QueryResult, filePath, fileID string, 
 	}
 	node.Meta["visibility"] = VisibilityByCase(name)
 	if body := goFuncBody(def.Node); body != nil {
-		if c := GoComplexity(body); c > 1 {
-			node.Meta["complexity"] = c
-		}
+		StampFunctionMetrics(node, body, "go")
 	}
 	scanGoPragmas(src, def.StartLine, node)
 	result.Nodes = append(result.Nodes, node)

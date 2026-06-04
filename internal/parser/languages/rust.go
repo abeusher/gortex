@@ -334,10 +334,10 @@ func (e *RustExtractor) emitFunction(m parser.QueryResult, filePath, fileID stri
 	doc := ExtractDocAbove(src, def.StartLine, DocLangSlashSlash)
 	visibility := rustVisibility(def.Node, src)
 	typeParams := rustTypeParams(def.Node, src)
-	complexity := 0
+	complexity, cognitive, loopDepth := 0, 0, 0
 	if def.Node != nil {
 		if body := def.Node.ChildByFieldName("body"); body != nil {
-			complexity = RustComplexity(body)
+			complexity, cognitive, loopDepth = BodyComplexityMetrics(body, "rust")
 		}
 	}
 
@@ -362,9 +362,7 @@ func (e *RustExtractor) emitFunction(m parser.QueryResult, filePath, fileID stri
 		if len(typeParams) > 0 {
 			meta["type_params"] = typeParams
 		}
-		if complexity > 1 {
-			meta["complexity"] = complexity
-		}
+		ApplyComplexityMeta(meta, complexity, cognitive, loopDepth)
 		result.Nodes = append(result.Nodes, &graph.Node{
 			ID: id, Kind: graph.KindMethod, Name: name,
 			FilePath: filePath, StartLine: startLine1, EndLine: def.EndLine + 1,
@@ -400,9 +398,7 @@ func (e *RustExtractor) emitFunction(m parser.QueryResult, filePath, fileID stri
 	if len(typeParams) > 0 {
 		meta["type_params"] = typeParams
 	}
-	if complexity > 1 {
-		meta["complexity"] = complexity
-	}
+	ApplyComplexityMeta(meta, complexity, cognitive, loopDepth)
 	result.Nodes = append(result.Nodes, &graph.Node{
 		ID: id, Kind: graph.KindFunction, Name: name,
 		FilePath: filePath, StartLine: startLine1, EndLine: def.EndLine + 1,
