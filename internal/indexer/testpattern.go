@@ -111,6 +111,62 @@ func IsTestSymbol(name, language string) bool {
 	return TestRole(name, language) != ""
 }
 
+// AnnotationTestRole maps a (language, annotation-name) pair to a test
+// role for the languages whose runners discover tests by attribute
+// rather than by file location — Rust's #[test] / #[bench] family and
+// the JVM JUnit / TestNG @Test family. Returns "" when the annotation
+// does not denote a test.
+//
+// The name is the bare attribute path as captured by the extractor (no
+// leading `@` / `#[`). Rust scoped attributes arrive as "tokio::test" /
+// "async_std::test"; JVM annotations may be written fully qualified
+// ("org.junit.jupiter.api.Test"), so the JVM branch matches on the
+// last path segment. This is the signal that lets an inline #[test] fn
+// in a production-path src/foo.rs — or a @Test method in a class whose
+// file name carries no test suffix — classify as a test even though
+// IsTestFile is false for its file.
+func AnnotationTestRole(language, name string) string {
+	if name == "" {
+		return ""
+	}
+	switch language {
+	case "rust":
+		switch {
+		case name == "bench":
+			return "benchmark"
+		case name == "test" || strings.HasSuffix(name, "::test"):
+			// #[test], #[tokio::test], #[async_std::test], #[actix_rt::test], …
+			return "test"
+		case name == "rstest" || name == "test_case" || name == "googletest":
+			return "test"
+		}
+	case "java", "kotlin":
+		short := name
+		if i := strings.LastIndexByte(short, '.'); i >= 0 {
+			short = short[i+1:]
+		}
+		switch short {
+		case "Test", "ParameterizedTest", "RepeatedTest", "TestFactory", "TestTemplate":
+			return "test"
+		}
+	}
+	return ""
+}
+
+// AnnotationTestRunner names the test runner for an annotation-discovered
+// test that lives in a production-path file, where the file-name and
+// import heuristics in detectTestRunnerForFile do not apply. Returns ""
+// for languages without an attribute-driven runner.
+func AnnotationTestRunner(language string) string {
+	switch language {
+	case "rust":
+		return "cargo-test"
+	case "java", "kotlin":
+		return "junit"
+	}
+	return ""
+}
+
 func hasTestPrefix(name string, prefixes ...string) bool {
 	for _, p := range prefixes {
 		if !strings.HasPrefix(name, p) {

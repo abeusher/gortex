@@ -43,6 +43,12 @@ const qCppAll = `
   (preproc_include
     path: (_) @include.path) @include.def
 
+  (preproc_def
+    name: (identifier) @macro.name) @macro.def
+
+  (preproc_function_def
+    name: (identifier) @macrofn.name) @macrofn.def
+
   (call_expression
     function: (identifier) @call.name) @call.expr
 
@@ -123,6 +129,12 @@ func (e *CppExtractor) Extract(filePath string, src []byte) (*parser.ExtractionR
 
 		case m.Captures["include.def"] != nil:
 			e.emitInclude(m, filePath, fileID, result)
+
+		case m.Captures["macro.def"] != nil:
+			emitCMacro(m.Captures["macro.def"].Node, false, filePath, fileID, "cpp", src, result, seen)
+
+		case m.Captures["macrofn.def"] != nil:
+			emitCMacro(m.Captures["macrofn.def"].Node, true, filePath, fileID, "cpp", src, result, seen)
 
 		case m.Captures["callm.expr"] != nil:
 			expr := m.Captures["callm.expr"]

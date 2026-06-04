@@ -124,6 +124,49 @@ void greet(const char* name) {
 	assert.Contains(t, targets, "unresolved::helper")
 }
 
+func TestCExtractor_Macros(t *testing.T) {
+	src := []byte(`#define PI 3.14159
+#define SQUARE(x) ((x) * (x))
+#define LOG(msg) write_log(stderr, msg)
+
+int area(int r) {
+    return SQUARE(r) * PI;
+}
+`)
+	e := NewCExtractor()
+	result, err := e.Extract("calc.c", src)
+	require.NoError(t, err)
+
+	macros := nodesOfKind(result.Nodes, graph.KindMacro)
+	byName := map[string]*graph.Node{}
+	for _, m := range macros {
+		byName[m.Name] = m
+	}
+	require.Contains(t, byName, "PI")
+	assert.Equal(t, "object", byName["PI"].Meta["macro_kind"])
+	require.Contains(t, byName, "SQUARE")
+	assert.Equal(t, "function", byName["SQUARE"].Meta["macro_kind"])
+	require.Contains(t, byName, "LOG")
+
+	// The function-like macro LOG hides a call to write_log; that edge is
+	// recovered from the macro's replacement list. SQUARE's body has no
+	// real call (x is a parameter), so it emits none.
+	var logCalls, squareCalls []string
+	for _, ed := range result.Edges {
+		if ed.Kind != graph.EdgeCalls {
+			continue
+		}
+		switch ed.From {
+		case "calc.c::LOG":
+			logCalls = append(logCalls, ed.To)
+		case "calc.c::SQUARE":
+			squareCalls = append(squareCalls, ed.To)
+		}
+	}
+	assert.Contains(t, logCalls, "unresolved::write_log")
+	assert.Empty(t, squareCalls, "SQUARE body has no hidden call (x is a param)")
+}
+
 func TestCExtractor_GlobalVariable(t *testing.T) {
 	src := []byte(`int max_retries = 3;
 const char* app_name = "test";

@@ -152,6 +152,8 @@ func runMCP(cmd *cobra.Command, args []string) error {
 	reg := parser.NewRegistry()
 	languages.RegisterAll(reg)
 	languages.RegisterCustomGrammars(reg, cfg.Index.Grammars, logger)
+	languages.RegisterExtractorPlugins(reg, cfg.Index.ExtractorPlugins, logger)
+	languages.RegisterFallbackChunkers(reg, cfg.Index.FallbackChunkers, logger)
 
 	idx := indexer.New(g, reg, cfg.Index, logger)
 

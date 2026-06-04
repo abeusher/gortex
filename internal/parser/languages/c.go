@@ -37,6 +37,12 @@ const qCAll = `
   (preproc_include
     path: (_) @include.path) @include.def
 
+  (preproc_def
+    name: (identifier) @macro.name) @macro.def
+
+  (preproc_function_def
+    name: (identifier) @macrofn.name) @macrofn.def
+
   (call_expression
     function: (identifier) @call.name) @call.expr
 
@@ -118,6 +124,12 @@ func (e *CExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRes
 
 		case m.Captures["include.def"] != nil:
 			e.emitInclude(m, filePath, fileID, result)
+
+		case m.Captures["macro.def"] != nil:
+			emitCMacro(m.Captures["macro.def"].Node, false, filePath, fileID, "c", src, result, seen)
+
+		case m.Captures["macrofn.def"] != nil:
+			emitCMacro(m.Captures["macrofn.def"].Node, true, filePath, fileID, "c", src, result, seen)
 
 		case m.Captures["call.expr"] != nil:
 			expr := m.Captures["call.expr"]

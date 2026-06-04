@@ -15,7 +15,11 @@ import (
 //     or "example" when the name matches a per-language convention
 //     (per TestRole), otherwise "test" for plain test support code.
 //     Meta["is_test"] = true is stamped alongside for back-compat with
-//     consumers that only need the boolean.
+//     consumers that only need the boolean. Symbols whose runner
+//     discovers tests by attribute rather than by file location (Rust
+//     #[test], JVM @Test — see AnnotationTestRole) are additionally
+//     stamped from their EdgeAnnotated edges, so an inline #[test] fn
+//     in a production-path file classifies too.
 //
 //  2. Walk every EdgeCalls. For each call whose source is a test
 //     function and whose target is non-test, emit a parallel
@@ -64,21 +68,62 @@ func markTestSymbolsAndEmitEdges(g graph.Store) (markedTests int, edgesEmitted i
 		}
 	}
 
+	// Annotation-driven test detection. Rust (#[test], #[tokio::test],
+	// #[bench]) and JVM JUnit/TestNG (@Test, @ParameterizedTest, …)
+	// runners discover tests by attribute, not by file location. The
+	// language extractors already emit EdgeAnnotated edges to synthetic
+	// annotation nodes (see EmitAnnotationEdge); consult them so an
+	// inline #[test] fn in a production-path src/foo.rs — or a @Test
+	// method in a class whose file name carries no test suffix — gets
+	// the same is_test / test_role / EdgeTests treatment as a function
+	// in a *_test.go file. Without this pass those tests are invisible
+	// to get_test_targets / analyze kind=tests_as_edges / coverage_gaps.
+	annoTestRole := map[string]string{} // symbol node ID → test role
+	annoNodeRole := map[string]string{} // annotation node ID → role (cached resolution)
+	for e := range g.EdgesByKind(graph.EdgeAnnotated) {
+		if e == nil {
+			continue
+		}
+		role, cached := annoNodeRole[e.To]
+		if !cached {
+			if anno := g.GetNode(e.To); anno != nil {
+				role = AnnotationTestRole(anno.Language, anno.Name)
+			}
+			annoNodeRole[e.To] = role
+		}
+		if role == "" {
+			continue
+		}
+		// Prefer the more specific "test" over "benchmark" when a
+		// single symbol carries both (rare).
+		if existing := annoTestRole[e.From]; existing == "" || (existing == "benchmark" && role == "test") {
+			annoTestRole[e.From] = role
+		}
+	}
+
 	testNodes := map[string]bool{}
 	stampTestSymbol := func(n *graph.Node) {
-		if !testFiles[n.FilePath] {
+		inTestFile := testFiles[n.FilePath]
+		var role, runner string
+		switch {
+		case inTestFile:
+			role = TestRole(n.Name, n.Language)
+			if role == "" {
+				role = "test"
+			}
+			runner = fileRunners[n.FilePath]
+		case annoTestRole[n.ID] != "":
+			role = annoTestRole[n.ID]
+			runner = AnnotationTestRunner(n.Language)
+		default:
 			return
-		}
-		role := TestRole(n.Name, n.Language)
-		if role == "" {
-			role = "test"
 		}
 		if n.Meta == nil {
 			n.Meta = map[string]any{}
 		}
 		n.Meta["is_test"] = true
 		n.Meta["test_role"] = role
-		if runner := fileRunners[n.FilePath]; runner != "" {
+		if runner != "" {
 			n.Meta["test_runner"] = runner
 		}
 		testNodes[n.ID] = true

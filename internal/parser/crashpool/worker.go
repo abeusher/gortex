@@ -24,6 +24,8 @@ func RunWorker(r io.Reader, w io.Writer) error {
 	reg := parser.NewRegistry()
 	languages.RegisterAll(reg)
 	registerWorkerGrammars(reg)
+	registerWorkerExtractorPlugins(reg)
+	registerWorkerFallbackChunkers(reg)
 	return serveWorker(reg, r, w)
 }
 
@@ -43,6 +45,40 @@ func registerWorkerGrammars(reg *parser.Registry) {
 		return
 	}
 	languages.RegisterCustomGrammars(reg, specs, nil)
+}
+
+// registerWorkerExtractorPlugins loads the subprocess extractor plugins
+// the parent passed through the GORTEX_EXTRACTOR_PLUGINS environment
+// variable — a JSON array of config.ExtractorPluginSpec — so a
+// crash-isolated worker resolves the same plugin languages as the
+// parent. A malformed or absent value is silently ignored.
+func registerWorkerExtractorPlugins(reg *parser.Registry) {
+	raw := os.Getenv("GORTEX_EXTRACTOR_PLUGINS")
+	if raw == "" {
+		return
+	}
+	var specs []config.ExtractorPluginSpec
+	if err := json.Unmarshal([]byte(raw), &specs); err != nil {
+		return
+	}
+	languages.RegisterExtractorPlugins(reg, specs, nil)
+}
+
+// registerWorkerFallbackChunkers loads the regex fallback chunkers the
+// parent passed through the GORTEX_FALLBACK_CHUNKERS environment
+// variable — a JSON array of config.FallbackChunkerSpec — so a
+// crash-isolated worker resolves the same grammar-less languages as the
+// parent. A malformed or absent value is silently ignored.
+func registerWorkerFallbackChunkers(reg *parser.Registry) {
+	raw := os.Getenv("GORTEX_FALLBACK_CHUNKERS")
+	if raw == "" {
+		return
+	}
+	var specs []config.FallbackChunkerSpec
+	if err := json.Unmarshal([]byte(raw), &specs); err != nil {
+		return
+	}
+	languages.RegisterFallbackChunkers(reg, specs, nil)
 }
 
 // serveWorker is the decode/extract/encode loop, factored out of

@@ -288,10 +288,10 @@ func (e *PythonExtractor) emitFunction(m parser.QueryResult, filePath, fileID st
 	doc := pyDocstringFromDef(def.Node, src)
 	visibility := VisibilityByUnderscore(name)
 	decorators := pyDecoratorNodes(def.Node)
-	complexity := 0
+	complexity, cognitive, loopDepth := 0, 0, 0
 	if def.Node != nil {
 		if body := def.Node.ChildByFieldName("body"); body != nil {
-			complexity = PyComplexity(body)
+			complexity, cognitive, loopDepth = BodyComplexityMetrics(body, "python")
 		}
 	}
 
@@ -314,9 +314,7 @@ func (e *PythonExtractor) emitFunction(m parser.QueryResult, filePath, fileID st
 		if doc != "" {
 			node.Meta["doc"] = doc
 		}
-		if complexity > 1 {
-			node.Meta["complexity"] = complexity
-		}
+		ApplyComplexityMeta(node.Meta, complexity, cognitive, loopDepth)
 		if def.Node != nil {
 			if rt := extractPyReturnType(def.Node, src); rt != "" {
 				node.Meta["return_type"] = rt
@@ -349,9 +347,7 @@ func (e *PythonExtractor) emitFunction(m parser.QueryResult, filePath, fileID st
 	if doc != "" {
 		meta["doc"] = doc
 	}
-	if complexity > 1 {
-		meta["complexity"] = complexity
-	}
+	ApplyComplexityMeta(meta, complexity, cognitive, loopDepth)
 	result.Nodes = append(result.Nodes, &graph.Node{
 		ID: id, Kind: graph.KindFunction, Name: name,
 		FilePath: filePath, StartLine: startLine1, EndLine: def.EndLine + 1,

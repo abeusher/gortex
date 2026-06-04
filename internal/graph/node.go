@@ -211,6 +211,17 @@ const (
 	// pairing artefact produced by the contracts matcher and rides at
 	// the structural ast_resolved tier.
 	KindTopic NodeKind = "topic"
+	// KindMacro represents a C/C++ preprocessor macro defined with
+	// #define — both object-like (`#define PI 3.14`) and function-like
+	// (`#define SQ(x) ((x)*(x))`). ID convention: `<file>::<NAME>`.
+	// Meta["macro_kind"] ∈ object|function; function-like macros carry
+	// Meta["params"] (the parameter names) and Meta["replacement"] (the
+	// replacement-list text). The owning file links via EdgeDefines, and
+	// a function-like macro emits EdgeCalls to the symbols its
+	// replacement list invokes — recovering call edges that would
+	// otherwise be hidden behind macro expansion (a call site `SQ(2)`
+	// resolves to the macro, whose body-calls then continue the chain).
+	KindMacro NodeKind = "macro"
 )
 
 var validNodeKinds = map[NodeKind]bool{
@@ -227,6 +238,7 @@ var validNodeKinds = map[NodeKind]bool{
 	KindRelease: true, KindLicense: true, KindString: true,
 	KindResource: true, KindKustomization: true, KindImage: true,
 	KindArtifact: true, KindDoc: true, KindTopic: true,
+	KindMacro: true,
 }
 
 type Node struct {
