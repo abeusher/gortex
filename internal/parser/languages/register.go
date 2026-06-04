@@ -150,6 +150,14 @@ func RegisterAll(reg *parser.Registry) {
 	// grammar's bundled tags.scm when present and falls back to a
 	// generic node-kind walker otherwise.
 	reg.Register(NewElmExtractor())
+	// Helm semantic layer (named templates, include/template calls,
+	// Chart.yaml chart + dependency graph). Registered before
+	// registerForestLanguages so the hand-written extractor claims
+	// `.tpl` / `.gotmpl` over the generic forest gotmpl grammar (which
+	// is then skipped on those extensions). `Chart.yaml` is a basename
+	// claim that wins over the YAML extractor's `.yaml` extension since
+	// basenames are resolved first.
+	reg.Register(NewHelmExtractor())
 	registerForestLanguages(reg)
 
 	// ObjC registered last so it wins the `.m` extension over Matlab.

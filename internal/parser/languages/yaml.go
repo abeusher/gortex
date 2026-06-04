@@ -1,6 +1,8 @@
 package languages
 
 import (
+	"bytes"
+
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/parser"
 	sitter "github.com/zzet/gortex/internal/parser/tsitter"
@@ -44,6 +46,17 @@ func (e *YAMLExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 		Language: "yaml",
 	}
 	result.Nodes = append(result.Nodes, fileNode)
+
+	// Helm render manifests (templates/*.yaml) embed Go-template
+	// include/template directives. Scan them up front and emit EdgeCalls
+	// into the chart's named templates — this augments, it does not
+	// replace, the normal dispatch below (the file still gets its
+	// resource / config-key nodes). Conservative: only when an
+	// include/template directive is actually present.
+	if bytes.Contains(src, []byte("{{")) &&
+		(bytes.Contains(src, []byte("include")) || bytes.Contains(src, []byte("template"))) {
+		helmTemplateCallsFromYAML(filePath, fileNode.ID, src, result)
+	}
 
 	// Specialised YAML dispatch. Order matters:
 	//   1. Kustomize files have a fixed basename — short-circuit.
