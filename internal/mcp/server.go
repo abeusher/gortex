@@ -220,6 +220,12 @@ type Server struct {
 	combo    *comboManager
 	frecency *frecencyTracker
 
+	// packCache retains recent smart_context pack views keyed by pack
+	// root so a later call with delta_from=<root> returns only the
+	// added/removed/changed symbols vs that prior pack. Always non-nil
+	// after NewServer.
+	packCache *packDeltaCache
+
 	// pprCache memoizes seeded Random-Walk-with-Restart (Personalized
 	// PageRank) results, keyed by content-addressed per-package Merkle
 	// roots so only walks touching a changed package recompute. Shared
@@ -781,6 +787,7 @@ func NewServer(engine *query.Engine, g graph.Store, idx *indexer.Indexer, watche
 		agentReg:   newAgentRegistry(),
 		queryLog:   newQueryLogger(),
 		pprCache:   newPPRWalkCache(),
+		packCache:  newPackDeltaCache(),
 	}
 	// Wire the process-wide tokenStats as the parent of every
 	// per-session counter so record() fanout aggregates daemon-wide.
