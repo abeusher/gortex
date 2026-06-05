@@ -1848,6 +1848,13 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 		relevantSymbols = reordered
 	}
 
+	// Pack strategy: reorder the working set per GORTEX_PACK_STRATEGY
+	// before the count cap / manifest budget fill. The default (top-k,
+	// rank-faithful) is identity, so existing callers are unaffected;
+	// density / file-grouped re-order by token efficiency or file
+	// coherence. This is the same strategy the eval harness A/Bs.
+	relevantSymbols = s.applyPackStrategy(relevantSymbols)
+
 	// 4. Limit to top N most relevant symbols. In graded-fidelity mode
 	// the overflow seeds the manifest's outline tier instead of being
 	// discarded.
