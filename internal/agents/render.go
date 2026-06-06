@@ -5,9 +5,11 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 )
 
 // render.go is the engine behind the skill-render drift fence. It runs
@@ -112,11 +114,45 @@ func manifestForDirs(home, root string) (string, error) {
 	return b.String(), nil
 }
 
-// normalizeRender replaces the sandbox-specific absolute paths with
-// stable placeholders so the manifest is identical on every machine.
+// gortexBinaryPaths memoizes the absolute paths an adapter might bake
+// into its config for the gortex binary — the running process
+// (os.Executable, as the hermes adapter uses) and a PATH lookup. They
+// are normalised to bare "gortex" so the manifest doesn't depend on
+// where this build happens to live (dev box vs CI vs `go test` binary).
+var gortexBinaryPaths = sync.OnceValue(func() []string {
+	seen := map[string]struct{}{}
+	var paths []string
+	add := func(p string) {
+		if p == "" || p == "gortex" {
+			return
+		}
+		if _, dup := seen[p]; dup {
+			return
+		}
+		seen[p] = struct{}{}
+		paths = append(paths, p)
+	}
+	if exe, err := os.Executable(); err == nil {
+		add(exe)
+		if abs, e := filepath.Abs(exe); e == nil {
+			add(abs)
+		}
+	}
+	if p, err := exec.LookPath("gortex"); err == nil {
+		add(p)
+	}
+	return paths
+})
+
+// normalizeRender replaces machine-specific absolutes — the sandbox
+// HOME / repo root and the resolved gortex binary path — with stable
+// placeholders so the manifest is identical on every machine.
 func normalizeRender(s, home, root string) string {
 	s = strings.ReplaceAll(s, home, "$HOME")
 	s = strings.ReplaceAll(s, root, "$ROOT")
+	for _, p := range gortexBinaryPaths() {
+		s = strings.ReplaceAll(s, p, "gortex")
+	}
 	return s
 }
 
