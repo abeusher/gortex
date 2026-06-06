@@ -178,6 +178,7 @@ func (s *Server) registerCodingTools() {
 			mcp.WithNumber("token_budget", mcp.Description("Token ceiling for the graded-fidelity manifest (default 8000). Entries are demoted full → compressed → outline as the budget fills. Ignored unless fidelity is \"graded\".")),
 			mcp.WithBoolean("estimate", mcp.Description("Dry-run: skip assembling the payload and return only a token-cost projection (projected_tokens plus per-tier counts) for the task at the chosen fidelity, so the caller can budget before fetching the real context.")),
 			mcp.WithString("if_none_match", mcp.Description("Pack-root etag from a previous smart_context response. When the recomputed pack root matches — nothing the pack covers has changed — the tool returns not_modified instead of resending the payload, turning a repeated call on an unchanged repo into a near-zero-token no-op.")),
+			mcp.WithString("delta_from", mcp.Description("Pack root (etag) of a prior smart_context pack the caller still holds. Instead of re-emitting the full pack, the tool returns a `pack_delta` block — symbols/files/edges added, removed, or changed vs that prior pack — so an incrementally-shifted working set re-delivers only the diff. When the delta is materially smaller than the full pack the bulky symbol lists are dropped (merge the delta into your held pack); the response's `etag` still identifies the full pack for the next delta_from. If the prior pack is no longer cached the full pack is returned with `pack_delta.available=false`.")),
 			mcp.WithString("format", mcp.Description("Output format: json (default), gcx (GCX1 compact wire format), or toon")),
 			mcp.WithNumber("max_bytes", mcp.Description("Cap the marshaled response at this many bytes. The longest list is trimmed; truncation metadata rides on the response. Omit for no cap.")),
 			mcp.WithString("repo", mcp.Description("Filter results to a specific repository prefix")),
@@ -306,6 +307,9 @@ func (s *Server) handleGetEditingContext(ctx context.Context, req mcp.CallToolRe
 	s.ensureFresh([]string{fp})
 
 	s.sessionFor(ctx).recordFile(fp)
+	// Tool-call observer: credit the recent search for the symbols in
+	// the file the agent is about to edit.
+	s.creditFileConsumption(ctx, fp)
 	out := editingContext{}
 	var fileNodeForScope *graph.Node
 	callerCap := 20
@@ -1755,7 +1759,7 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 	// previously-dropped result back into the embedded slots — not
 	// just append it at the tail.
 	if s.feedback != nil && s.feedback.HasData() {
-		missed := s.feedback.MissedSymbols(3)
+		missed := s.feedback.MissedSymbolsForQuery(task, 3)
 		injected := 0
 		for _, missedID := range missed {
 			if injected >= 2 {
@@ -1812,7 +1816,7 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 			scoredSyms := make([]scored, len(relevantSymbols))
 			for i, sym := range relevantSymbols {
 				baseScore := 1.0 / float64(i+1) // BM25 rank-based score
-				fbScore := s.feedback.GetSymbolScore(sym.ID)
+				fbScore := s.feedback.GetSymbolScoreForQuery(sym.ID, task)
 				scoredSyms[i] = scored{node: sym, score: baseScore + fbScore*0.3}
 			}
 			sort.SliceStable(scoredSyms, func(i, j int) bool {
@@ -1843,6 +1847,13 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 		}
 		relevantSymbols = reordered
 	}
+
+	// Pack strategy: reorder the working set per GORTEX_PACK_STRATEGY
+	// before the count cap / manifest budget fill. The default (top-k,
+	// rank-faithful) is identity, so existing callers are unaffected;
+	// density / file-grouped re-order by token efficiency or file
+	// coherence. This is the same strategy the eval harness A/Bs.
+	relevantSymbols = s.applyPackStrategy(relevantSymbols)
 
 	// 4. Limit to top N most relevant symbols. In graded-fidelity mode
 	// the overflow seeds the manifest's outline tier instead of being
@@ -1906,6 +1917,9 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 		symbolContexts = append(symbolContexts, entry)
 	}
 	result["relevant_symbols"] = symbolContexts
+	// Report the focus-symbol count to the retrieval query log so a
+	// zero-result context assembly is recorded as such.
+	recordQueryResultCount(ctx, len(symbolContexts))
 
 	// 5b1. Graded-fidelity manifest: focus symbols at full source,
 	// their caller/callee adjacency ring as elided signature stubs,
@@ -2053,6 +2067,37 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 		return notModifiedResult(etag), nil
 	}
 	result["etag"] = etag
+
+	// Delta context packing: cache this pack's canonical view under its
+	// root, and when the caller passes a prior root it already holds,
+	// return only the added/removed/changed symbols vs that pack instead
+	// of re-emitting the whole thing. When the delta is materially
+	// smaller than the full pack we drop the bulky symbol lists from the
+	// response (the agent merges the delta into its held pack); the pack
+	// root still identifies the full pack for the next delta_from.
+	currentView := extractPackView(result, true)
+	s.packCache.put(etag, currentView)
+	if deltaFrom := req.GetString("delta_from", ""); deltaFrom != "" {
+		if prior, ok := s.packCache.get(deltaFrom); ok {
+			delta := diffPackViews(prior, currentView, deltaFrom, etag)
+			result["pack_delta"] = delta
+			if worth, _ := delta["worth_it"].(bool); worth {
+				result["delta"] = true
+				delete(result, "relevant_symbols")
+				delete(result, "context_manifest")
+				// The delta is structured JSON; bypass the GCX/TOON
+				// pack encoders, which assume the full pack shape.
+				return mcp.NewToolResultJSON(result)
+			}
+		} else {
+			result["pack_delta"] = map[string]any{
+				"available": false,
+				"base_root": deltaFrom,
+				"new_root":  etag,
+				"reason":    "prior pack not in cache (evicted or never seen) — full pack returned",
+			}
+		}
+	}
 
 	if s.isGCX(ctx, req) {
 		return s.gcxResponseWithBudget(req)(encodeSmartContext(result))

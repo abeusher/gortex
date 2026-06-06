@@ -33,6 +33,17 @@ type AdjacencySnapshot struct {
 	neighbors []int32
 	weights   []float64
 	outWeight []float64
+
+	// pkgRoots maps a package directory (the dir of a node's file path,
+	// ≈ a Go package) to a content hash of that package's contribution
+	// to the walk: every member node's stable ID plus its out-edges
+	// (neighbour IDs + weights). The hash is index-shift invariant — it
+	// uses string IDs, not dense indices — so a package whose subgraph
+	// did not change keeps the same root even when nodes are added or
+	// removed in OTHER packages. This is the per-package Merkle root the
+	// walk cache keys on, so only walks touching a changed package miss.
+	// Empty when the snapshot is empty.
+	pkgRoots map[string]uint64
 }
 
 // NodeCount returns the number of nodes in the snapshot.
@@ -137,6 +148,7 @@ func BuildAdjacencySnapshot(g graph.Store) *AdjacencySnapshot {
 	snap.neighbors = neighbors
 	snap.weights = weights
 	snap.outWeight = outWeight
+	snap.pkgRoots = computePackageRoots(ids, offsets, neighbors, weights)
 	return snap
 }
 

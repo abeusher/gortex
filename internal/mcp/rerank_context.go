@@ -66,7 +66,7 @@ func (s *Server) buildRerankContext(ctx context.Context, query string) *rerank.C
 
 	if s.feedback != nil && s.feedback.HasData() {
 		fb := s.feedback
-		rctx.FeedbackOf = func(id string) float64 { return fb.GetSymbolScore(id) }
+		rctx.FeedbackOf = func(id string) float64 { return fb.GetSymbolScoreForQuery(id, query) }
 	}
 
 	if s.symHistory != nil {
@@ -93,6 +93,19 @@ func (s *Server) buildRerankContext(ctx context.Context, query string) *rerank.C
 				return 0
 			}
 			return hits.HubOf(id) / maxHub
+		}
+	}
+
+	// Centrality: a per-query Random-Walk-with-Restart (Personalized
+	// PageRank) over the call/reference graph, seeded from the query's
+	// strongest candidate matches, feeds ProximitySignal — the graph-
+	// centrality spine of retrieval. The walk runs against the
+	// immutable adjacency snapshot built by RunAnalysis; nil until then
+	// (the signal then sits at 0). The actual walk fires once per
+	// Rerank inside Context.prepare, after the seeds are chosen.
+	if snap := s.getAdjacency(); snap != nil {
+		rctx.Centrality = func(seeds []string) map[string]float64 {
+			return s.personalizedPageRank(snap, seeds)
 		}
 	}
 

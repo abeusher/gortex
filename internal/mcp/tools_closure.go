@@ -201,8 +201,9 @@ func (s *Server) closureProximity(rankMode string, seeds []string) map[string]fl
 	if snap == nil {
 		return nil
 	}
-	// restart 0 -> the snapshot's default restart probability.
-	return snap.PersonalizedPageRank(seeds, 0)
+	// Route through the Merkle-keyed walk cache (restart 0 -> the
+	// snapshot's default restart probability).
+	return s.personalizedPageRank(snap, seeds)
 }
 
 // normalizeClosureFilePath converts a seed file argument into the
