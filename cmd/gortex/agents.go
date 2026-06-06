@@ -70,7 +70,7 @@ func runAgentsRender(cmd *cobra.Command, _ []string) error {
 				return err
 			}
 		}
-		fmt.Fprintf(cmd.OutOrStdout(), "Wrote %d adapter manifests to %s\n", len(names), agentsRenderTarget)
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Wrote %d adapter manifests to %s\n", len(names), agentsRenderTarget)
 	}
 
 	if agentsRenderCheck {
@@ -87,17 +87,17 @@ func runAgentsRender(cmd *cobra.Command, _ []string) error {
 		}
 		if len(problems) > 0 {
 			for _, p := range problems {
-				fmt.Fprintf(cmd.ErrOrStderr(), "drift: %s\n", p)
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "drift: %s\n", p)
 			}
 			return fmt.Errorf("agents render --check failed for %d adapter(s)", len(problems))
 		}
-		fmt.Fprintf(cmd.OutOrStdout(), "OK: all %d adapters render a gortex registration\n", len(names))
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "OK: all %d adapters render a gortex registration\n", len(names))
 		return nil
 	}
 
 	if agentsRenderTarget == "" {
 		for _, n := range names {
-			fmt.Fprintf(cmd.OutOrStdout(), "%-14s %d bytes\n", n, len(manifests[n]))
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%-14s %d bytes\n", n, len(manifests[n]))
 		}
 	}
 	return nil
