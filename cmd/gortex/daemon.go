@@ -249,6 +249,14 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		controller.liveRouter = router
 		logger.Info("daemon: multi-server router wired",
 			zap.Int("servers", len(scfg.Server)), zap.String("local_slug", daemon.LocalServerSentinel))
+		// Federation Option-B (spec-08): when federation.edges is on,
+		// install the evidence prober on the indexer's resolver (so
+		// cross-repo resolution mints proxy edges) and keep the hydrator
+		// for the read path. No-op when the flag is off.
+		if hyd := daemon.WireRemoteStitch(router, state.multiIndexer, state.graph, resolveFederationEdgesConfig(), logger); hyd != nil {
+			state.proxyHydrator = hyd
+			logger.Info("daemon: federation Option-B edges enabled (proxy minting + hydration)")
+		}
 	} else if scfgErr != nil {
 		logger.Warn("daemon: servers.toml load error (running single-server)", zap.Error(scfgErr))
 	}

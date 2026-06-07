@@ -28,6 +28,17 @@ func resolveFederationConfig() daemon.FederationConfig {
 	}
 }
 
+// resolveFederationEdgesConfig loads the federation.edges (Option-B) block
+// from the active config. Returns the zero value (feature off) on a load
+// error.
+func resolveFederationEdgesConfig() config.FederationEdgesConfig {
+	cfg, err := config.Load(cfgFile)
+	if err != nil || cfg == nil {
+		return config.FederationEdgesConfig{}
+	}
+	return cfg.Federation.Edges
+}
+
 // sessionRemoteOverrideSink bridges the MCP session proxy-toggle tools to
 // the daemon's per-session overrides and the live router's roster. It is
 // wired into the shared MCP server at daemon start; the router accessor

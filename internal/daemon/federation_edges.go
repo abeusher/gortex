@@ -12,9 +12,31 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/resolver"
 )
+
+// WireRemoteStitch activates federation Option-B end-to-end when the
+// edges feature is enabled and the router carries a federator: it installs
+// the evidence prober on the MultiIndexer (so cross-repo resolution mints
+// proxy edges) and returns a ProxyHydrator for the read path. Returns nil
+// (a no-op) when the feature is off, the router has no federator, or there
+// is no MultiIndexer — leaving the daemon Option-C-only.
+func WireRemoteStitch(router *Router, mi *indexer.MultiIndexer, g graph.Store, cfg config.FederationEdgesConfig, logger *zap.Logger) *ProxyHydrator {
+	if !cfg.IsEnabled() || router == nil || router.federator == nil || mi == nil || g == nil {
+		return nil
+	}
+	remotes := func() []ServerEntry { return router.EffectiveEnabledRemotes(nil) }
+	timeout := router.federator.cfg.PerRemoteTimeout
+
+	prober := NewProxyEdgeProber(router.federator, remotes, timeout, logger)
+	mi.SetRemoteStitch(prober, cfg.MaxNodes())
+
+	return NewProxyHydrator(g, router.federator.clientFor, remotes,
+		cfg.TTL(), cfg.Depth(), cfg.MaxNodes(), timeout, logger)
+}
 
 // ProxyEdgeProber implements resolver.RemoteDeclarationProber for the
 // Option-B mint path: it asks each enabled remote that advertises the
