@@ -70,7 +70,7 @@ func init() {
 	mcpCmd.Flags().BoolVar(&mcpSemantic, "semantic", false, "enable semantic enrichment (SCIP, go/types, LSP)")
 	mcpCmd.Flags().BoolVar(&mcpNoSemantic, "no-semantic", false, "disable semantic enrichment")
 	mcpCmd.Flags().StringVar(&mcpSemanticMode, "semantic-mode", "typecheck", "Go analysis mode: typecheck or callgraph")
-	mcpCmd.Flags().BoolVar(&mcpNoDaemon, "no-daemon", false, "force embedded server, do not connect to a running daemon")
+	mcpCmd.Flags().BoolVar(&mcpNoDaemon, "no-daemon", false, "deprecated no-op (warns when set); the embedded server is used automatically when no daemon is available")
 	mcpCmd.Flags().BoolVar(&mcpForceProxy, "proxy", false, "require a running daemon and proxy through it (error if unavailable)")
 	rootCmd.AddCommand(mcpCmd)
 }
@@ -100,21 +100,21 @@ func runMCP(cmd *cobra.Command, args []string) error {
 	// Daemon-first: ensure a daemon is up (auto-starting it under a
 	// single-flight lock when GORTEX_AUTOSTART allows), then relay stdio
 	// over its socket. The old stdin-TTY heuristic is gone — behavior is
-	// identical from a terminal or a pipe given the same daemon state.
-	// --no-daemon forces the embedded fallback (deprecated; warned above).
-	if !mcpNoDaemon {
-		switch resolveDaemonDecision() {
-		case daemonReady, daemonAutostarted:
-			ran, proxyErr := runProxy(cmd.Context())
-			if proxyErr != nil {
-				return proxyErr
-			}
-			if ran {
-				return nil
-			}
-			// Lost the daemon between ensure and dial (rare) — fall
-			// through to the embedded server.
+	// identical from a terminal or a pipe given the same daemon state. The
+	// legacy --no-daemon flag is an inert no-op (warned above): whether we
+	// proxy or fall back to the embedded server is decided purely by daemon
+	// presence + GORTEX_AUTOSTART, never by the flag.
+	switch resolveDaemonDecision() {
+	case daemonReady, daemonAutostarted:
+		ran, proxyErr := runProxy(cmd.Context())
+		if proxyErr != nil {
+			return proxyErr
 		}
+		if ran {
+			return nil
+		}
+		// Lost the daemon between ensure and dial (rare) — fall
+		// through to the embedded server.
 	}
 
 	logger := newLogger()
