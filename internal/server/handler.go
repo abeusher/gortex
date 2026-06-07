@@ -61,6 +61,7 @@ type Handler struct {
 	activity      *activityBuffer        // ring buffer of recent graph events
 	overlays      *daemon.OverlayManager // nil when overlay support is off
 	router        *daemon.Router         // nil when single-server (no servers.toml)
+	decision      *daemon.ProxyDecision  // shared peek→route→outcome helper; nil until SetRouter
 	streamable    *streamable.Transport  // nil when the MCP 2026 Streamable HTTP path is off
 	readOnly      bool                   // self-advertised /v1/health write posture
 	capabilities  []string               // self-advertised federation caps; nil => baseline
@@ -167,7 +168,10 @@ func (h *Handler) SetOverlayManager(m *daemon.OverlayManager) { h.overlays = m }
 // remote workspaces proxy via daemon.ServerClient.ProxyTool, local
 // ones fall through to the in-process MCP tool dispatch. Nil
 // disables routing (the legacy single-server behaviour).
-func (h *Handler) SetRouter(r *daemon.Router) { h.router = r }
+func (h *Handler) SetRouter(r *daemon.Router) {
+	h.router = r
+	h.decision = daemon.NewProxyDecision(func() *daemon.Router { return h.router })
+}
 
 // Router returns the currently-wired router (or nil). Exposed so
 // composite wire-ups can share a single router instance across the
@@ -362,24 +366,26 @@ func (h *Handler) handleToolCall(w http.ResponseWriter, r *http.Request) {
 	// the proxied response verbatim. Only the proxy short-circuits
 	// — local routing reuses the legacy code so downstream features
 	// (combo / frecency / session state) keep working unchanged.
-	if h.router != nil {
+	if h.router != nil && h.decision != nil {
 		scope, cwd := h.peekRouteContext(body, r)
-		out, status, rerr := h.router.RouteToolCall(r.Context(), toolName, body, daemon.RouteContext{
-			ScopeOverride: scope,
-			Cwd:           cwd,
-		})
-		if rerr == nil && status > 0 {
-			// Proxied to a remote server; relay the upstream
-			// response.
+		outcome := h.decision.Decide(r.Context(), daemon.RouteInputs{
+			ToolName: toolName,
+			Body:     body,
+			Cwd:      cwd,
+			Scope:    scope,
+		}, nil)
+		if outcome.Proxied {
+			// Proxied to a remote server (or a gate refusal); relay
+			// the response verbatim.
 			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(status)
-			_, _ = w.Write(out)
+			w.WriteHeader(outcome.Status)
+			_, _ = w.Write(outcome.Out)
 			return
 		}
-		if rerr != nil && !errors.Is(rerr, daemon.ErrRouteUnresolved) {
+		if outcome.Err != nil && !errors.Is(outcome.Err, daemon.ErrRouteUnresolved) {
 			h.logger.Warn("router: proxy failed, falling back to local",
 				zap.String("tool", toolName),
-				zap.Error(rerr))
+				zap.Error(outcome.Err))
 		}
 		// Either ErrRouteUnresolved (no remote claims this scope) or
 		// the local-fast path — both fall through to the in-process

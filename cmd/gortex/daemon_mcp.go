@@ -31,13 +31,18 @@ type mcpDispatcher struct {
 	// publish a freshly-built (or torn-down) router live without
 	// racing a concurrent dispatch read.
 	router atomic.Pointer[daemon.Router]
+	// decision is the shared peek→route→outcome helper; it reads the
+	// router through the atomic accessor so a live swap is reflected.
+	decision *daemon.ProxyDecision
 }
 
 func newMCPDispatcher(srv *gortexmcp.Server, mi *indexer.MultiIndexer, logger *zap.Logger) *mcpDispatcher {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
-	return &mcpDispatcher{srv: srv, multiIndexer: mi, logger: logger}
+	d := &mcpDispatcher{srv: srv, multiIndexer: mi, logger: logger}
+	d.decision = daemon.NewProxyDecision(func() *daemon.Router { return d.router.Load() })
+	return d
 }
 
 // SetRouter wires the hybrid-read router into the daemon's MCP
@@ -100,8 +105,8 @@ func (d *mcpDispatcher) Dispatch(ctx context.Context, sess *daemon.Session, fram
 	// frames (initialize, tools/list, notifications) flow through
 	// the local MCPServer below; routing them across a federation
 	// would change semantics that are intentionally machine-local.
-	if rtr := d.router.Load(); rtr != nil {
-		if proxied, ok := d.tryProxyToolCall(ctx, sess, rtr, frame); ok {
+	if d.router.Load() != nil {
+		if proxied, ok := d.tryProxyToolCall(ctx, sess, frame); ok {
 			return proxied, nil
 		}
 	}
@@ -204,7 +209,7 @@ func (d *mcpDispatcher) isCWDTracked(cwd string) bool {
 // (local-fast path), or the proxy itself errors (we let the local
 // path handle it as a fallback so transient network blips don't
 // break the user's session).
-func (d *mcpDispatcher) tryProxyToolCall(ctx context.Context, sess *daemon.Session, rtr *daemon.Router, frame []byte) ([]byte, bool) {
+func (d *mcpDispatcher) tryProxyToolCall(ctx context.Context, sess *daemon.Session, frame []byte) ([]byte, bool) {
 	var peek struct {
 		ID     json.RawMessage `json:"id"`
 		Method string          `json:"method"`
@@ -224,16 +229,18 @@ func (d *mcpDispatcher) tryProxyToolCall(ctx context.Context, sess *daemon.Sessi
 	if err != nil {
 		return nil, false
 	}
-	out, status, rerr := rtr.RouteToolCall(ctx, peek.Params.Name, body, daemon.RouteContext{
-		Cwd:            sess.CWD,
-		ScopeOverride:  scope,
-		EnabledRemotes: rtr.EffectiveEnabledRemotes(sess),
-	})
-	if rerr != nil || status == 0 {
+	outcome := d.decision.Decide(ctx, daemon.RouteInputs{
+		ToolName: peek.Params.Name,
+		Body:     body,
+		Cwd:      sess.CWD,
+		Scope:    scope,
+	}, sess)
+	if !outcome.Proxied {
 		// ErrRouteUnresolved or some other failure — let the local
 		// HandleMessage path take over (the same body works there).
 		return nil, false
 	}
+	out, status := outcome.Out, outcome.Status
 	if status >= 400 {
 		// Surface the upstream error as a JSON-RPC error so the
 		// client sees a structured failure instead of a 4xx that
