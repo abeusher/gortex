@@ -77,10 +77,32 @@ type SharedServerConfig struct {
 	Version        string
 	Embedder       EmbedderRequest
 	BufferPoolMB   uint64
-	SideStoreKey   string // notes/memories partition key (e.g. "daemon")
-	CacheDir       string // notes/memories/notebook root dir
+	SideStores     SideStores
 	ScopeWorkspace string
 	ScopeProject   string
+}
+
+// SideStores configures where the agent-authored knowledge stores
+// persist. Each (dir, repo) pair selects the sidecar DB file (dir, which
+// opens <dir>/sidecar.sqlite) and the partition key (repo, hashed via
+// persistence.RepoCacheKey); an empty dir OR repo yields an in-memory
+// store that never flushes. The zero value therefore makes every store
+// ephemeral — entry points opt into persistence explicitly, encoding
+// whether the server owns one repo (per-repo keying) or many (a
+// workspace-global key).
+type SideStores struct {
+	// NotesDir / NotesRepo back the durable, repo-partitioned notes and
+	// development-memory stores.
+	NotesDir  string
+	NotesRepo string
+	// FeedbackDir / FeedbackRepo back feedback, the combo tracker, and the
+	// frecency tracker (the implicit-signal stores).
+	FeedbackDir  string
+	FeedbackRepo string
+	// NotebookPath is the repository-local notebook root (committed to
+	// git so it travels with the repo); empty leaves the notebook
+	// uninitialised.
+	NotebookPath string
 }
 
 // SharedServer bundles the constructed stack plus the teardown chain.
@@ -389,12 +411,13 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 
 	// Side-stores. The HTTP path previously wired NONE of these; routing it
 	// through the shared constructor adds notes/memories/savings to it.
-	srv.InitFeedback("", "")
-	srv.InitNotes(cfg.CacheDir, cfg.SideStoreKey)
-	srv.InitMemories(cfg.CacheDir, cfg.SideStoreKey)
-	srv.InitNotebook(filepath.Join(cfg.CacheDir, "notebook-cache"))
-	srv.InitCombo("", "", gortexmcp.ModeAI)
-	srv.InitFrecency("", "", gortexmcp.ModeAI)
+	sideCfg := cfg.SideStores
+	srv.InitFeedback(sideCfg.FeedbackDir, sideCfg.FeedbackRepo)
+	srv.InitNotes(sideCfg.NotesDir, sideCfg.NotesRepo)
+	srv.InitMemories(sideCfg.NotesDir, sideCfg.NotesRepo)
+	srv.InitNotebook(sideCfg.NotebookPath)
+	srv.InitCombo(sideCfg.FeedbackDir, sideCfg.FeedbackRepo, gortexmcp.ModeAI)
+	srv.InitFrecency(sideCfg.FeedbackDir, sideCfg.FeedbackRepo, gortexmcp.ModeAI)
 
 	if savingsStore, err := savings.Open(savings.DefaultPath()); err == nil {
 		srv.InitSavings(savingsStore, "")

@@ -136,8 +136,15 @@ func buildDaemonState(logger *zap.Logger) (*daemonState, error) {
 			FlagChanged: daemonEmbeddingsChanged,
 			FlagEnabled: daemonEmbeddings,
 		},
-		SideStoreKey: "daemon",
-		CacheDir:     platform.DataDir(),
+		// Workspace-global side-store layout: notes/memories partition
+		// under the "daemon" key in the shared DataDir sidecar; the
+		// notebook lives in a cache dir (no single repo git tree to
+		// anchor to); feedback/combo/frecency stay ephemeral.
+		SideStores: serverstack.SideStores{
+			NotesDir:     platform.DataDir(),
+			NotesRepo:    "daemon",
+			NotebookPath: filepath.Join(platform.DataDir(), "notebook-cache"),
+		},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("build server stack: %w", err)

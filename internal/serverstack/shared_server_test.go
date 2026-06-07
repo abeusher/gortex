@@ -25,10 +25,9 @@ func TestNewSharedServer_OneshotMemory(t *testing.T) {
 		Lifecycle:    LifecycleOneshot,
 		Index:        repo,
 		Config:       config.Default(),
-		Logger:       zap.NewNop(),
-		Version:      "test",
-		SideStoreKey: "test",
-		CacheDir:     t.TempDir(),
+		Logger:     zap.NewNop(),
+		Version:    "test",
+		SideStores: SideStores{NotesDir: t.TempDir(), NotesRepo: "test"},
 	})
 	if err != nil {
 		t.Fatalf("NewSharedServer: %v", err)
