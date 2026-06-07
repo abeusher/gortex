@@ -292,6 +292,16 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		if !isLocalhostBind(daemonHTTPAddr) && token == "" {
 			return fmt.Errorf("--http-addr %q is non-localhost; --http-auth-token (or $GORTEX_DAEMON_HTTP_TOKEN) is required", daemonHTTPAddr)
 		}
+		// Resolve the expected token per request so $GORTEX_DAEMON_HTTP_TOKEN
+		// can be rotated without restarting the daemon. The flag, when set,
+		// is fixed for the process lifetime and wins; otherwise the env var
+		// is re-read on every request.
+		tokenFn := func() string {
+			if daemonHTTPAuthToken != "" {
+				return daemonHTTPAuthToken
+			}
+			return os.Getenv("GORTEX_DAEMON_HTTP_TOKEN")
+		}
 		// Router was already wired into the dispatcher above; reuse
 		// it here so the streamable transport sees the same proxy
 		// fan-out for cross-workspace tool calls.
@@ -299,7 +309,7 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		if r := disp.Router(); r != nil {
 			router = r
 		}
-		streamH := buildDaemonStreamableHandler(disp, srv.Sessions(), router, logger, token)
+		streamH := buildDaemonStreamableHandler(disp, srv.Sessions(), router, logger, tokenFn)
 
 		// Mount the /v1 REST surface (the former `gortex server`) on the
 		// same listener so a single daemon process serves both the MCP
@@ -321,7 +331,7 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 			v1.SetRouter(router)
 		}
 
-		srv.HTTPHandler = composeDaemonHTTPHandler(streamH, v1, token, daemonHTTPCORSOrigin)
+		srv.HTTPHandler = composeDaemonHTTPHandler(streamH, v1, tokenFn, daemonHTTPCORSOrigin)
 		srv.HTTPAddr = daemonHTTPAddr
 		logger.Info("daemon: HTTP surface configured (/mcp + /v1)",
 			zap.String("addr", daemonHTTPAddr),

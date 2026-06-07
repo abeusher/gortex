@@ -17,7 +17,7 @@ func TestComposeDaemonHTTPHandler(t *testing.T) {
 		_, _ = w.Write([]byte("V1"))
 	})
 
-	h := composeDaemonHTTPHandler(streamH, v1, "secret", "*")
+	h := composeDaemonHTTPHandler(streamH, v1, func() string { return "secret" }, "*")
 
 	// /mcp (and any non-/v1 path) routes to the streamable surface.
 	t.Run("mcp routes to streamable", func(t *testing.T) {
@@ -64,7 +64,7 @@ func TestComposeDaemonHTTPHandler(t *testing.T) {
 // CORS wrapper (no header injected).
 func TestComposeDaemonHTTPHandler_NoCORS(t *testing.T) {
 	v1 := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {})
-	h := composeDaemonHTTPHandler(http.NewServeMux(), v1, "", "")
+	h := composeDaemonHTTPHandler(http.NewServeMux(), v1, func() string { return "" }, "")
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/v1/health", nil)
 	req.Header.Set("Origin", "https://app.example.com")
