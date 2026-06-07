@@ -89,11 +89,6 @@ type daemonState struct {
 	shared *serverstack.SharedServer
 }
 
-// isFalsyEnv returns true when the env var is explicitly set to one
-// of the "no" spellings: "0", "false", "no", "off", "n". An unset or
-// empty env returns false (default-on semantics for opt-out flags).
-func isFalsyEnv(name string) bool { return serverstack.IsFalsyEnv(name) }
-
 // lspDisabledSet builds the set of LSP spec names that should NOT be
 // auto-registered by Router.RegisterAvailable. Two inputs are merged:
 //
