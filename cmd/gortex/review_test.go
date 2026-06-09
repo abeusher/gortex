@@ -38,6 +38,7 @@ func newReviewTestCmd(t *testing.T) (*cobra.Command, *bytes.Buffer) {
 	reviewDiff = ""
 	reviewUseLLM = false
 	reviewFormat = "text"
+	reviewAudience = "human"
 	reviewRepo = ""
 	reviewPost = false
 	reviewPR = 0
@@ -87,6 +88,35 @@ func TestReviewCLI_RendersVerdictAndFindings(t *testing.T) {
 	require.Contains(t, out, "query in loop")
 	// Files are rendered in sorted order: handler.go before loop.go.
 	require.Less(t, strings.Index(out, "handler.go"), strings.Index(out, "loop.go"))
+}
+
+// TestReviewCLI_AudienceAgent asserts --audience agent renders the terse,
+// machine-first summary (one-line VERDICT, compact finding lines, a cost line)
+// instead of the readable per-file packet.
+func TestReviewCLI_AudienceAgent(t *testing.T) {
+	orig := reviewDaemonTool
+	t.Cleanup(func() { reviewDaemonTool = orig })
+	reviewDaemonTool = func(string, string, map[string]any) (json.RawMessage, error) {
+		return json.RawMessage(cannedReviewJSON), nil
+	}
+
+	cmd, buf := newReviewTestCmd(t)
+	reviewAudience = "agent"
+	require.NoError(t, runReview(cmd, nil))
+
+	out := buf.String()
+	// Terse one-line verdict with the severity histogram.
+	require.True(t, strings.HasPrefix(out, "VERDICT: block (1 error, 1 warning)\n"),
+		"agent audience must lead with the terse VERDICT line, got:\n%s", out)
+	// Compact per-finding lines: file:line severity rule — message.
+	require.Contains(t, out, "internal/svc/handler.go:7 error go-inverted-err-check — inverted error check")
+	require.Contains(t, out, "internal/svc/loop.go:12 warning go-loop-query-call — query in loop")
+	// A cost line is always present (zero block when the wire carries no cost).
+	require.Contains(t, out, "cost: in=0 out=0")
+	// The readable human packet markers must NOT appear.
+	require.NotContains(t, out, "Verdict: BLOCK")
+	require.NotContains(t, out, "File risk:")
+	require.NotContains(t, out, "Findings (")
 }
 
 // TestReviewCLI_FormatJSON asserts --format json round-trips the structured

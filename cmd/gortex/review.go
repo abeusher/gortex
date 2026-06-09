@@ -9,6 +9,8 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+
+	"github.com/zzet/gortex/internal/review"
 )
 
 var (
@@ -17,6 +19,7 @@ var (
 	reviewDiff          string
 	reviewUseLLM        bool
 	reviewFormat        string
+	reviewAudience      string
 	reviewRepo          string
 	reviewPost          bool
 	reviewPR            int
@@ -54,6 +57,7 @@ func init() {
 	reviewCmd.Flags().StringVarP(&reviewDiff, "diff", "d", "", "review a pasted unified diff from a file (\"-\" for stdin) instead of git")
 	reviewCmd.Flags().BoolVar(&reviewUseLLM, "use-llm", false, "fold in LLM-found findings (requires a configured LLM provider)")
 	reviewCmd.Flags().StringVarP(&reviewFormat, "format", "f", "text", "output format: text or json")
+	reviewCmd.Flags().StringVar(&reviewAudience, "audience", "human", "text-render audience: human (readable packet) or agent (terse machine-first summary); --format json overrides")
 	reviewCmd.Flags().StringVar(&reviewRepo, "repo", "", "repository path the daemon must track (default: current directory)")
 	reviewCmd.Flags().BoolVar(&reviewPost, "post", false, "post the findings as inline comments on a PR (requires --pr); secrets are redacted before egress")
 	reviewCmd.Flags().IntVar(&reviewPR, "pr", 0, "the PR / MR number to post comments on (with --post)")
@@ -180,8 +184,64 @@ type reviewPayloadCLI struct {
 		Risk     string `json:"risk"`
 		Findings int    `json:"findings"`
 	} `json:"file_risk"`
+	Depth string `json:"depth"`
+	Cost  *struct {
+		InputTokens      int     `json:"input_tokens"`
+		OutputTokens     int     `json:"output_tokens"`
+		CacheReadTokens  int     `json:"cache_read_tokens"`
+		CacheWriteTokens int     `json:"cache_write_tokens"`
+		USD              float64 `json:"usd"`
+		Estimated        bool    `json:"estimated"`
+		ElapsedMs        int64   `json:"elapsed_ms"`
+	} `json:"cost"`
 	// degradation / error shape
 	Error string `json:"error"`
+}
+
+// reviewReportFromPayload reconstructs the canonical review.ReviewReport from the
+// daemon's wire payload so the CLI can drive review.RenderSummary — the single
+// source of truth for both the human and agent renderings. The wire uses
+// `comments` for the findings and `risk` strings for the per-file ranking; this
+// rebuilds the Finding / FileRisk / CostBreakdown shapes the renderer consumes.
+func reviewReportFromPayload(p reviewPayloadCLI) *review.ReviewReport {
+	report := &review.ReviewReport{
+		Verdict: review.Verdict(p.Verdict),
+		Summary: p.Summary,
+		Depth:   p.Depth,
+	}
+	if report.Verdict == "" {
+		report.Verdict = review.VerdictApprove
+	}
+	for _, c := range p.Comments {
+		report.Findings = append(report.Findings, review.Finding{
+			File:     c.File,
+			Line:     c.Line,
+			Severity: review.Severity(c.Severity),
+			Message:  c.Message,
+			Rule:     c.Rule,
+			Category: c.Category,
+			Source:   c.Source,
+		})
+	}
+	for _, fr := range p.FileRisk {
+		report.FileRisk = append(report.FileRisk, review.FileRisk{
+			File:     fr.File,
+			Risk:     fr.Risk,
+			Findings: fr.Findings,
+		})
+	}
+	if p.Cost != nil {
+		report.Cost = &review.CostBreakdown{
+			InputTokens:      p.Cost.InputTokens,
+			OutputTokens:     p.Cost.OutputTokens,
+			CacheReadTokens:  p.Cost.CacheReadTokens,
+			CacheWriteTokens: p.Cost.CacheWriteTokens,
+			USD:              p.Cost.USD,
+			Estimated:        p.Cost.Estimated,
+			ElapsedMs:        p.Cost.ElapsedMs,
+		}
+	}
+	return report
 }
 
 // printReview renders the verdict, summary, per-file risk, and the line-anchored
@@ -195,6 +255,15 @@ func printReview(cmd *cobra.Command, raw json.RawMessage) error {
 	}
 	if p.Error != "" {
 		_, _ = fmt.Fprintf(out, "review failed: %s\n", p.Error)
+		return nil
+	}
+
+	// The agent audience renders the terse, machine-first summary from the
+	// canonical review renderer so the CLI and any sub-agent shelling the verb
+	// see byte-identical output. The human audience keeps the readable per-file
+	// packet below.
+	if strings.EqualFold(reviewAudience, "agent") {
+		_, _ = io.WriteString(out, review.RenderSummary(reviewReportFromPayload(p), review.AudienceAgent))
 		return nil
 	}
 

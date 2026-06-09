@@ -90,6 +90,7 @@ var SlashCommands = map[string]string{
 	"gortex-quality-audit.md":          commandQualityAudit,
 	"gortex-architecture-review.md":    commandArchitectureReview,
 	"gortex-pr-review.md":              commandPRReview,
+	"gortex-pr-review-agent.md":        commandPRReviewAgent,
 }
 
 // GlobalSkills maps the directory name under ~/.claude/skills/ to
@@ -209,6 +210,12 @@ name: gortex-pr-review
 description: "Use when the user wants a code-review pass on a pending change — local staged diff, a branch about to merge, or a PR they're reading. Walks the diff through the graph so comments are grounded in real callers / contracts / coverage / guards, not style nitpicks. Enforces detect_changes / diff_context / explain_change_impact / verify_change / contracts check / check_guards / analyze would_create_cycle|coverage_gaps / get_test_targets / find_clones dead_only / preview_edit on high-risk changes / surface_memories on touched symbols / export_context. Examples: \"Review this PR\", \"What does this staged diff break?\", \"Do a graph-grounded review of this change\""
 ---
 ` + commandPRReview,
+
+	"gortex-pr-review-agent": `---
+name: gortex-pr-review-agent
+description: "Use when you are a coding agent that needs a graph-grounded review verdict on a pending change without hand-walking the review gates. Shell the review verb once — gortex review --audience agent (add --format json for structured output) — and act on the terse one-line verdict + compact file:line findings + cost. Block means fix every critical/error finding and re-run until it clears. Examples: \"Review my change and tell me if it's safe to merge\", \"Run the review verb and act on the findings\", \"Get a terse review verdict for this diff\""
+---
+` + commandPRReviewAgent,
 }
 
 const commandGuide = `# Gortex Guide
@@ -1679,4 +1686,65 @@ If the diff is in the working tree (or a feature branch checked out), ` + "`dete
 - ` + "`surface_memories`" + ` on the touched symbols before finalising the review — a diff that contradicts a pinned invariant is a blocker, not a nit
 - ` + "`export_context format=markdown`" + ` for the structured review block; never hand the user a stream-of-consciousness comment
 - Cross-repo PRs: ` + "`contracts({action: check})`" + ` + ` + "`analyze kind=cross_repo`" + ` + ` + "`get_test_targets`" + ` (cross-repo aware)
+`
+
+const commandPRReviewAgent = `# PR Review as a sub-agent (shell the review verb)
+
+Use this when you are a coding agent (Codex / Claude Code / any CLI agent) and need a graph-grounded review verdict on a pending change **without** hand-walking the ten review gates yourself. Instead of orchestrating ` + "`detect_changes`" + ` / ` + "`diff_context`" + ` / ` + "`verify_change`" + ` / … one call at a time, shell the ` + "`gortex review`" + ` verb once and act on its terse, machine-first output.
+
+The review engine runs the deterministic correctness rulepack, grounds every finding to an exact ` + "`file:line`" + `, optionally folds in LLM findings, gates by confidence / severity, and prints a verdict — all server-side. You consume the result.
+
+## Run the verb
+
+` + "```bash" + `
+# Terse, prose-free summary an agent can parse (one-line verdict + compact findings + cost):
+gortex review --audience agent
+
+# The same review as structured JSON when you want to branch on fields programmatically:
+gortex review --audience agent --format json
+` + "```" + `
+
+Select the changeset the same way a human would:
+
+- ` + "`--scope unstaged|staged|all|compare`" + ` — which working-tree changes to review (default ` + "`unstaged`" + `)
+- ` + "`--base <ref>`" + ` — review everything since a base ref (shorthand for compare)
+- ` + "`--diff <file>`" + ` (or ` + "`--diff -`" + ` for stdin) — review a pasted unified diff instead of git
+- ` + "`--use-llm`" + ` — additionally fold in LLM-found findings (needs a configured provider)
+- ` + "`--repo <path>`" + ` — the repo the daemon tracks (default: current directory)
+
+A daemon that tracks the repo must be running (` + "`gortex daemon status`" + `). The verb relays to the daemon; you never start the engine yourself.
+
+## Read the terse output
+
+` + "`--audience agent`" + ` prints exactly three things, no narrative:
+
+` + "```" + `
+VERDICT: block (1 critical, 2 error)
+findings:
+  internal/svc/handler.go:7 error go-inverted-err-check — inverted error check
+  internal/svc/loop.go:12 warning go-loop-query-call — query in loop
+cost: in=1234 out=456 cache_r=2000 cache_w=0 usd=0.012000 elapsed=4.2s
+` + "```" + `
+
+- **Line 1** is the verdict — ` + "`block`" + ` / ` + "`review`" + ` / ` + "`approve`" + ` — with the kept-finding severity histogram in parentheses.
+- The **findings** block has one compact line per finding: ` + "`file:line severity rule — message`" + `. Each is anchored to a real new-side line, so you can open the file at that line directly.
+- The **cost** line is the per-review token + USD accounting.
+
+## Act on the verdict
+
+| Verdict | What to do |
+| ------- | ---------- |
+| ` + "`block`" + `  | Do **not** merge / proceed. Fix every ` + "`critical`" + ` / ` + "`error`" + ` finding at its ` + "`file:line`" + `, then re-run ` + "`gortex review --audience agent`" + ` until the verdict clears. |
+| ` + "`review`" + ` | Address the ` + "`warning`" + ` findings or justify each one in the PR thread before merging. |
+| ` + "`approve`" + ` | No blocking findings — proceed. |
+
+When you want the full reasoning behind a verdict (per-file risk, contracts, guards, coverage), drop the ` + "`--audience agent`" + ` flag for the readable human packet, or use the ` + "`/gortex-pr-review`" + ` playbook to walk the ten gates by hand.
+
+## Checklist
+
+- ` + "`gortex daemon status`" + ` first — the verb needs a daemon tracking the repo
+- ` + "`gortex review --audience agent`" + ` for the terse, parseable summary; add ` + "`--format json`" + ` to branch on fields
+- Open each finding at its printed ` + "`file:line`" + ` — the anchor is exact, not approximate
+- On ` + "`block`" + `, fix and **re-run the verb** until it clears; do not merge a blocking verdict
+- Escalate to the human packet (drop ` + "`--audience agent`" + `) or ` + "`/gortex-pr-review`" + ` when you need the full gate-by-gate reasoning
 `
