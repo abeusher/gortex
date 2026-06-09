@@ -1928,3 +1928,52 @@ func encodePRRisk(result map[string]any) ([]byte, error) {
 
 	return buf.Bytes(), nil
 }
+
+// encodeSuggestReviewers encodes the suggest_reviewers payload as GCX1: a
+// one-row summary section plus a per-reviewer row section. The map shape is
+// whatever suggestReviewersPayload built, so JSON and GCX stay a single source
+// of truth for field names.
+func encodeSuggestReviewers(result map[string]any) ([]byte, error) {
+	var buf bytes.Buffer
+
+	total, _ := result["total"].(int)
+	changedFiles, _ := result["changed_files"].(int)
+	codeownersFound, _ := result["codeowners_found"].(bool)
+
+	sumEnc := newGCX(&buf, "suggest_reviewers.summary",
+		[]string{"total", "changed_files", "codeowners_found"},
+	)
+	if err := sumEnc.WriteRow(total, changedFiles, codeownersFound); err != nil {
+		return nil, err
+	}
+	if err := sumEnc.Close(); err != nil {
+		return nil, err
+	}
+
+	revEnc := newGCX(&buf, "suggest_reviewers.reviewers",
+		[]string{"reviewer", "kind", "score", "reasons", "matched_files"},
+	)
+	if reviewers, ok := result["reviewers"].([]map[string]any); ok {
+		for _, r := range reviewers {
+			reviewer, _ := r["reviewer"].(string)
+			kind, _ := r["kind"].(string)
+			score, _ := r["score"].(int)
+			reasons, _ := r["reasons"].([]string)
+			matched, _ := r["matched_files"].([]string)
+			if err := revEnc.WriteRow(
+				reviewer,
+				kind,
+				score,
+				strings.Join(reasons, "; "),
+				strings.Join(matched, ","),
+			); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if err := revEnc.Close(); err != nil {
+		return nil, err
+	}
+
+	return buf.Bytes(), nil
+}
