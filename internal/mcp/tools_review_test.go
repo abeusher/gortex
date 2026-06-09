@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -17,6 +18,7 @@ import (
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/parser/languages"
 	"github.com/zzet/gortex/internal/query"
+	"github.com/zzet/gortex/internal/review"
 )
 
 // siblingDiffGitRepo creates a git repo with a base commit and a HEAD commit
@@ -250,6 +252,219 @@ func TestSiblingDiffContext_GCXAndTOONAndBudget(t *testing.T) {
 	toon := callSiblingDiff(t, srv, toonArgs)
 	require.False(t, toon.IsError)
 	require.Contains(t, toon.Content[0].(mcplib.TextContent).Text, "total")
+}
+
+// reviewGitRepo creates a git repo whose HEAD commit introduces a function with
+// a planted review-rule violation: an inverted error check
+// (`if err == nil { return err }`) that the go-inverted-err-check detector flags
+// at error severity. Returns the repo root and the changed file path.
+func reviewGitRepo(t *testing.T) (root, file string) {
+	t.Helper()
+	dir := t.TempDir()
+	run := func(args ...string) {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t",
+			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t",
+		)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	run("init", "-b", "main")
+	run("config", "user.email", "t@t")
+	run("config", "user.name", "t")
+	run("config", "diff.noprefix", "false")
+
+	file = filepath.Join("internal", "svc", "handler.go")
+	write := func(rel, src string) {
+		abs := filepath.Join(dir, rel)
+		require.NoError(t, os.MkdirAll(filepath.Dir(abs), 0o755))
+		require.NoError(t, os.WriteFile(abs, []byte(src), 0o644))
+	}
+	write(file, "package svc\n\nfunc Load() error {\n\treturn nil\n}\n")
+	run("add", ".")
+	run("commit", "-m", "base")
+	run("tag", "base-ref")
+
+	// HEAD commit rewrites Load to carry the inverted err-check bug.
+	write(file, "package svc\n\nimport \"errors\"\n\n"+
+		"func Load() error {\n"+
+		"\terr := errors.New(\"boom\")\n"+
+		"\tif err == nil {\n"+
+		"\t\treturn err\n"+
+		"\t}\n"+
+		"\treturn nil\n"+
+		"}\n")
+	run("add", ".")
+	run("commit", "-m", "change")
+	return dir, file
+}
+
+func callReview(t *testing.T, srv *Server, args map[string]any) *mcplib.CallToolResult {
+	t.Helper()
+	req := mcplib.CallToolRequest{}
+	req.Params.Name = "review"
+	req.Params.Arguments = args
+	res, err := srv.handleReview(t.Context(), req)
+	require.NoError(t, err)
+	return res
+}
+
+type reviewOut struct {
+	Verdict  string `json:"verdict"`
+	Summary  string `json:"summary"`
+	Total    int    `json:"total"`
+	Comments []struct {
+		File     string `json:"file"`
+		Line     int    `json:"line"`
+		Severity string `json:"severity"`
+		Message  string `json:"message"`
+		Rule     string `json:"rule"`
+		Category string `json:"category"`
+		Source   string `json:"source"`
+	} `json:"comments"`
+	FileRisk []struct {
+		File     string `json:"file"`
+		Risk     string `json:"risk"`
+		Findings int    `json:"findings"`
+	} `json:"file_risk"`
+}
+
+func decodeReview(t *testing.T, res *mcplib.CallToolResult) reviewOut {
+	t.Helper()
+	require.False(t, res.IsError, "errored: %v", res)
+	var out reviewOut
+	require.NoError(t, json.Unmarshal([]byte(res.Content[0].(mcplib.TextContent).Text), &out))
+	return out
+}
+
+// TestReview_RulepackFindingAndVerdict asserts the review tool runs the
+// deterministic rulepack over the changeset, returns a line-anchored finding for
+// the planted inverted-err-check, and reports a BLOCK verdict (error severity).
+func TestReview_RulepackFindingAndVerdict(t *testing.T) {
+	dir, file := reviewGitRepo(t)
+	srv := indexedSiblingServer(t, dir)
+
+	out := decodeReview(t, callReview(t, srv, map[string]any{
+		"base": "base-ref",
+	}))
+
+	require.Equal(t, "BLOCK", out.Verdict, "an error-severity finding must block")
+	require.GreaterOrEqual(t, out.Total, 1, "the planted inverted-err-check must be flagged")
+
+	var found bool
+	for _, c := range out.Comments {
+		if c.Rule == "go-inverted-err-check" {
+			found = true
+			require.Equal(t, filepath.ToSlash(file), filepath.ToSlash(c.File))
+			require.Greater(t, c.Line, 0, "the finding must be anchored to a real line")
+			require.Equal(t, "error", c.Severity)
+			require.Equal(t, "rulepack", c.Source)
+		}
+	}
+	require.True(t, found, "expected a go-inverted-err-check finding; got %+v", out.Comments)
+
+	// The file carries a risk row.
+	require.NotEmpty(t, out.FileRisk)
+}
+
+// TestReview_UseLLMAddsFinding drives the LLM phase through the test-only seam:
+// a stubbed gen returns a candidate whose snippet appears verbatim in the
+// change, so it relocates to a real line and joins the report as an LLM finding.
+func TestReview_UseLLMAddsFinding(t *testing.T) {
+	dir, file := reviewGitRepo(t)
+	srv := indexedSiblingServer(t, dir)
+
+	// The stub gen returns one candidate anchored to a verbatim change line.
+	srv.reviewLLMGenOverride = func() review.LLMGen {
+		return func(_ context.Context, _ string, _ int) (string, error) {
+			return `[{"file":"` + filepath.ToSlash(file) + `",` +
+				`"snippet":"err := errors.New(\"boom\")",` +
+				`"message":"prefer fmt.Errorf for wrapping","severity":"warning","category":"idiom"}]`, nil
+		}
+	}
+
+	out := decodeReview(t, callReview(t, srv, map[string]any{
+		"base":    "base-ref",
+		"use_llm": true,
+	}))
+
+	var llmFound bool
+	for _, c := range out.Comments {
+		if c.Source == "llm" {
+			llmFound = true
+			require.Equal(t, filepath.ToSlash(file), filepath.ToSlash(c.File))
+			require.Greater(t, c.Line, 0, "LLM finding must relocate to a real line")
+			require.Equal(t, "prefer fmt.Errorf for wrapping", c.Message)
+		}
+	}
+	require.True(t, llmFound, "the stubbed LLM finding must join the report; got %+v", out.Comments)
+}
+
+// TestReview_PastedDiff reviews a pasted unified diff off-disk (no git command).
+func TestReview_PastedDiff(t *testing.T) {
+	dir, _ := reviewGitRepo(t)
+	srv := indexedSiblingServer(t, dir)
+
+	diff := "diff --git a/x.go b/x.go\n" +
+		"--- a/x.go\n+++ b/x.go\n" +
+		"@@ -1,1 +1,2 @@\n package x\n+var Added = 1\n"
+	out := decodeReview(t, callReview(t, srv, map[string]any{
+		"diff": diff,
+	}))
+	// A pasted diff with no rule violation approves; the file appears in risk.
+	require.Equal(t, "APPROVE", out.Verdict)
+	require.NotNil(t, out.Comments)
+}
+
+// TestReview_GCXAndTOONAndBudget covers the wire-format + budget contract.
+func TestReview_GCXAndTOONAndBudget(t *testing.T) {
+	dir, _ := reviewGitRepo(t)
+	srv := indexedSiblingServer(t, dir)
+
+	base := map[string]any{"base": "base-ref"}
+
+	gcxArgs := map[string]any{"format": "gcx"}
+	for k, v := range base {
+		gcxArgs[k] = v
+	}
+	gcx := callReview(t, srv, gcxArgs)
+	require.False(t, gcx.IsError)
+	gtext := gcx.Content[0].(mcplib.TextContent).Text
+	require.Contains(t, gtext, "review.summary")
+	require.Contains(t, gtext, "review.comments")
+
+	budgetArgs := map[string]any{"format": "gcx", "max_bytes": float64(120)}
+	for k, v := range base {
+		budgetArgs[k] = v
+	}
+	budgeted := callReview(t, srv, budgetArgs)
+	require.False(t, budgeted.IsError)
+	require.LessOrEqual(t, len(budgeted.Content[0].(mcplib.TextContent).Text), 600)
+
+	toonArgs := map[string]any{"format": "toon"}
+	for k, v := range base {
+		toonArgs[k] = v
+	}
+	toon := callReview(t, srv, toonArgs)
+	require.False(t, toon.IsError)
+	require.Contains(t, toon.Content[0].(mcplib.TextContent).Text, "verdict")
+}
+
+// TestReview_RegisteredEagerly asserts the review tool is in the eager set.
+func TestReview_RegisteredEagerly(t *testing.T) {
+	require.True(t, hotEagerTools["review"],
+		"review must be eagerly registered (hot), not deferred")
+
+	t.Setenv("GORTEX_LAZY_TOOLS", "1")
+	srv, _ := setupTestServer(t)
+	live := srv.mcpServer.ListTools()
+	require.Contains(t, live, "review",
+		"eager review tool must appear in tools/list without tools_search expansion")
+	require.False(t, srv.lazy.IsDeferred("review"),
+		"review must not be deferred")
 }
 
 // TestSiblingDiffContext_RegisteredEagerly asserts the review-engine tool is in

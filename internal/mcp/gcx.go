@@ -2199,6 +2199,62 @@ func encodeSiblingDiffContext(result map[string]any) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// encodeReview renders the review tool's verdict envelope + line-anchored
+// inline comments + per-file risk into GCX1: a one-row summary section, a
+// comments row-section, and a file-risk row-section.
+func encodeReview(result map[string]any) ([]byte, error) {
+	var buf bytes.Buffer
+
+	verdict, _ := result["verdict"].(string)
+	summary, _ := result["summary"].(string)
+	total, _ := result["total"].(int)
+	sumEnc := newGCX(&buf, "review.summary", []string{"verdict", "total", "summary"})
+	if err := sumEnc.WriteRow(verdict, total, summary); err != nil {
+		return nil, err
+	}
+	if err := sumEnc.Close(); err != nil {
+		return nil, err
+	}
+
+	comEnc := newGCX(&buf, "review.comments",
+		[]string{"file", "line", "severity", "category", "rule", "source", "message"},
+	)
+	if comments, ok := result["comments"].([]map[string]any); ok {
+		for _, c := range comments {
+			file, _ := c["file"].(string)
+			line, _ := c["line"].(int)
+			severity, _ := c["severity"].(string)
+			category, _ := c["category"].(string)
+			rule, _ := c["rule"].(string)
+			source, _ := c["source"].(string)
+			message, _ := c["message"].(string)
+			if err := comEnc.WriteRow(file, line, severity, category, rule, source, message); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if err := comEnc.Close(); err != nil {
+		return nil, err
+	}
+
+	riskEnc := newGCX(&buf, "review.file_risk", []string{"file", "risk", "findings"})
+	if risks, ok := result["file_risk"].([]map[string]any); ok {
+		for _, r := range risks {
+			file, _ := r["file"].(string)
+			risk, _ := r["risk"].(string)
+			findings, _ := r["findings"].(int)
+			if err := riskEnc.WriteRow(file, risk, findings); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if err := riskEnc.Close(); err != nil {
+		return nil, err
+	}
+
+	return buf.Bytes(), nil
+}
+
 // joinInts renders a slice of ints as a comma-joined string for GCX1
 // scalar columns that carry a small list (e.g. colliding PR numbers).
 func joinInts(xs []int) string {

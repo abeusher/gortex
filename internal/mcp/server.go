@@ -26,6 +26,7 @@ import (
 	"github.com/zzet/gortex/internal/llm/svc"
 	"github.com/zzet/gortex/internal/platform"
 	"github.com/zzet/gortex/internal/query"
+	"github.com/zzet/gortex/internal/review"
 	"github.com/zzet/gortex/internal/savings"
 	"github.com/zzet/gortex/internal/search"
 	"github.com/zzet/gortex/internal/semantic"
@@ -290,12 +291,18 @@ type Server struct {
 	// leaves it nil so the live server is used.
 	resourcesNotifier resourcesUpdatedNotifier
 
+	// reviewLLMGenOverride substitutes the review tool's LLM re-location
+	// seam. Test-only: production leaves it nil and reviewLLMGen builds the
+	// closure over llmService.Generate. A non-nil override is returned
+	// directly (gated on use_llm) so a test can drive the LLM review phase
+	// without constructing a real provider.
+	reviewLLMGenOverride func() review.LLMGen
+
 	// proxyHydrate is the cross-daemon proxy-edge lazy hydration hook.
 	// nil unless the daemon installed one (federation.edges on); the
 	// traversal tools call it to pull a proxy node's neighbour ring before
 	// crossing into it. See proxy_hydrate.go.
 	proxyHydrate func(ctx context.Context, proxyID string) (int, error)
-
 
 	// toolScopes is the per-Server tool-name → ToolScope registry.
 	// Populated by registerToolWithScope as tools are added; consulted

@@ -69,6 +69,7 @@ var hotEagerTools = map[string]bool{
 	// the first turn of a review task; a discovery round-trip would regress
 	// that hot path. Registered as a group by registerReviewTools.
 	"sibling_diff_context": true,
+	"review":               true,
 }
 
 // LazyToolsSearchName is the well-known name of the discovery tool the
