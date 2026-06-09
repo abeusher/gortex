@@ -409,3 +409,145 @@ func dedupStrings(in []string) []string {
 func roundPR(v float64) float64 {
 	return float64(int64(v*100+0.5)) / 100
 }
+
+// receiptVersion is the on-the-wire schema version of a ReviewReceipt. Bump it
+// only on a breaking field change so a consumer can refuse an unknown shape.
+const receiptVersion = 1
+
+// receiptSpanSplit is the community-span count at or above which a change is
+// considered cross-cutting enough that splitting the PR is the next safe
+// action (when nothing more urgent applies).
+const receiptSpanSplit = 3
+
+// next_safe_action vocabulary. A small, fixed enum so the receipt carries a
+// machine-actionable verdict with no free-form text that could leak context.
+const (
+	actionAddTests       = "add-tests"
+	actionSplitPR        = "split-pr"
+	actionReviewSecurity = "review-security"
+	actionMergeReady     = "merge-ready"
+)
+
+// blocker_reason vocabulary. A fixed enum so the receipt never embeds a path,
+// symbol ID, or any caller-supplied free text in the reason — safe to share.
+const (
+	blockerCIFailure      = "ci-failure"
+	blockerCriticalRisk   = "critical-risk"
+	blockerBreakingChange = "breaking-change"
+)
+
+// ReceiptFactor is the privacy-safe projection of a PRRiskFactor: only the
+// axis name and its 0-100 score. The human-readable Reason is deliberately
+// dropped — it can mention changed symbol names, which a shared receipt must
+// not leak.
+type ReceiptFactor struct {
+	Axis  string  `json:"axis"`
+	Score float64 `json:"score"`
+}
+
+// ReviewReceipt is a small, machine-readable projection of a PR-risk result: a
+// structured blast-radius summary with a derived next-safe-action and a
+// merge-blocker verdict. It carries only counts, tier labels, axis names, and
+// a fixed-vocabulary action/reason — never a file path, symbol ID, or email —
+// so (especially with scrub) it is safe to share across org boundaries.
+type ReviewReceipt struct {
+	ReceiptVersion  int             `json:"receipt_version"`
+	RiskTier        RiskLevel       `json:"risk_tier"`
+	NextSafeAction  string          `json:"next_safe_action"`
+	MergeBlocker    bool            `json:"merge_blocker"`
+	BlockerReason   string          `json:"blocker_reason"`
+	AffectedCount   int             `json:"affected_count"`
+	UncoveredCount  int             `json:"uncovered_count"`
+	CommunitySpan   int             `json:"community_span"`
+	SecurityFlagged bool            `json:"security_flagged"`
+	TopFactors      []ReceiptFactor `json:"top_factors"`
+}
+
+// BuildReviewReceipt projects an already-computed PR-risk result into a small,
+// privacy-safe receipt. ci is the normalized CI rollup (NONE / FAILURE /
+// PENDING / SUCCESS); blocker reports an out-of-band hard blocker (e.g. a
+// broken contract / breaking change the caller detected). merge_blocker is set
+// when CI failed, the risk is the top tier, or the caller flagged a breaking
+// change. When scrub is true the receipt is additionally sanitized so no
+// path-like, "::"-bearing, or email-like value can leak — the counts, tier,
+// action, and axis names are always retained.
+func BuildReviewReceipt(result PRRiskResult, ci string, blocker bool, scrub bool) ReviewReceipt {
+	blocked := false
+	reason := ""
+	switch {
+	case strings.EqualFold(ci, "FAILURE"):
+		blocked, reason = true, blockerCIFailure
+	case result.Risk == RiskCritical:
+		blocked, reason = true, blockerCriticalRisk
+	case blocker:
+		blocked, reason = true, blockerBreakingChange
+	}
+
+	top := make([]ReceiptFactor, 0, len(result.Factors))
+	for _, f := range result.Factors {
+		top = append(top, ReceiptFactor{Axis: f.Axis, Score: f.Score})
+	}
+
+	r := ReviewReceipt{
+		ReceiptVersion:  receiptVersion,
+		RiskTier:        result.Risk,
+		NextSafeAction:  nextSafeAction(result),
+		MergeBlocker:    blocked,
+		BlockerReason:   reason,
+		AffectedCount:   result.TotalAffected,
+		UncoveredCount:  result.UncoveredSymbols,
+		CommunitySpan:   result.CommunitySpan,
+		SecurityFlagged: len(result.SecurityHits) > 0,
+		TopFactors:      top,
+	}
+
+	if scrub {
+		scrubReceipt(&r)
+	}
+	return r
+}
+
+// nextSafeAction derives the single most useful next step from a risk result.
+// Precedence (most urgent first): uncovered changed symbols → add tests; a
+// cross-cutting change → split the PR; a security-sensitive change → route to
+// a security reviewer; otherwise the change is merge-ready.
+func nextSafeAction(r PRRiskResult) string {
+	switch {
+	case r.UncoveredSymbols > 0:
+		return actionAddTests
+	case r.CommunitySpan >= receiptSpanSplit:
+		return actionSplitPR
+	case len(r.SecurityHits) > 0:
+		return actionReviewSecurity
+	default:
+		return actionMergeReady
+	}
+}
+
+// scrubReceipt strips any path-like, symbol-ID-like, or email-like value from
+// the free-text fields of a receipt so it is safe to share cross-org. The
+// numeric counts, the tier label, the merge verdict, the fixed-vocabulary
+// action/reason, and the axis names are structurally privacy-safe and are
+// retained verbatim; only fields that could ever carry caller context are
+// sanitized, defensively, in case a future field is wired in.
+func scrubReceipt(r *ReviewReceipt) {
+	if leaksContext(r.NextSafeAction) {
+		r.NextSafeAction = ""
+	}
+	if leaksContext(r.BlockerReason) {
+		r.BlockerReason = ""
+	}
+	for i := range r.TopFactors {
+		if leaksContext(r.TopFactors[i].Axis) {
+			r.TopFactors[i].Axis = ""
+		}
+	}
+}
+
+// leaksContext reports whether a string carries a path-like, symbol-ID-like,
+// or email-like value — the three context shapes a shared receipt must not
+// expose. It is intentionally conservative: a slash, a "::" symbol-ID
+// separator, or an "@" (email) all count as a leak.
+func leaksContext(s string) bool {
+	return strings.ContainsAny(s, "/\\@") || strings.Contains(s, "::")
+}
