@@ -2255,6 +2255,102 @@ func encodeReview(result map[string]any) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// encodeReviewPack renders the packaged review envelope into GCX1: a one-row
+// summary (verdict + the gate rollups), a changed-symbol classification
+// row-section, a per-file risk row-section, a findings row-section, and a guards
+// row-section. The append-only section layout keeps the encoder forward
+// compatible — a new gate adds a section, never reorders an existing one.
+func encodeReviewPack(result map[string]any) ([]byte, error) {
+	var buf bytes.Buffer
+
+	verdict, _ := result["verdict"].(string)
+	summary, _ := result["summary"].(string)
+	verCmd, _ := result["verification_command"].(string)
+	total, _ := result["total"].(int)
+	guards, _ := result["guards"].([]analysis.GuardViolation)
+	breaking := 0
+	if ci, ok := result["contracts"].(*contractImpact); ok && ci != nil {
+		breaking = ci.Breaking
+	}
+	sumEnc := newGCX(&buf, "review_pack.summary",
+		[]string{"verdict", "findings", "guard_violations", "contract_breaking", "verification_command", "summary"},
+	)
+	if err := sumEnc.WriteRow(verdict, total, len(guards), breaking, verCmd, summary); err != nil {
+		return nil, err
+	}
+	if err := sumEnc.Close(); err != nil {
+		return nil, err
+	}
+
+	symEnc := newGCX(&buf, "review_pack.changed_symbols",
+		[]string{"id", "name", "class", "risk"},
+	)
+	if syms, ok := result["changed_symbols"].([]map[string]any); ok {
+		for _, sym := range syms {
+			id, _ := sym["id"].(string)
+			name, _ := sym["name"].(string)
+			class, _ := sym["class"].(string)
+			risk, _ := sym["risk"].(string)
+			if err := symEnc.WriteRow(id, name, class, risk); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if err := symEnc.Close(); err != nil {
+		return nil, err
+	}
+
+	riskEnc := newGCX(&buf, "review_pack.file_risk", []string{"file", "risk", "findings"})
+	if risks, ok := result["file_risk"].([]map[string]any); ok {
+		for _, r := range risks {
+			file, _ := r["file"].(string)
+			risk, _ := r["risk"].(string)
+			findings, _ := r["findings"].(int)
+			if err := riskEnc.WriteRow(file, risk, findings); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if err := riskEnc.Close(); err != nil {
+		return nil, err
+	}
+
+	findEnc := newGCX(&buf, "review_pack.findings",
+		[]string{"file", "line", "severity", "category", "rule", "source", "message"},
+	)
+	if findings, ok := result["findings"].([]map[string]any); ok {
+		for _, f := range findings {
+			file, _ := f["file"].(string)
+			line, _ := f["line"].(int)
+			severity, _ := f["severity"].(string)
+			category, _ := f["category"].(string)
+			rule, _ := f["rule"].(string)
+			source, _ := f["source"].(string)
+			message, _ := f["message"].(string)
+			if err := findEnc.WriteRow(file, line, severity, category, rule, source, message); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if err := findEnc.Close(); err != nil {
+		return nil, err
+	}
+
+	guardEnc := newGCX(&buf, "review_pack.guards",
+		[]string{"rule_name", "kind", "description"},
+	)
+	for _, v := range guards {
+		if err := guardEnc.WriteRow(v.RuleName, v.Kind, v.Description); err != nil {
+			return nil, err
+		}
+	}
+	if err := guardEnc.Close(); err != nil {
+		return nil, err
+	}
+
+	return buf.Bytes(), nil
+}
+
 // joinInts renders a slice of ints as a comma-joined string for GCX1
 // scalar columns that carry a small list (e.g. colliding PR numbers).
 func joinInts(xs []int) string {

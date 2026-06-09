@@ -204,6 +204,13 @@ func buildImpactEntries(g graph.Store, view *ChangeView, impact *analysis.Impact
 	return callers, outline
 }
 
+// SymbolHunk renders the diff-hunk text for a single changed symbol — the
+// exported entry point the packaged-review layer uses to ground a per-symbol
+// classification on the change itself.
+func SymbolHunk(g graph.Store, view *ChangeView, sym analysis.ChangedSymbol) string {
+	return symbolHunk(g, view, sym)
+}
+
 // symbolHunk renders the diff-hunk text for a changed symbol: the new-side and
 // old-side lines from the ChangeView that fall inside the symbol's graph span
 // [StartLine,EndLine], as a +/- block. When the view carries no lines for the

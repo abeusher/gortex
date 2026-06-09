@@ -353,6 +353,13 @@ func ruleForFile(resolver *RuleResolver, file string) config.ReviewRule {
 	return config.ReviewRule{}
 }
 
+// MergeImpact folds a per-symbol impact map into a single ImpactResult for the
+// review pack's caller/outline tiers — the exported entry point the packaged
+// review layer uses when it already holds the per-symbol map.
+func MergeImpact(impact map[string]*analysis.ImpactResult) *analysis.ImpactResult {
+	return mergedImpact(impact)
+}
+
 // mergedImpact folds the caller's per-symbol impact map into a single
 // ImpactResult for the review pack's caller/outline tiers. The per-symbol map is
 // retained separately for per-file risk ranking. A nil/empty map yields nil so

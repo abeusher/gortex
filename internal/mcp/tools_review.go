@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
@@ -12,7 +13,9 @@ import (
 
 	"github.com/zzet/gortex/internal/analysis"
 	"github.com/zzet/gortex/internal/astquery"
+	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/review"
+	"github.com/zzet/gortex/internal/semantic/lsp"
 )
 
 // registerReviewTools registers the review-engine tool group. Unlike most
@@ -54,6 +57,24 @@ func (s *Server) registerReviewTools() {
 			mcp.WithNumber("max_tokens", mcp.Description("Token budget for the response and the internal review pack handed to the LLM.")),
 		),
 		s.handleReview,
+	)
+
+	s.addTool(
+		mcp.NewTool("review_pack",
+			mcp.WithDescription("Run the whole PR-review gate set over a changeset and fold the result into ONE packaged envelope. Composes the deterministic graph-grounded review (verdict + line-anchored findings), per-symbol semantic classification (feature/fix/refactor/test/config), per-file risk ranking, contract-impact + guard/architecture checks, and the impacted test targets — then derives a concrete `verification_command` to run and a privacy-safe risk receipt. The verdict is the worst-of the review report, upgraded to BLOCK when a contract breaks or a guard/architecture rule is violated. Pass `base`/`scope` to select the changeset (or a pasted `diff`); `include_pack` adds the tiered diff-hunk pack; `scrub` strips any path/symbol/email from the receipt. Use as the single entrypoint for an AST-grounded PR review."),
+			mcp.WithString("base", mcp.Description("Base git ref (e.g. main). Selects the changeset as `git diff base...HEAD`. Alias for scope=compare + base_ref=base.")),
+			mcp.WithString("base_ref", mcp.Description("Base ref for scope=compare (default: main). `base` takes precedence when both are set.")),
+			mcp.WithString("scope", mcp.Description("Changeset scope: unstaged (default), staged, all, or compare. Ignored when `base` or `diff` is set.")),
+			mcp.WithString("diff", mcp.Description("Raw unified-diff text to review off-disk (the pasted-diff path). When set, no git command runs and `scope`/`base` are ignored. Contract/guard/test gates that need indexed symbols are skipped for a pasted diff.")),
+			mcp.WithString("repo", mcp.Description("Repository prefix to resolve the working tree (multi-repo mode).")),
+			mcp.WithBoolean("use_llm", mcp.Description("Engage the LLM review phase (graph-grounded rulepack findings always run). Requires a configured LLM provider; ignored when none is available. Default: false.")),
+			mcp.WithBoolean("include_pack", mcp.Description("Include the tiered review pack (changed symbols as diff hunks, direct callers as full source, the rest as an outline). Default: false.")),
+			mcp.WithBoolean("scrub", mcp.Description("Sanitize the risk receipt so no path-like, symbol-ID-like, or email-like value can leak — safe to share cross-org. Default: false.")),
+			mcp.WithString("format", mcp.Description("Output format: json (default), gcx (GCX1 compact wire format), or toon")),
+			mcp.WithNumber("max_bytes", mcp.Description("Cap the marshaled response at this many bytes. The longest list is trimmed first; truncation metadata rides on the response. Omit for no cap.")),
+			mcp.WithNumber("max_tokens", mcp.Description("Token budget for the response and the internal review pack handed to the LLM.")),
+		),
+		s.handleReviewPack,
 	)
 }
 
@@ -615,4 +636,511 @@ func reviewPayload(report *review.ReviewReport) map[string]any {
 		"total":     len(commentRows),
 		"stats":     stats,
 	}
+}
+
+// classifiedSymbol is one changed symbol with its coarse change class
+// (feature/fix/refactor/test/config) and its impact-derived risk tier.
+type classifiedSymbol struct {
+	ID    string `json:"id"`
+	Name  string `json:"name"`
+	Class string `json:"class"`
+	Risk  string `json:"risk"`
+}
+
+// reviewEnvelope is the single packaged PR-review result: the worst-of verdict
+// (review report, upgraded by contract/guard breaks), the per-symbol semantic
+// classification, the per-file risk ranking, the line-anchored findings, the
+// contract + guard gate results, the impacted test targets, the concrete
+// verification command, the privacy-safe risk receipt, and an optional tiered
+// review pack.
+type reviewEnvelope struct {
+	Verdict             string                  `json:"verdict"`
+	Summary             string                  `json:"summary"`
+	ChangedSymbols      []classifiedSymbol      `json:"changed_symbols"`
+	FileRisk            []review.FileRisk       `json:"file_risk"`
+	Findings            []inlineComment         `json:"findings"`
+	Contracts           *contractImpact         `json:"contracts,omitempty"`
+	Guards              []analysis.GuardViolation `json:"guards"`
+	HighRiskPreviews    []reviewPreview         `json:"high_risk_previews,omitempty"`
+	TestTargets         []string                `json:"test_targets"`
+	VerificationCommand string                  `json:"verification_command"`
+	Receipt             analysis.ReviewReceipt  `json:"receipt"`
+	Pack                *review.ReviewPack      `json:"pack,omitempty"`
+}
+
+// reviewPreview is the cost-bounded speculative-edit preview run for a single
+// high-risk (depth-1-heavy) changed symbol: the broken callers/implementors and
+// the impact rollup the simulation produced from a no-op rewrite of the symbol's
+// own range.
+type reviewPreview struct {
+	SymbolID           string `json:"symbol_id"`
+	BrokenCallers      int    `json:"broken_callers"`
+	BrokenImplementors int    `json:"broken_implementors"`
+	Summary            string `json:"summary"`
+}
+
+// highRiskD1Threshold is the direct-dependent (depth-1) count at or above which a
+// changed symbol is "high-risk" and earns a cost-bounded preview_edit simulation.
+// Keeping the bound high means the speculative pass runs only for the few symbols
+// a heavily-depended-on change touches, never the whole changeset.
+const highRiskD1Threshold = 5
+
+// handleReviewPack runs the full PR-review gate set over a changeset and folds
+// the result into one packaged envelope. It composes the existing handlers /
+// analysis — it never re-implements a gate:
+//
+//	MapGitDiff          → the changed symbols + files
+//	AnalyzeImpact       → per-symbol blast radius (risk ranking + d=1 high-risk set)
+//	review.Run          → the verdict report (findings + per-file risk + summary)
+//	computeContractImpact → contract-boundary breaks
+//	EvaluateGuards/Architecture → guard + layering violations
+//	get-test-targets walk → the impacted test files → verification_command
+//	buildSimulation     → a cost-bounded preview for the high-risk d=1 symbols only
+//	ScorePRRisk/BuildReviewReceipt → the privacy-safe receipt (scrub passthrough)
+//
+// The verdict is the review report's worst-of, upgraded to BLOCK when a contract
+// breaks or any guard/architecture rule is violated (mirroring the contract-risk
+// upgrade the enhanced change-impact handler applies).
+func (s *Server) handleReviewPack(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	if s.graph == nil {
+		return mcp.NewToolResultError("no graph available — index a repo first"), nil
+	}
+
+	diffText := strings.TrimSpace(req.GetString("diff", ""))
+	scope, baseRef := siblingDiffScope(req)
+
+	repo := strings.TrimSpace(req.GetString("repo", ""))
+	roots := s.collectRepoRoots(repo)
+	repoRoot := pickRepoRoot(roots, repo)
+	if repoRoot == "" && s.indexer != nil {
+		if root := s.indexer.RootPath(); root != "" {
+			repoRoot = root
+		}
+	}
+	if repoRoot == "" && diffText == "" {
+		return mcp.NewToolResultError("could not resolve a repository root for the changeset diff"), nil
+	}
+
+	// Enumerate the changeset (on-disk path only — a pasted diff has no graph
+	// changeset, so the gates that need indexed symbols are skipped).
+	var (
+		diff     *analysis.DiffResult
+		rulepack []astquery.Match
+		impact   map[string]*analysis.ImpactResult
+		ids      []string
+	)
+	if diffText == "" {
+		d, err := analysis.MapGitDiff(s.graph, repoRoot, scope, baseRef)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		diff = d
+		allowedRepos, err := s.resolveRepoFilter(ctx, req)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		rulepack = s.reviewRulepackMatches(ctx, diff.ChangedFiles, allowedRepos)
+		impact = s.reviewImpact(diff.ChangedSymbols)
+		for _, cs := range diff.ChangedSymbols {
+			if cs.ID != "" {
+				ids = append(ids, cs.ID)
+			}
+		}
+	}
+
+	// The review report (deterministic rulepack always; LLM phase gated).
+	useLLM := requestBoolDefault(req, "use_llm", false)
+	gen := s.reviewLLMGen(useLLM)
+	report, err := review.Run(ctx, s.graph, gen, review.Options{
+		RepoRoot:        repoRoot,
+		Scope:           scope,
+		BaseRef:         baseRef,
+		Diff:            diffText,
+		RulepackMatches: rulepack,
+		Impact:          impact,
+		UseLLM:          useLLM && gen != nil,
+		TokenBudget:     intArg(req.GetArguments(), "max_tokens", 0),
+	})
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	// Gate: contract-boundary impact.
+	contracts := s.computeContractImpact(ids)
+
+	// Gate: guard + architecture rules.
+	var guards []analysis.GuardViolation
+	if len(ids) > 0 && (len(s.guardRules) > 0 || !s.architecture.IsEmpty()) {
+		guards = analysis.EvaluateGuards(s.graph, s.guardRules, ids)
+		guards = append(guards, analysis.EvaluateArchitecture(s.graph, s.architecture, ids)...)
+	}
+
+	// Verdict = the review report's worst-of, upgraded to BLOCK on any contract
+	// break or guard/architecture violation.
+	verdict := report.Verdict
+	if (contracts != nil && contracts.Breaking > 0) || len(guards) > 0 {
+		verdict = review.VerdictBlock
+	}
+
+	// Per-symbol semantic classification, graph-grounded on the diff-hunk text.
+	changedSyms := s.classifyChangedSymbols(diff, impact)
+
+	// Impacted test targets → the concrete verification command.
+	testTargets := s.reviewTestTargets(ctx, ids)
+	verCmd := review.VerificationCommand(testTargets, reviewPackLang(diff))
+
+	// Cost bound: run a speculative preview_edit for the high-risk (d=1-heavy)
+	// changed symbols only — never the whole changeset.
+	previews := s.highRiskPreviews(ctx, diff, impact)
+
+	// Privacy-safe risk receipt over the whole changeset.
+	scrub := requestBoolDefault(req, "scrub", false)
+	receipt := s.reviewReceipt(ids, diff, contracts, guards, scrub)
+
+	env := reviewEnvelope{
+		Verdict:             string(verdict),
+		Summary:             report.Summary,
+		ChangedSymbols:      changedSyms,
+		FileRisk:            report.FileRisk,
+		Findings:            reviewFindingsToComments(report),
+		Contracts:           contracts,
+		Guards:              guards,
+		HighRiskPreviews:    previews,
+		TestTargets:         testTargets,
+		VerificationCommand: verCmd,
+		Receipt:             receipt,
+	}
+	if requestBoolDefault(req, "include_pack", false) {
+		env.Pack = s.buildReviewPack(diff, impact, intArg(req.GetArguments(), "max_tokens", 0))
+	}
+
+	payload := reviewPackPayload(env)
+
+	if s.isGCX(ctx, req) {
+		return s.gcxResponseWithBudget(req)(encodeReviewPack(payload))
+	}
+	if s.isTOON(ctx, req) {
+		return returnTOON(payload)
+	}
+	return s.respondJSONOrTOON(ctx, req, payload)
+}
+
+// classifyChangedSymbols stamps a change class + impact-risk tier on every
+// changed symbol. The class is graph-grounded on the symbol's diff-hunk text;
+// the risk tier is the symbol's AnalyzeImpact tier (LOW when no impact entry).
+func (s *Server) classifyChangedSymbols(diff *analysis.DiffResult, impact map[string]*analysis.ImpactResult) []classifiedSymbol {
+	if diff == nil {
+		return []classifiedSymbol{}
+	}
+	view, _ := s.reviewChangeView(diff)
+	out := make([]classifiedSymbol, 0, len(diff.ChangedSymbols))
+	for _, cs := range diff.ChangedSymbols {
+		hunk := review.SymbolHunk(s.graph, view, cs)
+		risk := string(analysis.RiskLow)
+		if impact != nil {
+			if ir := impact[cs.ID]; ir != nil && ir.Risk != "" {
+				risk = string(ir.Risk)
+			}
+		}
+		out = append(out, classifiedSymbol{
+			ID:    cs.ID,
+			Name:  cs.Name,
+			Class: review.ClassifyChange(s.graph, cs, hunk),
+			Risk:  risk,
+		})
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+// reviewChangeView builds the ChangeView the classify/pack rendering reads its
+// diff-hunk text from. Errors degrade to a nil view (the renderers tolerate it).
+func (s *Server) reviewChangeView(diff *analysis.DiffResult) (*review.ChangeView, *analysis.DiffResult) {
+	repoRoot := ""
+	if s.indexer != nil {
+		repoRoot = s.indexer.RootPath()
+	}
+	view, err := review.BuildChangeView(s.graph, repoRoot, "", "")
+	if err != nil {
+		return nil, diff
+	}
+	return view, diff
+}
+
+// reviewTestTargets walks the impacted symbols to their covering test files,
+// reusing the same EdgeTests / caller walk get_test_targets uses, and returns
+// the distinct test-file paths.
+func (s *Server) reviewTestTargets(ctx context.Context, ids []string) []string {
+	files := map[string]bool{}
+	eng := s.engineFor(ctx)
+	for _, id := range ids {
+		node := eng.GetSymbol(id)
+		if node == nil {
+			continue
+		}
+		// Fast path: the persistent test-edge inverse walk.
+		if testers := eng.GetTesters(id); len(testers) > 0 {
+			for _, tn := range testers {
+				if tn != nil && tn.FilePath != "" {
+					files[cleanPathMCP(tn.FilePath)] = true
+				}
+			}
+			continue
+		}
+		// Fallback: BFS callers, keep the ones in test files.
+		callers := eng.GetCallers(id, query.QueryOptions{Depth: 3, Limit: 100, Detail: "brief"})
+		for _, cn := range callers.Nodes {
+			if isTestFile(cn.FilePath) {
+				files[cleanPathMCP(cn.FilePath)] = true
+			}
+		}
+		if isTestFile(node.FilePath) {
+			files[cleanPathMCP(node.FilePath)] = true
+		}
+	}
+	out := make([]string, 0, len(files))
+	for f := range files {
+		out = append(out, f)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// highRiskPreviews runs a cost-bounded speculative preview for each high-risk
+// changed symbol — one whose direct-dependent (depth-1) count meets the
+// threshold. A no-op rewrite of the symbol's own range is fed to buildSimulation
+// so the broken-callers / impact rollup is computed without touching disk. Only
+// the high-risk subset is simulated, so the pass never scales with the whole
+// changeset.
+func (s *Server) highRiskPreviews(ctx context.Context, diff *analysis.DiffResult, impact map[string]*analysis.ImpactResult) []reviewPreview {
+	if diff == nil || impact == nil {
+		return nil
+	}
+	var previews []reviewPreview
+	for _, cs := range diff.ChangedSymbols {
+		ir := impact[cs.ID]
+		if ir == nil || len(ir.ByDepth[1]) < highRiskD1Threshold {
+			continue
+		}
+		edit, ok := s.identityEditForSymbol(cs.ID)
+		if !ok {
+			continue
+		}
+		sim, err := s.buildSimulation(ctx, []lsp.WorkspaceEdit{edit}, false)
+		if err != nil || len(sim.steps) == 0 {
+			continue
+		}
+		step := sim.steps[0]
+		previews = append(previews, reviewPreview{
+			SymbolID:           cs.ID,
+			BrokenCallers:      len(step.brokenCallers),
+			BrokenImplementors: len(step.brokenImplementors),
+			Summary:            step.summary,
+		})
+	}
+	sort.SliceStable(previews, func(i, j int) bool { return previews[i].SymbolID < previews[j].SymbolID })
+	return previews
+}
+
+// identityEditForSymbol builds a no-op WorkspaceEdit that rewrites a symbol's own
+// [StartLine,EndLine] range with its current source. Fed to buildSimulation it
+// yields the symbol's broken-callers / impact preview without changing disk. Only
+// nodes with a known range under the indexed root are eligible.
+func (s *Server) identityEditForSymbol(id string) (lsp.WorkspaceEdit, bool) {
+	n := s.graph.GetNode(id)
+	if n == nil || n.StartLine <= 0 || n.FilePath == "" {
+		return lsp.WorkspaceEdit{}, false
+	}
+	abs, err := s.resolveOverlayAbsPath(n.FilePath)
+	if err != nil || abs == "" {
+		return lsp.WorkspaceEdit{}, false
+	}
+	data, rerr := os.ReadFile(abs)
+	if rerr != nil {
+		return lsp.WorkspaceEdit{}, false
+	}
+	lines := strings.Split(string(data), "\n")
+	end := n.EndLine
+	if end < n.StartLine {
+		end = n.StartLine
+	}
+	if n.StartLine > len(lines) {
+		return lsp.WorkspaceEdit{}, false
+	}
+	if end > len(lines) {
+		end = len(lines)
+	}
+	src := strings.Join(lines[n.StartLine-1:end], "\n") + "\n"
+	edit := lsp.WorkspaceEdit{
+		Changes: map[string][]lsp.TextEdit{
+			n.FilePath: {{
+				Range: lsp.Range{
+					Start: lsp.Position{Line: n.StartLine - 1, Character: 0},
+					End:   lsp.Position{Line: end, Character: 0},
+				},
+				NewText: src,
+			}},
+		},
+	}
+	return edit, true
+}
+
+// reviewReceipt scores PR-level risk over the changeset and projects it to the
+// privacy-safe receipt. A contract break or guard violation flags the
+// out-of-band hard blocker so the receipt's merge_blocker reflects the gates.
+func (s *Server) reviewReceipt(ids []string, diff *analysis.DiffResult, ci *contractImpact, guards []analysis.GuardViolation, scrub bool) analysis.ReviewReceipt {
+	var changedFiles []string
+	if diff != nil {
+		changedFiles = diff.ChangedFiles
+	}
+	communities := s.getCommunities()
+	var nodeToComm map[string]string
+	if communities != nil {
+		nodeToComm = communities.NodeToComm
+	}
+	result := analysis.ScorePRRisk(s.graph, analysis.PRRiskInput{
+		SymbolIDs:    ids,
+		ChangedFiles: changedFiles,
+		NodeToComm:   nodeToComm,
+		Communities:  communities,
+		Processes:    s.getProcesses(),
+	})
+	blocker := (ci != nil && ci.Breaking > 0) || len(guards) > 0
+	return analysis.BuildReviewReceipt(result, "NONE", blocker, scrub)
+}
+
+// buildReviewPack renders the FG9 tiered review pack for the envelope: changed
+// symbols as diff hunks, direct callers as full source, the rest as an outline.
+func (s *Server) buildReviewPack(diff *analysis.DiffResult, impact map[string]*analysis.ImpactResult, budget int) *review.ReviewPack {
+	if diff == nil {
+		return nil
+	}
+	view, _ := s.reviewChangeView(diff)
+	return review.BuildReviewPack(s.graph, view, diff, review.MergeImpact(impact), budget)
+}
+
+// reviewFindingsToComments projects the report's findings onto the line-anchored
+// inline-comment shape the envelope carries.
+func reviewFindingsToComments(report *review.ReviewReport) []inlineComment {
+	out := make([]inlineComment, 0)
+	if report == nil {
+		return out
+	}
+	for _, f := range report.Findings {
+		line := f.Line
+		if line == 0 {
+			line = f.StartLine
+		}
+		out = append(out, inlineComment{
+			File:     f.File,
+			Line:     line,
+			Severity: string(f.Severity),
+			Message:  f.Message,
+			Rule:     f.Rule,
+			Category: f.Category,
+			Source:   f.Source,
+		})
+	}
+	return out
+}
+
+// reviewPackLang infers the dominant language of the changeset from the changed
+// file extensions so the verification command targets the right toolchain.
+func reviewPackLang(diff *analysis.DiffResult) string {
+	if diff == nil {
+		return ""
+	}
+	counts := map[string]int{}
+	for _, f := range diff.ChangedFiles {
+		switch strings.ToLower(filepath.Ext(f)) {
+		case ".go":
+			counts["go"]++
+		case ".py":
+			counts["python"]++
+		case ".ts", ".tsx":
+			counts["typescript"]++
+		case ".js", ".jsx":
+			counts["javascript"]++
+		case ".rs":
+			counts["rust"]++
+		}
+	}
+	best, bestN := "", 0
+	for lang, n := range counts {
+		if n > bestN || (n == bestN && lang < best) {
+			best, bestN = lang, n
+		}
+	}
+	return best
+}
+
+// cleanPathMCP cleans a graph-relative path to slash form for the test-target set.
+func cleanPathMCP(p string) string {
+	return filepath.ToSlash(filepath.Clean(strings.TrimSpace(p)))
+}
+
+// reviewPackPayload projects the envelope onto the wire map shape. The map form
+// keeps the GCX / TOON encoders and the byte/token budget machinery on the same
+// path as the rest of the review surface.
+func reviewPackPayload(env reviewEnvelope) map[string]any {
+	changed := make([]map[string]any, 0, len(env.ChangedSymbols))
+	for _, c := range env.ChangedSymbols {
+		changed = append(changed, map[string]any{
+			"id":    c.ID,
+			"name":  c.Name,
+			"class": c.Class,
+			"risk":  c.Risk,
+		})
+	}
+	fileRisk := make([]map[string]any, 0, len(env.FileRisk))
+	for _, fr := range env.FileRisk {
+		fileRisk = append(fileRisk, map[string]any{
+			"file":     fr.File,
+			"risk":     fr.Risk,
+			"findings": fr.Findings,
+		})
+	}
+	findings := make([]map[string]any, 0, len(env.Findings))
+	for _, f := range env.Findings {
+		findings = append(findings, map[string]any{
+			"file":     f.File,
+			"line":     f.Line,
+			"severity": f.Severity,
+			"message":  f.Message,
+			"rule":     f.Rule,
+			"category": f.Category,
+			"source":   f.Source,
+		})
+	}
+	previews := make([]map[string]any, 0, len(env.HighRiskPreviews))
+	for _, p := range env.HighRiskPreviews {
+		previews = append(previews, map[string]any{
+			"symbol_id":           p.SymbolID,
+			"broken_callers":      p.BrokenCallers,
+			"broken_implementors": p.BrokenImplementors,
+			"summary":             p.Summary,
+		})
+	}
+	payload := map[string]any{
+		"verdict":              env.Verdict,
+		"summary":              env.Summary,
+		"changed_symbols":      changed,
+		"file_risk":            fileRisk,
+		"findings":             findings,
+		"guards":               env.Guards,
+		"test_targets":         env.TestTargets,
+		"verification_command": env.VerificationCommand,
+		"receipt":              env.Receipt,
+		"total":                len(findings),
+	}
+	if env.Contracts != nil {
+		payload["contracts"] = env.Contracts
+	}
+	if len(previews) > 0 {
+		payload["high_risk_previews"] = previews
+	}
+	if env.Pack != nil {
+		payload["pack"] = env.Pack
+	}
+	return payload
 }

@@ -483,3 +483,270 @@ func TestSiblingDiffContext_RegisteredEagerly(t *testing.T) {
 	require.False(t, srv.lazy.IsDeferred("sibling_diff_context"),
 		"sibling_diff_context must not be deferred")
 }
+
+func callReviewPack(t *testing.T, srv *Server, args map[string]any) *mcplib.CallToolResult {
+	t.Helper()
+	req := mcplib.CallToolRequest{}
+	req.Params.Name = "review_pack"
+	req.Params.Arguments = args
+	res, err := srv.handleReviewPack(t.Context(), req)
+	require.NoError(t, err)
+	return res
+}
+
+type reviewPackOut struct {
+	Verdict        string `json:"verdict"`
+	Summary        string `json:"summary"`
+	Total          int    `json:"total"`
+	ChangedSymbols []struct {
+		ID    string `json:"id"`
+		Name  string `json:"name"`
+		Class string `json:"class"`
+		Risk  string `json:"risk"`
+	} `json:"changed_symbols"`
+	FileRisk []struct {
+		File     string `json:"file"`
+		Risk     string `json:"risk"`
+		Findings int    `json:"findings"`
+	} `json:"file_risk"`
+	Findings []struct {
+		File     string `json:"file"`
+		Line     int    `json:"line"`
+		Severity string `json:"severity"`
+		Rule     string `json:"rule"`
+		Source   string `json:"source"`
+	} `json:"findings"`
+	Guards []struct {
+		RuleName string `json:"rule_name"`
+		Kind     string `json:"kind"`
+	} `json:"guards"`
+	TestTargets         []string `json:"test_targets"`
+	VerificationCommand string   `json:"verification_command"`
+	Receipt             struct {
+		RiskTier       string `json:"risk_tier"`
+		NextSafeAction string `json:"next_safe_action"`
+		MergeBlocker   bool   `json:"merge_blocker"`
+		BlockerReason  string `json:"blocker_reason"`
+		AffectedCount  int    `json:"affected_count"`
+		TopFactors     []struct {
+			Axis  string  `json:"axis"`
+			Score float64 `json:"score"`
+		} `json:"top_factors"`
+	} `json:"receipt"`
+	Pack *struct {
+		Changed []struct {
+			ID   string `json:"id"`
+			Diff string `json:"diff"`
+		} `json:"changed"`
+	} `json:"pack"`
+}
+
+func decodeReviewPack(t *testing.T, res *mcplib.CallToolResult) reviewPackOut {
+	t.Helper()
+	require.False(t, res.IsError, "errored: %v", res)
+	var out reviewPackOut
+	require.NoError(t, json.Unmarshal([]byte(res.Content[0].(mcplib.TextContent).Text), &out))
+	return out
+}
+
+// TestReviewPack_Envelope asserts the packaged envelope carries the verdict,
+// per-symbol classification, per-file risk, line-anchored findings, the
+// impacted-test verification command, and the privacy-safe receipt on a staged
+// change with a planted error-severity finding.
+func TestReviewPack_Envelope(t *testing.T) {
+	dir, file := reviewGitRepo(t)
+	srv := indexedSiblingServer(t, dir)
+
+	out := decodeReviewPack(t, callReviewPack(t, srv, map[string]any{
+		"base": "base-ref",
+	}))
+
+	// Verdict reflects the error-severity rulepack finding.
+	require.Equal(t, "BLOCK", out.Verdict, "an error-severity finding blocks")
+	require.GreaterOrEqual(t, out.Total, 1)
+
+	// The planted inverted-err-check finding rides on the envelope, anchored.
+	var found bool
+	for _, f := range out.Findings {
+		if f.Rule == "go-inverted-err-check" {
+			found = true
+			require.Equal(t, filepath.ToSlash(file), filepath.ToSlash(f.File))
+			require.Greater(t, f.Line, 0)
+			require.Equal(t, "error", f.Severity)
+		}
+	}
+	require.True(t, found, "expected the planted finding; got %+v", out.Findings)
+
+	// Per-symbol classification: the changed Load function is classified.
+	require.NotEmpty(t, out.ChangedSymbols)
+	var classified bool
+	for _, cs := range out.ChangedSymbols {
+		if cs.Name == "Load" {
+			classified = true
+			require.NotEmpty(t, cs.Class, "the changed symbol carries a class")
+			require.NotEmpty(t, cs.Risk, "the changed symbol carries a risk tier")
+		}
+	}
+	require.True(t, classified, "expected Load to be classified; got %+v", out.ChangedSymbols)
+
+	// Per-file risk ranking.
+	require.NotEmpty(t, out.FileRisk)
+
+	// A concrete, runnable verification command derived from the toolchain.
+	require.NotEmpty(t, out.VerificationCommand)
+	require.Contains(t, out.VerificationCommand, "go test")
+
+	// The receipt is populated (a real PR-risk projection).
+	require.NotEmpty(t, out.Receipt.NextSafeAction)
+	require.GreaterOrEqual(t, out.Receipt.AffectedCount, 0)
+}
+
+// TestReviewPack_GuardBreakBlocks plants a co-change guard rule the changeset
+// violates (it touches internal/svc but not the required internal/audit), and
+// asserts the verdict is driven to BLOCK and the violation rides on the envelope.
+func TestReviewPack_GuardBreakBlocks(t *testing.T) {
+	dir, _ := reviewGitRepo(t)
+	srv := indexedSiblingServer(t, dir)
+
+	// A co-change rule: any change to internal/svc requires a matching change
+	// to internal/audit. The changeset only touches internal/svc, so the rule
+	// is violated.
+	srv.guardRules = []config.GuardRule{{
+		Name:    "svc-requires-audit",
+		Kind:    "co-change",
+		Source:  filepath.Join("internal", "svc"),
+		Target:  filepath.Join("internal", "audit"),
+		Message: "svc changes require an audit-log update",
+	}}
+
+	out := decodeReviewPack(t, callReviewPack(t, srv, map[string]any{
+		"base": "base-ref",
+	}))
+
+	require.Equal(t, "BLOCK", out.Verdict, "a guard violation must drive the verdict to BLOCK")
+	require.NotEmpty(t, out.Guards, "the guard violation rides on the envelope")
+	var guarded bool
+	for _, g := range out.Guards {
+		if g.RuleName == "svc-requires-audit" {
+			guarded = true
+			require.Equal(t, "co-change", g.Kind)
+		}
+	}
+	require.True(t, guarded, "expected the planted guard violation; got %+v", out.Guards)
+
+	// The receipt's merge blocker reflects the out-of-band gate break.
+	require.True(t, out.Receipt.MergeBlocker, "guard break flags the receipt merge_blocker")
+}
+
+// TestReviewPack_ScrubScrubsReceipt asserts scrub:true sanitizes the receipt's
+// free-text fields while keeping the structural counts/tier/action.
+func TestReviewPack_ScrubScrubsReceipt(t *testing.T) {
+	dir, _ := reviewGitRepo(t)
+	srv := indexedSiblingServer(t, dir)
+
+	out := decodeReviewPack(t, callReviewPack(t, srv, map[string]any{
+		"base":  "base-ref",
+		"scrub": true,
+	}))
+
+	// The structural fields survive scrub.
+	require.NotEmpty(t, out.Receipt.RiskTier, "the risk tier is structurally safe and retained")
+	// No field carries a path-like / symbol-ID-like / email-like value.
+	require.NotContains(t, out.Receipt.NextSafeAction, "/")
+	require.NotContains(t, out.Receipt.BlockerReason, "::")
+	for _, f := range out.Receipt.TopFactors {
+		require.NotContains(t, f.Axis, "/")
+		require.NotContains(t, f.Axis, "::")
+		require.NotContains(t, f.Axis, "@")
+	}
+}
+
+// TestReviewPack_IncludePack renders the FG9 tiered pack when include_pack is set.
+func TestReviewPack_IncludePack(t *testing.T) {
+	dir, _ := reviewGitRepo(t)
+	srv := indexedSiblingServer(t, dir)
+
+	out := decodeReviewPack(t, callReviewPack(t, srv, map[string]any{
+		"base":         "base-ref",
+		"include_pack": true,
+	}))
+	require.NotNil(t, out.Pack, "include_pack must render the tiered pack")
+	require.NotEmpty(t, out.Pack.Changed, "the changed tier carries the changed symbols")
+	var hasDiff bool
+	for _, e := range out.Pack.Changed {
+		if e.Diff != "" {
+			hasDiff = true
+		}
+	}
+	require.True(t, hasDiff, "the changed tier renders diff-hunk text")
+}
+
+// TestReviewPack_PastedDiffApproves reviews a pasted diff off-disk with no rule
+// violation: it approves and skips the indexed-symbol gates gracefully.
+func TestReviewPack_PastedDiffApproves(t *testing.T) {
+	dir, _ := reviewGitRepo(t)
+	srv := indexedSiblingServer(t, dir)
+
+	diff := "diff --git a/x.go b/x.go\n" +
+		"--- a/x.go\n+++ b/x.go\n" +
+		"@@ -1,1 +1,2 @@\n package x\n+var Added = 1\n"
+	out := decodeReviewPack(t, callReviewPack(t, srv, map[string]any{
+		"diff": diff,
+	}))
+	require.Equal(t, "APPROVE", out.Verdict)
+	require.Empty(t, out.Guards)
+	// A pasted diff has no runnable test targets — the command falls back to the
+	// whole-tree run so it is always runnable.
+	require.NotEmpty(t, out.VerificationCommand)
+}
+
+// TestReviewPack_GCXAndTOONAndBudget covers the wire-format + budget contract.
+func TestReviewPack_GCXAndTOONAndBudget(t *testing.T) {
+	dir, _ := reviewGitRepo(t)
+	srv := indexedSiblingServer(t, dir)
+
+	base := map[string]any{"base": "base-ref"}
+
+	gcxArgs := map[string]any{"format": "gcx"}
+	for k, v := range base {
+		gcxArgs[k] = v
+	}
+	gcx := callReviewPack(t, srv, gcxArgs)
+	require.False(t, gcx.IsError)
+	gtext := gcx.Content[0].(mcplib.TextContent).Text
+	require.Contains(t, gtext, "review_pack.summary")
+	require.Contains(t, gtext, "review_pack.changed_symbols")
+	require.Contains(t, gtext, "review_pack.findings")
+
+	budgetArgs := map[string]any{"format": "gcx", "max_bytes": float64(120)}
+	for k, v := range base {
+		budgetArgs[k] = v
+	}
+	budgeted := callReviewPack(t, srv, budgetArgs)
+	require.False(t, budgeted.IsError)
+	require.LessOrEqual(t, len(budgeted.Content[0].(mcplib.TextContent).Text), 900)
+
+	toonArgs := map[string]any{"format": "toon"}
+	for k, v := range base {
+		toonArgs[k] = v
+	}
+	toon := callReviewPack(t, srv, toonArgs)
+	require.False(t, toon.IsError)
+	require.Contains(t, toon.Content[0].(mcplib.TextContent).Text, "verdict")
+}
+
+// TestReviewPack_RegisteredEagerly asserts review_pack is in the eager (hot) set
+// — published in tools/list at session start so a reviewing agent does not pay a
+// discovery round-trip.
+func TestReviewPack_RegisteredEagerly(t *testing.T) {
+	require.True(t, hotEagerTools["review_pack"],
+		"review_pack must be eagerly registered (hot), not deferred")
+
+	t.Setenv("GORTEX_LAZY_TOOLS", "1")
+	srv, _ := setupTestServer(t)
+	live := srv.mcpServer.ListTools()
+	require.Contains(t, live, "review_pack",
+		"eager review_pack tool must appear in tools/list without tools_search expansion")
+	require.False(t, srv.lazy.IsDeferred("review_pack"),
+		"review_pack must not be deferred")
+}
