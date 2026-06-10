@@ -453,23 +453,40 @@ func (s *Server) handleEditFile(ctx context.Context, req mcp.CallToolRequest) (*
 	}
 	fileStr := string(content)
 
-	count := strings.Count(fileStr, oldString)
+	matches := findEOLMatches(fileStr, oldString)
+	count := matches.count
 	if count == 0 {
 		return mcp.NewToolResultError(
 			"old_string not found in file. Use get_file_summary or get_editing_context to inspect the current content."), nil
 	}
 	if count > 1 && !replaceAll {
-		hint := matchLocationsHint(fileStr, oldString)
+		hint := matchSpansHint(fileStr, matches.spans)
 		return mcp.NewToolResultError(fmt.Sprintf(
 			"old_string matches %d locations%s. Provide a larger fragment for uniqueness or pass replace_all=true.", count, hint)), nil
 	}
 
 	var newContent string
 	var replacements int
-	if replaceAll {
+	switch {
+	case matches.normalized:
+		// The CRLF<->LF fallback matched: splice the real byte spans and
+		// write new_string with each region's own line terminators so the
+		// edit never introduces mixed endings.
+		limit := 1
+		replacements = 1
+		if replaceAll {
+			limit = -1
+			replacements = count
+		}
+		newContent = spliceSpansEOL(fileStr, matches.spans, newString, limit)
+		if newContent == fileStr {
+			return mcp.NewToolResultError(
+				"old_string and new_string are identical after line-ending normalization"), nil
+		}
+	case replaceAll:
 		newContent = strings.ReplaceAll(fileStr, oldString, newString)
 		replacements = count
-	} else {
+	default:
 		newContent = strings.Replace(fileStr, oldString, newString, 1)
 		replacements = 1
 	}
@@ -481,7 +498,7 @@ func (s *Server) handleEditFile(ctx context.Context, req mcp.CallToolRequest) (*
 		// Dry-run: validate everything but skip the write + reindex.
 		// Returns the same shape so callers can branch on dry_run for a
 		// preview before committing.
-		return s.respondJSONOrTOON(ctx, req, map[string]any{
+		preview := map[string]any{
 			"path":          relPath,
 			"status":        "would_apply",
 			"dry_run":       true,
@@ -490,7 +507,11 @@ func (s *Server) handleEditFile(ctx context.Context, req mcp.CallToolRequest) (*
 			"reindexed":     false,
 			"diff":          unifiedDiff(relPath, fileStr, newContent),
 			"new_sha":       newSHA,
-		})
+		}
+		if matches.normalized {
+			preview["eol_normalized"] = true
+		}
+		return s.respondJSONOrTOON(ctx, req, preview)
 	}
 
 	perm := os.FileMode(0o644)
@@ -513,6 +534,9 @@ func (s *Server) handleEditFile(ctx context.Context, req mcp.CallToolRequest) (*
 		"bytes_written": len(newContentBytes),
 		"reindexed":     reindexed,
 		"new_sha":       newSHA,
+	}
+	if matches.normalized {
+		resp["eol_normalized"] = true
 	}
 	if health := s.fileSyntaxHealth(relPath, absPath); health != nil {
 		resp["syntax_health"] = health
