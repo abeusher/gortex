@@ -66,6 +66,27 @@ func TestEnsureDaemon_StopIntentSuppressesAutostart(t *testing.T) {
 	}
 }
 
+func TestEnsureDaemon_RealStopIntentMarkerSuppresses(t *testing.T) {
+	isolateSpawnLock(t) // points XDG_CACHE_HOME at a fresh temp dir
+	defer restoreSeams()
+	stopIntentActive = daemon.StopIntentActive // exercise the real FS-backed check
+	var spawned int32
+	isDaemonRunning = func() bool { return false }
+	spawnDaemon = func() error { atomic.AddInt32(&spawned, 1); return nil }
+	if err := daemon.MarkStopIntent(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { daemon.ClearStopIntent() })
+	// End-to-end: the real marker write + real read must agree on the path and
+	// suppress the spawn — not just the stubbed seam.
+	if d := ensureDaemonReady(true); d != daemonUnavailable {
+		t.Fatalf("a real stop-intent marker must suppress autostart, got %d", d)
+	}
+	if atomic.LoadInt32(&spawned) != 0 {
+		t.Fatal("must not spawn while a real stop-intent marker is present")
+	}
+}
+
 func TestEnsureDaemon_SingleFlight(t *testing.T) {
 	isolateSpawnLock(t)
 	defer restoreSeams()

@@ -73,7 +73,14 @@ func runDaemonInstallService(cmd *cobra.Command, _ []string) error {
 	// doesn't fight with it over the socket.
 	if daemon.IsRunning() {
 		_, _ = fmt.Fprintln(w, "[gortex daemon] stopping existing daemon before install")
-		if err := runDaemonStop(cmd, nil); err != nil {
+		// This is an internal lifecycle bounce — the supervisor starts the
+		// daemon right after — not a user "stay down". Suppress the stop-intent
+		// marker (as `daemon restart` does) so a failed install can't leave
+		// autostart permanently disabled with no daemon and no service.
+		daemonRestartActive = true
+		err := runDaemonStop(cmd, nil)
+		daemonRestartActive = false
+		if err != nil {
 			return fmt.Errorf("stop existing daemon: %w", err)
 		}
 	}

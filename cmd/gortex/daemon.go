@@ -132,10 +132,14 @@ func init() {
 // with GORTEX_DAEMON_CHILD=1 set, which the inner exec picks up and runs
 // the actual serve loop.
 func runDaemonStart(cmd *cobra.Command, _ []string) error {
-	// An explicit start (user, supervisor, or autostart spawn) supersedes any
-	// prior `daemon stop` — clear the stay-down mark so autostart works again.
-	daemon.ClearStopIntent()
-	if daemon.IsRunning() {
+	// An explicit start (user or supervisor) supersedes a prior `daemon stop` —
+	// clear the stay-down mark so autostart works again. The autostart-spawned
+	// child (GORTEX_DAEMON_CHILD=1) must NOT clear it: that would let an
+	// in-flight autostart erase a stop-intent the user wrote in the meantime.
+	if os.Getenv("GORTEX_DAEMON_CHILD") != "1" {
+		daemon.ClearStopIntent()
+	}
+	if isDaemonRunning() {
 		return fmt.Errorf("daemon already running (socket: %s)", daemon.SocketPath())
 	}
 	// IsRunning only probes the socket. A daemon that is mid-shutdown — or
@@ -755,7 +759,9 @@ func runDaemonStop(cmd *cobra.Command, _ []string) error {
 	// the daemon we're about to stop. A `daemon restart` re-clears it via the
 	// following start, so only a standalone stop is sticky.
 	if !daemonRestartActive {
-		_ = daemon.MarkStopIntent()
+		if err := daemon.MarkStopIntent(); err != nil {
+			fmt.Fprintf(w, "[gortex daemon] warning: could not record stop intent (%v); daemon may auto-respawn\n", err)
+		}
 		// If an OS supervisor (systemd --user / launchd) owns the daemon, stop
 		// it THROUGH the supervisor — a socket-level stop just kills the worker
 		// and the supervisor restarts it. `daemon restart` skips this and
