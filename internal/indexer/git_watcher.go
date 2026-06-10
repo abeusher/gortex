@@ -5,13 +5,13 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
+	"github.com/zzet/gortex/internal/gitcmd"
 	"go.uber.org/zap"
 )
 
@@ -316,21 +316,15 @@ func (gw *GitWatcher) applyChanges(changes []gitChange) int {
 // packed-refs, and worktree indirection all work without us
 // reimplementing git's ref resolution.
 func (gw *GitWatcher) currentSHA(ctx context.Context) (string, error) {
-	cmd := exec.CommandContext(ctx, "git", "-C", gw.repoPath, "rev-parse", "HEAD")
-	out, err := cmd.Output()
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(string(out)), nil
+	return gitcmd.Output(ctx, gw.repoPath, "rev-parse", "HEAD")
 }
 
 // diffNameStatus shells out to `git diff --name-status -M -C oldSHA..newSHA`
 // and decodes the output into gitChange records. -M enables rename
 // detection, -C enables copy detection.
 func (gw *GitWatcher) diffNameStatus(ctx context.Context, oldSHA, newSHA string) ([]gitChange, error) {
-	cmd := exec.CommandContext(ctx, "git", "-C", gw.repoPath,
+	out, err := gitcmd.Run(ctx, gw.repoPath,
 		"diff", "--name-status", "-M", "-C", "-z", oldSHA, newSHA)
-	out, err := cmd.Output()
 	if err != nil {
 		return nil, err
 	}

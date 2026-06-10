@@ -26,6 +26,7 @@ import (
 	"github.com/zzet/gortex/internal/llm/svc"
 	"github.com/zzet/gortex/internal/platform"
 	"github.com/zzet/gortex/internal/query"
+	"github.com/zzet/gortex/internal/review"
 	"github.com/zzet/gortex/internal/savings"
 	"github.com/zzet/gortex/internal/search"
 	"github.com/zzet/gortex/internal/semantic"
@@ -219,6 +220,11 @@ type Server struct {
 	notebook *notebookManager
 	combo    *comboManager
 	frecency *frecencyTracker
+	// suppressions holds the durable per-repo review-finding FP suppression
+	// store (sidecar-backed). The review gate consults it to drop known false
+	// positives by stable identity; the suppress_finding tool mutates it. Nil
+	// until InitSuppressions fires; the review flow tolerates a nil store.
+	suppressions *suppressionManager
 
 	// packCache retains recent smart_context pack views keyed by pack
 	// root so a later call with delta_from=<root> returns only the
@@ -238,6 +244,12 @@ type Server struct {
 	// tuning and the eval harness have a substrate to measure. Always
 	// non-nil after NewServer; a disabled logger is a cheap no-op.
 	queryLog *queryLogger
+
+	// prCache is a short-TTL cache of fetched forge.PR values keyed by
+	// (repo, number), shared across the PR data tools so a triage
+	// fan-out plus a follow-up impact call reuse one fetch. Always
+	// non-nil after NewServer.
+	prCache *prCache
 
 	// diagBroadcaster forwards LSP `publishDiagnostics` payloads to
 	// MCP clients as `notifications/diagnostics`. Lazy-initialised by
@@ -284,12 +296,41 @@ type Server struct {
 	// leaves it nil so the live server is used.
 	resourcesNotifier resourcesUpdatedNotifier
 
+	// reviewLLMGenOverride substitutes the review tool's plain (non-usage) LLM
+	// re-location seam. Test-only: production leaves it nil and
+	// reviewLLMGenWithUsage builds the closure over llmService.GenerateWithUsage.
+	// A non-nil override is adapted up to the usage-aware shape (reporting zero
+	// usage) so a test that only needs to drive the LLM review phase — without
+	// asserting cost — can still do so without constructing a real provider.
+	reviewLLMGenOverride func() review.LLMGen
+
+	// reviewLLMGenWithUsageOverride substitutes the review tool's usage-aware
+	// LLM seam (the one that feeds the per-review CostBreakdown). Test-only:
+	// production leaves it nil and reviewLLMGenWithUsage builds the closure
+	// over llmService.GenerateWithUsage. A non-nil override is returned
+	// directly (gated on use_llm) so a test can drive the cost-bearing review
+	// path — and assert the returned usage shows up in the response — without
+	// constructing a real provider.
+	reviewLLMGenWithUsageOverride func() review.LLMGenWithUsage
+
+	// reviewPricingOverride substitutes the rate card the review cost block
+	// prices token usage against. Test-only: production reads it from the LLM
+	// service (Pricing). A non-nil override lets a test assert a deterministic
+	// USD estimate from a stubbed usage seam.
+	reviewPricingOverride *llm.ProviderPricing
+
+	// critiqueLLMGenOverride substitutes the critique_review tool's LLM seam.
+	// Test-only: production leaves it nil and the handler builds the closure
+	// over llmService.Generate. A non-nil override stands in for the real
+	// provider so a test can drive the self-critique pass without constructing
+	// a backend.
+	critiqueLLMGenOverride func() review.LLMGen
+
 	// proxyHydrate is the cross-daemon proxy-edge lazy hydration hook.
 	// nil unless the daemon installed one (federation.edges on); the
 	// traversal tools call it to pull a proxy node's neighbour ring before
 	// crossing into it. See proxy_hydrate.go.
 	proxyHydrate func(ctx context.Context, proxyID string) (int, error)
-
 
 	// toolScopes is the per-Server tool-name → ToolScope registry.
 	// Populated by registerToolWithScope as tools are added; consulted
@@ -884,6 +925,7 @@ func NewServer(engine *query.Engine, g graph.Store, idx *indexer.Indexer, watche
 		queryLog:   newQueryLogger(),
 		pprCache:   newPPRWalkCache(),
 		packCache:  newPackDeltaCache(),
+		prCache:    newPRCache(prCacheTTL),
 	}
 	// Wire the process-wide tokenStats as the parent of every
 	// per-session counter so record() fanout aggregates daemon-wide.
@@ -978,6 +1020,9 @@ func NewServer(engine *query.Engine, g graph.Store, idx *indexer.Indexer, watche
 	s.registerCitationTools()
 	s.registerKnowledgeGapsTool()
 	s.registerSurprisingConnectionsTool()
+	s.registerReviewQuestionsTool()
+	s.registerPRReviewContextTool()
+	s.registerCritiqueReviewTool()
 	s.registerArchitectureTool()
 	s.registerReplayEpisodeTool()
 	s.registerSafeDeleteSymbolTool()
@@ -1001,6 +1046,11 @@ func NewServer(engine *query.Engine, g graph.Store, idx *indexer.Indexer, watche
 	s.registerGraphQueryTool()
 	s.registerNavTool()
 	s.registerFindDeclarationTool()
+	s.registerPRRiskTool()
+	s.registerSuggestReviewersTool()
+	s.registerReviewTools()
+	s.registerPRTools()
+	s.registerConflictsPRTool()
 	s.registerResources()
 	s.registerPrompts()
 
@@ -1105,6 +1155,16 @@ func (s *Server) InitNotes(cacheDir, repoPath string) {
 // with the repo and surface in PR reviews.
 func (s *Server) InitNotebook(repoPath string) {
 	s.notebook = newNotebookManager(repoPath)
+}
+
+// InitSuppressions initializes the durable per-repo review-finding
+// false-positive suppression store used by the review gate and the
+// suppress_finding tool. Call after NewServer with the cache directory and
+// primary repo path. Empty arguments yield an in-memory-only store (still wired
+// to the tools, just doesn't flush to disk). Suppressions persist across daemon
+// restarts and are per-repo, scoped by the same cache key as notes / memories.
+func (s *Server) InitSuppressions(cacheDir, repoPath string) {
+	s.suppressions = newSuppressionManager(cacheDir, repoPath)
 }
 
 func (s *Server) InitMemories(cacheDir, repoPath string) {
