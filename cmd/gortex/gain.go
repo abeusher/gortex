@@ -51,8 +51,8 @@ Default behavior:
   1. Find the most recent gortex bench tokens output (auto-discovery
      under bench/results/, then a transparent re-run when none).
   2. Render a USD-per-model card scaled to --responses-per-day.
-  3. Append a short "Your history" section from ~/.gortex/cache/savings.json
-     when --since's window has any tracked calls.
+  3. Append a short "Your history" section from the savings ledger
+     (~/.gortex/sidecar.sqlite) when --since's window has any tracked calls.
 
 Flags:
   --bench-result PATH     specific bench tokens JSON to use (skip discovery)
@@ -61,7 +61,7 @@ Flags:
   --since DURATION        history window (e.g. 24h, 7d; default 7d)
   --json                  emit machine-readable JSON
   --no-history            skip the cumulative-history section
-  --cache-dir DIR         override savings cache (savings.json lives here)`,
+  --cache-dir DIR         override the ledger directory (its sidecar.sqlite)`,
 	RunE: runGain,
 }
 
@@ -72,7 +72,7 @@ func init() {
 	gainCmd.Flags().DurationVar(&gainSince, "since", 7*24*time.Hour, "history window for the cumulative-savings section (e.g. 24h, 7d)")
 	gainCmd.Flags().BoolVar(&gainJSON, "json", false, "emit machine-readable JSON")
 	gainCmd.Flags().BoolVar(&gainNoHistory, "no-history", false, "skip the cumulative-history section")
-	gainCmd.Flags().StringVar(&gainCacheDir, "cache-dir", "", "override graph cache directory (savings.json lives here)")
+	gainCmd.Flags().StringVar(&gainCacheDir, "cache-dir", "", "override the ledger directory (its sidecar.sqlite holds the savings ledger)")
 	rootCmd.AddCommand(gainCmd)
 }
 

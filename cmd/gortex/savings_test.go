@@ -196,4 +196,9 @@ func TestEmitSavingsDashboard_EmptyTotals(t *testing.T) {
 	if strings.Contains(out, "█") {
 		t.Errorf("empty totals should not render bars, got:\n%s", out)
 	}
+	// An empty ledger has never tracked anything — the dashboard must not
+	// claim a "tracking since" moment (the zero FirstSeen stays hidden).
+	if strings.Contains(out, "Tracking since") {
+		t.Errorf("empty ledger must not print a tracking-since line, got:\n%s", out)
+	}
 }

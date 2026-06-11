@@ -35,23 +35,26 @@ sessions: Today, Last 7 days, and All time. Each bucket shows a 16-cell
 saved/total bar, percentage saved, raw token counts, and the USD value of
 the tokens avoided (priced against popular models).
 
-Savings accumulate every time a source-reading MCP tool (get_symbol_source,
-batch_symbols, smart_context) returns a symbol or compressed view instead of
-a full-file read. Cumulative totals live at ~/.gortex/cache/savings.json and
-per-call events at the sibling ~/.gortex/cache/savings.jsonl — Today / 7-day
-buckets come from the JSONL log, All time from the cumulative file.
+Savings accumulate every time a source-reading MCP tool — read_file,
+get_file_summary, get_editing_context, get_symbol_source, batch_symbols,
+smart_context — returns a summary, symbol, or compressed view that stands
+in for a full-file read. The ledger lives in the machine-global sidecar
+database (~/.gortex/sidecar.sqlite); flat-file ledgers from older
+releases (savings.json / savings.jsonl under the cache dir) are imported
+once and renamed *.bak.
 
-Override the cache dir with --cache-dir, override pricing by exporting
-GORTEX_MODEL_PRICING_JSON, and pass --verbose for a per-tool breakdown
-inside each bucket.`,
+Override the ledger location with --cache-dir (uses that directory's
+sidecar.sqlite and imports its legacy files), override pricing by
+exporting GORTEX_MODEL_PRICING_JSON, and pass --verbose for a per-tool
+breakdown inside each bucket.`,
 	RunE: runSavings,
 }
 
 func init() {
 	savingsCmd.Flags().StringVar(&savingsModel, "model", "", "highlight one model in USD output (default: show all)")
 	savingsCmd.Flags().BoolVar(&savingsJSON, "json", false, "emit machine-readable JSON instead of the dashboard")
-	savingsCmd.Flags().BoolVar(&savingsReset, "reset", false, "wipe cumulative totals + event log and exit")
-	savingsCmd.Flags().StringVar(&savingsCacheDir, "cache-dir", "", "override graph cache directory (savings.json + savings.jsonl live here)")
+	savingsCmd.Flags().BoolVar(&savingsReset, "reset", false, "wipe cumulative totals + event history and exit")
+	savingsCmd.Flags().StringVar(&savingsCacheDir, "cache-dir", "", "override the ledger directory (its sidecar.sqlite holds the savings ledger)")
 	savingsCmd.Flags().BoolVarP(&savingsVerbose, "verbose", "v", false, "include per-tool breakdown for each bucket")
 	savingsCmd.Flags().IntVar(&savingsBarCells, "bar-width", 16, "number of cells in each bar (default 16, matching semble)")
 	savingsCmd.Flags().BoolVar(&savingsUTC, "utc", false, "bucket Today by UTC calendar (default: local time)")
@@ -199,13 +202,14 @@ func emitSavingsDashboard(snap savings.File, buckets []savings.Bucket, path stri
 	headline, headlineModel := pickHeadlineCost(costs, savingsModel)
 	fmt.Println()
 	if snap.Totals.CallsCounted == 0 {
+		hint := "savings record when the agent reads code through gortex (read_file, get_file_summary, get_editing_context, get_symbol_source, smart_context, …)"
 		if tty {
 			fmt.Println("  " + progress.StyleHint.Render("◌  no source-reading tool calls recorded yet"))
-			fmt.Println("     " + progress.Caption("run `gortex mcp` and use get_symbol_source / batch_symbols / smart_context"))
+			fmt.Println("     " + progress.Caption(hint))
 			fmt.Println()
 		} else {
 			fmt.Println("No source-reading tool calls recorded yet.")
-			fmt.Println("Run `gortex mcp` and use get_symbol_source / batch_symbols / smart_context.")
+			fmt.Println("Savings record when the agent reads code through gortex (read_file, get_file_summary, get_editing_context, get_symbol_source, smart_context, ...).")
 		}
 		return
 	}
