@@ -18,10 +18,32 @@ func testLedgerPath(t *testing.T) string {
 	return filepath.Join(t.TempDir(), "sidecar.sqlite")
 }
 
+// mustSnapshot unwraps Snapshot for tests that expect a healthy ledger.
+func mustSnapshot(t *testing.T, s *Store) File {
+	t.Helper()
+	snap, err := s.Snapshot()
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	return snap
+}
+
+// closeOnCleanup releases the sidecar handle when the test ends, so the
+// process-wide handle cache doesn't accumulate open DBs (and TempDir
+// cleanup works on platforms that refuse to delete open files).
+func closeOnCleanup(t *testing.T, s *Store) *Store {
+	t.Helper()
+	t.Cleanup(func() { _ = s.Close() })
+	return s
+}
+
 func TestAddObservation_PerLanguageBucket(t *testing.T) {
 	path := testLedgerPath(t)
 
 	s, err := Open(path)
+	if err == nil {
+		closeOnCleanup(t, s)
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -34,10 +56,13 @@ func TestAddObservation_PerLanguageBucket(t *testing.T) {
 	s.AddObservation(Observation{Repo: "/repo-c", Tool: "smart_context", Returned: 10, Saved: 20})
 
 	reopened, err := Open(path)
+	if err == nil {
+		closeOnCleanup(t, reopened)
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
-	snap := reopened.Snapshot()
+	snap := mustSnapshot(t, reopened)
 
 	if got, want := snap.Totals.CallsCounted, int64(4); got != want {
 		t.Errorf("CallsCounted = %d, want %d", got, want)
@@ -64,6 +89,9 @@ func TestAddObservation_DurableImmediately(t *testing.T) {
 	path := testLedgerPath(t)
 
 	s, err := Open(path)
+	if err == nil {
+		closeOnCleanup(t, s)
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,7 +100,7 @@ func TestAddObservation_DurableImmediately(t *testing.T) {
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("ledger DB must exist immediately after the first observation: %v", err)
 	}
-	snap := s.Snapshot()
+	snap := mustSnapshot(t, s)
 	if snap.Totals.CallsCounted != 1 || snap.Totals.TokensSaved != 90 {
 		t.Errorf("snapshot = %+v, want calls=1 saved=90 with no flush", snap.Totals)
 	}
@@ -92,6 +120,9 @@ func TestConcurrentWriters_SameLedger(t *testing.T) {
 	stores := make([]*Store, 4)
 	for i := range stores {
 		s, err := Open(path)
+		if err == nil {
+			closeOnCleanup(t, s)
+		}
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -110,7 +141,7 @@ func TestConcurrentWriters_SameLedger(t *testing.T) {
 	}
 	wg.Wait()
 
-	snap := stores[0].Snapshot()
+	snap := mustSnapshot(t, stores[0])
 	wantCalls := int64(len(stores) * perStore)
 	if got := snap.Totals.CallsCounted; got != wantCalls {
 		t.Errorf("CallsCounted = %d, want %d (observation lost across writers)", got, wantCalls)
@@ -133,10 +164,13 @@ func TestConcurrentWriters_SameLedger(t *testing.T) {
 // had never recorded anything.
 func TestOpen_FreshLedger_EmptySnapshot(t *testing.T) {
 	s, err := Open(testLedgerPath(t))
+	if err == nil {
+		closeOnCleanup(t, s)
+	}
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	snap := s.Snapshot()
+	snap := mustSnapshot(t, s)
 	if snap.Totals.CallsCounted != 0 {
 		t.Errorf("new ledger has CallsCounted=%d, want 0", snap.Totals.CallsCounted)
 	}
@@ -150,6 +184,9 @@ func TestOpen_FreshLedger_EmptySnapshot(t *testing.T) {
 
 func TestObservation_StampsFirstAndLastSeen(t *testing.T) {
 	s, err := Open(testLedgerPath(t))
+	if err == nil {
+		closeOnCleanup(t, s)
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,7 +194,7 @@ func TestObservation_StampsFirstAndLastSeen(t *testing.T) {
 	s.AddObservation(Observation{Tool: "test", Returned: 1, Saved: 1})
 	after := time.Now().UTC().Add(time.Second)
 
-	snap := s.Snapshot()
+	snap := mustSnapshot(t, s)
 	if snap.FirstSeen.Before(before) || snap.FirstSeen.After(after) {
 		t.Errorf("FirstSeen = %v, want within [%v, %v]", snap.FirstSeen, before, after)
 	}
@@ -187,7 +224,7 @@ func TestAddObservation_ConcurrentSafe(t *testing.T) {
 	}
 	wg.Wait()
 
-	snap := s.Snapshot()
+	snap := mustSnapshot(t, s)
 	if got, want := snap.Totals.CallsCounted, int64(workers*per); got != want {
 		t.Errorf("CallsCounted = %d, want %d", got, want)
 	}
@@ -205,7 +242,7 @@ func TestOpen_EmptyPath_InMemoryOnly(t *testing.T) {
 	if err := s.Flush(); err != nil {
 		t.Errorf("Flush on in-memory store should no-op, got: %v", err)
 	}
-	snap := s.Snapshot()
+	snap := mustSnapshot(t, s)
 	if snap.Totals.CallsCounted != 1 {
 		t.Errorf("in-memory store should track, got CallsCounted=%d", snap.Totals.CallsCounted)
 	}
@@ -222,12 +259,13 @@ func TestReset_ClearsLedger(t *testing.T) {
 	path := testLedgerPath(t)
 
 	s, _ := Open(path)
+	closeOnCleanup(t, s)
 	s.AddObservation(Observation{Repo: "/r", Tool: "test", Returned: 50, Saved: 500})
 
 	if err := s.Reset(); err != nil {
 		t.Fatalf("Reset: %v", err)
 	}
-	snap := s.Snapshot()
+	snap := mustSnapshot(t, s)
 	if snap.Totals.CallsCounted != 0 {
 		t.Errorf("totals should be cleared after reset, got CallsCounted=%d", snap.Totals.CallsCounted)
 	}
@@ -247,9 +285,10 @@ func TestReset_ClearsLedger(t *testing.T) {
 // expose — the surface contract of cumulative_savings.
 func TestSnapshot_JSONShape(t *testing.T) {
 	s, _ := Open(testLedgerPath(t))
+	closeOnCleanup(t, s)
 	s.AddObservation(Observation{Repo: "/repo-a", Language: "go", Tool: "test", Returned: 10, Saved: 100})
 
-	data, err := json.Marshal(s.Snapshot())
+	data, err := json.Marshal(mustSnapshot(t, s))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -266,6 +305,7 @@ func TestSnapshot_JSONShape(t *testing.T) {
 
 func TestEventsSince_Filters(t *testing.T) {
 	s, _ := Open(testLedgerPath(t))
+	closeOnCleanup(t, s)
 	s.AddObservation(Observation{Tool: "a", Returned: 1, Saved: 1})
 	time.Sleep(5 * time.Millisecond)
 	cutoff := time.Now().UTC()
@@ -313,6 +353,9 @@ func TestImportLegacy_FullFlatFiles(t *testing.T) {
 	}
 
 	s, err := Open(testLedgerPath(t))
+	if err == nil {
+		closeOnCleanup(t, s)
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -320,7 +363,7 @@ func TestImportLegacy_FullFlatFiles(t *testing.T) {
 		t.Fatalf("ImportLegacy: %v", err)
 	}
 
-	snap := s.Snapshot()
+	snap := mustSnapshot(t, s)
 	if snap.Totals.CallsCounted != 10 || snap.Totals.TokensSaved != 1000 {
 		t.Errorf("imported totals = %+v, want calls=10 saved=1000", snap.Totals)
 	}
@@ -351,7 +394,7 @@ func TestImportLegacy_FullFlatFiles(t *testing.T) {
 	if err := s.ImportLegacy(jsonPath); err != nil {
 		t.Fatalf("second ImportLegacy: %v", err)
 	}
-	if got := s.Snapshot().Totals.CallsCounted; got != 10 {
+	if got := mustSnapshot(t, s).Totals.CallsCounted; got != 10 {
 		t.Errorf("totals after second import = %d, want 10 (no double count)", got)
 	}
 }
@@ -376,10 +419,11 @@ func TestImportLegacy_EventsOnlyRebuildsTotals(t *testing.T) {
 	}
 
 	s, _ := Open(testLedgerPath(t))
+	closeOnCleanup(t, s)
 	if err := s.ImportLegacy(jsonPath); err != nil {
 		t.Fatalf("ImportLegacy: %v", err)
 	}
-	snap := s.Snapshot()
+	snap := mustSnapshot(t, s)
 	if snap.Totals.CallsCounted != 3 || snap.Totals.TokensSaved != 90 {
 		t.Errorf("rebuilt totals = %+v, want calls=3 saved=90", snap.Totals)
 	}
@@ -399,6 +443,7 @@ func TestImportLegacy_NothingToImportMarksDone(t *testing.T) {
 	jsonPath := filepath.Join(legacyDir, "savings.json")
 
 	s, _ := Open(testLedgerPath(t))
+	closeOnCleanup(t, s)
 	if err := s.ImportLegacy(jsonPath); err != nil {
 		t.Fatalf("ImportLegacy on missing files: %v", err)
 	}
@@ -412,7 +457,7 @@ func TestImportLegacy_NothingToImportMarksDone(t *testing.T) {
 	if err := s.ImportLegacy(jsonPath); err != nil {
 		t.Fatal(err)
 	}
-	if got := s.Snapshot().Totals.CallsCounted; got != 0 {
+	if got := mustSnapshot(t, s).Totals.CallsCounted; got != 0 {
 		t.Errorf("late-appearing legacy file must not import, got calls=%d", got)
 	}
 }
@@ -447,5 +492,100 @@ func TestDefaultDBPath_HonorsXDGDataHome(t *testing.T) {
 	want := filepath.Join(xdg, "gortex", "sidecar.sqlite")
 	if got := DefaultDBPath(); got != want {
 		t.Fatalf("DefaultDBPath() with XDG_DATA_HOME = %s, want %s", got, want)
+	}
+}
+
+// A legacy file with JSON null bucket values must import cleanly — a
+// nil *Totals dereference here would crash-loop every server start.
+func TestImportLegacy_NullBucketValues(t *testing.T) {
+	legacyDir := t.TempDir()
+	jsonPath := filepath.Join(legacyDir, "savings.json")
+	body := `{"version":1,"totals":{"tokens_saved":10,"tokens_returned":1,"calls_counted":1},"per_repo":{"x":null},"per_language":{"y":null}}`
+	if err := os.WriteFile(jsonPath, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s, _ := Open(testLedgerPath(t))
+	closeOnCleanup(t, s)
+	if err := s.ImportLegacy(jsonPath); err != nil {
+		t.Fatalf("ImportLegacy with null buckets: %v", err)
+	}
+	snap := mustSnapshot(t, s)
+	if snap.Totals.CallsCounted != 1 {
+		t.Errorf("totals = %+v, want calls=1", snap.Totals)
+	}
+	if len(snap.PerRepo) != 0 || len(snap.PerLanguage) != 0 {
+		t.Errorf("null buckets must be dropped, got repo=%v lang=%v", snap.PerRepo, snap.PerLanguage)
+	}
+	if _, err := os.Stat(jsonPath + ".bak"); err != nil {
+		t.Errorf("legacy file should be renamed after import: %v", err)
+	}
+}
+
+// The flat-file cumulative was flush-batched while the event log
+// appended eagerly; the import floors totals at what the events
+// reconstruct so "Last 7 days" can never exceed "All time".
+func TestImportLegacy_FlushLaggedTotalsFlooredByEvents(t *testing.T) {
+	legacyDir := t.TempDir()
+	jsonPath := filepath.Join(legacyDir, "savings.json")
+	jsonlPath := filepath.Join(legacyDir, "savings.jsonl")
+
+	lagged := File{
+		Version: schemaVersion,
+		Totals:  Totals{TokensSaved: 10, TokensReturned: 1, CallsCounted: 1},
+	}
+	data, _ := json.Marshal(lagged)
+	if err := os.WriteFile(jsonPath, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ts := time.Date(2026, 6, 1, 10, 0, 0, 0, time.UTC)
+	var lines []byte
+	for i := 0; i < 3; i++ {
+		line, _ := json.Marshal(Event{TS: ts.Add(time.Duration(i) * time.Minute), Tool: "t", Returned: 1, Saved: 10})
+		lines = append(append(lines, line...), '\n')
+	}
+	if err := os.WriteFile(jsonlPath, lines, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s, _ := Open(testLedgerPath(t))
+	closeOnCleanup(t, s)
+	if err := s.ImportLegacy(jsonPath); err != nil {
+		t.Fatal(err)
+	}
+	snap := mustSnapshot(t, s)
+	if snap.Totals.CallsCounted != 3 || snap.Totals.TokensSaved != 30 {
+		t.Errorf("totals = %+v, want floored at the events' calls=3 saved=30", snap.Totals)
+	}
+}
+
+// A hard event-log read error aborts the import without marking or
+// renaming, so the next open retries instead of permanently losing the
+// unread tail.
+func TestImportLegacy_UnreadableEventsAborts(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("permission bits don't bind as root")
+	}
+	legacyDir := t.TempDir()
+	jsonPath := filepath.Join(legacyDir, "savings.json")
+	jsonlPath := filepath.Join(legacyDir, "savings.jsonl")
+	if err := os.WriteFile(jsonlPath, []byte("{}\n"), 0o000); err != nil {
+		t.Fatal(err)
+	}
+
+	s, _ := Open(testLedgerPath(t))
+	closeOnCleanup(t, s)
+	if err := s.ImportLegacy(jsonPath); err == nil {
+		t.Fatal("unreadable event log must abort the import")
+	}
+	if _, err := os.Stat(jsonlPath); err != nil {
+		t.Errorf("aborted import must not rename the event log: %v", err)
+	}
+	// A later open (permissions fixed) imports successfully.
+	if err := os.Chmod(jsonlPath, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ImportLegacy(jsonPath); err != nil {
+		t.Fatalf("retry after fixing permissions: %v", err)
 	}
 }

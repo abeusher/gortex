@@ -41,8 +41,8 @@ func captureStdout(t *testing.T, fn func()) string {
 
 func TestPickHeadlineCost_RespectsModelFlag(t *testing.T) {
 	costs := map[string]float64{
-		"claude-opus-4":   0.50,
-		"claude-sonnet-4": 0.10,
+		"claude-opus-4":    0.50,
+		"claude-sonnet-4":  0.10,
 		"claude-haiku-4.5": 0.03,
 	}
 	val, name := pickHeadlineCost(costs, "claude-sonnet-4")
@@ -165,8 +165,8 @@ func TestEmitSavingsDashboard_RendersThreeBuckets(t *testing.T) {
 		"Today",
 		"Last 7 days",
 		"All time",
-		"█", // at least one filled bar cell
-		"░", // at least one empty bar cell
+		"█",                 // at least one filled bar cell
+		"░",                 // at least one empty bar cell
 		"get_symbol_source", // verbose per-tool table
 		"smart_context",
 		"Cost avoided per model (all time):",

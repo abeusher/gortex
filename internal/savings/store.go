@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/zzet/gortex/internal/persistence"
@@ -48,6 +49,11 @@ type File struct {
 	Totals      Totals             `json:"totals"`
 	PerRepo     map[string]*Totals `json:"per_repo,omitempty"`
 	PerLanguage map[string]*Totals `json:"per_language,omitempty"`
+	// DroppedObservations counts ledger writes this process discarded
+	// (accounting must never fail a tool call, but drops must not be
+	// invisible — a persistently failing ledger looks exactly like
+	// "nothing recorded" otherwise).
+	DroppedObservations int64 `json:"dropped_observations,omitempty"`
 }
 
 // Observation is one source-reading tool call to book.
@@ -74,6 +80,13 @@ type Store struct {
 	sc        *persistence.SidecarStore
 	mem       File    // in-memory accumulation when sc == nil
 	memEvents []Event // in-memory event log when sc == nil
+
+	// dropped counts observations the sidecar refused (disk full,
+	// permissions, lock timeout). warnOnce emits a single stderr line
+	// the first time it happens so the failure is diagnosable without
+	// failing any tool call.
+	dropped  atomic.Int64
+	warnOnce sync.Once
 }
 
 // DefaultDBPath returns the canonical savings ledger location: the
@@ -164,7 +177,7 @@ func (s *Store) AddObservation(o Observation) {
 	now := time.Now().UTC()
 
 	if s.sc != nil {
-		_ = s.sc.AddSavingsObservation(persistence.SavingsEvent{
+		err := s.sc.AddSavingsObservation(persistence.SavingsEvent{
 			TS:        now,
 			SessionID: o.SessionID,
 			Tool:      o.Tool,
@@ -173,6 +186,12 @@ func (s *Store) AddObservation(o Observation) {
 			Returned:  o.Returned,
 			Saved:     o.Saved,
 		})
+		if err != nil {
+			s.dropped.Add(1)
+			s.warnOnce.Do(func() {
+				fmt.Fprintf(os.Stderr, "gortex: savings ledger write failed, observations will be dropped: %v\n", err)
+			})
+		}
 		return
 	}
 
@@ -216,9 +235,13 @@ func (s *Store) AddObservation(o Observation) {
 // not just this one. FirstSeen stays the zero time until something has
 // actually been recorded — callers must not present it as "tracking since"
 // when it is zero.
-func (s *Store) Snapshot() File {
+//
+// On a read error the returned File is empty and the error is non-nil —
+// callers that render the empty state must distinguish "nothing recorded"
+// from "ledger unreadable".
+func (s *Store) Snapshot() (File, error) {
 	if s == nil {
-		return emptyFile()
+		return emptyFile(), nil
 	}
 	if s.sc == nil {
 		s.mu.Lock()
@@ -226,16 +249,18 @@ func (s *Store) Snapshot() File {
 		cp := s.mem
 		cp.PerRepo = copyTotalsMap(s.mem.PerRepo)
 		cp.PerLanguage = copyTotalsMap(s.mem.PerLanguage)
-		return cp
+		cp.DroppedObservations = s.dropped.Load()
+		return cp, nil
 	}
 
 	buckets, firstSeen, lastUpdated, err := s.sc.SavingsTotals()
 	if err != nil {
-		return emptyFile()
+		return emptyFile(), fmt.Errorf("savings totals read: %w", err)
 	}
 	out := emptyFile()
 	out.FirstSeen = firstSeen
 	out.LastUpdated = lastUpdated
+	out.DroppedObservations = s.dropped.Load()
 	for bucket, r := range buckets {
 		t := &Totals{TokensSaved: r.Saved, TokensReturned: r.Returned, CallsCounted: r.Calls}
 		switch {
@@ -247,7 +272,48 @@ func (s *Store) Snapshot() File {
 			out.PerLanguage[bucket[5:]] = t
 		}
 	}
-	return out
+	return out, nil
+}
+
+// ToolTotals returns the per-tool aggregate over events with TS >= since
+// (zero = all time), sorted by tokens saved descending. Sidecar-backed
+// stores aggregate in SQL so the dashboard never materializes the full
+// event history just to render a breakdown.
+func (s *Store) ToolTotals(since time.Time) ([]ToolTotal, error) {
+	if s == nil {
+		return nil, nil
+	}
+	if s.sc == nil {
+		s.mu.Lock()
+		events := FilterSince(s.memEvents, since)
+		s.mu.Unlock()
+		_, per := AggregateByTool(events)
+		return per, nil
+	}
+	rows, err := s.sc.SavingsToolTotals(since)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ToolTotal, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, ToolTotal{Tool: r.Tool, Totals: Totals{
+			TokensSaved:    r.Saved,
+			TokensReturned: r.Returned,
+			CallsCounted:   r.Calls,
+		}})
+	}
+	return out, nil
+}
+
+// Close releases the underlying sidecar handle (dropping it from the
+// process-wide cache). Safe on nil and in-memory stores. The daemon
+// keeps its store open for the process lifetime; tests and one-shot
+// CLI paths should Close when done.
+func (s *Store) Close() error {
+	if s == nil || s.sc == nil {
+		return nil
+	}
+	return s.sc.Close()
 }
 
 // EventsSince returns the per-call events with TS >= since, oldest first.
@@ -306,11 +372,24 @@ func (s *Store) Reset() error {
 // sidecar, then renames both files to *.bak. Idempotent: a migration
 // mark guarantees the import runs once per sidecar, including when
 // there was nothing to import. In-memory stores skip the import.
+//
+// The cumulative file was flush-batched while the event log appended
+// eagerly, so a SIGKILL-era ledger can carry fewer totals than its own
+// events; totals are floored per bucket and per field at what the
+// events reconstruct, or "Last 7 days" could exceed "All time".
 func (s *Store) ImportLegacy(jsonPath string) error {
 	if s == nil || s.sc == nil || jsonPath == "" {
 		return nil
 	}
+	eventsPath := EventsPathFor(jsonPath)
 	if s.sc.SavingsLegacyImportDone() {
+		// Self-heal lingering files: a crash between the import commit
+		// and the renames — or an old-version daemon recreating the
+		// files after migration — leaves live-looking flat files no
+		// future open would ever touch. Their content is intentionally
+		// not imported (the mark owns that decision); sweep them aside.
+		_ = renameLegacySavings(jsonPath)
+		_ = renameLegacySavings(eventsPath)
 		return nil
 	}
 
@@ -318,43 +397,61 @@ func (s *Store) ImportLegacy(jsonPath string) error {
 	if err != nil {
 		return err
 	}
-	eventsPath := EventsPathFor(jsonPath)
-	events, _ := LoadEvents(eventsPath, time.Time{})
+	// A hard read error must abort without marking or renaming so the
+	// import retries next open — importing a truncated event log and
+	// renaming the original away would make the loss permanent.
+	events, err := LoadEvents(eventsPath, time.Time{})
+	if err != nil {
+		return fmt.Errorf("read legacy savings events: %w", err)
+	}
 
-	buckets := make(map[string]persistence.SavingsTotalsRow)
+	// Rebuild totals from the events unconditionally...
+	rebuilt := make(map[string]persistence.SavingsTotalsRow)
+	for _, ev := range events {
+		bump := func(bucket string) {
+			r := rebuilt[bucket]
+			r.Saved += ev.Saved
+			r.Returned += ev.Returned
+			r.Calls++
+			rebuilt[bucket] = r
+		}
+		bump("")
+		if ev.Repo != "" {
+			bump("repo:" + ev.Repo)
+		}
+		if ev.Language != "" {
+			bump("lang:" + ev.Language)
+		}
+	}
+
+	// ...then overlay the cumulative file's (possibly larger, possibly
+	// flush-lagged) numbers, taking the per-field max of the two views.
+	buckets := rebuilt
 	var firstSeen, lastUpdated time.Time
-	switch {
-	case legacy != nil:
-		buckets[""] = totalsRow(legacy.Totals)
+	if legacy != nil {
+		overlay := func(bucket string, t Totals) {
+			r := buckets[bucket]
+			r.Saved = max(r.Saved, t.TokensSaved)
+			r.Returned = max(r.Returned, t.TokensReturned)
+			r.Calls = max(r.Calls, t.CallsCounted)
+			buckets[bucket] = r
+		}
+		overlay("", legacy.Totals)
 		for k, v := range legacy.PerRepo {
-			buckets["repo:"+k] = totalsRow(*v)
+			overlay("repo:"+k, *v)
 		}
 		for k, v := range legacy.PerLanguage {
-			buckets["lang:"+k] = totalsRow(*v)
+			overlay("lang:"+k, *v)
 		}
 		firstSeen, lastUpdated = legacy.FirstSeen, legacy.LastUpdated
-	case len(events) > 0:
-		// Event log without a cumulative file (e.g. the cumulative
-		// flush never ran before the process died): rebuild the
-		// totals the file would have carried.
-		for _, ev := range events {
-			bump := func(bucket string) {
-				r := buckets[bucket]
-				r.Saved += ev.Saved
-				r.Returned += ev.Returned
-				r.Calls++
-				buckets[bucket] = r
-			}
-			bump("")
-			if ev.Repo != "" {
-				bump("repo:" + ev.Repo)
-			}
-			if ev.Language != "" {
-				bump("lang:" + ev.Language)
-			}
+	}
+	if len(events) > 0 {
+		if firstSeen.IsZero() || events[0].TS.Before(firstSeen) {
+			firstSeen = events[0].TS
 		}
-		firstSeen = events[0].TS
-		lastUpdated = events[len(events)-1].TS
+		if last := events[len(events)-1].TS; last.After(lastUpdated) {
+			lastUpdated = last
+		}
 	}
 
 	pevents := make([]persistence.SavingsEvent, 0, len(events))
@@ -372,25 +469,27 @@ func (s *Store) ImportLegacy(jsonPath string) error {
 	if err := s.sc.ImportLegacySavings(buckets, firstSeen, lastUpdated, pevents); err != nil {
 		return err
 	}
-	renameLegacySavings(jsonPath)
-	renameLegacySavings(eventsPath)
-	return nil
-}
-
-func totalsRow(t Totals) persistence.SavingsTotalsRow {
-	return persistence.SavingsTotalsRow{Saved: t.TokensSaved, Returned: t.TokensReturned, Calls: t.CallsCounted}
+	return errors.Join(
+		renameLegacySavings(jsonPath),
+		renameLegacySavings(eventsPath),
+	)
 }
 
 // renameLegacySavings moves an already-imported flat file aside to
-// <file>.bak. Best-effort — never deletes; a missing file is fine.
-func renameLegacySavings(path string) {
+// <file>.bak. Never deletes; a missing file is fine. A rename failure
+// is reported so the caller can surface it — silently leaving the file
+// in place makes it look live when it no longer is.
+func renameLegacySavings(path string) error {
 	if path == "" {
-		return
+		return nil
 	}
 	if _, err := os.Stat(path); err != nil {
-		return
+		return nil
 	}
-	_ = os.Rename(path, path+".bak")
+	if err := os.Rename(path, path+".bak"); err != nil {
+		return fmt.Errorf("rename legacy savings file: %w", err)
+	}
+	return nil
 }
 
 // readLegacyFile loads a flat-file era savings.json. Returns (nil, nil)
@@ -413,6 +512,18 @@ func readLegacyFile(path string) (*File, error) {
 	}
 	if loaded.PerLanguage == nil {
 		loaded.PerLanguage = make(map[string]*Totals)
+	}
+	// JSON null map values unmarshal to nil pointers — drop them here,
+	// the single choke point, so no consumer dereferences one.
+	for k, v := range loaded.PerRepo {
+		if v == nil {
+			delete(loaded.PerRepo, k)
+		}
+	}
+	for k, v := range loaded.PerLanguage {
+		if v == nil {
+			delete(loaded.PerLanguage, k)
+		}
 	}
 	return &loaded, nil
 }

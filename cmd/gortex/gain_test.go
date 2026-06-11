@@ -15,11 +15,11 @@ import (
 
 func TestHumanDuration(t *testing.T) {
 	cases := map[time.Duration]string{
-		24 * time.Hour:       "24h",
-		7 * 24 * time.Hour:   "7d",
-		30 * 24 * time.Hour:  "30d",
-		2 * time.Hour:        "2h",
-		90 * time.Minute:     "1h30m0s",
+		24 * time.Hour:      "24h",
+		7 * 24 * time.Hour:  "7d",
+		30 * 24 * time.Hour: "30d",
+		2 * time.Hour:       "2h",
+		90 * time.Minute:    "1h30m0s",
 	}
 	for in, want := range cases {
 		if got := humanDuration(in); got != want {
@@ -240,4 +240,3 @@ func TestGainCmd_Registered(t *testing.T) {
 		t.Errorf("rootCmd missing `gain`; have %v", subs)
 	}
 }
-

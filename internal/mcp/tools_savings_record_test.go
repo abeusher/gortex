@@ -73,7 +73,8 @@ func TestReadFamilyToolsRecordSavings(t *testing.T) {
 
 	// Single-repo events attribute to the lone repo's prefix — the same
 	// bucket key multi-repo mode would use — for every recording tool.
-	ledger := store.Snapshot()
+	ledger, lerr := store.Snapshot()
+	require.NoError(t, lerr)
 	require.NotNil(t, ledger.PerRepo["myrepo"], "events must land in the lone repo's per-repo bucket, got %v", ledger.PerRepo)
 	require.Equal(t, int64(4), ledger.PerRepo["myrepo"].CallsCounted)
 }

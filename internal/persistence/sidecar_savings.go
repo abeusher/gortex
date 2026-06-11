@@ -112,7 +112,7 @@ func upsertSavingsBucket(tx *sql.Tx, bucket string, saved, returned, calls int64
 }
 
 // SavingsTotals returns every totals bucket plus the first_seen /
-// last_updated stamps. Buckets map keys are '' (top-line),
+// last_updated stamps. Buckets map keys are ” (top-line),
 // 'repo:<prefix>', and 'lang:<code>'. The zero time means "never".
 func (s *SidecarStore) SavingsTotals() (map[string]SavingsTotalsRow, time.Time, time.Time, error) {
 	if s == nil {
@@ -262,7 +262,46 @@ func (s *SidecarStore) ImportLegacySavings(buckets map[string]SavingsTotalsRow, 
 	return tx.Commit()
 }
 
-// ResetSavings wipes the savings ledger (events, totals, meta). The
+// SavingsToolTotals aggregates events per tool over ts >= since
+// (zero = all time), tokens-saved descending — the dashboard breakdown
+// without materializing the event history into Go.
+func (s *SidecarStore) SavingsToolTotals(since time.Time) ([]SavingsToolRow, error) {
+	if s == nil {
+		return nil, nil
+	}
+	rows, err := s.db.Query(
+		`SELECT tool, SUM(saved), SUM(returned), COUNT(1)
+		 FROM savings_events WHERE ts >= ?
+		 GROUP BY tool ORDER BY SUM(saved) DESC, tool`,
+		unixOrZero(since),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("persistence: savings tool totals: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []SavingsToolRow
+	for rows.Next() {
+		var r SavingsToolRow
+		if err := rows.Scan(&r.Tool, &r.Saved, &r.Returned, &r.Calls); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// SavingsToolRow is one per-tool aggregate row.
+type SavingsToolRow struct {
+	Tool     string
+	Saved    int64
+	Returned int64
+	Calls    int64
+}
+
+// ResetSavings wipes the savings ledger (events, totals, meta) in one
+// transaction, so a concurrent writer's observation either survives
+// whole or is wiped whole — never an orphan event without totals. The
 // legacy-import migration mark survives so renamed flat files are not
 // re-imported after a reset.
 func (s *SidecarStore) ResetSavings() error {
@@ -271,14 +310,19 @@ func (s *SidecarStore) ResetSavings() error {
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("persistence: savings reset tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
 	for _, stmt := range []string{
 		`DELETE FROM savings_events`,
 		`DELETE FROM savings_totals`,
 		`DELETE FROM savings_meta`,
 	} {
-		if _, err := s.db.Exec(stmt); err != nil {
+		if _, err := tx.Exec(stmt); err != nil {
 			return fmt.Errorf("persistence: savings reset: %w", err)
 		}
 	}
-	return nil
+	return tx.Commit()
 }

@@ -168,20 +168,20 @@ func FilterDay(events []Event, day time.Time, loc *time.Location) []Event {
 }
 
 // BuildDashboard returns the three canonical buckets (Today / Last 7 days /
-// All time) from the full event history (oldest first), using `now` as the
+// All time) from the last week's events (oldest first), using `now` as the
 // reference clock and `loc` as the calendar for the "Today" boundary.
-// storeAllTime supplies the All-time totals — it can exceed what the events
-// reconstruct when history predates the event log (flat-file era imports).
-func BuildDashboard(events []Event, storeAllTime Totals, now time.Time, loc *time.Location) []Bucket {
+// storeAllTime supplies the All-time totals and allPerTool its per-tool
+// breakdown — both come from the ledger's aggregates, so callers never
+// materialize the full event history just to render the dashboard.
+func BuildDashboard(weekEvents []Event, storeAllTime Totals, allPerTool []ToolTotal, now time.Time, loc *time.Location) []Bucket {
 	if loc == nil {
 		loc = time.Local
 	}
-	weekEvents := FilterSince(events, now.Add(-7*24*time.Hour))
+	weekEvents = FilterSince(weekEvents, now.Add(-7*24*time.Hour))
 
 	todayEvents := FilterDay(weekEvents, now, loc)
 	todayTotals, todayPerTool := AggregateByTool(todayEvents)
 	weekTotals, weekPerTool := AggregateByTool(weekEvents)
-	_, allPerTool := AggregateByTool(events)
 
 	return []Bucket{
 		{Label: "Today", Totals: todayTotals, PerTool: todayPerTool},

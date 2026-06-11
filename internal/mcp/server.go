@@ -1575,9 +1575,12 @@ func (s *Server) cumulativeSavingsSnapshot() map[string]any {
 		return nil
 	}
 
-	snap := store.Snapshot()
+	snap, err := store.Snapshot()
+	if err != nil && s.logger != nil {
+		s.logger.Warn("cumulative savings snapshot failed", zap.Error(err))
+	}
 	costs := savings.CostAvoidedAll(snap.Totals.TokensSaved)
-	return map[string]any{
+	out := map[string]any{
 		"first_seen":       snap.FirstSeen.Format(time.RFC3339),
 		"last_updated":     snap.LastUpdated.Format(time.RFC3339),
 		"tokens_saved":     snap.Totals.TokensSaved,
@@ -1585,6 +1588,10 @@ func (s *Server) cumulativeSavingsSnapshot() map[string]any {
 		"calls_counted":    snap.Totals.CallsCounted,
 		"cost_avoided_usd": costs,
 	}
+	if snap.DroppedObservations > 0 {
+		out["dropped_observations"] = snap.DroppedObservations
+	}
+	return out
 }
 
 // ExportContext generates a portable context briefing for the given task.

@@ -85,20 +85,30 @@ func runSavings(_ *cobra.Command, _ []string) error {
 		return nil
 	}
 
-	snap := store.Snapshot()
+	snap, serr := store.Snapshot()
+	if serr != nil {
+		// Surface it: an unreadable ledger must not masquerade as a
+		// fresh install's "nothing recorded yet" empty state.
+		fmt.Fprintf(os.Stderr, "[gortex savings] totals read failed: %v\n", serr)
+	}
 
 	loc := time.Local
 	if savingsUTC {
 		loc = time.UTC
 	}
-	events, err := store.EventsSince(time.Time{})
+	now := time.Now()
+	events, err := store.EventsSince(now.Add(-7 * 24 * time.Hour))
 	if err != nil {
 		// Don't fail the whole command on event read errors — fall back
 		// to a dashboard with empty Today/7d buckets.
 		fmt.Fprintf(os.Stderr, "[gortex savings] event history read failed: %v\n", err)
 		events = nil
 	}
-	buckets := savings.BuildDashboard(events, snap.Totals, time.Now(), loc)
+	allPerTool, err := store.ToolTotals(time.Time{})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[gortex savings] per-tool aggregate failed: %v\n", err)
+	}
+	buckets := savings.BuildDashboard(events, snap.Totals, allPerTool, now, loc)
 
 	if savingsJSON {
 		return emitSavingsJSON(snap, buckets, dbPath)

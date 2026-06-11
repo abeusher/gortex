@@ -7,10 +7,10 @@
 //
 // gain vs savings:
 //   - savings   — rear-looking: what HAPPENED across past MCP calls
-//                 (your actual cumulative store + JSONL event log)
+//     (your actual cumulative store + JSONL event log)
 //   - gain      — forward-looking: what gortex SAVES on a typical
-//                 call (benchmark-derived, works on fresh installs
-//                 with no history)
+//     call (benchmark-derived, works on fresh installs
+//     with no history)
 package main
 
 import (
@@ -303,12 +303,12 @@ func renderGainProjection(w interface{ Write([]byte) (int, error) }, rows []toke
 // constrained to the --since window. Zero-population when no calls
 // fell inside the window.
 type gainHistory struct {
-	Path       string
-	Since      time.Duration
-	Calls      int64
-	Saved      int64
-	Returned   int64
-	Costs      map[string]float64
+	Path     string
+	Since    time.Duration
+	Calls    int64
+	Saved    int64
+	Returned int64
+	Costs    map[string]float64
 }
 
 func (h *gainHistory) toJSON() map[string]any {
@@ -338,7 +338,10 @@ func loadHistory(cacheDir string, since time.Duration) (*gainHistory, error) {
 		return nil, err
 	}
 	_ = store.ImportLegacy(legacyJSON)
-	snap := store.Snapshot()
+	snap, serr := store.Snapshot()
+	if serr != nil {
+		fmt.Fprintf(os.Stderr, "[gortex gain] savings totals read failed: %v\n", serr)
+	}
 
 	if since <= 0 {
 		// --since 0 → entire-history view; just use the cumulative

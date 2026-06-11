@@ -48,6 +48,9 @@ func TestEventsPathFor(t *testing.T) {
 
 func TestAddObservation_RecordsEvent(t *testing.T) {
 	s, err := Open(filepath.Join(t.TempDir(), "sidecar.sqlite"))
+	if err == nil {
+		t.Cleanup(func() { _ = s.Close() })
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -211,7 +214,8 @@ func TestBuildDashboard_BucketsByWindow(t *testing.T) {
 
 	all := Totals{TokensSaved: 9999 + 300 + 200 + 50 + 150 + 100, TokensReturned: 60, CallsCounted: 6}
 
-	buckets := BuildDashboard(events, all, now, time.UTC)
+	_, allPerTool := AggregateByTool(events)
+	buckets := BuildDashboard(events, all, allPerTool, now, time.UTC)
 	if len(buckets) != 3 {
 		t.Fatalf("buckets = %d, want 3", len(buckets))
 	}
@@ -312,6 +316,9 @@ func TestBarString_DefaultsCellsTo16(t *testing.T) {
 
 func TestEvents_ConcurrentWritersAllRecorded(t *testing.T) {
 	s, err := Open(filepath.Join(t.TempDir(), "sidecar.sqlite"))
+	if err == nil {
+		t.Cleanup(func() { _ = s.Close() })
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
