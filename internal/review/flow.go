@@ -24,6 +24,10 @@ type Options struct {
 	// RepoRoot is the repository root the change is read from. May be empty for
 	// the pasted-diff (off-disk) path, in which case Diff must be set.
 	RepoRoot string
+	// RepoPrefix is the graph repo prefix anchoring RepoRoot's indexed nodes —
+	// multi-repo daemons key file paths as "<prefix>/<rel>" while git emits
+	// repo-relative paths. Empty in single-repo / unprefixed mode.
+	RepoPrefix string
 	// Scope selects the git diff range: "staged", "all", "compare", or
 	// "unstaged" (default). Ignored when Diff is set.
 	Scope string
@@ -211,11 +215,11 @@ func buildSubstrate(g graph.Store, opts Options) (*ChangeView, *analysis.DiffRes
 		return view, diffFromView(view), nil
 	}
 
-	view, err := BuildChangeView(g, opts.RepoRoot, opts.Scope, opts.BaseRef)
+	view, err := BuildChangeView(g, opts.RepoRoot, opts.RepoPrefix, opts.Scope, opts.BaseRef)
 	if err != nil {
 		return nil, nil, err
 	}
-	diff, err := analysis.MapGitDiff(g, opts.RepoRoot, opts.Scope, opts.BaseRef)
+	diff, err := analysis.MapGitDiff(g, opts.RepoRoot, opts.RepoPrefix, opts.Scope, opts.BaseRef)
 	if err != nil {
 		return nil, nil, err
 	}

@@ -111,6 +111,7 @@ func (s *Server) handleConflictsPRs(ctx context.Context, req mcp.CallToolRequest
 
 	// Per-PR community fan-out and a per-PR risk score for the suggested
 	// merge order. Both derive from the PR's changed-file set.
+	joinPrefix := s.prJoinPrefix(ctx, repo)
 	prCommunities := map[int][]string{}
 	prRisk := map[int]float64{}
 	for _, pr := range prs {
@@ -122,7 +123,7 @@ func (s *Server) handleConflictsPRs(ctx context.Context, req mcp.CallToolRequest
 			return mcp.NewToolResultError(ferr.Error()), nil
 		}
 
-		changedFiles, changedSymbolNodes := s.changedSymbolsForFiles(files)
+		changedFiles, changedSymbolNodes := s.changedSymbolsForFiles(joinPrefix, files)
 		symbolIDs := make([]string, 0, len(changedSymbolNodes))
 		for _, n := range changedSymbolNodes {
 			symbolIDs = append(symbolIDs, n.ID)

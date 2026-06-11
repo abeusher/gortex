@@ -260,7 +260,7 @@ func (s *Server) handleSiblingDiffContext(ctx context.Context, req mcp.CallToolR
 	}
 
 	// Enumerate the whole changeset.
-	diff, err := analysis.MapGitDiff(s.graph, repoRoot, scope, baseRef)
+	diff, err := analysis.MapGitDiff(s.graph, repoRoot, s.diffJoinPrefix(repoRoot), scope, baseRef)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -565,6 +565,7 @@ func (s *Server) handleReview(ctx context.Context, req mcp.CallToolRequest) (*mc
 	if repoRoot == "" && diffText == "" {
 		return mcp.NewToolResultError("could not resolve a repository root for the changeset diff"), nil
 	}
+	repoPrefix := s.diffJoinPrefix(repoRoot)
 
 	// Compute the deterministic rulepack matches over the changed files, and the
 	// per-changed-symbol impact map, from the on-disk changeset. For a pasted
@@ -575,7 +576,7 @@ func (s *Server) handleReview(ctx context.Context, req mcp.CallToolRequest) (*mc
 		impact   map[string]*analysis.ImpactResult
 	)
 	if diffText == "" {
-		diff, err := analysis.MapGitDiff(s.graph, repoRoot, scope, baseRef)
+		diff, err := analysis.MapGitDiff(s.graph, repoRoot, repoPrefix, scope, baseRef)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
@@ -596,6 +597,7 @@ func (s *Server) handleReview(ctx context.Context, req mcp.CallToolRequest) (*mc
 	suppStore, suppRepoKey := s.reviewSuppressions()
 	report, err := review.RunWithUsage(ctx, s.graph, gen, s.reviewPricing(), review.Options{
 		RepoRoot:        repoRoot,
+		RepoPrefix:      repoPrefix,
 		Scope:           scope,
 		BaseRef:         baseRef,
 		Diff:            diffText,
@@ -974,6 +976,7 @@ func (s *Server) handleReviewPack(ctx context.Context, req mcp.CallToolRequest) 
 	if repoRoot == "" && diffText == "" {
 		return mcp.NewToolResultError("could not resolve a repository root for the changeset diff"), nil
 	}
+	repoPrefix := s.diffJoinPrefix(repoRoot)
 
 	// Enumerate the changeset (on-disk path only — a pasted diff has no graph
 	// changeset, so the gates that need indexed symbols are skipped).
@@ -984,7 +987,7 @@ func (s *Server) handleReviewPack(ctx context.Context, req mcp.CallToolRequest) 
 		ids      []string
 	)
 	if diffText == "" {
-		d, err := analysis.MapGitDiff(s.graph, repoRoot, scope, baseRef)
+		d, err := analysis.MapGitDiff(s.graph, repoRoot, repoPrefix, scope, baseRef)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
@@ -1008,6 +1011,7 @@ func (s *Server) handleReviewPack(ctx context.Context, req mcp.CallToolRequest) 
 	suppStore, suppRepoKey := s.reviewSuppressions()
 	report, err := review.RunWithUsage(ctx, s.graph, gen, s.reviewPricing(), review.Options{
 		RepoRoot:        repoRoot,
+		RepoPrefix:      repoPrefix,
 		Scope:           scope,
 		BaseRef:         baseRef,
 		Diff:            diffText,
@@ -1122,7 +1126,7 @@ func (s *Server) reviewChangeView(diff *analysis.DiffResult) (*review.ChangeView
 	if s.indexer != nil {
 		repoRoot = s.indexer.RootPath()
 	}
-	view, err := review.BuildChangeView(s.graph, repoRoot, "", "")
+	view, err := review.BuildChangeView(s.graph, repoRoot, s.diffJoinPrefix(repoRoot), "", "")
 	if err != nil {
 		return nil, diff
 	}

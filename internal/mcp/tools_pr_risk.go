@@ -65,7 +65,7 @@ func (s *Server) handlePRRisk(ctx context.Context, req mcp.CallToolRequest) (*mc
 		if root == "" {
 			return mcp.NewToolResultError("could not resolve a repository root for the base diff"), nil
 		}
-		diff, err := analysis.MapGitDiff(s.graph, root, "compare", base)
+		diff, err := analysis.MapGitDiff(s.graph, root, s.diffJoinPrefix(root), "compare", base)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("git diff against %q failed: %v", base, err)), nil
 		}

@@ -277,7 +277,7 @@ func (s *Server) buildActiveProjectPayload(ctx context.Context) map[string]any {
 // resolveRepoPrefixOrReconcile when drift between persisted config and
 // in-memory state could produce a false miss.
 func (s *Server) resolveRepoPrefix(pathOrPrefix string) string {
-	if s.multiIndexer == nil {
+	if s.multiIndexer == nil || pathOrPrefix == "" {
 		return ""
 	}
 
@@ -295,6 +295,24 @@ func (s *Server) resolveRepoPrefix(pathOrPrefix string) string {
 		}
 	}
 
+	return ""
+}
+
+// diffJoinPrefix resolves the graph repo prefix used to join repo-relative
+// diff / forge file paths to indexed nodes: multi-repo daemons key file
+// paths as "<prefix>/<rel>" while git and forge APIs emit repo-relative
+// paths. repoRoot is the already-resolved working-tree root. Returns "" in
+// single-repo / unprefixed mode, where the raw lookup already matches.
+func (s *Server) diffJoinPrefix(repoRoot string) string {
+	if repoRoot == "" {
+		return ""
+	}
+	if p := s.resolveRepoPrefix(repoRoot); p != "" {
+		return p
+	}
+	if s.indexer != nil && s.indexer.RootPath() == repoRoot {
+		return s.indexer.RepoPrefix()
+	}
 	return ""
 }
 

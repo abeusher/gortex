@@ -140,8 +140,9 @@ func (s *Server) postReviewFindingsFor(ctx context.Context, req mcp.CallToolRequ
 		rulepack []astquery.Match
 		impact   map[string]*analysis.ImpactResult
 	)
+	repoPrefix := s.diffJoinPrefix(repoRoot)
 	if diffText == "" {
-		diff, err := analysis.MapGitDiff(s.graph, repoRoot, scope, baseRef)
+		diff, err := analysis.MapGitDiff(s.graph, repoRoot, repoPrefix, scope, baseRef)
 		if err != nil {
 			return nil, err
 		}
@@ -156,6 +157,7 @@ func (s *Server) postReviewFindingsFor(ctx context.Context, req mcp.CallToolRequ
 	suppStore, suppRepoKey := s.reviewSuppressions()
 	report, err := review.Run(ctx, s.graph, nil, review.Options{
 		RepoRoot:        repoRoot,
+		RepoPrefix:      repoPrefix,
 		Scope:           scope,
 		BaseRef:         baseRef,
 		Diff:            diffText,

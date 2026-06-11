@@ -188,7 +188,7 @@ func (s *Server) handlePRReviewContext(ctx context.Context, req mcp.CallToolRequ
 		if repoRoot == "" {
 			return mcp.NewToolResultError("could not resolve a repository root for the changeset diff"), nil
 		}
-		d, err := analysis.MapGitDiff(s.graph, repoRoot, scope, baseRef)
+		d, err := analysis.MapGitDiff(s.graph, repoRoot, s.diffJoinPrefix(repoRoot), scope, baseRef)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}

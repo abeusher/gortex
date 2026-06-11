@@ -242,7 +242,7 @@ func (s *Server) handleDetectChanges(ctx context.Context, req mcp.CallToolReques
 		}
 	}
 
-	diff, err := analysis.MapGitDiff(s.graph, repoRoot, scope, baseRef)
+	diff, err := analysis.MapGitDiff(s.graph, repoRoot, s.diffJoinPrefix(repoRoot), scope, baseRef)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}

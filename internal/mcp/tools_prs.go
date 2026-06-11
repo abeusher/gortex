@@ -341,7 +341,7 @@ func (s *Server) handleGetPRImpact(ctx context.Context, req mcp.CallToolRequest)
 		files = fetched
 	}
 
-	payload := s.prImpactForNumber(ctx, number, files, receipt, scrub)
+	payload := s.prImpactForNumber(ctx, number, s.prJoinPrefix(ctx, repo), files, receipt, scrub)
 
 	if s.isGCX(ctx, req) {
 		return s.gcxResponseWithBudget(req)(encodePRImpact(payload))
@@ -356,8 +356,10 @@ func (s *Server) handleGetPRImpact(ctx context.Context, req mcp.CallToolRequest)
 // changed file set: file→symbol join, PR-risk score, and community / blast
 // grouping. receipt adds a privacy-safe review receipt projected from the
 // same risk result. It performs no network I/O — the files are supplied.
-func (s *Server) prImpactForNumber(ctx context.Context, number int, files []string, receipt, scrub bool) map[string]any {
-	changedFiles, changedSymbolNodes := s.changedSymbolsForFiles(files)
+// repoPrefix anchors the file→symbol join in multi-repo mode (see
+// prJoinPrefix).
+func (s *Server) prImpactForNumber(ctx context.Context, number int, repoPrefix string, files []string, receipt, scrub bool) map[string]any {
+	changedFiles, changedSymbolNodes := s.changedSymbolsForFiles(repoPrefix, files)
 	symbolIDs := make([]string, 0, len(changedSymbolNodes))
 	for _, n := range changedSymbolNodes {
 		symbolIDs = append(symbolIDs, n.ID)
@@ -431,11 +433,13 @@ func (s *Server) prImpactForNumber(ctx context.Context, number int, files []stri
 }
 
 // changedSymbolsForFiles maps a set of changed file paths to the code
-// symbols those files define, via GetFileNodes (whole-file granularity —
-// the coarse mapping a not-checked-out PR allows). Returns the deduped
-// non-empty file list and the deduped symbol nodes (file nodes excluded),
-// both deterministically ordered.
-func (s *Server) changedSymbolsForFiles(files []string) ([]string, []*graph.Node) {
+// symbols those files define, via the prefix-aware file→node join
+// (whole-file granularity — the coarse mapping a not-checked-out PR
+// allows). Forge APIs return repo-relative paths while multi-repo daemons
+// key file paths as "<prefix>/<rel>"; repoPrefix bridges the two. Returns
+// the deduped non-empty file list and the deduped symbol nodes (file nodes
+// excluded), both deterministically ordered.
+func (s *Server) changedSymbolsForFiles(repoPrefix string, files []string) ([]string, []*graph.Node) {
 	fileSeen := map[string]bool{}
 	var changedFiles []string
 	nodeSeen := map[string]bool{}
@@ -447,7 +451,7 @@ func (s *Server) changedSymbolsForFiles(files []string) ([]string, []*graph.Node
 		}
 		fileSeen[f] = true
 		changedFiles = append(changedFiles, f)
-		for _, n := range s.graph.GetFileNodes(f) {
+		for _, n := range analysis.JoinFileNodes(s.graph, repoPrefix, f) {
 			if n == nil || n.Kind == graph.KindFile {
 				continue
 			}
@@ -460,6 +464,27 @@ func (s *Server) changedSymbolsForFiles(files []string) ([]string, []*graph.Node
 	}
 	sort.Slice(nodes, func(i, j int) bool { return nodes[i].ID < nodes[j].ID })
 	return changedFiles, nodes
+}
+
+// prJoinPrefix resolves the graph repo prefix for the forge-file → symbol
+// join: the caller's repo selector when it names a tracked repo, then the
+// prefix anchoring the picked repo root, then the session's cwd-bound repo
+// (the CLI dials the daemon with its working directory, so `gortex prs <N>`
+// run inside a tracked repo joins against that repo without an explicit
+// selector). Empty in single-repo / unprefixed mode.
+func (s *Server) prJoinPrefix(ctx context.Context, repo string) string {
+	if p := s.resolveRepoPrefix(repo); p != "" {
+		return p
+	}
+	if p := s.diffJoinPrefix(pickRepoRoot(s.collectRepoRoots(repo), repo)); p != "" {
+		return p
+	}
+	if cwd := SessionCWDFromContext(ctx); cwd != "" && s.multiIndexer != nil {
+		if _, _, prefix, ok := s.multiIndexer.ScopeForCWD(cwd); ok {
+			return prefix
+		}
+	}
+	return ""
 }
 
 // handleTriagePRs ranks a repository's open PRs by get_pr_impact score
@@ -511,6 +536,7 @@ func (s *Server) handleTriagePRs(ctx context.Context, req mcp.CallToolRequest) (
 		prs = prs[:limit]
 	}
 
+	joinPrefix := s.prJoinPrefix(ctx, repo)
 	ranked := make([]map[string]any, 0, len(prs))
 	for _, pr := range prs {
 		files, degraded, ferr := s.resolvePRFiles(ctx, repo, pr, filesByNumber)
@@ -520,7 +546,7 @@ func (s *Server) handleTriagePRs(ctx context.Context, req mcp.CallToolRequest) (
 		if ferr != nil {
 			return mcp.NewToolResultError(ferr.Error()), nil
 		}
-		impact := s.prImpactForNumber(ctx, pr.Number, files, false, false)
+		impact := s.prImpactForNumber(ctx, pr.Number, joinPrefix, files, false, false)
 		ranked = append(ranked, map[string]any{
 			"number": pr.Number,
 			"title":  pr.Title,

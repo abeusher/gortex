@@ -153,7 +153,7 @@ func TestMapGitDiffWithLinesReturnsNewSideLines(t *testing.T) {
 		Language:  "go",
 	})
 
-	res, lines, err := MapGitDiffWithLines(g, dir, "all", "")
+	res, lines, err := MapGitDiffWithLines(g, dir, "", "all", "")
 	if err != nil {
 		t.Fatalf("MapGitDiffWithLines: %v", err)
 	}
@@ -189,6 +189,94 @@ func TestMapGitDiffWithLinesReturnsNewSideLines(t *testing.T) {
 	}
 }
 
+// TestMapGitDiffRepoPrefixJoin covers the multi-repo daemon shape: indexed
+// file paths carry the repo prefix ("myrepo/foo.go") while git emits
+// repo-relative hunk paths ("foo.go"). The prefix-aware join must find the
+// symbol; ChangedFiles must stay diff-relative so git pathspec re-joins keep
+// working.
+func TestMapGitDiffRepoPrefixJoin(t *testing.T) {
+	dir := newTestRepo(t)
+
+	g := graph.New()
+	g.AddNode(&graph.Node{
+		ID:        "myrepo/foo.go::Foo",
+		Kind:      graph.KindFunction,
+		Name:      "Foo",
+		FilePath:  "myrepo/foo.go",
+		StartLine: 3,
+		EndLine:   6,
+		Language:  "go",
+	})
+
+	res, err := MapGitDiff(g, dir, "myrepo", "all", "")
+	if err != nil {
+		t.Fatalf("MapGitDiff: %v", err)
+	}
+	var sawFoo bool
+	for _, cs := range res.ChangedSymbols {
+		if cs.ID == "myrepo/foo.go::Foo" {
+			sawFoo = true
+		}
+	}
+	if !sawFoo {
+		t.Fatalf("expected prefixed Foo among changed symbols: %#v", res.ChangedSymbols)
+	}
+	if len(res.ChangedFiles) != 1 || res.ChangedFiles[0] != "foo.go" {
+		t.Fatalf("ChangedFiles must keep diff-relative paths, got %#v", res.ChangedFiles)
+	}
+
+	// Without the prefix the join misses — the pre-fix behavior, kept for
+	// single-repo graphs whose paths are unprefixed.
+	res, err = MapGitDiff(g, dir, "", "all", "")
+	if err != nil {
+		t.Fatalf("MapGitDiff (no prefix): %v", err)
+	}
+	if len(res.ChangedSymbols) != 0 {
+		t.Fatalf("unprefixed join against a prefixed graph should miss, got %#v", res.ChangedSymbols)
+	}
+}
+
+func TestJoinFileNodes(t *testing.T) {
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "myrepo/a.go::A", Kind: graph.KindFunction, Name: "A", FilePath: "myrepo/a.go"})
+	g.AddNode(&graph.Node{ID: "b.go::B", Kind: graph.KindFunction, Name: "B", FilePath: "b.go"})
+
+	// Raw hit wins (single-repo / unprefixed graph).
+	if nodes := JoinFileNodes(g, "myrepo", "b.go"); len(nodes) != 1 || nodes[0].ID != "b.go::B" {
+		t.Fatalf("raw lookup should win: %#v", nodes)
+	}
+	// Relative path retries with the prefix.
+	if nodes := JoinFileNodes(g, "myrepo", "a.go"); len(nodes) != 1 || nodes[0].ID != "myrepo/a.go::A" {
+		t.Fatalf("prefixed retry should hit: %#v", nodes)
+	}
+	// Already-prefixed input does not double-prefix.
+	if nodes := JoinFileNodes(g, "myrepo", "myrepo/a.go"); len(nodes) != 1 || nodes[0].ID != "myrepo/a.go::A" {
+		t.Fatalf("already-prefixed input should hit raw: %#v", nodes)
+	}
+	// No prefix → raw only.
+	if nodes := JoinFileNodes(g, "", "a.go"); len(nodes) != 0 {
+		t.Fatalf("no-prefix miss should stay a miss: %#v", nodes)
+	}
+}
+
+func TestJoinFilePath(t *testing.T) {
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "myrepo/a.go::A", Kind: graph.KindFunction, Name: "A", FilePath: "myrepo/a.go"})
+
+	if got := JoinFilePath(g, "myrepo", "a.go"); got != "myrepo/a.go" {
+		t.Fatalf("expected prefixed path, got %q", got)
+	}
+	if got := JoinFilePath(g, "myrepo", "myrepo/a.go"); got != "myrepo/a.go" {
+		t.Fatalf("already-prefixed path should pass through, got %q", got)
+	}
+	if got := JoinFilePath(g, "myrepo", "missing.go"); got != "missing.go" {
+		t.Fatalf("unresolvable path should pass through raw, got %q", got)
+	}
+	if got := JoinFilePath(g, "", "a.go"); got != "a.go" {
+		t.Fatalf("no prefix should pass through, got %q", got)
+	}
+}
+
 // TestMapGitDiffUnchanged asserts the existing --unified=0 path still yields the
 // same DiffResult shape (hunks + changed symbols + changed files) it always did,
 // independent of the new sibling.
@@ -206,7 +294,7 @@ func TestMapGitDiffUnchanged(t *testing.T) {
 		Language:  "go",
 	})
 
-	res, err := MapGitDiff(g, dir, "all", "")
+	res, err := MapGitDiff(g, dir, "", "all", "")
 	if err != nil {
 		t.Fatalf("MapGitDiff: %v", err)
 	}
