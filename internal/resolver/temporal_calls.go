@@ -2,6 +2,8 @@ package resolver
 
 import (
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/zzet/gortex/internal/graph"
 )
@@ -11,6 +13,21 @@ import (
 // workflow) dispatch it can't land locally
 // (`unresolved::temporal::<kind>::<name>`).
 const temporalStubPrefix = unresolvedPrefix + "temporal::"
+
+// temporalEnvDefaultConfidence is stamped on a stub edge whose name was
+// resolved through an env-var-with-literal-default variable (the parser
+// tags it `temporal_name_origin=env_default`). It sits in the
+// speculative band (< 0.5) so the edge lands at the AMBIGUOUS label and,
+// together with MetaSpeculative, is hidden from default queries: the
+// runtime env override may name a different handler than the default.
+const temporalEnvDefaultConfidence = 0.4
+
+// temporalCrossLangConfidence is stamped on a cross-language Temporal link
+// (e.g. a Java service that starts a Go workflow, matched by canonical
+// name across a type-system boundary with no compiler guarantee the names
+// line up). It sits in the speculative band so the edge is hidden from
+// default queries, consistent with the env-default tier.
+const temporalCrossLangConfidence = 0.4
 
 // Temporal annotation node IDs the Java extractor emits via
 // EmitAnnotationEdge. The resolver consumes these to discover
@@ -85,47 +102,133 @@ func ResolveTemporalCalls(g graph.Store) int {
 	mu := g.ResolveMutex()
 	mu.Lock()
 	defer mu.Unlock()
-	idx := buildTemporalIndex(g)
-	resolved := 0
-	var reindexBatch []graph.EdgeReindex
-	// First sweep: collect stub edges and the From IDs we need so the
-	// per-edge GetNode below collapses to one batch lookup.
+
+	// Single sweep over EdgeCalls — the largest edge class — collecting
+	// both the temporal.register edges (index inputs) and the
+	// temporal.stub edges (edges to resolve), instead of scanning it once
+	// per concern. The From IDs of stub edges are gathered so the
+	// per-edge caller lookup below collapses to one batch fetch.
 	type stubEdge struct {
 		edge       *graph.Edge
 		kind, name string
 	}
 	var stubs []stubEdge
+	var registerEdges []*graph.Edge
 	fromIDSet := map[string]struct{}{}
 	for e := range g.EdgesByKind(graph.EdgeCalls) {
 		if e == nil || e.Meta == nil {
 			continue
 		}
-		if v, _ := e.Meta["via"].(string); v != "temporal.stub" {
-			continue
-		}
-		kind, _ := e.Meta["temporal_kind"].(string)
-		name, _ := e.Meta["temporal_name"].(string)
-		if kind == "" || name == "" {
-			continue
-		}
-		stubs = append(stubs, stubEdge{edge: e, kind: kind, name: name})
-		if e.From != "" {
-			fromIDSet[e.From] = struct{}{}
+		switch v, _ := e.Meta["via"].(string); v {
+		case "temporal.register":
+			registerEdges = append(registerEdges, e)
+		case "temporal.stub", "temporal.start":
+			// temporal.stub is a workflow→activity / workflow→child-workflow
+			// dispatch; temporal.start is a service→workflow start
+			// (client.ExecuteWorkflow / SignalWithStartWorkflow). Both
+			// resolve the same way — rewrite to the registered handler /
+			// workflow found by <kind>::<name>.
+			kind, _ := e.Meta["temporal_kind"].(string)
+			name, _ := e.Meta["temporal_name"].(string)
+			if kind == "" || name == "" {
+				continue
+			}
+			stubs = append(stubs, stubEdge{edge: e, kind: kind, name: name})
+			if e.From != "" {
+				fromIDSet[e.From] = struct{}{}
+			}
 		}
 	}
+
+	// Probe the (smaller) annotation class for Java temporal tags.
+	var annotatedEdges []*graph.Edge
+	for e := range g.EdgesByKind(graph.EdgeAnnotated) {
+		if e == nil {
+			continue
+		}
+		if r, m := temporalRoleForJavaAnnotation(e.To); r == "" && m == "" {
+			continue
+		}
+		annotatedEdges = append(annotatedEdges, e)
+	}
+
+	// Early-out: a graph with no Temporal register / stub / annotation
+	// edges (the common case for most repos) skips all node fetches,
+	// index building, role stamping, and Java propagation entirely — the
+	// pass costs only the two EdgesByKind scans above.
+	if len(registerEdges) == 0 && len(stubs) == 0 && len(annotatedEdges) == 0 {
+		return 0
+	}
+
+	idx := buildTemporalIndex(g, registerEdges, annotatedEdges)
+	resolved := 0
+	var reindexBatch []graph.EdgeReindex
 	fromList := make([]string, 0, len(fromIDSet))
 	for id := range fromIDSet {
 		fromList = append(fromList, id)
 	}
 	callerNodes := g.GetNodesByIDs(fromList)
 
+	// Const-dereference map: a dispatch named through a string const
+	// (`const ChargeCardActivity = "ChargeCard"`) reaches the resolver as
+	// the identifier "ChargeCardActivity"; map it to the literal value so
+	// the lookup keys on the registered name. Built once from the
+	// queryable constant_values sidecar.
+	stubNames := make([]string, 0, len(stubs))
+	for _, s := range stubs {
+		stubNames = append(stubNames, s.name)
+	}
+	derefByName := buildConstDerefMap(g, stubNames)
+
 	for _, s := range stubs {
 		e := s.edge
 		callerRepo := ""
+		callerLang := ""
 		if from := callerNodes[e.From]; from != nil {
 			callerRepo = from.RepoPrefix
+			callerLang = from.Language
 		}
-		handlerID, origin, conf := idx.lookup(s.kind, s.name, callerRepo)
+		handlerID, origin, conf := idx.lookup(s.kind, s.name, callerRepo, callerLang)
+		// When the direct name didn't resolve, try dereferencing it as a
+		// string constant and re-looking-up under the literal value.
+		constDeref := ""
+		if handlerID == "" {
+			if v, ok := derefByName[s.name]; ok && v != "" {
+				if hID, o, c := idx.lookup(s.kind, v, callerRepo, callerLang); hID != "" {
+					handlerID, origin, conf = hID, o, c
+					constDeref = v
+				}
+			}
+		}
+		// Cross-language join: a consumer (typically a temporal.start, e.g.
+		// a Java service starting a Go workflow) with no same-language
+		// handler is matched to a unique other-language candidate by
+		// canonical name, at the speculative tier.
+		crossLang := false
+		if handlerID == "" {
+			matchName := s.name
+			if constDeref != "" {
+				matchName = constDeref
+			}
+			if hID, ok := idx.lookupCrossLang(s.kind, matchName, callerLang); ok {
+				handlerID = hID
+				origin = graph.OriginSpeculative
+				conf = temporalCrossLangConfidence
+				crossLang = true
+			}
+		}
+
+		// When the name came from an env-var-with-literal-default
+		// variable, the value is a best-guess: land the resolved edge at
+		// the speculative tier instead of ast_resolved.
+		envDefault := false
+		if v, _ := e.Meta["temporal_name_origin"].(string); v == "env_default" {
+			envDefault = true
+		}
+		if handlerID != "" && envDefault {
+			origin = graph.OriginSpeculative
+			conf = temporalEnvDefaultConfidence
+		}
 
 		want := handlerID
 		if want == "" {
@@ -145,6 +248,19 @@ func ResolveTemporalCalls(g graph.Store) int {
 			e.Confidence = conf
 			e.ConfidenceLabel = graph.ConfidenceLabelFor(graph.EdgeCalls, conf)
 			e.Meta["temporal_resolution"] = origin
+			if envDefault || crossLang {
+				e.Meta[graph.MetaSpeculative] = true
+			}
+			if crossLang {
+				e.Meta["temporal_cross_lang"] = true
+			} else {
+				delete(e.Meta, "temporal_cross_lang")
+			}
+			if constDeref != "" {
+				e.Meta["temporal_const_deref"] = constDeref
+			} else {
+				delete(e.Meta, "temporal_const_deref")
+			}
 			StampSynthesized(e, SynthTemporalStub)
 			resolved++
 		} else {
@@ -152,6 +268,9 @@ func ResolveTemporalCalls(g graph.Store) int {
 			e.Confidence = 0
 			e.ConfidenceLabel = ""
 			delete(e.Meta, "temporal_resolution")
+			delete(e.Meta, graph.MetaSpeculative)
+			delete(e.Meta, "temporal_const_deref")
+			delete(e.Meta, "temporal_cross_lang")
 			UnstampSynthesized(e)
 		}
 		reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: e, OldTo: oldTo})
@@ -176,10 +295,31 @@ type temporalIndex struct {
 	byKindName map[string][]*graph.Node
 }
 
-func (idx *temporalIndex) lookup(kind, name, callerRepo string) (id, origin string, confidence float64) {
-	cands := idx.byKindName[kind+"::"+name]
-	if len(cands) == 0 {
+func (idx *temporalIndex) lookup(kind, name, callerRepo, callerLang string) (id, origin string, confidence float64) {
+	all := idx.byKindName[kind+"::"+name]
+	if len(all) == 0 {
 		return "", "", 0
+	}
+	// Language gate: a Temporal stub call resolves only within its own
+	// language. The candidate set co-mingles Go register targets and Java
+	// annotation-tagged methods under the same "<kind>::<name>" key with
+	// no language tag, so without this gate a Go workflow.ExecuteActivity
+	// stub could land on a Java method node when names collide and that
+	// Java entry is the unique overall candidate (pickGoTemporalTarget
+	// gates language only on the Go register-indexing path, not here). The
+	// intentional Java→Go cross-language join is a separate, explicitly
+	// cross-language pass, not this same-language stub resolver.
+	cands := all
+	if callerLang != "" {
+		cands = cands[:0:0]
+		for _, n := range all {
+			if n.Language == callerLang {
+				cands = append(cands, n)
+			}
+		}
+		if len(cands) == 0 {
+			return "", "", 0
+		}
 	}
 	// Prefer same-repo, then unique overall.
 	var sameRepo []*graph.Node
@@ -197,34 +337,69 @@ func (idx *temporalIndex) lookup(kind, name, callerRepo string) (id, origin stri
 	return "", "", 0
 }
 
-// buildTemporalIndex walks the graph once and (a) stamps temporal_role
-// on every node identifiable as a Temporal workflow / activity via
-// either Go `worker.Register*` calls or Java `@ActivityInterface` /
-// `@WorkflowInterface` annotations (propagated to interface
-// implementors), and (b) returns a name index the stub-call resolver
-// consults.
-func buildTemporalIndex(g graph.Store) *temporalIndex {
+// lookupCrossLang is the cross-language fallback for a Temporal consumer
+// whose same-language lookup found no handler: it matches a candidate in a
+// DIFFERENT language by canonical name (e.g. a Java service that starts a
+// Go workflow, or vice-versa). The match is a by-string name across a
+// type-system boundary with no compiler guarantee, so it resolves only
+// when there is exactly ONE other-language candidate for the name — and
+// the caller lands it at the speculative tier. Returns ("", false) when
+// the join is absent or ambiguous.
+func (idx *temporalIndex) lookupCrossLang(kind, name, callerLang string) (id string, ok bool) {
+	all := idx.byKindName[kind+"::"+name]
+	if len(all) == 0 || callerLang == "" {
+		return "", false
+	}
+	var other []*graph.Node
+	for _, n := range all {
+		if n != nil && n.Language != callerLang {
+			other = append(other, n)
+		}
+	}
+	if len(other) == 1 {
+		return other[0].ID, true
+	}
+	return "", false
+}
+
+// buildTemporalIndex (a) stamps temporal_role on every node identifiable
+// as a Temporal workflow / activity via either Go `worker.Register*`
+// calls or Java `@ActivityInterface` / `@WorkflowInterface` annotations
+// (propagated to interface implementors), and (b) returns a name index
+// the stub-call resolver consults.
+//
+// registerEdges and annotatedEdges are the temporal.register EdgeCalls
+// edges and the temporal-annotation EdgeAnnotated edges, already
+// collected by the single ResolveTemporalCalls sweep — passing them in
+// avoids re-scanning the (largest) EdgeCalls class and the EdgeAnnotated
+// class a second time.
+func buildTemporalIndex(g graph.Store, registerEdges, annotatedEdges []*graph.Edge) *temporalIndex {
 	idx := &temporalIndex{byKindName: map[string][]*graph.Node{}}
 
-	// Phase 1 — Go side. Walk `temporal.register` edges and stamp the
-	// registered function's node. The "via" tag lives on EdgeCalls
-	// edges, so narrow with EdgesByKind before the Meta filter.
+	// Phase 1 — Go side. Walk the pre-collected `temporal.register` edges
+	// and stamp the registered function's node.
 	//
-	// Collect every register edge first so we can batch-fetch every
-	// caller node and resolve every Go target name in one pair of
+	// Collect every register edge's targets first so we can batch-fetch
+	// every caller node and resolve every Go target name in one pair of
 	// round-trips, instead of N AllNodes scans + N GetNode calls.
 	type goRegister struct {
-		edge       *graph.Edge
-		kind, name string
+		edge *graph.Edge
+		kind string
+		// name is the function-reference identifier (used to locate the
+		// registered node); regName is the canonical registered name (the
+		// index key) — they differ only when RegisterActivityWithOptions
+		// overrides the name via RegisterOptions{Name: "..."}. For a plural
+		// registration name is the struct TYPE name and regName is unused.
+		name, regName string
+		// plural marks a RegisterActivities(&Struct{}) struct registration:
+		// every exported method of the struct is promoted to an activity.
+		plural bool
 	}
 	var goRegisters []goRegister
 	registerCallerIDs := map[string]struct{}{}
 	registerNames := map[string]struct{}{}
-	for e := range g.EdgesByKind(graph.EdgeCalls) {
+	for _, e := range registerEdges {
 		if e == nil || e.Meta == nil {
-			continue
-		}
-		if v, _ := e.Meta["via"].(string); v != "temporal.register" {
 			continue
 		}
 		kind, _ := e.Meta["temporal_kind"].(string)
@@ -232,7 +407,12 @@ func buildTemporalIndex(g graph.Store) *temporalIndex {
 		if kind == "" || name == "" {
 			continue
 		}
-		goRegisters = append(goRegisters, goRegister{edge: e, kind: kind, name: name})
+		regName, _ := e.Meta["temporal_registered_name"].(string)
+		if regName == "" {
+			regName = name
+		}
+		plural, _ := e.Meta["temporal_register_plural"].(bool)
+		goRegisters = append(goRegisters, goRegister{edge: e, kind: kind, name: name, regName: regName, plural: plural})
 		if e.From != "" {
 			registerCallerIDs[e.From] = struct{}{}
 		}
@@ -254,24 +434,41 @@ func buildTemporalIndex(g graph.Store) *temporalIndex {
 		if caller == nil {
 			continue
 		}
+		if r.plural {
+			// RegisterActivities(&MyActivities{}): promote every exported
+			// method of the struct to an activity keyed by its method name.
+			typeNode := pickGoTypeNode(candidatesByName[r.name], caller)
+			if typeNode == nil {
+				continue
+			}
+			for _, m := range exportedGoMethodsOfType(g, typeNode) {
+				stampTemporalRole(g, m, r.kind, m.Name)
+				idx.byKindName[r.kind+"::"+m.Name] = append(idx.byKindName[r.kind+"::"+m.Name], m)
+			}
+			continue
+		}
 		target := pickGoTemporalTarget(candidatesByName[r.name], caller)
 		if target == nil {
 			continue
 		}
-		stampTemporalRole(g, target, r.kind, r.name)
-		idx.byKindName[r.kind+"::"+r.name] = append(idx.byKindName[r.kind+"::"+r.name], target)
+		// Stamp + index under the canonical registered name (regName),
+		// which is the func-ref name unless a RegisterOptions{Name}
+		// override renamed it — that is the name a dispatch matches.
+		stampTemporalRole(g, target, r.kind, r.regName)
+		idx.byKindName[r.kind+"::"+r.regName] = append(idx.byKindName[r.kind+"::"+r.regName], target)
 	}
 
-	// Phase 2 — Java side. Walk `EdgeAnnotated` edges to find
-	// temporal-tagged interfaces and methods. As with Phase 1, collect
-	// every annotation edge and batch the From-side GetNode calls.
+	// Phase 2 — Java side. Walk the pre-collected temporal-annotation
+	// `EdgeAnnotated` edges to find temporal-tagged interfaces and
+	// methods. As with Phase 1, batch the From-side GetNode calls.
 	type javaAnno struct {
 		fromID                string
 		ifaceRole, methodRole string
+		args                  string // raw annotation inner-parens text
 	}
 	var javaAnnos []javaAnno
 	annoFromIDs := map[string]struct{}{}
-	for e := range g.EdgesByKind(graph.EdgeAnnotated) {
+	for _, e := range annotatedEdges {
 		if e == nil {
 			continue
 		}
@@ -279,7 +476,8 @@ func buildTemporalIndex(g graph.Store) *temporalIndex {
 		if role == "" && methodRole == "" {
 			continue
 		}
-		javaAnnos = append(javaAnnos, javaAnno{fromID: e.From, ifaceRole: role, methodRole: methodRole})
+		args, _ := e.Meta["args"].(string)
+		javaAnnos = append(javaAnnos, javaAnno{fromID: e.From, ifaceRole: role, methodRole: methodRole, args: args})
 		if e.From != "" {
 			annoFromIDs[e.From] = struct{}{}
 		}
@@ -291,8 +489,9 @@ func buildTemporalIndex(g graph.Store) *temporalIndex {
 	annoFromNodes := g.GetNodesByIDs(annoFromList)
 
 	type javaIfaceTag struct {
-		ifaceID string
-		role    string // "activity_interface" / "workflow_interface"
+		ifaceID    string
+		role       string // "activity_interface" / "workflow_interface"
+		namePrefix string // @ActivityInterface(namePrefix = "...")
 	}
 	var javaIfaces []javaIfaceTag
 	for _, a := range javaAnnos {
@@ -300,17 +499,25 @@ func buildTemporalIndex(g graph.Store) *temporalIndex {
 		if from == nil {
 			continue
 		}
-		// Method-level annotation: stamp directly.
+		// Method-level annotation: stamp + index under the canonical
+		// Temporal name (explicit @XxxMethod(name=) > activity Capitalize >
+		// bare method name) so it keys off the same string a matching Go
+		// registration uses.
 		if a.methodRole != "" && (from.Kind == graph.KindMethod || from.Kind == graph.KindFunction) {
-			stampTemporalRole(g, from, a.methodRole, from.Name)
-			idx.byKindName[normaliseTemporalKind(a.methodRole)+"::"+from.Name] = append(
-				idx.byKindName[normaliseTemporalKind(a.methodRole)+"::"+from.Name], from)
+			canonical := javaMethodCanonicalName(a.methodRole, from.Name, a.args)
+			stampTemporalRole(g, from, a.methodRole, canonical)
+			key := normaliseTemporalKind(a.methodRole) + "::" + canonical
+			idx.byKindName[key] = append(idx.byKindName[key], from)
 			continue
 		}
 		// Interface-level annotation: queue for the propagation pass.
 		if a.ifaceRole != "" && from.Kind == graph.KindInterface {
 			stampTemporalRole(g, from, a.ifaceRole, from.Name)
-			javaIfaces = append(javaIfaces, javaIfaceTag{ifaceID: from.ID, role: a.ifaceRole})
+			javaIfaces = append(javaIfaces, javaIfaceTag{
+				ifaceID:    from.ID,
+				role:       a.ifaceRole,
+				namePrefix: javaAnnotationStringArg(a.args, "namePrefix"),
+			})
 		}
 	}
 
@@ -366,10 +573,22 @@ func buildTemporalIndex(g graph.Store) *temporalIndex {
 		if iface == nil {
 			continue
 		}
+		// Canonical Temporal name for a method of this interface: a
+		// workflow's type is the interface simple name; an activity's type
+		// is its method name capitalized, with the @ActivityInterface
+		// namePrefix prepended. Keyed the same for interface and impl
+		// methods (same method name) so a dispatch lands on either.
+		canonicalFor := func(m *graph.Node) string {
+			if t.role == "workflow_interface" {
+				return iface.Name
+			}
+			return t.namePrefix + capitalizeASCII(m.Name)
+		}
 		ifaceMethods := collectJavaInterfaceMethodsFromIndex(iface, javaMethodsByFile)
 		for _, m := range ifaceMethods {
-			stampTemporalRole(g, m, methodRole, m.Name)
-			idx.byKindName[methodRole+"::"+m.Name] = append(idx.byKindName[methodRole+"::"+m.Name], m)
+			canonical := canonicalFor(m)
+			stampTemporalRole(g, m, methodRole, canonical)
+			idx.byKindName[methodRole+"::"+canonical] = append(idx.byKindName[methodRole+"::"+canonical], m)
 		}
 		// Propagate to implementing classes' methods.
 		implMethodNames := map[string]struct{}{}
@@ -385,8 +604,9 @@ func buildTemporalIndex(g graph.Store) *temporalIndex {
 				if _, ok := implMethodNames[m.Name]; !ok {
 					continue
 				}
-				stampTemporalRole(g, m, methodRole, m.Name)
-				idx.byKindName[methodRole+"::"+m.Name] = append(idx.byKindName[methodRole+"::"+m.Name], m)
+				canonical := canonicalFor(m)
+				stampTemporalRole(g, m, methodRole, canonical)
+				idx.byKindName[methodRole+"::"+canonical] = append(idx.byKindName[methodRole+"::"+canonical], m)
 			}
 		}
 	}
@@ -417,6 +637,73 @@ func temporalRoleForJavaAnnotation(annoID string) (ifaceRole, methodRole string)
 	return "", ""
 }
 
+// javaAnnotationStringArg extracts the value of a `key = "value"` argument
+// from an annotation's raw inner-parens text (the EdgeAnnotated Meta
+// "args"), e.g. javaAnnotationStringArg(`name = "ChargeCard"`, "name") ==
+// "ChargeCard". Matched on a word boundary so a "name" lookup does not
+// match "namePrefix". Returns "" when the key is absent or unquoted.
+func javaAnnotationStringArg(args, key string) string {
+	for i := 0; i+len(key) <= len(args); i++ {
+		if args[i:i+len(key)] != key {
+			continue
+		}
+		if i > 0 {
+			if b := args[i-1]; b != ' ' && b != ',' && b != '(' {
+				continue
+			}
+		}
+		j := i + len(key)
+		for j < len(args) && args[j] == ' ' {
+			j++
+		}
+		if j >= len(args) || args[j] != '=' {
+			continue
+		}
+		rest := args[j+1:]
+		q := strings.IndexByte(rest, '"')
+		if q < 0 {
+			return ""
+		}
+		rest = rest[q+1:]
+		end := strings.IndexByte(rest, '"')
+		if end < 0 {
+			return ""
+		}
+		return rest[:end]
+	}
+	return ""
+}
+
+// capitalizeASCII upper-cases the first rune of s (Temporal's Java SDK
+// derives an activity's default type from the method name with the first
+// letter capitalized).
+func capitalizeASCII(s string) string {
+	if s == "" {
+		return s
+	}
+	r, size := utf8.DecodeRuneInString(s)
+	return string(unicode.ToUpper(r)) + s[size:]
+}
+
+// javaMethodCanonicalName computes the canonical Temporal name a Java
+// method-level annotation registers under, so the resolver keys it off the
+// same string a matching Go registration would use:
+//   - an explicit @XxxMethod(name = "...") always wins;
+//   - an activity method defaults to its name with the first letter
+//     capitalized (the Java SDK default activity type);
+//   - signal / query / update / workflow methods default to the bare
+//     method name (signal/query/update names match by string at runtime;
+//     a workflow's type is usually the interface name, handled in Phase 3).
+func javaMethodCanonicalName(role, methodName, args string) string {
+	if explicit := javaAnnotationStringArg(args, "name"); explicit != "" {
+		return explicit
+	}
+	if role == "activity" {
+		return capitalizeASCII(methodName)
+	}
+	return methodName
+}
+
 // normaliseTemporalKind collapses the seven role tags down to the two
 // kinds that drive stub-call lookup ("activity" / "workflow"). Signal
 // / query / update handlers are workflow methods, not separate kinds.
@@ -437,6 +724,21 @@ func normaliseTemporalKind(role string) string {
 func stampTemporalRole(g graph.Store, n *graph.Node, role, name string) {
 	if n == nil || role == "" {
 		return
+	}
+	// Skip the write-back entirely when the role + name are already what
+	// we would stamp. ResolveTemporalCalls is a full recompute that runs
+	// on every incremental edit, so without this guard every Temporal-role
+	// node is re-AddNode'd (a serialised single-row write on the sqlite
+	// backend) on every pass even when nothing changed. The common steady
+	// state — re-running the pass after an unrelated edit — then costs no
+	// node writes at all.
+	if cur, _ := n.Meta["temporal_role"].(string); cur == role {
+		if name == "" {
+			return
+		}
+		if curName, _ := n.Meta["temporal_name"].(string); curName == name {
+			return
+		}
 	}
 	if n.Meta == nil {
 		n.Meta = map[string]any{}
@@ -502,6 +804,145 @@ func pickGoTemporalTarget(candidates []*graph.Node, caller *graph.Node) *graph.N
 		return all[0]
 	}
 	return nil
+}
+
+// pickGoTypeNode selects the Go type node a `RegisterActivities(&T{})`
+// struct registration refers to, from a name-matched candidate set, using
+// the same same-file → same-repo → unique-overall locality tie-break as
+// pickGoTemporalTarget. Returns nil when no unambiguous Go type matches.
+func pickGoTypeNode(candidates []*graph.Node, caller *graph.Node) *graph.Node {
+	if caller == nil {
+		return nil
+	}
+	var sameFile, sameRepo, all []*graph.Node
+	for _, n := range candidates {
+		if n == nil || n.Language != "go" {
+			continue
+		}
+		if n.Kind != graph.KindType && n.Kind != graph.KindInterface {
+			continue
+		}
+		all = append(all, n)
+		if caller.RepoPrefix != "" && n.RepoPrefix == caller.RepoPrefix {
+			sameRepo = append(sameRepo, n)
+		}
+		if n.FilePath == caller.FilePath {
+			sameFile = append(sameFile, n)
+		}
+	}
+	if len(sameFile) == 1 {
+		return sameFile[0]
+	}
+	if len(sameRepo) == 1 {
+		return sameRepo[0]
+	}
+	if len(all) == 1 {
+		return all[0]
+	}
+	return nil
+}
+
+// exportedGoMethodsOfType returns the exported Go method nodes of a type,
+// found via the EdgeMemberOf in-edges the Go extractor emits from each
+// method to its receiver type. Used to promote every method of a
+// RegisterActivities(&Struct{}) registration to a temporal activity.
+func exportedGoMethodsOfType(g graph.Store, typeNode *graph.Node) []*graph.Node {
+	if typeNode == nil {
+		return nil
+	}
+	var memberIDs []string
+	for _, ie := range g.GetInEdges(typeNode.ID) {
+		if ie == nil || ie.Kind != graph.EdgeMemberOf || ie.From == "" {
+			continue
+		}
+		memberIDs = append(memberIDs, ie.From)
+	}
+	if len(memberIDs) == 0 {
+		return nil
+	}
+	members := g.GetNodesByIDs(memberIDs)
+	var out []*graph.Node
+	for _, id := range memberIDs {
+		m := members[id]
+		if m == nil || m.Language != "go" || m.Kind != graph.KindMethod {
+			continue
+		}
+		if !isExportedGoName(m.Name) {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// isExportedGoName reports whether a Go identifier is exported (its first
+// rune is an uppercase letter) — Temporal registers only exported methods
+// of a struct passed to RegisterActivities.
+func isExportedGoName(name string) bool {
+	if name == "" {
+		return false
+	}
+	r, _ := utf8.DecodeRuneInString(name)
+	return unicode.IsUpper(r)
+}
+
+// buildConstDerefMap resolves the names of string constants used as
+// Temporal dispatch identifiers to their literal values, read from the
+// queryable constant_values sidecar. Returns name → value for every name
+// that is a string const with a single unambiguous value across the
+// workspace; a name with conflicting values in different files (e.g. the
+// same const name defined twice with different literals) is dropped so a
+// dereference is never a wrong guess. Returns nil when the backend does
+// not implement ConstantValueReader.
+func buildConstDerefMap(g graph.Store, names []string) map[string]string {
+	reader, ok := g.(graph.ConstantValueReader)
+	if !ok || len(names) == 0 {
+		return nil
+	}
+	nameSet := make(map[string]struct{}, len(names))
+	for _, n := range names {
+		nameSet[n] = struct{}{}
+	}
+	uniq := make([]string, 0, len(nameSet))
+	for n := range nameSet {
+		uniq = append(uniq, n)
+	}
+	candByName := g.FindNodesByNames(uniq)
+	idToName := map[string]string{}
+	var constIDs []string
+	for name, cands := range candByName {
+		for _, n := range cands {
+			if n == nil || n.Kind != graph.KindConstant {
+				continue
+			}
+			constIDs = append(constIDs, n.ID)
+			idToName[n.ID] = name
+		}
+	}
+	if len(constIDs) == 0 {
+		return nil
+	}
+	vals, err := reader.ConstantValuesByNodeIDs(constIDs)
+	if err != nil || len(vals) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(vals))
+	ambiguous := map[string]struct{}{}
+	for id, v := range vals {
+		name := idToName[id]
+		if name == "" || v == "" {
+			continue
+		}
+		if existing, seen := out[name]; seen && existing != v {
+			ambiguous[name] = struct{}{}
+			continue
+		}
+		out[name] = v
+	}
+	for name := range ambiguous {
+		delete(out, name)
+	}
+	return out
 }
 
 // buildJavaMethodViews materialises two indexes over every Java

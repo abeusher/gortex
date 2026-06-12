@@ -201,6 +201,41 @@ type goDeferredCall struct {
 	tempKind  string
 	tempName  string
 	tempLocal bool
+	// tempEnvDefault is set when tempName was resolved from a bare
+	// variable read from an env var with a literal default (e.g.
+	// `cmp.Or(os.Getenv("K"), "Default")`). The stub edge is then tagged
+	// `temporal_name_origin=env_default` so the resolver lands it at the
+	// speculative tier — the runtime env value may differ from the default.
+	tempEnvDefault bool
+	// tempHandlerKind is "query" / "signal" / "update" when this call
+	// is a `workflow.SetQueryHandler` / `GetSignalChannel` /
+	// `SetUpdateHandler` in-workflow handler declaration; tempName then
+	// carries the handler's string name. `via=temporal.handler` meta is
+	// stamped on the emitted edge in the call post-pass below.
+	tempHandlerKind string
+	// tempOutKind is "signal" / "query" when this call is an outbound
+	// signal-send / query-call against a running workflow
+	// (SignalExternalWorkflow / SignalWorkflow / QueryWorkflow); tempName
+	// then carries the signal/query name. `via=temporal.signal-send` /
+	// `temporal.query-call` meta is stamped on the emitted edge below.
+	tempOutKind string
+	// tempRegisteredName is the canonical registered name when a
+	// RegisterActivityWithOptions / RegisterWorkflowWithOptions call
+	// overrides it via RegisterOptions{Name: "..."}. tempName still holds
+	// the function-reference identifier (used to locate the node); this
+	// is the name the activity/workflow is dispatched under and becomes
+	// the resolver's index key. Empty when no Name override is present.
+	tempRegisteredName string
+	// tempRegisterPlural marks a `w.RegisterActivities(&MyActivities{})`
+	// struct registration: tempName then holds the struct TYPE name and
+	// the resolver promotes every exported method of that struct to a
+	// temporal activity keyed by the method name.
+	tempRegisterPlural bool
+	// tempStartName is the workflow name when this call STARTS a workflow
+	// (client.ExecuteWorkflow / SignalWithStartWorkflow). `via=temporal.start`
+	// meta is stamped on the emitted edge and the resolver rewrites it to
+	// the registered workflow — the "who starts this workflow" edge.
+	tempStartName string
 }
 
 type goDeferredTypeRef struct {
@@ -250,11 +285,21 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 	result.Nodes = append(result.Nodes, fileNode)
 
 	imports := map[string]string{} // alias → importPath
+	// Local alias the Temporal workflow package is imported under in this
+	// file (default "workflow"; "" when not imported). The receiver-gated
+	// temporal detectors canonicalise a matching receiver to "workflow" so
+	// an aliased `import wf "go.temporal.io/sdk/workflow"` is recognised.
+	wfAlias := goWorkflowReceiverAlias(root, src)
 	tenv := make(typeEnv)
 	// paramsByFunc: enclosing-function ID → (param/receiver name → type).
 	// Function parameters and method receivers shadow file-wide tenv at
 	// call resolution time so each function's locals stay sandboxed.
 	paramsByFunc := map[string]typeEnv{}
+	// paramNamesByFunc: function/method ID → set of ALL its parameter
+	// names (paramsByFunc only keeps params with non-builtin types). Used
+	// by the Temporal wrapper detector to recognise a dispatch whose name
+	// is a forwarded parameter.
+	paramNamesByFunc := map[string]map[string]bool{}
 	seenTypeName := map[string]bool{} // dedup when alias + typedef match same name
 
 	var calls []goDeferredCall
@@ -290,10 +335,10 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 			// No-op (the package name is not currently surfaced as a node).
 
 		case m.Captures["func.def"] != nil:
-			e.emitFunction(m, filePath, fileID, src, result, paramsByFunc, imports)
+			e.emitFunction(m, filePath, fileID, src, result, paramsByFunc, paramNamesByFunc, imports)
 
 		case m.Captures["method.def"] != nil:
-			e.emitMethod(m, filePath, fileID, src, result, paramsByFunc, imports)
+			e.emitMethod(m, filePath, fileID, src, result, paramsByFunc, paramNamesByFunc, imports)
 
 		case m.Captures["typedef.def"] != nil:
 			e.emitTypeDecl(m, filePath, fileID, src, result, seenTypeName)
@@ -332,19 +377,71 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 				dc.grpcRegService, dc.grpcRegArgNode = svc, argNode
 			}
 			// Temporal workflow → activity dispatch:
-			// `workflow.ExecuteActivity(ctx, X, ...)` etc.
-			if kind, local, ok := goTemporalDispatchKind(receiver, method); ok {
-				if name := goTemporalDispatchName(expr.Node, src); name != "" {
+			// `workflow.ExecuteActivity(ctx, X, ...)` etc. Canonicalise an
+			// aliased workflow-package receiver (e.g. `wf`) to "workflow"
+			// so the receiver-gated detectors recognise it.
+			tempRecv := goCanonicalWorkflowReceiver(receiver, wfAlias)
+			if kind, local, ok := goTemporalDispatchKind(tempRecv, method); ok {
+				argNode := goTemporalDispatchArg(expr.Node)
+				if name := goTemporalNameFromExpr(argNode, src); name != "" {
 					dc.tempKind = kind
 					dc.tempName = name
 					dc.tempLocal = local
+					// Env-default refinement: when the name is a bare local
+					// variable, try to resolve it to an env-var-with-literal
+					// -default so the dispatch lands on the default activity.
+					if argNode != nil && argNode.Type() == "identifier" {
+						if def, ok := goTemporalEnvDefaultName(expr.Node, name, src); ok {
+							dc.tempName = def
+							dc.tempEnvDefault = true
+						}
+					}
 				}
-			} else if kind, _, ok := goTemporalRegisterKind(method); ok {
+			} else if kind, plural, ok := goTemporalRegisterKind(method); ok {
 				// Temporal worker registration:
 				// `w.RegisterActivity(F)` etc.
-				if name := goTemporalRegisterName(expr.Node, src); name != "" {
+				if plural {
+					// `w.RegisterActivities(&MyActivities{})` — every
+					// exported method of the struct becomes an activity.
+					// tempName carries the struct TYPE name; the resolver
+					// promotes the methods.
+					if st := goTemporalRegisterStructType(expr.Node, src); st != "" {
+						dc.tempKind = "register_" + kind
+						dc.tempName = st
+						dc.tempRegisterPlural = true
+					}
+				} else if name := goTemporalRegisterName(expr.Node, src); name != "" {
 					dc.tempKind = "register_" + kind
 					dc.tempName = name
+					// RegisterActivityWithOptions / RegisterWorkflowWithOptions
+					// may override the registered name via
+					// RegisterOptions{Name: "..."} — that is the name a
+					// dispatch matches against, so capture it as the index key.
+					if override := goTemporalRegisterNameOverride(expr.Node, src); override != "" {
+						dc.tempRegisteredName = override
+					}
+				}
+			} else if hkind, ok := goTemporalHandlerKind(tempRecv, method); ok {
+				// Temporal in-workflow handler declaration:
+				// `workflow.SetQueryHandler(ctx, "name", fn)` etc.
+				if name := goTemporalHandlerName(expr.Node, src); name != "" {
+					dc.tempHandlerKind = hkind
+					dc.tempName = name
+				}
+			} else if okind, namePos, ok := goTemporalSignalQueryOutKind(tempRecv, method); ok {
+				// Outbound signal-send / query-call against a running
+				// workflow: SignalExternalWorkflow / SignalWorkflow /
+				// QueryWorkflow. The name is the 4th positional literal.
+				if name := goTemporalNthStringLiteralArg(expr.Node, namePos, src); name != "" {
+					dc.tempOutKind = okind
+					dc.tempName = name
+				}
+			} else if wfPos, ok := goTemporalStartKind(method); ok {
+				// Service-side workflow START: client.ExecuteWorkflow /
+				// SignalWithStartWorkflow. The workflow is the wfPos-th
+				// positional arg (a func ref, selector, or string type name).
+				if name := goTemporalNthArgName(expr.Node, wfPos, src); name != "" {
+					dc.tempStartName = name
 				}
 			}
 			calls = append(calls, dc)
@@ -420,7 +517,7 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 			e.emitVar(m, filePath, fileID, result, tenv)
 
 		case m.Captures["const.def"] != nil:
-			e.emitConst(m, filePath, fileID, result)
+			e.emitConst(m, filePath, fileID, src, result)
 
 		case m.Captures["svar.def"] != nil:
 			e.recordShortVarType(m, src, tenv)
@@ -641,6 +738,23 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 			// doesn't resolve onto the SDK's generic `ExecuteActivity`
 			// helper instead of the actual activity body.
 			if c.tempKind == "activity" || c.tempKind == "workflow" {
+				// Wrapper detection: when the dispatch name is a PARAMETER of
+				// the enclosing function, this function is a dispatch wrapper
+				// (e.g. executeActivity(ctx, ao, name, …) {
+				// workflow.ExecuteActivity(ctx, name, …) }). The parameter is
+				// not a real activity name, so the stub could never resolve —
+				// suppress the noise and mark the wrapper instead. Propagating
+				// a caller's literal/const argument into the dispatch
+				// (cross-file wrapper-FOLLOWING) needs call-argument flow and
+				// is a deliberate, documented blind spot for now.
+				if !c.tempEnvDefault {
+					if names, ok := paramNamesByFunc[callerID]; ok {
+						if names[c.tempName] {
+							markGoTemporalWrapper(result, callerID, c.tempKind, c.tempName)
+							continue
+						}
+					}
+				}
 				target := "unresolved::temporal::" + c.tempKind + "::" + c.tempName
 				meta := map[string]any{
 					"via":           "temporal.stub",
@@ -649,6 +763,9 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 				}
 				if c.tempLocal {
 					meta["temporal_local"] = true
+				}
+				if c.tempEnvDefault {
+					meta["temporal_name_origin"] = "env_default"
 				}
 				result.Edges = append(result.Edges, &graph.Edge{
 					From: callerID, To: target,
@@ -668,6 +785,9 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 			}
 			applyGoGRPCRegisterMeta(edge, c, src, tenv)
 			applyGoTemporalRegisterMeta(edge, c)
+			applyGoTemporalHandlerMeta(edge, c)
+			applyGoTemporalSignalQueryMeta(edge, c)
+			applyGoTemporalStartMeta(edge, c)
 			result.Edges = append(result.Edges, edge)
 			emitGoSpawnEdge(c, callerID, target, filePath, result)
 			continue
@@ -680,6 +800,9 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 			}
 			applyGoGRPCRegisterMeta(edge, c, src, tenv)
 			applyGoTemporalRegisterMeta(edge, c)
+			applyGoTemporalHandlerMeta(edge, c)
+			applyGoTemporalSignalQueryMeta(edge, c)
+			applyGoTemporalStartMeta(edge, c)
 			result.Edges = append(result.Edges, edge)
 			emitGoSpawnEdge(c, callerID, target, filePath, result)
 			continue
@@ -729,6 +852,8 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 		}
 		applyGoGRPCRegisterMeta(edge, c, src, tenv)
 		applyGoTemporalRegisterMeta(edge, c)
+		applyGoTemporalSignalQueryMeta(edge, c)
+		applyGoTemporalStartMeta(edge, c)
 		result.Edges = append(result.Edges, edge)
 		emitGoSpawnEdge(c, callerID, target, filePath, result)
 	}
@@ -893,10 +1018,15 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 
 // --- Per-match emit helpers -----------------------------------------
 
-func (e *GoExtractor) emitFunction(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, paramsByFunc map[string]typeEnv, imports map[string]string) {
+func (e *GoExtractor) emitFunction(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, paramsByFunc map[string]typeEnv, paramNamesByFunc map[string]map[string]bool, imports map[string]string) {
 	name := m.Captures["func.name"].Text
 	def := m.Captures["func.def"]
 	id := filePath + "::" + name
+	if pc, ok := m.Captures["func.params"]; ok && pc != nil {
+		if names := extractGoParamNames(pc.Node, src); len(names) > 0 {
+			paramNamesByFunc[id] = names
+		}
+	}
 	node := &graph.Node{
 		ID:        id,
 		Kind:      graph.KindFunction,
@@ -974,13 +1104,18 @@ func ownReceiverField(receiver, recvName string) (string, bool) {
 	return rest, true
 }
 
-func (e *GoExtractor) emitMethod(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, paramsByFunc map[string]typeEnv, imports map[string]string) {
+func (e *GoExtractor) emitMethod(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, paramsByFunc map[string]typeEnv, paramNamesByFunc map[string]map[string]bool, imports map[string]string) {
 	name := m.Captures["method.name"].Text
 	def := m.Captures["method.def"]
 	receiverText := m.Captures["method.receiver"].Text
 	receiverType := extractReceiverType(receiverText)
 
 	id := filePath + "::" + receiverType + "." + name
+	if paramsCap, ok := m.Captures["method.params"]; ok && paramsCap != nil {
+		if names := extractGoParamNames(paramsCap.Node, src); len(names) > 0 {
+			paramNamesByFunc[id] = names
+		}
+	}
 	scope := typeEnv{}
 	if recvName := extractReceiverName(receiverText); recvName != "" && receiverType != "" {
 		scope[recvName] = receiverType
@@ -1607,7 +1742,7 @@ func (e *GoExtractor) emitVar(m parser.QueryResult, filePath, fileID string, res
 	}
 }
 
-func (e *GoExtractor) emitConst(m parser.QueryResult, filePath, fileID string, result *parser.ExtractionResult) {
+func (e *GoExtractor) emitConst(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult) {
 	nameCap := m.Captures["const.name"]
 	def := m.Captures["const.def"]
 	if nameCap == nil || nameCap.Text == "" || nameCap.Text == "_" {
@@ -1636,6 +1771,59 @@ func (e *GoExtractor) emitConst(m parser.QueryResult, filePath, fileID string, r
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
 	})
+	// Retain the literal value (string / numeric) for the queryable
+	// constant_values sidecar, so the resolver can dereference a
+	// const-identifier dispatch name to its value across files. Computed
+	// constants (iota, expressions) carry no literal and are skipped.
+	if kind == graph.KindConstant {
+		if v, ok := goConstLiteralValue(def.Node, src); ok {
+			result.ConstValues = append(result.ConstValues, parser.ConstValue{
+				NodeID: id, FilePath: filePath, Value: v,
+			})
+		}
+	}
+}
+
+// goConstLiteralValue extracts the literal value of a single-spec
+// const_spec (`const X = "literal"` / `const X = 42`) from the spec's
+// value field, when that value is a string or numeric literal. Returns
+// ("", false) for computed / multi-value / non-literal specs.
+func goConstLiteralValue(constSpec *sitter.Node, src []byte) (string, bool) {
+	if constSpec == nil {
+		return "", false
+	}
+	spec := constSpec
+	if spec.Type() != "const_spec" {
+		// def captures the const_declaration; descend to the lone spec.
+		var found *sitter.Node
+		count := 0
+		for i := 0; i < int(spec.NamedChildCount()); i++ {
+			c := spec.NamedChild(i)
+			if c != nil && c.Type() == "const_spec" {
+				found = c
+				count++
+			}
+		}
+		if count != 1 || found == nil {
+			return "", false
+		}
+		spec = found
+	}
+	valueList := spec.ChildByFieldName("value")
+	if valueList == nil || valueList.NamedChildCount() != 1 {
+		return "", false
+	}
+	v := valueList.NamedChild(0)
+	if v == nil {
+		return "", false
+	}
+	switch v.Type() {
+	case "interpreted_string_literal", "raw_string_literal":
+		return goTemporalNameFromExpr(v, src), true
+	case "int_literal", "float_literal":
+		return v.Content(src), true
+	}
+	return "", false
 }
 
 // containsGoIotaBlock reports whether a const_declaration's source
@@ -1928,6 +2116,37 @@ func extractReceiverName(receiver string) string {
 // parameters, blank identifiers, and types that normalizeGoTypeName
 // drops (primitives, map/chan/func) are skipped — callers only care
 // about names that point at receiver types we could resolve methods on.
+// extractGoParamNames returns the set of ALL parameter names declared in a
+// parameter_list, regardless of type (unlike extractGoParamTypes, which
+// keeps only params with a non-builtin type for receiver resolution). Used
+// by the Temporal wrapper detector to recognise a forwarded parameter.
+func extractGoParamNames(paramList *sitter.Node, src []byte) map[string]bool {
+	if paramList == nil {
+		return nil
+	}
+	out := map[string]bool{}
+	for i := 0; i < int(paramList.NamedChildCount()); i++ {
+		decl := paramList.NamedChild(i)
+		if decl == nil {
+			continue
+		}
+		if t := decl.Type(); t != "parameter_declaration" && t != "variadic_parameter_declaration" {
+			continue
+		}
+		typeNode := decl.ChildByFieldName("type")
+		for j := 0; j < int(decl.NamedChildCount()); j++ {
+			c := decl.NamedChild(j)
+			if c == nil || c == typeNode {
+				continue
+			}
+			if c.Type() == "identifier" {
+				out[c.Content(src)] = true
+			}
+		}
+	}
+	return out
+}
+
 func extractGoParamTypes(paramList *sitter.Node, src []byte) typeEnv {
 	if paramList == nil {
 		return nil

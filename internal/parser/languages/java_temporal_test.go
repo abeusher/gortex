@@ -117,3 +117,122 @@ public interface OrderActivities {
 	assert.True(t, hasAnnotationEdge(t, result.Edges, method.ID, "ActivityMethod"),
 		"method-level @ActivityMethod must emit its own EdgeAnnotated edge")
 }
+
+// temporalStartEdge returns the via=temporal.start edge originating at
+// fromID, or nil.
+func temporalStartEdge(edges []*graph.Edge, fromID string) *graph.Edge {
+	for _, e := range edges {
+		if e.From == fromID && e.Meta != nil && e.Meta["via"] == "temporal.start" {
+			return e
+		}
+	}
+	return nil
+}
+
+func TestJavaTemporal_NewWorkflowStubStart(t *testing.T) {
+	src := []byte(`public class OrderService {
+    public void start(WorkflowClient client) {
+        OrderWorkflow wf = client.newWorkflowStub(OrderWorkflow.class, options);
+        wf.processOrder("id");
+    }
+}
+`)
+	e := NewJavaExtractor()
+	result, err := e.Extract("OrderService.java", src)
+	require.NoError(t, err)
+
+	var startMethod string
+	for _, n := range result.Nodes {
+		if n.Name == "start" {
+			startMethod = n.ID
+		}
+	}
+	require.NotEmpty(t, startMethod, "start method must be indexed")
+
+	edge := temporalStartEdge(result.Edges, startMethod)
+	require.NotNil(t, edge, "newWorkflowStub must emit a via=temporal.start edge")
+	assert.Equal(t, "workflow", edge.Meta["temporal_kind"])
+	assert.Equal(t, "OrderWorkflow", edge.Meta["temporal_name"],
+		"the class literal's simple name is the canonical workflow type")
+}
+
+func TestJavaTemporal_NewUntypedWorkflowStubStart(t *testing.T) {
+	src := []byte(`public class OrderService {
+    public void start(WorkflowClient client) {
+        client.newUntypedWorkflowStub("OrderWorkflow");
+    }
+}
+`)
+	e := NewJavaExtractor()
+	result, err := e.Extract("OrderService.java", src)
+	require.NoError(t, err)
+
+	var startMethod string
+	for _, n := range result.Nodes {
+		if n.Name == "start" {
+			startMethod = n.ID
+		}
+	}
+	require.NotEmpty(t, startMethod)
+	edge := temporalStartEdge(result.Edges, startMethod)
+	require.NotNil(t, edge)
+	assert.Equal(t, "OrderWorkflow", edge.Meta["temporal_name"])
+}
+
+func temporalEdgeByViaFrom(edges []*graph.Edge, fromID, via string) *graph.Edge {
+	for _, e := range edges {
+		if e.From == fromID && e.Meta != nil && e.Meta["via"] == via {
+			return e
+		}
+	}
+	return nil
+}
+
+func TestJavaTemporal_UntypedStubSignalSend(t *testing.T) {
+	src := []byte(`public class Canceller {
+    public void cancel(WorkflowClient client) {
+        WorkflowStub stub = client.newUntypedWorkflowStub("OrderWorkflow");
+        stub.signal("cancel-request", null);
+    }
+}
+`)
+	e := NewJavaExtractor()
+	result, err := e.Extract("Canceller.java", src)
+	require.NoError(t, err)
+
+	var fromID string
+	for _, n := range result.Nodes {
+		if n.Name == "cancel" {
+			fromID = n.ID
+		}
+	}
+	require.NotEmpty(t, fromID)
+	edge := temporalEdgeByViaFrom(result.Edges, fromID, "temporal.signal-send")
+	require.NotNil(t, edge, "stub.signal on a WorkflowStub must emit a signal-send edge")
+	assert.Equal(t, "signal", edge.Meta["temporal_kind"])
+	assert.Equal(t, "cancel-request", edge.Meta["temporal_name"])
+}
+
+func TestJavaTemporal_SignalOnNonStubIgnored(t *testing.T) {
+	// `signal` on a receiver that is NOT a WorkflowStub must not be
+	// detected — the type gate keeps the common method name precise.
+	src := []byte(`public class Light {
+    public void flip(Lamp lamp) {
+        lamp.signal("on");
+    }
+}
+`)
+	e := NewJavaExtractor()
+	result, err := e.Extract("Light.java", src)
+	require.NoError(t, err)
+
+	var fromID string
+	for _, n := range result.Nodes {
+		if n.Name == "flip" {
+			fromID = n.ID
+		}
+	}
+	require.NotEmpty(t, fromID)
+	assert.Nil(t, temporalEdgeByViaFrom(result.Edges, fromID, "temporal.signal-send"),
+		"signal on a non-WorkflowStub receiver must not be detected")
+}

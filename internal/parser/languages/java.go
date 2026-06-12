@@ -84,6 +84,20 @@ type javaDeferredCall struct {
 	receiver   string // selector receiver text (empty for plain call)
 	line       int    // 1-based call_expression start line
 	isSelector bool
+	// tempStartWorkflow is the workflow type name when this call starts a
+	// Temporal workflow (`client.newWorkflowStub(OrderWorkflow.class, …)`
+	// or `newUntypedWorkflowStub("OrderWorkflow")`). A via=temporal.start
+	// edge keyed by this name is emitted in the post-pass, and the
+	// resolver cross-resolves it to the workflow's implementation (which
+	// may live in a Go repo).
+	tempStartWorkflow string
+	// tempSignalKind / tempSignalName carry an outbound signal-send /
+	// query-call on an untyped WorkflowStub (stub.signal("name", …) /
+	// stub.query("name", …)). Emitted in the post-pass only when the
+	// receiver's inferred type is WorkflowStub, to keep the common
+	// "signal"/"query" method names from false-matching.
+	tempSignalKind string
+	tempSignalName string
 }
 
 // javaDeferredVar buffers a variable declaration for the post-pass
@@ -170,12 +184,20 @@ func (e *JavaExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 
 		case m.Captures["callm.expr"] != nil:
 			expr := m.Captures["callm.expr"]
-			calls = append(calls, javaDeferredCall{
-				name:       m.Captures["callm.method"].Text,
+			method := m.Captures["callm.method"].Text
+			dc := javaDeferredCall{
+				name:       method,
 				receiver:   m.Captures["callm.receiver"].Text,
 				line:       expr.StartLine + 1,
 				isSelector: true,
-			})
+			}
+			if wf := javaTemporalStartWorkflowName(expr.Node, method, src); wf != "" {
+				dc.tempStartWorkflow = wf
+			}
+			if sk, sn := javaTemporalSignalQuery(expr.Node, method, src); sk != "" {
+				dc.tempSignalKind, dc.tempSignalName = sk, sn
+			}
+			calls = append(calls, dc)
 
 		case m.Captures["call.expr"] != nil:
 			// Plain-call pattern fires for `bar()` AND for the inner
@@ -267,6 +289,41 @@ func (e *JavaExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 			}
 		}
 		result.Edges = append(result.Edges, edge)
+
+		// Temporal workflow START (consumer side): emit a via=temporal.start
+		// edge keyed by the workflow type name. The resolver cross-resolves
+		// it to the registered workflow — which may be implemented in a Go
+		// repo — so get_callers on that workflow surfaces this Java service.
+		if c.tempStartWorkflow != "" {
+			result.Edges = append(result.Edges, &graph.Edge{
+				From: callerID, To: "unresolved::temporal::workflow::" + c.tempStartWorkflow,
+				Kind: graph.EdgeCalls, FilePath: filePath, Line: c.line,
+				Meta: map[string]any{
+					"via":           "temporal.start",
+					"temporal_kind": "workflow",
+					"temporal_name": c.tempStartWorkflow,
+				},
+			})
+		}
+		// Outbound signal-send / query-call on an untyped WorkflowStub,
+		// symmetric with the Go side (#81). Gated on the receiver's inferred
+		// type being WorkflowStub so the common "signal"/"query" method
+		// names don't false-match arbitrary code.
+		if c.tempSignalKind != "" && tenv[c.receiver] == "WorkflowStub" {
+			via := "temporal.signal-send"
+			if c.tempSignalKind == "query" {
+				via = "temporal.query-call"
+			}
+			result.Edges = append(result.Edges, &graph.Edge{
+				From: callerID, To: "unresolved::*." + c.name,
+				Kind: graph.EdgeCalls, FilePath: filePath, Line: c.line,
+				Meta: map[string]any{
+					"via":           via,
+					"temporal_kind": c.tempSignalKind,
+					"temporal_name": c.tempSignalName,
+				},
+			})
+		}
 	}
 
 	// React Native Fabric / Paper view managers: a class with @ReactProp

@@ -133,3 +133,379 @@ func setup(w Worker) {
 	assert.Equal(t, child.ID, stubCall.To)
 	assert.Equal(t, "workflow", stubCall.Meta["temporal_kind"])
 }
+
+// TestTemporalE2E_GoEnvDefaultActivity exercises the env-var-with-literal
+// -default dispatch name: the workflow names its activity through a
+// variable read from os.Getenv with a literal fallback. The pipeline must
+// land the call on the default activity but at the speculative tier.
+func TestTemporalE2E_GoEnvDefaultActivity(t *testing.T) {
+	dir := t.TempDir()
+
+	writeFile(t, filepath.Join(dir, "workflow.go"), `package wf
+
+import (
+	"cmp"
+	"os"
+
+	"go.temporal.io/sdk/workflow"
+)
+
+func OrderWorkflow(ctx workflow.Context, id string) error {
+	actName := cmp.Or(os.Getenv("CHARGE_ACTIVITY"), "ChargeCard")
+	return workflow.ExecuteActivity(ctx, actName, id).Get(ctx, nil)
+}
+`)
+	writeFile(t, filepath.Join(dir, "activity.go"), `package wf
+
+import "context"
+
+func ChargeCard(ctx context.Context, id string) error {
+	return nil
+}
+`)
+	writeFile(t, filepath.Join(dir, "main.go"), `package wf
+
+func setupWorker(w Worker) {
+	w.RegisterWorkflow(OrderWorkflow)
+	w.RegisterActivity(ChargeCard)
+}
+`)
+
+	g := graph.New()
+	idx := newTestIndexer(g)
+	_, err := idx.Index(dir)
+	require.NoError(t, err)
+
+	wf := g.FindNodesByName("OrderWorkflow")[0]
+	activity := g.FindNodesByName("ChargeCard")[0]
+
+	var stubCall *graph.Edge
+	for _, e := range g.GetOutEdges(wf.ID) {
+		if e != nil && e.Meta != nil && e.Meta["via"] == "temporal.stub" {
+			stubCall = e
+			break
+		}
+	}
+	require.NotNil(t, stubCall, "workflow must have an outbound temporal.stub edge")
+	assert.Equal(t, activity.ID, stubCall.To,
+		"env-default dispatch must land on the default activity")
+	assert.Equal(t, "env_default", stubCall.Meta["temporal_name_origin"])
+	assert.Equal(t, graph.OriginSpeculative, stubCall.Origin,
+		"env-default resolution must be speculative")
+	assert.Equal(t, true, stubCall.Meta[graph.MetaSpeculative],
+		"env-default edge must be hidden-by-default")
+}
+
+// TestTemporalE2E_GoQueryHandler exercises in-workflow handler detection:
+// a workflow.SetQueryHandler call must surface as a via=temporal.handler
+// edge from the enclosing workflow carrying its kind + name.
+func TestTemporalE2E_GoQueryHandler(t *testing.T) {
+	dir := t.TempDir()
+
+	writeFile(t, filepath.Join(dir, "workflow.go"), `package wf
+
+import "go.temporal.io/sdk/workflow"
+
+func StatusWorkflow(ctx workflow.Context) error {
+	workflow.SetQueryHandler(ctx, "status", func() (string, error) { return "ok", nil })
+	return nil
+}
+`)
+
+	g := graph.New()
+	idx := newTestIndexer(g)
+	_, err := idx.Index(dir)
+	require.NoError(t, err)
+
+	wf := g.FindNodesByName("StatusWorkflow")[0]
+	var handler *graph.Edge
+	for _, e := range g.GetOutEdges(wf.ID) {
+		if e != nil && e.Meta != nil && e.Meta["via"] == "temporal.handler" {
+			handler = e
+			break
+		}
+	}
+	require.NotNil(t, handler, "workflow must have an outbound temporal.handler edge")
+	assert.Equal(t, "query", handler.Meta["temporal_kind"])
+	assert.Equal(t, "status", handler.Meta["temporal_name"])
+}
+
+// TestTemporalE2E_GoOutboundSignalQuery exercises the consumer side of the
+// signal/query namespaces through the real indexer: a workflow that signals
+// an external workflow and a service that queries a running workflow must
+// surface via=temporal.signal-send / via=temporal.query-call edges carrying
+// the signal/query name (the 4th positional string literal).
+func TestTemporalE2E_GoOutboundSignalQuery(t *testing.T) {
+	dir := t.TempDir()
+
+	writeFile(t, filepath.Join(dir, "orchestrator.go"), `package wf
+
+import "go.temporal.io/sdk/workflow"
+
+func Orchestrator(ctx workflow.Context) error {
+	return workflow.SignalExternalWorkflow(ctx, "order-123", "", "cancel-request", nil).Get(ctx, nil)
+}
+`)
+	writeFile(t, filepath.Join(dir, "service.go"), `package wf
+
+type Client interface {
+	QueryWorkflow(ctx any, wid, rid, queryType string, args ...any) (any, error)
+}
+
+func CheckStatus(ctx any, c Client) {
+	c.QueryWorkflow(ctx, "order-123", "", "get-status")
+}
+`)
+
+	g := graph.New()
+	idx := newTestIndexer(g)
+	_, err := idx.Index(dir)
+	require.NoError(t, err)
+
+	findOut := func(fnName, via string) *graph.Edge {
+		fn := g.FindNodesByName(fnName)
+		require.NotEmpty(t, fn, "function %s must be indexed", fnName)
+		for _, e := range g.GetOutEdges(fn[0].ID) {
+			if e != nil && e.Meta != nil && e.Meta["via"] == via {
+				return e
+			}
+		}
+		return nil
+	}
+
+	sig := findOut("Orchestrator", "temporal.signal-send")
+	require.NotNil(t, sig, "Orchestrator must have an outbound temporal.signal-send edge")
+	assert.Equal(t, "signal", sig.Meta["temporal_kind"])
+	assert.Equal(t, "cancel-request", sig.Meta["temporal_name"])
+
+	qry := findOut("CheckStatus", "temporal.query-call")
+	require.NotNil(t, qry, "CheckStatus must have an outbound temporal.query-call edge")
+	assert.Equal(t, "query", qry.Meta["temporal_kind"])
+	assert.Equal(t, "get-status", qry.Meta["temporal_name"])
+}
+
+// TestTemporalE2E_GoRegisterActivitiesPlural exercises struct registration:
+// w.RegisterActivities(&Activities{}) must promote every exported method of
+// the struct to a temporal activity, so a workflow that dispatches one of
+// those methods by name resolves to the method node.
+func TestTemporalE2E_GoRegisterActivitiesPlural(t *testing.T) {
+	dir := t.TempDir()
+
+	writeFile(t, filepath.Join(dir, "activities.go"), `package wf
+
+import "context"
+
+type Activities struct{}
+
+func (a *Activities) ChargeCard(ctx context.Context, id string) error { return nil }
+func (a *Activities) Refund(ctx context.Context, id string) error     { return nil }
+func (a *Activities) internalHelper() {}
+`)
+	writeFile(t, filepath.Join(dir, "workflow.go"), `package wf
+
+import "go.temporal.io/sdk/workflow"
+
+func OrderWorkflow(ctx workflow.Context, id string) error {
+	return workflow.ExecuteActivity(ctx, "ChargeCard", id).Get(ctx, nil)
+}
+`)
+	writeFile(t, filepath.Join(dir, "main.go"), `package wf
+
+func setup(w Worker) {
+	w.RegisterActivities(&Activities{})
+}
+`)
+
+	g := graph.New()
+	idx := newTestIndexer(g)
+	_, err := idx.Index(dir)
+	require.NoError(t, err)
+
+	wf := g.FindNodesByName("OrderWorkflow")[0]
+	var stubCall *graph.Edge
+	for _, e := range g.GetOutEdges(wf.ID) {
+		if e != nil && e.Meta != nil && e.Meta["via"] == "temporal.stub" {
+			stubCall = e
+			break
+		}
+	}
+	require.NotNil(t, stubCall, "workflow must have an outbound temporal.stub edge")
+
+	// The stub must land on the promoted ChargeCard method, which must
+	// carry the activity role.
+	charge := g.FindNodesByName("ChargeCard")
+	require.NotEmpty(t, charge, "ChargeCard method must be indexed")
+	assert.Equal(t, charge[0].ID, stubCall.To,
+		"dispatch must resolve to the struct's promoted method")
+	assert.Equal(t, "activity", charge[0].Meta["temporal_role"])
+}
+
+// TestTemporalE2E_GoServiceStartsWorkflow exercises the workflow-start
+// family: a service that calls client.ExecuteWorkflow(ctx, opts, WorkflowFn)
+// must get a via=temporal.start edge resolved to the registered workflow —
+// the "who starts this workflow" relationship.
+func TestTemporalE2E_GoServiceStartsWorkflow(t *testing.T) {
+	dir := t.TempDir()
+
+	writeFile(t, filepath.Join(dir, "workflow.go"), `package wf
+
+import "go.temporal.io/sdk/workflow"
+
+func OrderWorkflow(ctx workflow.Context, id string) error { return nil }
+`)
+	writeFile(t, filepath.Join(dir, "service.go"), `package wf
+
+import "go.temporal.io/sdk/client"
+
+func StartOrder(ctx any, c client.Client, id string) error {
+	_, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{}, OrderWorkflow, id)
+	return err
+}
+`)
+	writeFile(t, filepath.Join(dir, "main.go"), `package wf
+
+func setup(w Worker) {
+	w.RegisterWorkflow(OrderWorkflow)
+}
+`)
+
+	g := graph.New()
+	idx := newTestIndexer(g)
+	_, err := idx.Index(dir)
+	require.NoError(t, err)
+
+	starter := g.FindNodesByName("StartOrder")
+	require.NotEmpty(t, starter)
+	wf := g.FindNodesByName("OrderWorkflow")
+	require.NotEmpty(t, wf)
+
+	var start *graph.Edge
+	for _, e := range g.GetOutEdges(starter[0].ID) {
+		if e != nil && e.Meta != nil && e.Meta["via"] == "temporal.start" {
+			start = e
+			break
+		}
+	}
+	require.NotNil(t, start, "StartOrder must have an outbound temporal.start edge")
+	assert.Equal(t, "workflow", start.Meta["temporal_kind"])
+	assert.Equal(t, "OrderWorkflow", start.Meta["temporal_name"])
+	assert.Equal(t, wf[0].ID, start.To,
+		"the start edge must resolve to the registered workflow")
+}
+
+// TestTemporalE2E_GoConstNamedActivity exercises cross-file const-value
+// retention + dereference: the activity name is a string const declared in
+// a separate file (the dominant real-world shape), and the dispatch names
+// it through the const identifier. The pipeline must persist the const
+// value and dereference it so the stub resolves to the activity.
+func TestTemporalE2E_GoConstNamedActivity(t *testing.T) {
+	dir := t.TempDir()
+
+	writeFile(t, filepath.Join(dir, "constants.go"), `package wf
+
+const ChargeCardActivity = "ChargeCard"
+`)
+	writeFile(t, filepath.Join(dir, "workflow.go"), `package wf
+
+import "go.temporal.io/sdk/workflow"
+
+func OrderWorkflow(ctx workflow.Context, id string) error {
+	return workflow.ExecuteActivity(ctx, ChargeCardActivity, id).Get(ctx, nil)
+}
+`)
+	writeFile(t, filepath.Join(dir, "activity.go"), `package wf
+
+import "context"
+
+func ChargeCard(ctx context.Context, id string) error { return nil }
+`)
+	writeFile(t, filepath.Join(dir, "main.go"), `package wf
+
+func setup(w Worker) {
+	w.RegisterWorkflow(OrderWorkflow)
+	w.RegisterActivityWithOptions(ChargeCard, RegisterOptions{Name: "ChargeCard"})
+}
+`)
+
+	g := graph.New()
+	idx := newTestIndexer(g)
+	_, err := idx.Index(dir)
+	require.NoError(t, err)
+
+	wf := g.FindNodesByName("OrderWorkflow")[0]
+	activity := g.FindNodesByName("ChargeCard")
+	require.NotEmpty(t, activity)
+
+	var stubCall *graph.Edge
+	for _, e := range g.GetOutEdges(wf.ID) {
+		if e != nil && e.Meta != nil && e.Meta["via"] == "temporal.stub" {
+			stubCall = e
+			break
+		}
+	}
+	require.NotNil(t, stubCall, "workflow must have an outbound temporal.stub edge")
+	assert.Equal(t, "ChargeCardActivity", stubCall.Meta["temporal_name"],
+		"the stub keeps the const identifier as its name")
+	assert.Equal(t, activity[0].ID, stubCall.To,
+		"the const-named dispatch must dereference to the activity")
+	assert.Equal(t, "ChargeCard", stubCall.Meta["temporal_const_deref"],
+		"the dereferenced literal value is recorded on the edge")
+}
+
+// TestTemporalE2E_CrossLangJavaStartsGoWorkflow exercises the full
+// cross-language join: a Java service that creates a workflow stub for a
+// workflow implemented (and registered) in Go must get a via=temporal.start
+// edge that resolves to the Go workflow node, at the speculative tier.
+func TestTemporalE2E_CrossLangJavaStartsGoWorkflow(t *testing.T) {
+	dir := t.TempDir()
+
+	writeFile(t, filepath.Join(dir, "workflow.go"), `package wf
+
+import "go.temporal.io/sdk/workflow"
+
+func OrderWorkflow(ctx workflow.Context, id string) error { return nil }
+`)
+	writeFile(t, filepath.Join(dir, "main.go"), `package wf
+
+func setup(w Worker) {
+	w.RegisterWorkflow(OrderWorkflow)
+}
+`)
+	writeFile(t, filepath.Join(dir, "OrderService.java"), `public class OrderService {
+    public void start(WorkflowClient client) {
+        OrderWorkflow wf = client.newWorkflowStub(OrderWorkflow.class, options);
+        wf.processOrder("id");
+    }
+}
+`)
+
+	g := graph.New()
+	idx := newTestIndexerGoJava(g)
+	_, err := idx.Index(dir)
+	require.NoError(t, err)
+
+	javaStart := g.FindNodesByName("start")
+	require.NotEmpty(t, javaStart, "Java start method must be indexed")
+	goWf := g.FindNodesByName("OrderWorkflow")
+	require.NotEmpty(t, goWf)
+	var goWfID string
+	for _, n := range goWf {
+		if n.Language == "go" {
+			goWfID = n.ID
+		}
+	}
+	require.NotEmpty(t, goWfID)
+
+	var start *graph.Edge
+	for _, e := range g.GetOutEdges(javaStart[0].ID) {
+		if e != nil && e.Meta != nil && e.Meta["via"] == "temporal.start" {
+			start = e
+			break
+		}
+	}
+	require.NotNil(t, start, "Java service must have an outbound temporal.start edge")
+	assert.Equal(t, goWfID, start.To,
+		"the Java start must cross-resolve to the Go workflow")
+	assert.Equal(t, true, start.Meta["temporal_cross_lang"])
+	assert.Equal(t, graph.OriginSpeculative, start.Origin)
+}

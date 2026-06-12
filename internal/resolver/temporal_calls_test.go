@@ -44,6 +44,17 @@ func (b *temporalTestGraph) addStubCall(callerID, kind, name, filePath string) *
 	return e
 }
 
+// addStubCallEnvDefault adds a Temporal stub-call edge whose name was
+// resolved from an env-var-with-literal-default variable
+// (temporal_name_origin=env_default). The resolver must still land it on
+// the registered handler but at the speculative tier (the runtime env
+// override may differ from the default).
+func (b *temporalTestGraph) addStubCallEnvDefault(callerID, kind, name, filePath string) *graph.Edge {
+	e := b.addStubCall(callerID, kind, name, filePath)
+	e.Meta["temporal_name_origin"] = "env_default"
+	return e
+}
+
 // addGoRegister adds a Go `worker.RegisterActivity(F)` edge: an
 // EdgeCalls edge from the worker-setup function to a placeholder,
 // carrying the temporal.register meta the resolver consumes.
@@ -150,6 +161,34 @@ func TestResolveTemporalCalls_GoActivityRegistration(t *testing.T) {
 	assert.Equal(t, "ChargeCard", activity.Meta["temporal_name"])
 
 	require.Len(t, b.g.GetInEdges(activity.ID), 1, "activity must see the inbound call edge")
+}
+
+func TestResolveTemporalCalls_EnvDefaultResolvesSpeculative(t *testing.T) {
+	b := newTemporalTestGraph()
+	b.addGoFunc("wf/workflow.go::OrderWorkflow", "OrderWorkflow", "wf/workflow.go", "svc")
+	call := b.addStubCallEnvDefault("wf/workflow.go::OrderWorkflow", "activity", "ChargeCard", "wf/workflow.go")
+	activity := b.addGoFunc("wf/activity.go::ChargeCard", "ChargeCard", "wf/activity.go", "svc")
+	b.addGoFunc("wf/main.go::setupWorker", "setupWorker", "wf/main.go", "svc")
+	b.addGoRegister("wf/main.go::setupWorker", "activity", "ChargeCard", "wf/main.go")
+
+	resolved := ResolveTemporalCalls(b.g)
+	assert.Equal(t, 1, resolved)
+	assert.Equal(t, activity.ID, call.To, "env-default stub must still land on the registered activity")
+	assert.Equal(t, graph.OriginSpeculative, call.Origin, "env-default resolution must be speculative tier")
+	assert.Less(t, call.Confidence, 0.5, "speculative confidence must be below the inferred threshold")
+	assert.Equal(t, true, call.Meta[graph.MetaSpeculative], "env-default edge must be hidden-by-default")
+}
+
+func TestResolveTemporalCalls_EnvDefaultUnresolvedStaysPlaceholder(t *testing.T) {
+	b := newTemporalTestGraph()
+	b.addGoFunc("wf/workflow.go::WF", "WF", "wf/workflow.go", "svc")
+	call := b.addStubCallEnvDefault("wf/workflow.go::WF", "activity", "MissingActivity", "wf/workflow.go")
+
+	resolved := ResolveTemporalCalls(b.g)
+	assert.Equal(t, 0, resolved)
+	assert.Equal(t, temporalStubPlaceholder("activity", "MissingActivity"), call.To)
+	_, speculative := call.Meta[graph.MetaSpeculative]
+	assert.False(t, speculative, "unresolved env-default edge must not carry the speculative flag")
 }
 
 func TestResolveTemporalCalls_GoChildWorkflowRegistration(t *testing.T) {
@@ -290,6 +329,12 @@ func TestResolveTemporalCalls_JavaActivityInterfacePropagation(t *testing.T) {
 	assert.Equal(t, "activity", ifaceMethods["shipOrder"].Meta["temporal_role"])
 	assert.Equal(t, "activity", implMethods["chargeCard"].Meta["temporal_role"], "impl methods tagged via interface chain")
 	assert.Equal(t, "activity", implMethods["shipOrder"].Meta["temporal_role"])
+	// G2: an activity's canonical Temporal type is its method name with the
+	// first letter capitalized (the Java SDK default), keyed off the same
+	// string a Go RegisterActivity would use.
+	assert.Equal(t, "ChargeCard", ifaceMethods["chargeCard"].Meta["temporal_name"],
+		"activity canonical name is the capitalized method name")
+	assert.Equal(t, "ChargeCard", implMethods["chargeCard"].Meta["temporal_name"])
 }
 
 func TestResolveTemporalCalls_JavaWorkflowInterfacePropagation(t *testing.T) {
@@ -308,6 +353,30 @@ func TestResolveTemporalCalls_JavaWorkflowInterfacePropagation(t *testing.T) {
 	assert.Equal(t, "workflow_interface", iface.Meta["temporal_role"])
 	assert.Equal(t, "workflow", ifaceMethods["processOrder"].Meta["temporal_role"])
 	assert.Equal(t, "workflow", implMethods["processOrder"].Meta["temporal_role"])
+	// G2: a workflow's canonical Temporal type is the interface simple
+	// name (not the method name), so a Go service that starts this
+	// workflow by type matches it.
+	assert.Equal(t, "OrderWorkflow", ifaceMethods["processOrder"].Meta["temporal_name"],
+		"workflow canonical name is the interface simple name")
+	assert.Equal(t, "OrderWorkflow", implMethods["processOrder"].Meta["temporal_name"])
+}
+
+func TestJavaTemporalCanonicalNameHelpers(t *testing.T) {
+	assert.Equal(t, "ChargeCard", javaAnnotationStringArg(`name = "ChargeCard"`, "name"))
+	assert.Equal(t, "Foo_", javaAnnotationStringArg(`namePrefix = "Foo_"`, "namePrefix"))
+	// "name" lookup must not match the "namePrefix" key.
+	assert.Equal(t, "", javaAnnotationStringArg(`namePrefix = "Foo_"`, "name"))
+	assert.Equal(t, "", javaAnnotationStringArg(``, "name"))
+
+	assert.Equal(t, "ChargeCard", capitalizeASCII("chargeCard"))
+	assert.Equal(t, "X", capitalizeASCII("x"))
+	assert.Equal(t, "", capitalizeASCII(""))
+
+	// explicit name wins; activity defaults to capitalized; others to bare.
+	assert.Equal(t, "Override", javaMethodCanonicalName("activity", "chargeCard", `name = "Override"`))
+	assert.Equal(t, "ChargeCard", javaMethodCanonicalName("activity", "chargeCard", ""))
+	assert.Equal(t, "status", javaMethodCanonicalName("query", "status", ""))
+	assert.Equal(t, "getStatus", javaMethodCanonicalName("query", "getStatus", ""))
 }
 
 func TestResolveTemporalCalls_JavaSignalAndQueryMethods(t *testing.T) {
@@ -388,4 +457,88 @@ func TestResolveTemporalCalls_RoleStampingIsIdempotent(t *testing.T) {
 		ResolveTemporalCalls(b.g)
 	}
 	assert.Equal(t, "activity", methods["doIt"].Meta["temporal_role"])
+}
+
+func TestTemporalIndexLookup_LanguageGate(t *testing.T) {
+	goNode := &graph.Node{ID: "go/a.go::ChargeCard", Name: "ChargeCard", Language: "go", RepoPrefix: "svc"}
+	javaNode := &graph.Node{ID: "java/A.java::chargeCard", Name: "ChargeCard", Language: "java", RepoPrefix: "jsvc"}
+
+	idx := &temporalIndex{byKindName: map[string][]*graph.Node{
+		"activity::ChargeCard": {javaNode}, // only a Java candidate
+	}}
+
+	// A Go stub must NOT resolve onto a Java handler node even when the
+	// Java entry is the unique overall candidate — that cross-language
+	// match is the job of the dedicated join pass, not the stub resolver.
+	id, _, _ := idx.lookup("activity", "ChargeCard", "svc", "go")
+	assert.Empty(t, id, "go stub must not resolve to a java handler")
+
+	// With a Go candidate present, the Go caller resolves to it (unique
+	// within the caller's language).
+	idx.byKindName["activity::ChargeCard"] = []*graph.Node{javaNode, goNode}
+	id, origin, conf := idx.lookup("activity", "ChargeCard", "svc", "go")
+	assert.Equal(t, goNode.ID, id)
+	assert.Equal(t, graph.OriginASTResolved, origin)
+	assert.Equal(t, 0.9, conf)
+
+	// An unknown caller language keeps the language-agnostic
+	// unique-overall fallback (no regression for callers with no lang).
+	idx.byKindName["activity::Solo"] = []*graph.Node{javaNode}
+	id, _, _ = idx.lookup("activity", "Solo", "", "")
+	assert.Equal(t, javaNode.ID, id, "unknown caller lang keeps the unique-overall fallback")
+}
+
+func TestResolveTemporalCalls_CrossLangJavaStartsGoWorkflow(t *testing.T) {
+	b := newTemporalTestGraph()
+	// Go side: a workflow registered under the canonical name OrderWorkflow.
+	b.addGoFunc("go/main.go::setup", "setup", "go/main.go", "gosvc")
+	b.addGoRegister("go/main.go::setup", "workflow", "OrderWorkflow", "go/main.go")
+	goWf := b.addGoFunc("go/wf.go::OrderWorkflow", "OrderWorkflow", "go/wf.go", "gosvc")
+
+	// Java side (a DIFFERENT repo): a service that starts the workflow by
+	// its canonical type name via a via=temporal.start consumer edge.
+	javaCaller := &graph.Node{
+		ID: "java/Svc.java::startOrder", Kind: graph.KindMethod, Name: "startOrder",
+		FilePath: "java/Svc.java", RepoPrefix: "jsvc", Language: "java",
+	}
+	b.g.AddNode(javaCaller)
+	startEdge := &graph.Edge{
+		From: javaCaller.ID, To: temporalStubPlaceholder("workflow", "OrderWorkflow"),
+		Kind: graph.EdgeCalls, FilePath: "java/Svc.java", Line: 10,
+		Meta: map[string]any{
+			"via": "temporal.start", "temporal_kind": "workflow", "temporal_name": "OrderWorkflow",
+		},
+	}
+	b.g.AddEdge(startEdge)
+
+	ResolveTemporalCalls(b.g)
+
+	assert.Equal(t, goWf.ID, startEdge.To,
+		"a Java start must cross-resolve to the Go workflow of the same canonical name")
+	assert.Equal(t, graph.OriginSpeculative, startEdge.Origin,
+		"a cross-language join lands at the speculative tier")
+	assert.Equal(t, true, startEdge.Meta["temporal_cross_lang"])
+	assert.Equal(t, true, startEdge.Meta[graph.MetaSpeculative], "cross-language edge is hidden by default")
+}
+
+func TestResolveTemporalCalls_RegisterNameOverride(t *testing.T) {
+	b := newTemporalTestGraph()
+	// Worker registers the impl ChargeCard under the override name "Charge"
+	// (RegisterActivityWithOptions{Name: "Charge"}).
+	b.addGoFunc("wf/main.go::setup", "setup", "wf/main.go", "svc")
+	reg := b.addGoRegister("wf/main.go::setup", "activity", "ChargeCard", "wf/main.go")
+	reg.Meta["temporal_registered_name"] = "Charge"
+	impl := b.addGoFunc("wf/activity.go::ChargeCard", "ChargeCard", "wf/activity.go", "svc")
+
+	// A workflow dispatches by the OVERRIDE name, not the func name.
+	b.addGoFunc("wf/workflow.go::OrderWorkflow", "OrderWorkflow", "wf/workflow.go", "svc")
+	call := b.addStubCall("wf/workflow.go::OrderWorkflow", "activity", "Charge", "wf/workflow.go")
+
+	resolved := ResolveTemporalCalls(b.g)
+	assert.Equal(t, 1, resolved)
+	assert.Equal(t, impl.ID, call.To,
+		"a dispatch by the override name must land on the registered impl")
+	assert.Equal(t, "Charge", impl.Meta["temporal_name"],
+		"the impl is known under the registered (override) name")
+	assert.Equal(t, "activity", impl.Meta["temporal_role"])
 }
