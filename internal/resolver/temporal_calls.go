@@ -93,34 +93,62 @@ func ResolveTemporalCalls(g graph.Store) int {
 	mu := g.ResolveMutex()
 	mu.Lock()
 	defer mu.Unlock()
-	idx := buildTemporalIndex(g)
-	resolved := 0
-	var reindexBatch []graph.EdgeReindex
-	// First sweep: collect stub edges and the From IDs we need so the
-	// per-edge GetNode below collapses to one batch lookup.
+
+	// Single sweep over EdgeCalls — the largest edge class — collecting
+	// both the temporal.register edges (index inputs) and the
+	// temporal.stub edges (edges to resolve), instead of scanning it once
+	// per concern. The From IDs of stub edges are gathered so the
+	// per-edge caller lookup below collapses to one batch fetch.
 	type stubEdge struct {
 		edge       *graph.Edge
 		kind, name string
 	}
 	var stubs []stubEdge
+	var registerEdges []*graph.Edge
 	fromIDSet := map[string]struct{}{}
 	for e := range g.EdgesByKind(graph.EdgeCalls) {
 		if e == nil || e.Meta == nil {
 			continue
 		}
-		if v, _ := e.Meta["via"].(string); v != "temporal.stub" {
-			continue
-		}
-		kind, _ := e.Meta["temporal_kind"].(string)
-		name, _ := e.Meta["temporal_name"].(string)
-		if kind == "" || name == "" {
-			continue
-		}
-		stubs = append(stubs, stubEdge{edge: e, kind: kind, name: name})
-		if e.From != "" {
-			fromIDSet[e.From] = struct{}{}
+		switch v, _ := e.Meta["via"].(string); v {
+		case "temporal.register":
+			registerEdges = append(registerEdges, e)
+		case "temporal.stub":
+			kind, _ := e.Meta["temporal_kind"].(string)
+			name, _ := e.Meta["temporal_name"].(string)
+			if kind == "" || name == "" {
+				continue
+			}
+			stubs = append(stubs, stubEdge{edge: e, kind: kind, name: name})
+			if e.From != "" {
+				fromIDSet[e.From] = struct{}{}
+			}
 		}
 	}
+
+	// Probe the (smaller) annotation class for Java temporal tags.
+	var annotatedEdges []*graph.Edge
+	for e := range g.EdgesByKind(graph.EdgeAnnotated) {
+		if e == nil {
+			continue
+		}
+		if r, m := temporalRoleForJavaAnnotation(e.To); r == "" && m == "" {
+			continue
+		}
+		annotatedEdges = append(annotatedEdges, e)
+	}
+
+	// Early-out: a graph with no Temporal register / stub / annotation
+	// edges (the common case for most repos) skips all node fetches,
+	// index building, role stamping, and Java propagation entirely — the
+	// pass costs only the two EdgesByKind scans above.
+	if len(registerEdges) == 0 && len(stubs) == 0 && len(annotatedEdges) == 0 {
+		return 0
+	}
+
+	idx := buildTemporalIndex(g, registerEdges, annotatedEdges)
+	resolved := 0
+	var reindexBatch []graph.EdgeReindex
 	fromList := make([]string, 0, len(fromIDSet))
 	for id := range fromIDSet {
 		fromList = append(fromList, id)
@@ -244,21 +272,25 @@ func (idx *temporalIndex) lookup(kind, name, callerRepo, callerLang string) (id,
 	return "", "", 0
 }
 
-// buildTemporalIndex walks the graph once and (a) stamps temporal_role
-// on every node identifiable as a Temporal workflow / activity via
-// either Go `worker.Register*` calls or Java `@ActivityInterface` /
-// `@WorkflowInterface` annotations (propagated to interface
-// implementors), and (b) returns a name index the stub-call resolver
-// consults.
-func buildTemporalIndex(g graph.Store) *temporalIndex {
+// buildTemporalIndex (a) stamps temporal_role on every node identifiable
+// as a Temporal workflow / activity via either Go `worker.Register*`
+// calls or Java `@ActivityInterface` / `@WorkflowInterface` annotations
+// (propagated to interface implementors), and (b) returns a name index
+// the stub-call resolver consults.
+//
+// registerEdges and annotatedEdges are the temporal.register EdgeCalls
+// edges and the temporal-annotation EdgeAnnotated edges, already
+// collected by the single ResolveTemporalCalls sweep — passing them in
+// avoids re-scanning the (largest) EdgeCalls class and the EdgeAnnotated
+// class a second time.
+func buildTemporalIndex(g graph.Store, registerEdges, annotatedEdges []*graph.Edge) *temporalIndex {
 	idx := &temporalIndex{byKindName: map[string][]*graph.Node{}}
 
-	// Phase 1 — Go side. Walk `temporal.register` edges and stamp the
-	// registered function's node. The "via" tag lives on EdgeCalls
-	// edges, so narrow with EdgesByKind before the Meta filter.
+	// Phase 1 — Go side. Walk the pre-collected `temporal.register` edges
+	// and stamp the registered function's node.
 	//
-	// Collect every register edge first so we can batch-fetch every
-	// caller node and resolve every Go target name in one pair of
+	// Collect every register edge's targets first so we can batch-fetch
+	// every caller node and resolve every Go target name in one pair of
 	// round-trips, instead of N AllNodes scans + N GetNode calls.
 	type goRegister struct {
 		edge       *graph.Edge
@@ -267,11 +299,8 @@ func buildTemporalIndex(g graph.Store) *temporalIndex {
 	var goRegisters []goRegister
 	registerCallerIDs := map[string]struct{}{}
 	registerNames := map[string]struct{}{}
-	for e := range g.EdgesByKind(graph.EdgeCalls) {
+	for _, e := range registerEdges {
 		if e == nil || e.Meta == nil {
-			continue
-		}
-		if v, _ := e.Meta["via"].(string); v != "temporal.register" {
 			continue
 		}
 		kind, _ := e.Meta["temporal_kind"].(string)
@@ -309,16 +338,16 @@ func buildTemporalIndex(g graph.Store) *temporalIndex {
 		idx.byKindName[r.kind+"::"+r.name] = append(idx.byKindName[r.kind+"::"+r.name], target)
 	}
 
-	// Phase 2 — Java side. Walk `EdgeAnnotated` edges to find
-	// temporal-tagged interfaces and methods. As with Phase 1, collect
-	// every annotation edge and batch the From-side GetNode calls.
+	// Phase 2 — Java side. Walk the pre-collected temporal-annotation
+	// `EdgeAnnotated` edges to find temporal-tagged interfaces and
+	// methods. As with Phase 1, batch the From-side GetNode calls.
 	type javaAnno struct {
 		fromID                string
 		ifaceRole, methodRole string
 	}
 	var javaAnnos []javaAnno
 	annoFromIDs := map[string]struct{}{}
-	for e := range g.EdgesByKind(graph.EdgeAnnotated) {
+	for _, e := range annotatedEdges {
 		if e == nil {
 			continue
 		}
@@ -484,6 +513,21 @@ func normaliseTemporalKind(role string) string {
 func stampTemporalRole(g graph.Store, n *graph.Node, role, name string) {
 	if n == nil || role == "" {
 		return
+	}
+	// Skip the write-back entirely when the role + name are already what
+	// we would stamp. ResolveTemporalCalls is a full recompute that runs
+	// on every incremental edit, so without this guard every Temporal-role
+	// node is re-AddNode'd (a serialised single-row write on the sqlite
+	// backend) on every pass even when nothing changed. The common steady
+	// state — re-running the pass after an unrelated edit — then costs no
+	// node writes at all.
+	if cur, _ := n.Meta["temporal_role"].(string); cur == role {
+		if name == "" {
+			return
+		}
+		if curName, _ := n.Meta["temporal_name"].(string); curName == name {
+			return
+		}
 	}
 	if n.Meta == nil {
 		n.Meta = map[string]any{}
