@@ -29,9 +29,71 @@
 package languages
 
 import (
+	"strings"
+
 	"github.com/zzet/gortex/internal/graph"
 	sitter "github.com/zzet/gortex/internal/parser/tsitter"
 )
+
+// goWorkflowPkgPath is the canonical import path of the Temporal Go SDK
+// workflow package whose helpers (ExecuteActivity, SetQueryHandler,
+// SignalExternalWorkflow, …) the detectors gate on.
+const goWorkflowPkgPath = "go.temporal.io/sdk/workflow"
+
+// goWorkflowReceiverAlias returns the local name the workflow package is
+// imported under in this file — the explicit alias for
+// `import wf "go.temporal.io/sdk/workflow"`, or "workflow" for a plain
+// import. Returns "" when the file does not import the workflow package.
+// The detectors canonicalise a matching receiver to "workflow" so an
+// aliased import (`wf.ExecuteActivity(...)`) is still recognised.
+func goWorkflowReceiverAlias(root *sitter.Node, src []byte) string {
+	if root == nil {
+		return ""
+	}
+	var found string
+	var walk func(n *sitter.Node)
+	walk = func(n *sitter.Node) {
+		if n == nil || found != "" {
+			return
+		}
+		if n.Type() == "import_spec" {
+			pathNode := n.ChildByFieldName("path")
+			if pathNode != nil {
+				p := pathNode.Content(src)
+				if len(p) >= 2 {
+					p = p[1 : len(p)-1] // strip the surrounding quotes
+				}
+				if p == goWorkflowPkgPath {
+					if nameNode := n.ChildByFieldName("name"); nameNode != nil {
+						found = nameNode.Content(src)
+					} else if i := strings.LastIndex(goWorkflowPkgPath, "/"); i >= 0 {
+						found = goWorkflowPkgPath[i+1:]
+					}
+					return
+				}
+			}
+		}
+		for i := 0; i < int(n.NamedChildCount()); i++ {
+			walk(n.NamedChild(i))
+			if found != "" {
+				return
+			}
+		}
+	}
+	walk(root)
+	return found
+}
+
+// goCanonicalWorkflowReceiver maps a call receiver to "workflow" when it
+// matches the file's workflow-package alias, so the receiver-gated
+// detectors recognise an aliased import. Other receivers pass through
+// unchanged. wfAlias == "" (package not imported) is a no-op.
+func goCanonicalWorkflowReceiver(receiver, wfAlias string) string {
+	if wfAlias != "" && receiver == wfAlias {
+		return "workflow"
+	}
+	return receiver
+}
 
 // goTemporalDispatchKind reports whether (receiver, method) names one
 // of the Temporal workflow dispatch helpers and, if so, returns the

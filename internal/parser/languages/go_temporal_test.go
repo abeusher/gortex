@@ -167,10 +167,10 @@ func WF(ctx workflow.Context) {
 		"only ExecuteActivity / ExecuteLocalActivity / ExecuteChildWorkflow should be stub-tagged")
 }
 
-func TestGoTemporal_AliasedImportNotDetected(t *testing.T) {
-	// We require the receiver text to be exactly "workflow" — aliased
-	// imports (intentionally) miss; this test pins that contract so a
-	// future relaxation is a conscious decision.
+func TestGoTemporal_AliasedImportDetected(t *testing.T) {
+	// An aliased `import wf "go.temporal.io/sdk/workflow"` is resolved from
+	// the file's import table and canonicalised to the "workflow" receiver,
+	// so dispatch through the alias is detected.
 	fix := runGoExtract(t, `package wf
 
 import wf "go.temporal.io/sdk/workflow"
@@ -179,7 +179,25 @@ func WF(ctx wf.Context) {
 	wf.ExecuteActivity(ctx, Charge, 1)
 }
 `)
-	assert.Empty(t, temporalEdgesByVia(fix, "temporal.stub"))
+	edges := temporalEdgesByVia(fix, "temporal.stub")
+	require.Len(t, edges, 1)
+	assert.Equal(t, "Charge", edges[0].Meta["temporal_name"])
+}
+
+func TestGoTemporal_NonWorkflowReceiverStillIgnored(t *testing.T) {
+	// A same-named receiver that is NOT the workflow package alias must
+	// not be misread as a dispatch — the alias gate only canonicalises the
+	// actual workflow import.
+	fix := runGoExtract(t, `package wf
+
+import wf "go.temporal.io/sdk/workflow"
+
+func WF(ctx wf.Context, other Helper) {
+	other.ExecuteActivity(ctx, Charge, 1)
+}
+`)
+	assert.Empty(t, temporalEdgesByVia(fix, "temporal.stub"),
+		"a non-workflow receiver must not be detected even when workflow is aliased")
 }
 
 func TestGoTemporal_StubAndRegisterCoexistInSameFile(t *testing.T) {
@@ -530,9 +548,9 @@ func OrderWorkflow(ctx workflow.Context, q string) error {
 		"non-literal handler name must not be detected")
 }
 
-func TestGoTemporal_HandlerAliasedImportNotDetected(t *testing.T) {
-	// Consistent with the dispatch detector: only the canonical
-	// "workflow" receiver alias is recognised.
+func TestGoTemporal_HandlerAliasedImportDetected(t *testing.T) {
+	// Consistent with the dispatch detector: an aliased workflow import is
+	// canonicalised and the handler declaration is detected.
 	fix := runGoExtract(t, `package wf
 
 import wf "go.temporal.io/sdk/workflow"
@@ -542,7 +560,10 @@ func OrderWorkflow(ctx wf.Context) error {
 	return nil
 }
 `)
-	assert.Empty(t, temporalEdgesByVia(fix, "temporal.handler"))
+	edges := temporalEdgesByVia(fix, "temporal.handler")
+	require.Len(t, edges, 1)
+	assert.Equal(t, "query", edges[0].Meta["temporal_kind"])
+	assert.Equal(t, "status", edges[0].Meta["temporal_name"])
 }
 
 // --- Outbound signal sends / query calls ----------------------------
@@ -621,10 +642,9 @@ func Cancel(c Client, name string) error {
 	assert.Empty(t, temporalEdgesByVia(fix, "temporal.signal-send"))
 }
 
-func TestGoTemporal_SignalExternalAliasedNotDetected(t *testing.T) {
-	// SignalExternalWorkflow is gated on the canonical "workflow"
-	// receiver (it is a workflow-package function); an aliased import
-	// is intentionally missed, consistent with the dispatch detector.
+func TestGoTemporal_SignalExternalAliasedDetected(t *testing.T) {
+	// SignalExternalWorkflow is a workflow-package function; an aliased
+	// import is canonicalised to the "workflow" receiver and detected.
 	fix := runGoExtract(t, `package wf
 
 import wf "go.temporal.io/sdk/workflow"
@@ -633,7 +653,10 @@ func Orchestrator(ctx wf.Context) error {
 	return wf.SignalExternalWorkflow(ctx, "order-123", "", "cancel-request", nil).Get(ctx, nil)
 }
 `)
-	assert.Empty(t, temporalEdgesByVia(fix, "temporal.signal-send"))
+	edges := temporalEdgesByVia(fix, "temporal.signal-send")
+	require.Len(t, edges, 1)
+	assert.Equal(t, "signal", edges[0].Meta["temporal_kind"])
+	assert.Equal(t, "cancel-request", edges[0].Meta["temporal_name"])
 }
 
 // --- Service-side workflow START (ExecuteWorkflow / SignalWithStartWorkflow) ---

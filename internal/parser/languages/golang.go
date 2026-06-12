@@ -285,6 +285,11 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 	result.Nodes = append(result.Nodes, fileNode)
 
 	imports := map[string]string{} // alias → importPath
+	// Local alias the Temporal workflow package is imported under in this
+	// file (default "workflow"; "" when not imported). The receiver-gated
+	// temporal detectors canonicalise a matching receiver to "workflow" so
+	// an aliased `import wf "go.temporal.io/sdk/workflow"` is recognised.
+	wfAlias := goWorkflowReceiverAlias(root, src)
 	tenv := make(typeEnv)
 	// paramsByFunc: enclosing-function ID → (param/receiver name → type).
 	// Function parameters and method receivers shadow file-wide tenv at
@@ -367,8 +372,11 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 				dc.grpcRegService, dc.grpcRegArgNode = svc, argNode
 			}
 			// Temporal workflow → activity dispatch:
-			// `workflow.ExecuteActivity(ctx, X, ...)` etc.
-			if kind, local, ok := goTemporalDispatchKind(receiver, method); ok {
+			// `workflow.ExecuteActivity(ctx, X, ...)` etc. Canonicalise an
+			// aliased workflow-package receiver (e.g. `wf`) to "workflow"
+			// so the receiver-gated detectors recognise it.
+			tempRecv := goCanonicalWorkflowReceiver(receiver, wfAlias)
+			if kind, local, ok := goTemporalDispatchKind(tempRecv, method); ok {
 				argNode := goTemporalDispatchArg(expr.Node)
 				if name := goTemporalNameFromExpr(argNode, src); name != "" {
 					dc.tempKind = kind
@@ -408,14 +416,14 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 						dc.tempRegisteredName = override
 					}
 				}
-			} else if hkind, ok := goTemporalHandlerKind(receiver, method); ok {
+			} else if hkind, ok := goTemporalHandlerKind(tempRecv, method); ok {
 				// Temporal in-workflow handler declaration:
 				// `workflow.SetQueryHandler(ctx, "name", fn)` etc.
 				if name := goTemporalHandlerName(expr.Node, src); name != "" {
 					dc.tempHandlerKind = hkind
 					dc.tempName = name
 				}
-			} else if okind, namePos, ok := goTemporalSignalQueryOutKind(receiver, method); ok {
+			} else if okind, namePos, ok := goTemporalSignalQueryOutKind(tempRecv, method); ok {
 				// Outbound signal-send / query-call against a running
 				// workflow: SignalExternalWorkflow / SignalWorkflow /
 				// QueryWorkflow. The name is the 4th positional literal.
