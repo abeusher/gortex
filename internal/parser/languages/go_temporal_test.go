@@ -132,7 +132,10 @@ func setup(w Worker) {
 	edges := temporalEdgesByVia(fix, "temporal.register")
 	require.Len(t, edges, 1)
 	assert.Equal(t, "activity", edges[0].Meta["temporal_kind"])
-	assert.Equal(t, "ChargeCard", edges[0].Meta["temporal_name"])
+	assert.Equal(t, "ChargeCard", edges[0].Meta["temporal_name"],
+		"temporal_name keeps the function-reference identifier")
+	assert.Equal(t, "Charge", edges[0].Meta["temporal_registered_name"],
+		"RegisterOptions{Name} override is captured as the registered name")
 }
 
 func TestGoTemporal_RegisterWorkflow(t *testing.T) {

@@ -293,8 +293,13 @@ func buildTemporalIndex(g graph.Store, registerEdges, annotatedEdges []*graph.Ed
 	// every caller node and resolve every Go target name in one pair of
 	// round-trips, instead of N AllNodes scans + N GetNode calls.
 	type goRegister struct {
-		edge       *graph.Edge
-		kind, name string
+		edge *graph.Edge
+		kind string
+		// name is the function-reference identifier (used to locate the
+		// registered node); regName is the canonical registered name (the
+		// index key) — they differ only when RegisterActivityWithOptions
+		// overrides the name via RegisterOptions{Name: "..."}.
+		name, regName string
 	}
 	var goRegisters []goRegister
 	registerCallerIDs := map[string]struct{}{}
@@ -308,7 +313,11 @@ func buildTemporalIndex(g graph.Store, registerEdges, annotatedEdges []*graph.Ed
 		if kind == "" || name == "" {
 			continue
 		}
-		goRegisters = append(goRegisters, goRegister{edge: e, kind: kind, name: name})
+		regName, _ := e.Meta["temporal_registered_name"].(string)
+		if regName == "" {
+			regName = name
+		}
+		goRegisters = append(goRegisters, goRegister{edge: e, kind: kind, name: name, regName: regName})
 		if e.From != "" {
 			registerCallerIDs[e.From] = struct{}{}
 		}
@@ -334,8 +343,11 @@ func buildTemporalIndex(g graph.Store, registerEdges, annotatedEdges []*graph.Ed
 		if target == nil {
 			continue
 		}
-		stampTemporalRole(g, target, r.kind, r.name)
-		idx.byKindName[r.kind+"::"+r.name] = append(idx.byKindName[r.kind+"::"+r.name], target)
+		// Stamp + index under the canonical registered name (regName),
+		// which is the func-ref name unless a RegisterOptions{Name}
+		// override renamed it — that is the name a dispatch matches.
+		stampTemporalRole(g, target, r.kind, r.regName)
+		idx.byKindName[r.kind+"::"+r.regName] = append(idx.byKindName[r.kind+"::"+r.regName], target)
 	}
 
 	// Phase 2 — Java side. Walk the pre-collected temporal-annotation

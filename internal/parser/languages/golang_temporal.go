@@ -257,6 +257,82 @@ func applyGoTemporalRegisterMeta(edge *graph.Edge, c goDeferredCall) {
 	edge.Meta["via"] = "temporal.register"
 	edge.Meta["temporal_kind"] = kind
 	edge.Meta["temporal_name"] = c.tempName
+	if c.tempRegisteredName != "" {
+		edge.Meta["temporal_registered_name"] = c.tempRegisteredName
+	}
+}
+
+// goTemporalRegisterNameOverride extracts the `Name:` string-literal
+// field from the RegisterOptions composite literal passed as the second
+// argument of a `RegisterActivityWithOptions` / `RegisterWorkflowWithOptions`
+// call — the canonical registered name that overrides the bare function
+// name (the name an `ExecuteActivity(ctx, "<name>", …)` dispatch must
+// match). Returns "" when there is no second composite-literal argument or
+// no string-literal Name field.
+//
+//	w.RegisterActivityWithOptions(MyActivity,
+//	    activity.RegisterOptions{Name: "ChargeCard"})
+func goTemporalRegisterNameOverride(callNode *sitter.Node, src []byte) string {
+	if callNode == nil || callNode.Type() != "call_expression" {
+		return ""
+	}
+	args := callNode.ChildByFieldName("arguments")
+	if args == nil {
+		return ""
+	}
+	// Second positional argument = the options struct.
+	var opts *sitter.Node
+	count := 0
+	for i := 0; i < int(args.NamedChildCount()); i++ {
+		c := args.NamedChild(i)
+		if c == nil {
+			continue
+		}
+		count++
+		if count == 2 {
+			opts = c
+			break
+		}
+	}
+	if opts == nil {
+		return ""
+	}
+	// Unwrap a `&RegisterOptions{...}` pointer literal.
+	if opts.Type() == "unary_expression" {
+		if op := opts.ChildByFieldName("operand"); op != nil {
+			opts = op
+		}
+	}
+	if opts.Type() != "composite_literal" {
+		return ""
+	}
+	body := opts.ChildByFieldName("body")
+	if body == nil {
+		return ""
+	}
+	unwrap := func(n *sitter.Node) *sitter.Node {
+		// A keyed-element key/value may be wrapped in a literal_element
+		// node depending on the grammar revision; reduce to the inner node.
+		if n != nil && n.Type() == "literal_element" && n.NamedChildCount() == 1 {
+			return n.NamedChild(0)
+		}
+		return n
+	}
+	for i := 0; i < int(body.NamedChildCount()); i++ {
+		kv := body.NamedChild(i)
+		if kv == nil || kv.Type() != "keyed_element" || kv.NamedChildCount() < 2 {
+			continue
+		}
+		key := unwrap(kv.NamedChild(0))
+		val := unwrap(kv.NamedChild(1))
+		if key == nil || val == nil || key.Content(src) != "Name" {
+			continue
+		}
+		if lit, ok := goStringLiteralValue(val, src); ok {
+			return lit
+		}
+	}
+	return ""
 }
 
 // applyGoTemporalHandlerMeta stamps `via=temporal.handler` plus

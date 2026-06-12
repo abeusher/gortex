@@ -219,6 +219,13 @@ type goDeferredCall struct {
 	// then carries the signal/query name. `via=temporal.signal-send` /
 	// `temporal.query-call` meta is stamped on the emitted edge below.
 	tempOutKind string
+	// tempRegisteredName is the canonical registered name when a
+	// RegisterActivityWithOptions / RegisterWorkflowWithOptions call
+	// overrides it via RegisterOptions{Name: "..."}. tempName still holds
+	// the function-reference identifier (used to locate the node); this
+	// is the name the activity/workflow is dispatched under and becomes
+	// the resolver's index key. Empty when no Name override is present.
+	tempRegisteredName string
 }
 
 type goDeferredTypeRef struct {
@@ -373,6 +380,13 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 				if name := goTemporalRegisterName(expr.Node, src); name != "" {
 					dc.tempKind = "register_" + kind
 					dc.tempName = name
+					// RegisterActivityWithOptions / RegisterWorkflowWithOptions
+					// may override the registered name via
+					// RegisterOptions{Name: "..."} — that is the name a
+					// dispatch matches against, so capture it as the index key.
+					if override := goTemporalRegisterNameOverride(expr.Node, src); override != "" {
+						dc.tempRegisteredName = override
+					}
 				}
 			} else if hkind, ok := goTemporalHandlerKind(receiver, method); ok {
 				// Temporal in-workflow handler declaration:

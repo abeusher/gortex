@@ -457,3 +457,25 @@ func TestTemporalIndexLookup_LanguageGate(t *testing.T) {
 	id, _, _ = idx.lookup("activity", "Solo", "", "")
 	assert.Equal(t, javaNode.ID, id, "unknown caller lang keeps the unique-overall fallback")
 }
+
+func TestResolveTemporalCalls_RegisterNameOverride(t *testing.T) {
+	b := newTemporalTestGraph()
+	// Worker registers the impl ChargeCard under the override name "Charge"
+	// (RegisterActivityWithOptions{Name: "Charge"}).
+	b.addGoFunc("wf/main.go::setup", "setup", "wf/main.go", "svc")
+	reg := b.addGoRegister("wf/main.go::setup", "activity", "ChargeCard", "wf/main.go")
+	reg.Meta["temporal_registered_name"] = "Charge"
+	impl := b.addGoFunc("wf/activity.go::ChargeCard", "ChargeCard", "wf/activity.go", "svc")
+
+	// A workflow dispatches by the OVERRIDE name, not the func name.
+	b.addGoFunc("wf/workflow.go::OrderWorkflow", "OrderWorkflow", "wf/workflow.go", "svc")
+	call := b.addStubCall("wf/workflow.go::OrderWorkflow", "activity", "Charge", "wf/workflow.go")
+
+	resolved := ResolveTemporalCalls(b.g)
+	assert.Equal(t, 1, resolved)
+	assert.Equal(t, impl.ID, call.To,
+		"a dispatch by the override name must land on the registered impl")
+	assert.Equal(t, "Charge", impl.Meta["temporal_name"],
+		"the impl is known under the registered (override) name")
+	assert.Equal(t, "activity", impl.Meta["temporal_role"])
+}
