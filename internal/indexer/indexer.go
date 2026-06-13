@@ -842,7 +842,9 @@ func (idx *Indexer) RunDeferredPasses(ctx context.Context) {
 
 	if idx.semanticMgr != nil && idx.semanticMgr.Enabled() && idx.semanticMgr.HasProviders() {
 		reporter.Report("semantic enrichment", 0, 0)
-		roots := map[string]string{"default": idx.rootPath}
+		// Key by the repo prefix so a repo-scoped provider can scope file
+		// selection to this repo (empty in single-repo mode).
+		roots := map[string]string{idx.repoPrefix: idx.rootPath}
 		results, err := idx.semanticMgr.EnrichAll(idx.graph, roots)
 		if err != nil {
 			idx.logger.Warn("semantic enrichment failed", zap.Error(err))
@@ -2429,7 +2431,9 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 		// Semantic enrichment (SCIP, go/types, LSP).
 		if idx.semanticMgr != nil && idx.semanticMgr.Enabled() && idx.semanticMgr.HasProviders() {
 			reporter.Report("semantic enrichment", 0, 0)
-			roots := map[string]string{"default": absRoot}
+			// Key by the repo prefix so a repo-scoped provider can scope
+			// file selection to this repo (empty in single-repo mode).
+			roots := map[string]string{idx.repoPrefix: absRoot}
 			results, err := idx.semanticMgr.EnrichAll(idx.graph, roots)
 			if err != nil {
 				idx.logger.Warn("semantic enrichment failed", zap.Error(err))
@@ -2841,8 +2845,6 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 				detectClonesAndEmitEdges(idx.graph, idx.repoPrefix, idx.cloneThreshold())
 			}
 		}
-		// Persist this file's resolved-reference facts to the durable sidecar
-		// (delete-then-set so removed references don't linger). No-op on the
 		// in-memory backend. Skipped for a quarantined / timed-out /
 		// minified file: its synthetic result yields no facts, so a
 		// delete-then-set would durably drop the file's real facts on a
@@ -2856,6 +2858,20 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 			// that referenced it — bounded, synchronous, and gated on the
 			// signature delta so a body-only edit fans out to nothing.
 			idx.reresolveAffectedBy(graphPath, abSnap, result.Nodes)
+
+			// Incremental semantic enrichment for this single file. Mirrors the
+			// full-index EnrichAll call but scoped to the saved file, so a
+			// watcher save re-runs the type resolvers (and any watch-enabled
+			// LSP / compiler provider) instead of leaving the file's edges at
+			// their pre-enrichment tier until the next full reindex. Gated
+			// internally on Config.EnrichOnWatch; a no-op when disabled.
+			if idx.semanticMgr != nil && idx.semanticMgr.Enabled() && idx.semanticMgr.HasProviders() {
+				if _, err := idx.semanticMgr.EnrichFile(idx.graph, idx.rootPath, graphPath); err != nil {
+					idx.logger.Debug("indexer: incremental semantic enrichment failed",
+						zap.String("file", graphPath),
+						zap.Error(err))
+				}
+			}
 		}
 	}
 

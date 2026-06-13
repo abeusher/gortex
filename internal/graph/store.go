@@ -959,6 +959,21 @@ type FileMtimeDeleter interface {
 	DeleteFileMtimes(repoPrefix string, paths []string) error
 }
 
+// EdgePersister is an optional capability backends MAY implement to
+// durably rewrite the mutable attribute columns (Confidence,
+// ConfidenceLabel, Origin, Tier, Meta) of an edge already present in the
+// graph, identified by its full logical key (From, To, Kind, FilePath,
+// Line). The in-memory backend never needs it — GetOutEdges hands back
+// the live *Edge pointer, so an in-place field mutation is already
+// durable. A disk backend, by contrast, returns a detached row copy:
+// mutating Confidence / Meta on that copy and calling SetEdgeProvenance
+// (which only writes Origin + Tier) silently drops the rest. A pass that
+// confirms an edge's full provenance bundle calls PersistEdgeAttributes
+// so every backend keeps it. A no matching row is a no-op.
+type EdgePersister interface {
+	PersistEdgeAttributes(e *Edge)
+}
+
 // CloneShingleWriter is an optional capability backends MAY implement
 // to persist each function/method node's MinHash shingle set (a
 // []uint64) keyed by node id. Lifting this state into the same backend
