@@ -343,9 +343,132 @@ func WF(ctx workflow.Context) {
 	assert.Equal(t, "env_default", edges[0].Meta["temporal_name_origin"])
 }
 
-func TestGoTemporal_ExecuteActivity_NonCmpOrCalleeNotEnvDefault(t *testing.T) {
-	// An arbitrary user function mixing an env read with a literal is NOT
-	// the cmp.Or env-or-default idiom — keep the bare identifier, no flag.
+func TestEnvFallbackViaHelper_GetEnvOrDefaultValue(t *testing.T) {
+	// The `...Value`-suffixed sibling of GetEnvOrDefault is a real variant
+	// seen in production env-helper packages (L1 corpus audit); it must be
+	// recognised exactly like GetEnvOrDefault since the allow-list matches
+	// the full callee name, not a substring.
+	fix := runGoExtract(t, `package wf
+
+import (
+	"go.temporal.io/sdk/workflow"
+	"example.com/app/envhelper"
+)
+
+func WF(ctx workflow.Context) {
+	actName := envhelper.GetEnvOrDefaultValue("PROCESS_CANCEL_ACTIVITY", "ProcessCancelActivity")
+	workflow.ExecuteActivity(ctx, actName, 1)
+}
+`)
+	edges := temporalEdgesByVia(fix, "temporal.stub")
+	require.Len(t, edges, 1)
+	e := edges[0]
+	assert.Equal(t, "ProcessCancelActivity", e.Meta["temporal_name"])
+	assert.Equal(t, "env_default", e.Meta["temporal_name_origin"])
+}
+
+func TestEnvFallbackViaHelper_BareIdentifierEnvOr(t *testing.T) {
+	// Bare (un-qualified) helper call: `EnvOr(KEY, "Default")`.
+	fix := runGoExtract(t, `package wf
+
+import "go.temporal.io/sdk/workflow"
+
+func WF(ctx workflow.Context) {
+	actName := EnvOr("REFUND_ACTIVITY", "RefundActivity")
+	workflow.ExecuteActivity(ctx, actName, 1)
+}
+`)
+	edges := temporalEdgesByVia(fix, "temporal.stub")
+	require.Len(t, edges, 1)
+	e := edges[0]
+	assert.Equal(t, "RefundActivity", e.Meta["temporal_name"])
+	assert.Equal(t, "env_default", e.Meta["temporal_name_origin"])
+}
+
+func TestEnvFallbackHeuristic_EnvNamedHelperFlaggedSpeculative(t *testing.T) {
+	// Generic recall layer: a helper NOT in the allow-list but whose name
+	// contains "env" (case-insensitive) is recognised by the structural
+	// heuristic — its 2nd string-literal argument is taken as the default,
+	// tagged temporal_env_source=heuristic so the resolver can keep it at the
+	// hidden speculative tier (the LLM cleaning pass verifies it later).
+	fix := runGoExtract(t, `package wf
+
+import (
+	"go.temporal.io/sdk/workflow"
+	"example.com/app/cfg"
+)
+
+func WF(ctx workflow.Context) {
+	actName := cfg.ActivityFromEnv("CHARGE_ACTIVITY", "ChargeActivity")
+	workflow.ExecuteActivity(ctx, actName, 1)
+}
+`)
+	edges := temporalEdgesByVia(fix, "temporal.stub")
+	require.Len(t, edges, 1)
+	e := edges[0]
+	assert.Equal(t, "ChargeActivity", e.Meta["temporal_name"])
+	assert.Equal(t, "env_default", e.Meta["temporal_name_origin"])
+	assert.Equal(t, "heuristic", e.Meta["temporal_env_source"])
+}
+
+func TestEnvFallbackViaHelper_AllowlistTaggedSource(t *testing.T) {
+	// An allow-list helper is tagged temporal_env_source=allowlist so the
+	// resolver can promote it above the generic-heuristic tier.
+	fix := runGoExtract(t, `package wf
+
+import (
+	"go.temporal.io/sdk/workflow"
+	"example.com/app/wfutils"
+)
+
+func WF(ctx workflow.Context) {
+	actName := wfutils.GetEnvOrDefault("CHARGE_ACTIVITY", "ChargeActivity")
+	workflow.ExecuteActivity(ctx, actName, 1)
+}
+`)
+	edges := temporalEdgesByVia(fix, "temporal.stub")
+	require.Len(t, edges, 1)
+	assert.Equal(t, "allowlist", edges[0].Meta["temporal_env_source"])
+}
+
+func TestEnvFallbackAllowlist_ConfigPromotesHelper(t *testing.T) {
+	// A helper that is neither built-in NOR "env"-named is invisible to both
+	// layers by default — but installing it in the per-repo corporate
+	// allow-list promotes it to the allowlist tier (source=allowlist).
+	src := `package wf
+
+import (
+	"go.temporal.io/sdk/workflow"
+	"example.com/app/cfg"
+)
+
+func WF(ctx workflow.Context) {
+	actName := cfg.FetchActivityName("CHARGE_ACTIVITY", "ChargeActivity")
+	workflow.ExecuteActivity(ctx, actName, 1)
+}
+`
+	// Default: the unknown helper is not recognised (the dispatch keeps the
+	// bare variable name, no env_default flag).
+	def := temporalEdgesByVia(runGoExtract(t, src), "temporal.stub")
+	require.Len(t, def, 1)
+	assert.Equal(t, "actName", def[0].Meta["temporal_name"])
+	_, flagged := def[0].Meta["temporal_name_origin"]
+	assert.False(t, flagged, "unknown non-env helper must not be flagged by default")
+
+	// With the corporate allow-list, the same helper resolves to its literal
+	// default at the allowlist tier.
+	got := temporalEdgesByVia(runGoExtractWithEnvHelpers(t, src, []string{"FetchActivityName"}), "temporal.stub")
+	require.Len(t, got, 1)
+	assert.Equal(t, "ChargeActivity", got[0].Meta["temporal_name"])
+	assert.Equal(t, "env_default", got[0].Meta["temporal_name_origin"])
+	assert.Equal(t, "allowlist", got[0].Meta["temporal_env_source"])
+}
+
+func TestEnvFallbackViaHelper_UnknownHelperNotFlagged(t *testing.T) {
+	// A helper whose name is NOT in the tight allow-list AND is not
+	// "env"-named must not be treated as an env-default — precision over
+	// recall. (`combine` mixes an env read with a literal but is neither
+	// cmp.Or nor an env-named helper.)
 	fix := runGoExtract(t, `package wf
 
 import (

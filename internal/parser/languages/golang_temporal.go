@@ -692,10 +692,10 @@ func goTemporalNameFromExpr(node *sitter.Node, src []byte) string {
 // os.Getenv-anchored literal default returns "", false. This is a
 // deliberately narrow data-flow shortcut, not general constant
 // propagation — see the speculative tier the resolver lands it at.
-func goTemporalEnvDefaultName(callNode *sitter.Node, name string, src []byte) (string, bool) {
+func goTemporalEnvDefaultName(callNode *sitter.Node, name string, src []byte, extra map[string]bool) (def string, source string, ok bool) {
 	body := goEnclosingFuncBody(callNode)
 	if body == nil {
-		return "", false
+		return "", "", false
 	}
 	limit := callNode.StartByte()
 
@@ -725,39 +725,52 @@ func goTemporalEnvDefaultName(callNode *sitter.Node, name string, src []byte) (s
 	// Replay the writes in order. The dispatch name is env-default-sourced
 	// only if, after the LAST write before the call, the variable still
 	// holds an env-or-default value: either a `cmp.Or(os.Getenv, "lit")`
-	// assignment, or a string-literal assignment that followed an
-	// os.Getenv / os.LookupEnv read (the `name := os.Getenv(...); if name
-	// == "" { name = "lit" }` shape). Any other later write — a plain
-	// reassignment `name = pick()` — clears the env-sourcing, and we leave
-	// the dispatch unresolved rather than guess.
+	// assignment, an allow-listed / heuristic env-helper call
+	// (`GetEnvOrDefault(KEY, "lit")` / `cfg.ActivityFromEnv(KEY, "lit")`),
+	// or a string-literal assignment that followed an os.Getenv /
+	// os.LookupEnv read (the `name := os.Getenv(...); if name == "" { name =
+	// "lit" }` shape). Any other later write — a plain reassignment `name =
+	// pick()` — clears the env-sourcing, and we leave the dispatch
+	// unresolved rather than guess.
+	//
+	// resolvedSource records HOW the default was recognised so the resolver
+	// can tier the edge: "os_getenv" / "allowlist" land at the inferred
+	// (visible) tier, "heuristic" stays at the hidden speculative tier.
 	resolved := ""
+	resolvedSource := ""
 	resolvedOK := false
 	envReadSeen := false
 	for _, a := range assigns {
 		rhs := goAssignRHSExpr(a)
 		switch {
 		case rhs == nil:
-			resolved, resolvedOK, envReadSeen = "", false, false
+			resolved, resolvedSource, resolvedOK, envReadSeen = "", "", false, false
 		case rhs.Type() == "call_expression" && goIsEnvRead(rhs, src):
 			// `name := os.Getenv("K")` — default still pending.
-			resolved, resolvedOK, envReadSeen = "", false, true
+			resolved, resolvedSource, resolvedOK, envReadSeen = "", "", false, true
 		case rhs.Type() == "call_expression":
 			// `name := cmp.Or(os.Getenv("K"), "lit")` — self-contained.
 			if def, ok := goCallEnvDefaultLiteral(rhs, src); ok {
-				resolved, resolvedOK, envReadSeen = def, true, false
+				resolved, resolvedSource, resolvedOK, envReadSeen = def, "os_getenv", true, false
+			} else if def, ok := goEnvHelperDefaultLiteral(rhs, src, extra); ok {
+				// Allow-listed env-helper (`GetEnvOrDefault(KEY, "lit")`).
+				resolved, resolvedSource, resolvedOK, envReadSeen = def, "allowlist", true, false
+			} else if def, ok := goEnvHelperHeuristicDefault(rhs, src); ok {
+				// Generic "env"-named helper — lower-trust heuristic.
+				resolved, resolvedSource, resolvedOK, envReadSeen = def, "heuristic", true, false
 			} else {
-				resolved, resolvedOK, envReadSeen = "", false, false
+				resolved, resolvedSource, resolvedOK, envReadSeen = "", "", false, false
 			}
 		default:
 			// `name = "lit"` — only a default when it follows an env read.
 			if lit, ok := goStringLiteralValue(rhs, src); ok && envReadSeen {
-				resolved, resolvedOK = lit, true
+				resolved, resolvedSource, resolvedOK = lit, "os_getenv", true
 			} else {
-				resolved, resolvedOK, envReadSeen = "", false, false
+				resolved, resolvedSource, resolvedOK, envReadSeen = "", "", false, false
 			}
 		}
 	}
-	return resolved, resolvedOK
+	return resolved, resolvedSource, resolvedOK
 }
 
 // goEnclosingFuncBody walks up from n to the nearest function-like
@@ -874,6 +887,103 @@ func goIsCmpOr(call *sitter.Node, src []byte) bool {
 		op.Content(src) == "cmp" && field.Content(src) == "Or"
 }
 
+// goEnvHelperNames is the built-in allow-list of project-local env-or-default
+// helper function names whose 2nd argument is the literal default. Matched
+// case-insensitively; a corporate fork extends it at runtime via the per-repo
+// allow-list threaded through `extra` (see goEnvHelperDefaultLiteral).
+var goEnvHelperNames = []string{
+	"GetEnvOrDefault",
+	"GetEnvOrDefaultValue",
+	"EnvOr",
+	"GetenvDefault",
+	"GetEnvDefault",
+}
+
+// goEnvHelperDefaultLiteral recognises a call to a project-local
+// env-or-default helper by name — `wfutils.GetEnvOrDefault(KEY, "Default")`
+// or the bare `EnvOr(KEY, "Default")` — and returns the string-literal 2nd
+// argument as the default. The callee name is taken from a bare identifier
+// or, for a selector_expression, its trailing `field`; it is compared
+// case-insensitively (strings.EqualFold) against the built-in goEnvHelperNames
+// PLUS `extra` — the per-repo corporate allow-list (lower-cased keys) loaded
+// from the git-ignored `.gortex/temporal-allowlist.yaml`. A match here is
+// "allowlist"-sourced, so the resolver lands the edge at the inferred (visible)
+// tier — that is how a corporate agent PROMOTES its own helper above the
+// generic "env"-name heuristic. Returns ("", false) for any non-matching name
+// or a non-string-literal 2nd arg.
+func goEnvHelperDefaultLiteral(call *sitter.Node, src []byte, extra map[string]bool) (string, bool) {
+	fn := call.ChildByFieldName("function")
+	if fn == nil {
+		return "", false
+	}
+	var callee string
+	switch fn.Type() {
+	case "identifier":
+		callee = fn.Content(src)
+	case "selector_expression":
+		if field := fn.ChildByFieldName("field"); field != nil {
+			callee = field.Content(src)
+		}
+	}
+	if callee == "" {
+		return "", false
+	}
+	matched := false
+	for _, name := range goEnvHelperNames {
+		if strings.EqualFold(callee, name) {
+			matched = true
+			break
+		}
+	}
+	if !matched && extra[strings.ToLower(callee)] {
+		matched = true
+	}
+	if !matched {
+		return "", false
+	}
+	args := call.ChildByFieldName("arguments")
+	if args == nil || args.NamedChildCount() < 2 {
+		return "", false
+	}
+	return goStringLiteralValue(args.NamedChild(1), src)
+}
+
+// goEnvHelperHeuristicDefault is the generic-recall fallback for env-or-default
+// helpers whose NAME is not in the allow-list. It fires on a structural anchor
+// — the callee's (bare or selector-trailing) name contains "env"
+// (case-insensitive), the near-universal marker of an env-reading helper
+// (`cfg.ActivityFromEnv("KEY", "Default")`, `getEnvActivity(...)`) — and takes
+// the 2nd argument's string literal as the default. Deliberately lower-trust
+// than the allow-list path: the caller tags the resulting edge
+// `temporal_env_source=heuristic` so the resolver keeps it at the hidden
+// speculative tier (where the LLM cleaning pass verifies or prunes it), rather
+// than asserting it as a real dispatch. Returns ("", false) when the name lacks
+// the "env" marker or the 2nd argument is not a string literal — so a plain
+// `pick(KEY, "X")` (no env marker) is left untouched, preserving precision.
+func goEnvHelperHeuristicDefault(call *sitter.Node, src []byte) (string, bool) {
+	fn := call.ChildByFieldName("function")
+	if fn == nil {
+		return "", false
+	}
+	var callee string
+	switch fn.Type() {
+	case "identifier":
+		callee = fn.Content(src)
+	case "selector_expression":
+		if field := fn.ChildByFieldName("field"); field != nil {
+			callee = field.Content(src)
+		}
+	}
+	if callee == "" || !strings.Contains(strings.ToLower(callee), "env") {
+		return "", false
+	}
+	args := call.ChildByFieldName("arguments")
+	if args == nil || args.NamedChildCount() < 2 {
+		return "", false
+	}
+	return goStringLiteralValue(args.NamedChild(1), src)
+}
+
 // goStringLiteralValue returns the unquoted value of a Go string literal
 // node, or ("", false) for any other node type.
 func goStringLiteralValue(n *sitter.Node, src []byte) (string, bool) {
@@ -890,12 +1000,15 @@ func goStringLiteralValue(n *sitter.Node, src []byte) (string, bool) {
 // goTemporalCallArgNames extracts positional arg names from a call expression.
 //
 // PURPOSE — extract positional arg names from a call expression for wrapper-following
-// RATIONALE — only qualifying args (string literals, selectors, Capitalized identifiers)
+// RATIONALE — qualifying args are string literals, selectors, Capitalized
 //
-//	are included; plain lowercase vars are not useful as activity names
+//	identifiers, OR a bare lowercase identifier that is one of the ENCLOSING
+//	function's own parameters (a name forwarded THROUGH this call) — the latter
+//	is what lets depth>1 wrapper-following propagate a name across multiple hops.
+//	`callerParams` is the enclosing function's parameter-name set (may be nil).
 //
-// KEYWORDS — arg_names, wrapper-following, call_expression
-func goTemporalCallArgNames(callNode *sitter.Node, src []byte) ([]string, bool) {
+// KEYWORDS — arg_names, wrapper-following, call_expression, forwarded-param
+func goTemporalCallArgNames(callNode *sitter.Node, src []byte, callerParams map[string]bool) ([]string, bool) {
 	if callNode == nil || callNode.Type() != "call_expression" {
 		return nil, false
 	}
@@ -925,6 +1038,13 @@ func goTemporalCallArgNames(callNode *sitter.Node, src []byte) ([]string, bool) 
 			name = c.Content(src)
 			if name != "" && name[0] >= 'A' && name[0] <= 'Z' {
 				qualifying = true
+			} else if callerParams[name] {
+				// A bare lowercase identifier that is the enclosing function's
+				// own parameter: this call forwards a caller-supplied name
+				// THROUGH (`runStep(ctx, name, …)` inside a wrapper). Recording
+				// it lets the wrapper-following resolver discover the caller as
+				// a transitive wrapper and propagate the name up another level.
+				qualifying = true
 			}
 		}
 		out = append(out, name)
@@ -943,8 +1063,8 @@ func goTemporalCallArgNames(callNode *sitter.Node, src []byte) ([]string, bool) 
 //	to match caller edges to wrapper definitions
 //
 // KEYWORDS — arg_names, callee, wrapper-following, edge meta
-func attachGoTemporalCallArgNames(edge *graph.Edge, c goDeferredCall, callNode *sitter.Node, src []byte) {
-	names, ok := goTemporalCallArgNames(callNode, src)
+func attachGoTemporalCallArgNames(edge *graph.Edge, c goDeferredCall, callNode *sitter.Node, src []byte, callerParams map[string]bool) {
+	names, ok := goTemporalCallArgNames(callNode, src, callerParams)
 	if !ok {
 		return
 	}

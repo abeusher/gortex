@@ -190,10 +190,134 @@ func setupWorker(w Worker) {
 	assert.Equal(t, activity.ID, stubCall.To,
 		"env-default dispatch must land on the default activity")
 	assert.Equal(t, "env_default", stubCall.Meta["temporal_name_origin"])
+	assert.Equal(t, "os_getenv", stubCall.Meta["temporal_env_source"])
+	assert.Equal(t, graph.OriginASTInferred, stubCall.Origin,
+		"provable os.Getenv env-default lands at the inferred (visible) tier")
+	_, hidden := stubCall.Meta[graph.MetaSpeculative]
+	assert.False(t, hidden, "os.Getenv env-default is visible by default")
+}
+
+// TestEnvFallbackResolution (G1) exercises the env-with-fallback-via-helper
+// dispatch name: the workflow names its activity through a variable read
+// from a project-local helper (`wfutils.GetEnvOrDefault(KEY, "Default")`)
+// rather than os.Getenv directly. The helper body lives in another package
+// and is invisible at extract time, so the literal 2nd argument is taken as
+// the default and the call lands on the default activity at the speculative
+// tier.
+func TestEnvFallbackResolution(t *testing.T) {
+	dir := t.TempDir()
+
+	writeFile(t, filepath.Join(dir, "workflow.go"), `package wf
+
+import (
+	"go.temporal.io/sdk/workflow"
+)
+
+func GetEnvOrDefault(key, def string) string { return def }
+
+func OrderWorkflow(ctx workflow.Context, id string) error {
+	actName := GetEnvOrDefault("CHARGE_ACTIVITY", "ChargeCard")
+	return workflow.ExecuteActivity(ctx, actName, id).Get(ctx, nil)
+}
+`)
+	writeFile(t, filepath.Join(dir, "activity.go"), `package wf
+
+import "context"
+
+func ChargeCard(ctx context.Context, id string) error {
+	return nil
+}
+`)
+	writeFile(t, filepath.Join(dir, "main.go"), `package wf
+
+func setupWorker(w Worker) {
+	w.RegisterWorkflow(OrderWorkflow)
+	w.RegisterActivity(ChargeCard)
+}
+`)
+
+	g := graph.New()
+	idx := newTestIndexer(g)
+	_, err := idx.Index(dir)
+	require.NoError(t, err)
+
+	wf := g.FindNodesByName("OrderWorkflow")[0]
+	activity := g.FindNodesByName("ChargeCard")[0]
+
+	var stubCall *graph.Edge
+	for _, e := range g.GetOutEdges(wf.ID) {
+		if e != nil && e.Meta != nil && e.Meta["via"] == "temporal.stub" {
+			stubCall = e
+			break
+		}
+	}
+	require.NotNil(t, stubCall, "workflow must have an outbound temporal.stub edge")
+	assert.Equal(t, activity.ID, stubCall.To,
+		"helper env-default dispatch must land on the default activity")
+	assert.Equal(t, "env_default", stubCall.Meta["temporal_name_origin"])
+	assert.Equal(t, "allowlist", stubCall.Meta["temporal_env_source"])
+	assert.Equal(t, graph.OriginASTInferred, stubCall.Origin,
+		"allow-list helper env-default lands at the inferred (visible) tier")
+	_, hidden := stubCall.Meta[graph.MetaSpeculative]
+	assert.False(t, hidden, "allow-list env-default is visible by default")
+}
+
+// TestTemporalE2E_GoEnvHeuristicSpeculative exercises the generic recall
+// layer end-to-end: a helper NOT in the allow-list but whose name contains
+// "env" is recognised by the heuristic, still resolves to the default
+// activity, but lands at the HIDDEN speculative tier (source=heuristic) — the
+// LLM cleaning pass is what later confirms or prunes it.
+func TestTemporalE2E_GoEnvHeuristicSpeculative(t *testing.T) {
+	dir := t.TempDir()
+
+	writeFile(t, filepath.Join(dir, "workflow.go"), `package wf
+
+import "go.temporal.io/sdk/workflow"
+
+func ActivityFromEnv(key, def string) string { return def }
+
+func OrderWorkflow(ctx workflow.Context, id string) error {
+	actName := ActivityFromEnv("CHARGE_ACTIVITY", "ChargeCard")
+	return workflow.ExecuteActivity(ctx, actName, id).Get(ctx, nil)
+}
+`)
+	writeFile(t, filepath.Join(dir, "activity.go"), `package wf
+
+import "context"
+
+func ChargeCard(ctx context.Context, id string) error { return nil }
+`)
+	writeFile(t, filepath.Join(dir, "main.go"), `package wf
+
+func setupWorker(w Worker) {
+	w.RegisterWorkflow(OrderWorkflow)
+	w.RegisterActivity(ChargeCard)
+}
+`)
+
+	g := graph.New()
+	idx := newTestIndexer(g)
+	_, err := idx.Index(dir)
+	require.NoError(t, err)
+
+	wf := g.FindNodesByName("OrderWorkflow")[0]
+	activity := g.FindNodesByName("ChargeCard")[0]
+
+	var stubCall *graph.Edge
+	for _, e := range g.GetOutEdges(wf.ID) {
+		if e != nil && e.Meta != nil && e.Meta["via"] == "temporal.stub" {
+			stubCall = e
+			break
+		}
+	}
+	require.NotNil(t, stubCall, "workflow must have an outbound temporal.stub edge")
+	assert.Equal(t, activity.ID, stubCall.To,
+		"heuristic env-default still resolves to the default activity")
+	assert.Equal(t, "heuristic", stubCall.Meta["temporal_env_source"])
 	assert.Equal(t, graph.OriginSpeculative, stubCall.Origin,
-		"env-default resolution must be speculative")
+		"heuristic env-default stays at the speculative tier")
 	assert.Equal(t, true, stubCall.Meta[graph.MetaSpeculative],
-		"env-default edge must be hidden-by-default")
+		"heuristic env-default is hidden by default")
 }
 
 // TestTemporalE2E_GoQueryHandler exercises in-workflow handler detection:
@@ -707,4 +831,65 @@ func setupWorker(w Worker) {
 	assert.Equal(t, activity.ID, stubCall.To,
 		"func-returning-constant dispatch must resolve to ChargeActivity")
 	assert.Equal(t, graph.OriginASTResolved, stubCall.Origin)
+}
+
+// TestTemporalE2E_GoWrapperDepth2 exercises depth>1 wrapper-following: the
+// dispatch name is forwarded through TWO wrapper hops (runStep -> execActivity
+// -> workflow.ExecuteActivity). The iterative wrapper pass must record the
+// forwarded lowercase parameter as an arg_name at each hop and chase the chain
+// to a fixpoint so the caller's literal ("ProcessCancel") reaches the registered
+// activity.
+func TestTemporalE2E_GoWrapperDepth2(t *testing.T) {
+	dir := t.TempDir()
+
+	writeFile(t, filepath.Join(dir, "wrappers.go"), `package wf
+
+import "go.temporal.io/sdk/workflow"
+
+func runStep(ctx workflow.Context, name string, args ...any) error {
+	return execActivity(ctx, name, args)
+}
+
+func execActivity(ctx workflow.Context, name string, args ...any) error {
+	return workflow.ExecuteActivity(ctx, name, args).Get(ctx, nil)
+}
+`)
+	writeFile(t, filepath.Join(dir, "workflow.go"), `package wf
+
+import "go.temporal.io/sdk/workflow"
+
+func CancelWorkflow(ctx workflow.Context) error {
+	return runStep(ctx, "ProcessCancel", 1)
+}
+`)
+	writeFile(t, filepath.Join(dir, "activity.go"), `package wf
+
+import "context"
+
+func ProcessCancel(ctx context.Context, n int) error { return nil }
+`)
+	writeFile(t, filepath.Join(dir, "main.go"), `package wf
+
+func setupWorker(w Worker) {
+	w.RegisterWorkflow(CancelWorkflow)
+	w.RegisterActivity(ProcessCancel)
+}
+`)
+
+	g := graph.New()
+	idx := newTestIndexer(g)
+	_, err := idx.Index(dir)
+	require.NoError(t, err)
+
+	wf := g.FindNodesByName("CancelWorkflow")[0]
+	activity := g.FindNodesByName("ProcessCancel")[0]
+
+	targets := map[string]bool{}
+	for _, e := range g.GetOutEdges(wf.ID) {
+		if e != nil && e.Meta != nil && e.Meta["via"] == "temporal.stub" && e.Meta["temporal_via_wrapper"] != nil {
+			targets[e.To] = true
+		}
+	}
+	assert.True(t, targets[activity.ID],
+		"depth-2 wrapper dispatch must follow runStep->execActivity and reach ProcessCancel")
 }

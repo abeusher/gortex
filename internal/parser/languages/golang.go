@@ -163,6 +163,31 @@ const qGoAll = `
 type GoExtractor struct {
 	lang *sitter.Language
 	qAll *parser.PreparedQuery
+	// envHelperExtra is the per-repo corporate env-helper allow-list (lower-
+	// cased names) loaded from the git-ignored `.gortex/temporal-allowlist.yaml`.
+	// Names here are merged with the built-in goEnvHelperNames when recognising
+	// a Temporal env-or-default dispatch helper, promoting the resolved edge to
+	// the inferred (visible) tier. Empty/nil when no local allow-list is loaded.
+	envHelperExtra map[string]bool
+}
+
+// SetEnvHelperNames installs the per-repo corporate env-helper allow-list on
+// the extractor. Names are stored lower-cased for case-insensitive matching.
+// Called once during extractor registration (config is not available at parse
+// time); a nil / empty slice clears it. Safe to call before indexing begins;
+// must not be called concurrently with Extract.
+func (e *GoExtractor) SetEnvHelperNames(names []string) {
+	if len(names) == 0 {
+		e.envHelperExtra = nil
+		return
+	}
+	m := make(map[string]bool, len(names))
+	for _, n := range names {
+		if n = strings.TrimSpace(n); n != "" {
+			m[strings.ToLower(n)] = true
+		}
+	}
+	e.envHelperExtra = m
 }
 
 func NewGoExtractor() *GoExtractor {
@@ -225,6 +250,13 @@ type goDeferredCall struct {
 	// carries the handler's string name. `via=temporal.handler` meta is
 	// stamped on the emitted edge in the call post-pass below.
 	tempHandlerKind string
+	// tempEnvSource records HOW the env-default name was recognised:
+	// "os_getenv" (provable os.Getenv / os.LookupEnv read), "allowlist" (a
+	// helper name in the configured env-helper allow-list), or "heuristic"
+	// (a generic env-named helper matched structurally). Emitted as
+	// `temporal_env_source` so the resolver can tier the edge: allow-list /
+	// os.Getenv land at the inferred tier, the heuristic stays speculative.
+	tempEnvSource string
 	// tempOutKind is "signal" / "query" when this call is an outbound
 	// signal-send / query-call against a running workflow
 	// (SignalExternalWorkflow / SignalWorkflow / QueryWorkflow); tempName
@@ -429,9 +461,10 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 					// variable, try to resolve it to an env-var-with-literal
 					// -default so the dispatch lands on the default activity.
 					if argNode != nil && argNode.Type() == "identifier" {
-						if def, ok := goTemporalEnvDefaultName(expr.Node, name, src); ok {
+						if def, source, ok := goTemporalEnvDefaultName(expr.Node, name, src, e.envHelperExtra); ok {
 							dc.tempName = def
 							dc.tempEnvDefault = true
+							dc.tempEnvSource = source
 						}
 					}
 				}
@@ -847,6 +880,9 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 				}
 				if c.tempEnvDefault {
 					meta["temporal_name_origin"] = "env_default"
+					if c.tempEnvSource != "" {
+						meta["temporal_env_source"] = c.tempEnvSource
+					}
 				}
 				if recvName := recvNameByID[callerID]; recvName != "" {
 					if arg := goTemporalDispatchArg(c.callNode); arg != nil && arg.Type() == "selector_expression" {
@@ -884,7 +920,7 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 			applyGoTemporalSignalQueryMeta(edge, c)
 			applyGoTemporalStartMeta(edge, c)
 			stampReturnUsage(edge, c.returnUsage)
-			attachGoTemporalCallArgNames(edge, c, c.callNode, src)
+			attachGoTemporalCallArgNames(edge, c, c.callNode, src, paramNamesByFunc[callerID])
 			result.Edges = append(result.Edges, edge)
 			emitGoSpawnEdge(c, callerID, target, filePath, result)
 			continue
@@ -901,7 +937,7 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 			applyGoTemporalSignalQueryMeta(edge, c)
 			applyGoTemporalStartMeta(edge, c)
 			stampReturnUsage(edge, c.returnUsage)
-			attachGoTemporalCallArgNames(edge, c, c.callNode, src)
+			attachGoTemporalCallArgNames(edge, c, c.callNode, src, paramNamesByFunc[callerID])
 			result.Edges = append(result.Edges, edge)
 			emitGoSpawnEdge(c, callerID, target, filePath, result)
 			continue
@@ -954,7 +990,7 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 		applyGoTemporalSignalQueryMeta(edge, c)
 		applyGoTemporalStartMeta(edge, c)
 		stampReturnUsage(edge, c.returnUsage)
-		attachGoTemporalCallArgNames(edge, c, c.callNode, src)
+		attachGoTemporalCallArgNames(edge, c, c.callNode, src, paramNamesByFunc[callerID])
 		result.Edges = append(result.Edges, edge)
 		emitGoSpawnEdge(c, callerID, target, filePath, result)
 	}

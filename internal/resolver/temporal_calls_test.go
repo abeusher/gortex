@@ -269,6 +269,47 @@ func TestResolveTemporalCalls_EnvDefaultUnresolvedStaysPlaceholder(t *testing.T)
 	assert.False(t, speculative, "unresolved env-default edge must not carry the speculative flag")
 }
 
+// TestResolveTemporalCalls_CrossRepoTestStubSuppressed reproduces the one
+// confirmed false positive from the L1 corpus audit: a dispatch in a service
+// repo would otherwise resolve to a REGISTERED activity that lives only in a
+// *_test.go fixture of an UNRELATED workflow repo. That target is a test mock,
+// not the real implementation, so the edge is spurious. eligibleTemporalCandidates
+// drops the cross-repo *_test.go candidate, leaving the dispatch unresolved
+// rather than minting the cross-repo test-stub edge. (Without the filter this
+// lone candidate would resolve via lookup's unique-overall branch — that
+// asymmetry is what makes this test load-bearing.)
+func TestResolveTemporalCalls_CrossRepoTestStubSuppressed(t *testing.T) {
+	b := newTemporalTestGraph()
+	b.addGoFunc("svc-beta/service.go::CatalogWorkflow", "CatalogWorkflow", "svc-beta/service.go", "svc-beta")
+	call := b.addStubCall("svc-beta/service.go::CatalogWorkflow", "activity", "GetCatalogActivity", "svc-beta/service.go")
+	// The only candidate named GetCatalogActivity is a REGISTERED test stub in
+	// a different repo's *_test.go — a mock, not the real activity.
+	b.addGoFunc("wf-theta/workflow_test.go::GetCatalogActivity", "GetCatalogActivity", "wf-theta/workflow_test.go", "wf-theta")
+	b.addGoFunc("wf-theta/main.go::setupWorker", "setupWorker", "wf-theta/main.go", "wf-theta")
+	b.addGoRegister("wf-theta/main.go::setupWorker", "activity", "GetCatalogActivity", "wf-theta/main.go")
+
+	resolved := ResolveTemporalCalls(b.g)
+	assert.Equal(t, 0, resolved, "cross-repo *_test.go stub must not be treated as a real handler")
+	assert.Equal(t, temporalStubPlaceholder("activity", "GetCatalogActivity"), call.To,
+		"dispatch must stay an unresolved placeholder, not point at the cross-repo test mock")
+}
+
+// TestResolveTemporalCalls_SameRepoTestActivityResolves guards the cross-repo
+// filter from over-reaching: a test workflow dispatching a REGISTERED activity
+// that lives in the SAME repo's *_test.go is the overwhelmingly common (and
+// correct) case — the filter must leave it eligible so it still resolves.
+func TestResolveTemporalCalls_SameRepoTestActivityResolves(t *testing.T) {
+	b := newTemporalTestGraph()
+	b.addGoFunc("svc/wf_test.go::OrderTestWorkflow", "OrderTestWorkflow", "svc/wf_test.go", "svc")
+	call := b.addStubCall("svc/wf_test.go::OrderTestWorkflow", "activity", "PostBillingActivity", "svc/wf_test.go")
+	activity := b.addGoFunc("svc/wf_test.go::PostBillingActivity", "PostBillingActivity", "svc/wf_test.go", "svc")
+	b.addGoFunc("svc/main.go::setupWorker", "setupWorker", "svc/main.go", "svc")
+	b.addGoRegister("svc/main.go::setupWorker", "activity", "PostBillingActivity", "svc/main.go")
+
+	ResolveTemporalCalls(b.g)
+	assert.Equal(t, activity.ID, call.To, "same-repo *_test.go activity must stay eligible and resolve")
+}
+
 func TestResolveTemporalCalls_GoChildWorkflowRegistration(t *testing.T) {
 	b := newTemporalTestGraph()
 	b.addGoFunc("a/parent.go::ParentWorkflow", "ParentWorkflow", "a/parent.go", "svc")
