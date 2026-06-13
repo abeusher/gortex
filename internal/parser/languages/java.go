@@ -64,6 +64,13 @@ const qJavaAll = `
 type JavaExtractor struct {
 	lang *sitter.Language
 	qAll *parser.PreparedQuery
+	// javaInvokers / javaInvokerMethods configure the Temporal invoker
+	// detector (corporate, per-repo), installed via SetTemporalInvokers /
+	// ConfigureTemporalJavaInvokers. javaInvokers holds invoker class
+	// simple-names; javaInvokerMethods the dispatch method names (defaults to
+	// javaInvokerDefaultMethods when nil). Empty javaInvokers → detection OFF.
+	javaInvokers       map[string]bool
+	javaInvokerMethods map[string]bool
 }
 
 func NewJavaExtractor() *JavaExtractor {
@@ -74,15 +81,48 @@ func NewJavaExtractor() *JavaExtractor {
 	}
 }
 
+// SetTemporalInvokers installs the per-repo corporate Temporal invoker config:
+// `invokers` are invoker class simple-names; `methods` overrides the default
+// dispatch method names (nil/empty → defaults). Stored as sets for O(1) lookup.
+// Called once during extractor registration; must not race with Extract.
+func (e *JavaExtractor) SetTemporalInvokers(invokers, methods []string) {
+	e.javaInvokers = toLowerableSet(invokers, false)
+	if len(methods) == 0 {
+		e.javaInvokerMethods = nil
+	} else {
+		e.javaInvokerMethods = toLowerableSet(methods, false)
+	}
+}
+
+// toLowerableSet builds a presence set; when lower is true keys are lower-cased.
+func toLowerableSet(in []string, lower bool) map[string]bool {
+	if len(in) == 0 {
+		return nil
+	}
+	m := make(map[string]bool, len(in))
+	for _, s := range in {
+		if s = strings.TrimSpace(s); s != "" {
+			if lower {
+				s = strings.ToLower(s)
+			}
+			m[s] = true
+		}
+	}
+	if len(m) == 0 {
+		return nil
+	}
+	return m
+}
+
 func (e *JavaExtractor) Language() string     { return "java" }
 func (e *JavaExtractor) Extensions() []string { return []string{".java"} }
 
 // --- Deferred match buffers ----------------------------------------
 
 type javaDeferredCall struct {
-	name       string // method name
-	receiver   string // selector receiver text (empty for plain call)
-	line       int    // 1-based call_expression start line
+	name       string       // method name
+	receiver   string       // selector receiver text (empty for plain call)
+	line       int          // 1-based call_expression start line
 	isSelector bool
 	// tempStartWorkflow is the workflow type name when this call starts a
 	// Temporal workflow (`client.newWorkflowStub(OrderWorkflow.class, …)`
@@ -102,6 +142,9 @@ type javaDeferredCall struct {
 	// (graph.ReturnUsage* label), classified at capture time and
 	// stamped as edge Meta on the EdgeCalls emitted for this site.
 	returnUsage string
+	// callNode is the method_invocation node, retained for argument
+	// inspection by the Temporal invoker detector (emitJavaTemporalInvoker).
+	callNode *sitter.Node
 }
 
 // javaDeferredVar buffers a variable declaration for the post-pass
@@ -195,6 +238,7 @@ func (e *JavaExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 				line:        expr.StartLine + 1,
 				isSelector:  true,
 				returnUsage: classifyReturnUsage(expr.Node, src, javaReturnUsageSpec),
+				callNode:    expr.Node,
 			}
 			if wf := javaTemporalStartWorkflowName(expr.Node, method, src); wf != "" {
 				dc.tempStartWorkflow = wf
@@ -279,6 +323,12 @@ func (e *JavaExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 	for _, c := range calls {
 		callerID := findEnclosingFunc(funcRanges, c.line)
 		if callerID == "" {
+			continue
+		}
+		// Temporal invoker dispatch (`invoker.invokeAsync("Wf", …)`): emit a
+		// via=temporal.stub edge instead of the generic call edge. No-op unless
+		// java_temporal_invokers is configured.
+		if e.emitJavaTemporalInvoker(c, callerID, tenv, filePath, src, result) {
 			continue
 		}
 		edge := &graph.Edge{
