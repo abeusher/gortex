@@ -165,6 +165,11 @@ type Server struct {
 	cochangeByFile map[string]map[string]float64
 	cochangeCount  map[string]map[string]int
 
+	// autoIndexOnce guards the opt-in (GORTEX_AUTOINDEX=1) zero-config
+	// background index of an untracked cwd, fired at most once per session
+	// from the first tool call. See auto_index.go.
+	autoIndexOnce sync.Once
+
 	// artifacts caches the materialised `.gortex.yaml::artifacts`
 	// manifest. artifactEntries is the configured manifest (installed
 	// via SetArtifacts); artifactList is the result of materialising

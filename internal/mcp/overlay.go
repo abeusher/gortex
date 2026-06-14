@@ -105,6 +105,10 @@ func (s *Server) wrapToolHandler(h mcpserver.ToolHandlerFunc) mcpserver.ToolHand
 		if blocked := s.checkToolGate(ctx, req.Params.Name); blocked != nil {
 			return blocked, nil
 		}
+		// Opt-in zero-config: background-index an untracked cwd on the first
+		// tool call (GORTEX_AUTOINDEX=1). Cheap getenv + sync.Once on the
+		// request path; all real work runs on a background goroutine.
+		s.maybeAutoIndexCWD()
 		view, err := s.buildOverlayViewForCtx(ctx)
 		if err != nil {
 			// Drift surfaces as a structured tool error result so the
