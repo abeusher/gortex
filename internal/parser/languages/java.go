@@ -788,6 +788,15 @@ func (e *JavaExtractor) emitField(m parser.QueryResult, filePath, fileID string,
 	if doc := ExtractDocAbove(src, def.StartLine, DocLangBlockStar); doc != "" {
 		meta["doc"] = doc
 	}
+	// A `static final String X = "literal"` is a Java string constant. Stamp
+	// its literal under the same Meta["value"] key Go string constants use, so
+	// the resolver's constVal index can resolve a const-ref Temporal dispatch
+	// (`invoker.invokeAsync(Constants.X, …)`) cross-language to the registered
+	// Go workflow/activity. Keyed by the field NAME (the dispatch records the
+	// trailing identifier).
+	if v, ok := javaStaticFinalStringValue(def.Node, src); ok {
+		meta["value"] = v
+	}
 	result.Nodes = append(result.Nodes, &graph.Node{
 		ID: id, Kind: graph.KindField, Name: name,
 		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
@@ -801,6 +810,51 @@ func (e *JavaExtractor) emitField(m parser.QueryResult, filePath, fileID string,
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: id, To: classID, Kind: graph.EdgeMemberOf, FilePath: filePath, Line: def.StartLine + 1,
 	})
+}
+
+// javaStaticFinalStringValue returns the literal of a Java
+// `static final String NAME = "literal"` field declaration, or ("", false)
+// for anything else (missing static/final, non-string or absent
+// initializer). Modifier tokens are scanned the same way javaVisibility
+// reads the `modifiers` child. Used to index Java string constants into the
+// resolver's constVal so a cross-language const-ref Temporal dispatch
+// resolves.
+func javaStaticFinalStringValue(decl *sitter.Node, src []byte) (string, bool) {
+	if decl == nil {
+		return "", false
+	}
+	hasStatic, hasFinal := false, false
+	for i := 0; i < int(decl.ChildCount()); i++ {
+		c := decl.Child(i)
+		if c == nil || c.Type() != "modifiers" {
+			continue
+		}
+		for j := 0; j < int(c.ChildCount()); j++ {
+			tok := c.Child(j)
+			if tok == nil {
+				continue
+			}
+			switch tok.Type() {
+			case "static":
+				hasStatic = true
+			case "final":
+				hasFinal = true
+			}
+		}
+	}
+	if !hasStatic || !hasFinal {
+		return "", false
+	}
+	for i := 0; i < int(decl.NamedChildCount()); i++ {
+		c := decl.NamedChild(i)
+		if c == nil || c.Type() != "variable_declarator" {
+			continue
+		}
+		if val := c.ChildByFieldName("value"); val != nil && val.Type() == "string_literal" {
+			return javaStringLiteralText(val, src), true
+		}
+	}
+	return "", false
 }
 
 func (e *JavaExtractor) emitImport(m parser.QueryResult, filePath, fileID string, result *parser.ExtractionResult) {

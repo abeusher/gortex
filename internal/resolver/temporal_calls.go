@@ -382,14 +382,20 @@ func ResolveTemporalCalls(g graph.Store) int {
 		}
 		handlerID, origin, conf := idx.lookup(s.kind, s.name, callerRepo, callerLang)
 		// When the direct name didn't resolve, try dereferencing it as a
-		// string constant and re-looking-up under the literal value.
+		// string constant and re-looking-up under the literal value. The
+		// deref value is computed up front so it also feeds the
+		// cross-language join below (a Java const-ref dispatch through
+		// `Constants.X` derefs X to the literal, then matches the Go
+		// workflow of that name across the type-system boundary).
 		constDeref := ""
-		if handlerID == "" {
-			if v, ok := derefByName[s.name]; ok && v != "" {
-				if hID, o, c := idx.lookup(s.kind, v, callerRepo, callerLang); hID != "" {
-					handlerID, origin, conf = hID, o, c
-					constDeref = v
-				}
+		derefVal := ""
+		if v, ok := derefByName[s.name]; ok && v != "" {
+			derefVal = v
+		}
+		if handlerID == "" && derefVal != "" {
+			if hID, o, c := idx.lookup(s.kind, derefVal, callerRepo, callerLang); hID != "" {
+				handlerID, origin, conf = hID, o, c
+				constDeref = derefVal
 			}
 		}
 		// Cross-language join: a consumer (typically a temporal.start, e.g.
@@ -399,14 +405,17 @@ func ResolveTemporalCalls(g graph.Store) int {
 		crossLang := false
 		if handlerID == "" {
 			matchName := s.name
-			if constDeref != "" {
-				matchName = constDeref
+			if derefVal != "" {
+				matchName = derefVal
 			}
 			if hID, ok := idx.lookupCrossLang(s.kind, matchName, callerLang); ok {
 				handlerID = hID
 				origin = graph.OriginSpeculative
 				conf = temporalCrossLangConfidence
 				crossLang = true
+				if derefVal != "" {
+					constDeref = derefVal
+				}
 			}
 		}
 
@@ -1220,10 +1229,10 @@ func isExportedGoName(name string) bool {
 // dereference is never a wrong guess. Returns nil when the backend does
 // not implement ConstantValueReader.
 func buildConstDerefMap(g graph.Store, names []string) map[string]string {
-	reader, ok := g.(graph.ConstantValueReader)
-	if !ok || len(names) == 0 {
+	if len(names) == 0 {
 		return nil
 	}
+	reader, _ := g.(graph.ConstantValueReader)
 	nameSet := make(map[string]struct{}, len(names))
 	for _, n := range names {
 		nameSet[n] = struct{}{}
@@ -1235,37 +1244,62 @@ func buildConstDerefMap(g graph.Store, names []string) map[string]string {
 	candByName := g.FindNodesByNames(uniq)
 	idToName := map[string]string{}
 	var constIDs []string
+	// javaFieldVals collects Java string constants (`static final String`),
+	// which the Java extractor emits as KindField nodes carrying the literal
+	// on Meta["value"] rather than through the queryable constant sidecar.
+	// Ingesting them here lets a Java invoker const-ref dispatch
+	// (`invoker.invokeAsync(Constants.X, …)`) deref X cross-language to the
+	// registered Go workflow / activity.
+	javaFieldVals := map[string]string{}
 	for name, cands := range candByName {
 		for _, n := range cands {
-			if n == nil || (n.Kind != graph.KindConstant && n.Kind != graph.KindFunction && n.Kind != graph.KindMethod) {
+			if n == nil {
 				continue
 			}
-			constIDs = append(constIDs, n.ID)
-			idToName[n.ID] = name
+			switch {
+			case n.Kind == graph.KindConstant || n.Kind == graph.KindFunction || n.Kind == graph.KindMethod:
+				constIDs = append(constIDs, n.ID)
+				idToName[n.ID] = name
+			case n.Kind == graph.KindField && n.Language == "java":
+				if v, ok := n.Meta["value"].(string); ok && v != "" {
+					javaFieldVals[name] = v
+				}
+			}
 		}
 	}
-	if len(constIDs) == 0 {
-		return nil
-	}
-	vals, err := reader.ConstantValuesByNodeIDs(constIDs)
-	if err != nil || len(vals) == 0 {
-		return nil
-	}
-	out := make(map[string]string, len(vals))
+
+	out := make(map[string]string)
 	ambiguous := map[string]struct{}{}
-	for id, v := range vals {
-		name := idToName[id]
+	ingest := func(name, v string) {
 		if name == "" || v == "" {
-			continue
+			return
+		}
+		if _, dropped := ambiguous[name]; dropped {
+			return
 		}
 		if existing, seen := out[name]; seen && existing != v {
+			delete(out, name)
 			ambiguous[name] = struct{}{}
-			continue
+			return
 		}
 		out[name] = v
 	}
-	for name := range ambiguous {
-		delete(out, name)
+
+	if reader != nil && len(constIDs) > 0 {
+		if vals, err := reader.ConstantValuesByNodeIDs(constIDs); err == nil {
+			for id, v := range vals {
+				ingest(idToName[id], v)
+			}
+		}
+	}
+	// Java string-constant fields share the SAME dereference index, with the
+	// same workspace-wide ambiguity rule as Go string constants.
+	for name, v := range javaFieldVals {
+		ingest(name, v)
+	}
+
+	if len(out) == 0 {
+		return nil
 	}
 	return out
 }
