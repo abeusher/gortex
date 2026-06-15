@@ -273,6 +273,14 @@ func (p *Provider) Enrich(g graph.Store, repoRoot string) (*semantic.EnrichResul
 	// round-trip them through the store at the end or the semantic_type
 	// stamp is discarded on the disk backend. See semantic.EnrichNodeMeta.
 	var stampedNodes []*graph.Node
+
+	// DIAGNOSTIC counters for debugging enrichment=0
+	var diagTotalNodes, diagHoverErr, diagHoverNil, diagTypeEmpty, diagEnriched int
+	var diagFirstHoverValue string
+	var diagFirstHoverError string
+	var diagFirstNodeName string
+	var diagFirstNodeFile string
+
 	for _, n := range g.AllNodes() {
 		if n.Kind == graph.KindFile || n.Kind == graph.KindImport {
 			continue
@@ -288,8 +296,16 @@ func (p *Provider) Enrich(g graph.Store, repoRoot string) (*semantic.EnrichResul
 			continue
 		}
 
+		diagTotalNodes++
+
 		if !openedFiles[n.FilePath] {
 			if err := p.openDocument(absRoot, n.FilePath); err != nil {
+				if diagTotalNodes <= 5 {
+					p.logger.Debug("ENRICH-DBG: openDocument failed",
+						zap.String("file", n.FilePath),
+						zap.Error(err),
+					)
+				}
 				continue
 			}
 			openedFiles[n.FilePath] = true
@@ -298,11 +314,27 @@ func (p *Provider) Enrich(g graph.Store, repoRoot string) (*semantic.EnrichResul
 
 		col := identifierColumn(p.getSource(absRoot, n.FilePath), n.StartLine, n.Name)
 		hoverResult, err := p.hover(absRoot, n.FilePath, n.StartLine-1, col)
-		if err != nil || hoverResult == nil {
+		if err != nil {
+			diagHoverErr++
+			if diagFirstHoverError == "" {
+				diagFirstHoverError = err.Error()
+				diagFirstNodeName = n.Name
+				diagFirstNodeFile = n.FilePath
+			}
+			continue
+		}
+		if hoverResult == nil {
+			diagHoverNil++
 			continue
 		}
 
 		typeInfo := extractTypeFromHover(hoverResult.Contents.Value)
+		if diagFirstHoverValue == "" {
+			diagFirstHoverValue = hoverResult.Contents.Value
+			if len(diagFirstHoverValue) > 200 {
+				diagFirstHoverValue = diagFirstHoverValue[:200]
+			}
+		}
 		if typeInfo != "" {
 			semantic.EnrichNodeMeta(n, "semantic_type", typeInfo, p.Name())
 			stampedNodes = append(stampedNodes, n)
@@ -311,8 +343,23 @@ func (p *Provider) Enrich(g graph.Store, repoRoot string) (*semantic.EnrichResul
 				result.SymbolsCovered++
 				enrichedNodes[n.ID] = true
 			}
+			diagEnriched++
+		} else {
+			diagTypeEmpty++
 		}
 	}
+	// DIAGNOSTIC: log enrichment counters
+	p.logger.Info("ENRICH-DBG: hover loop complete",
+		zap.Int("total_nodes", diagTotalNodes),
+		zap.Int("hover_err", diagHoverErr),
+		zap.Int("hover_nil", diagHoverNil),
+		zap.Int("type_empty", diagTypeEmpty),
+		zap.Int("enriched", diagEnriched),
+		zap.String("first_hover_value", diagFirstHoverValue),
+		zap.String("first_hover_error", diagFirstHoverError),
+		zap.String("first_node_name", diagFirstNodeName),
+		zap.String("first_node_file", diagFirstNodeFile),
+	)
 	if len(stampedNodes) > 0 {
 		g.AddBatch(stampedNodes, nil)
 	}
@@ -661,6 +708,11 @@ func (p *Provider) ensureClient(workspaceRoot string) error {
 				},
 			},
 		},
+	}
+	// Pass server-specific InitializationOptions (e.g. Maven/Gradle import
+	// settings for jdtls) when the provider was built from a ServerSpec.
+	if p.spec != nil && len(p.spec.InitializationOptions) > 0 {
+		initParams.InitializationOptions = p.spec.InitializationOptions
 	}
 
 	var initResult InitializeResult
@@ -1537,6 +1589,7 @@ func identifierColumn(src []byte, oneBasedLine int, name string) int {
 func extractTypeFromHover(hover string) string {
 	// Remove markdown code fences.
 	hover = strings.TrimPrefix(hover, "```go\n")
+	hover = strings.TrimPrefix(hover, "```java\n")
 	hover = strings.TrimPrefix(hover, "```\n")
 	hover = strings.TrimSuffix(hover, "\n```")
 	hover = strings.TrimSpace(hover)
@@ -1544,6 +1597,7 @@ func extractTypeFromHover(hover string) string {
 	lines := strings.SplitN(hover, "\n", 2)
 	if len(lines) > 0 {
 		line := strings.TrimSpace(lines[0])
+		// Go keywords
 		if strings.HasPrefix(line, "func ") ||
 			strings.HasPrefix(line, "type ") ||
 			strings.HasPrefix(line, "var ") ||
@@ -1552,7 +1606,24 @@ func extractTypeFromHover(hover string) string {
 			strings.HasPrefix(line, "package ") {
 			return line
 		}
-		// Short type like "string", "*Foo", "[]byte".
+		// Java keywords / modifiers — jdtls hover format:
+		//   "public class Foo", "void bar()", "private String baz",
+		//   "abstract class X", "interface Y", "@Deprecated",
+		//   "static final int N", "enum Color", "protected Object"
+		if strings.HasPrefix(line, "public ") ||
+			strings.HasPrefix(line, "private ") ||
+			strings.HasPrefix(line, "protected ") ||
+			strings.HasPrefix(line, "abstract ") ||
+			strings.HasPrefix(line, "static ") ||
+			strings.HasPrefix(line, "final ") ||
+			strings.HasPrefix(line, "class ") ||
+			strings.HasPrefix(line, "interface ") ||
+			strings.HasPrefix(line, "enum ") ||
+			strings.HasPrefix(line, "void ") ||
+			strings.HasPrefix(line, "@") {
+			return line
+		}
+		// Short type like "string", "*Foo", "[]byte", "int", "boolean".
 		if !strings.Contains(line, " ") && len(line) > 0 && len(line) < 100 {
 			return line
 		}
