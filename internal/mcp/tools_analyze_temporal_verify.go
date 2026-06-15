@@ -21,6 +21,8 @@ package mcp
 import (
 	"context"
 	"os"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -28,6 +30,7 @@ import (
 	"github.com/zzet/gortex/internal/analyzer"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/resolver"
+	"go.uber.org/zap"
 )
 
 // maxTemporalNodeSourceBytes caps the per-node source handed to the LLM so a
@@ -111,9 +114,29 @@ func (s *Server) handleAnalyzeTemporalVerify(ctx context.Context, req mcp.CallTo
 		return mcp.NewToolResultError("temporal_verify: LLM provider unavailable"), nil
 	}
 
-	verifier := analyzer.NewLLMTemporalVerifierFromProvider(provider)
+	inner := analyzer.NewLLMTemporalVerifierFromProvider(provider)
+	// Disk-backed verdict cache so re-runs (e.g. in CI) don't re-pay the LLM.
+	// The key includes the model and the actual caller / target source, so it
+	// invalidates automatically when the model or the code changes.
+	cachePath := ""
+	roots := s.collectRepoRoots("")
+	rootKeys := make([]string, 0, len(roots))
+	for k := range roots {
+		rootKeys = append(rootKeys, k)
+	}
+	sort.Strings(rootKeys)
+	for _, k := range rootKeys {
+		if roots[k] != "" {
+			cachePath = filepath.Join(roots[k], ".gortex", "temporal-verify-cache.json")
+			break
+		}
+	}
+	verifier := analyzer.NewCachingVerifier(inner, provider.Name(), cachePath)
 	src := newServerSourceProvider(s)
 	report := resolver.VerifyTemporalEdges(ctx, s.graph, src, verifier)
+	if err := verifier.Flush(); err != nil && s.logger != nil {
+		s.logger.Warn("temporal_verify: verdict cache flush failed", zap.Error(err))
+	}
 
 	out := analyzer.VerifyReportToMap(report)
 

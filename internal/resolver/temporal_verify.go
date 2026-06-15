@@ -142,67 +142,107 @@ func VerifyTemporalEdges(ctx context.Context, g graph.Store, src TemporalSourceP
 	if g == nil || src == nil || v == nil {
 		return report
 	}
+
+	// Phase 1 (locked): snapshot the candidate edges and their endpoint nodes,
+	// then release the resolve mutex. The LLM verification in phase 2 is slow
+	// and network-bound, so it must NOT run while holding the lock (that would
+	// stall every concurrent resolution / edit for the whole pass).
+	type candidate struct {
+		edge           *graph.Edge
+		caller, target *graph.Node
+	}
 	mu := g.ResolveMutex()
 	mu.Lock()
-	defer mu.Unlock()
-
-	// Snapshot candidates first so we don't mutate while ranging the index.
-	var candidates []*graph.Edge
+	var candidates []candidate
 	for e := range g.EdgesByKind(graph.EdgeCalls) {
-		if temporalVerifiable(e) {
-			candidates = append(candidates, e)
+		if !temporalVerifiable(e) {
+			continue
 		}
-	}
-
-	for _, e := range candidates {
 		caller := g.GetNode(e.From)
 		target := g.GetNode(e.To)
 		if caller == nil || target == nil {
 			continue
 		}
-		callerSrc, _ := src.NodeSource(caller)
-		targetSrc, _ := src.NodeSource(target)
-		name, _ := e.Meta["temporal_name"].(string)
-		kind, _ := e.Meta["temporal_kind"].(string)
-		source := temporalEdgeSource(e)
+		candidates = append(candidates, candidate{edge: e, caller: caller, target: target})
+	}
+	mu.Unlock()
+
+	// Phase 2 (unlocked): read source and run the LLM verifier per candidate.
+	type verdictResult struct {
+		edge    *graph.Edge
+		verdict TemporalVerdict
+		reason  string
+	}
+	var results []verdictResult
+	for _, c := range candidates {
+		callerSrc, _ := src.NodeSource(c.caller)
+		targetSrc, _ := src.NodeSource(c.target)
+		name, _ := c.edge.Meta["temporal_name"].(string)
+		kind, _ := c.edge.Meta["temporal_kind"].(string)
+		source := temporalEdgeSource(c.edge)
 
 		report.Checked++
 		res, err := v.Verify(ctx, TemporalVerifyRequest{
 			DispatchName: name,
 			Kind:         kind,
 			Source:       source,
-			CallerName:   caller.Name,
+			CallerName:   c.caller.Name,
 			CallerSource: callerSrc,
-			TargetName:   target.Name,
+			TargetName:   c.target.Name,
 			TargetSource: targetSrc,
 		})
 		if err != nil {
 			report.Errors++
 			continue
 		}
-
-		e.Meta["temporal_llm_verdict"] = string(res.Verdict)
-		if res.Reason != "" {
-			e.Meta["temporal_llm_reason"] = res.Reason
-		}
 		switch res.Verdict {
+		case TemporalVerdictConfirmed:
+			report.Confirmed++
+		case TemporalVerdictRejected:
+			report.Rejected++
+		default:
+			report.Uncertain++
+		}
+		report.Details = append(report.Details, TemporalVerifyDetail{
+			From: c.edge.From, To: c.edge.To, Name: name, Kind: kind,
+			Source: source, Verdict: res.Verdict, Reason: res.Reason,
+		})
+		results = append(results, verdictResult{edge: c.edge, verdict: res.Verdict, reason: res.Reason})
+	}
+	if len(results) == 0 {
+		return report
+	}
+
+	// Phase 3 (locked): apply the verdicts to the edges and PERSIST them via
+	// ReindexEdges, so the promotion / suppression survives on a disk-backed
+	// store (where EdgesByKind hands back decoded copies) — not just on the
+	// in-memory store.
+	mu.Lock()
+	defer mu.Unlock()
+	batch := make([]graph.EdgeReindex, 0, len(results))
+	for _, r := range results {
+		e := r.edge
+		if e.Meta == nil {
+			e.Meta = map[string]any{}
+		}
+		e.Meta["temporal_llm_verdict"] = string(r.verdict)
+		if r.reason != "" {
+			e.Meta["temporal_llm_reason"] = r.reason
+		}
+		switch r.verdict {
 		case TemporalVerdictConfirmed:
 			e.Confidence = temporalVerifyConfirmedConfidence
 			e.ConfidenceLabel = graph.ConfidenceLabelFor(graph.EdgeCalls, e.Confidence)
 			delete(e.Meta, graph.MetaSpeculative)
-			report.Confirmed++
 		case TemporalVerdictRejected:
 			e.Confidence = temporalVerifyRejectedConfidence
 			e.ConfidenceLabel = graph.ConfidenceLabelFor(graph.EdgeCalls, e.Confidence)
 			e.Meta[graph.MetaSpeculative] = true
-			report.Rejected++
-		default: // uncertain — leave the tier as-is
-			report.Uncertain++
 		}
-		report.Details = append(report.Details, TemporalVerifyDetail{
-			From: e.From, To: e.To, Name: name, Kind: kind,
-			Source: source, Verdict: res.Verdict, Reason: res.Reason,
-		})
+		// To is unchanged — OldTo == e.To — but ReindexEdges still persists the
+		// edge's mutated Confidence / Meta to the backend.
+		batch = append(batch, graph.EdgeReindex{Edge: e, OldTo: e.To})
 	}
+	g.ReindexEdges(batch)
 	return report
 }

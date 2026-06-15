@@ -163,6 +163,31 @@ const qGoAll = `
 type GoExtractor struct {
 	lang *sitter.Language
 	qAll *parser.PreparedQuery
+	// envHelperExtra is the per-repo corporate env-helper allow-list (lower-
+	// cased names) loaded from the git-ignored `.gortex/temporal-allowlist.yaml`.
+	// Names here are merged with the built-in goEnvHelperNames when recognising
+	// a Temporal env-or-default dispatch helper, promoting the resolved edge to
+	// the inferred (visible) tier. Empty/nil when no local allow-list is loaded.
+	envHelperExtra map[string]bool
+}
+
+// SetEnvHelperNames installs the per-repo corporate env-helper allow-list on
+// the extractor. Names are stored lower-cased for case-insensitive matching.
+// Called once during extractor registration (config is not available at parse
+// time); a nil / empty slice clears it. Safe to call before indexing begins;
+// must not be called concurrently with Extract.
+func (e *GoExtractor) SetEnvHelperNames(names []string) {
+	if len(names) == 0 {
+		e.envHelperExtra = nil
+		return
+	}
+	m := make(map[string]bool, len(names))
+	for _, n := range names {
+		if n = strings.TrimSpace(n); n != "" {
+			m[strings.ToLower(n)] = true
+		}
+	}
+	e.envHelperExtra = m
 }
 
 func NewGoExtractor() *GoExtractor {
@@ -219,12 +244,32 @@ type goDeferredCall struct {
 	// `temporal_name_origin=env_default` so the resolver lands it at the
 	// speculative tier — the runtime env value may differ from the default.
 	tempEnvDefault bool
+	// tempVarTrace is set when tempName was recovered by tracing a bare
+	// local dispatch variable to its last intra-procedural assignment — a
+	// string literal, a const reference, or a no-arg const-returning func
+	// (the "meta_vars" broken-dispatch category). The stub edge is tagged
+	// `temporal_name_origin=var_trace` so the resolver lands it at the
+	// speculative tier — last-assignment-wins is a best-effort static guess.
+	tempVarTrace bool
 	// tempHandlerKind is "query" / "signal" / "update" when this call
 	// is a `workflow.SetQueryHandler` / `GetSignalChannel` /
 	// `SetUpdateHandler` in-workflow handler declaration; tempName then
 	// carries the handler's string name. `via=temporal.handler` meta is
 	// stamped on the emitted edge in the call post-pass below.
 	tempHandlerKind string
+	// tempDefaultConst is set when the env-default's default argument was a
+	// constant REFERENCE (`config.ACTIVITY_NAME_DEFAULT` / a bare const name)
+	// rather than a string literal. temporal_name then stays the dispatch
+	// variable name; the resolver substitutes the constant's literal value
+	// from its const-deref index. Emitted as `temporal_default_const`.
+	tempDefaultConst string
+	// tempEnvSource records HOW the env-default name was recognised:
+	// "os_getenv" (provable os.Getenv / os.LookupEnv read), "allowlist" (a
+	// helper name in the configured env-helper allow-list), or "heuristic"
+	// (a generic env-named helper matched structurally). Emitted as
+	// `temporal_env_source` so the resolver can tier the edge: allow-list /
+	// os.Getenv land at the inferred tier, the heuristic stays speculative.
+	tempEnvSource string
 	// tempOutKind is "signal" / "query" when this call is an outbound
 	// signal-send / query-call against a running workflow
 	// (SignalExternalWorkflow / SignalWorkflow / QueryWorkflow); tempName
@@ -429,9 +474,32 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 					// variable, try to resolve it to an env-var-with-literal
 					// -default so the dispatch lands on the default activity.
 					if argNode != nil && argNode.Type() == "identifier" {
-						if def, ok := goTemporalEnvDefaultName(expr.Node, name, src); ok {
-							dc.tempName = def
+						if litDef, constName, source, ok := goTemporalEnvDefaultName(expr.Node, name, src, e.envHelperExtra); ok {
 							dc.tempEnvDefault = true
+							dc.tempEnvSource = source
+							if constName != "" {
+								// Const-reference default: keep temporal_name as the
+								// dispatch variable; the resolver substitutes the
+								// constant's literal value via temporal_default_const.
+								dc.tempDefaultConst = constName
+							} else {
+								dc.tempName = litDef
+							}
+						} else if lit, cn, ok := goTemporalVarTrace(expr.Node, name, src); ok {
+							// Variable tracing (Cat 2): the dispatch name is a bare
+							// local var assigned a string literal, a const
+							// reference, or a no-arg const-returning func. Emit the
+							// traced value as the dispatch name — a literal resolves
+							// directly; a const NAME is dereferenced by the
+							// resolver's const-deref map (a non-const name simply
+							// fails to deref and stays a broken_dispatch).
+							switch {
+							case lit != "":
+								dc.tempName = lit
+							case cn != "":
+								dc.tempName = cn
+							}
+							dc.tempVarTrace = true
 						}
 					}
 				}
@@ -847,6 +915,21 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 				}
 				if c.tempEnvDefault {
 					meta["temporal_name_origin"] = "env_default"
+					if c.tempEnvSource != "" {
+						meta["temporal_env_source"] = c.tempEnvSource
+					}
+					if c.tempDefaultConst != "" {
+						meta["temporal_default_const"] = c.tempDefaultConst
+					}
+				}
+				if c.tempVarTrace {
+					// Variable-traced dispatch name (Cat 2): the name was the
+					// last intra-procedural assignment to a bare local — a
+					// best-effort static guess (a later conditional reassign
+					// may not execute). The resolver lands it at the
+					// speculative tier, and (when the traced value is a const
+					// NAME) dereferences it to the literal via the const map.
+					meta["temporal_name_origin"] = "var_trace"
 				}
 				if recvName := recvNameByID[callerID]; recvName != "" {
 					if arg := goTemporalDispatchArg(c.callNode); arg != nil && arg.Type() == "selector_expression" {
@@ -884,7 +967,7 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 			applyGoTemporalSignalQueryMeta(edge, c)
 			applyGoTemporalStartMeta(edge, c)
 			stampReturnUsage(edge, c.returnUsage)
-			attachGoTemporalCallArgNames(edge, c, c.callNode, src)
+			attachGoTemporalCallArgNames(edge, c, c.callNode, src, paramNamesByFunc[callerID])
 			result.Edges = append(result.Edges, edge)
 			emitGoSpawnEdge(c, callerID, target, filePath, result)
 			continue
@@ -901,7 +984,7 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 			applyGoTemporalSignalQueryMeta(edge, c)
 			applyGoTemporalStartMeta(edge, c)
 			stampReturnUsage(edge, c.returnUsage)
-			attachGoTemporalCallArgNames(edge, c, c.callNode, src)
+			attachGoTemporalCallArgNames(edge, c, c.callNode, src, paramNamesByFunc[callerID])
 			result.Edges = append(result.Edges, edge)
 			emitGoSpawnEdge(c, callerID, target, filePath, result)
 			continue
@@ -954,7 +1037,7 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 		applyGoTemporalSignalQueryMeta(edge, c)
 		applyGoTemporalStartMeta(edge, c)
 		stampReturnUsage(edge, c.returnUsage)
-		attachGoTemporalCallArgNames(edge, c, c.callNode, src)
+		attachGoTemporalCallArgNames(edge, c, c.callNode, src, paramNamesByFunc[callerID])
 		result.Edges = append(result.Edges, edge)
 		emitGoSpawnEdge(c, callerID, target, filePath, result)
 	}
@@ -1900,11 +1983,26 @@ func (e *GoExtractor) emitConst(m parser.QueryResult, filePath, fileID string, s
 	if def != nil && def.Node != nil && containsGoIotaBlock(def.Text) {
 		kind = graph.KindEnumMember
 	}
+	meta := map[string]any{"visibility": VisibilityByCase(name)}
+	// Const-to-const alias (Cat 3): `const ALIAS = RealName` carries no
+	// literal of its own, so record the referenced const NAME. The
+	// resolver's const-deref map collapses alias chains (ALIAS = REAL =
+	// "lit") against the constant_values sidecar by a bounded fixpoint, so
+	// an ALL_CAPS dispatch name that is itself a const alias still
+	// dereferences to the underlying literal. A const WITH a literal value
+	// is handled by the constant_values sidecar below, not here.
+	if def != nil && def.Node != nil {
+		if _, ok := goConstLiteralValue(def.Node, name, src); !ok {
+			if ref, ok := goConstRefName(def.Node, name, src); ok {
+				meta["const_ref"] = ref
+			}
+		}
+	}
 	result.Nodes = append(result.Nodes, &graph.Node{
 		ID: id, Kind: kind, Name: name,
 		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
 		Language: "go",
-		Meta:     map[string]any{"visibility": VisibilityByCase(name)},
+		Meta:     meta,
 	})
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
@@ -1914,7 +2012,7 @@ func (e *GoExtractor) emitConst(m parser.QueryResult, filePath, fileID string, s
 	// const-identifier dispatch name to its value across files. Computed
 	// constants (iota, expressions) carry no literal and are skipped.
 	if kind == graph.KindConstant {
-		if v, ok := goConstLiteralValue(def.Node, src); ok {
+		if v, ok := goConstLiteralValue(def.Node, name, src); ok {
 			result.ConstValues = append(result.ConstValues, parser.ConstValue{
 				NodeID: id, FilePath: filePath, Value: v,
 			})
@@ -1990,30 +2088,48 @@ func goFuncSingleReturnLiteral(declNode *sitter.Node, src []byte) (string, bool)
 	return "", false
 }
 
-// goConstLiteralValue extracts the literal value of a single-spec
-// const_spec (`const X = "literal"` / `const X = 42`) from the spec's
-// value field, when that value is a string or numeric literal. Returns
-// ("", false) for computed / multi-value / non-literal specs.
-func goConstLiteralValue(constSpec *sitter.Node, src []byte) (string, bool) {
+// goConstLiteralValue extracts the literal value of a const_spec
+// (`const X = "literal"` / `const X = 42`) from the spec's value field,
+// when that value is a string or numeric literal. Returns ("", false)
+// for computed / multi-value / non-literal specs.
+//
+// constSpec may be the const_spec itself or the enclosing
+// const_declaration. For a grouped block (`const ( A = ...; B = ... )`)
+// the declaration holds several specs; name selects the matching one so
+// each member's value is captured independently (not just single-spec
+// blocks). For a single-spec block name still selects correctly.
+func goConstLiteralValue(constSpec *sitter.Node, name string, src []byte) (string, bool) {
 	if constSpec == nil {
 		return "", false
 	}
 	spec := constSpec
 	if spec.Type() != "const_spec" {
-		// def captures the const_declaration; descend to the lone spec.
-		var found *sitter.Node
+		// def captures the const_declaration; pick the spec whose name
+		// field matches the const being emitted (grouped blocks hold
+		// several), falling back to the lone spec when there is exactly
+		// one and no name match (defensive).
+		var found, only *sitter.Node
 		count := 0
 		for i := 0; i < int(spec.NamedChildCount()); i++ {
 			c := spec.NamedChild(i)
-			if c != nil && c.Type() == "const_spec" {
+			if c == nil || c.Type() != "const_spec" {
+				continue
+			}
+			count++
+			only = c
+			if nameNode := c.ChildByFieldName("name"); nameNode != nil && nameNode.Content(src) == name {
 				found = c
-				count++
+				break
 			}
 		}
-		if count != 1 || found == nil {
+		switch {
+		case found != nil:
+			spec = found
+		case count == 1 && only != nil:
+			spec = only
+		default:
 			return "", false
 		}
-		spec = found
 	}
 	valueList := spec.ChildByFieldName("value")
 	if valueList == nil || valueList.NamedChildCount() != 1 {
@@ -2028,6 +2144,45 @@ func goConstLiteralValue(constSpec *sitter.Node, src []byte) (string, bool) {
 		return goTemporalNameFromExpr(v, src), true
 	case "int_literal", "float_literal":
 		return v.Content(src), true
+	}
+	return "", false
+}
+
+// goConstRefName returns the NAME of the constant that `name`'s value is a
+// plain one-hop reference to (`const ALIAS = RealName`), or ("", false) when
+// the value is not a single bare-identifier reference. The resolver aliases
+// one constant's value to another via the constant_values sidecar (chains
+// collapsed by a bounded fixpoint), so an ALL_CAPS dispatch name that is
+// itself a const alias still resolves to the underlying literal.
+func goConstRefName(constDecl *sitter.Node, name string, src []byte) (string, bool) {
+	if constDecl == nil {
+		return "", false
+	}
+	for i := 0; i < int(constDecl.NamedChildCount()); i++ {
+		spec := constDecl.NamedChild(i)
+		if spec == nil || spec.Type() != "const_spec" {
+			continue
+		}
+		nameNode := spec.ChildByFieldName("name")
+		if nameNode == nil || nameNode.Content(src) != name {
+			continue
+		}
+		val := spec.ChildByFieldName("value")
+		if val == nil {
+			return "", false
+		}
+		expr := val
+		if val.Type() == "expression_list" {
+			expr = val.NamedChild(0)
+		}
+		if expr == nil || expr.Type() != "identifier" {
+			return "", false
+		}
+		ref := expr.Content(src)
+		if ref == "" || ref == name {
+			return "", false
+		}
+		return ref, true
 	}
 	return "", false
 }

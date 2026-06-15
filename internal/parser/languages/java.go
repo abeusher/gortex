@@ -64,6 +64,13 @@ const qJavaAll = `
 type JavaExtractor struct {
 	lang *sitter.Language
 	qAll *parser.PreparedQuery
+	// javaInvokers / javaInvokerMethods configure the Temporal invoker
+	// detector (corporate, per-repo), installed via SetTemporalInvokers /
+	// ConfigureTemporalJavaInvokers. javaInvokers holds invoker class
+	// simple-names; javaInvokerMethods the dispatch method names (defaults to
+	// javaInvokerDefaultMethods when nil). Empty javaInvokers → detection OFF.
+	javaInvokers       map[string]bool
+	javaInvokerMethods map[string]bool
 }
 
 func NewJavaExtractor() *JavaExtractor {
@@ -74,15 +81,48 @@ func NewJavaExtractor() *JavaExtractor {
 	}
 }
 
+// SetTemporalInvokers installs the per-repo corporate Temporal invoker config:
+// `invokers` are invoker class simple-names; `methods` overrides the default
+// dispatch method names (nil/empty → defaults). Stored as sets for O(1) lookup.
+// Called once during extractor registration; must not race with Extract.
+func (e *JavaExtractor) SetTemporalInvokers(invokers, methods []string) {
+	e.javaInvokers = toLowerableSet(invokers, false)
+	if len(methods) == 0 {
+		e.javaInvokerMethods = nil
+	} else {
+		e.javaInvokerMethods = toLowerableSet(methods, false)
+	}
+}
+
+// toLowerableSet builds a presence set; when lower is true keys are lower-cased.
+func toLowerableSet(in []string, lower bool) map[string]bool {
+	if len(in) == 0 {
+		return nil
+	}
+	m := make(map[string]bool, len(in))
+	for _, s := range in {
+		if s = strings.TrimSpace(s); s != "" {
+			if lower {
+				s = strings.ToLower(s)
+			}
+			m[s] = true
+		}
+	}
+	if len(m) == 0 {
+		return nil
+	}
+	return m
+}
+
 func (e *JavaExtractor) Language() string     { return "java" }
 func (e *JavaExtractor) Extensions() []string { return []string{".java"} }
 
 // --- Deferred match buffers ----------------------------------------
 
 type javaDeferredCall struct {
-	name       string // method name
-	receiver   string // selector receiver text (empty for plain call)
-	line       int    // 1-based call_expression start line
+	name       string       // method name
+	receiver   string       // selector receiver text (empty for plain call)
+	line       int          // 1-based call_expression start line
 	isSelector bool
 	// tempStartWorkflow is the workflow type name when this call starts a
 	// Temporal workflow (`client.newWorkflowStub(OrderWorkflow.class, …)`
@@ -102,6 +142,9 @@ type javaDeferredCall struct {
 	// (graph.ReturnUsage* label), classified at capture time and
 	// stamped as edge Meta on the EdgeCalls emitted for this site.
 	returnUsage string
+	// callNode is the method_invocation node, retained for argument
+	// inspection by the Temporal invoker detector (emitJavaTemporalInvoker).
+	callNode *sitter.Node
 }
 
 // javaDeferredVar buffers a variable declaration for the post-pass
@@ -195,6 +238,7 @@ func (e *JavaExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 				line:        expr.StartLine + 1,
 				isSelector:  true,
 				returnUsage: classifyReturnUsage(expr.Node, src, javaReturnUsageSpec),
+				callNode:    expr.Node,
 			}
 			if wf := javaTemporalStartWorkflowName(expr.Node, method, src); wf != "" {
 				dc.tempStartWorkflow = wf
@@ -276,9 +320,22 @@ func (e *JavaExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 	// All function/method nodes have been emitted; map call sites to
 	// their enclosing definition.
 	funcRanges := buildFuncRanges(result)
+	// @Value("${key:Default}") fields → their literal defaults, for invoker
+	// dispatch through a Spring-injected field (built only when invoker
+	// detection is configured).
+	var valueFields map[string]string
+	if len(e.javaInvokers) > 0 {
+		valueFields = javaCollectValueFields(varBuf, src)
+	}
 	for _, c := range calls {
 		callerID := findEnclosingFunc(funcRanges, c.line)
 		if callerID == "" {
+			continue
+		}
+		// Temporal invoker dispatch (`invoker.invokeAsync("Wf", …)`): emit a
+		// via=temporal.stub edge instead of the generic call edge. No-op unless
+		// java_temporal_invokers is configured.
+		if e.emitJavaTemporalInvoker(c, callerID, tenv, valueFields, filePath, src, result) {
 			continue
 		}
 		edge := &graph.Edge{
@@ -731,6 +788,15 @@ func (e *JavaExtractor) emitField(m parser.QueryResult, filePath, fileID string,
 	if doc := ExtractDocAbove(src, def.StartLine, DocLangBlockStar); doc != "" {
 		meta["doc"] = doc
 	}
+	// A `static final String X = "literal"` is a Java string constant. Stamp
+	// its literal under the same Meta["value"] key Go string constants use, so
+	// the resolver's constVal index can resolve a const-ref Temporal dispatch
+	// (`invoker.invokeAsync(Constants.X, …)`) cross-language to the registered
+	// Go workflow/activity. Keyed by the field NAME (the dispatch records the
+	// trailing identifier).
+	if v, ok := javaStaticFinalStringValue(def.Node, src); ok {
+		meta["value"] = v
+	}
 	result.Nodes = append(result.Nodes, &graph.Node{
 		ID: id, Kind: graph.KindField, Name: name,
 		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
@@ -744,6 +810,51 @@ func (e *JavaExtractor) emitField(m parser.QueryResult, filePath, fileID string,
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: id, To: classID, Kind: graph.EdgeMemberOf, FilePath: filePath, Line: def.StartLine + 1,
 	})
+}
+
+// javaStaticFinalStringValue returns the literal of a Java
+// `static final String NAME = "literal"` field declaration, or ("", false)
+// for anything else (missing static/final, non-string or absent
+// initializer). Modifier tokens are scanned the same way javaVisibility
+// reads the `modifiers` child. Used to index Java string constants into the
+// resolver's constVal so a cross-language const-ref Temporal dispatch
+// resolves.
+func javaStaticFinalStringValue(decl *sitter.Node, src []byte) (string, bool) {
+	if decl == nil {
+		return "", false
+	}
+	hasStatic, hasFinal := false, false
+	for i := 0; i < int(decl.ChildCount()); i++ {
+		c := decl.Child(i)
+		if c == nil || c.Type() != "modifiers" {
+			continue
+		}
+		for j := 0; j < int(c.ChildCount()); j++ {
+			tok := c.Child(j)
+			if tok == nil {
+				continue
+			}
+			switch tok.Type() {
+			case "static":
+				hasStatic = true
+			case "final":
+				hasFinal = true
+			}
+		}
+	}
+	if !hasStatic || !hasFinal {
+		return "", false
+	}
+	for i := 0; i < int(decl.NamedChildCount()); i++ {
+		c := decl.NamedChild(i)
+		if c == nil || c.Type() != "variable_declarator" {
+			continue
+		}
+		if val := c.ChildByFieldName("value"); val != nil && val.Type() == "string_literal" {
+			return javaStringLiteralText(val, src), true
+		}
+	}
+	return "", false
 }
 
 func (e *JavaExtractor) emitImport(m parser.QueryResult, filePath, fileID string, result *parser.ExtractionResult) {

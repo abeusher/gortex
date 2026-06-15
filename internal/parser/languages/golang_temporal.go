@@ -692,10 +692,17 @@ func goTemporalNameFromExpr(node *sitter.Node, src []byte) string {
 // os.Getenv-anchored literal default returns "", false. This is a
 // deliberately narrow data-flow shortcut, not general constant
 // propagation — see the speculative tier the resolver lands it at.
-func goTemporalEnvDefaultName(callNode *sitter.Node, name string, src []byte) (string, bool) {
+// The result is reported as exactly one of `litDef` (a string-literal default)
+// or `constName` (a constant-reference default the resolver substitutes through
+// constVal), plus a `source` tier marker: "os_getenv" / "allowlist" (trusted
+// literal), "const_ref" (trusted helper with a constant default — same visible
+// tier as allowlist), or "heuristic" (env-named-helper guess, hidden tier;
+// stays heuristic even when its default is a constant, the helper itself being
+// the weak link).
+func goTemporalEnvDefaultName(callNode *sitter.Node, name string, src []byte, extra map[string]bool) (litDef string, constName string, source string, ok bool) {
 	body := goEnclosingFuncBody(callNode)
 	if body == nil {
-		return "", false
+		return "", "", "", false
 	}
 	limit := callNode.StartByte()
 
@@ -725,39 +732,307 @@ func goTemporalEnvDefaultName(callNode *sitter.Node, name string, src []byte) (s
 	// Replay the writes in order. The dispatch name is env-default-sourced
 	// only if, after the LAST write before the call, the variable still
 	// holds an env-or-default value: either a `cmp.Or(os.Getenv, "lit")`
-	// assignment, or a string-literal assignment that followed an
-	// os.Getenv / os.LookupEnv read (the `name := os.Getenv(...); if name
-	// == "" { name = "lit" }` shape). Any other later write — a plain
-	// reassignment `name = pick()` — clears the env-sourcing, and we leave
-	// the dispatch unresolved rather than guess.
-	resolved := ""
+	// assignment, an allow-listed / heuristic env-helper call
+	// (`GetEnvOrDefault(KEY, "lit")` / `cfg.ActivityFromEnv(KEY, "lit")`),
+	// or a string-literal assignment that followed an os.Getenv /
+	// os.LookupEnv read (the `name := os.Getenv(...); if name == "" { name =
+	// "lit" }` shape). Any other later write — a plain reassignment `name =
+	// pick()` — clears the env-sourcing, and we leave the dispatch
+	// unresolved rather than guess.
+	//
+	// resolvedSource records HOW the default was recognised so the resolver
+	// can tier the edge: "os_getenv" / "allowlist" / "const_ref" land at the
+	// inferred (visible) tier, "heuristic" stays at the hidden speculative
+	// tier. The default is reported as exactly one of resLit (a string-literal
+	// default) or resConst (a constant-reference default the resolver
+	// substitutes through its const-deref index).
+	resLit := ""
+	resConst := ""
+	resolvedSource := ""
 	resolvedOK := false
 	envReadSeen := false
+	// commit records a resolved default, routing a constant-reference value
+	// into resConst (and downgrading "const_ref" → "heuristic" when the helper
+	// itself is only a heuristic match — the helper, not the constant, is the
+	// weak link).
+	commit := func(val string, isConst bool, trustedSource string) {
+		if isConst {
+			resLit, resConst = "", val
+			if trustedSource == "heuristic" {
+				resolvedSource = "heuristic"
+			} else {
+				resolvedSource = "const_ref"
+			}
+		} else {
+			resLit, resConst, resolvedSource = val, "", trustedSource
+		}
+		resolvedOK, envReadSeen = true, false
+	}
+	clear := func() {
+		resLit, resConst, resolvedSource, resolvedOK, envReadSeen = "", "", "", false, false
+	}
 	for _, a := range assigns {
-		rhs := goAssignRHSExpr(a)
+		rhs := goAssignRHSExpr(a, name, src)
 		switch {
 		case rhs == nil:
-			resolved, resolvedOK, envReadSeen = "", false, false
+			clear()
 		case rhs.Type() == "call_expression" && goIsEnvRead(rhs, src):
 			// `name := os.Getenv("K")` — default still pending.
-			resolved, resolvedOK, envReadSeen = "", false, true
+			clear()
+			envReadSeen = true
 		case rhs.Type() == "call_expression":
 			// `name := cmp.Or(os.Getenv("K"), "lit")` — self-contained.
-			if def, ok := goCallEnvDefaultLiteral(rhs, src); ok {
-				resolved, resolvedOK, envReadSeen = def, true, false
+			if v, isC, ok := goCallEnvDefaultLiteral(rhs, src); ok {
+				commit(v, isC, "os_getenv")
+			} else if v, isC, ok := goEnvHelperDefaultLiteral(rhs, src, extra); ok {
+				// Allow-listed env-helper (`GetEnvOrDefault(KEY, "lit")`).
+				commit(v, isC, "allowlist")
+			} else if v, isC, ok := goEnvHelperHeuristicDefault(rhs, src); ok {
+				// Generic "env"-named helper — lower-trust heuristic.
+				commit(v, isC, "heuristic")
 			} else {
-				resolved, resolvedOK, envReadSeen = "", false, false
+				clear()
 			}
 		default:
-			// `name = "lit"` — only a default when it follows an env read.
-			if lit, ok := goStringLiteralValue(rhs, src); ok && envReadSeen {
-				resolved, resolvedOK = lit, true
+			// `name = "lit"` / `name = CONST` — only a default when it
+			// follows an env read.
+			if v, isC, ok := goArgDefaultValue(rhs, src); ok && envReadSeen {
+				commit(v, isC, "os_getenv")
 			} else {
-				resolved, resolvedOK, envReadSeen = "", false, false
+				clear()
 			}
 		}
 	}
-	return resolved, resolvedOK
+	return resLit, resConst, resolvedSource, resolvedOK
+}
+
+// goTemporalVarTrace traces a bare-identifier dispatch name to its
+// intra-procedural assignment when that assignment is a plain literal /
+// constant reference / const-returning func call. The env-var-with-default
+// shape is handled by goTemporalEnvDefaultName and takes precedence; this is
+// the general fallback for `name := <value>; workflow.ExecuteActivity(ctx,
+// name, …)` — the "meta_vars" broken-dispatch category (activity /
+// activityName / type). It returns the LAST assignment to `name` lexically
+// before the dispatch, reduced to exactly one of:
+//
+//	litDef   : string-literal value       (`name := "ChargeActivity"`)
+//	constName: a constant NAME            (`name := pkg.ChargeName` / `name := CHARGE`)
+//	funcName : a const-returning func name (`name := GetChargeName()`)
+//
+// The resolver validates constName / funcName against its constVal index, so
+// an identifier that is not actually a string constant simply fails to
+// resolve and stays a broken_dispatch — no false-resolution risk. The
+// last-assignment-wins rule is a best-effort static guess (a later
+// conditional reassignment may not execute), so the resolver lands these at
+// the inferred / convention tier, not the register-confirmed 0.9. Returns
+// ok=false when there is no traceable assignment to `name`.
+func goTemporalVarTrace(callNode *sitter.Node, name string, src []byte) (litDef, constName string, ok bool) {
+	body := goEnclosingFuncBody(callNode)
+	if body == nil {
+		return "", "", false
+	}
+	limit := callNode.StartByte()
+	var rhs *sitter.Node
+	assigns := 0
+	var walk func(n *sitter.Node)
+	walk = func(n *sitter.Node) {
+		if n == nil {
+			return
+		}
+		if (n.Type() == "short_var_declaration" || n.Type() == "assignment_statement") &&
+			n.StartByte() < limit && goAssignHasTarget(n, name, src) {
+			// Count every assignment to `name` (the single-assignment guard
+			// below relies on the total); rhs is the index-matched value, which
+			// may be nil for a multi-value call.
+			assigns++
+			rhs = goAssignRHSExpr(n, name, src)
+		}
+		for i := 0; i < int(n.NamedChildCount()); i++ {
+			walk(n.NamedChild(i))
+		}
+	}
+	walk(body)
+	// Trace ONLY when the variable has exactly ONE assignment before the
+	// dispatch. Multiple assignments mean the live value is conditional /
+	// reassigned (e.g. an env-default write later overwritten by a plain
+	// call) — guessing the last one would be a false-resolution risk, so we
+	// leave the dispatch a broken_dispatch rather than guess.
+	if assigns != 1 || rhs == nil {
+		return "", "", false
+	}
+	switch rhs.Type() {
+	case "interpreted_string_literal", "raw_string_literal":
+		if v, okk := goStringLiteralValue(rhs, src); okk && v != "" {
+			return v, "", true
+		}
+	case "identifier":
+		// Bare const reference (`name := CHARGE`). Admitted ONLY when the
+		// referenced identifier is a package-level CONST declared in this
+		// file — a function parameter or arbitrary local (`actName :=
+		// picked`) is exactly the "don't guess at arbitrary variables" case
+		// the plain-var path deliberately refuses. The const NAME is emitted
+		// as temporal_name so the resolver's const-deref map substitutes the
+		// literal. Guarded by length to skip throwaway names; skip
+		// self-reference.
+		if cn := rhs.Content(src); len(cn) > 2 && cn != name && goIdentIsFileConst(callNode, cn, src) {
+			return "", cn, true
+		}
+	case "selector_expression":
+		// Package / receiver const reference (`name := config.ChargeName`).
+		if field := rhs.ChildByFieldName("field"); field != nil {
+			if cn := field.Content(src); len(cn) > 2 {
+				return "", cn, true
+			}
+		}
+	case "call_expression":
+		// Const-returning name getter (`name := GetChargeName()`). os.Getenv
+		// is the env path's job, not this one. Require ZERO arguments: a call
+		// WITH args (`wfutils.PickActivity("KEY", "default")`) is an
+		// env/helper-style call whose default is the env path's responsibility
+		// (and which the env path deliberately declines for unknown helpers) —
+		// treating it as a const-return getter would mislabel it. The callee's
+		// returned value is resolved in-file to a literal / const name, since
+		// the resolver has no func-returning-name channel.
+		if goIsEnvRead(rhs, src) {
+			return "", "", false
+		}
+		if a := rhs.ChildByFieldName("arguments"); a != nil && a.NamedChildCount() > 0 {
+			return "", "", false
+		}
+		if lit, cn, okk := goTemporalFuncReturnName(rhs, callNode, src); okk {
+			return lit, cn, true
+		}
+	}
+	return "", "", false
+}
+
+// goIdentIsFileConst reports whether `ident` is the name of a constant
+// declared anywhere in the same source file as fromNode. Used to gate the
+// variable-trace bare-identifier case so it admits a `name := chargeName`
+// const reference but refuses a `actName := picked` parameter / local —
+// honouring the "don't guess at arbitrary variables" invariant. The scan
+// inspects every const_spec name under the file root.
+func goIdentIsFileConst(fromNode *sitter.Node, ident string, src []byte) bool {
+	root := fromNode
+	for root.Parent() != nil {
+		root = root.Parent()
+	}
+	found := false
+	var walk func(n *sitter.Node)
+	walk = func(n *sitter.Node) {
+		if n == nil || found {
+			return
+		}
+		if n.Type() == "const_spec" {
+			if nm := n.ChildByFieldName("name"); nm != nil && nm.Content(src) == ident {
+				found = true
+				return
+			}
+		}
+		for i := 0; i < int(n.NamedChildCount()); i++ {
+			walk(n.NamedChild(i))
+		}
+	}
+	walk(root)
+	return found
+}
+
+// goTemporalFuncReturnName resolves a no-argument func/method call used to
+// supply a dispatch name (`name := GetChargeName()`) to the value the callee
+// unconditionally returns — either a string literal (emitted as the dispatch
+// name directly) or a bare const reference (emitted as a const name for the
+// resolver to dereference). It locates the callee declaration by simple name
+// within the SAME file as the call, then returns the single `return <expr>`
+// it finds when that expr is a string literal or a one-hop identifier
+// reference. Returns ok=false when the callee is not found in-file, is not a
+// plain identifier call, has multiple/none returns, or returns something
+// other than a literal / bare const — keeping resolution precision-safe.
+func goTemporalFuncReturnName(call, fromNode *sitter.Node, src []byte) (litDef, constName string, ok bool) {
+	fn := call.ChildByFieldName("function")
+	if fn == nil || fn.Type() != "identifier" {
+		return "", "", false
+	}
+	callee := fn.Content(src)
+	if callee == "" {
+		return "", "", false
+	}
+	root := fromNode
+	for root.Parent() != nil {
+		root = root.Parent()
+	}
+	var decl *sitter.Node
+	var find func(n *sitter.Node)
+	find = func(n *sitter.Node) {
+		if n == nil || decl != nil {
+			return
+		}
+		if n.Type() == "function_declaration" {
+			if nm := n.ChildByFieldName("name"); nm != nil && nm.Content(src) == callee {
+				decl = n
+				return
+			}
+		}
+		for i := 0; i < int(n.NamedChildCount()); i++ {
+			find(n.NamedChild(i))
+		}
+	}
+	find(root)
+	if decl == nil {
+		return "", "", false
+	}
+	body := decl.ChildByFieldName("body")
+	if body == nil {
+		return "", "", false
+	}
+	var ret *sitter.Node
+	count := 0
+	var walk func(n *sitter.Node)
+	walk = func(n *sitter.Node) {
+		if n == nil {
+			return
+		}
+		if n.Type() == "return_statement" {
+			count++
+			if n.NamedChildCount() == 1 {
+				ret = n.NamedChild(0)
+			}
+		}
+		for i := 0; i < int(n.NamedChildCount()); i++ {
+			walk(n.NamedChild(i))
+		}
+	}
+	walk(body)
+	if count != 1 || ret == nil {
+		return "", "", false
+	}
+	// A return_statement's value is wrapped in an expression_list; unwrap a
+	// single-expression list down to the lone expression.
+	if ret.Type() == "expression_list" {
+		if ret.NamedChildCount() != 1 {
+			return "", "", false
+		}
+		ret = ret.NamedChild(0)
+	}
+	if ret == nil {
+		return "", "", false
+	}
+	switch ret.Type() {
+	case "interpreted_string_literal", "raw_string_literal":
+		if v, okk := goStringLiteralValue(ret, src); okk && v != "" {
+			return v, "", true
+		}
+	case "identifier":
+		if cn := ret.Content(src); len(cn) > 2 {
+			return "", cn, true
+		}
+	case "selector_expression":
+		if field := ret.ChildByFieldName("field"); field != nil {
+			if cn := field.Content(src); len(cn) > 2 {
+				return "", cn, true
+			}
+		}
+	}
+	return "", "", false
 }
 
 // goEnclosingFuncBody walks up from n to the nearest function-like
@@ -788,15 +1063,39 @@ func goAssignHasTarget(assign *sitter.Node, name string, src []byte) bool {
 	return false
 }
 
-// goAssignRHSExpr returns the first right-hand expression of an
-// assignment (the value for a single-target assign, or the lone call for
-// a multi-return `a, b := f()`), or nil.
-func goAssignRHSExpr(assign *sitter.Node) *sitter.Node {
+// goAssignRHSExpr returns the right-hand expression assigned to `name`,
+// matching the RHS position to the matched LHS target position for a
+// parallel assignment (`a, name := x, "v"` → "v"). A single RHS shared by
+// multiple targets is a multi-value call (`a, b := f()`) with no per-target
+// literal to trace, so it returns nil. Returns nil when `name` is not a
+// target of the assignment.
+func goAssignRHSExpr(assign *sitter.Node, name string, src []byte) *sitter.Node {
+	left := assign.ChildByFieldName("left")
 	right := assign.ChildByFieldName("right")
-	if right == nil || right.NamedChildCount() == 0 {
+	if left == nil || right == nil || right.NamedChildCount() == 0 {
 		return nil
 	}
-	return right.NamedChild(0)
+	idx := -1
+	for i := 0; i < int(left.NamedChildCount()); i++ {
+		c := left.NamedChild(i)
+		if c != nil && c.Type() == "identifier" && c.Content(src) == name {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return nil
+	}
+	// Parallel assignment: take the RHS at the matched target position.
+	if left.NamedChildCount() == right.NamedChildCount() {
+		return right.NamedChild(idx)
+	}
+	// Single target, single value.
+	if left.NamedChildCount() == 1 && right.NamedChildCount() == 1 {
+		return right.NamedChild(0)
+	}
+	// Multi-value call (`a, b := f()`): no per-target literal to trace.
+	return nil
 }
 
 // goIsEnvRead reports whether a call_expression is `os.Getenv(...)` or
@@ -818,6 +1117,36 @@ func goIsEnvRead(call *sitter.Node, src []byte) bool {
 	return false
 }
 
+// goArgDefaultValue reduces an env-or-default helper's DEFAULT argument to its
+// dispatch-name value. A string literal (`"ChargeActivity"`) yields the literal
+// with isConst=false. A constant REFERENCE — a bare identifier
+// (`ACTIVITY_NAME_DEFAULT`) or a selector_expression
+// (`config.ACTIVITY_NAME_DEFAULT`) — yields the constant's NAME with
+// isConst=true; the resolver later substitutes the constant's literal value
+// through its const-deref index (the constant body usually lives in another
+// package, invisible at extract time). Identifiers are admitted optimistically
+// because the resolver validates them against the const-deref index — an
+// identifier that is not actually a string constant simply fails to resolve and
+// stays a broken_dispatch, so there is no false-resolution risk. Returns
+// ("", false, false) for any other shape.
+func goArgDefaultValue(node *sitter.Node, src []byte) (val string, isConst bool, ok bool) {
+	if node == nil {
+		return "", false, false
+	}
+	if lit, okk := goStringLiteralValue(node, src); okk {
+		return lit, false, true
+	}
+	switch node.Type() {
+	case "identifier":
+		return node.Content(src), true, true
+	case "selector_expression":
+		if field := node.ChildByFieldName("field"); field != nil {
+			return field.Content(src), true, true
+		}
+	}
+	return "", false, false
+}
+
 // goCallEnvDefaultLiteral inspects a `cmp.Or(os.Getenv("KEY"), "Default")`
 // call and returns its literal default. cmp.Or returns the FIRST non-zero
 // argument, so when the env read yields "" at runtime the value is the
@@ -827,19 +1156,22 @@ func goIsEnvRead(call *sitter.Node, src []byte) bool {
 // "Suffix")`) is deliberately NOT treated as env-or-default — only the
 // stdlib cmp.Or idiom qualifies, since cmp.Or is the one combinator whose
 // "first non-zero" semantics make the literal a provable default. Returns
-// ("", false) when the callee is not cmp.Or, no os.Getenv / os.LookupEnv
-// read is present, or there is no string-literal argument.
-func goCallEnvDefaultLiteral(call *sitter.Node, src []byte) (string, bool) {
+// ("", false, false) when the callee is not cmp.Or, no os.Getenv /
+// os.LookupEnv read is present, or there is no default argument. The default
+// may be a string literal (isConst=false) or a constant reference
+// (isConst=true) the resolver substitutes through its const-deref index.
+func goCallEnvDefaultLiteral(call *sitter.Node, src []byte) (val string, isConst bool, ok bool) {
 	if !goIsCmpOr(call, src) {
-		return "", false
+		return "", false, false
 	}
 	args := call.ChildByFieldName("arguments")
 	if args == nil {
-		return "", false
+		return "", false, false
 	}
 	hasEnvRead := false
-	firstLiteral := ""
-	haveLiteral := false
+	firstVal := ""
+	firstConst := false
+	haveDefault := false
 	for i := 0; i < int(args.NamedChildCount()); i++ {
 		c := args.NamedChild(i)
 		if c == nil {
@@ -849,14 +1181,14 @@ func goCallEnvDefaultLiteral(call *sitter.Node, src []byte) (string, bool) {
 			hasEnvRead = true
 			continue
 		}
-		if lit, ok := goStringLiteralValue(c, src); ok && !haveLiteral {
-			firstLiteral, haveLiteral = lit, true
+		if v, isC, okk := goArgDefaultValue(c, src); okk && !haveDefault {
+			firstVal, firstConst, haveDefault = v, isC, true
 		}
 	}
-	if hasEnvRead && haveLiteral {
-		return firstLiteral, true
+	if hasEnvRead && haveDefault {
+		return firstVal, firstConst, true
 	}
-	return "", false
+	return "", false, false
 }
 
 // goIsCmpOr reports whether a call_expression is a call to the stdlib
@@ -872,6 +1204,103 @@ func goIsCmpOr(call *sitter.Node, src []byte) bool {
 	field := fn.ChildByFieldName("field")
 	return op != nil && field != nil &&
 		op.Content(src) == "cmp" && field.Content(src) == "Or"
+}
+
+// goEnvHelperNames is the built-in allow-list of project-local env-or-default
+// helper function names whose 2nd argument is the literal default. Matched
+// case-insensitively; a corporate fork extends it at runtime via the per-repo
+// allow-list threaded through `extra` (see goEnvHelperDefaultLiteral).
+var goEnvHelperNames = []string{
+	"GetEnvOrDefault",
+	"GetEnvOrDefaultValue",
+	"EnvOr",
+	"GetenvDefault",
+	"GetEnvDefault",
+}
+
+// goEnvHelperDefaultLiteral recognises a call to a project-local
+// env-or-default helper by name — `wfutils.GetEnvOrDefault(KEY, "Default")`
+// or the bare `EnvOr(KEY, "Default")` — and returns the string-literal 2nd
+// argument as the default. The callee name is taken from a bare identifier
+// or, for a selector_expression, its trailing `field`; it is compared
+// case-insensitively (strings.EqualFold) against the built-in goEnvHelperNames
+// PLUS `extra` — the per-repo corporate allow-list (lower-cased keys) loaded
+// from the git-ignored `.gortex/temporal-allowlist.yaml`. A match here is
+// "allowlist"-sourced, so the resolver lands the edge at the inferred (visible)
+// tier — that is how a corporate agent PROMOTES its own helper above the
+// generic "env"-name heuristic. Returns ("", false) for any non-matching name
+// or a non-string-literal 2nd arg.
+func goEnvHelperDefaultLiteral(call *sitter.Node, src []byte, extra map[string]bool) (val string, isConst bool, ok bool) {
+	fn := call.ChildByFieldName("function")
+	if fn == nil {
+		return "", false, false
+	}
+	var callee string
+	switch fn.Type() {
+	case "identifier":
+		callee = fn.Content(src)
+	case "selector_expression":
+		if field := fn.ChildByFieldName("field"); field != nil {
+			callee = field.Content(src)
+		}
+	}
+	if callee == "" {
+		return "", false, false
+	}
+	matched := false
+	for _, name := range goEnvHelperNames {
+		if strings.EqualFold(callee, name) {
+			matched = true
+			break
+		}
+	}
+	if !matched && extra[strings.ToLower(callee)] {
+		matched = true
+	}
+	if !matched {
+		return "", false, false
+	}
+	args := call.ChildByFieldName("arguments")
+	if args == nil || args.NamedChildCount() < 2 {
+		return "", false, false
+	}
+	return goArgDefaultValue(args.NamedChild(1), src)
+}
+
+// goEnvHelperHeuristicDefault is the generic-recall fallback for env-or-default
+// helpers whose NAME is not in the allow-list. It fires on a structural anchor
+// — the callee's (bare or selector-trailing) name contains "env"
+// (case-insensitive), the near-universal marker of an env-reading helper
+// (`cfg.ActivityFromEnv("KEY", "Default")`, `getEnvActivity(...)`) — and takes
+// the 2nd argument's string literal as the default. Deliberately lower-trust
+// than the allow-list path: the caller tags the resulting edge
+// `temporal_env_source=heuristic` so the resolver keeps it at the hidden
+// speculative tier (where the LLM cleaning pass verifies or prunes it), rather
+// than asserting it as a real dispatch. Returns ("", false) when the name lacks
+// the "env" marker or the 2nd argument is not a string literal — so a plain
+// `pick(KEY, "X")` (no env marker) is left untouched, preserving precision.
+func goEnvHelperHeuristicDefault(call *sitter.Node, src []byte) (val string, isConst bool, ok bool) {
+	fn := call.ChildByFieldName("function")
+	if fn == nil {
+		return "", false, false
+	}
+	var callee string
+	switch fn.Type() {
+	case "identifier":
+		callee = fn.Content(src)
+	case "selector_expression":
+		if field := fn.ChildByFieldName("field"); field != nil {
+			callee = field.Content(src)
+		}
+	}
+	if callee == "" || !strings.Contains(strings.ToLower(callee), "env") {
+		return "", false, false
+	}
+	args := call.ChildByFieldName("arguments")
+	if args == nil || args.NamedChildCount() < 2 {
+		return "", false, false
+	}
+	return goArgDefaultValue(args.NamedChild(1), src)
 }
 
 // goStringLiteralValue returns the unquoted value of a Go string literal
@@ -890,12 +1319,15 @@ func goStringLiteralValue(n *sitter.Node, src []byte) (string, bool) {
 // goTemporalCallArgNames extracts positional arg names from a call expression.
 //
 // PURPOSE — extract positional arg names from a call expression for wrapper-following
-// RATIONALE — only qualifying args (string literals, selectors, Capitalized identifiers)
+// RATIONALE — qualifying args are string literals, selectors, Capitalized
 //
-//	are included; plain lowercase vars are not useful as activity names
+//	identifiers, OR a bare lowercase identifier that is one of the ENCLOSING
+//	function's own parameters (a name forwarded THROUGH this call) — the latter
+//	is what lets depth>1 wrapper-following propagate a name across multiple hops.
+//	`callerParams` is the enclosing function's parameter-name set (may be nil).
 //
-// KEYWORDS — arg_names, wrapper-following, call_expression
-func goTemporalCallArgNames(callNode *sitter.Node, src []byte) ([]string, bool) {
+// KEYWORDS — arg_names, wrapper-following, call_expression, forwarded-param
+func goTemporalCallArgNames(callNode *sitter.Node, src []byte, callerParams map[string]bool) ([]string, bool) {
 	if callNode == nil || callNode.Type() != "call_expression" {
 		return nil, false
 	}
@@ -925,6 +1357,13 @@ func goTemporalCallArgNames(callNode *sitter.Node, src []byte) ([]string, bool) 
 			name = c.Content(src)
 			if name != "" && name[0] >= 'A' && name[0] <= 'Z' {
 				qualifying = true
+			} else if callerParams[name] {
+				// A bare lowercase identifier that is the enclosing function's
+				// own parameter: this call forwards a caller-supplied name
+				// THROUGH (`runStep(ctx, name, …)` inside a wrapper). Recording
+				// it lets the wrapper-following resolver discover the caller as
+				// a transitive wrapper and propagate the name up another level.
+				qualifying = true
 			}
 		}
 		out = append(out, name)
@@ -943,8 +1382,8 @@ func goTemporalCallArgNames(callNode *sitter.Node, src []byte) ([]string, bool) 
 //	to match caller edges to wrapper definitions
 //
 // KEYWORDS — arg_names, callee, wrapper-following, edge meta
-func attachGoTemporalCallArgNames(edge *graph.Edge, c goDeferredCall, callNode *sitter.Node, src []byte) {
-	names, ok := goTemporalCallArgNames(callNode, src)
+func attachGoTemporalCallArgNames(edge *graph.Edge, c goDeferredCall, callNode *sitter.Node, src []byte, callerParams map[string]bool) {
+	names, ok := goTemporalCallArgNames(callNode, src, callerParams)
 	if !ok {
 		return
 	}

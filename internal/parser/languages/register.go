@@ -163,3 +163,50 @@ func RegisterAll(reg *parser.Registry) {
 	// ObjC registered last so it wins the `.m` extension over Matlab.
 	reg.Register(NewObjCExtractor())
 }
+
+// TemporalInvokerConfigurable is implemented by extractors that accept a per-repo
+// Temporal invoker allow-list. Only the Java extractor implements it today.
+//
+// NOTE: there is currently no production wiring that feeds this — main has no
+// per-repo temporal config surface — so the invoker detector is reachable only
+// via ConfigureTemporalJavaInvokers (tests / programmatic callers). Production
+// wiring awaits a temporal-config surface on main; until then detection stays
+// OFF by default (empty invoker set).
+type TemporalInvokerConfigurable interface {
+	SetTemporalInvokers(invokers, methods []string)
+}
+
+// ConfigureTemporalJavaInvokers installs the Java Temporal invoker config onto
+// the Java extractor. No-op when invokers is empty, so the detector stays OFF
+// by default; callers pass the configured list unconditionally.
+func ConfigureTemporalJavaInvokers(reg *parser.Registry, invokers, methods []string) {
+	if len(invokers) == 0 {
+		return
+	}
+	if ext, ok := reg.GetByLanguage("java"); ok {
+		if c, ok := ext.(TemporalInvokerConfigurable); ok {
+			c.SetTemporalInvokers(invokers, methods)
+		}
+	}
+}
+
+// EnvHelperConfigurable is implemented by extractors that accept a per-repo
+// Temporal env-helper allow-list. Only the Go extractor implements it today.
+type EnvHelperConfigurable interface {
+	SetEnvHelperNames(names []string)
+}
+
+// ConfigureTemporalEnvHelpers installs the per-repo corporate env-helper
+// allow-list (loaded from a git-ignored `.gortex/temporal-allowlist.yaml`) onto
+// every registered extractor that supports it. No-op when names is empty, so
+// callers can pass the loader result unconditionally.
+func ConfigureTemporalEnvHelpers(reg *parser.Registry, names []string) {
+	if len(names) == 0 {
+		return
+	}
+	if ext, ok := reg.GetByLanguage("go"); ok {
+		if c, ok := ext.(EnvHelperConfigurable); ok {
+			c.SetEnvHelperNames(names)
+		}
+	}
+}

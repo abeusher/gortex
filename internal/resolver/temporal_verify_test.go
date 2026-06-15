@@ -115,3 +115,37 @@ func TestVerifyTemporalEdges_SkipsUnresolvedPlaceholders(t *testing.T) {
 	rep := VerifyTemporalEdges(context.Background(), b.g, fakeSource{}, fakeVerifier{})
 	assert.Equal(t, 0, rep.Checked, "unresolved placeholders are not verification candidates")
 }
+
+func TestVerifyTemporalEdges_PersistsViaReindex(t *testing.T) {
+	b := newTemporalTestGraph()
+	b.addGoFunc("wf/w.go::CoreWF", "CoreWF", "wf/w.go", "svc")
+	b.addGoFunc("wf/a.go::ChargeActivity", "ChargeActivity", "wf/a.go", "svc")
+	e := &graph.Edge{
+		From: "wf/w.go::CoreWF", To: "wf/a.go::ChargeActivity", Kind: graph.EdgeCalls,
+		Confidence: 0.4,
+		Meta: map[string]any{
+			"via": "temporal.stub", "temporal_kind": "activity",
+			"temporal_name": "ChargeActivity", graph.MetaSpeculative: true,
+		},
+	}
+	b.g.AddEdge(e)
+
+	v := fakeVerifier{verdicts: map[string]TemporalVerdict{"ChargeActivity": TemporalVerdictConfirmed}}
+	VerifyTemporalEdges(context.Background(), b.g, fakeSource{}, v)
+
+	// Re-fetch from the store (not the original pointer) to prove the verdict
+	// was persisted through ReindexEdges, not just mutated on a transient copy
+	// that a disk-backed store would discard.
+	var got *graph.Edge
+	for _, oe := range b.g.GetOutEdges("wf/w.go::CoreWF") {
+		if oe != nil && oe.To == "wf/a.go::ChargeActivity" {
+			got = oe
+		}
+	}
+	if assert.NotNil(t, got, "edge must still exist after verify") {
+		assert.Equal(t, 0.85, got.Confidence, "promotion must be persisted in the store")
+		assert.Equal(t, "confirmed", got.Meta["temporal_llm_verdict"])
+		_, spec := got.Meta[graph.MetaSpeculative]
+		assert.False(t, spec, "suppression flag must be cleared in the store")
+	}
+}
