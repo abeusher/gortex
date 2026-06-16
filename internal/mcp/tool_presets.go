@@ -183,7 +183,7 @@ func (p *toolPolicy) allows(name string) bool {
 	return true
 }
 
-func (p *toolPolicy) isActive() bool { return p != nil && p.active }
+func (p *toolPolicy) isActive() bool  { return p != nil && p.active }
 func (p *toolPolicy) hideMode() bool  { return p.isActive() && p.mode == toolPolicyModeHide }
 func (p *toolPolicy) deferMode() bool { return p.isActive() && p.mode == toolPolicyModeDefer }
 

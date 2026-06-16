@@ -68,7 +68,7 @@ func (s *Server) liveToolNames() []string {
 func (s *Server) registerToolProfileTool() {
 	s.addTool(
 		mcp.NewTool("tool_profile",
-			mcp.WithDescription("Report the active MCP tool profile so the agent knows what is actually available instead of guessing. With no arguments: returns `{lazy_enabled, total, live_count, deferred_count, live[], deferred[], scopes{}}` — `live` tools are in the current tools/list, `deferred` tools are reachable via `tools_search`. With `tool:\"<name>\"`: returns `{tool, enabled, status, scope}` for that one tool (status ∈ live | deferred | absent)."),
+			mcp.WithDescription("Report the active MCP tool profile so the agent knows what is actually available instead of guessing. With no arguments: returns `{lazy_enabled, total, live_count, deferred_count, live[], deferred[], scopes{}, categories{}}` plus `preset` / `preset_mode` when a tool preset narrows the surface — `live` tools are in the current tools/list, `deferred` tools are reachable via `tools_search`, and `categories` groups every tool into a functional family (nav / read / edit / analysis / review / pr / memory / overlay / subscription / enrich / workspace / admin). With `tool:\"<name>\"`: returns `{tool, enabled, status, scope, category}` for that one tool (status ∈ live | deferred | blocked | absent)."),
 			mcp.WithString("tool", mcp.Description("Optional — report only this tool's enabled status and scope instead of the whole profile.")),
 		),
 		s.handleToolProfile,
@@ -82,10 +82,11 @@ func (s *Server) handleToolProfile(ctx context.Context, req mcp.CallToolRequest)
 	// Per-tool advisory mode.
 	if name, _ := args["tool"].(string); name != "" {
 		return s.respondJSONOrTOON(ctx, req, map[string]any{
-			"tool":    name,
-			"enabled": s.IsToolEnabled(name),
-			"status":  s.toolStatus(name),
-			"scope":   scopes[name],
+			"tool":     name,
+			"enabled":  s.IsToolEnabled(name),
+			"status":   s.toolStatus(name),
+			"scope":    scopes[name],
+			"category": toolCategory(name),
 		})
 	}
 
@@ -105,6 +106,7 @@ func (s *Server) handleToolProfile(ctx context.Context, req mcp.CallToolRequest)
 		"live":           live,
 		"deferred":       deferred,
 		"scopes":         scopes,
+		"categories":     toolCategories(append(append([]string{}, live...), deferred...)),
 	}
 	// Active tool preset (mcp.tools / GORTEX_TOOLS): report the preset
 	// name and mode so an agent knows its surface was deliberately
