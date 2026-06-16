@@ -34,6 +34,7 @@ import (
 // state" consult daemon.MutatingTools (internal/daemon/mutating.go).
 var hotEagerTools = map[string]bool{
 	"search_symbols":       true,
+	"find_files":           true,
 	"find_usages":          true,
 	"find_implementations": true,
 	"find_overrides":       true,
