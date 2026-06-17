@@ -849,12 +849,26 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 		}
 	}
 
+	// Withhold secret-shaped values from config / data-leaf files unless the
+	// caller explicitly opts out. Keys stay readable; only secret-shaped values
+	// are replaced.
+	secretsRedacted := false
+	if !isBinary {
+		if red, did := s.maybeRedactConfigLeaf(language, relPath, req.GetBool("allow_secrets", false), string(content)); did {
+			content = []byte(red)
+			secretsRedacted = true
+		}
+	}
+
 	result := map[string]any{
 		"path":           relPath,
 		"language":       language,
 		"bytes":          len(content),
 		"original_bytes": originalBytes,
 		"content":        string(content),
+	}
+	if secretsRedacted {
+		result["secrets_redacted"] = true
 	}
 	if bodiesElided {
 		result["bodies_elided"] = true
@@ -880,6 +894,10 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 	if salienceTruncated {
 		omissions = append(omissions, omission("truncated",
 			"oversized source reduced toward its control-flow skeleton; runs of leaf statements collapsed"))
+	}
+	if secretsRedacted {
+		omissions = append(omissions, omission("secrets_withheld",
+			"secret-shaped values in this config file were withheld; pass allow_secrets:true to read them"))
 	}
 	if len(omissions) > 0 {
 		result["omissions"] = omissions

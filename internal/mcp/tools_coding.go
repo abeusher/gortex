@@ -67,6 +67,7 @@ func (s *Server) registerCodingTools() {
 			mcp.WithString("format", mcp.Description("Output format: json (default), gcx (GCX1 compact wire format), or toon")),
 			mcp.WithNumber("max_bytes", mcp.Description("Cap the marshaled response at this many bytes. The longest list is trimmed; truncation metadata rides on the response. Omit for no cap.")),
 			mcp.WithBoolean("compress_bodies", mcp.Description("Replace function/method bodies in the returned source with a `{ /* N lines elided */ }` stub. Signatures, doc-comments, and structure stay intact. ~30-40% of original tokens. Useful when you only need the surface signature of the symbol, not its implementation. Default: false.")),
+			mcp.WithBoolean("allow_secrets", mcp.Description("Serve secret-shaped values verbatim when the symbol is a config / data-leaf value (.env, *.yaml, *.properties, ...). By default such values are withheld. Default: false.")),
 			mcp.WithNumber("max_lines", mcp.Description("When the returned source exceeds this many lines, collapse runs of leaf statements inside function bodies into `… N lines elided …` markers while keeping the signature and the full control-flow skeleton — a structure-preserving alternative to a hard line cut. Omit or 0 to disable.")),
 		),
 		s.handleGetSymbolSource,
@@ -130,6 +131,7 @@ func (s *Server) registerCodingTools() {
 			mcp.WithDescription("Reads a whole file by path and returns its content. Use sparingly — prefer get_symbol_source / get_editing_context for code. Useful when you need a non-indexed file (config, fixture, raw markdown) or when you genuinely need the full body. With compress_bodies=true, every function/method body is replaced by a `{ /* N lines elided */ }` stub — signatures + structure preserved, ~30-40% of original tokens. Composable with format:\"gcx\"."),
 			mcp.WithString("path", mcp.Required(), mcp.Description("Absolute path, or repo-prefixed / repo-root-relative path")),
 			mcp.WithBoolean("compress_bodies", mcp.Description("Replace function/method bodies with elided stubs (default: false)")),
+			mcp.WithBoolean("allow_secrets", mcp.Description("Serve secret-shaped values in config / data-leaf files (.env, *.yaml, *.toml, *.properties, ...) verbatim. By default such values are withheld and only their keys are shown. Default: false.")),
 			mcp.WithString("keep", mcp.Description("Comma-separated symbol names, IDs, or node kinds whose bodies stay verbatim when compress_bodies is set — every other body in the file is still stubbed. Ignored unless compress_bodies is true.")),
 			mcp.WithString("fidelity_globs", mcp.Description(fidelityGlobsParamDescription)),
 			mcp.WithNumber("max_lines", mcp.Description("When the file exceeds this many lines, collapse runs of leaf statements inside function bodies into `… N lines elided …` markers while keeping declarations and the control-flow skeleton. Falls back to a plain head cut for non-code files. Omit or 0 to disable.")),
@@ -839,6 +841,14 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 		}
 	}
 
+	// Withhold secret-shaped values when serving a config / data-leaf symbol
+	// (e.g. a populated .env / yaml key) unless the caller opts out.
+	secretsRedacted := false
+	if red, did := s.maybeRedactConfigLeaf(node.Language, node.FilePath, req.GetBool("allow_secrets", false), source); did {
+		source = red
+		secretsRedacted = true
+	}
+
 	// Server-side accounting only — the savings value isn't returned to
 	// the caller (agents don't act on it and it burns tokens in every
 	// response). Aggregated stats remain available via the `savings` tool.
@@ -865,6 +875,9 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 	if salienceTruncated {
 		result["salience_truncated"] = true
 	}
+	if secretsRedacted {
+		result["secrets_redacted"] = true
+	}
 
 	// Omission notes: flag what the payload leaves out or reshapes so
 	// the model doesn't reason about absent code.
@@ -876,6 +889,10 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 	if salienceTruncated {
 		omissions = append(omissions, omission("truncated",
 			"oversized source reduced toward its control-flow skeleton; runs of leaf statements collapsed"))
+	}
+	if secretsRedacted {
+		omissions = append(omissions, omission("secrets_withheld",
+			"secret-shaped values in this config symbol were withheld; pass allow_secrets:true to read them"))
 	}
 	if len(omissions) > 0 {
 		result["omissions"] = omissions
@@ -1923,6 +1940,9 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 			sym.StartLine > 0 && sym.EndLine > 0 {
 			if absPath, err := s.resolveNodePath(sym); err == nil {
 				if source, _, totalFileChars, err := s.readLinesForCtx(ctx, absPath, sym.StartLine, sym.EndLine, 0); err == nil {
+					if red, did := s.maybeRedactConfigLeaf(sym.Language, sym.FilePath, false, source); did {
+						source = red
+					}
 					entry["source"] = source
 					sourcesEmbedded++
 					returned := tokens.CachedCountInt64(source)

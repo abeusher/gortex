@@ -1460,6 +1460,19 @@ type MCPConfig struct {
 	Transport string         `mapstructure:"transport" yaml:"transport,omitempty"`
 	Port      int            `mapstructure:"port"      yaml:"port,omitempty"`
 	Tools     MCPToolsConfig `mapstructure:"tools"     yaml:"tools,omitempty"`
+	// RedactConfigSecrets governs whether the content-serving read sinks
+	// (read_file / get_symbol_source / smart_context) withhold secret-shaped
+	// values from config / data-leaf files. A nil pointer means the default
+	// (redaction ON); set it to false to serve config-leaf values verbatim.
+	RedactConfigSecrets *bool `mapstructure:"redact_config_secrets" yaml:"redact_config_secrets,omitempty"`
+}
+
+// RedactConfigSecretsEnabled reports whether config-leaf secret redaction is
+// active for this MCP config. Redaction is on by default (a nil pointer), so an
+// agent reading a populated .env / secrets.yaml gets the keys with their values
+// withheld unless the caller opts out per call or sets this field false.
+func (c MCPConfig) RedactConfigSecretsEnabled() bool {
+	return c.RedactConfigSecrets == nil || *c.RedactConfigSecrets
 }
 
 // MCPToolsConfig selects which MCP tools the server publishes. Preset is
