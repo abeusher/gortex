@@ -15,6 +15,7 @@ Subcommands:
   swebench   — run the SWE-bench harness (eval/run_eval.py)
   stdbench   — standardized retrieval benches (CoIR / SWE-ContextBench / ContextBench)
   tokens     — GCX1 wire-format token savings vs JSON
+  parity     — per-language cross-file coverage vs the committed baseline
 
 Typical use:
 
