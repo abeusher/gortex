@@ -37,7 +37,13 @@ var (
 	// (the function has no *cobra.Command of its own) to decide whether
 	// the flag overrides the `embedding:` config block. Set once in
 	// runDaemonStart before buildDaemonState runs.
-	daemonEmbeddingsChanged     bool
+	daemonEmbeddingsChanged bool
+	// daemonEmbeddingsURL / daemonEmbeddingsModel mirror `gortex mcp`'s
+	// --embeddings-url / --embeddings-model so the daemon can be started with an
+	// explicit OpenAI-compatible (or Ollama) embedding API. A non-empty URL forces
+	// the api provider in ResolveEmbedder, overriding the embedding: config block.
+	daemonEmbeddingsURL         string
+	daemonEmbeddingsModel       string
 	daemonStatusWatch           bool
 	daemonStatusInterval        time.Duration
 	daemonHTTPAddr              string
@@ -103,6 +109,10 @@ func init() {
 		"fork to background after starting (logs to the daemon log file — see `gortex daemon logs`)")
 	daemonStartCmd.Flags().BoolVar(&daemonEmbeddings, "embeddings", false,
 		"load a semantic embedding provider (opt-in — adds ~87 MB model download on first use and ~60 ms/symbol warmup)")
+	daemonStartCmd.Flags().StringVar(&daemonEmbeddingsURL, "embeddings-url", "",
+		"OpenAI-compatible (or Ollama) embedding API base URL (e.g. https://api.openai.com/v1). A non-empty URL forces the api provider, overriding the embedding: config. Key via $GORTEX_EMBEDDINGS_API_KEY or $OPENAI_API_KEY (openai.com only).")
+	daemonStartCmd.Flags().StringVar(&daemonEmbeddingsModel, "embeddings-model", "",
+		"embedding model for --embeddings-url (default: auto-detect — text-embedding-3-small for OpenAI, nomic-embed-text for Ollama)")
 	daemonStartCmd.Flags().StringVar(&daemonHTTPAddr, "http-addr", "",
 		"also expose the MCP 2026 Streamable HTTP transport on this TCP address (e.g. 127.0.0.1:7411); empty disables")
 	daemonStartCmd.Flags().StringVar(&daemonHTTPAuthToken, "http-auth-token", "",
