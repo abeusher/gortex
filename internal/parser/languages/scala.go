@@ -230,7 +230,12 @@ func (e *ScalaExtractor) extractMembersFromBody(
 		}
 		for j := 0; j < int(child.ChildCount()); j++ {
 			member := child.Child(j)
-			if member.Type() != "function_definition" && member.Type() != "function_declaration" {
+			switch member.Type() {
+			case "val_definition", "var_definition", "val_declaration", "var_declaration":
+				e.emitScalaField(member, src, filePath, fileNode, ownerID, ownerName, result, seen)
+				continue
+			case "function_definition", "function_declaration":
+			default:
 				continue
 			}
 			mName := scalaFindChildIdentifier(member, src)
@@ -248,11 +253,15 @@ func (e *ScalaExtractor) extractMembersFromBody(
 			}
 			seen[mID] = true
 			seen[filePath+"::_method_L"+fmt.Sprint(mStartLine)] = true
+			mMeta := map[string]any{"receiver": ownerName}
+			if rt := scalaReturnType(member, src); rt != "" {
+				mMeta["return_type"] = rt
+			}
 			result.Nodes = append(result.Nodes, &graph.Node{
 				ID: mID, Kind: graph.KindMethod, Name: mName,
 				FilePath: filePath, StartLine: mStartLine, EndLine: mEndLine,
 				Language: "scala",
-				Meta:     map[string]any{"receiver": ownerName},
+				Meta:     mMeta,
 			})
 			result.Edges = append(result.Edges, &graph.Edge{
 				From: fileNode.ID, To: mID, Kind: graph.EdgeDefines,
@@ -265,6 +274,90 @@ func (e *ScalaExtractor) extractMembersFromBody(
 			emitScalaAnnotationEdges(member, mID, filePath, src, result, annotationSeen)
 		}
 	}
+}
+
+// emitScalaField emits a val/var member as a field of its enclosing type, with a
+// typed-as reference to its declared type when annotated.
+func (e *ScalaExtractor) emitScalaField(member *sitter.Node, src []byte, filePath string, fileNode *graph.Node, ownerID, ownerName string, result *parser.ExtractionResult, seen map[string]bool) {
+	name := scalaFindChildIdentifier(member, src)
+	if name == "" {
+		return
+	}
+	id := filePath + "::" + ownerName + "." + name
+	if seen[id] {
+		return
+	}
+	seen[id] = true
+	line := int(member.StartPoint().Row) + 1
+	meta := map[string]any{"receiver": ownerName}
+	if t := member.Type(); t == "var_definition" || t == "var_declaration" {
+		meta["mutable"] = true
+	}
+	typ := scalaTypeAnnotation(member, src)
+	if typ != "" {
+		meta["field_type"] = typ
+	}
+	result.Nodes = append(result.Nodes, &graph.Node{
+		ID: id, Kind: graph.KindField, Name: name,
+		FilePath: filePath, StartLine: line, EndLine: int(member.EndPoint().Row) + 1,
+		Language: "scala", Meta: meta,
+	})
+	result.Edges = append(result.Edges, &graph.Edge{From: fileNode.ID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: line})
+	result.Edges = append(result.Edges, &graph.Edge{From: id, To: ownerID, Kind: graph.EdgeMemberOf, FilePath: filePath, Line: line})
+	if typ != "" {
+		result.Edges = append(result.Edges, &graph.Edge{From: id, To: "unresolved::" + typ, Kind: graph.EdgeTypedAs, FilePath: filePath, Line: line})
+	}
+}
+
+// scalaTypeAnnotation returns the base type named in a `val/var name: Type = ...`
+// declaration (generics and dotted prefix stripped), or "".
+func scalaTypeAnnotation(member *sitter.Node, src []byte) string {
+	header := scalaDeclHeader(member, src)
+	colon := strings.IndexByte(header, ':')
+	if colon < 0 {
+		return ""
+	}
+	return scalaBaseType(header[colon+1:])
+}
+
+// scalaReturnType returns the declared return type of a `def name(...): Type`,
+// or "". Best-effort: the return colon is taken after the parameter list.
+func scalaReturnType(member *sitter.Node, src []byte) string {
+	header := scalaDeclHeader(member, src)
+	region := header
+	if rp := strings.LastIndexByte(header, ')'); rp >= 0 {
+		region = header[rp+1:]
+	}
+	colon := strings.IndexByte(region, ':')
+	if colon < 0 {
+		return ""
+	}
+	return scalaBaseType(region[colon+1:])
+}
+
+// scalaDeclHeader returns the first line of a declaration up to its initializer.
+func scalaDeclHeader(member *sitter.Node, src []byte) string {
+	text := member.Content(src)
+	if i := strings.IndexByte(text, '\n'); i >= 0 {
+		text = text[:i]
+	}
+	if i := strings.IndexByte(text, '='); i >= 0 {
+		text = text[:i]
+	}
+	return text
+}
+
+// scalaBaseType reduces a type expression to its base name (generic args and
+// dotted prefix stripped).
+func scalaBaseType(s string) string {
+	t := strings.TrimSpace(s)
+	if i := strings.IndexByte(t, '['); i >= 0 {
+		t = t[:i]
+	}
+	if i := strings.LastIndexByte(t, '.'); i >= 0 {
+		t = t[i+1:]
+	}
+	return strings.TrimSpace(t)
 }
 
 // extractImport extracts an import_declaration, building the path from identifier children.
