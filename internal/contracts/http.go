@@ -806,6 +806,10 @@ func (h *HTTPExtractor) extract(
 		if djangoRouteCallRE.MatchString(text) {
 			out = append(out, h.extractDjangoRoutes(filePath, text, lines, fileNodes, lang, tree)...)
 		}
+		// DRF router.register(prefix, ViewSet) expands to per-action routes.
+		if strings.Contains(text, ".register(") {
+			out = append(out, h.extractDRFRoutes(filePath, text, lines, fileNodes, lang, tree)...)
+		}
 	}
 
 	// Configurable HTTP-client wrapper aliases. Calls to a

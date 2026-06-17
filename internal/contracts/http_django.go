@@ -124,6 +124,137 @@ func (h *HTTPExtractor) buildDjangoContract(filePath, callName, rawRoute, symbol
 	return c
 }
 
+// drfAction is one Django REST Framework ViewSet action and the HTTP verb +
+// collection/detail route the default router maps it to.
+type drfAction struct {
+	name   string
+	method string
+	detail bool // true → prefix/{pk}, false → prefix
+}
+
+// drfActions is the standard ViewSet action set a DefaultRouter wires up.
+var drfActions = []drfAction{
+	{"list", "GET", false},
+	{"create", "POST", false},
+	{"retrieve", "GET", true},
+	{"update", "PUT", true},
+	{"partial_update", "PATCH", true},
+	{"destroy", "DELETE", true},
+}
+
+// drfRegisterRE matches router.register(r'prefix', ViewSetClass[, ...]).
+var drfRegisterRE = regexp.MustCompile(`\.register\s*\(\s*r?["']([^"']*)["']\s*,\s*([A-Za-z_]\w*)`)
+
+// extractDRFRoutes detects Django REST Framework router.register(prefix,
+// ViewSet) registrations and expands each into the per-action routes the
+// default router generates. An action defined explicitly on the ViewSet
+// resolves to that method node; the standard actions a ModelViewSet /
+// ReadOnlyModelViewSet inherits resolve to the ViewSet class node.
+func (h *HTTPExtractor) extractDRFRoutes(filePath, text string, lines []string, fileNodes []*graph.Node, lang string, tree *parser.ParseTree) []Contract {
+	var out []Contract
+	for i, line := range lines {
+		m := drfRegisterRE.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+		prefix, viewSet := m[1], m[2]
+		lineNum := i + 1
+
+		classID := ""
+		if t := findTypeNodeByName(fileNodes, viewSet); t != nil {
+			classID = t.ID
+		}
+		explicit := drfActionMethods(fileNodes, classID)
+		for _, a := range drfViewSetActions(text, viewSet, explicit) {
+			handler := explicit[a.name]
+			if handler == "" {
+				if classID == "" {
+					continue
+				}
+				handler = classID
+			}
+			out = append(out, h.buildDRFContract(filePath, a, prefix, handler, viewSet, lineNum, lines, fileNodes, lang, tree))
+		}
+	}
+	return out
+}
+
+// drfViewSetActions returns the actions a registered ViewSet serves: every
+// action it defines explicitly, plus the standard set its base class supplies
+// (all six for ModelViewSet, list+retrieve for ReadOnlyModelViewSet).
+func drfViewSetActions(text, viewSet string, explicit map[string]string) []drfAction {
+	bases := ""
+	if m := regexp.MustCompile(`class\s+` + regexp.QuoteMeta(viewSet) + `\s*\(([^)]*)\)`).FindStringSubmatch(text); m != nil {
+		bases = m[1]
+	}
+	readonly := strings.Contains(bases, "ReadOnlyModelViewSet")
+	full := strings.Contains(bases, "ModelViewSet") && !readonly
+
+	var out []drfAction
+	for _, a := range drfActions {
+		switch {
+		case explicit[a.name] != "":
+			out = append(out, a)
+		case full:
+			out = append(out, a)
+		case readonly && (a.name == "list" || a.name == "retrieve"):
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// drfActionMethods returns action-name→methodNodeID for the standard ViewSet
+// actions a class defines explicitly.
+func drfActionMethods(fileNodes []*graph.Node, classID string) map[string]string {
+	out := map[string]string{}
+	if classID == "" {
+		return out
+	}
+	for _, a := range drfActions {
+		want := classID + "." + a.name
+		for _, n := range fileNodes {
+			if n.Kind == graph.KindMethod && n.ID == want {
+				out[a.name] = n.ID
+				break
+			}
+		}
+	}
+	return out
+}
+
+// buildDRFContract assembles a provider contract for one DRF ViewSet action.
+func (h *HTTPExtractor) buildDRFContract(filePath string, a drfAction, prefix, symbolID, viewSet string, lineNum int, lines []string, fileNodes []*graph.Node, lang string, tree *parser.ParseTree) Contract {
+	route := "/" + strings.Trim(prefix, "^$/ ")
+	if a.detail {
+		route += "/{pk}"
+	}
+	normPath, origNames := NormalizeHTTPPathWithParams(route)
+	meta := map[string]any{
+		"method":      a.method,
+		"path":        normPath,
+		"framework":   "drf",
+		"route_shape": "viewset",
+		"drf_action":  a.name,
+		"viewset":     viewSet,
+	}
+	if len(origNames) > 0 {
+		meta["path_param_names"] = origNames
+	}
+	c := Contract{
+		ID:         fmt.Sprintf("http::%s::%s", a.method, normPath),
+		Type:       ContractHTTP,
+		Role:       RoleProvider,
+		SymbolID:   symbolID,
+		FilePath:   filePath,
+		Line:       lineNum,
+		Meta:       meta,
+		Confidence: 0.85,
+	}
+	EnrichHTTPContractWithTree(&c, lines, fileNodes, lang, tree)
+	return c
+}
+
 // buildDjangoMount records a path('prefix/', include('app.urls')) sub-URLconf
 // mount — the prefix-join seed the route-prefix pass consumes.
 func (h *HTTPExtractor) buildDjangoMount(filePath, callName, rawRoute, includeModule string, lineNum int, lines []string, fileNodes []*graph.Node, lang string, tree *parser.ParseTree) Contract {
