@@ -132,7 +132,7 @@ CREATE TABLE IF NOT EXISTS clone_shingles (
 
 -- constant_values is the per-KindConstant literal-value sidecar: one row
 -- per constant whose RHS is a string / numeric literal, keyed by node_id
--- (the join key back to nodes.id). Lifting the value out of the gob Meta
+-- (the join key back to nodes.id). Lifting the value out of the JSON Meta
 -- blob keeps it queryable (and out of the every-node-load decode path) so
 -- the resolver can dereference a const-identifier dispatch name to its
 -- value across files. file_path scopes per-file eviction on reindex;
@@ -182,10 +182,11 @@ CREATE TABLE IF NOT EXISTS vectors (
 ) WITHOUT ROWID;
 
 -- churn_enrichment is the per-node git-churn sidecar (change A: move
--- enrichment OUT of nodes.meta so the node hot path stops gob-encoding
--- rarely-read data and get_churn_rate does an indexed read instead of an
--- AllNodes+gob scan). One typed row per enriched file/function/method
--- node, keyed by node_id (join key back to nodes.id); repo_prefix scopes
+-- enrichment OUT of nodes.meta so the node hot path stops encoding
+-- rarely-read data into the blob and get_churn_rate does an indexed read
+-- instead of an AllNodes+meta-decode scan). One typed row per enriched
+-- file/function/method node, keyed by node_id (join key back to
+-- nodes.id); repo_prefix scopes
 -- per-repo reseeds/wipes. head_sha/branch/computed_at are file-level only
 -- (empty for symbols). WITHOUT ROWID: the PK index IS the table.
 CREATE TABLE IF NOT EXISTS churn_enrichment (

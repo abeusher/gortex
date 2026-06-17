@@ -11,8 +11,9 @@
 // fans out 8 concurrent writers; reads still run concurrently under
 // WAL mode.
 //
-// Meta maps are encoded with gob; an empty / nil Meta is stored as
-// NULL so the common case adds no row weight beyond the column header.
+// Meta maps are encoded as JSON (see meta_json.go); an empty / nil Meta
+// is stored as NULL so the common case adds no row weight beyond the
+// column header.
 //
 // EdgeIdentityRevisions is tracked in memory (atomic counter) -- it
 // mirrors the in-memory store's monotonic "provenance churn" signal
