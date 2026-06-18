@@ -31,6 +31,10 @@ func (h *HTTPExtractor) SupportedLanguages() []string {
 		"go", "typescript", "javascript", "python",
 		"java", "kotlin", "dart", "swift",
 		"rust", "csharp", "ruby", "php", "elixir",
+		// File-based routing: page files in these frameworks carry the route
+		// in their path, so the extractor must see them even though they are
+		// not otherwise HTTP-bearing languages.
+		"astro", "svelte", "vue",
 	}
 }
 
@@ -634,8 +638,11 @@ func (h *HTTPExtractor) extract(
 		// the fetch/axios/app. markers, so the prefilter would skip the
 		// file and the alias pass would never run. Keep the file alive
 		// when it mentions an alias name; the alias pass below is the
-		// only work that will then fire.
-		if !srcMentionsAnyAlias(src, h.ClientAliases) {
+		// only work that will then fire. File-based route files (a Next.js
+		// page.tsx, a SvelteKit +server.ts) and React Router modules carry
+		// none of those markers either — their route is path/JSX-derived —
+		// so keep them alive too.
+		if !srcMentionsAnyAlias(src, h.ClientAliases) && !isFileBasedRouteFile(filePath) && !hasReactRouterMarkers(src) {
 			return nil
 		}
 	}
@@ -650,6 +657,16 @@ func (h *HTTPExtractor) extract(
 	})
 
 	var out []Contract
+
+	// File-based routing (Next.js / Nuxt / SvelteKit / Astro): the route is
+	// derived from the file PATH, so it runs regardless of the content
+	// prefilter above. React Router routes are JSX/object-config derived.
+	if isFileBasedRouteFile(filePath) {
+		out = append(out, h.extractFileBasedRoutes(filePath, text, lines, fileNodes, lang, tree)...)
+	}
+	if (lang == "typescript" || lang == "javascript") && hasReactRouterMarkers(src) {
+		out = append(out, h.extractReactRouterRoutes(filePath, text, lines, fileNodes, lang, tree)...)
+	}
 
 	// Go AST-based route detection (Phase 2 of spec-contract-extraction.md).
 	// When a parse tree is available, walk it for route registrations
@@ -960,6 +977,12 @@ func detectLanguage(filePath string) string {
 		return "php"
 	case strings.HasSuffix(filePath, ".ex"), strings.HasSuffix(filePath, ".exs"):
 		return "elixir"
+	case strings.HasSuffix(filePath, ".astro"):
+		return "astro"
+	case strings.HasSuffix(filePath, ".svelte"):
+		return "svelte"
+	case strings.HasSuffix(filePath, ".vue"):
+		return "vue"
 	default:
 		return ""
 	}
