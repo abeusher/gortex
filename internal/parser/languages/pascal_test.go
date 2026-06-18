@@ -50,16 +50,19 @@ end.
 
 	var gotUnit, gotType, gotCreate, gotArea, gotHello bool
 	for _, n := range res.Nodes {
-		switch n.Name {
-		case "Shapes":
+		// Methods carry the bare name and a class-qualified ID — the
+		// convention shared with every other language — instead of jamming
+		// the qualified name into Name as the old regex extractor did.
+		switch n.ID {
+		case "Shapes.pas::Shapes":
 			gotUnit = true
-		case "TCircle":
+		case "Shapes.pas::TCircle":
 			gotType = true
-		case "TCircle.Create":
+		case "Shapes.pas::TCircle.Create":
 			gotCreate = true
-		case "TCircle.Area":
+		case "Shapes.pas::TCircle.Area":
 			gotArea = true
-		case "Hello":
+		case "Shapes.pas::Hello":
 			gotHello = true
 		}
 	}
@@ -82,4 +85,64 @@ func TestPascalExtractor_EmptyInput(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, res.Nodes, 1)
 	assert.Equal(t, graph.KindFile, res.Nodes[0].Kind)
+}
+
+// TestPascalParenlessCallEdges is the C1 named test: the tree-sitter extractor
+// emits call edges for both parenthesised (`Compute(x)`) and paren-less (`Baz;`)
+// calls — the sharpest regression, since the old regex extractor emitted zero —
+// and resolves same-file callees directly to their definition at a higher
+// provenance tier than an unresolved external call.
+func TestPascalParenlessCallEdges(t *testing.T) {
+	src := []byte(`unit MyUnit;
+interface
+type
+  TFoo = class
+  public
+    function Bar(x: Integer): string;
+    procedure Baz;
+  end;
+implementation
+function TFoo.Bar(x: Integer): string;
+begin
+  Result := Compute(x);
+  Baz;
+end;
+procedure TFoo.Baz;
+begin
+  DoThing;
+end;
+end.
+`)
+	res, err := NewPascalExtractor().Extract("MyUnit.pas", src)
+	require.NoError(t, err)
+
+	type edge struct {
+		from, to string
+		origin   string
+	}
+	var calls []edge
+	for _, e := range res.Edges {
+		if e.Kind == graph.EdgeCalls {
+			calls = append(calls, edge{e.From, e.To, e.Origin})
+		}
+	}
+
+	has := func(from, to, origin string) bool {
+		for _, c := range calls {
+			if c.from == from && c.to == to && c.origin == origin {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Parenthesised call to an external proc — unresolved, name-only tier.
+	assert.True(t, has("MyUnit.pas::TFoo.Bar", "unresolved::*.Compute", graph.OriginTextMatched),
+		"parenthesised call Compute(x) should emit an edge; got %v", calls)
+	// Paren-less call to a same-file method — resolved directly, higher tier.
+	assert.True(t, has("MyUnit.pas::TFoo.Bar", "MyUnit.pas::TFoo.Baz", graph.OriginASTResolved),
+		"paren-less call Baz; should resolve in-file to TFoo.Baz; got %v", calls)
+	// Paren-less call to an external proc — unresolved.
+	assert.True(t, has("MyUnit.pas::TFoo.Baz", "unresolved::*.DoThing", graph.OriginTextMatched),
+		"paren-less call DoThing; should emit an edge; got %v", calls)
 }

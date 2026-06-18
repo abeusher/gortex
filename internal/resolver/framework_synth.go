@@ -72,6 +72,7 @@ const (
 	SynthStoreFactory      = "store-factory"
 	SynthSpeculative       = "speculative-dispatch"
 	SynthFnValue           = SynthFnValueCallback
+	SynthPascalFormName    = SynthPascalForm
 )
 
 // StampSynthesized marks an edge as the product of a framework
@@ -148,6 +149,8 @@ func defaultFrameworkSynthesizers() []FrameworkSynthesizer {
 		// drops unbound candidates. The per-language capture feeds it via
 		// placeholder edges; the pass is inert until those land.
 		synthFunc{name: SynthFnValue, fn: ResolveFnValueCallbacks},
+		// Pascal unit ↔ form (.pas/.dfm) pairing by same-dir basename.
+		synthFunc{name: SynthPascalFormName, fn: ResolvePascalForms},
 	}
 }
 
