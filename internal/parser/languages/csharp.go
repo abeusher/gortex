@@ -1,6 +1,7 @@
 package languages
 
 import (
+	"bytes"
 	"fmt"
 	"regexp"
 	"strings"
@@ -125,21 +126,75 @@ type csharpDeferredLocal struct {
 	defNode *sitter.Node
 }
 
+// Extract parses the C# source, adaptively recovering symbols that tree-sitter
+// silently drops inside conditional-compilation branches. The grammar parses a
+// #if/#elif/#else block without raising any error, yet omits every declaration
+// inside its branches from the tree — so a method guarded by #if vanishes with
+// no signal. When the source uses conditional compilation, Extract therefore
+// also extracts from a directive-blanked copy (offset-preserving) and keeps
+// whichever variant yields more symbols; native wins ties, so a file the
+// grammar already handles cleanly is never perturbed. This beats an always-blank
+// rewrite, which would discard the grammar's handling on files that don't need
+// it and can unbalance braces when both branches are forced live.
 func (e *CSharpExtractor) Extract(filePath string, src []byte) (*parser.ExtractionResult, error) {
-	src = parser.ApplyPreParse(e, src)
-	tree, err := parser.ParseFile(src, e.lang)
+	res, _, err := e.extractCSharp(filePath, src)
 	if err != nil {
 		return nil, err
+	}
+	if hasCSharpConditional(src) {
+		if alt, _, altErr := e.extractCSharp(filePath, blankConditionalDirectives(src)); altErr == nil && csharpSymbolCount(alt) > csharpSymbolCount(res) {
+			return alt, nil
+		}
+	}
+	return res, nil
+}
+
+// hasCSharpConditional reports whether src contains a conditional-compilation
+// directive — the cheap gate that decides whether the directive-blanked
+// re-parse is worth attempting. A false positive (the token in a string or
+// comment) only costs one extra parse whose result loses the symbol-count tie.
+func hasCSharpConditional(src []byte) bool {
+	return bytes.Contains(src, []byte("#if"))
+}
+
+// csharpSymbolCount counts the non-file symbol nodes in a result — the metric
+// the adaptive re-parse maximises when deciding whether the directive-blanked
+// variant recovered more of the file than the native parse.
+func csharpSymbolCount(r *parser.ExtractionResult) int {
+	if r == nil {
+		return 0
+	}
+	n := 0
+	for _, nd := range r.Nodes {
+		if nd != nil && nd.Kind != graph.KindFile {
+			n++
+		}
+	}
+	return n
+}
+
+func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.ExtractionResult, bool, error) {
+	tree, err := parser.ParseFile(src, e.lang)
+	if err != nil {
+		return nil, false, err
 	}
 	defer tree.Close()
 
 	root := tree.RootNode()
 	result := &parser.ExtractionResult{}
+	hadError := root.HasError()
 
 	fileNode := &graph.Node{
 		ID: filePath, Kind: graph.KindFile, Name: filePath,
 		FilePath: filePath, StartLine: 1, EndLine: int(root.EndPoint().Row) + 1,
 		Language: "csharp",
+	}
+	// Parse-health signal: a file the grammar could not fully parse (and that
+	// the blanked re-parse did not improve) is flagged so a consumer knows its
+	// C# member surface may be incomplete — codegraph parses silently with no
+	// such signal.
+	if hadError {
+		fileNode.Meta = map[string]any{"parse_health": "partial"}
 	}
 	fileID := fileNode.ID
 	result.Nodes = append(result.Nodes, fileNode)
@@ -302,7 +357,7 @@ func (e *CSharpExtractor) Extract(filePath string, src []byte) (*parser.Extracti
 	// interop. Stamped onto the file node.
 	detectDotNetSurfaces(src, result)
 
-	return result, nil
+	return result, hadError, nil
 }
 
 // --- Per-match emit helpers -----------------------------------------

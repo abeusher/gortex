@@ -7,6 +7,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/parser"
 )
 
 func TestCSharpExtractor_ClassWithMethods(t *testing.T) {
@@ -57,6 +58,65 @@ func TestCSharpExtractor_Interface(t *testing.T) {
 	methods, ok := ifaces[0].Meta["methods"].([]string)
 	require.True(t, ok)
 	assert.Equal(t, []string{"FindById", "Save"}, methods)
+}
+
+// csharpSymbolNames returns the set of non-file node names in a result.
+func csharpSymbolNames(res *parser.ExtractionResult) map[string]bool {
+	names := map[string]bool{}
+	for _, n := range res.Nodes {
+		if n != nil && n.Kind != graph.KindFile {
+			names[n.Name] = true
+		}
+	}
+	return names
+}
+
+// TestCSharpConditionalRecoversSymbolsViaAdaptiveReparse is a B1 named test:
+// when a conditional directive desynchronises the native parse (here a #if that
+// brackets a stray brace plus a whole namespace), the adaptive re-parse falls
+// back to the directive-blanked source and recovers the symbols the native
+// parse dropped — without the caller doing anything.
+func TestCSharpConditionalRecoversSymbolsViaAdaptiveReparse(t *testing.T) {
+	src := []byte("public class C {\n" +
+		"    public void A() {}\n" +
+		"#if NET\n" +
+		"}\n" +
+		"namespace Extra {\n" +
+		"    public class D { public void B() {} }\n" +
+		"}\n" +
+		"#endif\n")
+	res, err := NewCSharpExtractor().Extract("R.cs", src)
+	require.NoError(t, err)
+
+	names := csharpSymbolNames(res)
+	// The native parse keeps only C and A; the blanked re-parse additionally
+	// recovers the #if-guarded namespace's class D and its method B.
+	assert.True(t, names["D"], "class D should be recovered by the adaptive re-parse; got %v", names)
+	assert.True(t, names["B"], "method B should be recovered by the adaptive re-parse; got %v", names)
+	assert.True(t, names["A"], "method A must still be present; got %v", names)
+}
+
+// TestCSharpConditionalKeepsAllBranchMethods proves the native tree-sitter
+// handling — which already extracts methods from every #if/#elif/#else branch —
+// is preserved (the adaptive path only ever adds symbols, never drops them).
+func TestCSharpConditionalKeepsAllBranchMethods(t *testing.T) {
+	src := []byte("public class C {\n" +
+		"#if A\n" +
+		"    public void M_A() {}\n" +
+		"#elif B\n" +
+		"    public void M_B() {}\n" +
+		"#else\n" +
+		"    public void M_C() {}\n" +
+		"#endif\n" +
+		"    public void Always() {}\n" +
+		"}\n")
+	res, err := NewCSharpExtractor().Extract("R.cs", src)
+	require.NoError(t, err)
+
+	names := csharpSymbolNames(res)
+	for _, want := range []string{"M_A", "M_B", "M_C", "Always"} {
+		assert.True(t, names[want], "%s should be extracted from its branch; got %v", want, names)
+	}
 }
 
 func TestCSharpExtractor_UsingImports(t *testing.T) {
