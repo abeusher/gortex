@@ -60,5 +60,6 @@ func (e *AstroExtractor) Extract(filePath string, src []byte) (*parser.Extractio
 	// Client-side <script> blocks (in addition to the frontmatter).
 	carveAndDelegateScripts(src, filePath, fileNode.ID, "astro", e.ts, e.js, result)
 	mineTemplateComponentUsages(src, filePath, componentID, result)
+	applyFrameworkTemplatePasses(src, filePath, componentID, "astro", result)
 	return result, nil
 }

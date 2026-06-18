@@ -71,6 +71,7 @@ const (
 	SynthSQLCallsite       = "sql-callsite"
 	SynthStoreFactory      = "store-factory"
 	SynthGinMiddleware     = "gin-middleware"
+	SynthSvelteKitLoad     = "sveltekit-load"
 	SynthSpeculative       = "speculative-dispatch"
 	SynthFnValue           = SynthFnValueCallback
 	SynthPascalFormName    = SynthPascalForm
@@ -145,6 +146,9 @@ func defaultFrameworkSynthesizers() []FrameworkSynthesizer {
 		// `c.handlers[idx](c)` indirection so ServeHTTP→handler reachability
 		// flows; repo-scoped, gated on a dispatcher existing.
 		synthFunc{name: SynthGinMiddleware, fn: ResolveGinMiddlewareCalls},
+		// SvelteKit +page ↔ +page.server load pairing: a route's page component
+		// reaches its server data loader so a trace flows page→load. Repo-scoped.
+		synthFunc{name: SynthSvelteKitLoad, fn: ResolveSvelteKitLoad},
 		// Rust impl-block / self-receiver / module-path resolution
 		// completion. Runs in the same settle window so residual
 		// unresolved Rust calls land before external-call synthesis
