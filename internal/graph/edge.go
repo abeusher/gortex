@@ -4,6 +4,14 @@ type EdgeKind string
 
 const (
 	EdgeImports EdgeKind = "imports"
+	// EdgeReExports links a file to a binding it forwards from another
+	// module — the barrel-file pattern `export { x } from "mod"` /
+	// `export * from "mod"` / `export * as ns from "mod"`. Direction:
+	// file → unresolved::import::<path>[::<original>]. Distinct from
+	// EdgeImports so a dependency walk can tell "this file re-exports
+	// mod's surface" (a transitive forwarding hop) from "this file
+	// consumes mod". The renamed name rides on Edge.Alias.
+	EdgeReExports EdgeKind = "re_exports"
 	// EdgeContains links a file node to its non-symbol children — import
 	// nodes today, and a natural home for future side-band kinds
 	// (todos, fixtures) that "belong to" a file without being defined
@@ -581,6 +589,14 @@ type Edge struct {
 	// so traversal tools can render a "— via X" suffix. Not part of the edge
 	// identity / dedup key.
 	Via string `json:"via,omitempty"`
+	// Alias is the renamed name carried by a per-binding import or a
+	// re-export edge — the local name for `import { x as alias }` and the
+	// exported name for `export { x as alias } from`. Empty when the binding
+	// is not renamed (the local/exported name equals the upstream name) and
+	// on every non-import edge. The edge's To still targets the upstream
+	// (original) name, so the alias is the only place the renamed identifier
+	// is recorded. Not part of the edge identity / dedup key.
+	Alias string `json:"alias,omitempty"`
 	// Meta is intentionally excluded from JSON. It holds internal
 	// instrumentation (semantic_source, provider hints, etc.) that agents
 	// don't consume but that adds measurable bytes to every edge in

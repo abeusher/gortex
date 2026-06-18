@@ -49,6 +49,9 @@ const tsQAll = `
   (import_statement
     source: (string) @import.path) @import.def
 
+  (export_statement
+    source: (string) @reexport.path) @reexport.def
+
   (call_expression
     function: (identifier) @call.name) @call.expr
 
@@ -248,6 +251,9 @@ func (e *TypeScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 			if p := m.Captures["import.path"]; p != nil {
 				importPaths = append(importPaths, strings.Trim(p.Text, "\"'`"))
 			}
+
+		case m.Captures["reexport.def"] != nil:
+			e.emitReExport(m, filePath, fileID, src, result)
 
 		case m.Captures["method.def"] != nil:
 			registerObjMember(e.emitMethod(m, filePath, src, result, annotationSeen))
@@ -933,6 +939,8 @@ func (e *TypeScriptExtractor) emitImport(m parser.QueryResult, filePath, fileID 
 	if !ok || defCap.Node == nil {
 		return
 	}
+	// Per-binding edges (`import { a, b as c }`) on top of the module edge.
+	emitJSPerBindingImports(defCap.Node, importPath, fileID, filePath, src, result)
 	for i := 0; i < int(defCap.Node.NamedChildCount()); i++ {
 		child := defCap.Node.NamedChild(i)
 		if child.Type() != "import_clause" {
@@ -952,6 +960,17 @@ func (e *TypeScriptExtractor) emitImport(m parser.QueryResult, filePath, fileID 
 			}
 		}
 	}
+}
+
+// emitReExport records the alias-aware re-export edges for an
+// `export ... from "mod"` statement (the barrel-file forwarding form).
+func (e *TypeScriptExtractor) emitReExport(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult) {
+	def, ok := m.Captures["reexport.def"]
+	if !ok || def.Node == nil {
+		return
+	}
+	importPath := strings.Trim(m.Captures["reexport.path"].Text, `"'`+"`")
+	emitJSReExport(def.Node, importPath, fileID, filePath, src, result)
 }
 
 // emitMethod is called once per method_definition captured at root

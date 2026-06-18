@@ -178,7 +178,13 @@ import axios from 'axios';
 	require.NoError(t, err)
 
 	imports := edgesOfKind(result.Edges, graph.EdgeImports)
-	require.Len(t, imports, 2)
+	// Two module-level dependency edges (express, axios) plus one per-binding
+	// edge for the named import `{ Router }`. `import axios` is a default
+	// import with no named bindings, so it adds only its module edge.
+	require.Len(t, imports, 3)
+	if importEdge(result, graph.EdgeImports, "unresolved::import::express::Router") == nil {
+		t.Error("missing per-binding import edge for Router")
+	}
 }
 
 func TestTSExtractor_TypeEnv_ExplicitType(t *testing.T) {

@@ -143,13 +143,13 @@ func wireContractGolden(name string) string {
 		// ProjectID, were added.
 		return "3b8920ab88d05028e215d68d5917445e2e6d05bdad23aef6dcdf6c9920647823"
 	case "graph.Edge":
-		// Bumped when Via was added — the human-readable synthesizer
-		// provenance label (Swift↔ObjC bridge / observer channel / …) derived
-		// from Meta["via"] and populated on demand by enrichSubGraphEdges.
-		// Additive: gob decodes older snapshots with Via blank, and it is
-		// recomputed; not part of the edge identity / dedup key.
-		// (Previously bumped when ReturnUsage, Context, then Tier, were added.)
-		return "74bade3c02d830002638d866730c21e3c3004bb519dbce102830b52247baed66"
+		// Bumped when Alias was added — the renamed name carried by a
+		// per-binding import (`import { x as alias }`) or a re-export
+		// (`export { x as alias } from`) edge; empty on every other edge.
+		// Additive: gob decodes older snapshots with Alias blank; not part of
+		// the edge identity / dedup key.
+		// (Previously bumped when Via, ReturnUsage, Context, then Tier, were added.)
+		return "4e51a5ea5eea74a33875b43baf9b6d80bf9609ae2befc16dd576132e09ea3d09"
 	case "snapshotHeader":
 		// Bumped when the VectorIndex / VectorDims / VectorCount fields
 		// were added (additive — gob decodes unknown fields as zero).

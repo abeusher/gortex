@@ -45,6 +45,9 @@ const qJSAll = `
   (import_statement
     source: (string (string_fragment) @import.path)) @import.def
 
+  (export_statement
+    source: (string (string_fragment) @reexport.path)) @reexport.def
+
   (call_expression
     function: (identifier) @req.name
     arguments: (arguments (string (string_fragment) @req.path))) @req.def
@@ -178,10 +181,13 @@ func (e *JavaScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 			e.emitClassArrowField(m, filePath, fileID, src, result)
 
 		case m.Captures["import.def"] != nil:
-			e.emitImport(m, filePath, fileID, result)
+			e.emitImport(m, filePath, fileID, src, result)
 			if p := m.Captures["import.path"]; p != nil {
 				importPaths = append(importPaths, p.Text)
 			}
+
+		case m.Captures["reexport.def"] != nil:
+			e.emitReExport(m, filePath, fileID, src, result)
 
 		case m.Captures["req.def"] != nil:
 			e.emitRequire(m, filePath, fileID, result)
@@ -718,13 +724,29 @@ func jsObjectOwnerName(member *sitter.Node, src []byte) string {
 	return ""
 }
 
-func (e *JavaScriptExtractor) emitImport(m parser.QueryResult, filePath, fileID string, result *parser.ExtractionResult) {
+func (e *JavaScriptExtractor) emitImport(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult) {
 	importPath := m.Captures["import.path"].Text
-	line := m.Captures["import.def"].StartLine + 1
+	def := m.Captures["import.def"]
+	line := def.StartLine + 1
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: fileID, To: "unresolved::import::" + importPath,
 		Kind: graph.EdgeImports, FilePath: filePath, Line: line,
 	})
+	// Per-binding edges (`import { a, b as c }`) on top of the module edge.
+	if def.Node != nil {
+		emitJSPerBindingImports(def.Node, importPath, fileID, filePath, src, result)
+	}
+}
+
+// emitReExport records the alias-aware re-export edges for an
+// `export ... from "mod"` statement (the barrel-file forwarding form).
+func (e *JavaScriptExtractor) emitReExport(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult) {
+	def := m.Captures["reexport.def"]
+	if def.Node == nil {
+		return
+	}
+	importPath := m.Captures["reexport.path"].Text
+	emitJSReExport(def.Node, importPath, fileID, filePath, src, result)
 }
 
 func (e *JavaScriptExtractor) emitRequire(m parser.QueryResult, filePath, fileID string, result *parser.ExtractionResult) {
