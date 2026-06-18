@@ -852,7 +852,56 @@ func (h *HTTPExtractor) extract(
 		out = append(out, h.extractObjectRouteProviders(filePath, text, lines, fileNodes, lang, tree)...)
 	}
 
+	// Preserve the developer-written path and stamp the per-reference route
+	// kind on every HTTP contract.
+	for i := range out {
+		if out[i].Type == ContractHTTP {
+			stampHTTPRouteShape(out[i].Meta)
+		}
+	}
+
 	return out
+}
+
+// RouteKindForPath classifies a normalized route path by its shape: a
+// catch-all/subtree route is "wildcard", one with path parameters is
+// "parametric", and a fully literal route is "static".
+func RouteKindForPath(normPath string) string {
+	switch {
+	case strings.Contains(normPath, "{rest}") || strings.Contains(normPath, "*"):
+		return "wildcard"
+	case strings.Contains(normPath, "{"):
+		return "parametric"
+	default:
+		return "static"
+	}
+}
+
+// OriginalRoutePath reconstructs the developer-written path from a
+// positional-normalized path ("/v1/sessions/{p1}") and its captured original
+// parameter names (["id"]) → "/v1/sessions/{id}".
+func OriginalRoutePath(normPath string, names []string) string {
+	out := normPath
+	for i, name := range names {
+		out = strings.Replace(out, fmt.Sprintf("{p%d}", i+1), "{"+name+"}", 1)
+	}
+	return out
+}
+
+// stampHTTPRouteShape records the developer-facing original_path and the
+// per-reference route_kind on an HTTP contract's Meta, derived from its
+// normalized path and original parameter names.
+func stampHTTPRouteShape(meta map[string]any) {
+	if meta == nil {
+		return
+	}
+	normPath, _ := meta["path"].(string)
+	if normPath == "" {
+		return
+	}
+	names, _ := meta["path_param_names"].([]string)
+	meta["original_path"] = OriginalRoutePath(normPath, names)
+	meta["route_kind"] = RouteKindForPath(normPath)
 }
 
 // detectLanguage infers the language from a file extension.

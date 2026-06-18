@@ -457,6 +457,15 @@ func JoinRouterPrefixes(reg *Registry, scanFiles []string, srcFor func(filePath 
 			if len(names) > 0 {
 				items[i].Meta["path_param_names"] = names
 			}
+			// Prepend the joined prefix to the route's developer-written path
+			// (which keeps the original param names the re-normalized path
+			// has already collapsed) and re-classify against the joined path.
+			prevOrig, ok := items[i].Meta["original_path"].(string)
+			if !ok || prevOrig == "" {
+				prevOrig = rawPath
+			}
+			items[i].Meta["original_path"] = joinPaths(rp, prevOrig)
+			items[i].Meta["route_kind"] = RouteKindForPath(newPath)
 			items[i].Meta[routePrefixJoinedMeta] = true
 			changed = true
 		}
