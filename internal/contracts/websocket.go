@@ -51,7 +51,11 @@ var wsPrefilterMarkers = [][]byte{
 	[]byte(".addEventListener("),
 	[]byte("WriteJSON"),
 	[]byte("JSON.stringify"),
+	[]byte("@SubscribeMessage("), // NestJS WebSocketGateway message handler
 }
+
+// wsSubscribeMessageRe matches a NestJS @SubscribeMessage('event') handler.
+var wsSubscribeMessageRe = regexp.MustCompile(`@SubscribeMessage\(\s*["']([^"']+)["']`)
 
 func (e *WebSocketExtractor) Extract(filePath string, src []byte, nodes []*graph.Node, edges []*graph.Edge) []Contract {
 	if !srcHasAnyMarker(src, wsPrefilterMarkers) {
@@ -99,6 +103,30 @@ func (e *WebSocketExtractor) Extract(filePath string, src []byte, nodes []*graph
 				Confidence: 0.8,
 			})
 		}
+	}
+
+	// NestJS WebSocketGateway message handlers: @SubscribeMessage('event') is
+	// a server-side handler for an inbound message — a provider of that event.
+	for _, m := range wsSubscribeMessageRe.FindAllStringSubmatchIndex(text, -1) {
+		event := text[m[2]:m[3]]
+		ln := lineNumber(lines, m[0])
+		handlerName, _ := nestHandlerAfter(lines, ln-1)
+		symbolID := findEnclosingSymbol(fileNodes, ln)
+		if handlerName != "" {
+			if hID := findFunctionByName(fileNodes, handlerName); hID != "" {
+				symbolID = hID
+			}
+		}
+		contracts = append(contracts, Contract{
+			ID:         fmt.Sprintf("ws::%s", event),
+			Type:       ContractWS,
+			Role:       RoleProvider,
+			SymbolID:   symbolID,
+			FilePath:   filePath,
+			Line:       ln,
+			Meta:       map[string]any{"event": event, "framework": "nestjs"},
+			Confidence: 0.9,
+		})
 	}
 
 	return contracts

@@ -2,6 +2,8 @@ package contracts
 
 import (
 	"testing"
+
+	"github.com/zzet/gortex/internal/graph"
 )
 
 func TestGraphQLExtractor_SchemaProvider(t *testing.T) {
@@ -90,5 +92,48 @@ mutation {
 	}
 	if !found {
 		t.Errorf("expected contract graphql::Mutation::createUser, got %v", contracts)
+	}
+}
+
+func TestGraphQLNestResolver(t *testing.T) {
+	src := []byte(`import { Resolver, Query, Mutation, Args } from '@nestjs/graphql';
+
+@Resolver(() => User)
+export class UserResolver {
+  @Query(() => [User])
+  users() {
+    return [];
+  }
+
+  @Mutation(() => User, { name: 'addUser' })
+  createUser(@Args('input') input: CreateUserInput) {
+    return null;
+  }
+}
+`)
+	nodes := []*graph.Node{
+		nestMethodNode("r.ts", "users", 6),
+		nestMethodNode("r.ts", "createUser", 11),
+	}
+	cs := (&GraphQLExtractor{}).Extract("r.ts", src, nodes, nil)
+
+	q := nestFindByID(cs, "graphql::Query::users")
+	if q == nil {
+		t.Fatalf("expected graphql::Query::users from @Query, got %+v", cs)
+	}
+	if q.Role != RoleProvider || q.Meta["framework"] != "nestjs" {
+		t.Errorf("query role/framework = %v/%v", q.Role, q.Meta["framework"])
+	}
+	if q.SymbolID != "r.ts::users" {
+		t.Errorf("query handler = %q", q.SymbolID)
+	}
+
+	// Explicit name: option wins over the method name.
+	m := nestFindByID(cs, "graphql::Mutation::addUser")
+	if m == nil {
+		t.Fatalf("expected graphql::Mutation::addUser (explicit name), got %+v", cs)
+	}
+	if m.SymbolID != "r.ts::createUser" {
+		t.Errorf("mutation handler = %q", m.SymbolID)
 	}
 }

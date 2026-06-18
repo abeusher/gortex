@@ -4342,6 +4342,7 @@ func (idx *Indexer) buildPerFileContractExtractors() ([]contracts.Extractor, map
 		&contracts.OpenAPIExtractor{},
 		&contracts.TopicExtractor{},
 		&contracts.WebSocketExtractor{},
+		&contracts.NestMicroserviceExtractor{},
 		&contracts.EnvVarExtractor{},
 	}
 	// Config-driven event bus: only registered when the user declared

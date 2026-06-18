@@ -49,6 +49,11 @@ func (e *GraphQLExtractor) Extract(filePath string, src []byte, nodes []*graph.N
 		contracts = append(contracts, e.extractSchemaProviders(filePath, src)...)
 	}
 
+	// NestJS code-first resolvers (@Query/@Mutation/@Subscription) live in
+	// source files and must run before the consumer-marker prefilter below,
+	// which would otherwise short-circuit a resolver file with no gql tag.
+	contracts = append(contracts, e.extractNestResolvers(filePath, src, nodes)...)
+
 	// Consumer scan: skip entirely when the file has no marker
 	// substring that any consumer regex could possibly match. A
 	// schema-only .graphql file lacks lowercase `query`/`mutation`/
@@ -109,6 +114,59 @@ func (e *GraphQLExtractor) extractSchemaProviders(filePath string, src []byte) [
 	}
 
 	return contracts
+}
+
+// gqlNestOpRe matches a NestJS code-first operation decorator.
+var gqlNestOpRe = regexp.MustCompile(`@(Query|Mutation|Subscription)\s*\(`)
+
+// gqlNestNameRe pulls an explicit `name: 'foo'` option out of the decorator.
+var gqlNestNameRe = regexp.MustCompile(`name:\s*["']([^"']+)["']`)
+
+// extractNestResolvers detects NestJS code-first resolver operations —
+// @Query/@Mutation/@Subscription on a resolver method — and records each as a
+// GraphQL provider. The operation field is the explicit `name:` option when
+// present, otherwise the decorated method's name.
+func (e *GraphQLExtractor) extractNestResolvers(filePath string, src []byte, nodes []*graph.Node) []Contract {
+	text := string(src)
+	if !strings.Contains(text, "@Query(") && !strings.Contains(text, "@Mutation(") && !strings.Contains(text, "@Subscription(") {
+		return nil
+	}
+	lines := strings.Split(text, "\n")
+	fileNodes := filterFileNodes(filePath, nodes)
+
+	var out []Contract
+	for i, line := range lines {
+		m := gqlNestOpRe.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+		opType := m[1] // Query | Mutation | Subscription
+		handlerName, _ := nestHandlerAfter(lines, i)
+		field := ""
+		if nm := gqlNestNameRe.FindStringSubmatch(line); nm != nil {
+			field = nm[1]
+		} else {
+			field = handlerName
+		}
+		if field == "" {
+			continue
+		}
+		symbolID := ""
+		if handlerName != "" {
+			symbolID = findFunctionByName(fileNodes, handlerName)
+		}
+		out = append(out, Contract{
+			ID:         fmt.Sprintf("graphql::%s::%s", opType, field),
+			Type:       ContractGraphQL,
+			Role:       RoleProvider,
+			SymbolID:   symbolID,
+			FilePath:   filePath,
+			Line:       i + 1,
+			Meta:       map[string]any{"operation": opType, "field": field, "framework": "nestjs"},
+			Confidence: 0.9,
+		})
+	}
+	return out
 }
 
 func (e *GraphQLExtractor) extractConsumers(filePath string, src []byte, fileNodes []*graph.Node) []Contract {
