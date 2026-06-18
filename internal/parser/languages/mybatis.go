@@ -111,6 +111,7 @@ func (e *MyBatisExtractor) Extract(filePath string, src []byte) (*parser.Extract
 	dec := xml.NewDecoder(bytes.NewReader(src))
 	dec.Strict = false
 	namespace := ""
+	currentStmt := "" // node ID of the statement / fragment currently open
 	seenID := map[string]bool{}
 
 	for {
@@ -129,6 +130,57 @@ func (e *MyBatisExtractor) Extract(filePath string, src []byte) (*parser.Extract
 				namespace = ns
 				fileNode.Meta = map[string]any{"mybatis_namespace": ns}
 			}
+			continue
+		}
+
+		elemLine := 1 + bytes.Count(src[:clampOffset(dec.InputOffset(), len(src))], []byte{'\n'})
+
+		// `<sql id="…">` is a reusable SQL fragment — a first-class node other
+		// statements `<include refid>` into. It becomes the current element so a
+		// nested `<include>` attributes to it.
+		if local == "sql" {
+			fragID := myBatisAttr(se, "id")
+			if fragID == "" || namespace == "" {
+				continue
+			}
+			fragNodeID := namespace + "::" + fragID
+			if !seenID["sql:"+fragID] {
+				seenID["sql:"+fragID] = true
+				result.Nodes = append(result.Nodes, &graph.Node{
+					ID: fragNodeID, Kind: graph.KindFunction, Name: fragID,
+					QualName: namespace + "." + fragID, FilePath: filePath,
+					StartLine: elemLine, EndLine: elemLine, Language: "mybatis",
+					Meta: map[string]any{
+						"mybatis_namespace": namespace,
+						"mybatis_fragment":  true,
+					},
+				})
+				result.Edges = append(result.Edges, &graph.Edge{
+					From: filePath, To: fragNodeID, Kind: graph.EdgeDefines,
+					FilePath: filePath, Line: elemLine,
+				})
+			}
+			currentStmt = fragNodeID
+			continue
+		}
+
+		// `<include refid="…">` reuses a fragment. A bare refid resolves within
+		// this mapper; a dotted `otherNs.Frag` is a cross-mapper reference,
+		// resolved to that mapper's `otherNs::Frag` node ID.
+		if local == "include" {
+			refid := myBatisAttr(se, "refid")
+			if refid == "" || currentStmt == "" {
+				continue
+			}
+			target := namespace + "::" + refid
+			if i := strings.LastIndexByte(refid, '.'); i >= 0 {
+				target = refid[:i] + "::" + refid[i+1:]
+			}
+			result.Edges = append(result.Edges, &graph.Edge{
+				From: currentStmt, To: target, Kind: graph.EdgeReferences,
+				FilePath: filePath, Line: elemLine,
+				Meta: map[string]any{"via": "mybatis.include", "refid": refid},
+			})
 			continue
 		}
 
@@ -166,7 +218,17 @@ func (e *MyBatisExtractor) Extract(filePath string, src []byte) (*parser.Extract
 				"mybatis_sql":       sql,
 			},
 		}
+		if rt := myBatisAttr(se, "resultType"); rt != "" {
+			stmt.Meta["mybatis_result_type"] = rt
+		}
+		if rm := myBatisAttr(se, "resultMap"); rm != "" {
+			stmt.Meta["mybatis_result_map"] = rm
+		}
+		if pt := myBatisAttr(se, "parameterType"); pt != "" {
+			stmt.Meta["mybatis_parameter_type"] = pt
+		}
 		result.Nodes = append(result.Nodes, stmt)
+		currentStmt = stmtNodeID
 
 		// EdgeDefines from the file so the statement node is contained by
 		// its mapper file (matches every other extractor's file→symbol

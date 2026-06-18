@@ -46,9 +46,9 @@ func TestLiquidExtractor_Basics(t *testing.T) {
 			continue
 		}
 		switch ed.To {
-		case "unresolved::import::header":
+		case "unresolved::import::snippets/header.liquid":
 			gotInclude = true
-		case "unresolved::import::product-card":
+		case "unresolved::import::snippets/product-card.liquid":
 			gotRender = true
 		}
 	}

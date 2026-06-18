@@ -14,11 +14,29 @@ import (
 //   - `{% capture NAME %}...{% endcapture %}` → function nodes
 //   - `{% include 'x' %}` / `{% render 'x' %}` → import edges
 var (
-	liquidAssignRe  = regexp.MustCompile(`(?m)\{%\s*assign\s+([A-Za-z_][\w]*)\s*=`)
-	liquidCaptureRe = regexp.MustCompile(`(?m)\{%\s*capture\s+([A-Za-z_][\w]*)\s*%\}`)
-	liquidIncludeRe = regexp.MustCompile(`(?m)\{%\s*include\s+['"]([^'"]+)['"]`)
-	liquidRenderRe  = regexp.MustCompile(`(?m)\{%\s*render\s+['"]([^'"]+)['"]`)
+	// `-?` after `{%` / before `%}` accepts the whitespace-trimming tag forms
+	// `{%- … -%}` that ship in real Shopify/Jekyll themes.
+	liquidAssignRe  = regexp.MustCompile(`(?m)\{%-?\s*assign\s+([A-Za-z_][\w]*)\s*=`)
+	liquidCaptureRe = regexp.MustCompile(`(?m)\{%-?\s*capture\s+([A-Za-z_][\w]*)\s*-?%\}`)
+	liquidIncludeRe = regexp.MustCompile(`(?m)\{%-?\s*include\s+['"]([^'"]+)['"]`)
+	liquidRenderRe  = regexp.MustCompile(`(?m)\{%-?\s*render\s+['"]([^'"]+)['"]`)
+	liquidSectionRe = regexp.MustCompile(`(?m)\{%-?\s*section\s+['"]([^'"]+)['"]`)
+	liquidSchemaRe  = regexp.MustCompile(`(?m)\{%-?\s*schema\s*-?%\}`)
 )
+
+// liquidSnippetPath / liquidSectionPath normalize a bare render/include/section
+// name to the theme-relative file it resolves to (Shopify layout convention),
+// so the import edge lands on a real cross-file target instead of a bare name.
+func liquidSnippetPath(name string) string { return liquidThemePath("snippets", name) }
+func liquidSectionPath(name string) string { return liquidThemePath("sections", name) }
+
+func liquidThemePath(dir, name string) string {
+	name = strings.TrimSuffix(name, ".liquid")
+	if strings.Contains(name, "/") {
+		return name + ".liquid" // already a path
+	}
+	return dir + "/" + name + ".liquid"
+}
 
 // LiquidExtractor extracts Shopify/Jekyll Liquid templates.
 type LiquidExtractor struct{}
@@ -71,15 +89,43 @@ func (e *LiquidExtractor) Extract(filePath string, src []byte) (*parser.Extracti
 		add(name, graph.KindFunction, line, findKeywordBlockEnd(lines, line, "{% endcapture"))
 	}
 
-	for _, re := range []*regexp.Regexp{liquidIncludeRe, liquidRenderRe} {
+	// render / include reference a snippet; section references a section file —
+	// normalize both to the theme-relative file so the import edge resolves
+	// cross-file to the real partial rather than dangling on a bare name.
+	emitImport := func(re *regexp.Regexp, normalize func(string) string) {
 		for _, m := range re.FindAllSubmatchIndex(src, -1) {
-			mod := string(src[m[2]:m[3]])
+			mod := normalize(string(src[m[2]:m[3]]))
 			line := lineAt(src, m[0])
 			result.Edges = append(result.Edges, &graph.Edge{
 				From: fileNode.ID, To: "unresolved::import::" + mod,
 				Kind: graph.EdgeImports, FilePath: filePath, Line: line,
 			})
 		}
+	}
+	emitImport(liquidIncludeRe, liquidSnippetPath)
+	emitImport(liquidRenderRe, liquidSnippetPath)
+	emitImport(liquidSectionRe, liquidSectionPath)
+
+	// A `{% schema %} … {% endschema %}` block configures a section's settings.
+	// Record that it exists as a redacted constant — never the raw JSON, which
+	// routinely carries credentials / API keys / store-specific values.
+	for _, m := range liquidSchemaRe.FindAllSubmatchIndex(src, -1) {
+		line := lineAt(src, m[0])
+		id := filePath + "::schema"
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		result.Nodes = append(result.Nodes, &graph.Node{
+			ID: id, Kind: graph.KindConstant, Name: "schema",
+			FilePath: filePath, StartLine: line,
+			EndLine:  findKeywordBlockEnd(lines, line, "{%- endschema"),
+			Language: "liquid",
+			Meta:     map[string]any{"liquid_schema": true, "value_redacted": true},
+		})
+		result.Edges = append(result.Edges, &graph.Edge{
+			From: fileNode.ID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: line,
+		})
 	}
 
 	return result, nil
