@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -30,9 +31,27 @@ type contentTransform interface {
 	asLanguage() string
 }
 
+// preParseTransform rewrites a file's bytes before extraction WITHOUT moving
+// any byte — its output is the same length as its input, so every offset (and
+// therefore every symbol's line/column) is preserved against the original
+// file. This is the slot for neutralising a parser-hostile span: blanking it
+// to spaces lets the grammar parse the surrounding code while positions stay
+// exact. It runs ahead of the offset-shifting contentTransforms (BOM strip,
+// command rewrites), so a pre-parse transform always sees the original layout.
+type preParseTransform interface {
+	name() string
+	matches(path string) bool
+	// rewrite returns the transformed bytes. It MUST return a slice the same
+	// length as src; the pipeline discards (and logs) a length-changing result
+	// so the offset-preservation guarantee can never be silently violated.
+	rewrite(path string, src []byte) []byte
+}
+
 // transformPipeline applies an ordered list of content transforms to a
-// file's bytes before the parser sees them.
+// file's bytes before the parser sees them. The offset-preserving prePass
+// slot runs first, then the offset-shifting transforms.
 type transformPipeline struct {
+	prePass    []preParseTransform
 	transforms []contentTransform
 	logger     *zap.Logger
 }
@@ -45,6 +64,9 @@ func newTransformPipeline(rules []config.TransformRule, logger *zap.Logger) *tra
 		logger = zap.NewNop()
 	}
 	p := &transformPipeline{logger: logger}
+	// Offset-preserving pre-parse slot: built-ins that blank parser-hostile
+	// spans to spaces without shifting positions.
+	p.prePass = append(p.prePass, csharpPreprocBlankTransform{})
 	p.transforms = append(p.transforms, bomStripTransform{})
 	for _, r := range rules {
 		if len(r.Command) == 0 {
@@ -57,6 +79,13 @@ func newTransformPipeline(rules []config.TransformRule, logger *zap.Logger) *tra
 	return p
 }
 
+// addPrePass registers an offset-preserving pre-parse transform. Pre-parse
+// transforms run before the offset-shifting ones and their length is enforced
+// by run.
+func (p *transformPipeline) addPrePass(t preParseTransform) {
+	p.prePass = append(p.prePass, t)
+}
+
 // run applies every matching transform to src in order. A transform
 // that errors is logged and skipped — the bytes from the previous
 // stage are kept, so one failing processor never drops a file.
@@ -65,6 +94,22 @@ func (p *transformPipeline) run(path string, src []byte) []byte {
 		return src
 	}
 	out := src
+	// Offset-preserving pre-parse slot first: these neutralise parser-hostile
+	// spans without moving any byte, so the offset-shifting transforms below
+	// still see the original layout and positions stay exact.
+	for _, t := range p.prePass {
+		if !t.matches(path) {
+			continue
+		}
+		res := t.rewrite(path, out)
+		if len(res) != len(out) {
+			p.logger.Warn("indexer: pre-parse transform changed length; dropped to preserve offsets",
+				zap.String("transform", t.name()), zap.String("file", path),
+				zap.Int("want_len", len(out)), zap.Int("got_len", len(res)))
+			continue
+		}
+		out = res
+	}
 	for _, t := range p.transforms {
 		if !t.matches(path) {
 			continue
@@ -231,4 +276,54 @@ func (c *commandTransform) apply(_ string, src []byte) ([]byte, error) {
 		return nil, err
 	}
 	return out.Bytes(), nil
+}
+
+// --- built-in pre-parse: C# conditional-compilation directive blank ------
+
+// csharpPreprocRe matches a C# conditional-compilation directive line —
+// `#if` / `#elif` / `#else` / `#endif`, the first non-space token on its line
+// (a C# requirement, so anchored to line start) through end of line. The
+// structural directives `#region` / `#pragma` / `#nullable` / `#define` parse
+// fine and are deliberately left alone.
+var csharpPreprocRe = regexp.MustCompile(`(?m)^[ \t]*#[ \t]*(?:if|elif|else|endif)\b[^\n]*`)
+
+// csharpPreprocBlankTransform blanks C# conditional-compilation directive
+// lines to spaces before parsing. The shipped tree-sitter C# grammar
+// mis-parses some preprocessor forms; blanking the directive lines — while
+// keeping the guarded code on both branches of an `#if/#else`, the right
+// default for a code graph that indexes every symbol regardless of build
+// flags — sidesteps it. Replacement is space-for-character with tabs and
+// newlines kept, so the file's length and every symbol's line/column stay
+// exact: an offset-preserving pre-parse transform.
+type csharpPreprocBlankTransform struct{}
+
+func (csharpPreprocBlankTransform) name() string { return "csharp-preproc-blank" }
+
+func (csharpPreprocBlankTransform) matches(path string) bool {
+	return strings.EqualFold(filepath.Ext(path), ".cs")
+}
+
+func (csharpPreprocBlankTransform) rewrite(_ string, src []byte) []byte {
+	return blankCSharpPreprocDirectives(src)
+}
+
+// blankCSharpPreprocDirectives replaces every conditional-compilation
+// directive line's characters with spaces (tabs and newlines preserved),
+// keeping the byte length identical. Returns src unchanged when it holds no
+// `#` at all.
+func blankCSharpPreprocDirectives(src []byte) []byte {
+	if !bytes.ContainsRune(src, '#') {
+		return src
+	}
+	return csharpPreprocRe.ReplaceAllFunc(src, func(m []byte) []byte {
+		out := make([]byte, len(m))
+		for i, b := range m {
+			if b == '\t' {
+				out[i] = '\t' // keep tab columns
+			} else {
+				out[i] = ' '
+			}
+		}
+		return out
+	})
 }
