@@ -369,13 +369,19 @@ func (e *CppExtractor) emitFunction(m parser.QueryResult, filePath, fileID strin
 
 func (e *CppExtractor) emitInclude(m parser.QueryResult, filePath, fileID string, result *parser.ExtractionResult) {
 	pathCap := m.Captures["include.path"]
-	includePath := strings.Trim(pathCap.Text, `"<>`)
+	raw := strings.TrimSpace(pathCap.Text)
+	kind := "system"
+	if strings.HasPrefix(raw, `"`) {
+		kind = "quoted"
+	}
+	includePath := strings.Trim(raw, `"<>`)
 	result.Edges = append(result.Edges, &graph.Edge{
 		From:     fileID,
 		To:       "unresolved::import::" + includePath,
 		Kind:     graph.EdgeImports,
 		FilePath: filePath,
 		Line:     pathCap.StartLine + 1,
+		Meta:     map[string]any{"include_kind": kind},
 	})
 }
 

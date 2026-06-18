@@ -69,3 +69,25 @@ func TestObjCExtractor_EmptyInput(t *testing.T) {
 	require.Len(t, res.Nodes, 1)
 	assert.Equal(t, graph.KindFile, res.Nodes[0].Kind)
 }
+
+// TestObjcPropertyTypeAndReceiver is part of the C11 set: an @property is a
+// fully-attributed field — carrying its declared type and owning class.
+func TestObjcPropertyTypeAndReceiver(t *testing.T) {
+	src := []byte("@interface Widget : NSObject\n" +
+		"@property (nonatomic, strong) NSString *title;\n" +
+		"@property NSInteger count;\n" +
+		"@end\n")
+	res, err := NewObjCExtractor().Extract("W.m", src)
+	require.NoError(t, err)
+	byName := map[string]*graph.Node{}
+	for _, n := range res.Nodes {
+		if n.Kind == graph.KindField {
+			byName[n.Name] = n
+		}
+	}
+	require.NotNil(t, byName["title"])
+	assert.Equal(t, "NSString", byName["title"].Meta["field_type"])
+	assert.Equal(t, "W.m::Widget", byName["title"].Meta["receiver"])
+	require.NotNil(t, byName["count"])
+	assert.Equal(t, "NSInteger", byName["count"].Meta["field_type"])
+}

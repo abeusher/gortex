@@ -172,23 +172,26 @@ func (e *ObjCExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 		})
 	}
 
-	emitImport := func(mod string, line int) {
+	emitImport := func(mod string, line int, kind string) {
 		if mod == "" {
 			return
 		}
 		result.Edges = append(result.Edges, &graph.Edge{
 			From: fileNode.ID, To: "unresolved::import::" + mod,
 			Kind: graph.EdgeImports, FilePath: filePath, Line: line,
+			Meta: map[string]any{"include_kind": kind},
 		})
 	}
+	// `#import "Foo.h"` is a local (quoted) include; `#import <X>` / `@import X`
+	// are system / module imports.
 	for _, m := range objcImportQRe.FindAllSubmatchIndex(src, -1) {
-		emitImport(string(src[m[2]:m[3]]), lineAt(src, m[0]))
+		emitImport(string(src[m[2]:m[3]]), lineAt(src, m[0]), "quoted")
 	}
 	for _, m := range objcImportARe.FindAllSubmatchIndex(src, -1) {
-		emitImport(string(src[m[2]:m[3]]), lineAt(src, m[0]))
+		emitImport(string(src[m[2]:m[3]]), lineAt(src, m[0]), "system")
 	}
 	for _, m := range objcAtImportRe.FindAllSubmatchIndex(src, -1) {
-		emitImport(string(src[m[2]:m[3]]), lineAt(src, m[0]))
+		emitImport(string(src[m[2]:m[3]]), lineAt(src, m[0]), "module")
 	}
 
 	// Message-send call edges: attribute each [recv selector:...] to the method
@@ -210,7 +213,9 @@ func (e *ObjCExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 		return objcEnclosing(methodRanges, line)
 	}, filePath, "objc", result)
 
-	// @property declarations become field members of their enclosing class.
+	// @property declarations become field members of their enclosing class,
+	// carrying the declared type and the owning class so the property is a
+	// fully-attributed field, not a bare name.
 	classRanges := objcClassRanges(src, lines, filePath)
 	for _, m := range objcPropertyRe.FindAllSubmatchIndex(src, -1) {
 		name := string(src[m[2]:m[3]])
@@ -220,14 +225,26 @@ func (e *ObjCExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 			continue
 		}
 		seen[propID] = true
-		result.Nodes = append(result.Nodes, &graph.Node{
+		owner := objcEnclosing(classRanges, line)
+		meta := map[string]any{}
+		if owner != "" {
+			meta["receiver"] = owner
+		}
+		if ft := objcPropertyType(string(src[m[0]:m[2]])); ft != "" {
+			meta["field_type"] = ft
+		}
+		node := &graph.Node{
 			ID: propID, Kind: graph.KindField, Name: name,
 			FilePath: filePath, StartLine: line, EndLine: line, Language: "objc",
-		})
+		}
+		if len(meta) > 0 {
+			node.Meta = meta
+		}
+		result.Nodes = append(result.Nodes, node)
 		result.Edges = append(result.Edges, &graph.Edge{
 			From: fileNode.ID, To: propID, Kind: graph.EdgeDefines, FilePath: filePath, Line: line,
 		})
-		if owner := objcEnclosing(classRanges, line); owner != "" {
+		if owner != "" {
 			result.Edges = append(result.Edges, &graph.Edge{
 				From: propID, To: owner, Kind: graph.EdgeMemberOf, FilePath: filePath, Line: line,
 			})
@@ -247,6 +264,26 @@ func (e *ObjCExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 // objcBuildSelector takes the captured argument-slice of a method
 // signature and returns the canonical selector with trailing colons
 // for each keyword part, e.g. `fooWith:andBar:`.
+// objcPropertyType extracts the declared type from an @property line prefix
+// (the text up to the property name): strips `@property`, the attribute list,
+// and the trailing pointer/whitespace, leaving e.g. "NSString" from
+// `@property (nonatomic) NSString *`.
+func objcPropertyType(prefix string) string {
+	i := strings.Index(prefix, "@property")
+	if i < 0 {
+		return ""
+	}
+	s := strings.TrimSpace(prefix[i+len("@property"):])
+	if strings.HasPrefix(s, "(") {
+		if j := strings.IndexByte(s, ')'); j >= 0 {
+			s = s[j+1:]
+		}
+	}
+	s = strings.TrimSpace(s)
+	s = strings.TrimRight(s, " \t*")
+	return strings.TrimSpace(s)
+}
+
 func objcBuildSelector(raw string) string {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {

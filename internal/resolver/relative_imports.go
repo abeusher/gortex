@@ -21,9 +21,11 @@ import (
 // target file is not in the graph stay as `external::*` so the
 // module-attribution pass can decide what to do with them.
 func (r *Resolver) resolveRelativeImports() {
-	// Python/Dart relative-import resolution only; skip the File-node +
-	// edge walk when the graph has neither language.
-	if !r.graphHasLanguage("python") && !r.graphHasLanguage("dart") {
+	// Relative-import resolution for Python / Dart relative imports and
+	// C-family quoted includes; skip the File-node + edge walk when the graph
+	// has none of those languages.
+	if !r.graphHasLanguage("python") && !r.graphHasLanguage("dart") &&
+		!r.graphHasLanguage("c") && !r.graphHasLanguage("cpp") && !r.graphHasLanguage("objc") {
 		return
 	}
 	fileLang := r.collectFileLanguages()
@@ -49,6 +51,23 @@ func (r *Resolver) resolveRelativeImports() {
 		for _, cand := range []string{stem + ".py", stem + "/__init__.py"} {
 			if _, ok := fileIDs[cand]; ok {
 				return cand
+			}
+		}
+		return ""
+	}
+	resolveCInclude := func(importingFile, rel string) string {
+		if rel == "" {
+			return ""
+		}
+		dir := ""
+		if i := strings.LastIndex(importingFile, "/"); i >= 0 {
+			dir = importingFile[:i]
+		}
+		for _, cand := range []string{joinRelativePath(dir, rel), joinRelativePath(dir, "./"+rel)} {
+			if cand != "" {
+				if _, ok := fileIDs[cand]; ok {
+					return cand
+				}
 			}
 		}
 		return ""
@@ -102,7 +121,18 @@ func (r *Resolver) resolveRelativeImports() {
 				resolved = resolveDart(e.From, path)
 			}
 		default:
-			continue
+			// C-family quoted include: `#include "foo.h"` / `#import "Foo.h"`
+			// resolves relative to the including file's directory.
+			if lang == "c" || lang == "cpp" || lang == "objc" {
+				if k, _ := e.Meta["include_kind"].(string); k == "quoted" &&
+					strings.HasPrefix(e.To, "unresolved::import::") {
+					path = strings.TrimPrefix(e.To, "unresolved::import::")
+					resolved = resolveCInclude(e.From, path)
+				}
+			}
+			if resolved == "" {
+				continue
+			}
 		}
 		if resolved == "" {
 			// pyrel:: edges that don't find an internal target are

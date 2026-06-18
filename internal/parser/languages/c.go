@@ -261,16 +261,23 @@ func (e *CExtractor) emitKindType(m parser.QueryResult, prefix, filePath, fileID
 
 func (e *CExtractor) emitInclude(m parser.QueryResult, filePath, fileID string, result *parser.ExtractionResult) {
 	pathCap := m.Captures["include.path"]
-	// Strip quotes or angle brackets: "foo.h" -> foo.h, <stdio.h> -> stdio.h
-	includePath := pathCap.Text
-	includePath = strings.Trim(includePath, `"`)
-	includePath = strings.Trim(includePath, "<>")
+	// `"foo.h"` is a local (quoted) include — resolvable relative to the
+	// including file; `<stdio.h>` is a system include. Recording which kind it
+	// is lets the resolver bind local includes to real file nodes and leave
+	// system headers external (codegraph treats both identically).
+	raw := strings.TrimSpace(pathCap.Text)
+	kind := "system"
+	if strings.HasPrefix(raw, `"`) {
+		kind = "quoted"
+	}
+	includePath := strings.Trim(strings.Trim(raw, `"`), "<>")
 	result.Edges = append(result.Edges, &graph.Edge{
 		From:     fileID,
 		To:       "unresolved::import::" + includePath,
 		Kind:     graph.EdgeImports,
 		FilePath: filePath,
 		Line:     pathCap.StartLine + 1,
+		Meta:     map[string]any{"include_kind": kind},
 	})
 }
 

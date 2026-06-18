@@ -164,3 +164,29 @@ func TestJoinRelativePath_VariousShapes(t *testing.T) {
 		require.Equal(t, c.want, got, "dir=%q rel=%q", c.dir, c.rel)
 	}
 }
+
+// TestResolveRelativeImports_CQuotedInclude pins the C11 C-include resolution:
+// a quoted `#include "bar.h"` (Meta include_kind=quoted) lands on the local
+// header file node; a system include is left external.
+func TestResolveRelativeImports_CQuotedInclude(t *testing.T) {
+	g := graph.New()
+	seedFile(g, "src/main.c", "c")
+	seedFile(g, "src/bar.h", "c")
+
+	quoted := &graph.Edge{
+		From: "src/main.c", To: "unresolved::import::bar.h", Kind: graph.EdgeImports,
+		Meta: map[string]any{"include_kind": "quoted"},
+	}
+	system := &graph.Edge{
+		From: "src/main.c", To: "unresolved::import::stdio.h", Kind: graph.EdgeImports,
+		Meta: map[string]any{"include_kind": "system"},
+	}
+	g.AddEdge(quoted)
+	g.AddEdge(system)
+
+	r := New(g)
+	r.resolveRelativeImports()
+
+	assert.Equal(t, "src/bar.h", quoted.To, "quoted include resolves to the local header")
+	assert.Equal(t, "unresolved::import::stdio.h", system.To, "system include stays external")
+}

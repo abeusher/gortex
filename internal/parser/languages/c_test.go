@@ -261,3 +261,41 @@ int main(int argc, char* argv[]) {
 	calls := edgesOfKind(result.Edges, graph.EdgeCalls)
 	assert.GreaterOrEqual(t, len(calls), 1)
 }
+
+// TestIncludeKindClassification is part of the C11 set: a quoted #include is a
+// local include (resolvable), an angle #include is a system header — each is
+// tagged on the import edge so the resolver can bind locals and leave system
+// headers external.
+func TestIncludeKindClassification(t *testing.T) {
+	src := []byte("#include \"local.h\"\n#include <stdio.h>\nint main(){return 0;}\n")
+	res, err := NewCExtractor().Extract("src/main.c", src)
+	require.NoError(t, err)
+	kinds := map[string]string{}
+	for _, e := range res.Edges {
+		if e.Kind == graph.EdgeImports {
+			k, _ := e.Meta["include_kind"].(string)
+			kinds[e.To] = k
+		}
+	}
+	assert.Equal(t, "quoted", kinds["unresolved::import::local.h"])
+	assert.Equal(t, "system", kinds["unresolved::import::stdio.h"])
+}
+
+// TestMisparseSkipButVisit is part of the C11 set: a construct the grammar
+// cannot parse (here an unknown macro-shaped declaration) does not stop
+// extraction — the valid functions around it are still recovered.
+func TestMisparseSkipButVisit(t *testing.T) {
+	src := []byte("int before(){return 1;}\n" +
+		"WEIRD_MACRO_DECL(@@@ not valid c @@@);\n" +
+		"int after(){return 2;}\n")
+	res, err := NewCExtractor().Extract("m.c", src)
+	require.NoError(t, err)
+	names := map[string]bool{}
+	for _, n := range res.Nodes {
+		if n.Kind == graph.KindFunction {
+			names[n.Name] = true
+		}
+	}
+	assert.True(t, names["before"], "function before the misparse survives")
+	assert.True(t, names["after"], "function after the misparse survives")
+}
