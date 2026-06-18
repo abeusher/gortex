@@ -40,11 +40,29 @@ const qRubyAll = `
   (call
     method: (identifier) @call.name) @call.expr
 
+  (body_statement
+    (identifier) @bare.name) @bare.stmt
+
   (assignment
     left: (constant) @const.name
     right: (_) @const.value) @const.def
 ]
 `
+
+// rubyVisibilityMarkers are the Module visibility macros — recognised both as
+// the section markers that flip subsequent method visibility and (in their
+// bare form) excluded from the bare-call surface so they don't read as calls.
+var rubyVisibilityMarkers = map[string]string{
+	"private":         VisibilityPrivate,
+	"protected":       VisibilityProtected,
+	"public":          VisibilityPublic,
+	"module_function": VisibilityPrivate,
+	"private_class_method": VisibilityPrivate,
+}
+
+// rubyMixinMacros are the module-composition macros: a class/module that calls
+// one with a constant argument composes that module.
+var rubyMixinMacros = map[string]bool{"include": true, "extend": true, "prepend": true}
 
 // RubyExtractor extracts Ruby source files into graph nodes and edges.
 type RubyExtractor struct {
@@ -125,6 +143,16 @@ func (e *RubyExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 				return
 			}
 			expr := m.Captures["call.expr"]
+			// Mixin composition: include/extend/prepend <Module> inside a
+			// class/module body composes that module — emit a traversable
+			// composition edge instead of a generic call to `include`.
+			if rubyMixinMacros[name] {
+				if typeID, ok := rubyEnclosingTypeID(expr.Node, src, filePath); ok {
+					if e.emitRubyMixin(name, typeID, expr.Node, src, filePath, expr.StartLine+1, result) {
+						return
+					}
+				}
+			}
 			hasRecv := false
 			if expr.Node != nil {
 				if expr.Node.ChildByFieldName("receiver") != nil {
@@ -137,6 +165,18 @@ func (e *RubyExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 				hasRecv:     hasRecv,
 				returnUsage: classifyReturnUsage(expr.Node, src, rubyReturnUsageSpec),
 			})
+
+		case m.Captures["bare.stmt"] != nil:
+			// A bare identifier in statement position is a paren-less,
+			// receiver-less method call (a DSL macro / lifecycle hook like
+			// `save`, `reload`, `validate`). Visibility markers are excluded —
+			// they are handled by the visibility pass, not as calls.
+			cap := m.Captures["bare.name"]
+			bname := cap.Text
+			if _, isVis := rubyVisibilityMarkers[bname]; isVis {
+				return
+			}
+			calls = append(calls, rubyDeferredCall{name: bname, line: cap.StartLine + 1})
 
 		case m.Captures["const.def"] != nil:
 			e.emitConstant(m, filePath, fileID, result, seen)
@@ -165,9 +205,129 @@ func (e *RubyExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 	// Rails-style callback dispatch — preserves legacy behaviour exactly.
 	emitRailsCallbacks(root, src, filePath, result)
 
+	// Method visibility: walk each type body in order so a `private` /
+	// `protected` section marker (and the targeted `private :foo` form) flips
+	// the visibility of the methods it governs.
+	applyRubyVisibility(root, src, filePath, result)
+
 	captureValueRefCandidates(result, root, filePath, src)
 	captureFnValueCandidates(result, root, filePath, src)
 	return result, nil
+}
+
+// rubyEnclosingTypeID walks up from node to the nearest enclosing class/module
+// and returns its node ID, or ok=false when node is not inside a type body.
+func rubyEnclosingTypeID(node *sitter.Node, src []byte, filePath string) (string, bool) {
+	for n := node; n != nil; n = n.Parent() {
+		if t := n.Type(); t == "class" || t == "module" {
+			if name := n.ChildByFieldName("name"); name != nil {
+				return filePath + "::" + name.Content(src), true
+			}
+			return "", false
+		}
+	}
+	return "", false
+}
+
+// emitRubyMixin emits a composition edge (EdgeExtends, Meta via=include/extend/
+// prepend) from typeID to each constant argument of an include/extend/prepend
+// call, so the mixed-in module's members are reachable through the type — a
+// dependency a plain call to `include` would hide. Returns true if it emitted.
+func (e *RubyExtractor) emitRubyMixin(macro, typeID string, call *sitter.Node, src []byte, filePath string, line int, result *parser.ExtractionResult) bool {
+	args := call.ChildByFieldName("arguments")
+	if args == nil {
+		return false
+	}
+	emitted := false
+	for i := 0; i < int(args.NamedChildCount()); i++ {
+		arg := args.NamedChild(i)
+		if arg.Type() != "constant" && arg.Type() != "scope_resolution" {
+			continue
+		}
+		mod := strings.TrimSpace(arg.Content(src))
+		if mod == "" {
+			continue
+		}
+		result.Edges = append(result.Edges, &graph.Edge{
+			From: typeID, To: "unresolved::" + mod, Kind: graph.EdgeExtends,
+			FilePath: filePath, Line: line, Meta: map[string]any{"via": macro},
+		})
+		emitted = true
+	}
+	return emitted
+}
+
+// applyRubyVisibility walks every class/module body in source order, tracking
+// the active visibility section and the targeted `private :sym` forms, and
+// stamps each method node's Meta["visibility"].
+func applyRubyVisibility(root *sitter.Node, src []byte, filePath string, result *parser.ExtractionResult) {
+	methodByID := map[string]*graph.Node{}
+	for _, n := range result.Nodes {
+		if n != nil && n.Kind == graph.KindMethod {
+			methodByID[n.ID] = n
+		}
+	}
+	if len(methodByID) == 0 {
+		return
+	}
+	var walk func(n *sitter.Node)
+	walk = func(n *sitter.Node) {
+		for i := 0; i < int(n.NamedChildCount()); i++ {
+			c := n.NamedChild(i)
+			if c.Type() == "class" || c.Type() == "module" {
+				nameNode := c.ChildByFieldName("name")
+				body := c.ChildByFieldName("body")
+				if nameNode != nil && body != nil {
+					applyRubyBodyVisibility(body, src, filePath, nameNode.Content(src), methodByID)
+				}
+			}
+			walk(c)
+		}
+	}
+	walk(root)
+}
+
+// applyRubyBodyVisibility applies the in-order visibility rules to one type body.
+func applyRubyBodyVisibility(body *sitter.Node, src []byte, filePath, className string, methodByID map[string]*graph.Node) {
+	current := VisibilityPublic
+	setVis := func(method string, vis string) {
+		if n := methodByID[filePath+"::"+className+"."+method]; n != nil {
+			if n.Meta == nil {
+				n.Meta = map[string]any{}
+			}
+			n.Meta["visibility"] = vis
+		}
+	}
+	for i := 0; i < int(body.NamedChildCount()); i++ {
+		c := body.NamedChild(i)
+		switch c.Type() {
+		case "identifier":
+			if vis, ok := rubyVisibilityMarkers[c.Content(src)]; ok {
+				current = vis
+			}
+		case "call":
+			method := ""
+			if mn := c.ChildByFieldName("method"); mn != nil {
+				method = mn.Content(src)
+			}
+			vis, ok := rubyVisibilityMarkers[method]
+			if !ok {
+				continue
+			}
+			// Targeted form `private :a, :b` — flip only the named methods.
+			if args := c.ChildByFieldName("arguments"); args != nil {
+				for i := 0; i < int(args.NamedChildCount()); i++ {
+					for _, sym := range collectRubySymbols(args.NamedChild(i), src) {
+						setVis(sym, vis)
+					}
+				}
+			}
+		case "method":
+			if nm := c.ChildByFieldName("name"); nm != nil {
+				setVis(nm.Content(src), current)
+			}
+		}
+	}
 }
 
 // --- Per-match emit helpers -----------------------------------------

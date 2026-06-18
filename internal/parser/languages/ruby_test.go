@@ -241,3 +241,48 @@ end
 		t.Fatalf("hello.vis = %q", hello.Meta["visibility"])
 	}
 }
+
+// TestRubyExtractor_MixinsBareCallsVisibility is the C5 test: include/extend/
+// prepend produce module-composition edges, a bare receiver-less call becomes a
+// call edge, and private/protected section markers (and the targeted form) set
+// method visibility.
+func TestRubyExtractor_MixinsBareCallsVisibility(t *testing.T) {
+	src := []byte("class Foo\n" +
+		"  include Comparable\n" +
+		"  prepend Loggable\n" +
+		"  def pub; helper; end\n" +
+		"  private\n" +
+		"  def sec; end\n" +
+		"  public\n" +
+		"  def pub2; end\n" +
+		"  private :pub2\n" +
+		"end\n")
+	res, err := NewRubyExtractor().Extract("foo.rb", src)
+	require.NoError(t, err)
+
+	vis := map[string]string{}
+	for _, n := range res.Nodes {
+		if n.Kind == graph.KindMethod {
+			v, _ := n.Meta["visibility"].(string)
+			vis[n.Name] = v
+		}
+	}
+	assert.Equal(t, "public", vis["pub"], "pub before any marker is public")
+	assert.Equal(t, "private", vis["sec"], "sec after `private` is private")
+	assert.Equal(t, "private", vis["pub2"], "pub2 flipped private by the targeted `private :pub2`")
+
+	mixins := map[string]string{}
+	var sawBareCall bool
+	for _, e := range res.Edges {
+		if e.Kind == graph.EdgeExtends && e.From == "foo.rb::Foo" && e.Meta != nil {
+			via, _ := e.Meta["via"].(string)
+			mixins[e.To] = via
+		}
+		if e.Kind == graph.EdgeCalls && e.From == "foo.rb::Foo.pub" && e.To == "unresolved::helper" {
+			sawBareCall = true
+		}
+	}
+	assert.Equal(t, "include", mixins["unresolved::Comparable"], "include composes Comparable")
+	assert.Equal(t, "prepend", mixins["unresolved::Loggable"], "prepend composes Loggable")
+	assert.True(t, sawBareCall, "a bare `helper` call should produce a call edge")
+}
