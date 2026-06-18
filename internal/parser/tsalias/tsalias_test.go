@@ -147,3 +147,76 @@ func TestLoad_MalformedConfigSkipped(t *testing.T) {
 	// Should not panic; should return nil because no usable config.
 	assert.Nil(t, Load(dir))
 }
+
+func tsaliasWrite(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestJSONCTolerantAliasResolution verifies a tsconfig using // and /* */
+// comments and trailing commas still yields its aliases (instead of dropping
+// every alias for the repo), and that a multi-target alias resolves to the
+// target that actually exists on disk rather than blindly to the first.
+func TestJSONCTolerantAliasResolution(t *testing.T) {
+	root := t.TempDir()
+	cfg := `{
+  // path aliases for the app
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      /* first target does not exist; second does */
+      "@/*": ["nonexistent/*", "src/*"],
+      "$config": ["src/config.ts"],
+    },
+  },
+}`
+	tsaliasWrite(t, filepath.Join(root, "tsconfig.json"), cfg)
+	tsaliasWrite(t, filepath.Join(root, "src", "Button.ts"), "export const Button = 1;")
+	tsaliasWrite(t, filepath.Join(root, "src", "config.ts"), "export const c = 1;")
+
+	col := Load(root)
+	require.NotNil(t, col, "JSONC tsconfig must still produce a collection")
+	m := col.FindForFile("app.ts")
+	require.NotNil(t, m)
+	require.NotEmpty(t, m.Entries, "comments / trailing commas must not wipe the aliases")
+
+	// Disk-grounded multi-target: @/Button resolves to the existing src/Button,
+	// not the first (nonexistent) target.
+	assert.Equal(t, "src/Button", Resolve(m, "@/Button"))
+	assert.Equal(t, "src/config", Resolve(m, "$config"))
+
+	// An import with no matching alias still resolves to "".
+	assert.Equal(t, "", Resolve(m, "react"))
+}
+
+// TestStripJSONCPreservesStrings ensures the stripper never touches
+// comment-like or comma sequences inside string literals.
+func TestStripJSONCPreservesStrings(t *testing.T) {
+	in := []byte(`{"a": "http://x.y/* z", "b": "trailing,", /* c */ "d": 1,}`)
+	out := string(stripJSONC(in))
+	if !contains(out, `"http://x.y/* z"`) {
+		t.Fatalf("string content was mangled: %s", out)
+	}
+	if !contains(out, `"trailing,"`) {
+		t.Fatalf("comma inside string was stripped: %s", out)
+	}
+	if contains(out, "/* c */") {
+		t.Fatalf("block comment survived: %s", out)
+	}
+}
+
+func contains(s, sub string) bool {
+	return len(s) >= len(sub) && (func() bool {
+		for i := 0; i+len(sub) <= len(s); i++ {
+			if s[i:i+len(sub)] == sub {
+				return true
+			}
+		}
+		return false
+	})()
+}

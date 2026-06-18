@@ -26,13 +26,16 @@
 //   - Targets are joined with `baseUrl` (if set) and returned without
 //     the trailing `.ts/.tsx/.js/.jsx/.mts/.cts` extension — callers
 //     reuse the same probing logic as relative imports.
-//   - Multi-target arrays (`"@/*": ["a/*", "b/*"]`) take the first
-//     entry; resolving by disk existence would require a stat per
-//     candidate and the first entry is the documented "primary" path.
+//   - Multi-target arrays (`"@/*": ["a/*", "b/*"]`) are resolved by disk
+//     existence: each candidate is probed under the repo root in priority
+//     order and the first that exists on disk wins, falling back to the
+//     first entry (the documented "primary" path) when none do.
 //
-// The package is intentionally narrow — no JSON-with-comments support,
-// no `extends:` chain following, no monorepo `references[]` traversal.
-// Those can be layered on without touching the resolver API.
+// tsconfig JSONC features the TypeScript tooling itself accepts — `//` and
+// `/* */` comments and trailing commas — are stripped before parsing, so a
+// commented config does not silently drop every alias for the repo. The
+// package still does not follow `extends:` chains or monorepo `references[]`
+// traversal; those can be layered on without touching the resolver API.
 package tsalias
 
 import (
@@ -52,10 +55,25 @@ type Alias struct {
 	AliasPrefix string
 	// AliasSuffix is the portion after `*`. Usually empty.
 	AliasSuffix string
-	// TargetPrefix / TargetSuffix split the resolved value the same way.
+	// TargetPrefix / TargetSuffix split the primary (first) resolved value
+	// the same way. Retained as the single-target fast path and so an
+	// externally hand-built Alias keeps working.
 	TargetPrefix string
 	TargetSuffix string
-	HasWildcard  bool
+	// Targets is every replacement value for this pattern, in tsconfig
+	// priority order, each split into prefix/suffix. When non-empty and a
+	// repo root is known, Resolve probes them on disk and returns the first
+	// that exists, falling back to Targets[0] — so a multi-target alias
+	// lands on the file that actually exists, not blindly on the first
+	// entry. Empty for a hand-built single-target Alias (TargetPrefix wins).
+	Targets     []AliasTarget
+	HasWildcard bool
+}
+
+// AliasTarget is one replacement value split around its `*`.
+type AliasTarget struct {
+	Prefix string
+	Suffix string
 }
 
 // Map is the alias set declared by one tsconfig/jsconfig file.
@@ -68,6 +86,10 @@ type Map struct {
 	// DirPrefix is the repo-relative path of the config file's
 	// directory. Used by Collection to pick the nearest ancestor scope.
 	DirPrefix string
+	// repoRoot is the absolute repository root, set by Load, used to
+	// disk-probe multi-target aliases. Empty for hand-built maps, which
+	// then resolve by first-match without touching the filesystem.
+	repoRoot string
 }
 
 // Collection aggregates every alias map found by Load, sorted by
@@ -106,37 +128,95 @@ func Resolve(m *Map, modulePath string) string {
 	if m == nil || modulePath == "" {
 		return ""
 	}
-	for _, a := range m.Entries {
-		var matched string
-		if a.HasWildcard {
-			if len(modulePath) < len(a.AliasPrefix)+len(a.AliasSuffix) {
-				continue
-			}
-			if !strings.HasPrefix(modulePath, a.AliasPrefix) {
-				continue
-			}
-			if !strings.HasSuffix(modulePath, a.AliasSuffix) {
-				continue
-			}
-			star := modulePath[len(a.AliasPrefix) : len(modulePath)-len(a.AliasSuffix)]
-			matched = a.TargetPrefix + star + a.TargetSuffix
-		} else {
-			if modulePath != a.AliasPrefix {
-				continue
-			}
-			matched = a.TargetPrefix
+	for i := range m.Entries {
+		a := &m.Entries[i]
+		star, ok := matchAlias(a, modulePath)
+		if !ok {
+			continue
 		}
-		// Join with BaseURL relative to the config's directory.
-		joined := matched
-		if m.BaseURL != "" {
-			joined = filepath.ToSlash(filepath.Join(m.BaseURL, matched))
+		targets := a.Targets
+		if len(targets) == 0 {
+			targets = []AliasTarget{{Prefix: a.TargetPrefix, Suffix: a.TargetSuffix}}
 		}
-		if m.DirPrefix != "" {
-			joined = filepath.ToSlash(filepath.Join(m.DirPrefix, joined))
+		first := ""
+		for ti, tgt := range targets {
+			joined := m.joinTarget(tgt.Prefix + star + tgt.Suffix)
+			stripped := stripExt(joined)
+			if ti == 0 {
+				first = stripped
+			}
+			// Disk-grounded multi-target: return the first candidate that
+			// actually exists. Skipped for hand-built maps (no repoRoot),
+			// which fall through to the documented primary path.
+			if m.repoRoot != "" && targetExistsOnDisk(m.repoRoot, joined) {
+				return stripped
+			}
 		}
-		return stripExt(joined)
+		return first
 	}
 	return ""
+}
+
+// matchAlias reports whether modulePath matches a and, when it does, returns
+// the substring captured by the `*` wildcard ("" for an exact pattern).
+func matchAlias(a *Alias, modulePath string) (string, bool) {
+	if a.HasWildcard {
+		if len(modulePath) < len(a.AliasPrefix)+len(a.AliasSuffix) {
+			return "", false
+		}
+		if !strings.HasPrefix(modulePath, a.AliasPrefix) {
+			return "", false
+		}
+		if !strings.HasSuffix(modulePath, a.AliasSuffix) {
+			return "", false
+		}
+		return modulePath[len(a.AliasPrefix) : len(modulePath)-len(a.AliasSuffix)], true
+	}
+	if modulePath != a.AliasPrefix {
+		return "", false
+	}
+	return "", true
+}
+
+// joinTarget resolves a filled-in target against the config's BaseURL and
+// DirPrefix, returning a forward-slashed repo-relative path.
+func (m *Map) joinTarget(matched string) string {
+	joined := matched
+	if m.BaseURL != "" {
+		joined = filepath.ToSlash(filepath.Join(m.BaseURL, matched))
+	}
+	if m.DirPrefix != "" {
+		joined = filepath.ToSlash(filepath.Join(m.DirPrefix, joined))
+	}
+	return joined
+}
+
+// probeExts are the source extensions a path-alias target may resolve to,
+// matching stripExt's set plus declaration / json / index-file forms.
+var probeExts = []string{".ts", ".tsx", ".d.ts", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs", ".json"}
+
+// targetExistsOnDisk reports whether the repo-relative joined target resolves
+// to a real file under repoRoot — as an exact path, with any source extension,
+// or as an index file in a directory of that name.
+func targetExistsOnDisk(repoRoot, joined string) bool {
+	base := filepath.Join(repoRoot, filepath.FromSlash(joined))
+	if fileExists(base) {
+		return true
+	}
+	for _, ext := range probeExts {
+		if fileExists(base + ext) {
+			return true
+		}
+		if fileExists(filepath.Join(base, "index"+ext)) {
+			return true
+		}
+	}
+	return false
+}
+
+func fileExists(p string) bool {
+	info, err := os.Stat(p)
+	return err == nil && !info.IsDir()
 }
 
 func stripExt(p string) string {
@@ -200,7 +280,7 @@ func Load(repoRoot string) *Collection {
 		if dirRel == "." {
 			dirRel = ""
 		}
-		if m := parseConfigFile(p, dirRel); m != nil {
+		if m := parseConfigFile(p, dirRel, repoRoot); m != nil {
 			scopes = append(scopes, m)
 		}
 		return nil
@@ -214,7 +294,7 @@ func Load(repoRoot string) *Collection {
 	return &Collection{scopes: scopes}
 }
 
-func parseConfigFile(absPath, dirPrefix string) *Map {
+func parseConfigFile(absPath, dirPrefix, repoRoot string) *Map {
 	data, err := os.ReadFile(absPath)
 	if err != nil {
 		return nil
@@ -225,10 +305,11 @@ func parseConfigFile(absPath, dirPrefix string) *Map {
 			Paths   map[string][]string `json:"paths"`
 		} `json:"compilerOptions"`
 	}
-	if err := json.Unmarshal(data, &raw); err != nil {
-		// Quietly skip JSON-with-comments / malformed configs. A real
-		// parser would be ~200 LOC; we accept the trade-off until a
-		// user reports a Next.js / Nuxt config that fails this path.
+	// tsconfig files routinely use the JSONC features tsserver itself
+	// accepts — // and /* */ comments and trailing commas. A strict JSON
+	// parse fails the WHOLE file on any of them, silently dropping every
+	// alias for the repo, so strip JSONC first.
+	if err := json.Unmarshal(stripJSONC(data), &raw); err != nil {
 		return nil
 	}
 	co := raw.CompilerOptions
@@ -238,12 +319,13 @@ func parseConfigFile(absPath, dirPrefix string) *Map {
 	m := &Map{
 		BaseURL:   filepath.ToSlash(strings.TrimSpace(co.BaseURL)),
 		DirPrefix: dirPrefix,
+		repoRoot:  repoRoot,
 	}
 	for pattern, targets := range co.Paths {
 		if len(targets) == 0 {
 			continue
 		}
-		entry, ok := splitAlias(pattern, targets[0])
+		entry, ok := splitAlias(pattern, targets)
 		if !ok {
 			continue
 		}
@@ -255,25 +337,131 @@ func parseConfigFile(absPath, dirPrefix string) *Map {
 	return m
 }
 
-func splitAlias(pattern, target string) (Alias, bool) {
+// splitAlias splits one `paths` entry (pattern → ordered targets) into an
+// Alias. Every target is split around its `*`; the first becomes the primary
+// TargetPrefix/TargetSuffix and all of them populate Targets for disk-probing.
+// Targets whose wildcard arity disagrees with the pattern (tsserver rejects
+// these) are skipped; the entry is dropped only when none remain.
+func splitAlias(pattern string, targets []string) (Alias, bool) {
 	pStar := strings.Index(pattern, "*")
-	tStar := strings.Index(target, "*")
-	if pStar == -1 && tStar == -1 {
-		return Alias{
-			AliasPrefix:  pattern,
-			TargetPrefix: target,
-			HasWildcard:  false,
-		}, true
+	a := Alias{HasWildcard: pStar != -1}
+	if a.HasWildcard {
+		a.AliasPrefix = pattern[:pStar]
+		a.AliasSuffix = pattern[pStar+1:]
+	} else {
+		a.AliasPrefix = pattern
 	}
-	if pStar == -1 || tStar == -1 {
-		// Mismatched wildcards — tsserver rejects these.
+	for _, target := range targets {
+		tStar := strings.Index(target, "*")
+		if (pStar == -1) != (tStar == -1) {
+			// Mismatched wildcard arity between pattern and this target.
+			continue
+		}
+		var t AliasTarget
+		if tStar == -1 {
+			t.Prefix = target
+		} else {
+			t.Prefix = target[:tStar]
+			t.Suffix = target[tStar+1:]
+		}
+		a.Targets = append(a.Targets, t)
+	}
+	if len(a.Targets) == 0 {
 		return Alias{}, false
 	}
-	return Alias{
-		AliasPrefix:  pattern[:pStar],
-		AliasSuffix:  pattern[pStar+1:],
-		TargetPrefix: target[:tStar],
-		TargetSuffix: target[tStar+1:],
-		HasWildcard:  true,
-	}, true
+	a.TargetPrefix = a.Targets[0].Prefix
+	a.TargetSuffix = a.Targets[0].Suffix
+	return a, true
+}
+
+// stripJSONC removes // line comments, /* */ block comments, and trailing
+// commas from a JSON-with-comments byte slice while leaving the contents of
+// string literals (including any comment-like or comma sequences inside them)
+// untouched, so a commented tsconfig parses as JSON instead of failing wholesale.
+func stripJSONC(data []byte) []byte {
+	out := make([]byte, 0, len(data))
+	inString, escaped := false, false
+	for i := 0; i < len(data); i++ {
+		c := data[i]
+		if inString {
+			out = append(out, c)
+			switch {
+			case escaped:
+				escaped = false
+			case c == '\\':
+				escaped = true
+			case c == '"':
+				inString = false
+			}
+			continue
+		}
+		if c == '"' {
+			inString = true
+			out = append(out, c)
+			continue
+		}
+		if c == '/' && i+1 < len(data) {
+			switch data[i+1] {
+			case '/':
+				i += 2
+				for i < len(data) && data[i] != '\n' {
+					i++
+				}
+				if i < len(data) {
+					out = append(out, '\n')
+				}
+				continue
+			case '*':
+				i += 2
+				for i < len(data) {
+					if data[i] == '*' && i+1 < len(data) && data[i+1] == '/' {
+						i++
+						break
+					}
+					i++
+				}
+				continue
+			}
+		}
+		out = append(out, c)
+	}
+	return stripTrailingCommas(out)
+}
+
+// stripTrailingCommas drops any comma whose next non-whitespace byte is a } or
+// ] closer, outside of string literals.
+func stripTrailingCommas(data []byte) []byte {
+	out := make([]byte, 0, len(data))
+	inString, escaped := false, false
+	for i := 0; i < len(data); i++ {
+		c := data[i]
+		if inString {
+			out = append(out, c)
+			switch {
+			case escaped:
+				escaped = false
+			case c == '\\':
+				escaped = true
+			case c == '"':
+				inString = false
+			}
+			continue
+		}
+		if c == '"' {
+			inString = true
+			out = append(out, c)
+			continue
+		}
+		if c == ',' {
+			j := i + 1
+			for j < len(data) && (data[j] == ' ' || data[j] == '\t' || data[j] == '\n' || data[j] == '\r') {
+				j++
+			}
+			if j < len(data) && (data[j] == '}' || data[j] == ']') {
+				continue
+			}
+		}
+		out = append(out, c)
+	}
+	return out
 }
