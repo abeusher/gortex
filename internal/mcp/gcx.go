@@ -1508,6 +1508,34 @@ func encodeSmartContext(result map[string]any) ([]byte, error) {
 				return nil, err
 			}
 		}
+		if flows, ok := inPack["flows"].(map[string]any); ok {
+			if spine, ok := flows["spine"].([]string); ok && len(spine) > 0 {
+				spEnc := newGCX(&buf, "smart_context.flow_spine",
+					[]string{"nodes"},
+					"length", fmt.Sprintf("%d", len(spine)),
+				)
+				if err := spEnc.WriteRow(strings.Join(spine, ">")); err != nil {
+					return nil, err
+				}
+				if err := spEnc.Close(); err != nil {
+					return nil, err
+				}
+			}
+			if bs, ok := flows["boundaries"].([]map[string]any); ok && len(bs) > 0 {
+				bEnc := newGCX(&buf, "smart_context.flow_boundaries",
+					[]string{"from", "target", "reason"},
+					"count", fmt.Sprintf("%d", len(bs)),
+				)
+				for _, b := range bs {
+					if err := bEnc.WriteRow(str(b["from"]), str(b["target"]), str(b["reason"])); err != nil {
+						return nil, err
+					}
+				}
+				if err := bEnc.Close(); err != nil {
+					return nil, err
+				}
+			}
+		}
 	}
 
 	return buf.Bytes(), nil

@@ -109,3 +109,77 @@ func TestGCXSmartContext_CallPaths(t *testing.T) {
 		t.Errorf("GCX output missing joined nodes 'c>focus':\n%s", s)
 	}
 }
+
+// flowGraph builds a forward chain focus→a→b.
+func flowGraph() *graph.Graph {
+	g := graph.New()
+	for _, id := range []string{"focus", "a", "b"} {
+		g.AddNode(&graph.Node{ID: id, Kind: graph.KindFunction, Name: id, FilePath: "x.go"})
+	}
+	g.AddEdge(&graph.Edge{From: "focus", To: "a", Kind: graph.EdgeCalls, Origin: graph.OriginASTResolved})
+	g.AddEdge(&graph.Edge{From: "a", To: "b", Kind: graph.EdgeCalls, Origin: graph.OriginASTResolved})
+	return g
+}
+
+func TestSmartContextFlows(t *testing.T) {
+	s := &Server{graph: flowGraph()}
+	result := map[string]any{}
+	s.attachInPackSections(result, config.SmartContextSections{Flows: true}, []*graph.Node{{ID: "focus"}})
+
+	blk, ok := result["in_pack"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected in_pack block, got %T", result["in_pack"])
+	}
+	flows, ok := blk["flows"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected flows section, got %T", blk["flows"])
+	}
+	spine, ok := flows["spine"].([]string)
+	if !ok || len(spine) != 3 || spine[0] != "focus" || spine[1] != "a" || spine[2] != "b" {
+		t.Fatalf("spine = %v, want [focus a b]", flows["spine"])
+	}
+
+	// GCX encoding emits a flow_spine section.
+	out, err := encodeSmartContext(map[string]any{"relevant_symbols": []map[string]any{}, "in_pack": blk})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out), "smart_context.flow_spine") || !strings.Contains(string(out), "focus>a>b") {
+		t.Errorf("GCX missing flow_spine:\n%s", out)
+	}
+
+	// Flows off → no block.
+	off := map[string]any{}
+	s.attachInPackSections(off, config.SmartContextSections{}, []*graph.Node{{ID: "focus"}})
+	if _, ok := off["in_pack"]; ok {
+		t.Errorf("flows off should add no block, got %+v", off["in_pack"])
+	}
+}
+
+func TestSmartContextBoundary(t *testing.T) {
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "focus", Kind: graph.KindFunction, Name: "focus", FilePath: "x.go"})
+	g.AddEdge(&graph.Edge{From: "focus", To: "unresolved::dynamicCall", Kind: graph.EdgeCalls})
+	s := &Server{graph: g}
+
+	result := map[string]any{}
+	s.attachInPackSections(result, config.SmartContextSections{Flows: true}, []*graph.Node{{ID: "focus"}})
+
+	blk := result["in_pack"].(map[string]any)
+	flows := blk["flows"].(map[string]any)
+	bs, ok := flows["boundaries"].([]map[string]any)
+	if !ok || len(bs) != 1 {
+		t.Fatalf("boundaries = %v, want one", flows["boundaries"])
+	}
+	if bs[0]["from"] != "focus" || bs[0]["target"] != "dynamicCall" || bs[0]["reason"] != "dynamic_dispatch" {
+		t.Errorf("boundary = %+v", bs[0])
+	}
+
+	out, err := encodeSmartContext(map[string]any{"relevant_symbols": []map[string]any{}, "in_pack": blk})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out), "smart_context.flow_boundaries") || !strings.Contains(string(out), "dynamicCall") {
+		t.Errorf("GCX missing flow_boundaries:\n%s", out)
+	}
+}

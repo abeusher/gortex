@@ -41,9 +41,81 @@ func (s *Server) attachInPackSections(result map[string]any, sections config.Sma
 			block["call_paths"] = cp
 		}
 	}
+	if sections.Flows {
+		if fl := s.inPackFlows(symbols); fl != nil {
+			block["flows"] = fl
+		}
+	}
 	if len(block) > 0 {
 		result["in_pack"] = block
 	}
+}
+
+// inPackFlows builds the flow section: a forward flow spine from the focus
+// symbol (the first pack symbol) and the dynamic-dispatch boundaries that spine
+// hits — call sites whose target the static graph cannot resolve, where the
+// flow would continue at runtime. Returns nil when there is no multi-node spine
+// and no boundary to announce.
+func (s *Server) inPackFlows(symbols []*graph.Node) map[string]any {
+	if s.graph == nil || len(symbols) == 0 || symbols[0] == nil {
+		return nil
+	}
+	spine, boundaries := s.flowSpine(symbols[0].ID, 8)
+	out := map[string]any{}
+	if len(spine) >= 2 {
+		out["spine"] = spine
+	}
+	if len(boundaries) > 0 {
+		out["boundaries"] = boundaries
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// flowSpine greedily walks forward from the focus over resolved CALLS/REFERENCES
+// edges (smallest target id first, for determinism), returning the chain of
+// node ids it traverses and the dynamic-dispatch boundaries — out-edges to
+// unresolved targets — encountered along the way.
+func (s *Server) flowSpine(focus string, maxDepth int) (spine []string, boundaries []map[string]any) {
+	visited := map[string]bool{focus: true}
+	bseen := map[string]bool{}
+	spine = []string{focus}
+	cur := focus
+	for depth := 0; depth < maxDepth; depth++ {
+		next := ""
+		for _, e := range s.graph.GetOutEdges(cur) {
+			if e == nil || (e.Kind != graph.EdgeCalls && e.Kind != graph.EdgeReferences) {
+				continue
+			}
+			if graph.IsUnresolvedTarget(e.To) {
+				key := e.From + "\x00" + e.To
+				if !bseen[key] {
+					bseen[key] = true
+					boundaries = append(boundaries, map[string]any{
+						"from":   e.From,
+						"target": graph.UnresolvedName(e.To),
+						"reason": "dynamic_dispatch",
+					})
+				}
+				continue
+			}
+			if visited[e.To] {
+				continue
+			}
+			if next == "" || e.To < next {
+				next = e.To
+			}
+		}
+		if next == "" {
+			break
+		}
+		visited[next] = true
+		spine = append(spine, next)
+		cur = next
+	}
+	return spine, boundaries
 }
 
 // inPackCallPaths builds the anchored call-paths section: the focus symbol (the
