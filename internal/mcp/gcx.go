@@ -1556,6 +1556,36 @@ func encodeSmartContext(result map[string]any) ([]byte, error) {
 		}
 	}
 
+	if rec, ok := result["recovered_edges"].([]map[string]any); ok && len(rec) > 0 {
+		rEnc := newGCX(&buf, "smart_context.recovered_edges",
+			[]string{"from", "to", "kind"},
+			"count", fmt.Sprintf("%d", len(rec)),
+		)
+		for _, e := range rec {
+			if err := rEnc.WriteRow(str(e["from"]), str(e["to"]), str(e["kind"])); err != nil {
+				return nil, err
+			}
+		}
+		if err := rEnc.Close(); err != nil {
+			return nil, err
+		}
+	}
+
+	if sibs, ok := result["hierarchy_siblings"].([]map[string]any); ok && len(sibs) > 0 {
+		sEnc := newGCX(&buf, "smart_context.hierarchy_siblings",
+			[]string{"id", "name", "kind", "parent"},
+			"count", fmt.Sprintf("%d", len(sibs)),
+		)
+		for _, sb := range sibs {
+			if err := sEnc.WriteRow(str(sb["id"]), str(sb["name"]), str(sb["kind"]), str(sb["parent"])); err != nil {
+				return nil, err
+			}
+		}
+		if err := sEnc.Close(); err != nil {
+			return nil, err
+		}
+	}
+
 	return buf.Bytes(), nil
 }
 

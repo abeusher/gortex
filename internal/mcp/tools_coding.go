@@ -2107,6 +2107,15 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 		}
 	}
 
+	// Pack-assembly passes: recover the edges between pack symbols a many-rooted
+	// retrieval leaves disconnected, and surface class-hierarchy siblings.
+	if rec := s.recoverPackEdges(relevantSymbols); len(rec) > 0 {
+		result["recovered_edges"] = rec
+	}
+	if sibs := s.packHierarchySiblings(relevantSymbols); len(sibs) > 0 {
+		result["hierarchy_siblings"] = sibs
+	}
+
 	// Pack-root dedup: hash the assembled context pack. When the
 	// caller passes back the pack root it already holds and nothing
 	// the pack covers has changed, return not_modified instead of

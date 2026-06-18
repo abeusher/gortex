@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"sort"
 
 	"github.com/zzet/gortex/internal/callpath"
 	"github.com/zzet/gortex/internal/config"
@@ -75,6 +76,115 @@ func (s *Server) inPackFlows(symbols []*graph.Node) map[string]any {
 	}
 	if len(boundaries) > 0 {
 		out["boundaries"] = boundaries
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// packRecoveryKinds are the edge kinds the edge-recovery pass restores between
+// pack symbols — the structural relations a many-rooted retrieval BFS leaves
+// disconnected.
+var packRecoveryKinds = map[graph.EdgeKind]bool{
+	graph.EdgeCalls:      true,
+	graph.EdgeExtends:    true,
+	graph.EdgeImplements: true,
+	graph.EdgeReferences: true,
+	graph.EdgeOverrides:  true,
+}
+
+// recoverPackEdges returns the edges (calls/extends/implements/references/
+// overrides) that exist between the pack's symbols — the internal connectivity
+// a many-rooted retrieval leaves out. Returns nil when fewer than two symbols
+// are in the pack or none are connected.
+func (s *Server) recoverPackEdges(symbols []*graph.Node) []map[string]any {
+	if s.graph == nil || len(symbols) < 2 {
+		return nil
+	}
+	ids := make(map[string]bool, len(symbols))
+	ordered := make([]string, 0, len(symbols))
+	for _, n := range symbols {
+		if n != nil && n.ID != "" && !ids[n.ID] {
+			ids[n.ID] = true
+			ordered = append(ordered, n.ID)
+		}
+	}
+	sort.Strings(ordered)
+	seen := map[string]bool{}
+	var out []map[string]any
+	for _, id := range ordered {
+		for _, e := range s.graph.GetOutEdges(id) {
+			if e == nil || !packRecoveryKinds[e.Kind] || !ids[e.To] {
+				continue
+			}
+			key := e.From + "\x00" + e.To + "\x00" + string(e.Kind)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			out = append(out, map[string]any{"from": e.From, "to": e.To, "kind": string(e.Kind)})
+		}
+	}
+	return out
+}
+
+// packHierarchySiblings returns type symbols that share a supertype with a pack
+// type — its siblings in the class hierarchy (e.g. a pack's InternalEngine and
+// the sibling ReadOnlyEngine that both extend Engine). Already-packed types are
+// excluded; the result is capped.
+func (s *Server) packHierarchySiblings(symbols []*graph.Node) []map[string]any {
+	if s.graph == nil {
+		return nil
+	}
+	inPack := map[string]bool{}
+	for _, n := range symbols {
+		if n != nil {
+			inPack[n.ID] = true
+		}
+	}
+	parents := map[string]bool{}
+	for _, n := range symbols {
+		if n == nil || (n.Kind != graph.KindType && n.Kind != graph.KindInterface) {
+			continue
+		}
+		for _, e := range s.graph.GetOutEdges(n.ID) {
+			if e != nil && (e.Kind == graph.EdgeExtends || e.Kind == graph.EdgeImplements) {
+				parents[e.To] = true
+			}
+		}
+	}
+	if len(parents) == 0 {
+		return nil
+	}
+	parentIDs := make([]string, 0, len(parents))
+	for p := range parents {
+		parentIDs = append(parentIDs, p)
+	}
+	sort.Strings(parentIDs)
+
+	sibSeen := map[string]bool{}
+	var out []map[string]any
+	for _, parent := range parentIDs {
+		for _, e := range s.graph.GetInEdges(parent) {
+			if e == nil || (e.Kind != graph.EdgeExtends && e.Kind != graph.EdgeImplements) {
+				continue
+			}
+			sib := e.From
+			if inPack[sib] || sibSeen[sib] {
+				continue
+			}
+			n := s.graph.GetNode(sib)
+			if n == nil {
+				continue
+			}
+			sibSeen[sib] = true
+			out = append(out, map[string]any{"id": sib, "name": n.Name, "kind": string(n.Kind), "parent": parent})
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool { return str(out[i]["id"]) < str(out[j]["id"]) })
+	if len(out) > 10 {
+		out = out[:10]
 	}
 	if len(out) == 0 {
 		return nil

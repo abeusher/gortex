@@ -267,3 +267,62 @@ func TestSmartContextAdaptive(t *testing.T) {
 		t.Errorf("call_paths should be capped to 3 by the small-repo budget, got %d", len(cps))
 	}
 }
+
+func TestSmartContextAssembly(t *testing.T) {
+	// Pack symbols a, b, c with a→b (calls) and b→c (references) between them.
+	g := graph.New()
+	for _, id := range []string{"a", "b", "c", "outside"} {
+		g.AddNode(&graph.Node{ID: id, Kind: graph.KindFunction, Name: id, FilePath: "x.go"})
+	}
+	g.AddEdge(&graph.Edge{From: "a", To: "b", Kind: graph.EdgeCalls})
+	g.AddEdge(&graph.Edge{From: "b", To: "c", Kind: graph.EdgeReferences})
+	g.AddEdge(&graph.Edge{From: "a", To: "outside", Kind: graph.EdgeCalls}) // outside the pack — excluded
+	s := &Server{graph: g}
+	pack := []*graph.Node{{ID: "a"}, {ID: "b"}, {ID: "c"}}
+
+	rec := s.recoverPackEdges(pack)
+	if len(rec) != 2 {
+		t.Fatalf("expected 2 recovered edges (a→b, b→c), got %d: %+v", len(rec), rec)
+	}
+	// a→b first (sorted by from id).
+	if rec[0]["from"] != "a" || rec[0]["to"] != "b" || rec[0]["kind"] != "calls" {
+		t.Errorf("first recovered edge = %+v", rec[0])
+	}
+	if rec[1]["from"] != "b" || rec[1]["to"] != "c" || rec[1]["kind"] != "references" {
+		t.Errorf("second recovered edge = %+v", rec[1])
+	}
+
+	// GCX encodes the section.
+	out, err := encodeSmartContext(map[string]any{"relevant_symbols": []map[string]any{}, "recovered_edges": rec})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out), "smart_context.recovered_edges") {
+		t.Errorf("GCX missing recovered_edges:\n%s", out)
+	}
+}
+
+func TestSmartContextSiblings(t *testing.T) {
+	// InternalEngine and ReadOnlyEngine both extend Engine; pack has InternalEngine.
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "Engine", Kind: graph.KindInterface, Name: "Engine", FilePath: "e.go"})
+	g.AddNode(&graph.Node{ID: "InternalEngine", Kind: graph.KindType, Name: "InternalEngine", FilePath: "i.go"})
+	g.AddNode(&graph.Node{ID: "ReadOnlyEngine", Kind: graph.KindType, Name: "ReadOnlyEngine", FilePath: "r.go"})
+	g.AddEdge(&graph.Edge{From: "InternalEngine", To: "Engine", Kind: graph.EdgeImplements})
+	g.AddEdge(&graph.Edge{From: "ReadOnlyEngine", To: "Engine", Kind: graph.EdgeImplements})
+	s := &Server{graph: g}
+	pack := []*graph.Node{{ID: "InternalEngine", Kind: graph.KindType}}
+
+	sibs := s.packHierarchySiblings(pack)
+	if len(sibs) != 1 || sibs[0]["id"] != "ReadOnlyEngine" || sibs[0]["parent"] != "Engine" {
+		t.Fatalf("expected ReadOnlyEngine sibling via Engine, got %+v", sibs)
+	}
+
+	out, err := encodeSmartContext(map[string]any{"relevant_symbols": []map[string]any{}, "hierarchy_siblings": sibs})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out), "smart_context.hierarchy_siblings") || !strings.Contains(string(out), "ReadOnlyEngine") {
+		t.Errorf("GCX missing hierarchy_siblings:\n%s", out)
+	}
+}
