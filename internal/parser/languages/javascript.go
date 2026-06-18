@@ -38,6 +38,10 @@ const qJSAll = `
   (method_definition
     name: (property_identifier) @method.name) @method.def
 
+  (field_definition
+    property: (property_identifier) @classarrow.name
+    value: (arrow_function)) @classarrow.def
+
   (import_statement
     source: (string (string_fragment) @import.path)) @import.def
 
@@ -169,6 +173,9 @@ func (e *JavaScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 
 		case m.Captures["method.def"] != nil:
 			registerObjMember(e.emitMethod(m, filePath, fileID, src, result))
+
+		case m.Captures["classarrow.def"] != nil:
+			e.emitClassArrowField(m, filePath, fileID, src, result)
 
 		case m.Captures["import.def"] != nil:
 			e.emitImport(m, filePath, fileID, result)
@@ -529,6 +536,39 @@ func (e *JavaScriptExtractor) emitMethod(m parser.QueryResult, filePath, fileID 
 		From: methodID, To: classID, Kind: graph.EdgeMemberOf, FilePath: filePath, Line: def.StartLine + 1,
 	})
 	return "", "", ""
+}
+
+// emitClassArrowField emits an arrow-valued class field — `handleClick = () =>
+// {…}` — as a callable method of its class, so it appears in the call graph
+// like a regular method rather than vanishing as a plain field.
+func (e *JavaScriptExtractor) emitClassArrowField(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult) {
+	def := m.Captures["classarrow.def"]
+	classNode := findEnclosingJSContainer(def.Node, "class_declaration")
+	if classNode == nil {
+		return
+	}
+	nameNode := classNode.ChildByFieldName("name")
+	if nameNode == nil {
+		return
+	}
+	className := nameNode.Content(src)
+	name := m.Captures["classarrow.name"].Text
+	classID := filePath + "::" + className
+	methodID := filePath + "::" + className + "." + name
+	node := &graph.Node{
+		ID: methodID, Kind: graph.KindMethod, Name: name,
+		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
+		Language: "javascript",
+	}
+	if arrow := def.Node.ChildByFieldName("value"); arrow != nil {
+		if body := tsFunctionBody(arrow); body != nil {
+			StampFunctionMetrics(node, body, "javascript")
+		}
+	}
+	result.Nodes = append(result.Nodes, node)
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: methodID, To: classID, Kind: graph.EdgeMemberOf, FilePath: filePath, Line: def.StartLine + 1,
+	})
 }
 
 // emitObjectLiteralMethod handles method shorthand inside an object
