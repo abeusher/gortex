@@ -55,7 +55,7 @@ func cliCommandDim(cmd *cobra.Command) string {
 // consent is enabled, so a default (telemetry-off) invocation never opens the
 // telemetry directory. getenv is injected for tests.
 func recordCLIUsage(cmd *cobra.Command, store *telemetry.Store, getenv func(string) string) {
-	consent := telemetry.ResolveConsent(telemetry.ConsentConfig{}, getenv)
+	consent := telemetry.ResolveConsent(telemetry.LoadConsentConfig(platform.TelemetryDir()), getenv)
 	if !consent.Enabled {
 		return
 	}

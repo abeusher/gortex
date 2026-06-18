@@ -35,9 +35,11 @@ import (
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/parser/languages"
-	"github.com/zzet/gortex/internal/query"
+	"github.com/zzet/gortex/internal/platform"
 	"github.com/zzet/gortex/internal/progress"
+	"github.com/zzet/gortex/internal/query"
 	genskills "github.com/zzet/gortex/internal/skills"
+	"github.com/zzet/gortex/internal/telemetry"
 	"github.com/zzet/gortex/internal/workspace"
 )
 
@@ -320,6 +322,13 @@ func runInit(cmd *cobra.Command, args []string) (err error) {
 		if err := ensureGlobalConfig(absRoot); err != nil {
 			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "[gortex init] warning: could not update global config: %v\n", err)
 		}
+	}
+
+	// One-time opt-in telemetry notice. Telemetry is off by default; this
+	// only informs and records the default choice so it shows at most once.
+	// Goes to stderr, so it never pollutes --json output. Skipped on dry run.
+	if !initDryRun {
+		telemetry.MaybeFirstRunNotice(platform.TelemetryDir(), cmd.ErrOrStderr())
 	}
 
 	if initJSON {
