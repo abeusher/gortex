@@ -70,6 +70,7 @@ const (
 	SynthRustScope         = "rust-scope"
 	SynthSQLCallsite       = "sql-callsite"
 	SynthStoreFactory      = "store-factory"
+	SynthGinMiddleware     = "gin-middleware"
 	SynthSpeculative       = "speculative-dispatch"
 	SynthFnValue           = SynthFnValueCallback
 	SynthPascalFormName    = SynthPascalForm
@@ -140,6 +141,10 @@ func defaultFrameworkSynthesizers() []FrameworkSynthesizer {
 		// Store-factory (Zustand/Redux/Pinia/MobX) indirect action calls —
 		// binds getState()-chain and destructured calls to the action node.
 		synthFunc{name: SynthStoreFactory, fn: ResolveStoreFactoryCalls},
+		// Gin middleware-chain dispatcher → registered handlers. Bridges the
+		// `c.handlers[idx](c)` indirection so ServeHTTP→handler reachability
+		// flows; repo-scoped, gated on a dispatcher existing.
+		synthFunc{name: SynthGinMiddleware, fn: ResolveGinMiddlewareCalls},
 		// Rust impl-block / self-receiver / module-path resolution
 		// completion. Runs in the same settle window so residual
 		// unresolved Rust calls land before external-call synthesis

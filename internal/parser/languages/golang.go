@@ -1230,6 +1230,9 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 	captureValueRefCandidates(result, root, filePath, src)
 	captureFnValueCandidates(result, root, filePath, src)
 
+	// Gin middleware-chain dispatcher + route registrations → resolver hints.
+	mineGinMiddleware(src, result)
+
 	return result, nil
 }
 
