@@ -2764,79 +2764,9 @@ func compositeLiteralType(lit *sitter.Node, src []byte) string {
 	return ""
 }
 
-// resolveChainType walks a dotted/chained receiver expression text like
-// `svc.GetUser().Save()` and returns the inferred type of the final
-// segment when each hop is typed — first segment via tenv, subsequent
-// segments via a method's return_type Meta. Returns "" on the first
-// unresolvable hop.
-func resolveChainType(expr string, tenv typeEnv, result *parser.ExtractionResult) string {
-	cleaned := stripCallArgs(expr)
-
-	parts := strings.Split(cleaned, ".")
-	if len(parts) < 2 {
-		return ""
-	}
-
-	currentType, ok := tenv[parts[0]]
-	if !ok {
-		return ""
-	}
-
-	for i := 1; i < len(parts); i++ {
-		methodName := parts[i]
-		returnType := findMethodReturnType(currentType, methodName, result)
-		if returnType == "" {
-			return ""
-		}
-		currentType = returnType
-	}
-
-	return currentType
-}
-
-// stripCallArgs removes balanced parentheses (and anything inside them)
-// from a receiver expression so "svc.GetUser(arg).Save()" collapses to
-// "svc.GetUser.Save" for chain walking.
-func stripCallArgs(expr string) string {
-	var b strings.Builder
-	depth := 0
-	for _, ch := range expr {
-		switch ch {
-		case '(':
-			depth++
-		case ')':
-			if depth > 0 {
-				depth--
-			}
-		default:
-			if depth == 0 {
-				b.WriteRune(ch)
-			}
-		}
-	}
-	return b.String()
-}
-
-// findMethodReturnType scans result.Nodes for a method (or package-level
-// function, for pkg.Func cases) with the given name on the given
-// receiver type and returns its return_type Meta. Empty string when
-// not found or unannotated.
-func findMethodReturnType(receiverType, methodName string, result *parser.ExtractionResult) string {
-	for _, n := range result.Nodes {
-		if n.Kind != graph.KindMethod && n.Kind != graph.KindFunction {
-			continue
-		}
-		if n.Name != methodName {
-			continue
-		}
-		if recv, ok := n.Meta["receiver"].(string); ok && recv == receiverType {
-			if rt, ok := n.Meta["return_type"].(string); ok {
-				return rt
-			}
-		}
-	}
-	return ""
-}
+// Chained-receiver / factory-chain return-type resolution (resolveChainType,
+// stripCallArgs, findMethodReturnType, findFactoryReturnType) is shared across
+// every AST extractor and lives in helpers_chaintype.go.
 
 // scanGoPragmas inspects up to 5 source lines immediately before a
 // function or method declaration looking for `//go:*` or `//export`
