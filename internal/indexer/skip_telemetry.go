@@ -72,7 +72,7 @@ type walkedFile struct {
 // completion in its goroutine (tree-sitter's own 5s parse cap bounds
 // the worst case) and its result is discarded.
 func (idx *Indexer) extractWithTimeout(ext parser.Extractor, relPath string, src []byte) (*parser.ExtractionResult, error) {
-	budget := idx.config.MaxExtractMillis
+	budget := effectiveExtractBudget(idx.config.MaxExtractMillis, len(src))
 	if budget <= 0 {
 		return safeExtract(ext, relPath, src)
 	}

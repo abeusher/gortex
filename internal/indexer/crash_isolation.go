@@ -158,6 +158,50 @@ func (idx *Indexer) CloseParsePool() {
 
 // extractFile produces one file's graph contribution. With pool == nil
 // it calls the extractor in-process (the default). With a pool the
+const (
+	// extractBudgetBytesPerMs grants one extra millisecond of extraction
+	// budget per this many source bytes, on top of the base budget. A flat
+	// budget skips a legitimately large file (which parses proportionally
+	// slower) at the same threshold as a pathological small one; scaling by
+	// size keeps real files in while still tripping on genuine runaways.
+	extractBudgetBytesPerMs = 1024
+	// extractBudgetMaxMultiple caps the size-scaled budget at this multiple
+	// of the base so even a multi-megabyte file cannot stall the pass
+	// indefinitely.
+	extractBudgetMaxMultiple = 8
+)
+
+// effectiveExtractBudget scales the base per-file extraction budget (ms) by
+// file size in bytes. base<=0 keeps the cap disabled (returns base unchanged),
+// and an empty file gets exactly the base. Otherwise the budget grows linearly
+// with byte count — one millisecond per extractBudgetBytesPerMs bytes — capped
+// at extractBudgetMaxMultiple× the base so the worst case stays bounded.
+func effectiveExtractBudget(base, fileBytes int) int {
+	if base <= 0 || fileBytes <= 0 {
+		return base
+	}
+	scaled := base + fileBytes/extractBudgetBytesPerMs
+	if capped := base * extractBudgetMaxMultiple; scaled > capped {
+		return capped
+	}
+	return scaled
+}
+
+// submitWithRetry runs submit once and, if the worker crashed, hung, or
+// panicked, retries exactly once. A worker fault can be a worker poisoned by a
+// prior parse rather than the file itself; the pool replaces the dead worker
+// before returning, so the single retry runs on a clean worker. A file that is
+// genuinely the fault fails again and is quarantined as before. A plain
+// extraction error (Result.Err without a crash) is deterministic and is not
+// retried.
+func submitWithRetry(submit func() crashpool.Result) crashpool.Result {
+	res := submit()
+	if res.Crashed || res.Panicked {
+		res = submit()
+	}
+	return res
+}
+
 // parse runs in a worker subprocess: a crash, hang, or panic quarantines
 // the file and yields a synthetic KindFile node carrying
 // Meta["parse_error"] instead of aborting the whole index pass.
@@ -182,7 +226,7 @@ func (idx *Indexer) extractFile(
 	if pool == nil {
 		r, eerr := idx.extractWithTimeout(ext, relPath, src)
 		if errors.Is(eerr, errExtractTimeout) {
-			budget := idx.config.MaxExtractMillis
+			budget := effectiveExtractBudget(idx.config.MaxExtractMillis, len(src))
 			idx.logger.Warn("indexer: file extraction exceeded budget; skipped",
 				zap.String("file", relPath), zap.Int("budget_ms", budget))
 			return timeoutSkipResult(relPath, lang, budget), true,
@@ -215,7 +259,7 @@ func (idx *Indexer) extractFile(
 			true, fmt.Errorf("skipped quarantined file %s", relPath)
 	}
 
-	res := pool.Submit(relPath, lang, src)
+	res := submitWithRetry(func() crashpool.Result { return pool.Submit(relPath, lang, src) })
 	switch {
 	case res.Crashed || res.Panicked:
 		q.Add(relPath, res.Err, mtime)
