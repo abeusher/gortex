@@ -62,3 +62,77 @@ func TestRazorExtractor(t *testing.T) {
 		}
 	}
 }
+
+// TestRazorBraceMatcherSkipsStringsAndCarvesBareBlock is the B4 named test: a
+// `}` inside a C# string or comment in a @code block must not truncate the
+// block (which dropped every member after it), and a bare @{ } block is also
+// carved and delegated. The per-file Blazor component node is emitted.
+func TestRazorBraceMatcherSkipsStringsAndCarvesBareBlock(t *testing.T) {
+	src := []byte("<h1>Hi</h1>\n" +
+		"@code {\n" +
+		"    string Brace() { return \"}\"; }\n" +
+		"    void After() { }\n" +
+		"    // a comment with a } brace\n" +
+		"    void Last() { }\n" +
+		"}\n" +
+		"@{\n" +
+		"    void BareHelper() { }\n" +
+		"}\n")
+	res, err := NewRazorExtractor().Extract("Counter.razor", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	methods := map[string]bool{}
+	for _, n := range res.Nodes {
+		if n.Kind == graph.KindMethod || n.Kind == graph.KindFunction {
+			methods[n.Name] = true
+		}
+	}
+	// All three @code members survive — the brace inside the string / comment
+	// no longer truncates the block.
+	for _, want := range []string{"Brace", "After", "Last"} {
+		if !methods[want] {
+			t.Fatalf("method %s was dropped by brace truncation; got %v", want, methods)
+		}
+	}
+	// The synthetic wrapper method/class are not leaked as symbols.
+	if methods["__Body"] {
+		t.Fatalf("synthetic __Body wrapper leaked as a method")
+	}
+
+	// The bare @{ } block is carved (two spans total).
+	spans := razorCodeSpans(src)
+	var bareSeen bool
+	for _, s := range spans {
+		if s.bare {
+			bareSeen = true
+		}
+	}
+	if !bareSeen {
+		t.Fatalf("bare @{ } block was not carved; spans=%v", spans)
+	}
+
+	// The per-file component node exists and is navigable.
+	var component bool
+	for _, n := range res.Nodes {
+		if n.Kind == graph.KindType && n.ID == "Counter.razor::Counter" {
+			if c, _ := n.Meta["component"].(bool); c {
+				component = true
+			}
+		}
+	}
+	if !component {
+		t.Fatalf("expected a per-file component node Counter.razor::Counter")
+	}
+}
+
+// TestRazorMatchBraceUnit checks the matcher directly on literals and comments.
+func TestRazorMatchBraceUnit(t *testing.T) {
+	// open at index 0; the } inside the string must be ignored.
+	src := []byte(`{ var s = "a}b"; var c = '}'; /* } */ }`)
+	end := matchRazorBrace(src, 0)
+	if end != len(src)-1 {
+		t.Fatalf("matchRazorBrace = %d, want %d (final brace)", end, len(src)-1)
+	}
+}

@@ -9,9 +9,12 @@ import (
 )
 
 var (
-	razorCodeBlockRe = regexp.MustCompile(`@(?:code|functions)\s*\{`)
-	razorModelRe     = regexp.MustCompile(`(?m)^\s*@(?:model|inherits)\s+([A-Za-z_][\w.]*(?:<[^>]*>)?)`)
-	razorInjectRe    = regexp.MustCompile(`(?m)^\s*@inject\s+([A-Za-z_][\w.]*(?:<[^>]*>)?)\s+\w+`)
+	// razorBlockRe matches a C# block opener: @code{ / @functions{ (group 1
+	// names the keyword) or a bare @{ statement block (group 1 empty).
+	razorBlockRe  = regexp.MustCompile(`@(code|functions)\s*\{|@\{`)
+	razorModelRe  = regexp.MustCompile(`(?m)^\s*@(?:model|inherits)\s+([A-Za-z_][\w.]*(?:<[^>]*>)?)`)
+	razorInjectRe = regexp.MustCompile(`(?m)^\s*@inject\s+([A-Za-z_][\w.]*(?:<[^>]*>)?)\s+\w+`)
+	razorTypeofRe = regexp.MustCompile(`@typeof\(\s*([A-Za-z_][\w.]*)`)
 )
 
 // RazorExtractor extracts Razor / Blazor files (.razor, .cshtml). It carves
@@ -39,23 +42,66 @@ func (e *RazorExtractor) Extract(filePath string, src []byte) (*parser.Extractio
 	}
 	result.Nodes = append(result.Nodes, fileNode)
 
-	// @code{...} / @functions{...} blocks hold C# class members. They are wrapped
-	// in a synthetic class so tree-sitter parses the members, then delegated;
+	// One navigable component node per .razor file: a Blazor component IS the
+	// file, so emitting it as a real KindType node (not just a reference) lets
+	// it participate in find_usages / renders_child as a first-class symbol —
+	// where codegraph only ever emits a reference.
+	componentID := ""
+	if name := razorComponentName(filePath); name != "" {
+		componentID = filePath + "::" + name
+		result.Nodes = append(result.Nodes, &graph.Node{
+			ID: componentID, Kind: graph.KindType, Name: name,
+			FilePath: filePath, StartLine: 1, EndLine: lineCount, Language: "razor",
+			Meta: map[string]any{"component": true},
+		})
+		result.Edges = append(result.Edges, &graph.Edge{
+			From: fileNode.ID, To: componentID, Kind: graph.EdgeDefines, FilePath: filePath, Line: 1,
+		})
+	}
+
+	// @code{...} / @functions{...} blocks hold C# class members; a bare @{...}
+	// holds statements. Each is wrapped in a synthetic class (or class+method
+	// for bare blocks) so tree-sitter parses it, then delegated;
 	// delegateRazorCode strips the wrapper and rebases into host coordinates.
 	for _, span := range razorCodeSpans(src) {
 		lineOffset := strings.Count(string(src[:span.start]), "\n")
-		e.delegateRazorCode(src[span.start:span.end], lineOffset, filePath, fileNode.ID, result)
+		wrapPrefix, wrapSuffix := razorCodeWrapPrefix+"\n", "\n}"
+		if span.bare {
+			wrapPrefix, wrapSuffix = razorCodeWrapPrefix+"\nvoid __Body() {\n", "\n}\n}"
+		}
+		e.delegateRazorCode(src[span.start:span.end], lineOffset, wrapPrefix, wrapSuffix, filePath, fileNode.ID, result)
 	}
 
 	// Directive type references: @model / @inherits name the view-model or base
-	// type; @inject names the injected service type.
+	// type; @inject names the injected service type; @typeof(X) references X.
 	for _, m := range razorModelRe.FindAllSubmatch(src, -1) {
 		emitRazorTypeRef(result, fileNode.ID, filePath, string(m[1]))
 	}
 	for _, m := range razorInjectRe.FindAllSubmatch(src, -1) {
 		emitRazorTypeRef(result, fileNode.ID, filePath, string(m[1]))
 	}
+	for _, m := range razorTypeofRe.FindAllSubmatch(src, -1) {
+		emitRazorTypeRef(result, fileNode.ID, filePath, string(m[1]))
+	}
 	return result, nil
+}
+
+// razorComponentName derives the Blazor component name from a .razor file path
+// (the PascalCase base name). Returns "" for .cshtml views, which are not
+// components.
+func razorComponentName(filePath string) string {
+	if !strings.HasSuffix(filePath, ".razor") {
+		return ""
+	}
+	base := filePath
+	if i := strings.LastIndexAny(base, "/\\"); i >= 0 {
+		base = base[i+1:]
+	}
+	base = strings.TrimSuffix(base, ".razor")
+	if base == "" || base[0] < 'A' || base[0] > 'Z' {
+		return ""
+	}
+	return base
 }
 
 // razorCodeWrapPrefix is a single line so the wrap shifts content by exactly one
@@ -65,19 +111,20 @@ const razorCodeWrapPrefix = "class __RazorCode {"
 // delegateRazorCode wraps a @code block body in a synthetic class, runs the C#
 // extractor over it, and merges the result rebased into host coordinates,
 // dropping the synthetic file and wrapper-class nodes.
-func (e *RazorExtractor) delegateRazorCode(content []byte, lineOffset int, filePath, fileID string, result *parser.ExtractionResult) {
+func (e *RazorExtractor) delegateRazorCode(content []byte, lineOffset int, wrapPrefix, wrapSuffix, filePath, fileID string, result *parser.ExtractionResult) {
 	if strings.TrimSpace(string(content)) == "" {
 		return
 	}
 	virtual := filePath + "#code"
-	wrapped := []byte(razorCodeWrapPrefix + "\n" + string(content) + "\n}")
+	wrapped := []byte(wrapPrefix + string(content) + wrapSuffix)
 	sub, err := e.cs.Extract(virtual, wrapped)
 	if err != nil || sub == nil {
 		return
 	}
-	// The wrapper prefix occupies one line, so a wrapped line W is content line
-	// W-1; combined with the block's host offset that is lineOffset-1.
-	shift := lineOffset - 1
+	// The wrapper prefix occupies one line per newline it carries, so a wrapped
+	// line W is content line W-(prefix lines); combined with the block's host
+	// offset that is lineOffset-(prefix lines).
+	shift := lineOffset - strings.Count(wrapPrefix, "\n")
 	wrapperID := ""
 	for _, n := range sub.Nodes {
 		if n == nil || n.ID == virtual {
@@ -85,6 +132,10 @@ func (e *RazorExtractor) delegateRazorCode(content []byte, lineOffset int, fileP
 		}
 		if n.Kind == graph.KindType && n.Name == "__RazorCode" {
 			wrapperID = n.ID
+			continue
+		}
+		// Drop the synthetic method that wraps a bare @{ } statement block.
+		if n.Kind == graph.KindMethod && n.Name == "__Body" {
 			continue
 		}
 		n.FilePath = filePath
@@ -116,43 +167,143 @@ func (e *RazorExtractor) delegateRazorCode(content []byte, lineOffset int, fileP
 	}
 }
 
-type razorSpan struct{ start, end int }
+type razorSpan struct {
+	start, end int
+	// bare is true for a @{ } statement block (delegated wrapped in a method
+	// body), false for a @code / @functions member block (wrapped in a class).
+	bare bool
+}
 
-// razorCodeSpans returns the inner content spans of every @code{...} /
-// @functions{...} block, matching braces so nested C# braces do not end it early.
+// razorCodeSpans returns the inner content span of every @code{...} /
+// @functions{...} member block and bare @{...} statement block. Brace matching
+// is string-, char-, and comment-aware (matchRazorBrace), so a `}` inside a C#
+// string literal or comment cannot end the block early — which would otherwise
+// truncate the delegated C# and silently drop every member after it.
 func razorCodeSpans(src []byte) []razorSpan {
 	var spans []razorSpan
-	for _, loc := range razorCodeBlockRe.FindAllIndex(src, -1) {
+	for _, loc := range razorBlockRe.FindAllSubmatchIndex(src, -1) {
 		open := loc[1] - 1 // position of the opening '{'
-		depth := 0
-		for i := open; i < len(src); i++ {
-			switch src[i] {
-			case '{':
-				depth++
-			case '}':
-				depth--
-				if depth == 0 {
-					spans = append(spans, razorSpan{open + 1, i})
-					i = len(src) // stop scanning this block
-				}
-			}
+		bare := loc[2] < 0 // group 1 absent → bare @{ block
+		end := matchRazorBrace(src, open)
+		if end < 0 {
+			continue
 		}
+		spans = append(spans, razorSpan{start: open + 1, end: end, bare: bare})
 	}
 	return spans
 }
 
+// matchRazorBrace returns the index of the '}' closing the '{' at open, scanning
+// the C# body with awareness of string ("..."), verbatim (@"..."), and char
+// ('...') literals and // and /* */ comments, so a brace inside any of them
+// never shifts the depth. Returns -1 when the brace is unbalanced.
+func matchRazorBrace(src []byte, open int) int {
+	depth := 0
+	for i := open; i < len(src); i++ {
+		switch src[i] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return i
+			}
+		case '"':
+			i = skipCSharpQuoted(src, i, '"', false)
+		case '\'':
+			i = skipCSharpQuoted(src, i, '\'', false)
+		case '@':
+			if i+1 < len(src) && src[i+1] == '"' {
+				i = skipCSharpQuoted(src, i+1, '"', true)
+			}
+		case '/':
+			if i+1 < len(src) && src[i+1] == '/' {
+				i += 2
+				for i < len(src) && src[i] != '\n' {
+					i++
+				}
+			} else if i+1 < len(src) && src[i+1] == '*' {
+				i += 2
+				for i < len(src) {
+					if src[i] == '*' && i+1 < len(src) && src[i+1] == '/' {
+						i++
+						break
+					}
+					i++
+				}
+			}
+		}
+	}
+	return -1
+}
+
+// skipCSharpQuoted returns the index of the closing quote of a literal that
+// opens at i. For a regular literal a backslash escapes the next byte; for a
+// verbatim (@"...") literal backslashes are literal and the quote is escaped by
+// doubling ("") instead. On an unterminated literal it returns len-1 so the
+// caller advances to EOF.
+func skipCSharpQuoted(src []byte, i int, quote byte, verbatim bool) int {
+	for j := i + 1; j < len(src); j++ {
+		switch {
+		case !verbatim && src[j] == '\\':
+			j++ // skip the escaped byte
+		case src[j] == quote:
+			if verbatim && j+1 < len(src) && src[j+1] == quote {
+				j++ // doubled quote inside a verbatim string
+				continue
+			}
+			return j
+		}
+	}
+	return len(src) - 1
+}
+
 func emitRazorTypeRef(result *parser.ExtractionResult, fromID, filePath, typeName string) {
 	typeName = strings.TrimSpace(typeName)
+	// Split generic type arguments into their own references: a `List<Foo>`
+	// directive references both List and Foo, so the type graph reaches every
+	// type the generic names rather than only the outer container.
 	if i := strings.IndexByte(typeName, '<'); i >= 0 {
+		if j := strings.LastIndexByte(typeName, '>'); j > i {
+			for _, arg := range splitRazorTypeArgs(typeName[i+1 : j]) {
+				emitRazorTypeRef(result, fromID, filePath, arg)
+			}
+		}
 		typeName = typeName[:i]
 	}
 	if i := strings.LastIndexByte(typeName, '.'); i >= 0 {
 		typeName = typeName[i+1:]
 	}
-	if typeName == "" {
+	if typeName = strings.TrimSpace(typeName); typeName == "" {
 		return
 	}
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: fromID, To: "unresolved::" + typeName, Kind: graph.EdgeReferences, FilePath: filePath,
 	})
+}
+
+// splitRazorTypeArgs splits a comma-separated generic argument list at the top
+// nesting level, so `string, List<int>` yields "string" and "List<int>".
+func splitRazorTypeArgs(s string) []string {
+	var args []string
+	depth, start := 0, 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '<':
+			depth++
+		case '>':
+			depth--
+		case ',':
+			if depth == 0 {
+				if a := strings.TrimSpace(s[start:i]); a != "" {
+					args = append(args, a)
+				}
+				start = i + 1
+			}
+		}
+	}
+	if a := strings.TrimSpace(s[start:]); a != "" {
+		args = append(args, a)
+	}
+	return args
 }
