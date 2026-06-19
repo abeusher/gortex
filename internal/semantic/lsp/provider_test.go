@@ -459,6 +459,66 @@ func TestLSP_Provider_OpensEachFileOnce(t *testing.T) {
 		"didOpen should be sent exactly once for shared.go even with 3 nodes inside it")
 }
 
+// A provider whose language owns no nodes in the (scoped) repo must skip
+// the whole pass — no didOpen, no hover, no hierarchy — so a warm restart
+// never pays a per-language server spin-up for zero enrichment. Guards the
+// lazy-spawn gate in EnrichRepo.
+func TestLSP_Provider_SkipsWhenNoNodesForLanguage(t *testing.T) {
+	repoRoot := t.TempDir()
+	require.NoError(t, os.WriteFile(
+		filepath.Join(repoRoot, "main.go"),
+		[]byte("package main\n\nfunc A() {}\n"),
+		0o644,
+	))
+
+	server := newFakeLSPServer()
+	// A python provider against a graph that holds only Go nodes.
+	p, cleanup := providerWithFakeServer(t, server, []string{"python"})
+	defer cleanup()
+
+	g := graph.New()
+	g.AddNode(&graph.Node{
+		ID: "main.go::A", Kind: graph.KindFunction, Name: "A",
+		FilePath: "main.go", StartLine: 3, EndLine: 3, Language: "go",
+	})
+
+	res, err := p.Enrich(g, repoRoot)
+	require.NoError(t, err)
+	require.NotNil(t, res)
+	assert.Equal(t, 0, res.NodesEnriched, "no python nodes → nothing enriched")
+	assert.Equal(t, 0, res.SymbolsTotal, "skip returns before the symbol count")
+	for _, n := range server.notifications() {
+		assert.NotEqual(t, "textDocument/didOpen", n,
+			"the gate must return before opening any document")
+	}
+}
+
+// EnrichRepo scoped to a prefix that owns none of the language's nodes
+// also skips — the nodes live under a different repo prefix.
+func TestLSP_Provider_SkipsWhenLanguageNodesInOtherRepo(t *testing.T) {
+	repoRoot := t.TempDir()
+	server := newFakeLSPServer()
+	p, cleanup := providerWithFakeServer(t, server, []string{"go"})
+	defer cleanup()
+
+	g := graph.New()
+	g.AddNode(&graph.Node{
+		ID: "other/main.go::A", Kind: graph.KindFunction, Name: "A",
+		FilePath: "other/main.go", StartLine: 3, EndLine: 3,
+		Language: "go", RepoPrefix: "other",
+	})
+
+	// Enrich the "wanted" repo, whose prefix owns no nodes.
+	res, err := p.EnrichRepo(g, "wanted", repoRoot)
+	require.NoError(t, err)
+	require.NotNil(t, res)
+	assert.Equal(t, 0, res.NodesEnriched)
+	for _, n := range server.notifications() {
+		assert.NotEqual(t, "textDocument/didOpen", n,
+			"a prefix-scoped pass must not open another repo's documents")
+	}
+}
+
 func TestLSP_Provider_EnrichFileIsNoOp(t *testing.T) {
 	server := newFakeLSPServer()
 	p, cleanup := providerWithFakeServer(t, server, []string{"go"})

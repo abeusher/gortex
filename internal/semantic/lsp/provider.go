@@ -205,7 +205,49 @@ func (p *Provider) Close() error {
 	return nil
 }
 
+// nodeRelPath strips a node's own RepoPrefix from its FilePath so the
+// result joins cleanly under repoRoot, which carries no prefix. Without
+// it a multi-repo node FilePath like "gortex/bench/x.rb" joined onto
+// repoRoot ".../gortex" doubles the prefix (".../gortex/gortex/bench/x.rb")
+// and every os.ReadFile / didOpen fails with ENOTDIR.
+func nodeRelPath(n *graph.Node) string {
+	if n.RepoPrefix != "" {
+		return strings.TrimPrefix(n.FilePath, n.RepoPrefix+"/")
+	}
+	return n.FilePath
+}
+
+// scopedPath re-attaches repoPrefix to a repo-relative path the language
+// server handed back: uriToPath returns repo-relative, but graph node
+// FilePaths are prefixed, so node lookups must re-prefix to match in a
+// multi-repo graph.
+func scopedPath(repoPrefix, rel string) string {
+	if repoPrefix == "" || rel == "" {
+		return rel
+	}
+	return repoPrefix + "/" + rel
+}
+
+// Enrich runs the full LSP enrichment pass for a single-repo (un-
+// prefixed) graph. It delegates to EnrichRepo with an empty prefix.
 func (p *Provider) Enrich(g graph.Store, repoRoot string) (*semantic.EnrichResult, error) {
+	return p.EnrichRepo(g, "", repoRoot)
+}
+
+// EnrichRepo runs the full LSP enrichment pass over the nodes that belong
+// to repoPrefix (the multi-repo scope key; "" for a single-repo / in-
+// memory graph). Scoping the node/edge selection to one repo stops a
+// multi-repo graph from driving this repo's language server with another
+// repo's files, and lets each node's on-disk path resolve by stripping
+// its own RepoPrefix.
+//
+// The language server is spawned lazily: if the repo has no AMBIGUOUS
+// (sub-1.0-confidence) edge of this provider's language there is nothing
+// for the server to confirm or refute, so the pass returns before
+// starting it. This is what keeps a warm restart — where the snapshot is
+// already fully resolved — from paying a full server spin-up plus a whole
+// hover / call-hierarchy sweep per language for zero enrichment.
+func (p *Provider) EnrichRepo(g graph.Store, repoPrefix, repoRoot string) (*semantic.EnrichResult, error) {
 	start := time.Now()
 
 	absRoot, err := filepath.Abs(repoRoot)
@@ -213,11 +255,72 @@ func (p *Provider) Enrich(g graph.Store, repoRoot string) (*semantic.EnrichResul
 		return nil, err
 	}
 
-	// Start or reuse client.
+	result := &semantic.EnrichResult{
+		Provider: p.Name(),
+		Language: p.languages[0],
+	}
+
+	// Collect nodes that need enrichment (AMBIGUOUS or INFERRED edges),
+	// scoped to this repo + language. Done BEFORE the server starts so an
+	// empty target set skips the spawn entirely.
+	type enrichTarget struct {
+		node *graph.Node
+		edge *graph.Edge
+	}
+	var targets []enrichTarget
+	for _, e := range g.AllEdges() {
+		if e.Confidence >= 1.0 {
+			continue
+		}
+		fromNode := g.GetNode(e.From)
+		if fromNode == nil || fromNode.RepoPrefix != repoPrefix {
+			continue
+		}
+		if p.languageMatches(fromNode.Language) {
+			targets = append(targets, enrichTarget{node: fromNode, edge: e})
+		}
+	}
+
+	// Lazy server spawn: the hover / implements / call- and type-hierarchy
+	// passes all operate on this language's symbols, so what makes the pass
+	// worth a server spin-up is at least one in-repo node of the provider's
+	// language — an ambiguous edge to confirm, or any function / type /
+	// interface to interrogate. When the repo has none (a Swift or TS
+	// server scoped to a Go repo, or a language whose nodes all live in a
+	// different repo) return without starting the server. This is what
+	// stops a warm restart from paying a full per-language LSP spin-up —
+	// process launch, initialize handshake, and a whole-repo sweep — for
+	// zero enrichment.
+	hasWork := len(targets) > 0
+	if !hasWork {
+		for _, n := range g.AllNodes() {
+			if n.RepoPrefix != repoPrefix {
+				continue
+			}
+			if n.Kind == graph.KindFile || n.Kind == graph.KindImport {
+				continue
+			}
+			if p.languageMatches(n.Language) {
+				hasWork = true
+				break
+			}
+		}
+	}
+	if !hasWork {
+		if p.logger != nil {
+			p.logger.Debug("LSP enrich: skipped, repo has no nodes for language",
+				zap.String("provider", p.Name()),
+				zap.String("repo_prefix", repoPrefix),
+			)
+		}
+		result.DurationMs = time.Since(start).Milliseconds()
+		return result, nil
+	}
+
+	// Start or reuse the client now that there is work to do.
 	if err := p.ensureClient(absRoot); err != nil {
 		return nil, fmt.Errorf("start LSP server: %w", err)
 	}
-
 	// Default the reconnect seam to the real ensureClient unless a test
 	// injected its own (in-memory piped client). Set once per pass.
 	if p.connectOnce == nil {
@@ -227,48 +330,16 @@ func (p *Provider) Enrich(g graph.Store, repoRoot string) (*semantic.EnrichResul
 	// only this Enrich invocation.
 	p.reconnectAttempts.Store(0)
 
-	result := &semantic.EnrichResult{
-		Provider: p.Name(),
-		Language: p.languages[0],
-	}
-
-	// Collect nodes that need enrichment (AMBIGUOUS or INFERRED edges).
-	type enrichTarget struct {
-		node *graph.Node
-		edge *graph.Edge
-	}
-
-	var targets []enrichTarget
-	for _, e := range g.AllEdges() {
-		if e.Confidence >= 1.0 {
-			continue
-		}
-		fromNode := g.GetNode(e.From)
-		if fromNode == nil {
-			continue
-		}
-		langMatch := false
-		for _, lang := range p.languages {
-			if fromNode.Language == lang {
-				langMatch = true
-				break
-			}
-		}
-		if langMatch {
-			targets = append(targets, enrichTarget{node: fromNode, edge: e})
-		}
-	}
-
-	// Count total symbols.
+	// Count total symbols (scoped to repo + language).
 	for _, n := range g.AllNodes() {
 		if n.Kind == graph.KindFile || n.Kind == graph.KindImport {
 			continue
 		}
-		for _, lang := range p.languages {
-			if n.Language == lang {
-				result.SymbolsTotal++
-				break
-			}
+		if n.RepoPrefix != repoPrefix {
+			continue
+		}
+		if p.languageMatches(n.Language) {
+			result.SymbolsTotal++
 		}
 	}
 
@@ -355,19 +426,12 @@ func (p *Provider) Enrich(g graph.Store, repoRoot string) (*semantic.EnrichResul
 		if n.Kind == graph.KindFile || n.Kind == graph.KindImport {
 			continue
 		}
-		langMatch := false
-		for _, lang := range p.languages {
-			if n.Language == lang {
-				langMatch = true
-				break
-			}
-		}
-		if !langMatch {
+		if n.RepoPrefix != repoPrefix || !p.languageMatches(n.Language) {
 			continue
 		}
 		ft := fileIndex[n.FilePath]
 		if ft == nil {
-			ft = &fileTargets{rel: n.FilePath}
+			ft = &fileTargets{rel: nodeRelPath(n)}
 			fileIndex[n.FilePath] = ft
 			fileList = append(fileList, ft)
 		}
@@ -472,7 +536,7 @@ func (p *Provider) Enrich(g graph.Store, repoRoot string) (*semantic.EnrichResul
 					}
 
 					col := identifierColumn(content, n.StartLine, n.Name)
-					hoverResult, err := p.hoverWith(c, absRoot, n.FilePath, n.StartLine-1, col)
+					hoverResult, err := p.hoverWith(c, absRoot, nodeRelPath(n), n.StartLine-1, col)
 					if err != nil && isServerExitError(err) {
 						// Server died mid-flight — recover once and retry this
 						// node's hover against the fresh session. The new client
@@ -489,7 +553,7 @@ func (p *Provider) Enrich(g graph.Store, repoRoot string) (*semantic.EnrichResul
 								zap.String("file", n.FilePath), zap.Error(err))
 							return
 						}
-						hoverResult, err = p.hoverWith(c, absRoot, n.FilePath, n.StartLine-1, col)
+						hoverResult, err = p.hoverWith(c, absRoot, nodeRelPath(n), n.StartLine-1, col)
 					}
 					if err != nil {
 						diagHoverErr.Add(1)
@@ -567,25 +631,19 @@ func (p *Provider) Enrich(g graph.Store, repoRoot string) (*semantic.EnrichResul
 		if n.Kind != graph.KindInterface {
 			continue
 		}
-		langMatch := false
-		for _, lang := range p.languages {
-			if n.Language == lang {
-				langMatch = true
-				break
-			}
-		}
-		if !langMatch {
+		if n.RepoPrefix != repoPrefix || !p.languageMatches(n.Language) {
 			continue
 		}
 
+		rel := nodeRelPath(n)
 		// Per-item doc lifecycle (no bulk pre-open): open this interface's
 		// file, query, close immediately so memory stays bounded.
-		if err := p.openDocument(absRoot, n.FilePath); err != nil {
+		if err := p.openDocument(absRoot, rel); err != nil {
 			continue
 		}
-		col := identifierColumn(p.getSource(absRoot, n.FilePath), n.StartLine, n.Name)
-		impls, err := p.findImplementations(absRoot, n.FilePath, n.StartLine-1, col)
-		_ = p.closeDocument(filepath.Join(absRoot, n.FilePath))
+		col := identifierColumn(p.getSource(absRoot, rel), n.StartLine, n.Name)
+		impls, err := p.findImplementations(absRoot, rel, n.StartLine-1, col)
+		_ = p.closeDocument(filepath.Join(absRoot, rel))
 		if err != nil || len(impls) == 0 {
 			continue
 		}
@@ -595,7 +653,7 @@ func (p *Provider) Enrich(g graph.Store, repoRoot string) (*semantic.EnrichResul
 			if implPath == "" {
 				continue
 			}
-			implNode := semantic.MatchNodeByFileLine(g, implPath, loc.Range.Start.Line+1)
+			implNode := semantic.MatchNodeByFileLine(g, scopedPath(repoPrefix, implPath), loc.Range.Start.Line+1)
 			if implNode == nil {
 				continue
 			}
@@ -618,14 +676,14 @@ func (p *Provider) Enrich(g graph.Store, repoRoot string) (*semantic.EnrichResul
 	// outgoing calls per indexed function and use them to promote
 	// existing call edges to lsp_resolved (or add edges that AST
 	// extraction missed when the callee is in another file).
-	p.enrichCallHierarchy(g, absRoot, result)
+	p.enrichCallHierarchy(g, repoPrefix, absRoot, result)
 
 	// Type hierarchy: ask the server for super- and sub-types of
 	// each indexed type/interface and emit EdgeExtends /
 	// EdgeImplements / EdgeComposes — the single biggest non-Go
 	// win because the AST extractor handles interface and type
 	// inheritance with very low fidelity outside Go.
-	p.enrichTypeHierarchy(g, absRoot, result)
+	p.enrichTypeHierarchy(g, repoPrefix, absRoot, result)
 
 	// Query references for AMBIGUOUS edges to confirm/refute.
 	for _, t := range targets {
@@ -634,23 +692,27 @@ func (p *Provider) Enrich(g graph.Store, repoRoot string) (*semantic.EnrichResul
 			continue
 		}
 
+		toRel := nodeRelPath(toNode)
 		// Per-item doc lifecycle (no bulk pre-open): open the referent's
 		// file, query, close immediately so memory stays bounded.
-		if err := p.openDocument(absRoot, toNode.FilePath); err != nil {
+		if err := p.openDocument(absRoot, toRel); err != nil {
 			continue
 		}
-		col := identifierColumn(p.getSource(absRoot, toNode.FilePath), toNode.StartLine, toNode.Name)
-		refs, err := p.findReferences(absRoot, toNode.FilePath, toNode.StartLine-1, col)
-		_ = p.closeDocument(filepath.Join(absRoot, toNode.FilePath))
+		col := identifierColumn(p.getSource(absRoot, toRel), toNode.StartLine, toNode.Name)
+		refs, err := p.findReferences(absRoot, toRel, toNode.StartLine-1, col)
+		_ = p.closeDocument(filepath.Join(absRoot, toRel))
 		if err != nil || len(refs) == 0 {
 			continue
 		}
 
-		// Check if any reference matches the caller's location.
+		// Check if any reference matches the caller's location. uriToPath
+		// returns a repo-relative path while the node FilePath is prefixed,
+		// so compare against the caller's stripped path.
+		callerRel := nodeRelPath(t.node)
 		confirmed := false
 		for _, ref := range refs {
 			refPath := uriToPath(ref.URI, absRoot)
-			if refPath == t.node.FilePath &&
+			if refPath == callerRel &&
 				ref.Range.Start.Line+1 >= t.node.StartLine &&
 				ref.Range.Start.Line+1 <= t.node.EndLine {
 				confirmed = true
@@ -1526,16 +1588,17 @@ func (p *Provider) Source(repoRoot, relPath string) []byte {
 // matching ast_inferred / text_matched EdgeCalls to lsp_resolved, or
 // add a fresh EdgeCalls when the AST extractor missed the link
 // (cross-file calls in languages without compile-unit info).
-func (p *Provider) enrichCallHierarchy(g graph.Store, absRoot string, result *semantic.EnrichResult) {
+func (p *Provider) enrichCallHierarchy(g graph.Store, repoPrefix, absRoot string, result *semantic.EnrichResult) {
 	for _, n := range g.AllNodes() {
 		if n.Kind != graph.KindFunction && n.Kind != graph.KindMethod {
 			continue
 		}
-		if !p.languageMatches(n.Language) {
+		if n.RepoPrefix != repoPrefix || !p.languageMatches(n.Language) {
 			continue
 		}
-		col := identifierColumn(p.getSource(absRoot, n.FilePath), n.StartLine, n.Name)
-		items, err := p.prepareCallHierarchy(absRoot, n.FilePath, n.StartLine-1, col)
+		rel := nodeRelPath(n)
+		col := identifierColumn(p.getSource(absRoot, rel), n.StartLine, n.Name)
+		items, err := p.prepareCallHierarchy(absRoot, rel, n.StartLine-1, col)
 		if err != nil || len(items) == 0 {
 			continue
 		}
@@ -1543,13 +1606,13 @@ func (p *Provider) enrichCallHierarchy(g graph.Store, absRoot string, result *se
 			calls, err := p.outgoingCalls(item)
 			if err == nil {
 				for _, c := range calls {
-					p.recordHierarchyCall(g, absRoot, n, c.To, true, result)
+					p.recordHierarchyCall(g, repoPrefix, absRoot, n, c.To, true, result)
 				}
 			}
 			incoming, err := p.incomingCalls(item)
 			if err == nil {
 				for _, c := range incoming {
-					p.recordHierarchyCall(g, absRoot, n, c.From, false, result)
+					p.recordHierarchyCall(g, repoPrefix, absRoot, n, c.From, false, result)
 				}
 			}
 		}
@@ -1560,12 +1623,12 @@ func (p *Provider) enrichCallHierarchy(g graph.Store, absRoot string, result *se
 // asOutgoing=true means "this node calls other"; false means "other
 // calls this node" (incoming-calls direction). Existing edges get
 // promoted to lsp_resolved; missing edges get added.
-func (p *Provider) recordHierarchyCall(g graph.Store, absRoot string, n *graph.Node, other CallHierarchyItem, asOutgoing bool, result *semantic.EnrichResult) {
+func (p *Provider) recordHierarchyCall(g graph.Store, repoPrefix, absRoot string, n *graph.Node, other CallHierarchyItem, asOutgoing bool, result *semantic.EnrichResult) {
 	otherPath := uriToPath(other.URI, absRoot)
 	if otherPath == "" {
 		return
 	}
-	otherNode := semantic.MatchNodeByFileLine(g, otherPath,
+	otherNode := semantic.MatchNodeByFileLine(g, scopedPath(repoPrefix, otherPath),
 		other.SelectionRange.Start.Line+1)
 	if otherNode == nil {
 		return
@@ -1601,27 +1664,28 @@ func (p *Provider) recordHierarchyCall(g graph.Store, absRoot string, n *graph.N
 //     T → super when the super is an interface kind.
 //   - subtypes(T) = the children of T. Emits EdgeImplements child
 //     → T when T is an interface; EdgeExtends otherwise.
-func (p *Provider) enrichTypeHierarchy(g graph.Store, absRoot string, result *semantic.EnrichResult) {
+func (p *Provider) enrichTypeHierarchy(g graph.Store, repoPrefix, absRoot string, result *semantic.EnrichResult) {
 	for _, n := range g.AllNodes() {
 		if n.Kind != graph.KindType && n.Kind != graph.KindInterface {
 			continue
 		}
-		if !p.languageMatches(n.Language) {
+		if n.RepoPrefix != repoPrefix || !p.languageMatches(n.Language) {
 			continue
 		}
-		col := identifierColumn(p.getSource(absRoot, n.FilePath), n.StartLine, n.Name)
-		items, err := p.prepareTypeHierarchy(absRoot, n.FilePath, n.StartLine-1, col)
+		rel := nodeRelPath(n)
+		col := identifierColumn(p.getSource(absRoot, rel), n.StartLine, n.Name)
+		items, err := p.prepareTypeHierarchy(absRoot, rel, n.StartLine-1, col)
 		if err != nil || len(items) == 0 {
 			continue
 		}
 		for _, item := range items {
 			supers, _ := p.supertypes(item)
 			for _, s := range supers {
-				p.linkTypeHierarchy(g, absRoot, n, s, true, result)
+				p.linkTypeHierarchy(g, repoPrefix, absRoot, n, s, true, result)
 			}
 			subs, _ := p.subtypes(item)
 			for _, s := range subs {
-				p.linkTypeHierarchy(g, absRoot, n, s, false, result)
+				p.linkTypeHierarchy(g, repoPrefix, absRoot, n, s, false, result)
 			}
 		}
 	}
@@ -1636,12 +1700,12 @@ func (p *Provider) enrichTypeHierarchy(g graph.Store, absRoot string, result *se
 // whose name matches a method on the parent — closing the
 // method-level half of the type hierarchy (Joern calls these
 // CONTAINS + OVERRIDES).
-func (p *Provider) linkTypeHierarchy(g graph.Store, absRoot string, cur *graph.Node, other TypeHierarchyItem, asSupertype bool, result *semantic.EnrichResult) {
+func (p *Provider) linkTypeHierarchy(g graph.Store, repoPrefix, absRoot string, cur *graph.Node, other TypeHierarchyItem, asSupertype bool, result *semantic.EnrichResult) {
 	otherPath := uriToPath(other.URI, absRoot)
 	if otherPath == "" {
 		return
 	}
-	otherNode := semantic.MatchNodeByFileLine(g, otherPath, other.SelectionRange.Start.Line+1)
+	otherNode := semantic.MatchNodeByFileLine(g, scopedPath(repoPrefix, otherPath), other.SelectionRange.Start.Line+1)
 	if otherNode == nil {
 		return
 	}
