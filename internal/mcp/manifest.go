@@ -79,6 +79,22 @@ func (s *Server) buildContextManifest(ctx context.Context, focus, outlineCandida
 		return c
 	}
 
+	// Flow-spine-aware sizing: a symbol on the forward flow spine from the
+	// focus is on the answer path and stays full; off-spine polymorphic
+	// siblings (and family supertypes) skeletonize to free budget. Computed
+	// once from the primary focus symbol.
+	onSpine := make(map[string]bool)
+	if len(focus) > 0 && focus[0] != nil {
+		if spine, _ := s.flowSpine(focus[0].ID, manifestSpineDepth); len(spine) > 0 {
+			for _, id := range spine {
+				onSpine[id] = true
+			}
+		}
+	}
+	// Process the symbols that will skeletonize first so their freed budget is
+	// available to the unique, full-source symbols after them.
+	focus = manifestOrderFocus(focus, onSpine, siblingCountOf)
+
 	base := func(n *graph.Node) map[string]any {
 		e := map[string]any{
 			"id":         n.ID,
@@ -115,24 +131,24 @@ func (s *Server) buildContextManifest(ctx context.Context, focus, outlineCandida
 		e := base(n)
 		src := s.manifestSymbolSource(ctx, n)
 		if src != "" {
-			// Polymorphic-sibling skeletonization: a focus type /
-			// interface / method that belongs to a large interchangeable
-			// family (more than skeletonizeSiblingThreshold siblings)
-			// ships compressed — one representative is enough detail; the
-			// rest of the family is redundant. Gated strictly on kind so a
-			// sole-implementation focus symbol is never skeletonized.
-			if skeletonizableKind(n.Kind) {
-				if sc := siblingCountOf(n); sc > skeletonizeSiblingThreshold {
-					if comp, err := elide.CompressString(src, n.Language); err == nil {
-						if cc := int(tokens.CachedCountInt64(comp)); used+cc <= budget {
-							e["tier"] = "focus"
-							e["source"] = comp
-							e["compressed"] = true
-							e["sibling_count"] = sc
-							used += cc
-							entries = append(entries, e)
-							continue
-						}
+			// Flow-spine-aware polymorphic-sibling skeletonization: a focus
+			// type / interface / method in a large interchangeable family
+			// (more than skeletonizeSiblingThreshold siblings) ships compressed
+			// when it is OFF the answer-path flow spine, or when it is the
+			// family supertype (the family-file override) — one representative
+			// is enough and the freed budget goes to the symbols/files the
+			// agent actually needs. An on-spine concrete symbol stays full.
+			if sc := siblingCountOf(n); manifestShouldSkeletonize(n.Kind, onSpine[n.ID], sc) {
+				if comp, err := elide.CompressString(src, n.Language); err == nil {
+					if cc := int(tokens.CachedCountInt64(comp)); used+cc <= budget {
+						e["tier"] = "focus"
+						e["source"] = comp
+						e["compressed"] = true
+						e["sibling_count"] = sc
+						e["off_spine"] = !onSpine[n.ID]
+						used += cc
+						entries = append(entries, e)
+						continue
 					}
 				}
 			}
@@ -259,6 +275,56 @@ func skeletonizableKind(k graph.NodeKind) bool {
 	default:
 		return false
 	}
+}
+
+// manifestSpineDepth is the forward flow-spine walk depth the graded manifest
+// uses to decide which focus symbols are "on the answer path".
+const manifestSpineDepth = 6
+
+// manifestIsFamilySupertype reports whether a node kind is the *supertype* of a
+// polymorphic family — an interface, or a parent method that subclasses
+// override. (A concrete KindType is a family *member*, not its supertype.) The
+// supertype's full body is redundant once the family's signatures are present.
+func manifestIsFamilySupertype(k graph.NodeKind) bool {
+	return k == graph.KindInterface || k == graph.KindMethod
+}
+
+// manifestShouldSkeletonize decides whether an embeddable focus symbol ships
+// skeletonized (a compressed signature/structure stub) rather than at full
+// source, given the flow spine and its polymorphic-family size:
+//
+//   - not a polymorphic-family member → never skeletonized;
+//   - the family *supertype* (interface / overridden method) → ALWAYS
+//     skeletonized, even on-spine: its body is redundant once the impl
+//     signatures are present, and the freed budget goes to the sibling
+//     implementation files the agent actually needs (the family-file override);
+//   - an off-spine concrete sibling → skeletonized (one representative is
+//     enough; thin the rest to free budget before unique symbols);
+//   - an on-spine concrete symbol → kept full (it is on the answer path).
+func manifestShouldSkeletonize(kind graph.NodeKind, onSpine bool, siblingCount int) bool {
+	if !skeletonizableKind(kind) || siblingCount <= skeletonizeSiblingThreshold {
+		return false
+	}
+	if manifestIsFamilySupertype(kind) {
+		return true
+	}
+	return !onSpine
+}
+
+// manifestOrderFocus stably reorders the focus set so the symbols that will
+// skeletonize (and therefore ship cheap) come first — the budget they free is
+// then available to the unique, full-source symbols processed after them.
+func manifestOrderFocus(focus []*graph.Node, onSpine map[string]bool, siblingCount func(*graph.Node) int) []*graph.Node {
+	skel := make([]*graph.Node, 0, len(focus))
+	uniq := make([]*graph.Node, 0, len(focus))
+	for _, n := range focus {
+		if n != nil && manifestShouldSkeletonize(n.Kind, onSpine[n.ID], siblingCount(n)) {
+			skel = append(skel, n)
+		} else {
+			uniq = append(uniq, n)
+		}
+	}
+	return append(skel, uniq...)
 }
 
 // manifestSiblingCount returns the size of a node's interchangeable
