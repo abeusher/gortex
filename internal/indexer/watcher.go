@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/sgtdi/fswatcher"
@@ -76,6 +77,17 @@ type Watcher struct {
 	stopped          chan struct{}
 	symbolChangeCb   SymbolChangeCallback
 	symbolChangeCbMu sync.RWMutex
+
+	// Degraded-watch state: set when the OS can't fully cover the tree —
+	// inotify watch exhaustion (ENOSPC) or FD exhaustion (EMFILE/ENFILE).
+	// degradedReason is the operator-facing explanation (surfaced as a
+	// whole-index "frozen" banner on read tools); degradedLogged makes the
+	// operator log warning fire exactly once; degradedCb (optional) pushes the
+	// notice onto the daemon's health channel. Guarded by degradedMu.
+	degradedMu     sync.RWMutex
+	degradedReason string
+	degradedLogged bool
+	degradedCb     func(reason string)
 
 	// probeWaiters maps a probe-file path (created during Start to confirm
 	// the inotify watch is active) to a chan that handleEvent closes when
@@ -269,6 +281,23 @@ func (w *Watcher) Start(paths []string) error {
 	case <-ready:
 	case err := <-watchErr:
 		cancel()
+		// Watch / FD exhaustion is not a hard failure: keep Start succeeding,
+		// log a one-time operator warning, and fall back to the adaptive
+		// poller so the graph still catches git-HEAD + mtime changes. Failing
+		// here would leave a busy machine with no daemon at all.
+		if isInotifyExhausted(err) || isFDExhausted(err) {
+			w.noteWatchDegraded(err)
+			w.degradedNoFsnotify = true
+			if w.fsw != nil {
+				w.fsw.Close()
+				w.fsw = nil
+			}
+			if w.config.Enabled {
+				w.poller = newPoller(w, w.indexer, w.logger)
+				w.poller.Start()
+			}
+			return nil
+		}
 		return err
 	case <-time.After(5 * time.Second):
 		cancel()
@@ -433,6 +462,71 @@ func (w *Watcher) OnSymbolChange(cb SymbolChangeCallback) {
 	w.symbolChangeCbMu.Lock()
 	defer w.symbolChangeCbMu.Unlock()
 	w.symbolChangeCb = cb
+}
+
+// OnDegraded registers a callback invoked once when the file watcher first
+// enters a degraded state (inotify / FD exhaustion). The daemon wires it to its
+// health push-notification channel so a subscribed agent learns the index may
+// be frozen without polling.
+func (w *Watcher) OnDegraded(cb func(reason string)) {
+	w.degradedMu.Lock()
+	w.degradedCb = cb
+	w.degradedMu.Unlock()
+}
+
+// DegradedReason returns a human-readable explanation when the native file
+// watcher is running degraded — inotify watch exhaustion or FD exhaustion — so
+// live edits may not reach the graph until a reindex. Empty when watching is
+// healthy. Read tools surface this as a whole-index "frozen" banner, distinct
+// from a per-file stale flag.
+func (w *Watcher) DegradedReason() string {
+	w.degradedMu.RLock()
+	defer w.degradedMu.RUnlock()
+	return w.degradedReason
+}
+
+// isInotifyExhausted reports whether err is the inotify watch-limit error
+// (ENOSPC) — the kernel ran out of `fs.inotify.max_user_watches`.
+func isInotifyExhausted(err error) bool { return errors.Is(err, syscall.ENOSPC) }
+
+// isFDExhausted reports whether err is a file-descriptor-exhaustion error
+// (EMFILE per-process, ENFILE system-wide).
+func isFDExhausted(err error) bool {
+	return errors.Is(err, syscall.EMFILE) || errors.Is(err, syscall.ENFILE)
+}
+
+// noteWatchDegraded records a watcher-degradation cause and logs a one-time
+// operator warning (subsequent calls are silent — "warns once"). ENOSPC names
+// the inotify watch-limit sysctl; FD exhaustion advises raising the open-file
+// limit. The first occurrence also fires the optional degraded callback so the
+// daemon can push the notice. Returns true on the first (logged) call.
+func (w *Watcher) noteWatchDegraded(err error) bool {
+	var reason, logMsg string
+	switch {
+	case isInotifyExhausted(err):
+		reason = "inotify watch limit reached — the graph may miss live edits until you raise fs.inotify.max_user_watches and reindex (the adaptive poller covers some changes)"
+		logMsg = "watcher: inotify watch limit (ENOSPC) — watches partially installed; raise fs.inotify.max_user_watches. Falling back to the adaptive poller for missed changes"
+	case isFDExhausted(err):
+		reason = "open-file limit reached — the watcher is degraded until you raise the process file-descriptor limit (ulimit -n) and reindex (the adaptive poller covers some changes)"
+		logMsg = "watcher: file-descriptor limit (EMFILE/ENFILE) — watcher degraded; raise ulimit -n. Falling back to the adaptive poller"
+	default:
+		return false
+	}
+	w.degradedMu.Lock()
+	first := !w.degradedLogged
+	w.degradedReason = reason
+	w.degradedLogged = true
+	cb := w.degradedCb
+	w.degradedMu.Unlock()
+	if first {
+		if w.logger != nil {
+			w.logger.Warn(logMsg)
+		}
+		if cb != nil {
+			cb(reason)
+		}
+	}
+	return first
 }
 
 func (w *Watcher) loop() {

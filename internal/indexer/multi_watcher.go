@@ -32,6 +32,10 @@ type MultiWatcher struct {
 	// callbackMu so registration and per-repo apply don't race.
 	callbackMu     sync.Mutex
 	symbolChangeCb SymbolChangeCallback
+	// degradedCb is fanned out to every per-repo Watcher (and re-applied at
+	// AddRepo) so a watcher entering a degraded state — inotify / FD
+	// exhaustion — pushes a single health notice through the daemon.
+	degradedCb func(reason string)
 }
 
 // NewMultiWatcher creates a MultiWatcher that watches all configured repos.
@@ -336,6 +340,49 @@ func (mw *MultiWatcher) OnSymbolChange(cb SymbolChangeCallback) {
 	}
 }
 
+// OnDegraded registers a callback fired (once per repo) when a per-repo watcher
+// first degrades — inotify / FD exhaustion. Fanned out to current watchers and
+// re-applied at AddRepo, mirroring OnSymbolChange.
+func (mw *MultiWatcher) OnDegraded(cb func(reason string)) {
+	mw.callbackMu.Lock()
+	mw.degradedCb = cb
+	mw.callbackMu.Unlock()
+
+	mw.mu.Lock()
+	watchers := make([]*Watcher, 0, len(mw.watchers))
+	for _, w := range mw.watchers {
+		watchers = append(watchers, w)
+	}
+	mw.mu.Unlock()
+
+	for _, w := range watchers {
+		w.OnDegraded(cb)
+	}
+}
+
+// DegradedReason returns the first non-empty per-repo degraded reason, prefixed
+// with the repo it came from, or "" when every watcher is healthy. Lets the
+// daemon-mode freshness rider surface a whole-index "frozen" banner the same
+// way the single-repo embedded watcher does.
+func (mw *MultiWatcher) DegradedReason() string {
+	mw.mu.Lock()
+	defer mw.mu.Unlock()
+	prefixes := make([]string, 0, len(mw.watchers))
+	for prefix := range mw.watchers {
+		prefixes = append(prefixes, prefix)
+	}
+	sort.Strings(prefixes)
+	for _, prefix := range prefixes {
+		if r := mw.watchers[prefix].DegradedReason(); r != "" {
+			if prefix != "" {
+				return prefix + ": " + r
+			}
+			return r
+		}
+	}
+	return ""
+}
+
 // AddRepo creates and starts a watcher for a newly tracked repo.
 func (mw *MultiWatcher) AddRepo(repoPrefix string, cfg config.WatchConfig) error {
 	mw.mu.Lock()
@@ -380,9 +427,13 @@ func (mw *MultiWatcher) AddRepo(repoPrefix string, cfg config.WatchConfig) error
 	// repos created at MultiWatcher construction time.
 	mw.callbackMu.Lock()
 	cb := mw.symbolChangeCb
+	degradedCb := mw.degradedCb
 	mw.callbackMu.Unlock()
 	if cb != nil {
 		w.OnSymbolChange(cb)
+	}
+	if degradedCb != nil {
+		w.OnDegraded(degradedCb)
 	}
 
 	go mw.forwardEvents(repoPrefix, w)

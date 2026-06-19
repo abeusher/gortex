@@ -505,6 +505,13 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		// was actively re-indexing changed files.
 		if state.mcpServer != nil && mw != nil {
 			state.mcpServer.SetWatcher(mw)
+			// Push a one-time degraded notice on the readiness channel when a
+			// watcher exhausts inotify watches / file descriptors, so a
+			// subscribed agent learns the index may be frozen without polling.
+			srv := state.mcpServer
+			mw.OnDegraded(func(reason string) {
+				srv.PublishReadiness("degraded", true, map[string]any{"watch_degraded": reason})
+			})
 		}
 		// Drive the /v1/events SSE stream from the MultiWatcher. The hub is
 		// the only consumer of mw.Events() (SetWatcher reads History(), not

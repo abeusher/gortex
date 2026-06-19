@@ -60,10 +60,20 @@ func (s *Server) freshnessRiderFor(toolName string, req mcp.CallToolRequest) map
 		}
 	}
 
-	if state == indexer.FileFresh && !mismatch && len(staleLangs) == 0 {
+	// Whole-index "frozen" banner: when the file watcher is degraded (inotify
+	// or FD exhaustion) the graph may silently lag every live edit, not just
+	// this file — a condition distinct from per-file staleness. Surface it even
+	// when the targeted file itself looks fresh.
+	frozen := s.watchDegradedReason()
+
+	if state == indexer.FileFresh && !mismatch && len(staleLangs) == 0 && frozen == "" {
 		return nil
 	}
 	out := map[string]any{"file": repoRel}
+	if frozen != "" {
+		out["index_frozen"] = true
+		out["index_frozen_hint"] = frozen
+	}
 	if p := owner.RepoPrefix(); p != "" {
 		out["repo"] = p
 	}
@@ -94,6 +104,21 @@ func (s *Server) freshnessRiderFor(toolName string, req mcp.CallToolRequest) map
 		out["worktree_hint"] = "the working directory is a linked git worktree the indexed graph does not cover — results reflect another checkout"
 	}
 	return out
+}
+
+// watchDegradedReason returns the file watcher's degraded reason (inotify / FD
+// exhaustion) when the index may be silently frozen, or "" when watching is
+// healthy or unavailable. Read through an interface assertion so the rider
+// stays decoupled from the concrete *indexer.Watcher behind the server's
+// watcher field.
+func (s *Server) watchDegradedReason() string {
+	if s.watcher == nil {
+		return ""
+	}
+	if dr, ok := s.watcher.(interface{ DegradedReason() string }); ok {
+		return dr.DegradedReason()
+	}
+	return ""
 }
 
 // indexerForRel routes a graph file path (as it appears in tool output or
