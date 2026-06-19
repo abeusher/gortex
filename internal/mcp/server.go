@@ -1008,6 +1008,116 @@ func ServerInstructionsUntracked(cwd string) string {
 		"Until then tools/list is intentionally empty; fall back to your own file reads and text search.", target, target)
 }
 
+// afterInitializeInstructions is the server's OnAfterInitialize hook: it
+// rewrites the initialize result's Instructions to the variant that fits THIS
+// connection's cwd. Because it runs inside the handshake, every MCP client —
+// not just ones that execute a SessionStart hook — learns the live workspace
+// shape and warmup state directly from initialize. See stateAwareInstructions.
+func (s *Server) afterInitializeInstructions(ctx context.Context, _ any, _ *mcp.InitializeRequest, result *mcp.InitializeResult) {
+	if s == nil || result == nil {
+		return
+	}
+	result.Instructions = s.stateAwareInstructions(SessionCWDFromContext(ctx))
+}
+
+// stateAwareInstructions chooses the initialize `instructions` text for a
+// connection rooted at cwd. An uncovered multi-repo cwd gets the terse
+// activation affordance (shared with the F4 handshake path); a covered cwd —
+// or a single-repo / cwd-less control client — gets the base guidance plus a
+// live-facts block describing the workspace and warmup state.
+func (s *Server) stateAwareInstructions(cwd string) string {
+	if s.multiIndexer != nil && strings.TrimSpace(cwd) != "" {
+		if _, _, _, ok := s.multiIndexer.ScopeForCWD(cwd); !ok {
+			return ServerInstructionsUntracked(cwd)
+		}
+	}
+	if facts := s.liveInstructionFacts(cwd); facts != "" {
+		return serverInstructions + "\n\n" + facts
+	}
+	return serverInstructions
+}
+
+// liveInstructionFacts renders the per-connection state block appended to the
+// covered-cwd instructions: tracked-repo count + names, the active project
+// (multi-repo only), and the daemon warmup phase / ready flag. Returns "" when
+// there is nothing live to report so the base guidance stays clean.
+func (s *Server) liveInstructionFacts(cwd string) string {
+	var lines []string
+
+	if repos := s.trackedRepoNames(cwd); len(repos) > 0 {
+		const maxNames = 8
+		shown, suffix := repos, ""
+		if len(repos) > maxNames {
+			shown = repos[:maxNames]
+			suffix = fmt.Sprintf(", +%d more", len(repos)-maxNames)
+		}
+		lines = append(lines, fmt.Sprintf("Tracked repositories (%d): %s%s.",
+			len(repos), strings.Join(shown, ", "), suffix))
+	}
+
+	if proj := s.activeProjectName(cwd); proj != "" {
+		lines = append(lines, fmt.Sprintf("Active project: %s.", proj))
+	}
+
+	if s.readinessBroadcaster != nil {
+		if snap := s.readinessBroadcaster.snapshot(); snap != nil {
+			if phase, _ := snap["phase"].(string); phase != "" {
+				ready, _ := snap["ready"].(bool)
+				state := "warming up — results may be partial until ready"
+				if ready {
+					state = "ready"
+				}
+				lines = append(lines, fmt.Sprintf("Index status: %s (phase %q).", state, phase))
+			}
+		}
+	}
+
+	if len(lines) == 0 {
+		return ""
+	}
+	return "Live state for this connection:\n- " + strings.Join(lines, "\n- ")
+}
+
+// trackedRepoNames returns the sorted repo prefixes visible to a connection
+// rooted at cwd: the cwd's workspace siblings when it resolves to one, else the
+// full tracked set. Empty in single-repo (no multi-indexer) mode.
+func (s *Server) trackedRepoNames(cwd string) []string {
+	if s.multiIndexer == nil {
+		return nil
+	}
+	var set map[string]bool
+	if strings.TrimSpace(cwd) != "" {
+		if ws, _, _, ok := s.multiIndexer.ScopeForCWD(cwd); ok {
+			set = s.multiIndexer.ReposInWorkspace(ws)
+		}
+	}
+	var names []string
+	if len(set) > 0 {
+		for p := range set {
+			names = append(names, p)
+		}
+	} else {
+		names = append(names, s.multiIndexer.RepoPrefixes()...)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// activeProjectName resolves the project slug for a cwd in multi-repo mode: the
+// cwd's own project when it resolves, else the server's configured active
+// project. Empty in single-repo mode.
+func (s *Server) activeProjectName(cwd string) string {
+	if s.multiIndexer == nil {
+		return ""
+	}
+	if strings.TrimSpace(cwd) != "" {
+		if _, proj, _, ok := s.multiIndexer.ScopeForCWD(cwd); ok && proj != "" {
+			return proj
+		}
+	}
+	return s.activeProject
+}
+
 // NewServer creates an MCP server with all Gortex tools registered.
 func NewServer(engine *query.Engine, g graph.Store, idx *indexer.Indexer, watcher *indexer.Watcher, logger *zap.Logger, guardRules []config.GuardRule, opts ...MultiRepoOptions) *Server {
 	s := &Server{
@@ -1032,6 +1142,16 @@ func NewServer(engine *query.Engine, g graph.Store, idx *indexer.Indexer, watche
 	// Wire the process-wide tokenStats as the parent of every
 	// per-session counter so record() fanout aggregates daemon-wide.
 	s.sessions.setParentTokenStats(s.tokenStats)
+	// Per-connection state-aware initialize instructions: the after-init
+	// hook rewrites result.Instructions for THIS session's cwd — the terse
+	// activation affordance for an uncovered cwd, or the base guidance plus
+	// live workspace + warmup facts for a covered one. It fires for every
+	// MCP client straight from the handshake, including non-Claude-Code
+	// clients that never run a SessionStart hook (where the daemon-side
+	// rewrite for the proxy path would not reach the embedded stdio server).
+	initHooks := &server.Hooks{}
+	initHooks.AddAfterInitialize(s.afterInitializeInstructions)
+
 	// mcpServer is constructed after s exists so the per-session tool
 	// filter can close over s — toolSurfaceFilter varies the tools/list
 	// surface by the session's planning mode (see tools_mode.go).
@@ -1039,6 +1159,8 @@ func NewServer(engine *query.Engine, g graph.Store, idx *indexer.Indexer, watche
 		// Surface "how to drive this server" to MCP clients in the
 		// initialize response — see serverInstructions.
 		server.WithInstructions(serverInstructions),
+		// Rewrite that instructions field per connection (see above).
+		server.WithHooks(initHooks),
 		// listChanged=true: tools_search promotes deferred tools into
 		// the live MCP server on demand, and a planning-mode flip
 		// re-filters the surface — both rely on tools/list_changed.

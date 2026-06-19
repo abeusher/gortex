@@ -3,8 +3,21 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+
+	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/parser"
+	"github.com/zzet/gortex/internal/parser/languages"
+	"github.com/zzet/gortex/internal/query"
+	"github.com/zzet/gortex/internal/search"
 )
 
 // TestInitialize_ReturnsInstructions drives a real `initialize`
@@ -48,4 +61,95 @@ func TestServerInstructions_NonEmpty(t *testing.T) {
 	if scrubControlChars(serverInstructions) != serverInstructions {
 		t.Error("serverInstructions carries control characters")
 	}
+}
+
+// TestStateAwareInstructionsVariants proves the F5 contract: the initialize
+// `instructions` field adapts to THIS connection's cwd. An uncovered cwd gets
+// the terse activation affordance; a covered cwd gets the base guidance plus a
+// live-facts block (tracked-repo names + count, active project, daemon warmup
+// state). The handshake subtests prove the after-initialize hook delivers
+// those live facts to ANY MCP client — including one that never runs a
+// SessionStart hook — which codegraph's static instructions cannot.
+func TestStateAwareInstructionsVariants(t *testing.T) {
+	repoA := setupMiniRepo(t, "repo-a")
+	repoB := setupMiniRepo(t, "repo-b")
+
+	tmpCfg := filepath.Join(t.TempDir(), "config.yaml")
+	gc := &config.GlobalConfig{
+		Repos: []config.RepoEntry{
+			{Path: repoA, Name: "repo-a"},
+			{Path: repoB, Name: "repo-b"},
+		},
+	}
+	gc.SetConfigPath(tmpCfg)
+	require.NoError(t, gc.Save())
+	cm, err := config.NewConfigManager(tmpCfg)
+	require.NoError(t, err)
+
+	reg := parser.NewRegistry()
+	reg.Register(languages.NewGoExtractor())
+	g := graph.New()
+	mi := indexer.NewMultiIndexer(g, reg, search.NewBM25(), cm, zap.NewNop())
+	_, err = mi.IndexAll()
+	require.NoError(t, err)
+
+	srv := NewServer(query.NewEngine(g), g, nil, nil, zap.NewNop(), nil, MultiRepoOptions{
+		ConfigManager: cm,
+		MultiIndexer:  mi,
+	})
+
+	// A live readiness snapshot so the covered variant carries the warmup
+	// fact a SessionStart-hook-less client could otherwise never learn.
+	srv.PublishReadiness("ready", true, nil)
+
+	instructionsFromHandshake := func(t *testing.T, cwd string, id int) string {
+		t.Helper()
+		ctx := WithSessionCWD(context.Background(), cwd)
+		frame := []byte(`{"jsonrpc":"2.0","id":` + strconv.Itoa(id) +
+			`,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}`)
+		reply := srv.MCPServer().HandleMessage(ctx, frame)
+		require.NotNil(t, reply)
+		out, err := json.Marshal(reply)
+		require.NoError(t, err)
+		var parsed struct {
+			Result struct {
+				Instructions string `json:"instructions"`
+			} `json:"result"`
+		}
+		require.NoError(t, json.Unmarshal(out, &parsed))
+		return parsed.Result.Instructions
+	}
+
+	t.Run("uncovered_cwd_gets_terse_activation_variant", func(t *testing.T) {
+		stranger := t.TempDir() // not tracked, under no repo
+		got := srv.stateAwareInstructions(stranger)
+		require.Contains(t, got, "INACTIVE")
+		require.Contains(t, got, "gortex track "+stranger)
+		require.NotContains(t, got, "Tracked repositories",
+			"the inactive variant must not leak the live-facts block")
+	})
+
+	t.Run("covered_cwd_appends_live_facts", func(t *testing.T) {
+		got := srv.stateAwareInstructions(repoA)
+		require.Contains(t, got, "smart_context", "base guidance must still lead")
+		require.Contains(t, got, "Tracked repositories", "live workspace facts must be appended")
+		require.Contains(t, got, "repo-a")
+		require.Contains(t, got, "Index status: ready", "warmup readiness must be surfaced")
+	})
+
+	t.Run("covered_handshake_delivers_live_facts", func(t *testing.T) {
+		// The whole point: a non-Claude-Code client learns the workspace
+		// shape + warmup state from initialize alone.
+		instr := instructionsFromHandshake(t, repoA, 1)
+		require.Contains(t, instr, "Tracked repositories")
+		require.Contains(t, instr, "repo-a")
+		require.Contains(t, instr, "Index status: ready")
+	})
+
+	t.Run("uncovered_handshake_is_inactive", func(t *testing.T) {
+		stranger := t.TempDir()
+		instr := instructionsFromHandshake(t, stranger, 2)
+		require.Contains(t, instr, "INACTIVE")
+		require.Contains(t, instr, "gortex track "+stranger)
+	})
 }
