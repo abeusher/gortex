@@ -225,12 +225,37 @@ func runInstall(cmd *cobra.Command, _ []string) (err error) {
 		}
 	}
 
+	// Opt-in install telemetry: one bounded event per configured adapter. The
+	// user's just-saved telemetry choice is re-resolved, so an install that
+	// opted in is counted and an opt-out records nothing.
+	if !installDryRun {
+		recordInstallTelemetry(results)
+	}
+
 	if installJSON {
 		if err := emitInstallJSON(cmd.OutOrStdout(), results, opts); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// recordInstallTelemetry records one install event per configured adapter,
+// dimensioned by the adapter name. Consent-gated and fail-silent: a disabled
+// recorder opens nothing.
+func recordInstallTelemetry(results []*agents.Result) {
+	consent := telemetry.ResolveConsent(telemetry.LoadConsentConfig(platform.TelemetryDir()), os.Getenv)
+	if !consent.Enabled {
+		return
+	}
+	rec := telemetry.NewRecorder(consent, telemetry.NewStore(platform.TelemetryDir()))
+	for _, r := range results {
+		if r == nil || !r.Configured {
+			continue
+		}
+		telemetry.RecordInstall(rec, "install", r.Name)
+	}
+	rec.Flush()
 }
 
 // runInstallFollowUps runs the daemon-side post-setup operations

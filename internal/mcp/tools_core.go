@@ -18,6 +18,7 @@ import (
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/search/rerank"
+	"github.com/zzet/gortex/internal/telemetry"
 )
 
 // minTierParamDescription is the `min_tier` parameter description shared by
@@ -1045,6 +1046,7 @@ func (s *Server) handleIndexRepository(ctx context.Context, req mcp.CallToolRequ
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 		s.RunAnalysis()
+		s.recordIndexTelemetry(result.FileCount)
 		return s.respondJSONOrTOON(ctx, req, result)
 	}
 
@@ -1053,7 +1055,27 @@ func (s *Server) handleIndexRepository(ctx context.Context, req mcp.CallToolRequ
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 	s.RunAnalysis()
+	s.recordIndexTelemetry(result.FileCount)
 	return s.respondJSONOrTOON(ctx, req, result)
+}
+
+// recordIndexTelemetry records one completed full-index pass to opt-in usage
+// telemetry: a coarse file-count bucket plus a per-language counter for each
+// language in the graph. Gated on an enabled recorder so a disabled / absent
+// recorder costs nothing — in particular it does not walk the graph for the
+// language set.
+func (s *Server) recordIndexTelemetry(fileCount int) {
+	if s.recorder == nil || !s.recorder.Enabled() {
+		return
+	}
+	var langs []string
+	if s.graph != nil {
+		for lang := range s.graph.Stats().ByLanguage {
+			langs = append(langs, lang)
+		}
+		sort.Strings(langs)
+	}
+	telemetry.RecordIndex(s.recorder, fileCount, langs)
 }
 
 // handleReindexRepository implements the reindex_repository tool: an

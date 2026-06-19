@@ -748,6 +748,10 @@ func (s *Server) NoteSessionClient(sessionID, name, version string) {
 	if s == nil || sessionID == "" || name == "" {
 		return
 	}
+	// Fold the client app into opt-in telemetry (consent-gated, fail-silent,
+	// version dropped + name bounded by the recorder's sanitiser). Captures
+	// which agents drive Gortex without ever recording a session identifier.
+	telemetry.RecordClient(s.recorder, name)
 	if s.sessions == nil {
 		// Embedded mode — single shared session; just record on the
 		// shared state.

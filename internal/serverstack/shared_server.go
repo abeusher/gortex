@@ -533,10 +533,14 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 	// rather than freezing the decision at startup.
 	teleDir := platform.TelemetryDir()
 	teleStore := telemetry.NewStore(teleDir)
-	srv.SetTelemetryRecorder(telemetry.NewRecorderFunc(
-		telemetry.CachedConsentResolver(teleDir, telemetryConsentTTL), teleStore))
+	teleRec := telemetry.NewRecorderFunc(
+		telemetry.CachedConsentResolver(teleDir, telemetryConsentTTL), teleStore)
+	srv.SetTelemetryRecorder(teleRec)
 	s.cleanup = append(s.cleanup, func() { srv.FlushTelemetry() })
 	if cfg.Lifecycle == LifecycleDaemon {
+		// One daemon-session event per process start, dimensioned by backend.
+		// Opt-in + fail-silent: a disabled recorder drops it.
+		telemetry.RecordDaemonSession(teleRec, backendName)
 		s.cleanup = append(s.cleanup, startTelemetrySender(srv, teleStore, teleDir, cfg.Version))
 	}
 

@@ -13,7 +13,11 @@ var allowedMetrics = map[string]bool{
 	"mcp_tool_call":  true, // an MCP tool was invoked; dim = tool name
 	"cli_command":    true, // a CLI subcommand ran; dim = command name
 	"index":          true, // an index pass completed; dim = file-count bucket
+	"index_lang":     true, // a language was present in an index pass; dim = language
 	"daemon_session": true, // a daemon session started; dim = backend kind
+	"install":        true, // an install applied; dim = agent target / scope
+	"uninstall":      true, // an uninstall applied; dim = agent target / scope
+	"client":         true, // an MCP client connected; dim = client app name
 }
 
 // IsAllowedMetric reports whether key may be recorded.

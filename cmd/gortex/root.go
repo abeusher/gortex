@@ -59,8 +59,16 @@ func recordCLIUsage(cmd *cobra.Command, store *telemetry.Store, getenv func(stri
 	if !consent.Enabled {
 		return
 	}
+	// A detached daemon re-spawns this binary with GORTEX_DAEMON_CHILD=1 to run
+	// `daemon start`; counting that re-spawn would double-record the user's one
+	// `gortex daemon start`. Skip it.
+	if getenv("GORTEX_DAEMON_CHILD") == "1" {
+		return
+	}
 	dim := cliCommandDim(cmd)
-	if dim == "" {
+	// Exclude the telemetry subcommand itself — recording usage of the
+	// telemetry on/off/status controls is self-referential noise.
+	if dim == "" || dim == "telemetry" || strings.HasPrefix(dim, "telemetry.") {
 		return
 	}
 	rec := telemetry.NewRecorder(consent, store)

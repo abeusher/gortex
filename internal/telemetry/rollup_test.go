@@ -1,9 +1,90 @@
 package telemetry
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
+
+// TestIndexAndSessionRecordSitesEmit proves the F9 record-site helpers emit the
+// right allow-listed, bucketed counters: an index pass records a file-count
+// BUCKET (never the exact count) plus deduped per-language counters, and the
+// daemon-session / install / uninstall sites emit their bounded dimensions.
+func TestIndexAndSessionRecordSitesEmit(t *testing.T) {
+	store := NewStore(t.TempDir())
+	r := NewRecorder(Consent{Enabled: true}, store)
+	r.now = fixedNow("2026-06-18")
+
+	RecordIndex(r, 4200, []string{"go", "python", "go", "", "  "})
+	RecordDaemonSession(r, "sqlite")
+	RecordInstall(r, "install", "claude")
+	RecordInstall(r, "uninstall", "cursor")
+	r.Flush()
+
+	got, err := store.Load("2026-06-18")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if got.Counts["index:1k-10k"] != 1 {
+		t.Errorf("index bucket = %d, want 1 (counts=%v)", got.Counts["index:1k-10k"], got.Counts)
+	}
+	if got.Counts["index:4200"] != 0 {
+		t.Error("the exact file count must never be recorded")
+	}
+	// Per-language counters: deduped (go appears twice), empties dropped.
+	if got.Counts["index_lang:go"] != 1 {
+		t.Errorf("index_lang:go = %d, want 1 (deduped)", got.Counts["index_lang:go"])
+	}
+	if got.Counts["index_lang:python"] != 1 {
+		t.Errorf("index_lang:python = %d, want 1", got.Counts["index_lang:python"])
+	}
+	if got.Counts["index_lang"] != 0 {
+		t.Error("a blank language must not record a bare index_lang counter")
+	}
+	if got.Counts["daemon_session:sqlite"] != 1 {
+		t.Errorf("daemon_session:sqlite = %d, want 1", got.Counts["daemon_session:sqlite"])
+	}
+	if got.Counts["install:claude"] != 1 || got.Counts["uninstall:cursor"] != 1 {
+		t.Errorf("install/uninstall counters wrong: %v", got.Counts)
+	}
+}
+
+// TestClientNameFolding proves an MCP client handshake folds to a bounded,
+// version-free token, lowercased, and that empty names record nothing.
+func TestClientNameFolding(t *testing.T) {
+	store := NewStore(t.TempDir())
+	r := NewRecorder(Consent{Enabled: true}, store)
+	r.now = fixedNow("2026-06-18")
+
+	RecordClient(r, "claude-code 1.0.42") // version dropped
+	RecordClient(r, "Cursor")             // lowercased
+	RecordClient(r, "   ")                // whitespace-only → dropped
+	RecordClient(r, "")                   // empty → dropped
+	r.Flush()
+
+	got, err := store.Load("2026-06-18")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got.Counts["client:claude-code"] != 1 {
+		t.Errorf("client fold = %v, want client:claude-code", got.Counts)
+	}
+	if got.Counts["client:cursor"] != 1 {
+		t.Errorf("client name must be lowercased: %v", got.Counts)
+	}
+	for k := range got.Counts {
+		if strings.Contains(k, "1.0.42") {
+			t.Errorf("the client version leaked into telemetry: %q", k)
+		}
+	}
+	if got.Counts["client"] != 0 {
+		t.Error("an empty client name must not record a bare client counter")
+	}
+	if got := NormalizeClientName("VS Code 1.2"); got != "vs" {
+		t.Errorf("NormalizeClientName first-field-lowercase = %q, want vs", got)
+	}
+}
 
 func TestBucketFileCount(t *testing.T) {
 	cases := []struct {
