@@ -1637,6 +1637,16 @@ func buildConstDerefMap(g graph.Store, names []string) map[string]string {
 					if ref, ok := n.Meta["const_ref"].(string); ok && ref != "" {
 						aliasRef[name] = ref
 					}
+					// A Java `static final String` is classified KindConstant
+					// but carries its literal on Meta["value"] (the Java
+					// extractor stamps it there, not in the queryable constant
+					// sidecar). Ingest it so a Java const-ref Temporal dispatch
+					// derefs cross-language, just like the KindField case below.
+					if n.Language == "java" {
+						if v, ok := n.Meta["value"].(string); ok && v != "" {
+							javaFieldVals[name] = v
+						}
+					}
 				case n.Kind == graph.KindField && n.Language == "java":
 					if v, ok := n.Meta["value"].(string); ok && v != "" {
 						javaFieldVals[name] = v
