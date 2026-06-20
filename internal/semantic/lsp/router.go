@@ -346,6 +346,11 @@ func (r *Router) ForSpecWorkspace(spec *ServerSpec, workspace string) (*Provider
 	p := NewProviderFromSpec(spec, r.logger)
 	p.workspaceFolders = r.additionalWorkspaceFolders
 	if err := p.EnsureClient(workspace); err != nil {
+		// A binary that resolves on PATH but cannot launch (e.g. a rustup
+		// `rust-analyzer` shim whose toolchain lacks the component) would
+		// otherwise be re-attempted on every repo. Mark it unavailable so the
+		// router stops retrying it for this session.
+		r.markSpawnFailed(spec.Name, err)
 		return nil, fmt.Errorf("spawn %s: %w", spec.Name, err)
 	}
 	// Attach the diagnostics hook (if any) before publishing to the
@@ -508,6 +513,27 @@ func (r *Router) specAvailable(spec *ServerSpec) bool {
 	r.avail[spec.Name] = avail
 	r.availMu.Unlock()
 	return avail
+}
+
+// markSpawnFailed records that a spec's server process failed to start, so
+// the availability cache reports it unavailable and the router stops
+// retrying it for the life of the daemon (until restart). Enrichment is
+// best-effort: a binary that resolves on PATH but cannot launch should be
+// dropped once with a clear warning rather than re-attempted on every repo.
+// The warning is emitted only on the transition to unavailable so a single
+// failure is reported once, not once per repo.
+func (r *Router) markSpawnFailed(specName string, err error) {
+	r.availMu.Lock()
+	prev, known := r.avail[specName]
+	r.avail[specName] = false
+	r.availMu.Unlock()
+	if known && !prev {
+		return // already marked unavailable — don't re-log
+	}
+	r.logger.Warn("LSP server failed to start; skipping its language enrichment this session",
+		zap.String("spec", specName),
+		zap.Error(err),
+	)
 }
 
 // LanguageIDForPath proxies to the package-level helper for callers
