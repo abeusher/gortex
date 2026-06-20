@@ -145,6 +145,7 @@ func assignCommandGroups() {
 		&cobra.Group{ID: "serve", Title: "MCP server — connect editors & agents:"},
 		&cobra.Group{ID: "engine", Title: "Daemon & repositories:"},
 		&cobra.Group{ID: "query", Title: "Query & explore the graph:"},
+		&cobra.Group{ID: "edit", Title: "Edit safely & verify:"},
 		&cobra.Group{ID: "index", Title: "Index & enrich:"},
 		&cobra.Group{ID: "setup", Title: "Setup & configuration:"},
 	)
@@ -155,7 +156,8 @@ func assignCommandGroups() {
 		"query": "query", "context": "query", "audit": "query", "wiki": "query",
 		"docs": "query", "export": "query", "wakeup": "query", "prs": "query",
 		"review": "query", "call": "query", "tools": "query",
-		"index":  "index", "enrich": "index", "db": "index",
+		"edit":  "edit",
+		"index": "index", "enrich": "index", "db": "index",
 		"init": "setup", "install": "setup", "uninstall": "setup", "agents": "setup",
 		"hook": "setup", "githook": "setup", "config": "setup",
 		"provider": "setup", "plugin": "setup", "cloud": "setup",

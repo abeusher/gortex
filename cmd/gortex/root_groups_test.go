@@ -13,7 +13,7 @@ func TestHelpCommandGroups(t *testing.T) {
 	for _, g := range rootCmd.Groups() {
 		registered[g.ID] = true
 	}
-	for _, id := range []string{"serve", "engine", "query", "index", "setup"} {
+	for _, id := range []string{"serve", "engine", "query", "edit", "index", "setup"} {
 		if !registered[id] {
 			t.Errorf("intent group %q is not registered", id)
 		}
@@ -22,7 +22,7 @@ func TestHelpCommandGroups(t *testing.T) {
 	// Representative commands land in the expected group.
 	want := map[string]string{
 		"mcp": "serve", "daemon": "engine", "track": "engine",
-		"query": "query", "audit": "query", "index": "index", "config": "setup",
+		"query": "query", "audit": "query", "edit": "edit", "index": "index", "config": "setup",
 	}
 	got := map[string]string{}
 	for _, c := range rootCmd.Commands() {
