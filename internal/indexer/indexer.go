@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -197,6 +198,16 @@ type Indexer struct {
 	// overwrite it. Off by default; a normal index always builds
 	// vectors when an embedder is present.
 	skipVectorBuild bool
+
+	// bulkVectorSink holds the disk store captured at the bulk-load
+	// shadow swap, so buildSearchIndex can still persist the vector
+	// index to the backend while idx.graph points at the in-memory
+	// shadow (which does not implement graph.VectorSearcher). Without
+	// it the embedding pass under the bulk loader builds vectors only
+	// in the in-process HNSW — they never reach the `vectors` table and
+	// are lost on the next daemon restart, forcing a paid re-embed.
+	// Set during the shadow swap, cleared when idx.graph is restored.
+	bulkVectorSink graph.VectorSearcher
 
 	// embedChunkOpts tunes the AST sub-chunking buildSearchIndex applies
 	// to large symbols before embedding. The zero value makes the
@@ -1986,6 +1997,12 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 		diskTarget = idx.graph
 		inMemShadow = graph.New()
 		idx.graph = inMemShadow
+		// Capture the disk store as the vector sink: buildSearchIndex runs
+		// while idx.graph is the shadow (no VectorSearcher), so without this
+		// the embedded vectors never land on disk. The `vectors` table has no
+		// FK to `nodes`, so upserting before FlushBulk persists the nodes is
+		// safe. Cleared when idx.graph is restored below.
+		idx.bulkVectorSink, _ = diskTarget.(graph.VectorSearcher)
 		// The resolver was constructed at indexer.New with the disk
 		// Store. Redirect it at the shadow too, otherwise ResolveAll
 		// reads from the empty disk Store, finds no pending edges,
@@ -1998,6 +2015,7 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 		defer func() {
 			if retErr != nil {
 				idx.graph = diskTarget
+				idx.bulkVectorSink = nil
 				if idx.resolver != nil {
 					idx.resolver.SetGraph(diskTarget)
 				}
@@ -2100,6 +2118,7 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 			}
 			reporter.Report("persisting bulk graph", 1, 1)
 			idx.graph = diskTarget
+			idx.bulkVectorSink = nil
 			// Mirror of the SetGraph(inMemShadow) above: the resolver
 			// must follow the graph pointer back to the disk store, or
 			// every post-index per-file resolve (the watcher save path,
@@ -3595,6 +3614,15 @@ func (idx *Indexer) buildSearchIndex() {
 	if idx.embedMaxSymbols > 0 {
 		embedMaxSymbols = idx.embedMaxSymbols
 	}
+	// Env override wins over both the default and the config-wired cap —
+	// a reliable knob independent of the config plumbing. Lets an operator
+	// lift the vector-index size guard for a large repo without editing
+	// (or debugging) the layered config.
+	if env := os.Getenv("GORTEX_EMBEDDINGS_MAX_SYMBOLS"); env != "" {
+		if n, err := strconv.Atoi(strings.TrimSpace(env)); err == nil && n > 0 {
+			embedMaxSymbols = n
+		}
+	}
 	if len(texts) > embedMaxSymbols {
 		idx.logger.Warn("vector index disabled — embedding text count exceeds threshold",
 			zap.Int("texts", len(texts)),
@@ -3670,15 +3698,28 @@ func (idx *Indexer) buildSearchIndex() {
 	// index lands with the same corpus the in-process one would
 	// have built.
 	vecSearcher, _ := idx.graph.(graph.VectorSearcher)
-	var backendItems []graph.VectorItem
 	if vecSearcher != nil {
 		vecBackend.SetDelegate(&vectorSearcherDelegate{s: vecSearcher})
+	}
+	// persistSink is where the embedded vectors are written to the backend
+	// so they survive a restart. Normally it is the active graph (a disk
+	// store). Under the bulk loader idx.graph is the in-memory shadow, which
+	// does not implement VectorSearcher; fall back to the disk store captured
+	// at the shadow swap (bulkVectorSink) so the vector index still reaches
+	// the `vectors` table instead of living only in the in-process HNSW and
+	// vanishing on the next restart (which would force a paid re-embed).
+	persistSink := vecSearcher
+	if persistSink == nil {
+		persistSink = idx.bulkVectorSink
+	}
+	var backendItems []graph.VectorItem
+	if persistSink != nil {
 		backendItems = make([]graph.VectorItem, 0, len(vectors))
 	}
 	for i, vec := range vectors {
 		if vec != nil {
 			vecBackend.Add(ids[i], vec)
-			if vecSearcher != nil {
+			if persistSink != nil {
 				backendItems = append(backendItems, graph.VectorItem{
 					NodeID: ids[i],
 					Vec:    vec,
@@ -3686,11 +3727,11 @@ func (idx *Indexer) buildSearchIndex() {
 			}
 		}
 	}
-	if vecSearcher != nil && len(backendItems) > 0 {
-		if err := vecSearcher.BulkUpsertEmbeddings(backendItems); err != nil {
+	if persistSink != nil && len(backendItems) > 0 {
+		if err := persistSink.BulkUpsertEmbeddings(backendItems); err != nil {
 			idx.logger.Warn("indexer: backend vector bulk upsert failed",
 				zap.Error(err))
-		} else if err := vecSearcher.BuildVectorIndex(dims); err != nil {
+		} else if err := persistSink.BuildVectorIndex(dims); err != nil {
 			idx.logger.Warn("indexer: backend vector index build failed",
 				zap.Error(err))
 		}
@@ -3719,10 +3760,20 @@ func (idx *Indexer) buildSearchIndex() {
 		inner = hyb.TextBackend()
 	}
 	sw.Swap(search.NewHybrid(inner, vecBackend, idx.embedder))
-	idx.logger.Info("vector index built",
+	fields := []zap.Field{
 		zap.Int("vectors", vecBackend.Count()),
 		zap.Int("chunk_vectors", len(chunkMap)),
-		zap.Int("dimensions", dims))
+		zap.Int("dimensions", dims),
+	}
+	// Surface the actual token spend of a paid embedding pass when the
+	// backend reports usage (API providers do; in-process ones don't).
+	// Without this the cost of an embedding run is invisible after the fact.
+	if acc, ok := idx.embedder.(interface{ TokensUsed() int64 }); ok {
+		if tokens := acc.TokensUsed(); tokens > 0 {
+			fields = append(fields, zap.Int64("embed_tokens", tokens))
+		}
+	}
+	idx.logger.Info("vector index built", fields...)
 }
 
 // dirIgnoreFiles are the per-directory ignore-file basenames honored by

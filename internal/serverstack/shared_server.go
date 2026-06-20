@@ -418,6 +418,26 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 	// Embeddings: explicit flag/env > `embedding:` config > default (on,
 	// static GloVe).
 	embedder, embDesc, embErr := ResolveEmbedder(cfg.Embedder, conf)
+	// Probe API-backed providers up front so Dimensions() is truthful before
+	// we log it and — crucially — before EmbedderDims gates snapshot-vector
+	// reload. An APIProvider reports 0 until its first embed; without this the
+	// log reads dim:0 and the warm-restart vector reload rejects a
+	// correctly-sized cached index, re-embedding the whole graph needlessly.
+	// Static / local providers know their width natively and don't implement
+	// the prober, so they skip this. Best-effort: a probe failure (bad key /
+	// unreachable URL) only warns — indexing still falls back to BM25.
+	if embedder != nil {
+		if prober, ok := embedder.(interface {
+			ProbeDimensions(context.Context) (int, error)
+		}); ok {
+			if dim, perr := prober.ProbeDimensions(context.Background()); perr != nil {
+				logger.Warn("serverstack: embedding dimension probe failed — width unknown until first embed",
+					zap.Error(perr))
+			} else {
+				logger.Info("serverstack: embedding dimension probed", zap.Int("dim", dim))
+			}
+		}
+	}
 	switch {
 	case embErr != nil:
 		logger.Warn("serverstack: embeddings requested but unavailable", zap.Error(embErr))
