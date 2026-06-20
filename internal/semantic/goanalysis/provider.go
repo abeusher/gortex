@@ -255,7 +255,7 @@ func (p *Provider) EnrichRepo(g graph.Store, repoPrefix, repoRoot string) (*sema
 	result.NodesEnriched += externals.nodesAdded
 
 	// Phase 3: Interface implementations via go/types.
-	result.EdgesConfirmed += p.enrichImplements(g, repoPrefix, pkgs, objToNode)
+	result.EdgesConfirmed += p.enrichImplements(g, pkgs, objToNode)
 	result.EdgesAdded += p.addMissingImplements(g, pkgs, objToNode, absRoot)
 
 	// Phase 4: Enrich node metadata with type info.
@@ -576,19 +576,8 @@ func repoGoNodes(g graph.Store, repoPrefix string) []*graph.Node {
 	return out
 }
 
-// repoGoEdges returns the edges whose source node belongs to repoPrefix via
-// the indexed GetRepoEdges scan, falling back to AllEdges only for the
-// embedded single-repo ("") path where GetRepoEdges returns nothing.
-func repoGoEdges(g graph.Store, repoPrefix string) []*graph.Edge {
-	edges := g.GetRepoEdges(repoPrefix)
-	if len(edges) == 0 && repoPrefix == "" {
-		return g.AllEdges()
-	}
-	return edges
-}
-
 // enrichImplements confirms existing EdgeImplements edges using go/types.
-func (p *Provider) enrichImplements(g graph.Store, repoPrefix string, pkgs []*packages.Package, objToNode map[types.Object]string) int {
+func (p *Provider) enrichImplements(g graph.Store, pkgs []*packages.Package, objToNode map[types.Object]string) int {
 	confirmed := 0
 
 	// Collect all interfaces from the loaded packages.
@@ -601,12 +590,12 @@ func (p *Provider) enrichImplements(g graph.Store, repoPrefix string, pkgs []*pa
 		}
 	}
 
-	// Check existing EdgeImplements edges (scoped to this repo's edges; the
-	// implementing type must live in this repo's loaded packages to confirm).
-	for _, e := range repoGoEdges(g, repoPrefix) {
-		if e.Kind != graph.EdgeImplements {
-			continue
-		}
+	// Check existing EdgeImplements edges. Iterate the kind-indexed edge set
+	// (not a whole-graph AllEdges scan, but still graph-wide for this kind) so
+	// a cross-repo implements edge — concrete type in another repo, interface
+	// in this repo's loaded packages — is still confirmed, matching the
+	// original behavior.
+	for e := range g.EdgesByKind(graph.EdgeImplements) {
 		fromNode := g.GetNode(e.From)
 		if fromNode == nil || fromNode.Language != "go" {
 			continue
