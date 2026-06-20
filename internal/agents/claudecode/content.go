@@ -216,6 +216,12 @@ name: gortex-pr-review-agent
 description: "Use when you are a coding agent that needs a graph-grounded review verdict on a pending change without hand-walking the review gates. Shell the review verb once — gortex review --audience agent (add --format json for structured output) — and act on the terse one-line verdict + compact file:line findings + cost. Block means fix every critical/error finding and re-run until it clears. Examples: \"Review my change and tell me if it's safe to merge\", \"Run the review verb and act on the findings\", \"Get a terse review verdict for this diff\""
 ---
 ` + commandPRReviewAgent,
+
+	// gortex-cli is skill-only (no slash-command twin) and self-contained:
+	// the frontmatter lives inside skillGortexCLI rather than being prefixed
+	// here, because the body is shell commands rather than a shared command*
+	// constant.
+	"gortex-cli": skillGortexCLI,
 }
 
 const commandGuide = `# Gortex Guide
@@ -1750,4 +1756,112 @@ When you want the full reasoning behind a verdict (per-file risk, contracts, gua
 - Open each finding at its printed ` + "`file:line`" + ` — the anchor is exact, not approximate
 - On ` + "`block`" + `, fix and **re-run the verb** until it clears; do not merge a blocking verdict
 - Escalate to the human packet (drop ` + "`--audience agent`" + `) or ` + "`/gortex-pr-review`" + ` when you need the full gate-by-gate reasoning
+`
+
+// skillGortexCLI is a user-level skill that drives Gortex entirely through
+// the `gortex` CLI verb groups — no MCP transport mounted. It exists for the
+// case where the MCP surface is unavailable or impractical (a plain shell, a
+// CI job, a low-context budget), or where an agent simply prefers to stay on
+// the command line. Unlike the other GlobalSkills it does not reuse a shared
+// command* constant: it has no slash-command twin, and its body is shell
+// commands rather than MCP tool names. The frontmatter carries an
+// `allowed-tools: Bash(gortex:*)` line — the Claude Code SKILL.md analogue of
+// the sub-agents' `tools:` allowlist — scoping the skill to the gortex binary.
+const skillGortexCLI = `---
+name: gortex-cli
+description: "Use to drive Gortex from the shell via the gortex CLI without mounting the MCP tool surface — when MCP is unavailable or impractical, in a CI job, or to keep baseline context low. Examples: \"use gortex from the CLI\", \"run the gortex safety workflow without MCP\", \"query the graph with the gortex command\""
+allowed-tools: Bash(gortex:*)
+---
+
+# Gortex from the CLI (no MCP surface)
+
+Every Gortex capability is reachable from the ` + "`gortex`" + ` command, so you can work the graph from a plain shell — no MCP server mounted, no extra tools in your context. Reach for this when the MCP surface is unavailable or impractical (a CI job, a low-context budget, a shell-only agent), or when you simply prefer the command line.
+
+This is a **toolkit, not a mandate**: pick the verbs your task needs. The sequence below is a reference safety workflow for changing code — run the steps that apply and skip the rest. Most verbs accept ` + "`--format json`" + ` for machine-readable output and ` + "`--repo <path>`" + ` to target a tracked repo other than the cwd. They all talk to a running daemon, so ` + "`gortex daemon status`" + ` first if anything errors.
+
+## Orient
+
+` + "```bash" + `
+gortex query stats
+` + "```" + `
+
+Confirms the daemon is up and prints node / edge counts for the active repo — the CLI analogue of a session-start orientation.
+
+## Assemble the working set
+
+` + "```bash" + `
+gortex explore "make the indexer skip vendored files"
+` + "```" + `
+
+Shells smart_context: one call returns the minimal relevant symbols, sources, and an edit plan for a task description. Start here instead of reading files one at a time. Note the symbol IDs it surfaces — later verbs take them as ` + "`--ids`" + ` / ` + "`--symbols`" + `.
+
+## Pick up prior knowledge
+
+` + "```bash" + `
+gortex memory surface --task "make the indexer skip vendored files" --symbols internal/indexer/indexer.go::IndexFile,internal/indexer/skip.go::shouldSkip
+` + "```" + `
+
+Surfaces cross-session invariants, decisions, and gotchas anchored to your working set, ranked by overlap. If it returns nothing, move on — don't probe further.
+
+## Before editing a file
+
+` + "```bash" + `
+gortex edit context internal/indexer/indexer.go
+` + "```" + `
+
+Shows the file's symbols, signatures, callers, and callees so you edit with the blast radius in view.
+
+## Before a signature change
+
+` + "```bash" + `
+gortex edit verify --change 'internal/indexer/indexer.go::IndexFile=func(path string, opts Opts) error'
+` + "```" + `
+
+Checks every caller and interface implementor against the proposed signature and reports what would break. ` + "`--change`" + ` is repeatable (` + "`id=new_signature`" + `); pass a raw JSON array via ` + "`--changes`" + ` / ` + "`--changes-file`" + ` for bulk edits.
+
+## Plan a multi-symbol refactor
+
+` + "```bash" + `
+gortex edit plan --ids internal/indexer/indexer.go::IndexFile,internal/indexer/skip.go::shouldSkip
+` + "```" + `
+
+Returns a dependency-ordered list of files and symbols to touch, so a multi-file change goes in the right order.
+
+## Apply edits atomically
+
+` + "```bash" + `
+gortex edit batch --edits-file edits.json
+` + "```" + `
+
+Applies multiple edits in one atomic, dependency-ordered pass. Build ` + "`edits.json`" + ` as the edits array (or pass it inline with ` + "`--edits`" + `, or on stdin with ` + "`--edits -`" + `); add ` + "`--dry-run`" + ` to preview the unified diff first.
+
+## After editing
+
+` + "```bash" + `
+gortex edit guards --ids internal/indexer/indexer.go::IndexFile
+gortex edit tests --ids internal/indexer/indexer.go::IndexFile
+` + "```" + `
+
+` + "`guards`" + ` evaluates team rules against the changed symbols; ` + "`tests`" + ` enumerates the test files and functions that exercise them so you know what to run.
+
+## Close the loop
+
+` + "```bash" + `
+gortex feedback record --task "make the indexer skip vendored files" --useful internal/indexer/skip.go::shouldSkip
+gortex memory store --kind decision --body "skip lives in shouldSkip; IndexFile stays signature-stable for the daemon hot path" --symbols internal/indexer/skip.go::shouldSkip
+` + "```" + `
+
+` + "`feedback record`" + ` scores which ` + "`explore`" + ` suggestions were useful / not needed / missing, improving future context quality. ` + "`memory store`" + ` persists a durable invariant / decision / gotcha so the next agent inherits the lesson — set ` + "`--kind`" + ` honestly and anchor it with ` + "`--symbols`" + `.
+
+## When you need more
+
+These verbs cover the dev-cycle workhorses. For the long tail of the catalog, discover and invoke any tool directly:
+
+` + "```bash" + `
+gortex tools list                       # the whole surface, by category + read/write class
+gortex tools search "dataflow taint"    # find a tool by keyword
+gortex call analyze --arg kind=dead_code --arg path=internal/indexer
+` + "```" + `
+
+` + "`gortex call <tool> --arg key=value`" + ` is the generic escape hatch — it invokes any registered tool by name, so nothing in the MCP surface is out of reach from the shell. There are also dedicated verb groups worth knowing: ` + "`gortex analyze`" + `, ` + "`gortex flow`" + ` / ` + "`gortex taint`" + `, ` + "`gortex clones`" + `, and the rest of the ` + "`gortex edit`" + ` and ` + "`gortex memory`" + ` families.
 `

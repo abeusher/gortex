@@ -636,6 +636,110 @@ The output of a quality audit is a prioritised markdown packet, not a one-line "
 - Rank by the P0..P4 tiers; do not hand the user a flat list
 - `export_context format=markdown` for the packet
 - `store_memory({kind: "reference", title: "<repo> audit YYYY-MM", body: "..."})` so the next audit can diff against this baseline
+=== home/.hermes/skills/code-intelligence/gortex-cli/SKILL.md ===
+---
+name: gortex-cli
+description: "Use to drive Gortex from the shell via the gortex CLI without mounting the MCP tool surface — when MCP is unavailable or impractical, in a CI job, or to keep baseline context low. Examples: \"use gortex from the CLI\", \"run the gortex safety workflow without MCP\", \"query the graph with the gortex command\""
+version: 1.0.0
+metadata:
+  hermes:
+    tags: [code-intelligence, mcp, cli]
+    category: code-intelligence
+    platforms: [linux, macos, windows]
+    related_skills: [gortex]
+---
+
+# Gortex from the CLI (no MCP surface)
+
+Every Gortex capability is reachable from the `gortex` command, so you can work the graph from a plain shell — no MCP server mounted, no extra tools in your context. Reach for this when the MCP surface is unavailable or impractical (a CI job, a low-context budget, a shell-only agent), or when you simply prefer the command line.
+
+This is a **toolkit, not a mandate**: pick the verbs your task needs. The sequence below is a reference safety workflow for changing code — run the steps that apply and skip the rest. Most verbs accept `--format json` for machine-readable output and `--repo <path>` to target a tracked repo other than the cwd. They all talk to a running daemon, so `gortex daemon status` first if anything errors.
+
+## Orient
+
+```bash
+gortex query stats
+```
+
+Confirms the daemon is up and prints node / edge counts for the active repo — the CLI analogue of a session-start orientation.
+
+## Assemble the working set
+
+```bash
+gortex explore "make the indexer skip vendored files"
+```
+
+Shells smart_context: one call returns the minimal relevant symbols, sources, and an edit plan for a task description. Start here instead of reading files one at a time. Note the symbol IDs it surfaces — later verbs take them as `--ids` / `--symbols`.
+
+## Pick up prior knowledge
+
+```bash
+gortex memory surface --task "make the indexer skip vendored files" --symbols internal/indexer/indexer.go::IndexFile,internal/indexer/skip.go::shouldSkip
+```
+
+Surfaces cross-session invariants, decisions, and gotchas anchored to your working set, ranked by overlap. If it returns nothing, move on — don't probe further.
+
+## Before editing a file
+
+```bash
+gortex edit context internal/indexer/indexer.go
+```
+
+Shows the file's symbols, signatures, callers, and callees so you edit with the blast radius in view.
+
+## Before a signature change
+
+```bash
+gortex edit verify --change 'internal/indexer/indexer.go::IndexFile=func(path string, opts Opts) error'
+```
+
+Checks every caller and interface implementor against the proposed signature and reports what would break. `--change` is repeatable (`id=new_signature`); pass a raw JSON array via `--changes` / `--changes-file` for bulk edits.
+
+## Plan a multi-symbol refactor
+
+```bash
+gortex edit plan --ids internal/indexer/indexer.go::IndexFile,internal/indexer/skip.go::shouldSkip
+```
+
+Returns a dependency-ordered list of files and symbols to touch, so a multi-file change goes in the right order.
+
+## Apply edits atomically
+
+```bash
+gortex edit batch --edits-file edits.json
+```
+
+Applies multiple edits in one atomic, dependency-ordered pass. Build `edits.json` as the edits array (or pass it inline with `--edits`, or on stdin with `--edits -`); add `--dry-run` to preview the unified diff first.
+
+## After editing
+
+```bash
+gortex edit guards --ids internal/indexer/indexer.go::IndexFile
+gortex edit tests --ids internal/indexer/indexer.go::IndexFile
+```
+
+`guards` evaluates team rules against the changed symbols; `tests` enumerates the test files and functions that exercise them so you know what to run.
+
+## Close the loop
+
+```bash
+gortex feedback record --task "make the indexer skip vendored files" --useful internal/indexer/skip.go::shouldSkip
+gortex memory store --kind decision --body "skip lives in shouldSkip; IndexFile stays signature-stable for the daemon hot path" --symbols internal/indexer/skip.go::shouldSkip
+```
+
+`feedback record` scores which `explore` suggestions were useful / not needed / missing, improving future context quality. `memory store` persists a durable invariant / decision / gotcha so the next agent inherits the lesson — set `--kind` honestly and anchor it with `--symbols`.
+
+## When you need more
+
+These verbs cover the dev-cycle workhorses. For the long tail of the catalog, discover and invoke any tool directly:
+
+```bash
+gortex tools list                       # the whole surface, by category + read/write class
+gortex tools search "dataflow taint"    # find a tool by keyword
+gortex call analyze --arg kind=dead_code --arg path=internal/indexer
+```
+
+`gortex call <tool> --arg key=value` is the generic escape hatch — it invokes any registered tool by name, so nothing in the MCP surface is out of reach from the shell. There are also dedicated verb groups worth knowing: `gortex analyze`, `gortex flow` / `gortex taint`, `gortex clones`, and the rest of the `gortex edit` and `gortex memory` families.
 === home/.hermes/skills/code-intelligence/gortex/SKILL.md ===
 ---
 name: gortex
@@ -646,7 +750,7 @@ metadata:
     tags: [code-intelligence, code-search, navigation, refactoring, mcp]
     category: code-intelligence
     platforms: [linux, macos, windows]
-    related_skills: [gortex-add-test, gortex-architecture-review, gortex-co-change, gortex-cross-repo-usage, gortex-dataflow-trace, gortex-debug, gortex-episode-replay, gortex-explore, gortex-extract-function, gortex-fix-all, gortex-impact, gortex-incident-investigation, gortex-onboarding, gortex-pr-review, gortex-pr-review-agent, gortex-quality-audit, gortex-refactor, gortex-rename, gortex-safe-edit]
+    related_skills: [gortex-add-test, gortex-architecture-review, gortex-cli, gortex-co-change, gortex-cross-repo-usage, gortex-dataflow-trace, gortex-debug, gortex-episode-replay, gortex-explore, gortex-extract-function, gortex-fix-all, gortex-impact, gortex-incident-investigation, gortex-onboarding, gortex-pr-review, gortex-pr-review-agent, gortex-quality-audit, gortex-refactor, gortex-rename, gortex-safe-edit]
 ---
 
 # Gortex Code Intelligence
@@ -742,6 +846,7 @@ After edits, call `verify_change` (broken callers + interface implementors, cros
 
 - `/gortex-add-test`
 - `/gortex-architecture-review`
+- `/gortex-cli`
 - `/gortex-co-change`
 - `/gortex-cross-repo-usage`
 - `/gortex-dataflow-trace`
