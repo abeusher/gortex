@@ -694,11 +694,11 @@ func buildUSDCardJSON(rows []tokensMetric, responsesPerDay int) map[string]any {
 		}
 		perResponse := float64(median) / 1_000_000.0 * p.USDPerMInput
 		models = append(models, map[string]any{
-			"model":          p.Model,
-			"usd_per_m":      p.USDPerMInput,
-			"usd_per_resp":   perResponse,
-			"usd_per_day":    perResponse * float64(responsesPerDay),
-			"usd_per_month":  perResponse * float64(responsesPerDay) * 30.0,
+			"model":         p.Model,
+			"usd_per_m":     p.USDPerMInput,
+			"usd_per_resp":  perResponse,
+			"usd_per_day":   perResponse * float64(responsesPerDay),
+			"usd_per_month": perResponse * float64(responsesPerDay) * 30.0,
 		})
 	}
 	return map[string]any{

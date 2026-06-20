@@ -77,8 +77,11 @@ func TestLegacyFlags_NoError(t *testing.T) {
 		{"watch only", []string{"--watch"}, []string{"watch"}},
 		{"proxy only", []string{"--proxy"}, []string{"proxy"}},
 		{"no-daemon only", []string{"--no-daemon"}, []string{"no-daemon"}},
-		{"all four", []string{"--index", ".", "--watch", "--proxy", "--no-daemon"},
-			[]string{"index", "watch", "proxy", "no-daemon"}},
+		{
+			"all four",
+			[]string{"--index", ".", "--watch", "--proxy", "--no-daemon"},
+			[]string{"index", "watch", "proxy", "no-daemon"},
+		},
 		{"none set", []string{}, nil},
 	}
 

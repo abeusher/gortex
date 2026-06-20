@@ -299,9 +299,9 @@ func runPRDeepDive(cmd *cobra.Command, repoPath string, number int) error {
 
 // prImpactPayload mirrors the get_pr_impact wire shape the deep-dive renders.
 type prImpactPayload struct {
-	Number           int      `json:"number"`
-	Risk             string   `json:"risk"`
-	Score            float64  `json:"score"`
+	Number           int     `json:"number"`
+	Risk             string  `json:"risk"`
+	Score            float64 `json:"score"`
 	ReviewPriorities []struct {
 		Axis   string  `json:"axis"`
 		Score  float64 `json:"score"`
