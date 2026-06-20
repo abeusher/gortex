@@ -37,10 +37,19 @@ type Provider struct {
 	includeTest bool
 	logger      *zap.Logger
 
-	// Cached state from the last Enrich() — used by LookupTypeAtLine
-	// to answer per-binding type queries from the contract pipeline
-	// without re-loading packages. Guarded by stateMu.
+	// Cached per-repo state from EnrichRepo — used by LookupTypeAtLine to
+	// answer per-binding type queries from the contract pipeline without
+	// re-loading packages. Keyed by the repo's absolute root so that, when
+	// multiple repos are enriched (in any order, possibly concurrently) before
+	// their contracts are extracted, each repo's contract pass still finds its
+	// own loaded packages rather than the last writer's. Guarded by stateMu.
 	stateMu sync.RWMutex
+	stashes map[string]*goStash // absRoot → loaded package state
+}
+
+// goStash is one repo's loaded go/packages state, retained for
+// LookupTypeAtLine after EnrichRepo returns.
+type goStash struct {
 	pkgs    []*packages.Package
 	fset    *token.FileSet
 	absRoot string
@@ -90,14 +99,15 @@ func (p *Provider) EnrichRepo(g graph.Store, repoPrefix, repoRoot string) (*sema
 		return nil, fmt.Errorf("load packages: %w", err)
 	}
 
-	// Stash the loaded state so LookupTypeAtLine can serve per-binding
-	// type queries from the contract pipeline without paying the
-	// 5-10s loadPackages cost again. The state survives until the
-	// next Enrich call (which replaces it).
+	// Stash the loaded state, keyed by this repo's root, so LookupTypeAtLine
+	// can serve per-binding type queries from the contract pipeline without
+	// paying the 5-10s loadPackages cost again — and so a later repo's enrich
+	// does not clobber this repo's state before its contracts are extracted.
 	p.stateMu.Lock()
-	p.pkgs = pkgs
-	p.fset = fset
-	p.absRoot = absRoot
+	if p.stashes == nil {
+		p.stashes = make(map[string]*goStash)
+	}
+	p.stashes[absRoot] = &goStash{pkgs: pkgs, fset: fset, absRoot: absRoot}
 	p.stateMu.Unlock()
 
 	result := &semantic.EnrichResult{
@@ -344,28 +354,35 @@ func (p *Provider) EnrichFile(g graph.Store, repoRoot, filePath string) (*semant
 // resolution at any line in the indexed source.
 func (p *Provider) LookupTypeAtLine(filePath string, line int) (string, bool) {
 	p.stateMu.RLock()
-	pkgs := p.pkgs
-	fset := p.fset
-	absRoot := p.absRoot
+	stashes := make([]*goStash, 0, len(p.stashes))
+	for _, s := range p.stashes {
+		stashes = append(stashes, s)
+	}
 	p.stateMu.RUnlock()
-	if len(pkgs) == 0 || fset == nil || absRoot == "" {
+	if len(stashes) == 0 {
 		return "", false
 	}
+	// Try every repo's stash; the file resolves under exactly one repo root.
 	target := normalizeRelPath(filePath)
-	for _, pkg := range pkgs {
-		if pkg.TypesInfo == nil {
+	for _, st := range stashes {
+		if len(st.pkgs) == 0 || st.fset == nil || st.absRoot == "" {
 			continue
 		}
-		for _, syntax := range pkg.Syntax {
-			if syntax == nil {
+		for _, pkg := range st.pkgs {
+			if pkg.TypesInfo == nil {
 				continue
 			}
-			pos := fset.Position(syntax.Pos())
-			if normalizeRelPath(relativePath(pos.Filename, absRoot)) != target {
-				continue
-			}
-			if t, ok := lookupTypeAtLineInFile(syntax, pkg.TypesInfo, fset, line); ok {
-				return t, true
+			for _, syntax := range pkg.Syntax {
+				if syntax == nil {
+					continue
+				}
+				pos := st.fset.Position(syntax.Pos())
+				if normalizeRelPath(relativePath(pos.Filename, st.absRoot)) != target {
+					continue
+				}
+				if t, ok := lookupTypeAtLineInFile(syntax, pkg.TypesInfo, st.fset, line); ok {
+					return t, true
+				}
 			}
 		}
 	}
