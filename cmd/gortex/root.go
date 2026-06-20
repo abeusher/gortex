@@ -154,7 +154,7 @@ func assignCommandGroups() {
 		"repos": "engine", "status": "engine", "proxy": "engine", "workspace": "engine",
 		"query": "query", "context": "query", "audit": "query", "wiki": "query",
 		"docs": "query", "export": "query", "wakeup": "query", "prs": "query",
-		"review": "query",
+		"review": "query", "call": "query", "tools": "query",
 		"index":  "index", "enrich": "index", "db": "index",
 		"init": "setup", "install": "setup", "uninstall": "setup", "agents": "setup",
 		"hook": "setup", "githook": "setup", "config": "setup",
