@@ -95,3 +95,83 @@ func TestExportContext_OuterRequestArgsUnmutated(t *testing.T) {
 	assert.Equal(t, "markdown", outerArgs["format"],
 		"outer args mutated by the inner-format override")
 }
+
+// TestRenderContextMarkdown_FenceMatchesSymbolLanguage is the regression
+// guard for the hardcoded-fence bug: embedded source snippets were always
+// wrapped in a ```go fence regardless of the symbol's real language, so a
+// TypeScript snippet was mislabelled as Go. The fence must track the
+// symbol's own indexed language.
+func TestRenderContextMarkdown_FenceMatchesSymbolLanguage(t *testing.T) {
+	data := map[string]any{
+		"task": "token invalidation",
+		"relevant_symbols": []any{
+			map[string]any{
+				"id":         "src/auth.ts::invalidateToken",
+				"kind":       "function",
+				"name":       "invalidateToken",
+				"file_path":  "src/auth.ts",
+				"language":   "typescript",
+				"start_line": float64(10),
+				"source":     "function invalidateToken(t: string) {}",
+			},
+		},
+	}
+
+	md := renderContextMarkdown(data, 2000)
+
+	assert.Contains(t, md, "```typescript\n",
+		"a TypeScript symbol must be fenced as typescript")
+	assert.NotContains(t, md, "```go",
+		"a TypeScript snippet must never be fenced as go")
+}
+
+// TestRenderContextMarkdown_FenceFallsBackToExtension covers the path where
+// the entry carries no language field (older/cached data or a federated
+// merge): the fence is derived from the file extension rather than defaulting
+// to go.
+func TestRenderContextMarkdown_FenceFallsBackToExtension(t *testing.T) {
+	data := map[string]any{
+		"task": "extension fallback",
+		"relevant_symbols": []any{
+			map[string]any{
+				"id":   "lib/util.py::helper",
+				"kind": "function",
+				"name": "helper",
+				// language deliberately omitted to exercise the fallback.
+				"file_path":  "lib/util.py",
+				"start_line": float64(1),
+				"source":     "def helper():\n    pass",
+			},
+		},
+	}
+
+	md := renderContextMarkdown(data, 2000)
+
+	assert.Contains(t, md, "```python\n",
+		"with no language field the fence must be derived from the .py extension")
+	assert.NotContains(t, md, "```go",
+		"the extension fallback must not produce a go fence")
+}
+
+// TestRenderContextMarkdown_GoSymbolStillFencedAsGo guards the common case:
+// the fix must not regress Go snippets, which should still be fenced as go.
+func TestRenderContextMarkdown_GoSymbolStillFencedAsGo(t *testing.T) {
+	data := map[string]any{
+		"task": "go path",
+		"relevant_symbols": []any{
+			map[string]any{
+				"id":         "main.go::run",
+				"kind":       "function",
+				"name":       "run",
+				"file_path":  "main.go",
+				"language":   "go",
+				"start_line": float64(1),
+				"source":     "func run() {}",
+			},
+		},
+	}
+
+	md := renderContextMarkdown(data, 2000)
+
+	assert.Contains(t, md, "```go\n", "a Go symbol must still be fenced as go")
+}

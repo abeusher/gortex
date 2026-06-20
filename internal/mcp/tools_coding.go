@@ -1936,6 +1936,7 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 			"kind":       sym.Kind,
 			"name":       sym.Name,
 			"file_path":  sym.FilePath,
+			"language":   sym.Language,
 			"start_line": sym.StartLine,
 		}
 		if sig, ok := sym.Meta["signature"]; ok {

@@ -3932,6 +3932,18 @@ func (s *Server) handleExportContext(ctx context.Context, req mcp.CallToolReques
 	return mcp.NewToolResultText(md), nil
 }
 
+// markdownFenceLang picks the Markdown code-fence info string for an embedded
+// source snippet. It prefers the symbol's indexed language (authoritative — the
+// graph already resolved it during indexing) and falls back to deriving one
+// from the file extension. An unrecognised language yields an empty info string
+// (a plain fence) rather than a wrong one, so a snippet is never mislabelled.
+func markdownFenceLang(language, filePath string) string {
+	if lang := strings.TrimSpace(strings.ToLower(language)); lang != "" {
+		return lang
+	}
+	return languageForExtension(filePath)
+}
+
 // renderContextMarkdown converts smart_context JSON output into a self-contained
 // markdown briefing suitable for sharing outside MCP.
 func renderContextMarkdown(data map[string]any, tokenBudget int) string {
@@ -3968,6 +3980,7 @@ func renderContextMarkdown(data map[string]any, tokenBudget int) string {
 			kind, _ := symMap["kind"].(string)
 			id, _ := symMap["id"].(string)
 			filePath, _ := symMap["file_path"].(string)
+			language, _ := symMap["language"].(string)
 			startLine, _ := symMap["start_line"].(float64)
 
 			fmt.Fprintf(&sb, "### `%s` (%s)\n\n", name, kind)
@@ -3978,10 +3991,12 @@ func renderContextMarkdown(data map[string]any, tokenBudget int) string {
 				fmt.Fprintf(&sb, "- **Signature:** `%s`\n", sig)
 			}
 
-			// Include source if within budget.
+			// Include source if within budget. The fence language tracks the
+			// symbol's own language rather than a hardcoded "go" so a snippet
+			// from any indexed language is highlighted correctly.
 			if source, ok := symMap["source"].(string); ok && source != "" {
 				if sb.Len()+len(source) < charBudget {
-					sb.WriteString("\n```go\n")
+					fmt.Fprintf(&sb, "\n```%s\n", markdownFenceLang(language, filePath))
 					sb.WriteString(source)
 					sb.WriteString("\n```\n")
 				} else {
