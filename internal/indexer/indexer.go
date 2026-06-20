@@ -18,6 +18,7 @@ import (
 
 	"github.com/pelletier/go-toml/v2"
 	"go.uber.org/zap"
+	"golang.org/x/sync/semaphore"
 
 	"github.com/zzet/gortex/internal/codegen"
 	"github.com/zzet/gortex/internal/codeowners"
@@ -1833,6 +1834,19 @@ func (idx *Indexer) Index(root string) (*IndexResult, error) {
 // is pulled from ctx via progress.FromContext — attach one with
 // progress.WithReporter to receive stage updates. If no reporter is attached,
 // stage calls are silently dropped.
+// clampParseWeight maps a file size to a parse-admission weight bounded to
+// [1, budget]. A file larger than the whole budget is admitted alone
+// (weight == budget) so the bytes-in-flight semaphore can never deadlock.
+func clampParseWeight(size, budget int64) int64 {
+	if size < 1 {
+		return 1
+	}
+	if size > budget {
+		return budget
+	}
+	return size
+}
+
 func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexResult, retErr error) {
 	start := time.Now()
 	reporter := progress.FromContext(ctx)
@@ -2183,6 +2197,23 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 	var skippedByTimeout int64
 	var skippedByMinified int64
 
+	// Bound peak parse memory: a weighted, bytes-in-flight semaphore
+	// admits each worker by its file size before it reads + extracts, so
+	// a cluster of large files (PDFs / office docs in a content repo)
+	// serialises instead of all workers materialising whole files and
+	// their parse trees at once. Code files are tiny and flow freely;
+	// only genuinely large inputs queue. budget <= 0 disables the cap.
+	parseBudget := idx.config.MaxParseBytesInFlight
+	var parseSem *semaphore.Weighted
+	if parseBudget > 0 {
+		parseSem = semaphore.NewWeighted(parseBudget)
+	}
+
+	// In addition to the bytes-in-flight budget above, cap how many
+	// genuinely large files are *read* concurrently: a few huge PDFs /
+	// spreadsheets / vector artifacts can dominate RSS before extraction
+	// even starts. Small source files bypass the gate and keep full
+	// throughput.
 	largeReadGate := make(chan struct{}, largeFileReadParallelism(workers))
 	readFile := func(wf walkedFile) ([]byte, error) {
 		if wf.size < largeFileReadThresholdBytes {
@@ -2214,11 +2245,26 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 						reporter.Report("parsing", int(p), totalFiles)
 					}
 
+					// Admit this file into extraction under the
+					// bytes-in-flight budget before reading it, so large
+					// content files serialise instead of all workers
+					// materialising whole files at once.
+					var weight int64
+					if parseSem != nil {
+						weight = clampParseWeight(wf.size, parseBudget)
+						if aerr := parseSem.Acquire(ctx, weight); aerr != nil {
+							return
+						}
+					}
+
 					src, err := readFile(wf)
 					if err != nil {
 						errMu.Lock()
 						errors = append(errors, IndexError{FilePath: path, Error: err.Error()})
 						errMu.Unlock()
+						if parseSem != nil {
+							parseSem.Release(weight)
+						}
 						continue
 					}
 
@@ -2242,6 +2288,9 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 						}
 					}
 					if ext == nil {
+						if parseSem != nil {
+							parseSem.Release(weight)
+						}
 						continue
 					}
 
@@ -2251,6 +2300,9 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 					src = idx.transforms.run(relPath, src)
 
 					result, skipped, err := idx.extractFile(parsePool, quarantine, path, relPath, lang, ext, src)
+					if parseSem != nil {
+						parseSem.Release(weight)
+					}
 					if err != nil {
 						errMu.Lock()
 						errors = append(errors, IndexError{FilePath: path, Error: err.Error()})

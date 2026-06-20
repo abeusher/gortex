@@ -584,6 +584,14 @@ type IndexConfig struct {
 	// that drops real symbols silently is a worse default than a
 	// slightly slower full index.
 	MaxFileSize int64 `mapstructure:"max_file_size" yaml:"max_file_size,omitempty"`
+	// MaxParseBytesInFlight bounds the total raw source bytes admitted
+	// into concurrent extraction at once. A weighted, bytes-in-flight
+	// semaphore admits each file by its size before it is read + parsed,
+	// so a cluster of large files (PDFs, office docs in a content repo)
+	// serialises instead of all workers materialising whole files and
+	// their parse trees simultaneously — the content-repo OOM class.
+	// Zero disables the cap; Default() sets a conservative non-zero budget.
+	MaxParseBytesInFlight int64 `mapstructure:"max_parse_bytes_in_flight" yaml:"max_parse_bytes_in_flight,omitempty"`
 	// IndexMinified controls whether bundled / minified build
 	// artifacts are indexed. Off by default: a minified bundle or a
 	// sourcemap is synthetic source — it has no meaningful symbols and
@@ -1501,6 +1509,12 @@ type MCPToolsConfig struct {
 	Deny   []string `mapstructure:"deny"   yaml:"deny,omitempty"`
 }
 
+// defaultMaxParseBytesInFlight caps concurrent raw source bytes in
+// extraction. 512 MiB keeps normal source indexing fully parallel (code
+// files are tiny) while bounding peak memory when a repo carries large
+// content assets (PDFs, office documents, datasets).
+const defaultMaxParseBytesInFlight = 512 << 20
+
 // Default returns a Config with sensible defaults.
 //
 // Exclude is intentionally empty here — the builtin baseline lives in
@@ -1510,7 +1524,8 @@ type MCPToolsConfig struct {
 func Default() *Config {
 	return &Config{
 		Index: IndexConfig{
-			Workers: runtime.NumCPU(),
+			Workers:               runtime.NumCPU(),
+			MaxParseBytesInFlight: defaultMaxParseBytesInFlight,
 			// MaxFileSize: 0 = no cap. Opt-in knob for users who want
 			// to skip large generated/minified files.
 			// Prose indexing is on by default; the ConfigManager
