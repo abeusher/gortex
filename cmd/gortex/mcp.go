@@ -124,6 +124,20 @@ func runMCP(cmd *cobra.Command, args []string) error {
 	logger := newLogger()
 	defer func() { _ = logger.Sync() }()
 
+	// We only reach here when no daemon is available (or autostart is off).
+	// A bare `gortex mcp` with no --index used to serve an EMPTY embedded
+	// graph — every tool returned nothing, which reads to the user as "gortex
+	// is broken." Default the embedded index to the launch cwd so the fallback
+	// serves the user's actual repo instead of nothing. An explicit --index
+	// still wins; an ambiguous cwd (`/`, $HOME) is left unset rather than
+	// indexing the world.
+	if mcpIndex == "" {
+		if cwd, cwdErr := resolveLaunchCWD(); cwdErr == nil && !isAmbiguousLaunchCWD(cwd) {
+			mcpIndex = cwd
+			fmt.Fprintf(os.Stderr, "[gortex] no daemon available; embedded server indexing %s\n", mcpIndex)
+		}
+	}
+
 	// The embedded server runs in single-repo mode over --index: it
 	// indexes that tree and serves the whole graph (no marker handshake,
 	// no .gortex/workspace.toml). Multi-repo scoping is the daemon's job.
