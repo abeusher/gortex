@@ -227,6 +227,22 @@ func (f *fakeRouter) ProviderForSpec(name string) (Provider, error) {
 	return p, nil
 }
 
+func (f *fakeRouter) ProviderForSpecWorkspace(name, workspace string) (Provider, error) {
+	f.calls = append(f.calls, "ProviderForSpecWorkspace:"+name)
+	if err, ok := f.providerErrs[name]; ok {
+		return nil, err
+	}
+	p, ok := f.providers[name]
+	if !ok {
+		return nil, assertionError("no provider for spec " + name)
+	}
+	return p, nil
+}
+
+func (f *fakeRouter) ReleaseSpecWorkspace(name, workspace string) {
+	f.calls = append(f.calls, "ReleaseSpecWorkspace:"+name)
+}
+
 func (f *fakeRouter) Close() error {
 	f.closeCalls++
 	return nil

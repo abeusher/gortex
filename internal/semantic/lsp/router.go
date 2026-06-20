@@ -77,6 +77,11 @@ type routedProvider struct {
 	workspace string
 	provider  *Provider
 	lastUsed  time.Time
+	// inUse counts callers currently holding this provider for a long
+	// operation (an enrichment pass). The LRU evictor skips any provider
+	// with inUse > 0 so a slow in-flight pass is never Close()d mid-use by
+	// another repo's concurrent spawn. Guarded by r.mu.
+	inUse int
 }
 
 // providerKey identifies a (spec, workspace) pair in the cache. Each
@@ -208,6 +213,24 @@ func (r *Router) ProviderForSpec(name string) (semantic.Provider, error) {
 	return r.ForSpec(spec)
 }
 
+// ProviderForSpecWorkspace returns the lazy-spawned LSP provider for the
+// named spec scoped to a specific workspace root, so each repo gets its own
+// provider instance keyed by (spec, workspace) instead of sharing the
+// default-workspace one. Used by per-repo enrichment so concurrent passes
+// across repos do not share a single Provider's connection / document caches.
+func (r *Router) ProviderForSpecWorkspace(name, workspace string) (semantic.Provider, error) {
+	r.mu.Lock()
+	spec, ok := r.enabled[name]
+	r.mu.Unlock()
+	if !ok {
+		return nil, fmt.Errorf("LSP spec %q not registered", name)
+	}
+	// forSpecWorkspace with pin=true increments inUse inside the same locked
+	// section it publishes/looks up the provider, closing the spawn→pin race.
+	// The caller MUST pair this with ReleaseSpecWorkspace.
+	return r.forSpecWorkspace(spec, workspace, true)
+}
+
 // SpecAvailable reports whether the named spec is registered AND its
 // command resolves on PATH. Pure read — no subprocess spawn. Caches
 // the PATH-lookup result like specAvailable does for ForSpec.
@@ -290,6 +313,30 @@ func (r *Router) WithMaxAlive(n int) *Router {
 	return r
 }
 
+// workspaceKey resolves a workspace string to the cache key form
+// ForSpecWorkspace uses (default-substituted, absolutised).
+func (r *Router) workspaceKey(specName, workspace string) providerKey {
+	if workspace == "" {
+		workspace = r.defaultWorkspace
+	}
+	if abs, err := filepath.Abs(workspace); err == nil {
+		workspace = abs
+	}
+	return providerKey{specName: specName, workspace: workspace}
+}
+
+// ReleaseSpecWorkspace marks a provider previously obtained via
+// ProviderForSpecWorkspace as no longer in active use, so the LRU evictor /
+// reaper may reclaim it again. Pairs one-to-one with ProviderForSpecWorkspace.
+func (r *Router) ReleaseSpecWorkspace(name, workspace string) {
+	key := r.workspaceKey(name, workspace)
+	r.mu.Lock()
+	if rp := r.providers[key]; rp != nil && rp.inUse > 0 {
+		rp.inUse--
+	}
+	r.mu.Unlock()
+}
+
 // For returns the provider responsible for the given file path under
 // the router's defaultWorkspace. Convenience wrapper for single-
 // workspace callers; multi-repo daemons should use ForWorkspace and
@@ -322,6 +369,15 @@ func (r *Router) ForSpec(spec *ServerSpec) (*Provider, error) {
 // given workspace root, spawning it on first call. The (spec,
 // workspace) tuple uniquely identifies the cached Provider.
 func (r *Router) ForSpecWorkspace(spec *ServerSpec, workspace string) (*Provider, error) {
+	return r.forSpecWorkspace(spec, workspace, false)
+}
+
+// forSpecWorkspace is ForSpecWorkspace with an optional in-use pin. When pin
+// is true the returned provider's inUse count is incremented in the SAME
+// locked section that looks it up or publishes it — so a concurrent spawn's
+// LRU eviction can never Close a freshly-returned-but-not-yet-pinned provider
+// (the spawn→pin TOCTOU). A pinned fetch MUST be paired with ReleaseSpecWorkspace.
+func (r *Router) forSpecWorkspace(spec *ServerSpec, workspace string, pin bool) (*Provider, error) {
 	if !r.specAvailable(spec) {
 		return nil, fmt.Errorf("LSP server %q not available on PATH", spec.Name)
 	}
@@ -337,6 +393,9 @@ func (r *Router) ForSpecWorkspace(spec *ServerSpec, workspace string) (*Provider
 	rp, ok := r.providers[key]
 	if ok {
 		rp.lastUsed = time.Now()
+		if pin {
+			rp.inUse++
+		}
 		r.mu.Unlock()
 		return rp.provider, nil
 	}
@@ -364,15 +423,24 @@ func (r *Router) ForSpecWorkspace(spec *ServerSpec, workspace string) (*Provider
 	// initializing. Prefer the existing one and shut down our duplicate.
 	if existing, ok := r.providers[key]; ok {
 		existing.lastUsed = time.Now()
+		if pin {
+			existing.inUse++
+		}
 		go func() { _ = p.Close() }()
 		return existing.provider, nil
 	}
-	r.providers[key] = &routedProvider{
+	newRP := &routedProvider{
 		spec:      spec,
 		workspace: workspace,
 		provider:  p,
 		lastUsed:  time.Now(),
 	}
+	// Pin BEFORE maybeEvictLRULocked runs so the just-published provider is
+	// never the eviction victim, and is protected the instant it is reachable.
+	if pin {
+		newRP.inUse = 1
+	}
+	r.providers[key] = newRP
 	r.maybeEvictLRULocked()
 	return p, nil
 }
@@ -550,6 +618,9 @@ func (r *Router) Reap() []string {
 	r.mu.Lock()
 	var victims []*routedProvider
 	for key, rp := range r.providers {
+		if rp.inUse > 0 {
+			continue // a provider held by an in-flight pass is not idle
+		}
 		if rp.lastUsed.Before(cut) {
 			victims = append(victims, rp)
 			delete(r.providers, key)
@@ -576,6 +647,9 @@ func (r *Router) maybeEvictLRULocked() {
 	var oldest *routedProvider
 	var oldestKey providerKey
 	for key, rp := range r.providers {
+		if rp.inUse > 0 {
+			continue // never evict a provider held by an in-flight pass
+		}
 		if oldest == nil || rp.lastUsed.Before(oldest.lastUsed) {
 			oldest = rp
 			oldestKey = key
