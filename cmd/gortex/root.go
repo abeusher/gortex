@@ -157,6 +157,8 @@ func assignCommandGroups() {
 		"query": "query", "context": "query", "audit": "query", "wiki": "query",
 		"docs": "query", "export": "query", "wakeup": "query", "prs": "query",
 		"review": "query", "call": "query", "tools": "query",
+		"analyze": "query", "flow": "query", "taint": "query",
+		"clones": "query", "feedback": "query",
 		"edit":   "edit",
 		"memory": "memory",
 		"index":  "index", "enrich": "index", "db": "index",
