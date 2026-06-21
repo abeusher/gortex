@@ -895,6 +895,40 @@ func (s *Server) attachFileDependents(result map[string]any, fileID string) {
 	}
 }
 
+// windowFileLines slices content to the 1-based line window [offset,
+// offset+limit). offset <= 0 starts at line 1; limit <= 0 reads to EOF.
+// Returns the windowed bytes, whether a window was applied, and the
+// 1-based inclusive start/end lines plus the file's total line count. A
+// trailing newline's phantom final line is excluded from the count and the
+// window, so total_lines matches what an editor shows. An offset past EOF
+// yields empty content (not an error).
+func windowFileLines(content []byte, offset, limit int) (out []byte, applied bool, start, end, total int) {
+	if offset <= 0 && limit <= 0 {
+		return content, false, 0, 0, 0
+	}
+	lines := strings.Split(string(content), "\n")
+	total = len(lines)
+	if total > 0 && lines[total-1] == "" {
+		// Trailing newline produced a phantom empty final element — don't
+		// count it as a line.
+		total--
+	}
+	start = offset
+	if start < 1 {
+		start = 1
+	}
+	if start > total {
+		return []byte{}, true, start, start - 1, total
+	}
+	end = total
+	if limit > 0 {
+		if e := start + limit - 1; e < end {
+			end = e
+		}
+	}
+	return []byte(strings.Join(lines[start-1:end], "\n")), true, start, end, total
+}
+
 func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	rawPath, err := req.RequireString("path")
 	if err != nil {
@@ -927,6 +961,17 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 	}
 
 	originalBytes := len(content)
+
+	// Line-window: when offset/limit are given, return only that slice of
+	// the file's lines. This is the bounded-read path for large files — the
+	// salience/compress transforms below reshape a whole body, whereas a
+	// window is a plain "lines M..N" cut the caller asked for explicitly.
+	windowed := false
+	var winStart, winEnd, winTotal int
+	if offset := req.GetInt("offset", 0); offset > 0 || req.GetInt("limit", 0) > 0 {
+		content, windowed, winStart, winEnd, winTotal = windowFileLines(content, offset, req.GetInt("limit", 0))
+	}
+
 	isBinary := looksBinary(content)
 	bodiesElided := false
 	var keptSymbols []string
@@ -1005,6 +1050,13 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 	if salienceTruncated {
 		result["salience_truncated"] = true
 	}
+	if windowed {
+		result["window"] = map[string]any{
+			"start_line":  winStart,
+			"end_line":    winEnd,
+			"total_lines": winTotal,
+		}
+	}
 
 	// Omission notes: tell the model what the payload deliberately
 	// leaves out or reshapes, so it does not reason about absent code.
@@ -1020,6 +1072,10 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 	if salienceTruncated {
 		omissions = append(omissions, omission("truncated",
 			"oversized source reduced toward its control-flow skeleton; runs of leaf statements collapsed"))
+	}
+	if windowed {
+		omissions = append(omissions, omission("windowed",
+			fmt.Sprintf("returned lines %d-%d of %d; the rest of the file was not included (offset/limit window)", winStart, winEnd, winTotal)))
 	}
 	if secretsRedacted {
 		omissions = append(omissions, omission("secrets_withheld",
@@ -1045,7 +1101,7 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 		contentStr := string(content)
 		returned := tokens.CachedCountInt64(contentStr)
 		fullFile := returned
-		if bodiesElided || salienceTruncated {
+		if bodiesElided || salienceTruncated || windowed {
 			fullFile = int64(tokens.EstimateFromSample(originalBytes, contentStr))
 		}
 		s.tokenStatsFor(ctx).record(s.fileAttributionNode(relPath, language), "read_file", returned, fullFile)

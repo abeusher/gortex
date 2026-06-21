@@ -128,8 +128,10 @@ func (s *Server) registerCodingTools() {
 
 	s.addTool(
 		mcp.NewTool("read_file",
-			mcp.WithDescription("Reads a whole file by path and returns its content. Use sparingly — prefer get_symbol_source / get_editing_context for code. Useful when you need a non-indexed file (config, fixture, raw markdown) or when you genuinely need the full body. With compress_bodies=true, every function/method body is replaced by a `{ /* N lines elided */ }` stub — signatures + structure preserved, ~30-40% of original tokens. Composable with format:\"gcx\"."),
+			mcp.WithDescription("Reads a file by path and returns its content. Pass offset (1-based start line) and/or limit (line count) to read a specific line WINDOW of a large file instead of the whole thing. Use sparingly — prefer get_symbol_source / get_editing_context for code. Useful when you need a non-indexed file (config, fixture, raw markdown) or when you genuinely need the full body. With compress_bodies=true, every function/method body is replaced by a `{ /* N lines elided */ }` stub — signatures + structure preserved, ~30-40% of original tokens. Composable with format:\"gcx\"."),
 			mcp.WithString("path", mcp.Required(), mcp.Description("Absolute path, or repo-prefixed / repo-root-relative path")),
+			mcp.WithNumber("offset", mcp.Description("1-based line number to start reading from. Pair with limit to read a window of a large file. Omit or 0 to start at the first line.")),
+			mcp.WithNumber("limit", mcp.Description("Maximum number of lines to return starting at offset. Omit or 0 to read to end of file. Set this (with or without offset) to read a bounded window instead of the whole file.")),
 			mcp.WithBoolean("compress_bodies", mcp.Description("Replace function/method bodies with elided stubs (default: false)")),
 			mcp.WithBoolean("allow_secrets", mcp.Description("Serve secret-shaped values in config / data-leaf files (.env, *.yaml, *.toml, *.properties, ...) verbatim. By default such values are withheld and only their keys are shown. Default: false.")),
 			mcp.WithString("keep", mcp.Description("Comma-separated symbol names, IDs, or node kinds whose bodies stay verbatim when compress_bodies is set — every other body in the file is still stubbed. Ignored unless compress_bodies is true.")),
