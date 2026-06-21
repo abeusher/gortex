@@ -760,6 +760,8 @@ func (s *Server) handleAnalyze(ctx context.Context, req mcp.CallToolRequest) (*m
 		return s.handleAnalyzeCoverageGaps(ctx, req)
 	case "stale_flags":
 		return s.handleAnalyzeStaleFlags(ctx, req)
+	case "doc_staleness":
+		return s.handleAnalyzeDocStaleness(ctx, req)
 	case "releases":
 		return s.handleAnalyzeReleases(ctx, req)
 	case "cgo_users":

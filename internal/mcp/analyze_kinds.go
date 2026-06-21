@@ -32,6 +32,7 @@ var analyzeKinds = []string{
 	"dbt_models",
 	"dead_code",
 	"def_use",
+	"doc_staleness",
 	"domain",
 	"edge_audit",
 	"env_var_users",

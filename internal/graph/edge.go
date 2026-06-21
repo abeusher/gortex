@@ -29,9 +29,15 @@ const (
 	EdgeImplements   EdgeKind = "implements"
 	EdgeExtends      EdgeKind = "extends"
 	EdgeReferences   EdgeKind = "references"
-	EdgeMemberOf     EdgeKind = "member_of"
-	EdgeProvides     EdgeKind = "provides"
-	EdgeConsumes     EdgeKind = "consumes"
+	// EdgeMotivates links knowledge — a KindRationale, KindArtifact, or
+	// content KindDoc — to the code symbol it explains or justifies: the
+	// causal "why this exists" relation, distinct from the structural
+	// mention EdgeReferences. Source: rationale projection and the
+	// doc->code linking pass.
+	EdgeMotivates EdgeKind = "motivates"
+	EdgeMemberOf  EdgeKind = "member_of"
+	EdgeProvides  EdgeKind = "provides"
+	EdgeConsumes  EdgeKind = "consumes"
 	// EdgeMatches links a consumer contract node to the provider contract
 	// node it resolves to (e.g. consumer http:GET:/v1/tucks → provider
 	// http:GET:/v1/tucks, across repos). Traversals bridge service
@@ -502,6 +508,10 @@ const (
 	EdgeCrossRepoCalls      EdgeKind = "cross_repo_calls"
 	EdgeCrossRepoImplements EdgeKind = "cross_repo_implements"
 	EdgeCrossRepoExtends    EdgeKind = "cross_repo_extends"
+	// EdgeCrossRepoMotivates parallels EdgeMotivates across a repo
+	// boundary — knowledge in one repo (e.g. an org-wide ADR / docs repo)
+	// explaining code in another tracked repo.
+	EdgeCrossRepoMotivates EdgeKind = "cross_repo_motivates"
 )
 
 // CrossRepoKindFor maps a base edge kind to its parallel cross-repo
@@ -517,6 +527,8 @@ func CrossRepoKindFor(base EdgeKind) (EdgeKind, bool) {
 		return EdgeCrossRepoImplements, true
 	case EdgeExtends:
 		return EdgeCrossRepoExtends, true
+	case EdgeMotivates:
+		return EdgeCrossRepoMotivates, true
 	}
 	return "", false
 }
@@ -532,6 +544,8 @@ func BaseKindForCrossRepo(cr EdgeKind) (EdgeKind, bool) {
 		return EdgeImplements, true
 	case EdgeCrossRepoExtends:
 		return EdgeExtends, true
+	case EdgeCrossRepoMotivates:
+		return EdgeMotivates, true
 	}
 	return "", false
 }
@@ -542,7 +556,7 @@ func BaseKindForCrossRepo(cr EdgeKind) (EdgeKind, bool) {
 // storage capability) that need the kind list without iterating
 // CrossRepoKindFor over every edge.
 func BaseKindsForCrossRepo() []EdgeKind {
-	return []EdgeKind{EdgeCalls, EdgeImplements, EdgeExtends}
+	return []EdgeKind{EdgeCalls, EdgeImplements, EdgeExtends, EdgeMotivates}
 }
 
 type Edge struct {

@@ -63,6 +63,15 @@ func RegisterAll(reg *parser.Registry) {
 	// claim their extensions over any generic forest grammar.
 	reg.Register(NewImageAssetExtractor())
 	reg.Register(NewPDFExtractor())
+	// Office and plain-text documents — content assets indexed as streamed
+	// KindDoc chunks (one per slide / sheet / windowed section). Registered
+	// before registerForestLanguages so they claim their extensions.
+	reg.Register(NewPptxExtractor())
+	reg.Register(NewXlsxExtractor())
+	reg.Register(NewTextExtractor())
+	// Pure data / binary assets — recorded as metadata-only file nodes
+	// (size + sha) and never parsed.
+	reg.Register(NewDataAssetExtractor())
 	reg.Register(NewOrgModeExtractor())
 	reg.Register(NewDartExtractor())
 	reg.Register(NewOCamlExtractor())

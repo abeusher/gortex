@@ -202,6 +202,14 @@ const (
 	// edited file keeps stable section identity. The owning file
 	// links to it via EdgeDefines.
 	KindDoc NodeKind = "doc"
+	// KindRationale is a graph projection of a development-memory record
+	// (a decision / incident / constraint / invariant) — the "why" behind
+	// code. The store_memory sidecar stays the system of record; this node
+	// is a derived view re-projected on memory write and reconciled on
+	// warmup, so a why-query is one hop from the code it explains. ID
+	// convention: "rationale::<memory-id>". Links to the code it explains
+	// via EdgeMotivates.
+	KindRationale NodeKind = "rationale"
 	// KindTopic represents a message-broker topic / subject / channel /
 	// exchange — the contract-layer pairing artefact for Kafka,
 	// RabbitMQ, NATS, and Redis pub-sub. ID convention:
@@ -271,7 +279,8 @@ var validNodeKinds = map[NodeKind]bool{
 	KindRelease: true, KindLicense: true, KindString: true,
 	KindResource: true, KindKustomization: true, KindImage: true,
 	KindArtifact: true, KindDoc: true, KindTopic: true,
-	KindMacro: true, KindAgent: true, KindContractBridge: true,
+	KindRationale: true,
+	KindMacro:     true, KindAgent: true, KindContractBridge: true,
 }
 
 type Node struct {

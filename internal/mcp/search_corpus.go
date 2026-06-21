@@ -24,6 +24,10 @@ const (
 	corpusDocs
 	// corpusAll returns code symbols and prose sections together.
 	corpusAll
+	// corpusContent returns only content KindDoc nodes — the
+	// data_class=content chunks from pdf / office / text documents,
+	// excluding Markdown prose sections.
+	corpusContent
 )
 
 // parseCorpus reads the `corpus` argument. "" / "code" -> corpusCode,
@@ -38,14 +42,21 @@ func parseCorpus(req mcpgo.CallToolRequest) (searchCorpus, error) {
 		return corpusDocs, nil
 	case "all", "both":
 		return corpusAll, nil
+	case "content":
+		return corpusContent, nil
 	default:
-		return corpusCode, fmt.Errorf("invalid corpus: %q (want code, docs, or all)",
+		return corpusCode, fmt.Errorf("invalid corpus: %q (want code, docs, content, or all)",
 			req.GetString("corpus", ""))
 	}
 }
 
-// includesDocs reports whether the corpus admits prose-section nodes.
-func (c searchCorpus) includesDocs() bool { return c == corpusDocs || c == corpusAll }
+// includesDocs reports whether the corpus admits prose-section nodes. Content
+// (corpusContent) rides the same doc-retrieval channel — content chunks are
+// KindDoc — so it admits docs at fetch time and narrows to content in the
+// post-filter.
+func (c searchCorpus) includesDocs() bool {
+	return c == corpusDocs || c == corpusAll || c == corpusContent
+}
 
 // includesCode reports whether the corpus admits code-symbol nodes.
 func (c searchCorpus) includesCode() bool { return c == corpusCode || c == corpusAll }
@@ -126,7 +137,18 @@ func filterNodesByCorpus(nodes []*graph.Node, c searchCorpus) []*graph.Node {
 	}
 	out := make([]*graph.Node, 0, len(nodes))
 	for _, n := range nodes {
+		if n == nil {
+			continue
+		}
 		isDoc := n.Kind == graph.KindDoc
+		if c == corpusContent {
+			// Content corpus: only the data_class=content chunks (pdf /
+			// office / text), not Markdown prose sections.
+			if isDoc && isContentNode(n) {
+				out = append(out, n)
+			}
+			continue
+		}
 		if isDoc && c.includesDocs() {
 			out = append(out, n)
 		} else if !isDoc && c.includesCode() {
@@ -134,4 +156,11 @@ func filterNodesByCorpus(nodes []*graph.Node, c searchCorpus) []*graph.Node {
 		}
 	}
 	return out
+}
+
+// isContentNode reports whether n is a content-corpus chunk — a KindDoc node
+// tagged data_class=content by a content extractor (pdf / pptx / xlsx / txt).
+func isContentNode(n *graph.Node) bool {
+	dc, _ := n.Meta["data_class"].(string)
+	return dc == "content"
 }
