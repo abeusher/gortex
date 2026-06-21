@@ -3698,12 +3698,13 @@ func flattenEmbedResults(results [][][]float32) [][]float32 {
 // AllNodes() path because nodes there carry an empty RepoPrefix and
 // GetRepoNodes("") would miss them.
 func (idx *Indexer) buildSearchIndex() {
-	var nodes []*graph.Node
-	if idx.repoPrefix != "" {
-		nodes = idx.graph.GetRepoNodes(idx.repoPrefix)
-	} else {
-		nodes = idx.graph.AllNodes()
-	}
+	// Code-only enumeration: content (data_class=content) sections live in
+	// the content index, never the symbol search or the vector store, so the
+	// FTS loop below and collectEmbedTexts both skip them anyway. Fetching
+	// the non-content set up front means a content-heavy repo's hundreds of
+	// thousands of sections never enter memory here (the disk backend filters
+	// them in SQL), instead of being materialised only to be skipped.
+	nodes := graph.RepoCodeNodes(idx.graph, idx.repoPrefix)
 
 	// Install the learned sub-word boundary table on the BM25 layer
 	// before populating postings, so the optional sparse-ngram

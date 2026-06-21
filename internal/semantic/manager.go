@@ -293,10 +293,12 @@ func (m *Manager) EnrichAll(g graph.Store, roots map[string]string) ([]*EnrichRe
 func (m *Manager) repoLanguages(g graph.Store, roots map[string]string) map[string]bool {
 	present := make(map[string]bool)
 	for repoPrefix := range roots {
-		nodes := g.GetRepoNodes(repoPrefix)
-		if len(nodes) == 0 && repoPrefix == "" {
-			nodes = g.AllNodes()
-		}
+		// Code-only enumeration: content (data_class=content) sections carry
+		// no enrichable language (pdf/text have no semantic provider), so
+		// dropping them at the store level keeps a content-heavy repo's
+		// hundreds of thousands of sections out of memory here. Content file
+		// nodes (KindFile) are kept, so a content language still registers.
+		nodes := graph.RepoCodeNodes(g, repoPrefix)
 		for _, n := range nodes {
 			// Include file/import nodes too: the per-provider EnrichRepo gate
 			// can spawn on an ambiguous edge sourced from a file/import node, so

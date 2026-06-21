@@ -15,3 +15,38 @@ func IsContentNode(n *Node) bool {
 	dc, _ := n.Meta["data_class"].(string)
 	return dc == "content"
 }
+
+// NonContentNodeReader is an optional store capability: a cheap (SQL-level
+// on the disk backend) enumeration of a repo's NON-content nodes, so the
+// code-oriented passes (search-index build, embedding, language detection)
+// never materialise a content-heavy repo's hundreds of thousands of content
+// sections just to iterate past them.
+type NonContentNodeReader interface {
+	GetRepoNonContentNodes(repoPrefix string) []*Node
+}
+
+// RepoCodeNodes returns repoPrefix's non-content nodes. It uses the store's
+// NonContentNodeReader fast path when available (the disk backend filters in
+// SQL, so 525k content sections never enter memory); otherwise it falls back
+// to materialising the repo's nodes and dropping content in Go — fine for the
+// in-memory store, which only backs small repos. An empty repoPrefix means
+// "all repos".
+func RepoCodeNodes(s Store, repoPrefix string) []*Node {
+	if r, ok := s.(NonContentNodeReader); ok {
+		return r.GetRepoNonContentNodes(repoPrefix)
+	}
+	var nodes []*Node
+	if repoPrefix != "" {
+		nodes = s.GetRepoNodes(repoPrefix)
+	}
+	if len(nodes) == 0 {
+		nodes = s.AllNodes()
+	}
+	out := make([]*Node, 0, len(nodes))
+	for _, n := range nodes {
+		if !IsContentNode(n) {
+			out = append(out, n)
+		}
+	}
+	return out
+}
