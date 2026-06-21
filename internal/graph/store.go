@@ -408,6 +408,65 @@ type SymbolSearcher interface {
 	SearchSymbols(query string, limit int) ([]SymbolHit, error)
 }
 
+// ContentHit is one result from a ContentSearcher query: the content
+// section node's ID plus locating metadata (file + ordinal), its BM25
+// relevance score (higher = more relevant), and a short snippet excerpt
+// from the matched body for display.
+type ContentHit struct {
+	NodeID   string
+	FilePath string
+	Ordinal  int
+	Score    float64
+	Snippet  string
+}
+
+// ContentFTSItem is the payload AppendContent takes per content section:
+// the node's ID, its locating metadata, and the full section body. The
+// body is indexed in the content store and is deliberately NOT retained on
+// the graph node (the node keeps only a short snippet), so the symbol
+// index and the code-oriented passes stay free of bulk content text.
+type ContentFTSItem struct {
+	NodeID   string
+	FilePath string
+	Ordinal  int
+	Body     string
+}
+
+// ContentSearcher is an optional interface backends MAY implement to
+// expose a full-text index over CONTENT (data_class="content") section
+// text, kept physically separate from the symbol search (SymbolSearcher).
+// Content text never enters the symbol FTS or the code-oriented analysis
+// passes; it streams into this dedicated index per file during parsing, so
+// a content-heavy repo (a few hundred large PDFs / text dumps that explode
+// into hundreds of thousands of sections) cannot flood the symbol index or
+// pin every section body in graph nodes.
+//
+// Contract:
+//
+//   - WipeContent clears a repo's content rows before a full rebuild
+//     (empty prefix = whole table, single-repo / conformance behaviour).
+//
+//   - WipeContentFile clears one file's content rows — the incremental
+//     reindex path when a single content file changes.
+//
+//   - AppendContent inserts content rows for repoPrefix without wiping —
+//     the streamed per-file build path. Callers WipeContent (full) or
+//     WipeContentFile (incremental) first, then AppendContent each file's
+//     sections. Idempotent only in combination with a preceding wipe.
+//
+//   - SearchContent runs a query scoped to repoPrefix (empty = all repos)
+//     and returns hits ordered by score descending, each with a snippet.
+//
+//   - BuildContentIndex finalises the index after the bulk parse phase
+//     (segment merge / optimize). Idempotent — safe to call repeatedly.
+type ContentSearcher interface {
+	WipeContent(repoPrefix string) error
+	WipeContentFile(filePath string) error
+	AppendContent(repoPrefix string, items []ContentFTSItem) error
+	SearchContent(query, repoPrefix string, limit int) ([]ContentHit, error)
+	BuildContentIndex() error
+}
+
 // SymbolBundle is the rerank-shaped result of one search call: the
 // matched node, its BM25 score, AND the in/out edges the rerank
 // pipeline reads from. Backends that can compose this in a single
