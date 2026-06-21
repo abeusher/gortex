@@ -398,10 +398,11 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 			// registers per-repo helpers via the OnRepoTracked hook.
 			if cfg.Index != "" {
 				if abs, aerr := filepath.Abs(cfg.Index); aerr == nil {
-					tsSpec := lsp.SpecByName("typescript-language-server")
-					if tsSpec != nil && lspRouter.Available(tsSpec) && RepoLikelyHasTypeScriptIntent(abs) {
-						helper := BuildResolverLSPHelper(lspRouter, tsSpec, abs, lsp.ResolverPoolSizeFromEnv(1), logger)
+					helper, specs := BuildResolverLSPHelperForRepo(lspRouter, abs, lsp.ResolverPoolSizeFromEnv(1), logger)
+					if helper != nil {
 						s.ResolverLSPRegistry.Register("", helper)
+						logger.Info("serverstack: single-repo resolve-time LSP helpers registered",
+							zap.Strings("specs", specs))
 					}
 				}
 			}
@@ -485,15 +486,10 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 				registryRef := s.ResolverLSPRegistry
 				poolSize := lsp.ResolverPoolSizeFromEnv(1)
 				mi.SetOnRepoTracked(func(prefix, absPath string) {
-					tsSpec := lsp.SpecByName("typescript-language-server")
-					if tsSpec == nil || !routerRef.Available(tsSpec) {
-						return
+					helper, _ := BuildResolverLSPHelperForRepo(routerRef, absPath, poolSize, logger)
+					if helper != nil {
+						registryRef.Register(prefix, helper)
 					}
-					if !RepoLikelyHasTypeScriptIntent(absPath) {
-						return
-					}
-					helper := BuildResolverLSPHelper(routerRef, tsSpec, absPath, poolSize, logger)
-					registryRef.Register(prefix, helper)
 				})
 			}
 		}

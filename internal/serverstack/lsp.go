@@ -8,6 +8,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/resolver"
 	"github.com/zzet/gortex/internal/semantic/lsp"
 )
 
@@ -64,6 +65,32 @@ func RepoLikelyHasTypeScriptIntent(absRoot string) bool {
 	return false
 }
 
+// RepoLikelyHasPythonIntent reports whether a repo root carries one of the
+// standard Python project markers, used to decide whether to wire the
+// resolve-time pyright helper for a tracked repo.
+func RepoLikelyHasPythonIntent(absRoot string) bool {
+	for _, marker := range []string{
+		"pyproject.toml",
+		"setup.py",
+		"setup.cfg",
+		"requirements.txt",
+		"requirements.in",
+		"Pipfile",
+		"poetry.lock",
+		"uv.lock",
+		"tox.ini",
+		".python-version",
+	} {
+		if _, err := os.Stat(filepath.Join(absRoot, marker)); err == nil {
+			return true
+		}
+	}
+	if matches, err := filepath.Glob(filepath.Join(absRoot, "*.py")); err == nil && len(matches) > 0 {
+		return true
+	}
+	return false
+}
+
 // BuildResolverLSPHelper constructs the resolve-time LSP helper for a
 // workspace, choosing the router-cached lazy path (poolSize <= 1, reuses
 // the router's idle reaper) or the fresh-spawn pool path (poolSize > 1,
@@ -91,4 +118,32 @@ func BuildResolverLSPHelper(router *lsp.Router, spec *lsp.ServerSpec, absRoot st
 		poolSize,
 		logger,
 	)
+}
+
+// BuildResolverLSPHelperForRepo constructs a per-repo helper that can route
+// each file extension to the appropriate language server. The returned spec
+// names are the helpers included in the mux, for logging and diagnostics.
+func BuildResolverLSPHelperForRepo(router *lsp.Router, absRoot string, poolSize int, logger *zap.Logger) (resolver.LSPHelper, []string) {
+	if router == nil {
+		return nil, nil
+	}
+
+	var helpers []resolver.LSPHelper
+	var specs []string
+	add := func(name string, enabled bool) {
+		if !enabled {
+			return
+		}
+		spec := lsp.SpecByName(name)
+		if spec == nil || !router.Available(spec) {
+			return
+		}
+		helpers = append(helpers, BuildResolverLSPHelper(router, spec, absRoot, poolSize, logger))
+		specs = append(specs, name)
+	}
+
+	add("typescript-language-server", RepoLikelyHasTypeScriptIntent(absRoot))
+	add("pyright", RepoLikelyHasPythonIntent(absRoot))
+
+	return lsp.NewResolverHelperMux(helpers...), specs
 }

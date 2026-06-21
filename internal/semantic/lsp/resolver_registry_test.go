@@ -108,6 +108,30 @@ func TestResolverHelperRegistry_SupportsPath_RoutesByExtension(t *testing.T) {
 	assert.False(t, reg.SupportsPath("src/foo.py"))
 }
 
+func TestResolverHelperMux_RoutesByExtension(t *testing.T) {
+	ts := newScriptedHelperWithExtensions(t, "/tmp/r", []string{".ts"}, map[string]scriptedAnswer{
+		"src/foo.ts:3:run": {defPath: "src/foo.ts", defLine: 9},
+	})
+	py := newScriptedHelperWithExtensions(t, "/tmp/r", []string{".py"}, map[string]scriptedAnswer{
+		"src/foo.py:4:run": {defPath: "src/foo.py", defLine: 11},
+	})
+	mux := NewResolverHelperMux(ts, py)
+
+	assert.True(t, mux.SupportsPath("src/foo.ts"))
+	assert.True(t, mux.SupportsPath("src/foo.py"))
+	assert.False(t, mux.SupportsPath("src/foo.go"))
+
+	defPath, defLine, ok := mux.Definition("src/foo.py", 4, "run")
+	require.True(t, ok)
+	assert.Equal(t, "src/foo.py", defPath)
+	assert.Equal(t, 11, defLine)
+
+	defPath, defLine, ok = mux.Definition("src/foo.ts", 3, "run")
+	require.True(t, ok)
+	assert.Equal(t, "src/foo.ts", defPath)
+	assert.Equal(t, 9, defLine)
+}
+
 // TestNewLazyResolverHelper_LookupFiresOnce verifies that the lazy
 // provider lookup runs exactly once and the result (or error) is
 // cached for subsequent calls.
@@ -154,9 +178,16 @@ type scriptedAnswer struct {
 type scriptedHelper struct {
 	workspaceRoot string
 	answers       map[string]scriptedAnswer
+	extensions    map[string]struct{}
 }
 
 func newScriptedHelper(t *testing.T, workspaceRoot string, answers map[string]scriptedAnswer) *scriptedHelper {
+	return newScriptedHelperWithExtensions(t, workspaceRoot, []string{
+		".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs",
+	}, answers)
+}
+
+func newScriptedHelperWithExtensions(t *testing.T, workspaceRoot string, extensions []string, answers map[string]scriptedAnswer) *scriptedHelper {
 	t.Helper()
 	if answers == nil {
 		answers = map[string]scriptedAnswer{}
@@ -164,7 +195,11 @@ func newScriptedHelper(t *testing.T, workspaceRoot string, answers map[string]sc
 	if abs, err := filepath.Abs(workspaceRoot); err == nil {
 		workspaceRoot = abs
 	}
-	return &scriptedHelper{workspaceRoot: workspaceRoot, answers: answers}
+	exts := make(map[string]struct{}, len(extensions))
+	for _, ext := range extensions {
+		exts[strings.ToLower(ext)] = struct{}{}
+	}
+	return &scriptedHelper{workspaceRoot: workspaceRoot, answers: answers, extensions: exts}
 }
 
 func (s *scriptedHelper) SupportsPath(relPath string) bool {
@@ -172,11 +207,8 @@ func (s *scriptedHelper) SupportsPath(relPath string) bool {
 		return false
 	}
 	ext := strings.ToLower(filepath.Ext(relPath))
-	switch ext {
-	case ".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs":
-		return true
-	}
-	return false
+	_, ok := s.extensions[ext]
+	return ok
 }
 
 func (s *scriptedHelper) Definition(relPath string, oneBasedLine int, name string) (string, int, bool) {

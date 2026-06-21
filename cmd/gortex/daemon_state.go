@@ -74,7 +74,7 @@ type daemonState struct {
 
 	// resolverLSPRegistry composes per-repo ResolverHelpers consulted
 	// by the cross-file resolver's hot path. Populated as repos
-	// are tracked so each tsserver instance is scoped to its owning
+	// are tracked so each language-server instance is scoped to its owning
 	// workspace. nil when the resolve-time LSP path is disabled
 	// (GORTEX_LSP_RESOLVER=0) or when semantic enrichment is off.
 	resolverLSPRegistry *lsp.ResolverHelperRegistry
@@ -193,40 +193,6 @@ func buildDaemonState(logger *zap.Logger) (*daemonState, error) {
 	}, nil
 }
 
-// repoLikelyHasTypeScriptIntent returns true when the repo root
-// carries one of the canonical TS / JS project markers: tsconfig.json,
-// jsconfig.json, or package.json. Used as a registration-time gate
-// so a Go-only repo with a stray .ts file (a Playwright config, a
-// vendored test fixture) doesn't trigger a full tsserver spawn the
-// first time the resolver hits that file. Repos that fail the check
-// fall through to AST-only resolution for TS/JS edges — degraded
-// gracefully rather than booting a per-workspace tsserver process
-// that scans the whole tree.
-//
-// Cheap: three stat calls per repo at warmup time. Misses are biased
-// safe — a workspace with TS code but none of these markers is rare,
-// and even then the cost is "no LSP precision" rather than incorrect
-// behaviour.
-func repoLikelyHasTypeScriptIntent(absRoot string) bool {
-	return serverstack.RepoLikelyHasTypeScriptIntent(absRoot)
-}
-
-// buildResolverLSPHelper constructs the resolve-time LSP helper for a
-// workspace, choosing between the router-cached lazy path (poolSize
-// ≤ 1) and the fresh-spawn pool path (poolSize > 1).
-//
-// Why the branch matters: the router-cached path reuses Router's
-// existing idle reaper — workspaces that go quiet release their
-// tsserver. A naive multi-provider pool keeps every spawn alive for
-// the process lifetime; multiplied across 400+ tracked workspaces
-// that's hundreds of GB of resident tsserver state. Until we have
-// reaping in the pool itself, multi-provider mode is opt-in
-// (GORTEX_LSP_POOL_SIZE > 1) and the recommendation is to use it only
-// when the tracked-workspace count is small.
-func buildResolverLSPHelper(router *lsp.Router, spec *lsp.ServerSpec, absRoot string, poolSize int, logger *zap.Logger) *lsp.ResolverHelper {
-	return serverstack.BuildResolverLSPHelper(router, spec, absRoot, poolSize, logger)
-}
-
 // warmupDaemonState performs the per-repo TrackRepoCtx loop and brings
 // up the MultiWatcher. Split out from buildDaemonState so the daemon can
 // open its socket and accept connections before this work finishes —
@@ -254,34 +220,40 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger) *indexer.MultiWat
 
 	// Register a per-repo resolver-time LSP helper for every
 	// tracked repo BEFORE the parallel warmup loop fires. The
-	// helpers are lazy: tsserver isn't spawned until the resolver
-	// asks for a TS/JS edge resolution, so there's no startup cost
-	// for repos with no TS code.
+	// helpers are lazy: language servers are not spawned until the
+	// resolver asks for a supported edge resolution, so there's no
+	// startup cost for repos with no matching code.
 	if state.resolverLSPRegistry != nil && state.lspRouter != nil {
-		tsSpec := lsp.SpecByName("typescript-language-server")
-		if tsSpec != nil && state.lspRouter.Available(tsSpec) {
-			poolSize := lsp.ResolverPoolSizeFromEnv(1)
-			registered, skipped := 0, 0
-			for _, entry := range repos {
-				absRoot, err := filepath.Abs(entry.Path)
-				if err != nil {
-					continue
-				}
-				if !repoLikelyHasTypeScriptIntent(absRoot) {
-					skipped++
-					continue
-				}
-				prefix := strings.TrimPrefix(indexer.EffectiveRepoPrefix(state.configManager, entry), "/")
-				absRootCapture := absRoot
-				helper := buildResolverLSPHelper(state.lspRouter, tsSpec, absRootCapture, poolSize, logger)
-				state.resolverLSPRegistry.Register(prefix, helper)
-				registered++
+		poolSize := lsp.ResolverPoolSizeFromEnv(1)
+		registered, skipped, tsRepos, pythonRepos := 0, 0, 0, 0
+		for _, entry := range repos {
+			absRoot, err := filepath.Abs(entry.Path)
+			if err != nil {
+				continue
 			}
-			logger.Info("daemon: resolve-time LSP helpers registered",
-				zap.Int("ts_repos", registered),
-				zap.Int("non_ts_repos_skipped", skipped),
-				zap.Int("pool_size", poolSize))
+			helper, specs := serverstack.BuildResolverLSPHelperForRepo(state.lspRouter, absRoot, poolSize, logger)
+			if helper == nil {
+				skipped++
+				continue
+			}
+			prefix := strings.TrimPrefix(indexer.EffectiveRepoPrefix(state.configManager, entry), "/")
+			state.resolverLSPRegistry.Register(prefix, helper)
+			registered++
+			for _, spec := range specs {
+				switch spec {
+				case "typescript-language-server":
+					tsRepos++
+				case "pyright":
+					pythonRepos++
+				}
+			}
 		}
+		logger.Info("daemon: resolve-time LSP helpers registered",
+			zap.Int("repos", registered),
+			zap.Int("skipped", skipped),
+			zap.Int("ts_repos", tsRepos),
+			zap.Int("python_repos", pythonRepos),
+			zap.Int("pool_size", poolSize))
 	}
 	// Bounded worker pool — disk I/O dominates parsing for most repos,
 	// but a few CPU-heavy ones overlap with disk waits on others. NumCPU
