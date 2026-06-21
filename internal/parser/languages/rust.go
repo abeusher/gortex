@@ -107,6 +107,8 @@ type rustDeferredCall struct {
 type rustDeferredLet struct {
 	name     string
 	explicit string       // normalized type from explicit annotation, "" if none
+	typeRaw  string       // verbatim explicit-annotation source (pre-canonicalization), "" if none
+	typeLine int          // 1-based line of the explicit annotation (0 if none)
 	value    *sitter.Node // RHS expression node, or nil
 }
 
@@ -174,6 +176,14 @@ func (e *RustExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 			}
 			if t, ok := m.Captures["lvar.type"]; ok {
 				d.explicit = normalizeRustTypeName(t.Text)
+				// Keep the verbatim annotation source + its line so the
+				// post-pass can emit a cross-file EdgeTypedAs from the
+				// enclosing function to the named type, mirroring the
+				// param/return function-shape emission. normalizeRustTypeName
+				// is lossy (drops wrappers the canonicalizer keeps), so we
+				// re-canonicalize from the raw text downstream.
+				d.typeRaw = t.Text
+				d.typeLine = t.StartLine + 1
 			}
 			if v, ok := m.Captures["lvar.value"]; ok && v.Node != nil {
 				d.value = v.Node
@@ -260,6 +270,24 @@ func (e *RustExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 	// All function/method nodes have been emitted; map call sites to
 	// their enclosing definition.
 	funcRanges := buildFuncRanges(result)
+
+	// Emit a cross-file type-usage edge for every `let x: Type = ...`
+	// binding annotation. Without this a type referenced only in a local
+	// binding (never in a param/return) is invisible to find_usages
+	// absent a language server. Attributed to the enclosing function
+	// (file node fallback), canonicalized to the bare named type, with
+	// primitives skipped — same shape as the param/return emission.
+	for _, l := range lets {
+		if l.typeRaw == "" {
+			continue
+		}
+		ownerID := findEnclosingFunc(funcRanges, l.typeLine)
+		if ownerID == "" {
+			ownerID = fileID
+		}
+		emitRustTypeUseEdges(ownerID, l.typeRaw, filePath, l.typeLine, result)
+	}
+
 	for _, c := range calls {
 		callerID := findEnclosingFunc(funcRanges, c.line)
 		if callerID == "" {
@@ -499,9 +527,9 @@ func rustTypeParams(item *sitter.Node, src []byte) []map[string]string {
 // emitRustThrowsEdges inspects a function's return type for a Result
 // wrapper and emits an EdgeThrows to the error type when found. Idiom:
 //
-//   fn parse(s: &str) -> Result<i32, ParseError> {…}     → throws ParseError
-//   fn open(p: &Path) -> Result<File, std::io::Error> {…} → throws Error
-//   fn no_error() -> i32 {…}                              → no edge
+//	fn parse(s: &str) -> Result<i32, ParseError> {…}     → throws ParseError
+//	fn open(p: &Path) -> Result<File, std::io::Error> {…} → throws Error
+//	fn no_error() -> i32 {…}                              → no edge
 //
 // `Origin: ASTInferred` because we're pattern-matching the return
 // type text, not type-checking it.
@@ -561,10 +589,10 @@ func rustRawReturnType(node *sitter.Node, src []byte) string {
 // the trailing identifier of the error parameter when the type is a
 // Result. Handles:
 //
-//   Result<T, E>            → E
-//   Result<T, std::io::E>   → E (trailing ident)
-//   Result<T, Box<dyn E>>   → E
-//   anyhow::Result<T>       → "" (single-arg form: error type elided)
+//	Result<T, E>            → E
+//	Result<T, std::io::E>   → E (trailing ident)
+//	Result<T, Box<dyn E>>   → E
+//	anyhow::Result<T>       → "" (single-arg form: error type elided)
 //
 // Returns "" for non-Result returns or when the error type can't be
 // extracted unambiguously.

@@ -263,6 +263,33 @@ func emitRustReturnEdges(ownerID, returnText, filePath string, line int, result 
 	})
 }
 
+// emitRustTypeUseEdges emits an EdgeTypedAs from ownerID to the named
+// type referenced by a `let x: Type = ...` binding annotation. typeText
+// is the verbatim annotation source; it's canonicalized to its bare
+// named form (references / generics / wrappers like Box<T>, Vec<T>,
+// Option<T>, Arc<T>, Rc<T>, Result<T, _> stripped to the inner named
+// type via canonicalizeRustTypeRef) and primitives are skipped, so the
+// edge only fires for workspace-resolvable types. Mirrors the param /
+// return function-shape emission so a type used only in a local binding
+// is still visible to find_usages without a language server.
+func emitRustTypeUseEdges(ownerID, typeText, filePath string, line int, result *parser.ExtractionResult) {
+	if ownerID == "" || typeText == "" {
+		return
+	}
+	canon := canonicalizeRustTypeRef(typeText)
+	if canon == "" || isRustPrimitive(canon) {
+		return
+	}
+	result.Edges = append(result.Edges, &graph.Edge{
+		From:     ownerID,
+		To:       "unresolved::" + canon,
+		Kind:     graph.EdgeTypedAs,
+		FilePath: filePath,
+		Line:     line,
+		Origin:   graph.OriginASTInferred,
+	})
+}
+
 func emitRustGenericParamNodes(ownerID string, funcNode *sitter.Node, src []byte, filePath string, line int, result *parser.ExtractionResult) {
 	tparams := rustTypeParams(funcNode, src)
 	if len(tparams) == 0 {

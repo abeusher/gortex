@@ -299,6 +299,31 @@ func emitPyReturnEdges(ownerID, returnText, filePath string, line int, result *p
 	}
 }
 
+// emitPyTypeUseEdges parses a variable annotation type and emits one
+// EdgeTypedAs per top-level named type to unresolved::<type>, so a type
+// used only in `x: T` annotation position is a first-class cross-file
+// reference the name-based resolver can land without an LSP. Mirrors
+// emitPyReturnEdges; primitives are skipped.
+func emitPyTypeUseEdges(ownerID, typeText, filePath string, line int, result *parser.ExtractionResult) {
+	if typeText == "" {
+		return
+	}
+	for _, raw := range splitPyUnionType(typeText) {
+		t := canonicalizePyTypeRef(raw)
+		if t == "" || isPyPrimitive(t) {
+			continue
+		}
+		result.Edges = append(result.Edges, &graph.Edge{
+			From:     ownerID,
+			To:       "unresolved::" + t,
+			Kind:     graph.EdgeTypedAs,
+			FilePath: filePath,
+			Line:     line,
+			Origin:   graph.OriginASTInferred,
+		})
+	}
+}
+
 func emitPyGenericParamNodes(ownerID string, funcNode *sitter.Node, src []byte, filePath string, line int, result *parser.ExtractionResult) {
 	tparams := funcNode.ChildByFieldName("type_parameters")
 	if tparams == nil {

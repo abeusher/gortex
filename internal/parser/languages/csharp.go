@@ -126,6 +126,16 @@ type csharpDeferredLocal struct {
 	defNode *sitter.Node
 }
 
+// csharpTypeUse buffers a type referenced only in a local-variable
+// annotation (`HttpResponse resp = Get();`) so the post-pass can emit an
+// EdgeTypedAs from the enclosing function once funcRanges are built.
+// Field / property annotations emit their edge inline from the member
+// node, so they don't ride this buffer.
+type csharpTypeUse struct {
+	typeText string
+	line     int
+}
+
 // Extract parses the C# source, adaptively recovering symbols that tree-sitter
 // silently drops inside conditional-compilation branches. The grammar parses a
 // #if/#elif/#else block without raising any error, yet omits every declaration
@@ -212,6 +222,7 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 
 	var calls []csharpDeferredCall
 	var locals []csharpDeferredLocal
+	var typeUses []csharpTypeUse
 
 	parser.EachMatch(e.qAll, root, src, func(m parser.QueryResult) {
 		switch {
@@ -276,6 +287,15 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 				rawType: m.Captures["lvar.type"].Text,
 				defNode: m.Captures["lvar.def"].Node,
 			})
+			// Buffer the annotated type so the post-pass (once
+			// funcRanges exist) can attribute an EdgeTypedAs to the
+			// enclosing function — a type used only in a local
+			// annotation seeds tenv but otherwise emits no reference,
+			// so find_usages would miss it without an LSP.
+			typeUses = append(typeUses, csharpTypeUse{
+				typeText: m.Captures["lvar.type"].Text,
+				line:     m.Captures["lvar.type"].StartLine + 1,
+			})
 		}
 	})
 
@@ -324,6 +344,19 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 
 	// Resolve calls against funcRanges + tenv.
 	funcRanges := buildFuncRanges(result)
+
+	// Local-variable type annotations → EdgeTypedAs from the enclosing
+	// function (file node as fallback). Mirrors the parameter/return
+	// type-use emission so a type referenced only in a local body
+	// declaration is still a navigable reference without an LSP.
+	for _, tu := range typeUses {
+		ownerID := findEnclosingFunc(funcRanges, tu.line)
+		if ownerID == "" {
+			ownerID = fileID
+		}
+		emitCSharpTypeUseEdges(ownerID, tu.typeText, filePath, tu.line, result)
+	}
+
 	for _, c := range calls {
 		callerID := findEnclosingFunc(funcRanges, c.line)
 		if callerID == "" {
@@ -760,8 +793,12 @@ func (e *CSharpExtractor) emitField(m parser.QueryResult, filePath, fileID strin
 		"receiver":   owner.name,
 		"visibility": csharpVisibility(def.Node, src, VisibilityPrivate),
 	}
-	if t := def.Node.ChildByFieldName("type"); t != nil {
-		meta["field_type"] = strings.TrimSpace(t.Content(src))
+	// A field_declaration's type lives on its nested variable_declaration
+	// (`field_declaration → variable_declaration[type] → variable_declarator`),
+	// not as a direct `type` field of the field_declaration itself.
+	fieldTypeRaw := csharpFieldDeclType(def.Node, src)
+	if fieldTypeRaw != "" {
+		meta["field_type"] = fieldTypeRaw
 	}
 	// A `const` field is a compile-time constant, not a mutable field —
 	// classify it as KindConstant so it joins the value-reference impact
@@ -792,6 +829,10 @@ func (e *CSharpExtractor) emitField(m parser.QueryResult, filePath, fileID strin
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: id, To: ownerID, Kind: graph.EdgeMemberOf, FilePath: filePath, Line: def.StartLine + 1,
 	})
+	// Field type annotation → EdgeTypedAs from the field node, so a type
+	// used only as a field's declared type (`private Session _s;`) is a
+	// navigable reference without an LSP.
+	emitCSharpTypeUseEdges(id, fieldTypeRaw, filePath, def.StartLine+1, result)
 }
 
 func (e *CSharpExtractor) emitProperty(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool) {
@@ -811,8 +852,10 @@ func (e *CSharpExtractor) emitProperty(m parser.QueryResult, filePath, fileID st
 		"visibility": csharpVisibility(def.Node, src, VisibilityPrivate),
 		"kind":       "property",
 	}
+	var propTypeRaw string
 	if t := def.Node.ChildByFieldName("type"); t != nil {
-		meta["field_type"] = strings.TrimSpace(t.Content(src))
+		propTypeRaw = strings.TrimSpace(t.Content(src))
+		meta["field_type"] = propTypeRaw
 	}
 	if doc := extractCSharpDoc(src, def.StartLine); doc != "" {
 		meta["doc"] = doc
@@ -830,6 +873,8 @@ func (e *CSharpExtractor) emitProperty(m parser.QueryResult, filePath, fileID st
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: id, To: ownerID, Kind: graph.EdgeMemberOf, FilePath: filePath, Line: def.StartLine + 1,
 	})
+	// Property type annotation → EdgeTypedAs from the property node.
+	emitCSharpTypeUseEdges(id, propTypeRaw, filePath, def.StartLine+1, result)
 }
 
 func (e *CSharpExtractor) emitUsing(m parser.QueryResult, filePath, fileID string, result *parser.ExtractionResult) {
@@ -1104,6 +1149,33 @@ func normalizeCSharpTypeName(t string) string {
 		return ""
 	}
 	return t
+}
+
+// csharpFieldDeclType returns the verbatim declared type of a
+// field_declaration. The type is a field of the nested
+// variable_declaration node, not of the field_declaration itself, so a
+// direct ChildByFieldName("type") on the field_declaration is always nil.
+func csharpFieldDeclType(fieldDecl *sitter.Node, src []byte) string {
+	if fieldDecl == nil {
+		return ""
+	}
+	for i := 0; i < int(fieldDecl.NamedChildCount()); i++ {
+		c := fieldDecl.NamedChild(i)
+		if c == nil || c.Type() != "variable_declaration" {
+			continue
+		}
+		if t := c.ChildByFieldName("type"); t != nil {
+			return strings.TrimSpace(t.Content(src))
+		}
+		// Fallback: first named child of the variable_declaration is the
+		// type in grammar revisions that don't tag the field.
+		if c.NamedChildCount() > 0 {
+			if first := c.NamedChild(0); first != nil && first.Type() != "variable_declarator" {
+				return strings.TrimSpace(first.Content(src))
+			}
+		}
+	}
+	return ""
 }
 
 // inferTypeFromCSharpNew extracts the type name from a C# object_creation_expression.

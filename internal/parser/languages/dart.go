@@ -71,6 +71,11 @@ func (e *DartExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 	// Call sites.
 	e.extractCalls(root, src, filePath, result, imports)
 
+	// Cross-file type-usage edges for declaration-position types (fields,
+	// parameters, return types, typed locals) — runs after the symbol
+	// extractors so the enclosing-owner ranges are populated.
+	e.extractTypeUses(root, src, filePath, fileNode, result)
+
 	captureValueRefCandidates(result, root, filePath, src)
 	captureFnValueCandidates(result, root, filePath, src)
 	return result, nil

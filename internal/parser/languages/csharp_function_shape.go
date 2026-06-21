@@ -221,12 +221,40 @@ func canonicalizeCSharpTypeRef(t string) string {
 
 func isCSharpPrimitive(t string) bool {
 	switch t {
-	case "", "void", "bool", "byte", "sbyte", "short", "ushort",
+	case "", "var", "void", "bool", "byte", "sbyte", "short", "ushort",
 		"int", "uint", "long", "ulong", "float", "double", "decimal",
 		"char", "string", "object", "dynamic":
 		return true
 	}
 	return false
+}
+
+// emitCSharpTypeUseEdges emits one EdgeTypedAs from ownerID to the bare
+// named type used in a variable / field / property annotation. The type
+// is canonicalised to its simple named form (nullable `T?`, arrays
+// `T[]`, and container generics like `List<T>` / `Task<T>` are unwrapped
+// by canonicalizeCSharpTypeRef) and primitives / `var` are skipped so
+// the graph isn't flooded with unresolved::int / unresolved::var edges
+// that never land. Edges ride at OriginASTInferred — the binding is a
+// tree-sitter inference, not an LSP-checked fact — so a type that a local
+// declaration uses (`HttpResponse resp = Get();`) becomes a traversable
+// reference even without a language server.
+func emitCSharpTypeUseEdges(ownerID, typeText, filePath string, line int, result *parser.ExtractionResult) {
+	if ownerID == "" {
+		return
+	}
+	canon := canonicalizeCSharpTypeRef(typeText)
+	if canon == "" || isCSharpPrimitive(canon) {
+		return
+	}
+	result.Edges = append(result.Edges, &graph.Edge{
+		From:     ownerID,
+		To:       "unresolved::" + canon,
+		Kind:     graph.EdgeTypedAs,
+		FilePath: filePath,
+		Line:     line,
+		Origin:   graph.OriginASTInferred,
+	})
 }
 
 // emitCSharpAsyncSpawns walks a C# method body for `await` expressions

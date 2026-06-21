@@ -504,6 +504,32 @@ func emitTSReturnEdges(ownerID, returnText, filePath string, line int, result *p
 	}
 }
 
+// emitTSTypeUseEdges parses a variable / const / field type annotation
+// and emits one EdgeTypedAs per top-level named type to
+// unresolved::<type>, so a type used only in annotation position is a
+// first-class cross-file reference the name-based resolver can land
+// without an LSP. Union / intersection branches each emit an edge,
+// mirroring emitTSReturnEdges; primitives are skipped.
+func emitTSTypeUseEdges(ownerID, typeText, filePath string, line int, result *parser.ExtractionResult) {
+	if typeText == "" {
+		return
+	}
+	for _, raw := range splitTSUnionType(typeText) {
+		t := canonicalizeTSTypeRef(raw)
+		if t == "" || isTSPrimitive(t) {
+			continue
+		}
+		result.Edges = append(result.Edges, &graph.Edge{
+			From:     ownerID,
+			To:       "unresolved::" + t,
+			Kind:     graph.EdgeTypedAs,
+			FilePath: filePath,
+			Line:     line,
+			Origin:   graph.OriginASTInferred,
+		})
+	}
+}
+
 // emitTSGenericParamNodes turns a TS function/class declaration's
 // type_parameters into KindGenericParam nodes plus EdgeMemberOf back
 // to the owner. Constraints and defaults are stored as meta.bound /

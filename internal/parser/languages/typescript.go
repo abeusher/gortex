@@ -157,6 +157,14 @@ type deferredVar struct {
 	endLn   int // 0-based
 }
 
+// deferredTypeUse holds a variable / const type annotation whose
+// EdgeTypedAs is emitted after funcRanges is built, so the reference is
+// attributed to its enclosing function (falling back to the file node).
+type deferredTypeUse struct {
+	typeText string
+	line     int // 1-based
+}
+
 func (e *TypeScriptExtractor) Extract(filePath string, src []byte) (*parser.ExtractionResult, error) {
 	lang, qAll := e.grammarFor(filePath)
 	tree, err := parser.ParseFile(src, lang)
@@ -183,6 +191,7 @@ func (e *TypeScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 
 	var calls []deferredCall
 	var vars []deferredVar
+	var typeUses []deferredTypeUse
 	// objLiteralMembers maps a top-level object-literal owner name to the
 	// member-function node IDs declared inside it — both method shorthand
 	// (`{ process() {...} }`) and arrow fields (`{ health: () => ... }`).
@@ -287,9 +296,14 @@ func (e *TypeScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 
 		case m.Captures["tvar.def"] != nil:
 			name := m.Captures["tvar.name"].Text
-			if tn := normalizeTypeName(m.Captures["tvar.type"].Text); tn != "" {
+			rawType := m.Captures["tvar.type"].Text
+			if tn := normalizeTypeName(rawType); tn != "" {
 				tenv[name] = tn
 			}
+			typeUses = append(typeUses, deferredTypeUse{
+				typeText: rawType,
+				line:     m.Captures["tvar.def"].StartLine + 1,
+			})
 
 		case m.Captures["var.def"] != nil:
 			def := m.Captures["var.def"]
@@ -342,6 +356,19 @@ func (e *TypeScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 	// Now every function/method node is in result; build the line
 	// range map used to attribute calls to their caller.
 	funcRanges := buildFuncRanges(result)
+
+	// Type-use edges: a `const x: T` / `let x: T` annotation references
+	// type T. Attributed to the enclosing function (fallback: the file
+	// node) so find_usages(T) surfaces every annotation site without an
+	// LSP. EdgeTypedAs mirrors the param / return type edges; the
+	// resolver lands it cross-file via the same name-based pass.
+	for _, tu := range typeUses {
+		ownerID := findEnclosingFunc(funcRanges, tu.line)
+		if ownerID == "" {
+			ownerID = fileID
+		}
+		emitTSTypeUseEdges(ownerID, tu.typeText, filePath, tu.line, result)
+	}
 
 	// Instantiation edges: `new Foo(...)` constructs Foo. Emitted as a typed
 	// EdgeInstantiates (not a flat call) attributed to the enclosing function,
@@ -1272,6 +1299,11 @@ func (e *TypeScriptExtractor) emitClassProperty(m parser.QueryResult, filePath s
 		From: id, To: classID, Kind: graph.EdgeMemberOf,
 		FilePath: filePath, Line: def.StartLine + 1,
 	})
+	// A typed field (`field: T`) references type T — emit EdgeTypedAs so
+	// find_usages(T) surfaces the declaration site without an LSP.
+	if rawType := tsReturnTypeRaw(def.Node, src); rawType != "" {
+		emitTSTypeUseEdges(id, rawType, filePath, def.StartLine+1, result)
+	}
 	// Decorators on a class field can appear two ways depending on
 	// grammar version: as previous siblings in the class body, or as
 	// direct children of the public_field_definition node. Try both

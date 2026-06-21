@@ -1480,7 +1480,26 @@ func panicOnFatal(err error) {
 	if errors.Is(err, sql.ErrNoRows) {
 		return
 	}
+	// A closed statement / database / connection is a teardown race, not
+	// data corruption: Close() shuts the store (daemon shutdown, restart,
+	// or store swap) while an in-flight reader -- e.g. a deferred
+	// parallel-enrich goroutine still holding a cached *sql.Stmt -- runs a
+	// query. Crashing the whole daemon over a benign shutdown race is
+	// strictly worse than the read returning empty (or a winding-down write
+	// being dropped), so treat these as non-fatal.
+	if errors.Is(err, sql.ErrConnDone) || isStoreClosedErr(err) {
+		return
+	}
 	panic(fmt.Errorf("store_sqlite: %w", err))
+}
+
+// isStoreClosedErr reports whether err is the database/sql sentinel for a
+// closed prepared statement or a closed database -- string-matched because
+// database/sql does not export these as typed errors.
+func isStoreClosedErr(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "statement is closed") ||
+		strings.Contains(msg, "database is closed")
 }
 
 // -- predicate-shaped reads ---------------------------------------------

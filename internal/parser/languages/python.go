@@ -151,6 +151,7 @@ func (e *PythonExtractor) Extract(filePath string, src []byte) (*parser.Extracti
 	tenvHasExplicit := make(map[string]bool) // names with Tier 0 type, lock from Tier 1 overwrite
 
 	var calls []pyDeferredCall
+	var typeUses []deferredTypeUse
 
 	parser.EachMatch(e.qAll, root, src, func(m parser.QueryResult) {
 		switch {
@@ -212,11 +213,16 @@ func (e *PythonExtractor) Extract(filePath string, src []byte) (*parser.Extracti
 		case m.Captures["tvar.def"] != nil:
 			// Tier 0: explicit type annotation — overwrite tenv.
 			name := m.Captures["tvar.name"].Text
-			typeName := normalizePyTypeName(m.Captures["tvar.type"].Text)
+			rawType := m.Captures["tvar.type"].Text
+			typeName := normalizePyTypeName(rawType)
 			if typeName != "" {
 				tenv[name] = typeName
 				tenvHasExplicit[name] = true
 			}
+			typeUses = append(typeUses, deferredTypeUse{
+				typeText: rawType,
+				line:     m.Captures["tvar.def"].StartLine + 1,
+			})
 
 		case m.Captures["uvar.def"] != nil:
 			// Tier 1: constructor-call inference. Only fills in keys
@@ -242,6 +248,18 @@ func (e *PythonExtractor) Extract(filePath string, src []byte) (*parser.Extracti
 	// All function/method nodes have been emitted; map call sites to
 	// their enclosing definition.
 	funcRanges := buildFuncRanges(result)
+
+	// Type-use edges: a `x: T` annotation references type T. Attributed
+	// to the enclosing function (fallback: the file node) so find_usages(T)
+	// surfaces every annotation site without an LSP.
+	for _, tu := range typeUses {
+		ownerID := findEnclosingFunc(funcRanges, tu.line)
+		if ownerID == "" {
+			ownerID = fileID
+		}
+		emitPyTypeUseEdges(ownerID, tu.typeText, filePath, tu.line, result)
+	}
+
 	for _, c := range calls {
 		callerID := findEnclosingFunc(funcRanges, c.line)
 		if callerID == "" {

@@ -5,7 +5,9 @@ import (
 	"go/ast"
 	"go/token"
 	"go/types"
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -43,17 +45,41 @@ type Provider struct {
 	// multiple repos are enriched (in any order, possibly concurrently) before
 	// their contracts are extracted, each repo's contract pass still finds its
 	// own loaded packages rather than the last writer's. Guarded by stateMu.
-	stateMu sync.RWMutex
-	stashes map[string]*goStash // absRoot → loaded package state
+	//
+	// A loaded stash holds the whole type-checked program (go/types.Info +
+	// every file's AST) for one repo — on the order of 1-2 GB for a large
+	// module. Retaining one per repo forever previously made the daemon's
+	// RSS grow without bound. The stash is therefore bounded under stateMu:
+	// an idle TTL (stashTTL) releases a repo's program once its contract
+	// pass goes quiet, and a count ceiling (maxStashes) caps how many
+	// coexist during a multi-repo warmup. A LookupTypeAtLine that misses an
+	// evicted stash returns ("", false) — the contract pipeline then falls
+	// back to its tree-sitter type tier, the intended graceful degradation.
+	stateMu    sync.RWMutex
+	stashes    map[string]*goStash // absRoot → loaded package state
+	maxStashes int                 // count ceiling (env GORTEX_GOTYPES_MAX_STASHES)
+	stashTTL   time.Duration       // idle release window (env GORTEX_GOTYPES_STASH_TTL)
+	sweepOnce  sync.Once
+	stopSweep  chan struct{}
 }
 
 // goStash is one repo's loaded go/packages state, retained for
-// LookupTypeAtLine after EnrichRepo returns.
+// LookupTypeAtLine after EnrichRepo returns. lastUsed drives idle
+// eviction; it is bumped under stateMu whenever a lookup touches the
+// repo, so an actively-queried program is never released mid-contract.
 type goStash struct {
-	pkgs    []*packages.Package
-	fset    *token.FileSet
-	absRoot string
+	pkgs     []*packages.Package
+	fset     *token.FileSet
+	absRoot  string
+	lastUsed time.Time
 }
+
+// Stash-retention bounds. Both overridable via env for operators who want
+// a different memory/recompute trade-off.
+const (
+	defaultMaxStashes = 8
+	defaultStashTTL   = 3 * time.Minute
+)
 
 // NewProvider creates a go/types provider.
 func NewProvider(mode LoadMode, includeTest bool, logger *zap.Logger) *Provider {
@@ -61,12 +87,30 @@ func NewProvider(mode LoadMode, includeTest bool, logger *zap.Logger) *Provider 
 		mode:        mode,
 		includeTest: includeTest,
 		logger:      logger,
+		maxStashes:  envPositiveInt("GORTEX_GOTYPES_MAX_STASHES", defaultMaxStashes),
+		stashTTL:    envPositiveDuration("GORTEX_GOTYPES_STASH_TTL", defaultStashTTL),
+		stopSweep:   make(chan struct{}),
 	}
 }
 
 func (p *Provider) Name() string        { return "go-types" }
 func (p *Provider) Languages() []string { return []string{"go"} }
-func (p *Provider) Close() error        { return nil }
+
+// Close stops the idle sweeper (idempotent) and drops every retained
+// type-checked program so a torn-down provider holds no memory.
+func (p *Provider) Close() error {
+	if p.stopSweep != nil {
+		select {
+		case <-p.stopSweep:
+		default:
+			close(p.stopSweep)
+		}
+	}
+	p.stateMu.Lock()
+	p.stashes = nil
+	p.stateMu.Unlock()
+	return nil
+}
 
 func (p *Provider) Available() bool {
 	// go/packages requires the Go toolchain. Check if 'go' is on PATH.
@@ -107,8 +151,12 @@ func (p *Provider) EnrichRepo(g graph.Store, repoPrefix, repoRoot string) (*sema
 	if p.stashes == nil {
 		p.stashes = make(map[string]*goStash)
 	}
-	p.stashes[absRoot] = &goStash{pkgs: pkgs, fset: fset, absRoot: absRoot}
+	p.stashes[absRoot] = &goStash{pkgs: pkgs, fset: fset, absRoot: absRoot, lastUsed: time.Now()}
+	p.evictLocked()
 	p.stateMu.Unlock()
+	// Release idle programs in the background so a quiet daemon doesn't hold
+	// every enriched repo's type tables until the next enrich.
+	p.startSweeper()
 
 	result := &semantic.EnrichResult{
 		Provider: p.Name(),
@@ -353,12 +401,13 @@ func (p *Provider) EnrichFile(g graph.Store, repoRoot, filePath string) (*semant
 // has run, the contract pipeline can ask for compiler-grade type
 // resolution at any line in the indexed source.
 func (p *Provider) LookupTypeAtLine(filePath string, line int) (string, bool) {
-	p.stateMu.RLock()
+	p.stateMu.Lock()
+	p.evictLocked()
 	stashes := make([]*goStash, 0, len(p.stashes))
 	for _, s := range p.stashes {
 		stashes = append(stashes, s)
 	}
-	p.stateMu.RUnlock()
+	p.stateMu.Unlock()
 	if len(stashes) == 0 {
 		return "", false
 	}
@@ -380,6 +429,9 @@ func (p *Provider) LookupTypeAtLine(filePath string, line int) (string, bool) {
 				if normalizeRelPath(relativePath(pos.Filename, st.absRoot)) != target {
 					continue
 				}
+				// This file belongs to st: keep the repo's program warm so the
+				// idle sweeper doesn't release it mid-contract-pass.
+				p.touch(st)
 				if t, ok := lookupTypeAtLineInFile(syntax, pkg.TypesInfo, st.fset, line); ok {
 					return t, true
 				}
@@ -387,6 +439,104 @@ func (p *Provider) LookupTypeAtLine(filePath string, line int) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// touch bumps a stash's lastUsed under the lock so the idle sweeper
+// treats an actively-queried repo as live.
+func (p *Provider) touch(st *goStash) {
+	p.stateMu.Lock()
+	st.lastUsed = time.Now()
+	p.stateMu.Unlock()
+}
+
+// evictLocked releases stashes idle past stashTTL and, if still over the
+// count ceiling, the least-recently-used ones. The caller holds stateMu.
+// Dropping a stash frees one repo's whole type-checked program for GC.
+func (p *Provider) evictLocked() {
+	if len(p.stashes) == 0 {
+		return
+	}
+	ttl := p.stashTTL
+	if ttl <= 0 {
+		ttl = defaultStashTTL
+	}
+	now := time.Now()
+	for root, st := range p.stashes {
+		if now.Sub(st.lastUsed) > ttl {
+			delete(p.stashes, root)
+		}
+	}
+	max := p.maxStashes
+	if max <= 0 {
+		max = defaultMaxStashes
+	}
+	for len(p.stashes) > max {
+		var lruRoot string
+		var lruTime time.Time
+		for root, st := range p.stashes {
+			if lruRoot == "" || st.lastUsed.Before(lruTime) {
+				lruRoot, lruTime = root, st.lastUsed
+			}
+		}
+		if lruRoot == "" {
+			break
+		}
+		delete(p.stashes, lruRoot)
+	}
+}
+
+// startSweeper lazily launches one background goroutine that periodically
+// releases idle stashes, so a daemon that has gone quiet drops its
+// retained type-checked programs instead of holding them until the next
+// enrich. Stopped by Close.
+func (p *Provider) startSweeper() {
+	p.sweepOnce.Do(func() {
+		if p.stopSweep == nil {
+			p.stopSweep = make(chan struct{})
+		}
+		interval := p.stashTTL
+		if interval <= 0 {
+			interval = defaultStashTTL
+		}
+		if interval /= 2; interval < 30*time.Second {
+			interval = 30 * time.Second
+		}
+		stop := p.stopSweep
+		go func() {
+			t := time.NewTicker(interval)
+			defer t.Stop()
+			for {
+				select {
+				case <-stop:
+					return
+				case <-t.C:
+					p.stateMu.Lock()
+					p.evictLocked()
+					p.stateMu.Unlock()
+				}
+			}
+		}()
+	})
+}
+
+// envPositiveInt / envPositiveDuration read an operator override, falling
+// back to def when the variable is unset or unparseable.
+func envPositiveInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return def
+}
+
+func envPositiveDuration(key string, def time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return def
 }
 
 // lookupTypeAtLineInFile walks the file's AST and returns the type
