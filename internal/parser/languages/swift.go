@@ -379,6 +379,7 @@ func (e *SwiftExtractor) emitFunction(m parser.QueryResult, filePath, fileID str
 			From: id, To: typeID, Kind: graph.EdgeMemberOf, FilePath: filePath, Line: def.StartLine + 1,
 		})
 		emitSwiftAnnotationEdges(def.Node, id, filePath, src, result, annotationSeen)
+		emitSwiftFunctionTypeEdges(id, def.Node, src, filePath, def.StartLine+1, result)
 		return
 	}
 
@@ -403,6 +404,7 @@ func (e *SwiftExtractor) emitFunction(m parser.QueryResult, filePath, fileID str
 		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
 	})
 	emitSwiftAnnotationEdges(def.Node, id, filePath, src, result, annotationSeen)
+	emitSwiftFunctionTypeEdges(id, def.Node, src, filePath, def.StartLine+1, result)
 }
 
 // emitProperty extracts a stored property declaration. Inside a type it is a
@@ -469,9 +471,14 @@ func (e *SwiftExtractor) emitProperty(m parser.QueryResult, filePath, fileID str
 		})
 	}
 	if fieldType != "" {
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: id, To: "unresolved::" + fieldType, Kind: graph.EdgeTypedAs, FilePath: filePath, Line: def.StartLine + 1,
-		})
+		// Emit the variable / property / local annotation as a type-use
+		// edge. Routing through emitSwiftTypeUseEdges skips Swift
+		// primitives (no `unresolved::Int` noise), stamps
+		// OriginASTInferred, and decomposes composite annotations
+		// (`[Foo]`, `Foo?`, `[K: V]`, `Bar<Baz>`) into per-leaf edges so
+		// a type used only in annotation position is reachable by
+		// find_usages without a language server.
+		emitSwiftTypeUseEdges(id, fieldType, filePath, def.StartLine+1, result)
 	}
 	emitSwiftAnnotationEdges(def.Node, id, filePath, src, result, annotationSeen)
 }
