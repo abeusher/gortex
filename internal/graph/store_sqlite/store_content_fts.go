@@ -1,6 +1,7 @@
 package store_sqlite
 
 import (
+	"database/sql"
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -174,4 +175,32 @@ func (s *Store) SearchContent(query, repoPrefix string, limit int) ([]graph.Cont
 		return nil, err
 	}
 	return hits, nil
+}
+
+// ScanContent streams every content row (scoped to repoPrefix; empty = all
+// repos) to fn with its FULL body, read incrementally via a cursor so a
+// consumer iterating hundreds of thousands of sections stays bounded. fn
+// returns false to stop the scan early.
+func (s *Store) ScanContent(repoPrefix string, fn func(nodeID, filePath, body string) bool) error {
+	var rows *sql.Rows
+	var err error
+	if repoPrefix == "" {
+		rows, err = s.db.Query(`SELECT node_id, file_path, body FROM content_fts`)
+	} else {
+		rows, err = s.db.Query(`SELECT node_id, file_path, body FROM content_fts WHERE repo_prefix = ?`, repoPrefix)
+	}
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var nodeID, filePath, body string
+		if err := rows.Scan(&nodeID, &filePath, &body); err != nil {
+			return err
+		}
+		if !fn(nodeID, filePath, body) {
+			return nil
+		}
+	}
+	return rows.Err()
 }

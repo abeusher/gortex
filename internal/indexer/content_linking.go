@@ -44,37 +44,57 @@ func (idx *Indexer) linkContentToCode() {
 	var edges []*graph.Edge
 	added := 0
 	truncated := false
-	for _, chunk := range g.AllNodes() {
-		if chunk == nil || chunk.Kind != graph.KindDoc || chunk.Meta == nil {
-			continue
-		}
-		if dc, _ := chunk.Meta["data_class"].(string); dc != "content" {
-			continue
-		}
-		text, _ := chunk.Meta["section_text"].(string)
+
+	// emit scans one chunk's FULL body for symbol references and mints the
+	// EdgeMotivates edges, honouring the single edge budget. Returns false
+	// when the budget is exhausted so the caller stops the scan.
+	emit := func(chunkID, filePath, text string) bool {
 		if text == "" {
-			continue
+			return true
 		}
 		signal := mineDocSignal(text)
 		for _, sym := range artifacts.ScanSymbolRefs([]byte(text), nameIndex) {
-			if sym == chunk.ID {
+			if sym == chunkID {
 				continue
 			}
 			if added >= budget {
 				truncated = true
-				break
+				return false
 			}
 			edges = append(edges, &graph.Edge{
-				From: chunk.ID, To: sym, Kind: graph.EdgeMotivates,
-				FilePath: chunk.FilePath, Origin: graph.OriginTextMatched,
+				From: chunkID, To: sym, Kind: graph.EdgeMotivates,
+				FilePath: filePath, Origin: graph.OriginTextMatched,
 				Meta: map[string]any{"signal": signal},
 			})
 			added++
 		}
-		if truncated {
-			break
+		return true
+	}
+
+	if cs := idx.contentSearcher(); cs != nil {
+		// Disk path: read FULL section bodies from the content index — the
+		// graph node keeps only a snippet — streamed so a content-heavy
+		// repo's hundreds of thousands of sections never materialise here.
+		// contentSearcher() resolves the disk sink even while idx.graph is
+		// the in-memory shadow (where the content rows were streamed to disk).
+		_ = cs.ScanContent(idx.repoPrefix, func(nodeID, filePath, body string) bool {
+			return emit(nodeID, filePath, body)
+		})
+	} else {
+		// In-memory fallback: with no content index the full text is still on
+		// the nodes (streamContentSections leans only when a content searcher
+		// exists), so scan the graph nodes directly.
+		for _, chunk := range g.AllNodes() {
+			if !graph.IsContentNode(chunk) {
+				continue
+			}
+			text, _ := chunk.Meta["section_text"].(string)
+			if !emit(chunk.ID, chunk.FilePath, text) {
+				break
+			}
 		}
 	}
+
 	if len(edges) > 0 {
 		g.AddBatch(nil, edges)
 	}

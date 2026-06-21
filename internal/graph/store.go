@@ -459,12 +459,19 @@ type ContentFTSItem struct {
 //
 //   - BuildContentIndex finalises the index after the bulk parse phase
 //     (segment merge / optimize). Idempotent — safe to call repeatedly.
+//
+//   - ScanContent streams every stored content row (scoped to repoPrefix;
+//     empty = all repos) to fn with its FULL body — so a consumer that
+//     needs the whole section text (e.g. the content->code linker) reads it
+//     from here rather than the graph node, which keeps only a snippet.
+//     fn returns false to stop the scan early.
 type ContentSearcher interface {
 	WipeContent(repoPrefix string) error
 	WipeContentFile(filePath string) error
 	AppendContent(repoPrefix string, items []ContentFTSItem) error
 	SearchContent(query, repoPrefix string, limit int) ([]ContentHit, error)
 	BuildContentIndex() error
+	ScanContent(repoPrefix string, fn func(nodeID, filePath, body string) bool) error
 }
 
 // SymbolBundle is the rerank-shaped result of one search call: the
