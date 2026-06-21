@@ -50,12 +50,20 @@ func parseCorpus(req mcpgo.CallToolRequest) (searchCorpus, error) {
 	}
 }
 
-// includesDocs reports whether the corpus admits prose-section nodes. Content
-// (corpusContent) rides the same doc-retrieval channel — content chunks are
-// KindDoc — so it admits docs at fetch time and narrows to content in the
-// post-filter.
+// includesDocs reports whether the corpus admits Markdown prose-section
+// nodes, which the symbol search still serves. Content (pdf / office / text)
+// now rides its own content-index channel — see includesContent — so
+// corpusContent does NOT pull the prose channel.
 func (c searchCorpus) includesDocs() bool {
-	return c == corpusDocs || c == corpusAll || c == corpusContent
+	return c == corpusDocs || c == corpusAll
+}
+
+// includesContent reports whether the corpus admits content-index sections
+// (data_class=content), served by the dedicated ContentSearcher rather than
+// the symbol search. corpusDocs keeps the historical superset semantic (all
+// KindDoc), so it pulls the content channel too.
+func (c searchCorpus) includesContent() bool {
+	return c == corpusContent || c == corpusDocs || c == corpusAll
 }
 
 // includesCode reports whether the corpus admits code-symbol nodes.
@@ -128,6 +136,56 @@ func (s *Server) mergeDocChannel(ctx context.Context, query string, nodes []*gra
 	return merged
 }
 
+// mergeContentChannel is the retrieval channel for content sections. Since
+// content (data_class=content) bodies live in the dedicated content index
+// (content_fts) and not the symbol search, the primary + doc fetches above
+// can never surface them — this queries the ContentSearcher directly,
+// scoped to the session's repo, materialises the matched content nodes by
+// ID, and merges them into the candidate pool (dedup by node ID). A nil
+// content searcher (in-memory store) or empty result returns the input
+// unchanged.
+func (s *Server) mergeContentChannel(ctx context.Context, query string, nodes []*graph.Node, fetchLimit int) []*graph.Node {
+	if strings.TrimSpace(query) == "" {
+		return nodes
+	}
+	cs, ok := s.graph.(graph.ContentSearcher)
+	if !ok {
+		return nodes
+	}
+	limit := fetchLimit * docChannelFetchMultiple
+	if limit > docChannelMaxLimit {
+		limit = docChannelMaxLimit
+	}
+	if limit <= fetchLimit {
+		limit = fetchLimit
+	}
+	repoPrefix, _ := s.sessionLocality(ctx)
+	hits, err := cs.SearchContent(query, repoPrefix, limit)
+	if err != nil || len(hits) == 0 {
+		return nodes
+	}
+
+	seen := make(map[string]struct{}, len(nodes))
+	for _, n := range nodes {
+		if n != nil {
+			seen[n.ID] = struct{}{}
+		}
+	}
+	merged := nodes
+	for _, h := range hits {
+		if _, dup := seen[h.NodeID]; dup {
+			continue
+		}
+		n := s.graph.GetNode(h.NodeID)
+		if n == nil {
+			continue
+		}
+		seen[h.NodeID] = struct{}{}
+		merged = append(merged, n)
+	}
+	return merged
+}
+
 // filterNodesByCorpus drops nodes that fall outside the selected
 // corpus. KindDoc nodes are the "docs" corpus; every other kind is
 // "code". corpusAll is a no-op.
@@ -158,9 +216,9 @@ func filterNodesByCorpus(nodes []*graph.Node, c searchCorpus) []*graph.Node {
 	return out
 }
 
-// isContentNode reports whether n is a content-corpus chunk — a KindDoc node
-// tagged data_class=content by a content extractor (pdf / pptx / xlsx / txt).
+// isContentNode is the mcp-local alias for graph.IsContentNode — a KindDoc
+// node tagged data_class=content by a content extractor (pdf / pptx / xlsx /
+// txt).
 func isContentNode(n *graph.Node) bool {
-	dc, _ := n.Meta["data_class"].(string)
-	return dc == "content"
+	return graph.IsContentNode(n)
 }

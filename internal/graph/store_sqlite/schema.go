@@ -244,4 +244,16 @@ CREATE INDEX IF NOT EXISTS blame_by_repo ON blame_enrichment(repo_prefix) WHERE 
 -- idempotent on every Open, so an existing .sqlite gains the vtable
 -- on its next open + reindex.
 CREATE VIRTUAL TABLE IF NOT EXISTS symbol_fts USING fts5(node_id UNINDEXED, repo_prefix UNINDEXED, tokens);
+
+-- content_fts is the FTS5 full-text index over CONTENT (data_class=
+-- "content") section bodies — text / pdf / pptx / xlsx chunks. It is
+-- kept SEPARATE from symbol_fts so content text never enters the symbol
+-- search or the code-oriented analysis passes: a content-heavy repo of a
+-- few hundred large documents explodes into hundreds of thousands of
+-- section nodes, and streaming their bodies here (per file, on disk)
+-- instead of into symbol_fts + graph nodes keeps the code index and the
+-- graph passes bounded. Only "body" is indexed for matching; node_id /
+-- repo_prefix / file_path / ordinal ride UNINDEXED so the per-repo and
+-- per-file staleness wipes hit literal columns without a b-tree.
+CREATE VIRTUAL TABLE IF NOT EXISTS content_fts USING fts5(node_id UNINDEXED, repo_prefix UNINDEXED, file_path UNINDEXED, ordinal UNINDEXED, body);
 `

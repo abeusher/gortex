@@ -210,6 +210,13 @@ type Indexer struct {
 	// Set during the shadow swap, cleared when idx.graph is restored.
 	bulkVectorSink graph.VectorSearcher
 
+	// contentSink mirrors bulkVectorSink for the content full-text index:
+	// the disk store captured at the shadow swap, so the per-file content
+	// stream reaches content_fts on disk even while idx.graph points at the
+	// in-memory shadow (which does not implement graph.ContentSearcher).
+	// Set during the shadow swap, cleared when idx.graph is restored.
+	contentSink graph.ContentSearcher
+
 	// embedChunkOpts tunes the AST sub-chunking buildSearchIndex applies
 	// to large symbols before embedding. The zero value makes the
 	// chunker fall back to its package defaults.
@@ -534,6 +541,13 @@ func (idx *Indexer) shouldIndexForSearch(n *graph.Node) bool {
 	// know `string` / `append`. They remain queryable by kind and
 	// by ID for the analytics passes that care.
 	if n.Kind == graph.KindBuiltin {
+		return false
+	}
+	// CONTENT (data_class="content") section nodes live in the dedicated
+	// content index (content_fts), never the symbol search — keeping the
+	// symbol corpus code-only and bounded. Markdown prose (KindDoc without
+	// data_class=content) is unaffected and still honours IndexProse below.
+	if isContentNode(n) {
 		return false
 	}
 	// Prose-section nodes are searchable only when prose indexing is
@@ -1976,6 +1990,20 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 	// so disk-non-empty is safe.
 	firstIndex := idx.indexCount.Load() == 0
 	belowShadowMax := len(files) <= shadowMaxFileCount()
+	// The file-count ceiling is blind to the few-huge-files shape: a
+	// content repo of a few hundred PDFs / text dumps / spreadsheets is
+	// far under shadowMaxFileCount yet holds multiple GB that explode
+	// into hundreds of thousands of section nodes. Gate the in-memory
+	// shadow on total input bytes too, so such a repo falls through to
+	// the bounded per-call disk path instead of pinning the whole
+	// post-parse graph in RAM and OOMing (see #120).
+	var totalFileBytes int64
+	for i := range files {
+		totalFileBytes += files[i].size
+	}
+	maxShadowBytes := shadowMaxBytes()
+	belowShadowBytes := totalFileBytes <= maxShadowBytes
+	shadowTaken := blOK && firstIndex && belowShadowMax && belowShadowBytes
 	preNodes := idx.graph.NodeCount()
 	preEdges := idx.graph.EdgeCount()
 	idx.logger.Info("indexer: shadow-swap decision",
@@ -1987,9 +2015,12 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 		zap.Int("files", len(files)),
 		zap.Int("shadow_max_files", shadowMaxFileCount()),
 		zap.Bool("below_shadow_max", belowShadowMax),
-		zap.Bool("shadow_taken", blOK && firstIndex && belowShadowMax),
+		zap.Int64("total_file_bytes", totalFileBytes),
+		zap.Int64("shadow_max_bytes", maxShadowBytes),
+		zap.Bool("below_shadow_bytes", belowShadowBytes),
+		zap.Bool("shadow_taken", shadowTaken),
 	)
-	if blOK && firstIndex && belowShadowMax {
+	if shadowTaken {
 		// Warm-restart safety. `firstIndex` is a PER-INDEXER sentinel, and
 		// a fresh per-repo Indexer is constructed on every daemon restart,
 		// so firstIndex is true on every restart — even when the
@@ -2023,6 +2054,9 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 		// FK to `nodes`, so upserting before FlushBulk persists the nodes is
 		// safe. Cleared when idx.graph is restored below.
 		idx.bulkVectorSink, _ = diskTarget.(graph.VectorSearcher)
+		// Same capture for the content index: the per-file content stream
+		// must reach content_fts on disk while idx.graph is the shadow.
+		idx.contentSink, _ = diskTarget.(graph.ContentSearcher)
 		// The resolver was constructed at indexer.New with the disk
 		// Store. Redirect it at the shadow too, otherwise ResolveAll
 		// reads from the empty disk Store, finds no pending edges,
@@ -2036,6 +2070,7 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 			if retErr != nil {
 				idx.graph = diskTarget
 				idx.bulkVectorSink = nil
+				idx.contentSink = nil
 				if idx.resolver != nil {
 					idx.resolver.SetGraph(diskTarget)
 				}
@@ -2139,6 +2174,7 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 			reporter.Report("persisting bulk graph", 1, 1)
 			idx.graph = diskTarget
 			idx.bulkVectorSink = nil
+			idx.contentSink = nil
 			// Mirror of the SetGraph(inMemShadow) above: the resolver
 			// must follow the graph pointer back to the disk store, or
 			// every post-index per-file resolve (the watcher save path,
@@ -2149,10 +2185,24 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 			}
 		}()
 	} else if diskTarget == nil && idx.graph.NodeCount() == 0 && idx.graph.EdgeCount() == 0 {
-		if _, isBulk := idx.graph.(graph.BulkLoader); isBulk && len(files) > shadowMaxFileCount() {
-			idx.logger.Info("indexer: skipping in-memory shadow above threshold",
+		if _, isBulk := idx.graph.(graph.BulkLoader); isBulk && firstIndex && (!belowShadowMax || !belowShadowBytes) {
+			idx.logger.Info("indexer: skipping in-memory shadow; building against disk store (bounded RAM)",
 				zap.Int("files", len(files)),
-				zap.Int("threshold", shadowMaxFileCount()))
+				zap.Int("file_threshold", shadowMaxFileCount()),
+				zap.Bool("over_file_count", !belowShadowMax),
+				zap.Int64("total_file_bytes", totalFileBytes),
+				zap.Int64("byte_threshold", maxShadowBytes),
+				zap.Bool("over_byte_budget", !belowShadowBytes))
+		}
+	}
+
+	// Clear this repo's prior content rows before the per-file streaming
+	// appends below, so a full reindex (cold or warm) rebuilds the content
+	// index from a clean slate instead of accumulating stale sections.
+	// No-op on a cold store; cheap per-repo DELETE on a warm one.
+	if cs := idx.contentSearcher(); cs != nil {
+		if err := cs.WipeContent(idx.RepoPrefix()); err != nil {
+			idx.logger.Warn("indexer: content index wipe failed", zap.Error(err))
 		}
 	}
 
@@ -2285,6 +2335,7 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 								continue
 							}
 							idx.applyRepoPrefix(result.Nodes, result.Edges)
+							idx.streamContentSections(result.Nodes)
 							idx.graph.AddBatch(result.Nodes, result.Edges)
 							idx.persistConstValues(result)
 							continue
@@ -2396,6 +2447,13 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 						}
 					}
 
+					// Stream this file's content (data_class=content) section
+					// bodies into the dedicated content index and lean the
+					// nodes to a snippet BEFORE AddBatch, so the bulk text
+					// never enters the graph, the symbol search, or the
+					// materialising code passes.
+					idx.streamContentSections(result.Nodes)
+
 					// Batch the per-file insert into one shard-grouped pass
 					// so each shard's lock is acquired at most once per
 					// file instead of N + 2·E times. Profiling showed 69
@@ -2483,6 +2541,14 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 		idx.graph = streamingDisk
 	} else {
 		parseChunk(files)
+	}
+
+	// Finalise the content index after the per-file streaming appends so
+	// its FTS5 segments are merged before the first content query.
+	if cs := idx.contentSearcher(); cs != nil {
+		if err := cs.BuildContentIndex(); err != nil {
+			idx.logger.Warn("indexer: content index build failed", zap.Error(err))
+		}
 	}
 
 	if processed > 0 {
@@ -2952,6 +3018,19 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 
 	idx.applyRepoPrefix(result.Nodes, result.Edges)
 
+	// Content (incremental): clear this file's prior content rows, then
+	// re-stream + lean — mirrors the full-index per-file path so an edited
+	// content file leaves no stale rows and doesn't revert to full text on
+	// the node.
+	if cs := idx.contentSearcher(); cs != nil {
+		if fp := firstContentFilePath(result.Nodes); fp != "" {
+			if err := cs.WipeContentFile(fp); err != nil {
+				idx.logger.Warn("indexer: content index file wipe failed", zap.Error(err))
+			}
+		}
+	}
+	idx.streamContentSections(result.Nodes)
+
 	idx.graph.AddBatch(result.Nodes, result.Edges)
 	idx.persistConstValues(result)
 
@@ -3349,6 +3428,15 @@ func (idx *Indexer) collectEmbedTexts(nodes []*graph.Node) (texts []string, ids 
 		if n.Kind == graph.KindFile || n.Kind == graph.KindImport {
 			continue
 		}
+		// CONTENT section bodies are served by the content index, not the
+		// vector store — excluding them keeps the embed-text count (and the
+		// 100k auto-disable check) code-only, so a content-heavy repo no
+		// longer drowns the embedding pass in hundreds of thousands of
+		// section texts.
+		if isContentNode(n) {
+			skipped++
+			continue
+		}
 		if config.ShouldSkipEmbed(idx.config.SkipEmbed, n.Language, string(n.Kind)) {
 			skipped++
 			continue
@@ -3610,12 +3698,13 @@ func flattenEmbedResults(results [][][]float32) [][]float32 {
 // AllNodes() path because nodes there carry an empty RepoPrefix and
 // GetRepoNodes("") would miss them.
 func (idx *Indexer) buildSearchIndex() {
-	var nodes []*graph.Node
-	if idx.repoPrefix != "" {
-		nodes = idx.graph.GetRepoNodes(idx.repoPrefix)
-	} else {
-		nodes = idx.graph.AllNodes()
-	}
+	// Code-only enumeration: content (data_class=content) sections live in
+	// the content index, never the symbol search or the vector store, so the
+	// FTS loop below and collectEmbedTexts both skip them anyway. Fetching
+	// the non-content set up front means a content-heavy repo's hundreds of
+	// thousands of sections never enter memory here (the disk backend filters
+	// them in SQL), instead of being materialised only to be skipped.
+	nodes := graph.RepoCodeNodes(idx.graph, idx.repoPrefix)
 
 	// Install the learned sub-word boundary table on the BM25 layer
 	// before populating postings, so the optional sparse-ngram

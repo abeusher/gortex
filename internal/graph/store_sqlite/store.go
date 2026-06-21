@@ -1134,6 +1134,43 @@ func (s *Store) queryNodes(stmt *sql.Stmt, args ...any) []*graph.Node {
 	return out
 }
 
+// GetRepoNonContentNodes is the graph.NonContentNodeReader fast path: a
+// SQL-level enumeration that drops CONTENT (data_class="content") section
+// nodes, so the code-oriented passes never materialise a content-heavy
+// repo's hundreds of thousands of sections. Meta is JSON (encodeMeta) in a
+// BLOB column, so json_extract reads it via CAST(... AS TEXT); the NULL-safe
+// `IS NOT 'content'` keeps every node whose meta is absent or carries any
+// other (or no) data_class. An empty repoPrefix spans all repos.
+func (s *Store) GetRepoNonContentNodes(repoPrefix string) []*graph.Node {
+	const filter = `json_extract(CAST(meta AS TEXT), '$.data_class') IS NOT 'content'`
+	if repoPrefix == "" {
+		return s.scanNodeQuery(`SELECT ` + lookupNodeCols + ` FROM nodes WHERE ` + filter)
+	}
+	return s.scanNodeQuery(`SELECT `+lookupNodeCols+` FROM nodes WHERE repo_prefix = ? AND `+filter, repoPrefix)
+}
+
+// scanNodeQuery runs an ad-hoc node SELECT (columns = lookupNodeCols) and
+// scans its rows into nodes — for the few non-hot enumerations that need a
+// WHERE clause the prepared statements don't cover.
+func (s *Store) scanNodeQuery(query string, args ...any) []*graph.Node {
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		panicOnFatal(err)
+		return nil
+	}
+	defer rows.Close()
+	var out []*graph.Node
+	for rows.Next() {
+		n, err := scanNode(rows)
+		if err != nil {
+			panicOnFatal(err)
+			return out
+		}
+		out = append(out, n)
+	}
+	return out
+}
+
 func (s *Store) GetOutEdges(nodeID string) []*graph.Edge {
 	return s.queryEdges(s.stmtOutEdges, nodeID)
 }

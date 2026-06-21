@@ -69,6 +69,12 @@ func DetectCommunitiesLouvain(g graph.Store) *CommunityResult {
 		if graph.IsProxyNode(n) {
 			continue
 		}
+		// Content sections are leaf knowledge, not code structure — they
+		// must not form or join code communities (which seed the skills
+		// router and architecture layers).
+		if graph.IsContentNode(n) {
+			continue
+		}
 		if n.Kind != graph.KindFile && n.Kind != graph.KindImport {
 			symbolNodes[n.ID] = true
 		}

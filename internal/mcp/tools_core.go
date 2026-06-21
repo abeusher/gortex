@@ -1419,6 +1419,13 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	if corpus.includesDocs() {
 		nodes = s.mergeDocChannel(ctx, q, nodes, fetchLimit, scope, timings)
 	}
+	// Content retrieval channel: content (data_class=content) sections live
+	// in the dedicated content index, not the symbol search, so the fetches
+	// above can't surface them — pull them from the ContentSearcher and
+	// merge before the corpus filter runs.
+	if corpus.includesContent() {
+		nodes = s.mergeContentChannel(ctx, q, nodes, fetchLimit)
+	}
 
 	candsAfterGather := len(nodes)
 	mergedCount := len(nodes) // pre-filter; comparable to primaryCount

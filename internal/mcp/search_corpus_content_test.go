@@ -48,8 +48,10 @@ func TestFilterNodesByCorpus_Content(t *testing.T) {
 }
 
 func TestIsContentNode(t *testing.T) {
-	require.True(t, isContentNode(&graph.Node{Meta: map[string]any{"data_class": "content"}}))
-	require.False(t, isContentNode(&graph.Node{Meta: map[string]any{"data_class": "data"}}))
-	require.False(t, isContentNode(&graph.Node{Meta: map[string]any{}}))
+	require.True(t, isContentNode(&graph.Node{Kind: graph.KindDoc, Meta: map[string]any{"data_class": "content"}}))
+	require.False(t, isContentNode(&graph.Node{Kind: graph.KindDoc, Meta: map[string]any{"data_class": "data"}}))
+	require.False(t, isContentNode(&graph.Node{Kind: graph.KindDoc, Meta: map[string]any{}}))
 	require.False(t, isContentNode(&graph.Node{}))
+	// A non-KindDoc node is never content, even if mistagged.
+	require.False(t, isContentNode(&graph.Node{Kind: graph.KindFunction, Meta: map[string]any{"data_class": "content"}}))
 }
