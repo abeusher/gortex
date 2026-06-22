@@ -357,6 +357,13 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 		emitCSharpTypeUseEdges(ownerID, tu.typeText, filePath, tu.line, result)
 	}
 
+	// Expression-site type references the symbol/annotation walk misses:
+	// instantiation (`new Foo()`), casts / type-tests (`(Foo)x`, `x is Foo`,
+	// `x as Foo`), static / const access (`Foo.Empty`, `typeof(Foo)`,
+	// `nameof(Foo)`), and attribute type names (`[Foo]`). Inheritance is
+	// already covered by emitCSharpBaseList, so it is not re-emitted here.
+	emitCSharpReferenceForms(root, src, filePath, fileID, result)
+
 	for _, c := range calls {
 		callerID := findEnclosingFunc(funcRanges, c.line)
 		if callerID == "" {
