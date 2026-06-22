@@ -104,6 +104,16 @@ func (e *SwiftExtractor) Extract(filePath string, src []byte) (*parser.Extractio
 	// type_identifier), so seed their ranges first; members inside an
 	// `extension Foo { ... }` then attribute to Foo like any other type member.
 	typeRanges = append(typeRanges, swiftExtensionRanges(src)...)
+	// Resilience net for parse errors: a tree-sitter error inside a type body
+	// (e.g. an unparseable `#if … && !canImport(...)`) can corrupt the enclosing
+	// class_declaration so the query never matches it — its members and every
+	// reference to the type would then strand on unresolved::Name. Seed the
+	// container ranges from a brace-matched text scan so members still attribute;
+	// gaps the query misses get a fallback container node after the match loop.
+	fallbackTypes := swiftFallbackTypeDecls(src)
+	for _, ft := range fallbackTypes {
+		typeRanges = append(typeRanges, swiftTypeRange{name: ft.name, startLine: ft.startLine, endLine: ft.endLine})
+	}
 	var calls []swiftDeferredCall
 
 	parser.EachMatch(e.qAll, root, src, func(m parser.QueryResult) {
@@ -148,6 +158,26 @@ func (e *SwiftExtractor) Extract(filePath string, src []byte) (*parser.Extractio
 			})
 		}
 	})
+
+	// Emit fallback container nodes for class/struct/actor/enum declarations the
+	// query missed (parse-error regions). `seen` already holds every container
+	// the query emitted, so this only fills gaps and never duplicates.
+	for _, ft := range fallbackTypes {
+		id := filePath + "::" + ft.name
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		result.Nodes = append(result.Nodes, &graph.Node{
+			ID: id, Kind: graph.KindType, Name: ft.name,
+			FilePath: filePath, StartLine: ft.startLine + 1, EndLine: ft.endLine + 1,
+			Language: "swift",
+			Meta:     map[string]any{"visibility": ft.visibility},
+		})
+		result.Edges = append(result.Edges, &graph.Edge{
+			From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: ft.startLine + 1,
+		})
+	}
 
 	// Stamp protocol method names onto protocol nodes' Meta["methods"].
 	for _, n := range result.Nodes {
@@ -621,6 +651,56 @@ func swiftExtensionRanges(src []byte) []swiftTypeRange {
 		})
 	}
 	return ranges
+}
+
+// swiftTypeDeclRe matches a class / struct / actor / enum declaration header at
+// the start of a line, capturing the type name. Leading attributes (`@objc`)
+// and access/other modifiers are skipped. Used as a parse-error resilience net
+// (see swiftFallbackTypeDecls).
+var swiftTypeDeclRe = regexp.MustCompile(`(?m)^[ \t]*(?:@[A-Za-z_]\w*(?:\([^)]*\))?[ \t]+)*(?:(?:public|private|internal|fileprivate|open|final|indirect)[ \t]+)*(?:class|struct|actor|enum)[ \t]+([A-Za-z_]\w*)`)
+
+type swiftFallbackType struct {
+	name       string
+	startLine  int // 0-based
+	endLine    int // 0-based
+	visibility string
+}
+
+// swiftFallbackTypeDecls finds class / struct / actor / enum declarations by a
+// brace-matched text scan — the resilience net for when a tree-sitter parse
+// error (e.g. an unparseable `#if … && !canImport(...)` inside a body) corrupts
+// the enclosing class_declaration so the query never matches it. Without this
+// the container node is absent and its members + every find_usages reference to
+// the type strand on unresolved::Name. Mirrors swiftExtensionRanges.
+func swiftFallbackTypeDecls(src []byte) []swiftFallbackType {
+	s := string(src)
+	var out []swiftFallbackType
+	for _, loc := range swiftTypeDeclRe.FindAllStringSubmatchIndex(s, -1) {
+		name := s[loc[2]:loc[3]]
+		rel := strings.IndexByte(s[loc[1]:], '{')
+		if rel < 0 {
+			continue
+		}
+		open := loc[1] + rel
+		end := swiftMatchBrace(s, open)
+		if end < 0 {
+			continue
+		}
+		vis := VisibilityInternal
+		switch prefix := s[loc[0]:loc[1]]; {
+		case strings.Contains(prefix, "public"), strings.Contains(prefix, "open"):
+			vis = VisibilityPublic
+		case strings.Contains(prefix, "private"), strings.Contains(prefix, "fileprivate"):
+			vis = VisibilityPrivate
+		}
+		out = append(out, swiftFallbackType{
+			name:       name,
+			startLine:  strings.Count(s[:open], "\n"),
+			endLine:    strings.Count(s[:end], "\n"),
+			visibility: vis,
+		})
+	}
+	return out
 }
 
 // swiftMatchBrace returns the index of the '}' that closes the '{' at open, or
