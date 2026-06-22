@@ -82,6 +82,53 @@ export function callIt(): number {
 	assert.Equal(t, 2, defLine)
 }
 
+func TestResolverHelper_RealPyright_DefinitionAcrossFiles(t *testing.T) {
+	if _, err := exec.LookPath("pyright-langserver"); err != nil {
+		t.Skip("pyright-langserver not on PATH")
+	}
+
+	workspace := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(workspace, "src", "pkg"), 0755))
+	mustWrite(t, filepath.Join(workspace, "pyrightconfig.json"), `{"include":["src"],"extraPaths":["src"]}`)
+	mustWrite(t, filepath.Join(workspace, "src", "pkg", "__init__.py"), ``)
+	mustWrite(t, filepath.Join(workspace, "src", "pkg", "dispatch.py"), `def dispatch_attempt() -> str:
+    return "ok"
+`)
+	mustWrite(t, filepath.Join(workspace, "src", "pkg", "scheduler.py"), `from pkg.dispatch import dispatch_attempt
+
+
+def scheduler_tick() -> str:
+    return dispatch_attempt()
+`)
+
+	spec := SpecByName("pyright")
+	require.NotNil(t, spec, "pyright spec must be in registry")
+
+	provider := NewProviderFromSpec(spec, zap.NewNop())
+	helper := NewResolverHelper(provider, workspace, 10*time.Second, zap.NewNop())
+	defer helper.Close()
+
+	var (
+		defPath string
+		defLine int
+		ok      bool
+	)
+	deadline := time.Now().Add(8 * time.Second)
+	for {
+		defPath, defLine, ok = helper.Definition("src/pkg/scheduler.py", 5, "dispatch_attempt")
+		if ok && defPath == "src/pkg/dispatch.py" {
+			break
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	require.True(t, ok, "pyright should eventually resolve dispatch_attempt across files")
+	assert.Equal(t, "src/pkg/dispatch.py", defPath)
+	assert.Equal(t, 1, defLine)
+}
+
 // TestResolverHelper_RealTsserver_NoMatchReturnsFalse — when the
 // identifier on the requested line doesn't resolve to anything
 // (typo, missing import), the helper returns ok=false rather than

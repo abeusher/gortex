@@ -1936,13 +1936,8 @@ func pathToURI(path string) string {
 }
 
 // buildWorkspaceFolders returns the LSP workspaceFolders list — the
-// primary root followed by any additional roots. It returns nil when
-// there are no additional roots so rootUri-only servers are unaffected
-// (the field is omitempty).
+// primary root followed by any additional roots.
 func buildWorkspaceFolders(primary string, additional []string) []WorkspaceFolder {
-	if len(additional) == 0 {
-		return nil
-	}
 	folders := make([]WorkspaceFolder, 0, len(additional)+1)
 	folders = append(folders, WorkspaceFolder{
 		URI:  pathToURI(primary),

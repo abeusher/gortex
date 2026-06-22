@@ -78,9 +78,10 @@ func TestLSP_NewClient_FailsForBadCommand(t *testing.T) {
 }
 
 func TestBuildWorkspaceFolders(t *testing.T) {
-	// No additional roots → nil, so rootUri-only servers are unaffected.
-	require.Nil(t, buildWorkspaceFolders("/repo", nil))
-	require.Nil(t, buildWorkspaceFolders("/repo", []string{}))
+	// Always include the primary root. Pyright relies on this to build
+	// workspace context for textDocument/definition even when rootUri is set.
+	require.Equal(t, []WorkspaceFolder{{URI: "file:///repo", Name: "repo"}}, buildWorkspaceFolders("/repo", nil))
+	require.Equal(t, []WorkspaceFolder{{URI: "file:///repo", Name: "repo"}}, buildWorkspaceFolders("/repo", []string{}))
 
 	folders := buildWorkspaceFolders("/repo/app", []string{"/repo/shared", "/repo/types"})
 	require.Len(t, folders, 3) // primary + 2 additional
