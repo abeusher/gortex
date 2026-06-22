@@ -183,6 +183,13 @@ func (e *SwiftExtractor) Extract(filePath string, src []byte) (*parser.Extractio
 	// Closure-collection dispatch: stamp dispatcher/registrar field markers.
 	mineSwiftClosureCollections(src, funcRanges, result)
 
+	// Structural reference forms a type-annotation extractor misses:
+	// instantiation (`Foo()` / `Foo.init`), inheritance / conformance
+	// (`class X: Base, Proto`), casts / type tests (`x as Foo`, `x is Foo`),
+	// and static / member access (`Foo.shared`). find_usages then lands these
+	// LSP-free. Type-annotation edges are already emitted as EdgeTypedAs above.
+	emitSwiftReferenceForms(root, src, filePath, fileID, funcRanges, typeRanges, result)
+
 	// Expo Modules native DSL (Name/Function/AsyncFunction) → synthetic
 	// JS-callable method nodes for the Expo bridge synthesizer.
 	emitExpoModuleNodes(src, filePath, "swift", fileID, result, seen)

@@ -920,6 +920,19 @@ const (
 	// than from code. find_usages can then separate "rendered here" usages from
 	// code-level references and show each positioned render location.
 	RefContextTemplate = "template"
+	// RefContextInherit marks a reference that names a supertype / conformed
+	// protocol in a type declaration's inheritance clause (`class X: Base,
+	// Proto`). It lets find_usages isolate "used as a base / conformance"
+	// references from incidental type uses.
+	RefContextInherit = "inherit"
+	// RefContextCast marks a reference where the target type is used in a cast
+	// or type test (`x as Foo`, `x as? Foo`, `x is Foo`) rather than a
+	// declaration.
+	RefContextCast = "cast"
+	// RefContextStaticAccess marks a reference that reaches a type's static
+	// member / nested type through the type name (`Foo.shared`,
+	// `Foo.Constant`) rather than constructing or declaring it.
+	RefContextStaticAccess = "static_access"
 )
 
 // RefContextOf classifies the reference context of an edge given the kind
