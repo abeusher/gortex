@@ -1,6 +1,7 @@
 package languages
 
 import (
+	"strings"
 	"unicode"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -83,9 +84,53 @@ func emitPythonReferenceForms(root *sitter.Node, src []byte, filePath, fileID st
 			emitPyStaticAccessReference(n, src, emit)
 		case "decorator":
 			emitPyDecoratorReference(n, src, emit)
+		case "type_parameter":
+			// Element types inside a type-annotation subscript:
+			// `List[Foo]`, `Dict[str, Bar]`, `Optional[Baz]`,
+			// `Callable[..., Result]`. The annotation pass records only the
+			// canonicalized head (List / Dict / …) and drops the argument
+			// types, so without this they never appear as references.
+			emitPyGenericArgReferences(n, src, emit)
 		}
 		return true
 	})
+}
+
+// emitPyGenericArgReferences emits a "generic_arg" reference for each named
+// type appearing as a direct argument of a type-annotation subscript. The
+// node passed in is always a `type_parameter` — the grammar only produces
+// that inside a `generic_type`, which only appears inside a `type`
+// annotation. That structural nesting is the zero-false-positive gate: a
+// runtime subscript like `arr[0]` / `d[key]` parses as a `subscript` node
+// (never inside a `type`), so this case never fires for it.
+//
+// Each direct child is a `type` node wrapping an identifier (`Foo`), a
+// dotted name (`mod.Qux` — the leaf is the type), an ellipsis (`...` in
+// `Callable[..., R]` — no identifier, naturally skipped), a primitive
+// (`str`/`int` — dropped by the builtin filter at the emit site), or a
+// nested subscript (`List[Foo]` inside `Dict[str, List[Foo]]`). Nesting is
+// handled by the outer walk visiting each nested `type_parameter`
+// independently; here every direct child is run through the shared
+// canonicalizer + capitalization/builtin filter at the emit site, which
+// for a wrapper like `List[Foo]` yields the inner element (`Foo`).
+func emitPyGenericArgReferences(tparam *sitter.Node, src []byte, emit func(string, int, graph.EdgeKind, string)) {
+	line := int(tparam.StartPoint().Row) + 1
+	for i := 0; i < int(tparam.NamedChildCount()); i++ {
+		c := tparam.NamedChild(i)
+		if c == nil || c.Type() != "type" {
+			continue
+		}
+		// The argument's name: an identifier or the leaf of a dotted
+		// attribute. Subscript wrappers / ellipses are left to the
+		// canonicalizer + filter (Optional[X] → X, ... → dropped).
+		name := strings.TrimSpace(c.Content(src))
+		if inner := c.NamedChild(0); inner != nil && inner.Type() == "attribute" {
+			if a := inner.ChildByFieldName("attribute"); a != nil {
+				name = a.Content(src)
+			}
+		}
+		emit(name, line, graph.EdgeReferences, "generic_arg")
+	}
 }
 
 // emitPyCallReference handles a `call` node. Two cases:

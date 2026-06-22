@@ -207,6 +207,55 @@ func TestPyRefForm_NegativeCases(t *testing.T) {
 	}
 }
 
+// TestPyRefForm_GenericArgs: element types inside a type-annotation
+// subscript (`List[Foo]`, `Dict[str, Bar]`, nested `Dict[str, List[Foo]]`,
+// and a parameter annotation) emit a "generic_arg" reference to each named
+// type, OriginASTResolved. Builtins (str/int) inside the subscript and a
+// runtime subscript (`arr[0]`) emit NO type reference.
+func TestPyRefForm_GenericArgs(t *testing.T) {
+	src := `from m import Foo, Bar, Baz
+
+xs: List[Foo] = []
+mapping: Dict[str, Bar] = {}
+nested: Dict[str, List[Foo]] = {}
+
+def handle(items: List[Baz]) -> None:
+    arr = [1, 2, 3]
+    return arr[0]
+`
+	_, edges := runPyExtract(t, "app/g.py", src)
+
+	for _, want := range []string{"Foo", "Bar", "Baz"} {
+		e := findRefEdge(edges, graph.EdgeReferences, "unresolved::"+want, "generic_arg")
+		if e == nil {
+			t.Fatalf("expected EdgeReferences -> unresolved::%s (ref_context=generic_arg); edges=%v", want, edgeDump(edges))
+		}
+		if e.Origin != graph.OriginASTResolved {
+			t.Errorf("generic_arg edge for %s Origin = %q, want OriginASTResolved", want, e.Origin)
+		}
+	}
+
+	// The element type inside the parameter annotation is attributed to the
+	// enclosing function, not the file.
+	if e := findRefEdge(edges, graph.EdgeReferences, "unresolved::Baz", "generic_arg"); e != nil && e.From != "app/g.py::handle" {
+		t.Errorf("parameter generic_arg From = %q, want app/g.py::handle", e.From)
+	}
+
+	// Builtins inside the subscript (str, int) must not produce a type ref.
+	for _, bad := range []string{"unresolved::str", "unresolved::int"} {
+		if hasEdgeTo(edges, bad) {
+			t.Errorf("builtin %q inside a subscript must not emit a type reference", bad)
+		}
+	}
+
+	// A runtime subscript `arr[0]` must not emit any generic_arg reference.
+	for _, e := range edges {
+		if uk, _ := e.Meta["ref_context"].(string); uk == "generic_arg" && e.To == "unresolved::arr" {
+			t.Errorf("runtime subscript arr[0] must not emit a generic_arg reference")
+		}
+	}
+}
+
 // edgeDump renders edges compactly for failure messages.
 func edgeDump(edges []*graph.Edge) []string {
 	out := make([]string, 0, len(edges))
