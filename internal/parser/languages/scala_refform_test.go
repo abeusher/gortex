@@ -39,8 +39,8 @@ func extractScalaRefEdges(t *testing.T, src string) []scalaRefEdge {
 	return out
 }
 
-// hasRefEdge reports whether edges contains one matching to/kind/refCtx.
-func hasRefEdge(edges []scalaRefEdge, to string, kind graph.EdgeKind, refCtx string) bool {
+// scalaHasRefEdge reports whether edges contains one matching to/kind/refCtx.
+func scalaHasRefEdge(edges []scalaRefEdge, to string, kind graph.EdgeKind, refCtx string) bool {
 	for _, e := range edges {
 		if e.to == to && e.kind == kind && e.refCtx == refCtx {
 			return true
@@ -71,10 +71,10 @@ class Factory {
 }
 `
 	edges := extractScalaRefEdges(t, src)
-	if !hasRefEdge(edges, "Widget", graph.EdgeInstantiates, "") {
+	if !scalaHasRefEdge(edges, "Widget", graph.EdgeInstantiates, "") {
 		t.Errorf("expected instantiate edge to Widget (new Widget()), got %+v", edges)
 	}
-	if !hasRefEdge(edges, "Cat", graph.EdgeInstantiates, "") {
+	if !scalaHasRefEdge(edges, "Cat", graph.EdgeInstantiates, "") {
 		t.Errorf("expected instantiate edge to Cat (Cat() apply), got %+v", edges)
 	}
 }
@@ -90,11 +90,11 @@ object O extends Foo
 `
 	edges := extractScalaRefEdges(t, src)
 	for _, want := range []string{"Base", "T1", "T2"} {
-		if !hasRefEdge(edges, want, graph.EdgeReferences, graph.RefContextInherit) {
+		if !scalaHasRefEdge(edges, want, graph.EdgeReferences, graph.RefContextInherit) {
 			t.Errorf("expected inherit ref to %s, got %+v", want, edges)
 		}
 	}
-	if !hasRefEdge(edges, "Foo", graph.EdgeReferences, graph.RefContextInherit) {
+	if !scalaHasRefEdge(edges, "Foo", graph.EdgeReferences, graph.RefContextInherit) {
 		t.Errorf("expected inherit ref to Foo (object O extends Foo), got %+v", edges)
 	}
 }
@@ -114,7 +114,7 @@ class Checker {
 `
 	edges := extractScalaRefEdges(t, src)
 	for _, want := range []string{"Foo", "Bar", "Baz"} {
-		if !hasRefEdge(edges, want, graph.EdgeReferences, graph.RefContextCast) {
+		if !scalaHasRefEdge(edges, want, graph.EdgeReferences, graph.RefContextCast) {
 			t.Errorf("expected cast ref to %s, got %+v", want, edges)
 		}
 	}
@@ -129,10 +129,10 @@ class User {
 }
 `
 	edges := extractScalaRefEdges(t, src)
-	if !hasRefEdge(edges, "Color", graph.EdgeReferences, graph.RefContextStaticAccess) {
+	if !scalaHasRefEdge(edges, "Color", graph.EdgeReferences, graph.RefContextStaticAccess) {
 		t.Errorf("expected static_access ref to Color, got %+v", edges)
 	}
-	if !hasRefEdge(edges, "Config", graph.EdgeReferences, graph.RefContextStaticAccess) {
+	if !scalaHasRefEdge(edges, "Config", graph.EdgeReferences, graph.RefContextStaticAccess) {
 		t.Errorf("expected static_access ref to Config, got %+v", edges)
 	}
 }
@@ -152,7 +152,7 @@ class Thing {
 	edges := extractScalaRefEdges(t, src)
 
 	// `foo()` is a lowercase apply — not construction.
-	if hasRefEdge(edges, "foo", graph.EdgeInstantiates, "") {
+	if scalaHasRefEdge(edges, "foo", graph.EdgeInstantiates, "") {
 		t.Errorf("lowercase apply foo() must not instantiate, got %+v", edges)
 	}
 	// `this.x` head is `this` — never static access.
@@ -160,7 +160,7 @@ class Thing {
 		t.Errorf("this.x must not emit static_access, got %+v", edges)
 	}
 	// `lowercaseObj.field` head is lowercase — not static access.
-	if hasRefEdge(edges, "lowercaseObj", graph.EdgeReferences, graph.RefContextStaticAccess) {
+	if scalaHasRefEdge(edges, "lowercaseObj", graph.EdgeReferences, graph.RefContextStaticAccess) {
 		t.Errorf("lowercase select must not emit static_access, got %+v", edges)
 	}
 	// `Int` is a primitive — filtered everywhere (annotation, cast, etc.).

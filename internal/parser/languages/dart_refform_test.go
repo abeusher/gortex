@@ -8,10 +8,10 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 )
 
-// refEdge reports whether edges contains an edge of kind to
+// dartRefEdge reports whether edges contains an edge of kind to
 // "unresolved::"+typeName whose Meta["ref_context"] equals refContext (pass
 // "" to require no ref_context, e.g. for EdgeInstantiates).
-func refEdge(edges []*graph.Edge, kind graph.EdgeKind, typeName, refContext string) bool {
+func dartRefEdge(edges []*graph.Edge, kind graph.EdgeKind, typeName, refContext string) bool {
 	want := "unresolved::" + typeName
 	for _, e := range edges {
 		if e.Kind != kind || e.To != want {
@@ -63,7 +63,7 @@ void foo() {}
 	require.NoError(t, err)
 
 	// `Widget()`, `new Widget()`, `const Widget.named()` all construct Widget.
-	assert.True(t, refEdge(res.Edges, graph.EdgeInstantiates, "Widget", ""),
+	assert.True(t, dartRefEdge(res.Edges, graph.EdgeInstantiates, "Widget", ""),
 		"Widget construction should emit EdgeInstantiates; edges=%v", res.Edges)
 
 	// Origin is OriginASTResolved (guard-survival + consistency).
@@ -74,7 +74,7 @@ void foo() {}
 	}
 
 	// A lowercase free-function call `foo()` is NOT a construction.
-	assert.False(t, refEdge(res.Edges, graph.EdgeInstantiates, "foo", ""),
+	assert.False(t, dartRefEdge(res.Edges, graph.EdgeInstantiates, "foo", ""),
 		"lowercase call foo() must not be an instantiation")
 
 	// `const Widget.named()` references Widget once as instantiation; the bare
@@ -96,11 +96,11 @@ func TestDartRefForm_InstantiationExternalType(t *testing.T) {
 	res, err := NewDartExtractor().Extract("api.dart", src)
 	require.NoError(t, err)
 
-	assert.True(t, refEdge(res.Edges, graph.EdgeInstantiates, "Client", ""),
+	assert.True(t, dartRefEdge(res.Edges, graph.EdgeInstantiates, "Client", ""),
 		"imported Client() should emit EdgeInstantiates; edges=%v", res.Edges)
-	assert.True(t, refEdge(res.Edges, graph.EdgeInstantiates, "Response", ""),
+	assert.True(t, dartRefEdge(res.Edges, graph.EdgeInstantiates, "Response", ""),
 		"imported Response() should emit EdgeInstantiates")
-	assert.False(t, refEdge(res.Edges, graph.EdgeInstantiates, "helper", ""),
+	assert.False(t, dartRefEdge(res.Edges, graph.EdgeInstantiates, "helper", ""),
 		"lowercase call helper() must not be an instantiation")
 }
 
@@ -115,11 +115,11 @@ class X extends Base with M implements I {}
 	res, err := NewDartExtractor().Extract("x.dart", src)
 	require.NoError(t, err)
 
-	assert.True(t, refEdge(res.Edges, graph.EdgeReferences, "Base", graph.RefContextInherit),
+	assert.True(t, dartRefEdge(res.Edges, graph.EdgeReferences, "Base", graph.RefContextInherit),
 		"extends Base should emit inherit reference; edges=%v", res.Edges)
-	assert.True(t, refEdge(res.Edges, graph.EdgeReferences, "M", graph.RefContextInherit),
+	assert.True(t, dartRefEdge(res.Edges, graph.EdgeReferences, "M", graph.RefContextInherit),
 		"with M should emit inherit reference")
-	assert.True(t, refEdge(res.Edges, graph.EdgeReferences, "I", graph.RefContextInherit),
+	assert.True(t, dartRefEdge(res.Edges, graph.EdgeReferences, "I", graph.RefContextInherit),
 		"implements I should emit inherit reference")
 
 	// Inherit references attribute to the file node (the class line is not
@@ -144,11 +144,11 @@ func TestDartRefForm_CastAndTypeTest(t *testing.T) {
 	res, err := NewDartExtractor().Extract("c.dart", src)
 	require.NoError(t, err)
 
-	assert.True(t, refEdge(res.Edges, graph.EdgeReferences, "Account", graph.RefContextCast),
+	assert.True(t, dartRefEdge(res.Edges, graph.EdgeReferences, "Account", graph.RefContextCast),
 		"`o as Account` should emit cast reference; edges=%v", res.Edges)
-	assert.True(t, refEdge(res.Edges, graph.EdgeReferences, "User", graph.RefContextCast),
+	assert.True(t, dartRefEdge(res.Edges, graph.EdgeReferences, "User", graph.RefContextCast),
 		"`o is User` should emit cast reference")
-	assert.True(t, refEdge(res.Edges, graph.EdgeReferences, "Token", graph.RefContextCast),
+	assert.True(t, dartRefEdge(res.Edges, graph.EdgeReferences, "Token", graph.RefContextCast),
 		"`o is! Token` should emit cast reference")
 
 	// Casts inside run() attribute to the enclosing method.
@@ -172,11 +172,11 @@ func TestDartRefForm_StaticAccess(t *testing.T) {
 	res, err := NewDartExtractor().Extract("s.dart", src)
 	require.NoError(t, err)
 
-	assert.True(t, refEdge(res.Edges, graph.EdgeReferences, "Colors", graph.RefContextStaticAccess),
+	assert.True(t, dartRefEdge(res.Edges, graph.EdgeReferences, "Colors", graph.RefContextStaticAccess),
 		"`Colors.red` should emit static_access reference; edges=%v", res.Edges)
-	assert.True(t, refEdge(res.Edges, graph.EdgeReferences, "Logger", graph.RefContextStaticAccess),
+	assert.True(t, dartRefEdge(res.Edges, graph.EdgeReferences, "Logger", graph.RefContextStaticAccess),
 		"`Logger.empty()` should emit static_access reference")
-	assert.True(t, refEdge(res.Edges, graph.EdgeReferences, "Math", graph.RefContextStaticAccess),
+	assert.True(t, dartRefEdge(res.Edges, graph.EdgeReferences, "Math", graph.RefContextStaticAccess),
 		"`Math.max(...)` should emit static_access reference")
 }
 
@@ -199,23 +199,23 @@ func TestDartRefForm_Negatives(t *testing.T) {
 	require.NoError(t, err)
 
 	// Lowercase free call → not an instantiation.
-	assert.False(t, refEdge(res.Edges, graph.EdgeInstantiates, "foo", ""),
+	assert.False(t, dartRefEdge(res.Edges, graph.EdgeInstantiates, "foo", ""),
 		"foo() must not be an instantiation")
 
 	// Lowercase instance call → not a static access (head is lowercase `obj`).
-	assert.False(t, refEdge(res.Edges, graph.EdgeReferences, "obj", graph.RefContextStaticAccess),
+	assert.False(t, dartRefEdge(res.Edges, graph.EdgeReferences, "obj", graph.RefContextStaticAccess),
 		"obj.method() must not be a static access")
-	assert.False(t, refEdge(res.Edges, graph.EdgeReferences, "method", graph.RefContextStaticAccess),
+	assert.False(t, dartRefEdge(res.Edges, graph.EdgeReferences, "method", graph.RefContextStaticAccess),
 		"method must not be referenced as a static access")
 
 	// `this.x` → no reference (`this` is filtered by capitalization gate).
-	assert.False(t, refEdge(res.Edges, graph.EdgeReferences, "this", graph.RefContextStaticAccess),
+	assert.False(t, dartRefEdge(res.Edges, graph.EdgeReferences, "this", graph.RefContextStaticAccess),
 		"this.x must not emit a static access")
 
 	// Chained `one.Two.three`: the head is lowercase `one`, so even though
 	// `Two` is capitalized it is NOT a static-access head (it lives inside a
 	// selector). Two must not be referenced as a static access.
-	assert.False(t, refEdge(res.Edges, graph.EdgeReferences, "Two", graph.RefContextStaticAccess),
+	assert.False(t, dartRefEdge(res.Edges, graph.EdgeReferences, "Two", graph.RefContextStaticAccess),
 		"chained one.Two.three must not treat Two as a static-access head")
 
 	// Primitive `int` emits nothing on any reference surface.
