@@ -370,6 +370,15 @@ func (e *JavaExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 		}
 		emitJavaTypeUseEdges(ownerID, tu.typeText, filePath, tu.line, result)
 	}
+
+	// Expression-position type references — instantiation (`new Foo()`),
+	// inheritance (`extends Foo` / `implements Bar`), casts / type-tests
+	// (`(Foo) x`, `x instanceof Foo`), static / constant access
+	// (`Foo.CONST`, `Foo.class`, `Foo.staticMethod()`), and annotations
+	// (`@Foo`). These are the find_usages(Foo) hits the declaration passes
+	// above don't cover. Attributed to the enclosing method via funcRanges.
+	emitJavaReferenceForms(root, src, filePath, fileID, funcRanges, result)
+
 	// @Value("${key:Default}") fields → their literal defaults, for invoker
 	// dispatch through a Spring-injected field (built only when invoker
 	// detection is configured).
