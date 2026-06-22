@@ -58,8 +58,8 @@ func TestRunSessionStart_DaemonReady_CwdExactMatch(t *testing.T) {
 			UptimeSeconds: 3600,
 			Ready:         true,
 			TrackedRepos: []daemon.TrackedRepoStatus{
-				{Name: "gortex", Path: "/Users/zzet/code/my/gortex/gortex", Workspace: "gortex", Nodes: 6604, Edges: 27403},
-				{Name: "cloud_web", Path: "/Users/zzet/code/my/gortex/cloud_web", Workspace: "cloud_web", Nodes: 265, Edges: 276},
+				{Name: "gortex", Path: "/tmp/gortex", Workspace: "gortex", Nodes: 6604, Edges: 27403},
+				{Name: "cloud_web", Path: "/tmp/cloud_web", Workspace: "cloud_web", Nodes: 265, Edges: 276},
 			},
 			Workspaces: []daemon.WorkspaceSummary{
 				{Slug: "gortex"}, {Slug: "cloud_web"},
@@ -67,7 +67,7 @@ func TestRunSessionStart_DaemonReady_CwdExactMatch(t *testing.T) {
 		}, nil
 	})
 
-	data := []byte(`{"hook_event_name":"SessionStart","cwd":"/Users/zzet/code/my/gortex/gortex"}`)
+	data := []byte(`{"hook_event_name":"SessionStart","cwd":"/tmp/gortex"}`)
 	out := captureStdout(t, func() { runSessionStart(data) })
 
 	var payload HookOutput
@@ -93,14 +93,14 @@ func TestRunSessionStart_DaemonReady_CwdContainsRepos(t *testing.T) {
 			UptimeSeconds: 60,
 			Ready:         true,
 			TrackedRepos: []daemon.TrackedRepoStatus{
-				{Name: "gortex", Path: "/Users/zzet/code/my/gortex/gortex"},
-				{Name: "cloud_web", Path: "/Users/zzet/code/my/gortex/cloud_web"},
-				{Name: "labrador", Path: "/Users/zzet/code/work/mpg/labrador"},
+				{Name: "gortex", Path: "/tmp/gortex"},
+				{Name: "cloud_web", Path: "/tmp/cloud_web"},
+				{Name: "project1", Path: "/tmp/project1"},
 			},
 		}, nil
 	})
 
-	data := []byte(`{"hook_event_name":"SessionStart","cwd":"/Users/zzet/code/my/gortex"}`)
+	data := []byte(`{"hook_event_name":"SessionStart","cwd":"/tmp"}`)
 	out := captureStdout(t, func() { runSessionStart(data) })
 
 	var payload HookOutput
@@ -114,7 +114,7 @@ func TestRunSessionStart_DaemonReady_CwdContainsRepos(t *testing.T) {
 	if !strings.Contains(ac, "cloud_web") || !strings.Contains(ac, "gortex") {
 		t.Errorf("expected sub-repo names, got:\n%s", ac)
 	}
-	if strings.Contains(ac, "labrador") {
+	if strings.Contains(ac, "project1") {
 		t.Errorf("unrelated repo leaked into briefing:\n%s", ac)
 	}
 	if !strings.Contains(ac, "fans out across") {
@@ -131,7 +131,7 @@ func TestRunSessionStart_DaemonReady_CwdNotTracked(t *testing.T) {
 			Version: "0.15.0",
 			Ready:   true,
 			TrackedRepos: []daemon.TrackedRepoStatus{
-				{Name: "gortex", Path: "/Users/zzet/code/my/gortex/gortex"},
+				{Name: "gortex", Path: "/tmp/gortex"},
 			},
 		}, nil
 	})

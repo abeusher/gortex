@@ -320,8 +320,7 @@ func (s *Server) resolveNodePath(node *graph.Node) (string, error) {
 			// at index time, so a node's FilePath looks like
 			// `gortex/internal/mcp/tools_fileops.go`. RepoRoot returns
 			// the on-disk path that ALREADY corresponds to the repo
-			// (e.g. `/Users/zzet/code/my/gortex/gortex`). Joining as-is
-			// duplicates the prefix segment when the repo's basename
+			// Joining as-is duplicates the prefix segment when the repo's basename
 			// matches the prefix — strip the leading `<prefix>/` from
 			// the file path before joining so the result is the real
 			// on-disk file regardless of basename collision.

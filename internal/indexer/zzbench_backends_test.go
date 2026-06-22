@@ -29,7 +29,7 @@ import (
 // process RSS, and query throughput so the sqlite backend can be compared
 // head-to-head with the in-memory baseline on real repositories.
 //
-//	GORTEX_BENCH_ROOT=/Users/zzet/code/my/gortex/gortex \
+//	GORTEX_BENCH_ROOT=/path/to/gortex \
 //	GORTEX_BENCH_BACKEND=sqlite \
 //	  go test ./internal/indexer/ -run TestBackendBench -timeout 40m -v
 func TestBackendBench(t *testing.T) {

@@ -65,14 +65,14 @@ func TestNormalizeEventPath(t *testing.T) {
 		{
 			"keeps_private_when_strip_doesnt_match_root",
 			"/private/etc/main.go",
-			"/Users/zzet/repo",
+			"/tmp/repo",
 			"/private/etc/main.go",
 		},
 		{
 			"unprefixed_path_passes_through",
-			"/Users/zzet/repo/main.go",
-			"/Users/zzet/repo",
-			"/Users/zzet/repo/main.go",
+			"/tmp/repo/main.go",
+			"/tmp/repo",
+			"/tmp/repo/main.go",
 		},
 		{
 			"empty_root_passes_through",

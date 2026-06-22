@@ -24,8 +24,8 @@ func sampleStatus() daemon.StatusResponse {
 		WarmupSeconds: 42,
 		TrackedRepos: []daemon.TrackedRepoStatus{
 			{
-				Prefix: "labrador",
-				Path:   "/Users/zzet/code/labrador",
+				Prefix: "project1",
+				Path:   "/tmp/code/project1",
 				Files:  2029, Nodes: 20774, Edges: 208956,
 				Memory: daemon.MemoryBreakdown{
 					NodesBytes: 8_500_000, EdgesBytes: 63_000_000,
@@ -34,8 +34,8 @@ func sampleStatus() daemon.StatusResponse {
 				},
 			},
 			{
-				Prefix: "daedalus",
-				Path:   "/Users/zzet/code/daedalus",
+				Prefix: "project2",
+				Path:   "/tmp/code/project2",
 				Files:  6174, Nodes: 27578, Edges: 72190,
 				Memory: daemon.MemoryBreakdown{
 					NodesBytes: 12_000_000, EdgesBytes: 24_000_000,
@@ -62,10 +62,10 @@ func TestRenderDaemonRepos_HasTableAndOtherRow(t *testing.T) {
 	var buf bytes.Buffer
 	renderDaemonRepos(&buf, sampleStatus())
 	out := buf.String()
-	// Both repos appear, biggest-memory-first (labrador before daedalus).
-	assert.Contains(t, out, "labrador")
-	assert.Contains(t, out, "daedalus")
-	assert.Less(t, strings.Index(out, "labrador"), strings.Index(out, "daedalus"),
+	// Both repos appear, biggest-memory-first (project1 before project2).
+	assert.Contains(t, out, "project1")
+	assert.Contains(t, out, "project2")
+	assert.Less(t, strings.Index(out, "project1"), strings.Index(out, "project2"),
 		"repos should sort by memory desc")
 	// "other" footer shows unattributed memory.
 	assert.Contains(t, out, "other")
