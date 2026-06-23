@@ -6,7 +6,7 @@
 
 
 ### High-performance and efficient code-intelligence engine for AI agents and IDE
-#### Indexes code and exposes it via CLI, MCP Server, and web UI. Multi-repository support by default.
+#### Indexes code into graph and exposes it via CLI, MCP Server, and web UI. Multi-repository support by default.
 #### Single static binary for macOS, Linux, and Windows — no dependency chain, simple installation and use.
 
 ---
