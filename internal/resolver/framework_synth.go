@@ -93,6 +93,7 @@ const (
 	SynthRustScope         = "rust-scope"
 	SynthSQLCallsite       = "sql-callsite"
 	SynthStoreFactory      = "store-factory"
+	SynthReduxThunk        = "redux-thunk"
 	SynthGinMiddleware     = "gin-middleware"
 	SynthSvelteKitLoad     = "sveltekit-load"
 	SynthSpeculative       = "speculative-dispatch"
@@ -182,6 +183,11 @@ func defaultFrameworkSynthesizers() []FrameworkSynthesizer {
 		// Store-factory (Zustand/Redux/Pinia/MobX) indirect action calls —
 		// binds getState()-chain and destructured calls to the action node.
 		synthFunc{name: SynthStoreFactory, fn: ResolveStoreFactoryCalls},
+		// Redux Toolkit createAsyncThunk dispatch chains: a thunk →
+		// each action/thunk it dispatches from its payload-creator body.
+		// After store-factory so its action nodes are indexed for the
+		// thunk → reducer cross-link.
+		synthFunc{name: SynthReduxThunk, fn: ResolveReduxThunkCalls},
 		// Gin middleware-chain dispatcher → registered handlers. Bridges the
 		// `c.handlers[idx](c)` indirection so ServeHTTP→handler reachability
 		// flows; repo-scoped, gated on a dispatcher existing.
