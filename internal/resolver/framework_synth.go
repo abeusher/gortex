@@ -101,6 +101,7 @@ const (
 	SynthSpringEvent       = "spring-event"
 	SynthMediatR           = "mediatr-dispatch"
 	SynthSidekiq           = "sidekiq-dispatch"
+	SynthLaravelEvent      = "laravel-event"
 	SynthGinMiddleware     = "gin-middleware"
 	SynthSvelteKitLoad     = "sveltekit-load"
 	SynthSpeculative       = "speculative-dispatch"
@@ -217,6 +218,9 @@ func defaultFrameworkSynthesizers() []FrameworkSynthesizer {
 		// Sidekiq job dispatch: Worker.perform_async(...) → the worker's
 		// perform, namespace-aware. Include-gated, typed tier.
 		synthFunc{name: SynthSidekiq, fn: ResolveSidekiqCalls},
+		// Laravel events: event(new X()) / X::dispatch() → every listener
+		// handle(X), from the Listeners convention and the $listen map.
+		synthFunc{name: SynthLaravelEvent, fn: ResolveLaravelEventCalls},
 		// Gin middleware-chain dispatcher → registered handlers. Bridges the
 		// `c.handlers[idx](c)` indirection so ServeHTTP→handler reachability
 		// flows; repo-scoped, gated on a dispatcher existing.

@@ -53,6 +53,9 @@ func (e *PHPExtractor) Extract(filePath string, src []byte) (*parser.ExtractionR
 	// and PHP 8 attributes. Runs after the symbol walk so buildFuncRanges /
 	// buildPHPTypeRanges see every function / method / class node.
 	emitPHPReferenceForms(root, src, filePath, fileNode.ID, result)
+
+	captureLaravelEvents(result, root, filePath, src)
+
 	return result, nil
 }
 
