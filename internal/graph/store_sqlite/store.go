@@ -425,7 +425,7 @@ func (s *Store) prepare() error {
 	const nodeCols = lookupNodeCols
 
 	prep(&s.stmtInsertNode,
-		`INSERT OR REPLACE INTO nodes (`+nodeCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+		`INSERT OR REPLACE INTO nodes (`+nodeCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
 	prep(&s.stmtGetNode,
 		`SELECT `+nodeCols+` FROM nodes WHERE id = ?`)
 	prep(&s.stmtGetNodeByQual,
@@ -529,16 +529,17 @@ func scanNode(scanner interface {
 	Scan(...any) error
 }) (*graph.Node, error) {
 	var (
-		n             graph.Node
-		metaBlob      []byte
-		sig, vis, doc sql.NullString
-		ext           sql.NullBool
+		n        graph.Node
+		metaBlob []byte
+		p        promotedNodeMeta
 	)
 	err := scanner.Scan(
 		&n.ID, &n.Kind, &n.Name, &n.QualName, &n.FilePath,
-		&n.StartLine, &n.EndLine, &n.Language,
+		&n.StartLine, &n.EndLine, &n.StartColumn, &n.EndColumn, &n.Language,
 		&n.RepoPrefix, &n.WorkspaceID, &n.ProjectID,
-		&sig, &vis, &doc, &ext, &metaBlob,
+		&p.sig, &p.vis, &p.doc, &p.external, &p.returnType,
+		&p.isAsync, &p.isStatic, &p.isAbstract, &p.isExported, &p.updatedAt,
+		&metaBlob,
 	)
 	if err != nil {
 		return nil, err
@@ -553,7 +554,7 @@ func scanNode(scanner interface {
 	// Restore the promoted columns into Meta. They are authoritative for
 	// rows written after the promotion; a NULL column (legacy gob rows)
 	// is left alone so the blob-carried value survives.
-	restorePromotedMeta(&n, sig, vis, doc, ext)
+	restorePromotedMeta(&n, p)
 	return &n, nil
 }
 
@@ -637,16 +638,18 @@ func (s *Store) AddNode(n *graph.Node) {
 }
 
 func (s *Store) insertNodeLocked(stmt *sql.Stmt, n *graph.Node) error {
-	sig, vis, doc, ext, blobMeta := extractPromotedMeta(n.Meta)
+	p, blobMeta := extractPromotedMeta(n.Meta)
 	metaBlob, err := encodeMeta(blobMeta)
 	if err != nil {
 		return err
 	}
 	_, err = stmt.Exec(
 		n.ID, string(n.Kind), n.Name, n.QualName, n.FilePath,
-		n.StartLine, n.EndLine, n.Language,
+		n.StartLine, n.EndLine, n.StartColumn, n.EndColumn, n.Language,
 		n.RepoPrefix, n.WorkspaceID, n.ProjectID,
-		sig, vis, doc, ext, metaBlob,
+		p.sig, p.vis, p.doc, p.external, p.returnType,
+		p.isAsync, p.isStatic, p.isAbstract, p.isExported, p.updatedAt,
+		metaBlob,
 	)
 	return err
 }

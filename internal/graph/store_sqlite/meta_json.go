@@ -372,11 +372,38 @@ var promotedMetaColumns = []struct {
 	{"visibility", "visibility TEXT"},
 	{"doc", "doc TEXT"},
 	{"external", "external INTEGER"},
+	{"return_type", "return_type TEXT"},
+	{"is_async", "is_async INTEGER"},
+	{"is_static", "is_static INTEGER"},
+	{"is_abstract", "is_abstract INTEGER"},
+	{"is_exported", "is_exported INTEGER"},
+	{"updated_at", "updated_at INTEGER"},
 }
 
-// ensureNodeColumns adds the promoted columns to a nodes table created
-// before they existed. A fresh DB already has them from the DDL, so this is
-// a no-op; an older DB is altered in place (ADD COLUMN defaults to NULL).
+// structNodeColumns are typed nodes columns read and written directly from
+// Node struct fields (not the Meta blob): the source column offsets. They are
+// NOT NULL DEFAULT 0 like start_line / end_line, so an ALTER on an existing DB
+// backfills 0.
+var structNodeColumns = []struct {
+	name string
+	ddl  string
+}{
+	{"start_column", "start_column INTEGER NOT NULL DEFAULT 0"},
+	{"end_column", "end_column INTEGER NOT NULL DEFAULT 0"},
+}
+
+// promotedNodeMeta holds the typed column values lifted out of a node's Meta
+// blob. A NULL (invalid) field means the key was absent (or had an unexpected
+// type and stayed in the blob).
+type promotedNodeMeta struct {
+	sig, vis, doc, returnType                           sql.NullString
+	external, isAsync, isStatic, isAbstract, isExported sql.NullBool
+	updatedAt                                           sql.NullInt64
+}
+
+// ensureNodeColumns adds the promoted + struct columns to a nodes table
+// created before they existed. A fresh DB already has them from the DDL, so
+// this is a no-op; an older DB is altered in place.
 func ensureNodeColumns(db *sql.DB) error {
 	rows, err := db.Query(`PRAGMA table_info(nodes)`)
 	if err != nil {
@@ -400,11 +427,20 @@ func ensureNodeColumns(db *sql.DB) error {
 		return err
 	}
 	_ = rows.Close()
-	for _, c := range promotedMetaColumns {
-		if existing[c.name] {
-			continue
+	add := func(name, ddl string) error {
+		if existing[name] {
+			return nil
 		}
-		if _, err := db.Exec(`ALTER TABLE nodes ADD COLUMN ` + c.ddl); err != nil {
+		_, err := db.Exec(`ALTER TABLE nodes ADD COLUMN ` + ddl)
+		return err
+	}
+	for _, c := range structNodeColumns {
+		if err := add(c.name, c.ddl); err != nil {
+			return err
+		}
+	}
+	for _, c := range promotedMetaColumns {
+		if err := add(c.name, c.ddl); err != nil {
 			return err
 		}
 	}
@@ -415,7 +451,7 @@ func ensureNodeColumns(db *sql.DB) error {
 // values and returns the remaining map destined for the JSON blob. m is
 // not mutated; a copy is made only when a promoted key is present and has
 // the expected type (otherwise the value stays in the blob).
-func extractPromotedMeta(m map[string]any) (sig, vis, doc sql.NullString, ext sql.NullBool, rest map[string]any) {
+func extractPromotedMeta(m map[string]any) (p promotedNodeMeta, rest map[string]any) {
 	rest = m
 	if len(m) == 0 {
 		return
@@ -431,54 +467,128 @@ func extractPromotedMeta(m map[string]any) (sig, vis, doc sql.NullString, ext sq
 		return
 	}
 	rest = make(map[string]any, len(m))
+	str := func(v any) (sql.NullString, bool) {
+		if s, ok := v.(string); ok {
+			return sql.NullString{String: s, Valid: true}, true
+		}
+		return sql.NullString{}, false
+	}
+	boolean := func(v any) (sql.NullBool, bool) {
+		if b, ok := v.(bool); ok {
+			return sql.NullBool{Bool: b, Valid: true}, true
+		}
+		return sql.NullBool{}, false
+	}
 	for k, v := range m {
+		var promoted bool
 		switch k {
 		case "signature":
-			if s, ok := v.(string); ok {
-				sig = sql.NullString{String: s, Valid: true}
-				continue
+			if nv, ok := str(v); ok {
+				p.sig, promoted = nv, true
 			}
 		case "visibility":
-			if s, ok := v.(string); ok {
-				vis = sql.NullString{String: s, Valid: true}
-				continue
+			if nv, ok := str(v); ok {
+				p.vis, promoted = nv, true
 			}
 		case "doc":
-			if s, ok := v.(string); ok {
-				doc = sql.NullString{String: s, Valid: true}
-				continue
+			if nv, ok := str(v); ok {
+				p.doc, promoted = nv, true
+			}
+		case "return_type":
+			if nv, ok := str(v); ok {
+				p.returnType, promoted = nv, true
 			}
 		case "external":
-			if b, ok := v.(bool); ok {
-				ext = sql.NullBool{Bool: b, Valid: true}
-				continue
+			if nv, ok := boolean(v); ok {
+				p.external, promoted = nv, true
+			}
+		case "is_async":
+			if nv, ok := boolean(v); ok {
+				p.isAsync, promoted = nv, true
+			}
+		case "is_static":
+			if nv, ok := boolean(v); ok {
+				p.isStatic, promoted = nv, true
+			}
+		case "is_abstract":
+			if nv, ok := boolean(v); ok {
+				p.isAbstract, promoted = nv, true
+			}
+		case "is_exported":
+			if nv, ok := boolean(v); ok {
+				p.isExported, promoted = nv, true
+			}
+		case "updated_at":
+			if i, ok := metaToInt64(v); ok {
+				p.updatedAt, promoted = sql.NullInt64{Int64: i, Valid: true}, true
 			}
 		}
-		rest[k] = v
+		if !promoted {
+			// Absent / wrong type: keep the value in the JSON blob.
+			rest[k] = v
+		}
 	}
 	return
+}
+
+// metaToInt64 coerces a meta numeric value (int / int64 / float64 / json.Number)
+// to int64 for a promoted timestamp column.
+func metaToInt64(v any) (int64, bool) {
+	switch x := v.(type) {
+	case int64:
+		return x, true
+	case int:
+		return int64(x), true
+	case float64:
+		return int64(x), true
+	case json.Number:
+		if i, err := x.Int64(); err == nil {
+			return i, true
+		}
+	}
+	return 0, false
 }
 
 // restorePromotedMeta writes the non-NULL promoted columns back into the
 // node's Meta. A NULL column is left alone so a legacy gob row's blob value
 // survives.
-func restorePromotedMeta(n *graph.Node, sig, vis, doc sql.NullString, ext sql.NullBool) {
-	if !sig.Valid && !vis.Valid && !doc.Valid && !ext.Valid {
+func restorePromotedMeta(n *graph.Node, p promotedNodeMeta) {
+	if !p.sig.Valid && !p.vis.Valid && !p.doc.Valid && !p.returnType.Valid &&
+		!p.external.Valid && !p.isAsync.Valid && !p.isStatic.Valid &&
+		!p.isAbstract.Valid && !p.isExported.Valid && !p.updatedAt.Valid {
 		return
 	}
 	if n.Meta == nil {
-		n.Meta = make(map[string]any, 4)
+		n.Meta = make(map[string]any, 8)
 	}
-	if sig.Valid {
-		n.Meta["signature"] = sig.String
+	if p.sig.Valid {
+		n.Meta["signature"] = p.sig.String
 	}
-	if vis.Valid {
-		n.Meta["visibility"] = vis.String
+	if p.vis.Valid {
+		n.Meta["visibility"] = p.vis.String
 	}
-	if doc.Valid {
-		n.Meta["doc"] = doc.String
+	if p.doc.Valid {
+		n.Meta["doc"] = p.doc.String
 	}
-	if ext.Valid {
-		n.Meta["external"] = ext.Bool
+	if p.returnType.Valid {
+		n.Meta["return_type"] = p.returnType.String
+	}
+	if p.external.Valid {
+		n.Meta["external"] = p.external.Bool
+	}
+	if p.isAsync.Valid {
+		n.Meta["is_async"] = p.isAsync.Bool
+	}
+	if p.isStatic.Valid {
+		n.Meta["is_static"] = p.isStatic.Bool
+	}
+	if p.isAbstract.Valid {
+		n.Meta["is_abstract"] = p.isAbstract.Bool
+	}
+	if p.isExported.Valid {
+		n.Meta["is_exported"] = p.isExported.Bool
+	}
+	if p.updatedAt.Valid {
+		n.Meta["updated_at"] = p.updatedAt.Int64
 	}
 }

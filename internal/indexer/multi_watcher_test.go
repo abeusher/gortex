@@ -160,8 +160,11 @@ func ModifiedA() {}
 	ev := waitForMultiEvent(t, mw, 3*time.Second)
 	assert.Equal(t, ChangeModified, ev.Kind)
 
-	// Graph should reflect the change.
-	assert.NotEmpty(t, mi.Graph().FindNodesByName("ModifiedA"))
+	// Graph should reflect the change. The reindex runs asynchronously after
+	// the change event, so poll rather than assert immediately.
+	require.Eventually(t, func() bool {
+		return len(mi.Graph().FindNodesByName("ModifiedA")) > 0
+	}, 3*time.Second, 20*time.Millisecond, "ModifiedA should be indexed")
 }
 
 func TestMultiWatcher_Events_MergedFromMultipleRepos(t *testing.T) {
@@ -183,9 +186,15 @@ func ChangedB() {}
 `)
 	_ = waitForMultiEvent(t, mw, 3*time.Second)
 
-	// Both changes should be reflected in the graph.
-	assert.NotEmpty(t, mi.Graph().FindNodesByName("ChangedA"))
-	assert.NotEmpty(t, mi.Graph().FindNodesByName("ChangedB"))
+	// Both changes should be reflected in the graph. The change event fires
+	// when the modification is DETECTED; the reindex that materialises the new
+	// symbol runs asynchronously after, so poll for the nodes rather than
+	// asserting immediately — the fixed-instant assert raced the reindex and
+	// flaked under CI load.
+	require.Eventually(t, func() bool {
+		return len(mi.Graph().FindNodesByName("ChangedA")) > 0 &&
+			len(mi.Graph().FindNodesByName("ChangedB")) > 0
+	}, 3*time.Second, 20*time.Millisecond, "both ChangedA and ChangedB should be indexed")
 }
 
 func TestMultiWatcher_AddRepo(t *testing.T) {

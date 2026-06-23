@@ -134,14 +134,14 @@ func describeFields(t reflect.Type) string {
 func wireContractGolden(name string) string {
 	switch name {
 	case "graph.Node":
-		// Bumped when the federation proxy-node fields Origin / Stub /
-		// FetchedAt were added — written only by the (gated, not-yet-built)
-		// cross-daemon mint path; empty on every locally-indexed node.
+		// Bumped when the source column-offset fields StartColumn / EndColumn
+		// were added (promoted to typed nodes columns on the SQLite backend).
 		// Additive: gob decodes unknown fields as zero, so older snapshots
-		// still load with them blank, and proxy nodes are never persisted.
-		// Previously bumped when AbsoluteFilePath, then WorkspaceID /
+		// still load with them blank.
+		// Previously bumped when the federation proxy-node fields Origin /
+		// Stub / FetchedAt, then AbsoluteFilePath, then WorkspaceID /
 		// ProjectID, were added.
-		return "3b8920ab88d05028e215d68d5917445e2e6d05bdad23aef6dcdf6c9920647823"
+		return "a600bd906c9e09ffa0828427f5d6622acd5fe244798a61d5712c151053be5dac"
 	case "graph.Edge":
 		// Bumped when Alias was added — the renamed name carried by a
 		// per-binding import (`import { x as alias }`) or a re-export

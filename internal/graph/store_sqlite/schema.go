@@ -48,6 +48,8 @@ CREATE TABLE IF NOT EXISTS nodes (
     file_path     TEXT NOT NULL,
     start_line    INTEGER NOT NULL DEFAULT 0,
     end_line      INTEGER NOT NULL DEFAULT 0,
+    start_column  INTEGER NOT NULL DEFAULT 0,
+    end_column    INTEGER NOT NULL DEFAULT 0,
     language      TEXT NOT NULL DEFAULT '',
     repo_prefix   TEXT NOT NULL DEFAULT '',
     workspace_id  TEXT NOT NULL DEFAULT '',
@@ -56,6 +58,12 @@ CREATE TABLE IF NOT EXISTS nodes (
     visibility    TEXT,
     doc           TEXT,
     external      INTEGER,
+    return_type   TEXT,
+    is_async      INTEGER,
+    is_static     INTEGER,
+    is_abstract   INTEGER,
+    is_exported   INTEGER,
+    updated_at    INTEGER,
     meta          BLOB
 ) WITHOUT ROWID;
 
@@ -146,6 +154,26 @@ CREATE TABLE IF NOT EXISTS constant_values (
 ) WITHOUT ROWID;
 
 CREATE INDEX IF NOT EXISTS constant_values_by_file ON constant_values(repo_prefix, file_path);
+
+-- files is the per-file metadata sidecar: one row per indexed file carrying
+-- the BLAKE3 content hash (the Merkle leaf), byte size, extracted node count,
+-- and a JSON array of parse-error locations. The Merkle tree stays the
+-- authoritative change detector; this table is queryable supplementary
+-- metadata (index_health reports per-file parse errors + node counts from it).
+-- PK is (repo_prefix, file_path) so a reindex replaces the row in place;
+-- WITHOUT ROWID — the PK index IS the table, like file_mtimes.
+CREATE TABLE IF NOT EXISTS files (
+    repo_prefix  TEXT NOT NULL DEFAULT '',
+    file_path    TEXT NOT NULL,
+    content_hash TEXT NOT NULL DEFAULT '',
+    size         INTEGER NOT NULL DEFAULT 0,
+    node_count   INTEGER NOT NULL DEFAULT 0,
+    errors       TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (repo_prefix, file_path)
+) WITHOUT ROWID;
+-- files_with_errors backs the index_health "files with parse errors" rollup
+-- so it scans only the (usually tiny) set of erroring files, not every row.
+CREATE INDEX IF NOT EXISTS files_with_errors ON files(repo_prefix) WHERE errors <> '';
 
 -- ref_facts is the resolved-reference sidecar: one row per reference edge
 -- that resolved to a concrete target, recording the target + the provenance

@@ -291,8 +291,13 @@ type Node struct {
 	FilePath  string   `json:"file_path"`
 	StartLine int      `json:"start_line"`
 	// EndLine is omitted when zero — File-kind nodes don't have ranges.
-	EndLine    int            `json:"end_line,omitempty"`
-	Language   string         `json:"language"`
+	EndLine int `json:"end_line,omitempty"`
+	// StartColumn / EndColumn are 0-based source column offsets of the
+	// symbol's span. Omitted when zero (most extractors record only line
+	// ranges); promoted to typed nodes columns on the SQLite backend.
+	StartColumn int            `json:"start_column,omitempty"`
+	EndColumn   int            `json:"end_column,omitempty"`
+	Language    string         `json:"language"`
 	Meta       map[string]any `json:"meta,omitempty"`
 	RepoPrefix string         `json:"repo_prefix,omitempty"`
 	// WorkspaceID is the hard graph boundary slug. Two nodes with

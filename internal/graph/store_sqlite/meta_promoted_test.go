@@ -64,6 +64,82 @@ func TestPromotedColumns_RoundTrip(t *testing.T) {
 	}
 }
 
+// TestPromotedColumns_NewColumns verifies the added promoted meta columns
+// (is_async / is_static / is_abstract / is_exported / return_type / updated_at)
+// and the struct-field columns (start_column / end_column) round-trip through
+// their typed columns, and that a SQL filter on is_async resolves WITHOUT
+// decoding the meta blob — the indexable-column acceptance.
+func TestPromotedColumns_NewColumns(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "p.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	s.AddNode(&graph.Node{
+		ID: "f.go::Async", Kind: graph.KindFunction, Name: "Async", FilePath: "f.go",
+		StartLine: 10, EndLine: 20, StartColumn: 4, EndColumn: 1,
+		Meta: map[string]any{
+			"is_async":    true,
+			"is_static":   false,
+			"is_abstract": true,
+			"is_exported": true,
+			"return_type": "error",
+			"updated_at":  int64(1700000000),
+			"complexity":  3, // non-promoted — stays in the blob
+		},
+	})
+	// A second, non-async node to prove the filter is selective.
+	s.AddNode(&graph.Node{
+		ID: "f.go::Sync", Kind: graph.KindFunction, Name: "Sync", FilePath: "f.go",
+		Meta: map[string]any{"is_async": false},
+	})
+
+	// Read-back restores every promoted key into Meta with its exact type,
+	// and the struct columns into the Node fields.
+	n := s.GetNode("f.go::Async")
+	if n == nil {
+		t.Fatal("GetNode returned nil")
+	}
+	assertType[bool](t, n.Meta, "is_async", true)
+	assertType[bool](t, n.Meta, "is_static", false)
+	assertType[bool](t, n.Meta, "is_abstract", true)
+	assertType[bool](t, n.Meta, "is_exported", true)
+	assertType[string](t, n.Meta, "return_type", "error")
+	assertType[int64](t, n.Meta, "updated_at", int64(1700000000))
+	assertType[int](t, n.Meta, "complexity", 3)
+	if n.StartColumn != 4 || n.EndColumn != 1 {
+		t.Errorf("column offsets = (%d,%d), want (4,1)", n.StartColumn, n.EndColumn)
+	}
+
+	// The promoted keys are stripped from the JSON blob; complexity is not.
+	var blob []byte
+	if err := s.db.QueryRow(`SELECT meta FROM nodes WHERE id=?`, "f.go::Async").Scan(&blob); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{"is_async", "is_abstract", "return_type", "updated_at"} {
+		if strings.Contains(string(blob), k) {
+			t.Errorf("blob still contains promoted key %q: %s", k, blob)
+		}
+	}
+	if !strings.Contains(string(blob), "complexity") {
+		t.Errorf("blob missing non-promoted key complexity: %s", blob)
+	}
+
+	// Acceptance: a SQL filter on the typed column resolves the node without
+	// touching the meta blob (only id is selected).
+	var id string
+	var startCol, endCol int
+	if err := s.db.QueryRow(
+		`SELECT id, start_column, end_column FROM nodes WHERE is_async = 1`,
+	).Scan(&id, &startCol, &endCol); err != nil {
+		t.Fatalf("is_async column filter failed: %v", err)
+	}
+	if id != "f.go::Async" || startCol != 4 || endCol != 1 {
+		t.Errorf("filter result = (%q,%d,%d), want (f.go::Async,4,1)", id, startCol, endCol)
+	}
+}
+
 // TestPromotedColumns_ExternalFalse guards the NULL-vs-false distinction:
 // a stored false must round-trip as false, not vanish.
 func TestPromotedColumns_ExternalFalse(t *testing.T) {
