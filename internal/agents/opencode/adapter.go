@@ -1,5 +1,13 @@
 // Package opencode implements the Gortex init integration for
-// OpenCode. OpenCode uses a different MCP schema than the canonical
+// OpenCode. OpenCode reads its project config from `opencode.json` or
+// `opencode.jsonc` at the repo root (and `~/.config/opencode/` for the
+// global config); it does NOT read `.opencode/config.json` — Gortex
+// wrote there historically and OpenCode silently ignored it, so the MCP
+// server was never registered. We now write the MCP stanza to a root
+// `opencode.json` (or merge into an existing `opencode.json` /
+// `opencode.jsonc`).
+//
+// OpenCode uses a different MCP schema than the canonical
 // Claude / Cursor shape:
 //
 //	{
@@ -51,9 +59,24 @@ func (a *Adapter) Detect(env agents.Env) (bool, error) {
 	return false, nil
 }
 
+// projectConfigPath resolves the file the MCP stanza should be written
+// into. OpenCode reads `opencode.json` / `opencode.jsonc` from the repo
+// root, so we merge into an existing one (preferring `.jsonc`, since a
+// hand-authored, comment-bearing config keeps its extension) and
+// otherwise default to a fresh `opencode.json`.
+func projectConfigPath(root string) string {
+	for _, name := range []string{"opencode.jsonc", "opencode.json"} {
+		p := filepath.Join(root, name)
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return filepath.Join(root, "opencode.json")
+}
+
 func (a *Adapter) Plan(env agents.Env) (*agents.Plan, error) {
 	p := &agents.Plan{Files: []agents.FileAction{
-		{Path: filepath.Join(env.Root, ".opencode", "config.json"), Action: agents.ActionWouldMerge, Keys: []string{"mcp"}},
+		{Path: projectConfigPath(env.Root), Action: agents.ActionWouldMerge, Keys: []string{"mcp"}},
 	}}
 	if env.Mode != agents.ModeGlobal && env.SkillsRouting != "" {
 		p.Files = append(p.Files, agents.FileAction{
@@ -77,7 +100,15 @@ func (a *Adapter) Apply(env agents.Env, opts agents.ApplyOpts) (*agents.Result, 
 	}
 	internalutil.Logf(env.Stderr, "[gortex init] setting up OpenCode integration...")
 
-	path := filepath.Join(env.Root, ".opencode", "config.json")
+	path := projectConfigPath(env.Root)
+	// Gortex used to write `.opencode/config.json`, which OpenCode does
+	// not read. If that stale file is still around, point the user at
+	// the config we're actually writing now.
+	if legacy := filepath.Join(env.Root, ".opencode", "config.json"); legacy != path {
+		if _, err := os.Stat(legacy); err == nil {
+			internalutil.Logf(env.Stderr, "[gortex init] note: %s is no longer read by OpenCode; writing the MCP config to %s instead", legacy, filepath.Base(path))
+		}
+	}
 	action, err := agents.MergeJSON(env.Stderr, path, func(root map[string]any, _ bool) (bool, error) {
 		mcpSection, ok := root["mcp"].(map[string]any)
 		if !ok {

@@ -174,6 +174,73 @@ func TestMergeJSONCreatesMergesAndSkipsIdempotent(t *testing.T) {
 	}
 }
 
+// TestStripJSONComments covers the JSONC sanitiser: comments and
+// trailing commas are removed, but `//`, `/* */`, and commas inside
+// string literals are preserved.
+func TestStripJSONComments(t *testing.T) {
+	in := `{
+  // a line comment
+  "url": "https://example.com/path", /* block */
+  "note": "a, b, c // not a comment",
+  "list": [1, 2, 3,],
+  "obj": { "k": "v", },
+}`
+	got := stripJSONComments([]byte(in))
+	var out map[string]any
+	if err := json.Unmarshal(got, &out); err != nil {
+		t.Fatalf("sanitised JSONC did not parse: %v\n---\n%s", err, got)
+	}
+	if out["url"] != "https://example.com/path" {
+		t.Fatalf("`//` inside a string was stripped: %v", out["url"])
+	}
+	if out["note"] != "a, b, c // not a comment" {
+		t.Fatalf("comment/comma inside a string was altered: %v", out["note"])
+	}
+	if list, ok := out["list"].([]any); !ok || len(list) != 3 {
+		t.Fatalf("trailing comma handling broke the array: %v", out["list"])
+	}
+}
+
+// TestMergeJSON_JSONCMergesInsteadOfClobbering guards the OpenCode
+// path: merging into an existing `.jsonc` with comments must preserve
+// the user's data keys (not back the file up as malformed and start
+// fresh).
+func TestMergeJSON_JSONCMergesInsteadOfClobbering(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "opencode.jsonc")
+	if err := os.WriteFile(path, []byte(`{
+  // user config
+  "theme": "dark",
+}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	add := func(root map[string]any, _ bool) (bool, error) {
+		root["added"] = true
+		return true, nil
+	}
+	a, err := MergeJSON(io.Discard, path, add, ApplyOpts{})
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if a.Action != ActionMerge {
+		t.Fatalf("expected merge, got %q", a.Action)
+	}
+	if _, err := os.Stat(path + ".bak"); err == nil {
+		t.Fatalf("a valid commented .jsonc must not be backed up as malformed")
+	}
+	var out map[string]any
+	data, _ := os.ReadFile(path)
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatalf("re-marshalled output not valid JSON: %v", err)
+	}
+	if out["theme"] != "dark" {
+		t.Fatalf("merge dropped the user's data key: %v", out)
+	}
+	if out["added"] != true {
+		t.Fatalf("merge didn't apply the mutation: %v", out)
+	}
+}
+
 // TestRegistryFilterValidatesNames ensures we hard-error on typos
 // rather than silently dropping them — a key UX requirement from the
 // init plan.
