@@ -178,7 +178,18 @@ func MergeJSON(w io.Writer, path string, mutate func(root map[string]any, existe
 			// An empty (or whitespace-only) file is an empty object, not
 			// malformed — no backup, nothing to preserve.
 		default:
-			if err := json.Unmarshal(data, &root); err != nil {
+			// `.jsonc` / `.json5` configs (e.g. OpenCode's
+			// opencode.jsonc) may carry comments and trailing commas
+			// that encoding/json rejects. Sanitize those before the
+			// parse so a commented config merges instead of being
+			// treated as malformed and clobbered. Comments are not
+			// round-tripped through the re-marshal — same policy as
+			// MergeTOML.
+			parse := data
+			if isJSONCPath(path) {
+				parse = stripJSONComments(data)
+			}
+			if err := json.Unmarshal(parse, &root); err != nil {
 				// Don't silently overwrite the user's file even if it's
 				// malformed — keep a backup for recovery. The backup is
 				// written only on the real write path below, so a DryRun
@@ -231,6 +242,109 @@ func MergeJSON(w io.Writer, path string, mutate func(root map[string]any, existe
 	}
 	logf(w, "[gortex init] %s %s", actionVerb(action), path)
 	return FileAction{Path: path, Action: action, Keys: keys}, nil
+}
+
+// isJSONCPath reports whether path uses a JSON-with-comments extension
+// (`.jsonc` / `.json5`) whose contents may need sanitising before they
+// can be handed to encoding/json.
+func isJSONCPath(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".jsonc", ".json5":
+		return true
+	default:
+		return false
+	}
+}
+
+// stripJSONComments rewrites JSONC / JSON5-style input into strict JSON
+// that encoding/json can parse: it drops `//` line comments, `/* */`
+// block comments, and trailing commas before `}` / `]`. String literals
+// (and their escape sequences) are copied through untouched, so a `//`
+// or comma inside a quoted value is preserved. The result is only used
+// for parsing — the merged map is re-marshalled fresh, so the original
+// comments and formatting are not carried over (matching MergeTOML).
+func stripJSONComments(b []byte) []byte {
+	out := make([]byte, 0, len(b))
+	inString, escaped := false, false
+	for i := 0; i < len(b); i++ {
+		c := b[i]
+		if inString {
+			out = append(out, c)
+			switch {
+			case escaped:
+				escaped = false
+			case c == '\\':
+				escaped = true
+			case c == '"':
+				inString = false
+			}
+			continue
+		}
+		switch {
+		case c == '"':
+			inString = true
+			out = append(out, c)
+		case c == '/' && i+1 < len(b) && b[i+1] == '/':
+			// Line comment: skip to (but keep) the newline.
+			for i+1 < len(b) && b[i+1] != '\n' {
+				i++
+			}
+		case c == '/' && i+1 < len(b) && b[i+1] == '*':
+			// Block comment: skip through the closing */.
+			i += 2
+			for i+1 < len(b) && (b[i] != '*' || b[i+1] != '/') {
+				i++
+			}
+			i++ // step onto '/', loop's i++ moves past it
+		default:
+			out = append(out, c)
+		}
+	}
+	return stripTrailingCommas(out)
+}
+
+// stripTrailingCommas removes a comma that is followed (ignoring
+// whitespace) by a `}` or `]` — JSONC / JSON5 permit it, strict JSON
+// does not. Commas inside string literals are left alone.
+func stripTrailingCommas(b []byte) []byte {
+	out := make([]byte, 0, len(b))
+	inString, escaped := false, false
+	for i := range len(b) {
+		c := b[i]
+		if inString {
+			out = append(out, c)
+			switch {
+			case escaped:
+				escaped = false
+			case c == '\\':
+				escaped = true
+			case c == '"':
+				inString = false
+			}
+			continue
+		}
+		if c == '"' {
+			inString = true
+			out = append(out, c)
+			continue
+		}
+		if c == ',' {
+			j := i + 1
+			for j < len(b) {
+				switch b[j] {
+				case ' ', '\t', '\n', '\r':
+					j++
+					continue
+				}
+				break
+			}
+			if j < len(b) && (b[j] == '}' || b[j] == ']') {
+				continue // drop the trailing comma
+			}
+		}
+		out = append(out, c)
+	}
+	return out
 }
 
 // actionVerb renders an ActionKind for human-readable log lines.

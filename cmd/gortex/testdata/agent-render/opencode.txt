@@ -1,4 +1,9 @@
-=== root/.opencode/config.json ===
+=== root/AGENTS.md ===
+<!-- gortex:communities:start -->
+- [example-community](.claude/skills/example/SKILL.md) — example routing block
+
+<!-- gortex:communities:end -->
+=== root/opencode.json ===
 {
   "$schema": "https://opencode.ai/config.json",
   "mcp": {
@@ -15,8 +20,3 @@
     }
   }
 }
-=== root/AGENTS.md ===
-<!-- gortex:communities:start -->
-- [example-community](.claude/skills/example/SKILL.md) — example routing block
-
-<!-- gortex:communities:end -->
