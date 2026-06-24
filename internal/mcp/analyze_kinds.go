@@ -78,6 +78,7 @@ var analyzeKinds = []string{
 	"stale_flags",
 	"string_emitters",
 	"suggest_boundaries",
+	"swiftui_views",
 	"synthesizers",
 	"temporal_orphans",
 	"temporal_verify",

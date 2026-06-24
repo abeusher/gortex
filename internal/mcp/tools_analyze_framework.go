@@ -161,6 +161,45 @@ func routeFramework(n *graph.Node) string {
 // handleAnalyzeDrupalHooks rolls up every detected Drupal hook
 // implementation, grouped by the hook it implements — the queryable face of
 // the hook layer ("which modules implement hook_node_insert?").
+// handleAnalyzeSwiftUIViews groups SwiftUI types by their classified role
+// (component / app_entry), stamped on Meta["swiftui_role"] by the extractor.
+func (s *Server) handleAnalyzeSwiftUIViews(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	roleFilter := strings.TrimSpace(stringArg(req.GetArguments(), "role"))
+	byRole := map[string][]string{}
+	for _, n := range s.graph.AllNodes() {
+		if n == nil || n.Meta == nil {
+			continue
+		}
+		role, _ := n.Meta["swiftui_role"].(string)
+		if role == "" || (roleFilter != "" && role != roleFilter) {
+			continue
+		}
+		byRole[role] = append(byRole[role], n.ID)
+	}
+	type roleRow struct {
+		Role  string   `json:"role"`
+		Types []string `json:"types"`
+		Count int      `json:"count"`
+	}
+	rows := make([]roleRow, 0, len(byRole))
+	for r, ids := range byRole {
+		sort.Strings(ids)
+		rows = append(rows, roleRow{Role: r, Types: ids, Count: len(ids)})
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].Role < rows[j].Role })
+	if isCompact(req) {
+		var b strings.Builder
+		for _, r := range rows {
+			fmt.Fprintf(&b, "%s: %d\n", r.Role, r.Count)
+		}
+		if len(rows) == 0 {
+			b.WriteString("no swiftui views\n")
+		}
+		return mcp.NewToolResultText(b.String()), nil
+	}
+	return s.respondJSONOrTOON(ctx, req, map[string]any{"roles": rows, "total": len(rows)})
+}
+
 func (s *Server) handleAnalyzeDrupalHooks(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	nameFilter := strings.TrimSpace(stringArg(req.GetArguments(), "name"))
 	hooks := map[string][]string{}

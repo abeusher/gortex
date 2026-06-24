@@ -226,6 +226,7 @@ func (e *SwiftExtractor) Extract(filePath string, src []byte) (*parser.Extractio
 
 	captureValueRefCandidates(result, root, filePath, src)
 	captureFnValueCandidates(result, root, filePath, src)
+	captureSwiftUIRoles(result, root, filePath, src)
 	return result, nil
 }
 

@@ -109,6 +109,7 @@ const (
 	SynthReactResolve      = "react-resolve"
 	SynthFastAPIResolve    = "fastapi-resolve"
 	SynthRailsResolve      = "rails-resolve"
+	SynthSwiftUIResolve    = "swiftui-resolve"
 	SynthGinMiddleware     = "gin-middleware"
 	SynthSvelteKitLoad     = "sveltekit-load"
 	SynthSpeculative       = "speculative-dispatch"
@@ -252,6 +253,10 @@ func defaultFrameworkSynthesizers() []FrameworkSynthesizer {
 		// `User.find` / `ApplicationHelper.fmt` call binds to the directory-
 		// located service / model / helper definition named by its receiver.
 		synthFunc{name: SynthRailsResolve, fn: ResolveRailsRefs},
+		// SwiftUI directory-convention fallback: a residual `*View` /
+		// `*ViewModel` / `*Store` / `*Manager` / PascalCase-model reference
+		// binds to its /Views/ /ViewModels/ /Stores/ /Models/ definition.
+		synthFunc{name: SynthSwiftUIResolve, fn: ResolveSwiftUIRefs},
 		// GoFrame reflective route → controller method, joined by the
 		// method's request-struct type rather than its name.
 		synthFunc{name: SynthGoFrameRoute, fn: ResolveGoFrameRoutes},
