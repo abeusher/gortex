@@ -8,6 +8,7 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 
+	"github.com/zzet/gortex/internal/contracts"
 	"github.com/zzet/gortex/internal/graph"
 )
 
@@ -98,6 +99,63 @@ func (s *Server) handleAnalyzeRoutes(ctx context.Context, req mcp.CallToolReques
 		"routes": rows,
 		"total":  len(rows),
 	})
+}
+
+// handleAnalyzeRouteFrameworks lists the registered structural route passes
+// (the FrameworkRoutePass registry) — each pass's name and language filter —
+// alongside the count of route contract nodes per framework in the active
+// graph. It is the queryable face of the route-extraction front door, the
+// sibling of analyze kind=synthesizers for the post-resolution dispatch
+// registry.
+func (s *Server) handleAnalyzeRouteFrameworks(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	frameworkCounts := map[string]int{}
+	for _, n := range s.graph.AllNodes() {
+		if n == nil || n.Kind != graph.KindContract || n.Meta == nil {
+			continue
+		}
+		if fw := routeFramework(n); fw != "" {
+			frameworkCounts[fw]++
+		}
+	}
+	type passRow struct {
+		Name      string   `json:"name"`
+		Languages []string `json:"languages,omitempty"`
+		Routes    int      `json:"routes"`
+	}
+	var passes []passRow
+	for _, p := range contracts.RegisteredFrameworkRoutePasses() {
+		passes = append(passes, passRow{Name: p.Name(), Languages: p.Languages(), Routes: frameworkCounts[p.Name()]})
+	}
+	if isCompact(req) {
+		var b strings.Builder
+		for _, p := range passes {
+			fmt.Fprintf(&b, "%-20s %v  (%d routes)\n", p.Name, p.Languages, p.Routes)
+		}
+		if len(passes) == 0 {
+			b.WriteString("no registered route frameworks\n")
+		}
+		return mcp.NewToolResultText(b.String()), nil
+	}
+	return s.respondJSONOrTOON(ctx, req, map[string]any{
+		"passes":                    passes,
+		"route_counts_by_framework": frameworkCounts,
+		"total_passes":              len(passes),
+	})
+}
+
+// routeFramework reads the framework label off a contract node's Meta
+// (top-level or the nested contract_meta map).
+func routeFramework(n *graph.Node) string {
+	if n == nil {
+		return ""
+	}
+	if meta, ok := n.Meta["contract_meta"].(map[string]any); ok {
+		if fw, _ := meta["framework"].(string); fw != "" {
+			return fw
+		}
+	}
+	fw, _ := n.Meta["framework"].(string)
+	return fw
 }
 
 // routeMethodAndPath pulls the most useful pair of fields out of a

@@ -66,6 +66,7 @@ var analyzeKinds = []string{
 	"retrieval_log",
 	"review",
 	"role",
+	"route_frameworks",
 	"routes",
 	"sast",
 	"scc",

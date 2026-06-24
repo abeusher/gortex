@@ -840,6 +840,8 @@ func (s *Server) handleAnalyze(ctx context.Context, req mcp.CallToolRequest) (*m
 		return s.handleAnalyzeRetrievalLog(ctx, req)
 	case "routes":
 		return s.handleAnalyzeRoutes(ctx, req)
+	case "route_frameworks":
+		return s.handleAnalyzeRouteFrameworks(ctx, req)
 	case "models":
 		return s.handleAnalyzeModels(ctx, req)
 	case "components":
