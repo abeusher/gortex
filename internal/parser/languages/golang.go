@@ -1239,6 +1239,9 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 	// every place it appears only as an argument/element type.
 	emitGoTypeArgReferences(root, src, filePath, fileID, funcRanges, result)
 
+	// GoFrame reflective routes: g.Meta-tagged request structs → controllers.
+	captureGoFrameRoutes(result, root, filePath, src)
+
 	return result, nil
 }
 

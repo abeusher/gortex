@@ -103,6 +103,7 @@ const (
 	SynthSidekiq           = "sidekiq-dispatch"
 	SynthLaravelEvent      = "laravel-event"
 	SynthFnPointerDispatch = "fn-pointer-dispatch"
+	SynthGoFrameRoute      = "goframe-route"
 	SynthGinMiddleware     = "gin-middleware"
 	SynthSvelteKitLoad     = "sveltekit-load"
 	SynthSpeculative       = "speculative-dispatch"
@@ -230,6 +231,9 @@ func defaultFrameworkSynthesizers() []FrameworkSynthesizer {
 		// `c.handlers[idx](c)` indirection so ServeHTTP→handler reachability
 		// flows; repo-scoped, gated on a dispatcher existing.
 		synthFunc{name: SynthGinMiddleware, fn: ResolveGinMiddlewareCalls},
+		// GoFrame reflective route → controller method, joined by the
+		// method's request-struct type rather than its name.
+		synthFunc{name: SynthGoFrameRoute, fn: ResolveGoFrameRoutes},
 		// SvelteKit +page ↔ +page.server load pairing: a route's page component
 		// reaches its server data loader so a trace flows page→load. Repo-scoped.
 		synthFunc{name: SynthSvelteKitLoad, fn: ResolveSvelteKitLoad},

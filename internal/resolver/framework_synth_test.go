@@ -85,6 +85,7 @@ func TestRunFrameworkSynthesizers_Report(t *testing.T) {
 	require.Contains(t, byName, SynthSidekiq)
 	require.Contains(t, byName, SynthLaravelEvent)
 	require.Contains(t, byName, SynthFnPointerDispatch)
+	require.Contains(t, byName, SynthGoFrameRoute)
 	assert.Equal(t, 0, byName[SynthGRPCStub])
 	assert.Equal(t, 0, byName[SynthTemporalStub])
 	assert.Equal(t, 1, byName[SynthEventChannel])
