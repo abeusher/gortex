@@ -92,3 +92,83 @@ func TestNormalizeAnnotationName(t *testing.T) {
 	require.Equal(t, "Data", normalizeAnnotationName("lombok.Data"))
 	require.Equal(t, "Mapper", normalizeAnnotationName(" @org.mapstruct.Mapper "))
 }
+
+func TestMaterializeLombokAccessors_GettersSetters(t *testing.T) {
+	nodes := []*graph.Node{
+		{ID: "User.java::User", Kind: graph.KindType, Name: "User", FilePath: "User.java"},
+		annoNode("annotation::java::Data", "Data"),
+		{ID: "User.java::User.name", Kind: graph.KindField, Name: "name", FilePath: "User.java", Meta: map[string]any{"receiver": "User", "field_type": "String"}},
+		{ID: "User.java::User.active", Kind: graph.KindField, Name: "active", FilePath: "User.java", Meta: map[string]any{"receiver": "User", "field_type": "boolean"}},
+	}
+	edges := []*graph.Edge{{From: "User.java::User", To: "annotation::java::Data", Kind: graph.EdgeAnnotated}}
+	MarkAnnotatedGenerated(nodes, edges)
+	newNodes, newEdges := MaterializeLombokAccessors(nodes)
+
+	byID := map[string]*graph.Node{}
+	for _, n := range newNodes {
+		byID[n.ID] = n
+	}
+	getName := byID["User.java::User.getName"]
+	require.NotNil(t, getName, "getName accessor minted")
+	require.Equal(t, graph.KindMethod, getName.Kind)
+	require.Equal(t, "getName", getName.Name)
+	require.Equal(t, "User", getName.Meta["receiver"])
+	require.Equal(t, true, getName.Meta["synthesized"])
+	require.Equal(t, true, getName.Meta["generated"])
+	require.Equal(t, "lombok", getName.Meta["codegen_tool"])
+	require.NotNil(t, byID["User.java::User.setName"], "setName minted")
+	require.NotNil(t, byID["User.java::User.isActive"], "boolean getter is-prefixed")
+	require.NotNil(t, byID["User.java::User.setActive"], "boolean setter minted")
+
+	var hasDefines, hasGenBy bool
+	for _, e := range newEdges {
+		if e.Kind == graph.EdgeDefines && e.From == "User.java::User" && e.To == "User.java::User.getName" {
+			hasDefines = true
+		}
+		if e.Kind == graph.EdgeGeneratedBy && e.From == "User.java::User.getName" && e.To == "external::generator-tool:lombok" {
+			hasGenBy = true
+		}
+	}
+	require.True(t, hasDefines, "EdgeDefines class→getName")
+	require.True(t, hasGenBy, "EdgeGeneratedBy getName→lombok")
+}
+
+func TestMaterializeLombokAccessors_NoDuplicateHandWrittenWins(t *testing.T) {
+	nodes := []*graph.Node{
+		{ID: "U.java::U", Kind: graph.KindType, Name: "U", FilePath: "U.java", Meta: map[string]any{"codegen_tool": "lombok", "generated_members": []string{"getters", "setters"}}},
+		{ID: "U.java::U.id", Kind: graph.KindField, Name: "id", FilePath: "U.java", Meta: map[string]any{"receiver": "U", "field_type": "int"}},
+		{ID: "U.java::U.getId", Kind: graph.KindMethod, Name: "getId", FilePath: "U.java", Meta: map[string]any{"receiver": "U"}},
+	}
+	newNodes, _ := MaterializeLombokAccessors(nodes)
+	for _, n := range newNodes {
+		if n.ID == "U.java::U.getId" {
+			t.Errorf("hand-written getId must not be re-minted")
+		}
+	}
+	var sawSetId bool
+	for _, n := range newNodes {
+		if n.ID == "U.java::U.setId" {
+			sawSetId = true
+		}
+	}
+	require.True(t, sawSetId, "setId minted (no hand-written version)")
+
+	all := append(append([]*graph.Node{}, nodes...), newNodes...)
+	again, _ := MaterializeLombokAccessors(all)
+	require.Empty(t, again, "a reindex / re-run mints no duplicate accessors")
+}
+
+func TestMaterializeLombokAccessors_BuilderAndLogger(t *testing.T) {
+	nodes := []*graph.Node{
+		{ID: "S.java::S", Kind: graph.KindType, Name: "S", FilePath: "S.java", Meta: map[string]any{"codegen_tool": "lombok", "generated_members": []string{"builder", "logger"}}},
+	}
+	newNodes, _ := MaterializeLombokAccessors(nodes)
+	byID := map[string]*graph.Node{}
+	for _, n := range newNodes {
+		byID[n.ID] = n
+	}
+	require.NotNil(t, byID["S.java::S.builder"], "builder() minted")
+	require.NotNil(t, byID["S.java::SBuilder"], "Builder type minted")
+	require.NotNil(t, byID["S.java::S.log"], "log field minted")
+	require.Equal(t, "org.slf4j.Logger", byID["S.java::S.log"].Meta["field_type"])
+}

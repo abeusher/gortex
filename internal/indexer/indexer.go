@@ -1273,6 +1273,12 @@ func (idx *Indexer) applyCoverageDomains(relPath, lang string, src []byte, resul
 		// source. Flag the annotated symbols so they stay visible.
 		if extra, st := codegen.MarkAnnotatedGenerated(result.Nodes, result.Edges); st.NodesMarked > 0 {
 			result.Edges = append(result.Edges, extra...)
+			// Materialize the actual Lombok accessor members (getX/setX/
+			// builder/log) so `obj.getName()` resolves to a real graph node.
+			if lnodes, ledges := codegen.MaterializeLombokAccessors(result.Nodes); len(lnodes) > 0 {
+				result.Nodes = append(result.Nodes, lnodes...)
+				result.Edges = append(result.Edges, ledges...)
+			}
 		}
 	}
 	// Framework entry points (Alembic migrations / Next.js pages /
