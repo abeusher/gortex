@@ -15,6 +15,10 @@ var (
 	razorModelRe  = regexp.MustCompile(`(?m)^\s*@(?:model|inherits)\s+([A-Za-z_][\w.]*(?:<[^>]*>)?)`)
 	razorInjectRe = regexp.MustCompile(`(?m)^\s*@inject\s+([A-Za-z_][\w.]*(?:<[^>]*>)?)\s+\w+`)
 	razorTypeofRe = regexp.MustCompile(`@typeof\(\s*([A-Za-z_][\w.]*)`)
+	// razorUsingRe matches an `@using Some.Namespace` directive (optionally
+	// `@using static`, whose member-import we skip). The captured namespace
+	// feeds the resolver's import cascade.
+	razorUsingRe = regexp.MustCompile(`(?m)^\s*@using\s+(?:static\s+)?([A-Za-z_][\w.]*)`)
 )
 
 // RazorExtractor extracts Razor / Blazor files (.razor, .cshtml). It carves
@@ -49,10 +53,17 @@ func (e *RazorExtractor) Extract(filePath string, src []byte) (*parser.Extractio
 	componentID := ""
 	if name := razorComponentName(filePath); name != "" {
 		componentID = filePath + "::" + name
+		compMeta := map[string]any{"component": true}
+		// The component's Blazor namespace is its directory path dotted
+		// (`App/Widgets/Counter.razor` → `App.Widgets`), so an `@using`
+		// import of that namespace can bind a `<Counter/>` reference.
+		if ns := razorComponentNamespace(filePath); ns != "" {
+			compMeta["scope_ns"] = ns
+		}
 		result.Nodes = append(result.Nodes, &graph.Node{
 			ID: componentID, Kind: graph.KindType, Name: name,
 			FilePath: filePath, StartLine: 1, EndLine: lineCount, Language: "razor",
-			Meta: map[string]any{"component": true},
+			Meta: compMeta,
 		})
 		result.Edges = append(result.Edges, &graph.Edge{
 			From: fileNode.ID, To: componentID, Kind: graph.EdgeDefines, FilePath: filePath, Line: 1,
@@ -82,6 +93,20 @@ func (e *RazorExtractor) Extract(filePath string, src []byte) (*parser.Extractio
 	}
 	for _, m := range razorTypeofRe.FindAllSubmatch(src, -1) {
 		emitRazorTypeRef(result, fileNode.ID, filePath, string(m[1]))
+	}
+
+	// `@using Some.Namespace` directives (and the cascading _Imports.razor)
+	// feed the resolver's namespace-scoped simple-type binding. Emitted as a
+	// per-file marker the resolver consumes and removes; no new node kind.
+	for _, m := range razorUsingRe.FindAllSubmatch(src, -1) {
+		ns := strings.TrimSpace(string(m[1]))
+		if ns == "" {
+			continue
+		}
+		result.Edges = append(result.Edges, &graph.Edge{
+			From: fileNode.ID, To: "unresolved::razor_using::" + ns,
+			Kind: graph.EdgeImports, FilePath: filePath, Line: 1,
+		})
 	}
 
 	// Markup component tags (`<Child />`) and Blazor generic type-arg
@@ -114,6 +139,23 @@ func razorComponentName(filePath string) string {
 		return ""
 	}
 	return base
+}
+
+// razorComponentNamespace derives a Blazor component's namespace from its
+// repo-relative directory path, dotted (`App/Widgets/Counter.razor` →
+// `App.Widgets`). Returns "" for a root-level component. Path-derived (not
+// RootNamespace-prefixed) so it matches the `@using` namespaces the resolver
+// compares against, which are likewise path-relative in practice.
+func razorComponentNamespace(filePath string) string {
+	filePath = strings.ReplaceAll(filePath, "\\", "/")
+	dir := ""
+	if i := strings.LastIndex(filePath, "/"); i >= 0 {
+		dir = filePath[:i]
+	}
+	if dir == "" {
+		return ""
+	}
+	return strings.ReplaceAll(dir, "/", ".")
 }
 
 // razorCodeWrapPrefix is a single line so the wrap shifts content by exactly one

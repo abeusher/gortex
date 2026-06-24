@@ -480,6 +480,10 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 	// the Lua module/instance requires onto their indexed file nodes.
 	r.resolveLuaRequires()
 
+	// Razor / Blazor `@using` namespace-cascade binding. Same settle window;
+	// binds simple-type references reachable only via an imported namespace.
+	r.resolveRazorUsings()
+
 	// Module attribution for ecosystems without a CGO type-checker
 	// path (Python, Dart, …). Runs serially on the post-resolution
 	// graph so it sees the final `external::*` set after the

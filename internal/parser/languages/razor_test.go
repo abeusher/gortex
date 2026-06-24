@@ -63,6 +63,46 @@ func TestRazorExtractor(t *testing.T) {
 	}
 }
 
+// TestRazorUsingExtraction pins `@using` directive extraction (with the
+// `@using static` member-import form skipped to its namespace) and the
+// path-derived component namespace.
+func TestRazorUsingExtraction(t *testing.T) {
+	const razor = `@using App.Widgets
+@using static System.Math
+
+<Counter />
+`
+	res, err := NewRazorExtractor().Extract("Components/Page.razor", []byte(razor))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	usings := map[string]bool{}
+	for _, e := range res.Edges {
+		if e.Kind == graph.EdgeImports && strings.HasPrefix(e.To, "unresolved::razor_using::") {
+			usings[strings.TrimPrefix(e.To, "unresolved::razor_using::")] = true
+		}
+	}
+	for _, want := range []string{"App.Widgets", "System.Math"} {
+		if !usings[want] {
+			t.Errorf("missing @using namespace %q (got: %v)", want, usings)
+		}
+	}
+
+	var comp *graph.Node
+	for _, n := range res.Nodes {
+		if n.Name == "Page" && n.Meta["component"] == true {
+			comp = n
+		}
+	}
+	if comp == nil {
+		t.Fatal("Page component node not emitted")
+	}
+	if comp.Meta["scope_ns"] != "Components" {
+		t.Errorf("component scope_ns = %v, want Components", comp.Meta["scope_ns"])
+	}
+}
+
 // TestRazorBraceMatcherSkipsStringsAndCarvesBareBlock is the B4 named test: a
 // `}` inside a C# string or comment in a @code block must not truncate the
 // block (which dropped every member after it), and a bare @{ } block is also
