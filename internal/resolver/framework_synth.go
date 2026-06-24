@@ -107,6 +107,7 @@ const (
 	SynthDjangoDescriptor  = "django-descriptor"
 	SynthExpressResolve    = "express-resolve"
 	SynthReactResolve      = "react-resolve"
+	SynthFastAPIResolve    = "fastapi-resolve"
 	SynthGinMiddleware     = "gin-middleware"
 	SynthSvelteKitLoad     = "sveltekit-load"
 	SynthSpeculative       = "speculative-dispatch"
@@ -241,6 +242,11 @@ func defaultFrameworkSynthesizers() []FrameworkSynthesizer {
 		// its /hooks/ definition; a `*Context`/`*Provider` reference binds to
 		// /context/ or /providers/, with the suffix-strip fallback.
 		synthFunc{name: SynthReactResolve, fn: ResolveReactHooksContext},
+		// FastAPI dependency / router fallback: a residual `Depends(get_db)`
+		// binds to a /dependencies/ provider, an `include_router(api_router)`
+		// to a /routers/ definition — only when reference resolution left the
+		// target unresolved.
+		synthFunc{name: SynthFastAPIResolve, fn: ResolveFastAPIDeps},
 		// GoFrame reflective route → controller method, joined by the
 		// method's request-struct type rather than its name.
 		synthFunc{name: SynthGoFrameRoute, fn: ResolveGoFrameRoutes},
