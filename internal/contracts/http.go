@@ -322,16 +322,10 @@ var httpPatterns = []httpPattern{
 	// `Router::new().route("/users/:id", post(create).delete(remove))`.
 	// The method comes from the `get|post|...` function call; the
 	// path is the first string literal in `.route(`.
-	{
-		re:         regexp.MustCompile(`\.route\(\s*"([^"]+)"\s*,\s*(get|post|put|delete|patch|head|options)\(\s*(\w+)?`),
-		role:       RoleProvider,
-		methodGrp:  2,
-		pathGrp:    1,
-		handlerGrp: 3,
-		framework:  "axum",
-		confidence: 0.9,
-		languages:  []string{"rust"},
-	},
+	// Axum `.route("/path", <chain>)` provider routes — including the
+	// chained-method form `get(h1).post(h2)` — are handled by the Rust route
+	// pass (http_rust.go), which emits one Contract per method in the chain.
+
 	// Actix-web macro form: `#[get("/path")]` / `#[post("/path")]`.
 	{
 		re:         regexp.MustCompile(`#\[(get|post|put|delete|patch|head|options)\(\s*"([^"]+)"`),
