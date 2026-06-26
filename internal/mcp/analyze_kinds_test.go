@@ -96,6 +96,36 @@ func collectAnalyzeSwitchCases(t *testing.T, file *ast.File) []string {
 	return cases
 }
 
+// TestAnalyzeKindDescriptions_Complete is the anti-drift guard for the
+// per-kind descriptions surfaced by `gortex analyze kinds`: it asserts
+// every canonical kind has a non-empty description, and that the map
+// carries no orphan key (a description for a kind that no longer exists).
+// Adding a kind to analyzeKinds without describing it — or removing one
+// without dropping its description — fails here.
+func TestAnalyzeKindDescriptions_Complete(t *testing.T) {
+	have := make(map[string]bool, len(analyzeKinds))
+	for _, k := range analyzeKinds {
+		have[k] = true
+		desc, ok := analyzeKindDescriptions[k]
+		if !ok || desc == "" {
+			t.Errorf("analyze kind %q has no description in analyzeKindDescriptions", k)
+		}
+		if got := AnalyzeKindDescription(k); got != desc {
+			t.Errorf("AnalyzeKindDescription(%q) = %q, want %q", k, got, desc)
+		}
+	}
+	for k := range analyzeKindDescriptions {
+		if !have[k] {
+			t.Errorf("analyzeKindDescriptions key %q has no matching analyze kind", k)
+		}
+	}
+
+	// An unknown kind resolves to the empty string, not a panic.
+	if got := AnalyzeKindDescription("definitely_not_a_kind"); got != "" {
+		t.Errorf("AnalyzeKindDescription(unknown) = %q, want empty", got)
+	}
+}
+
 // TestAnalyzeKinds_SortedDefensiveCopy asserts AnalyzeKinds returns a
 // sorted copy that callers may mutate without corrupting the package
 // source.

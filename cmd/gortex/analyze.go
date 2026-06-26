@@ -55,11 +55,27 @@ Requires a running daemon that tracks the repo.`,
 // SSOT — no daemon needed.
 var analyzeKindsCmd = &cobra.Command{
 	Use:   "kinds",
-	Short: "List the valid analyze kinds (no daemon needed)",
+	Short: "List the valid analyze kinds with a one-line description (no daemon needed)",
 	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, _ []string) error {
-		for _, k := range gortexmcp.AnalyzeKinds() {
-			fmt.Fprintln(cmd.OutOrStdout(), k)
+		kinds := gortexmcp.AnalyzeKinds()
+
+		// Width the kind column to the widest name so the descriptions
+		// line up into a readable two-column reference listing.
+		width := 0
+		for _, k := range kinds {
+			if len(k) > width {
+				width = len(k)
+			}
+		}
+
+		out := cmd.OutOrStdout()
+		for _, k := range kinds {
+			if desc := gortexmcp.AnalyzeKindDescription(k); desc != "" {
+				fmt.Fprintf(out, "%-*s  %s\n", width, k, desc)
+			} else {
+				fmt.Fprintln(out, k)
+			}
 		}
 		return nil
 	},
