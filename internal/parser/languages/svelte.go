@@ -49,6 +49,8 @@ func (e *SvelteExtractor) Extract(filePath string, src []byte) (*parser.Extracti
 	carveAndDelegateScripts(src, filePath, fileNode.ID, "svelte", e.ts, e.js, result)
 	mineTemplateComponentUsages(src, filePath, componentID, "svelte", result)
 	applyFrameworkTemplatePasses(src, filePath, componentID, "svelte", result)
+	// `$store` auto-subscriptions in markup resolve to the imported store.
+	mineSvelteStoreSubscriptions(src, filePath, componentID, result)
 	return result, nil
 }
 
