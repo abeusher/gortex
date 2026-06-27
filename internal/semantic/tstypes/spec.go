@@ -244,10 +244,13 @@ func firstChildOfType(n *sitter.Node, t string) *sitter.Node {
 }
 
 // identifierLike reports whether the node is a bare single-token name
-// usable for scope lookup.
+// usable for scope lookup. "name" is tree-sitter-php's bare identifier
+// node — it is the scope of a static `Foo::bar()` call, so it must be
+// recognised for the type-qualified receiver path; no other registered
+// grammar emits a "name" node in receiver / initializer position.
 func identifierLike(t string) bool {
 	switch t {
-	case "identifier", "constant", "type_identifier", "variable_name", "local_variable":
+	case "identifier", "constant", "type_identifier", "variable_name", "local_variable", "name":
 		return true
 	}
 	return false

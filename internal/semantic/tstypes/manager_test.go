@@ -69,8 +69,8 @@ pub fn main() {
 	}
 }
 
-// All six in-process providers register on a plain manager and resolve
-// the mixed fixture without any LSP router or external binary.
+// All in-process providers register on a plain manager and resolve the
+// mixed fixture without any LSP router or external binary.
 func TestManager_SupplementalProvidersEnrichWithoutLSP(t *testing.T) {
 	g, dir := buildFixture(t, mixedFixture())
 	mgr := semantic.NewManager(semantic.Config{Enabled: true}, zap.NewNop())

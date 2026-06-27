@@ -42,6 +42,7 @@ func DefaultProviders(logger *zap.Logger) []*Provider {
 		NewProvider(RustSpec(), logger),
 		NewProvider(TypeScriptSpec(), logger),
 		NewProvider(CSharpSpec(), logger),
+		NewProvider(PHPSpec(), logger),
 	}
 }
 
