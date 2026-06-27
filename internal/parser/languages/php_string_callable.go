@@ -12,20 +12,33 @@ import (
 // one of these calls is a function-as-value reference the gate resolves
 // repo-wide (unique-or-drop), bypassing the same-file scope.
 var phpCallableHOFs = map[string]bool{
-	"array_map":                  true,
-	"array_filter":               true,
-	"array_walk":                 true,
-	"array_walk_recursive":       true,
-	"array_reduce":               true,
-	"usort":                      true,
-	"uasort":                     true,
-	"uksort":                     true,
-	"call_user_func":             true,
-	"call_user_func_array":       true,
-	"preg_replace_callback":      true,
-	"register_shutdown_function": true,
-	"set_error_handler":          true,
-	"spl_autoload_register":      true,
+	"array_map":                   true,
+	"array_filter":                true,
+	"array_walk":                  true,
+	"array_walk_recursive":        true,
+	"array_reduce":                true,
+	"usort":                       true,
+	"uasort":                      true,
+	"uksort":                      true,
+	"call_user_func":              true,
+	"call_user_func_array":        true,
+	"preg_replace_callback":       true,
+	"register_shutdown_function":  true,
+	"set_error_handler":           true,
+	"spl_autoload_register":       true,
+	"array_udiff":                 true,
+	"array_udiff_assoc":           true,
+	"array_uintersect":            true,
+	"array_uintersect_assoc":      true,
+	"forward_static_call":         true,
+	"forward_static_call_array":   true,
+	"preg_replace_callback_array": true,
+	"register_tick_function":      true,
+	"set_exception_handler":       true,
+	"ob_start":                    true,
+	"iterator_apply":              true,
+	"header_register_callback":    true,
+	"is_callable":                 true,
 }
 
 // capturePHPStringCallables records each string / array callable passed to a
@@ -55,7 +68,8 @@ func (e *PHPExtractor) capturePHPStringCallables(result *parser.ExtractionResult
 		if i := strings.LastIndex(callee, "\\"); i >= 0 {
 			callee = callee[i+1:]
 		}
-		if !phpCallableHOFs[strings.ToLower(callee)] {
+		calleeLower := strings.ToLower(callee)
+		if !phpCallableHOFs[calleeLower] {
 			return
 		}
 		args := n.ChildByFieldName("arguments")
@@ -67,24 +81,37 @@ func (e *PHPExtractor) capturePHPStringCallables(result *parser.ExtractionResult
 		if fromID == "" {
 			return
 		}
-		for i := 0; i < int(args.NamedChildCount()); i++ {
-			a := args.NamedChild(i)
-			if a == nil {
-				continue
-			}
-			name, recvHint, ok := e.phpCallableArg(a, src)
-			if !ok {
-				continue
-			}
-			key := fromID + "\x00php\x00" + name + "\x00" + recvHint
+		emit := func(name, recvHint string) {
+			key := fromID + "|" + name + "|" + recvHint
 			if seen[key] {
-				continue
+				return
 			}
 			seen[key] = true
 			cands = append(cands, FnValueCandidate{
 				FromID: fromID, Name: name, FilePath: filePath, Line: line,
 				Form: "php_string_callable", RecvHint: recvHint, Lang: "php", SkipGate: true,
 			})
+		}
+		// preg_replace_callback_array passes a `pattern => callback` map; the
+		// callbacks live on the value side, so resolve each value rather than
+		// scanning the array flat (its regex-pattern keys are not callables).
+		callbackArray := calleeLower == "preg_replace_callback_array"
+		for i := 0; i < int(args.NamedChildCount()); i++ {
+			a := args.NamedChild(i)
+			if a == nil {
+				continue
+			}
+			if callbackArray {
+				for _, cb := range e.phpCallbackArrayValues(a, src) {
+					emit(cb.name, cb.recvHint)
+				}
+				continue
+			}
+			name, recvHint, ok := e.phpCallableArg(a, src)
+			if !ok {
+				continue
+			}
+			emit(name, recvHint)
 		}
 	})
 	EmitFnValueCandidates(result, cands)
@@ -124,6 +151,41 @@ func (e *PHPExtractor) phpCallableArg(a *sitter.Node, src []byte) (name, recvHin
 		}
 	}
 	return "", "", false
+}
+
+// phpCallableRef is a resolved (name, receiver-hint) callable pair.
+type phpCallableRef struct{ name, recvHint string }
+
+// phpCallbackArrayValues resolves the value-side callable of each element of
+// a `pattern => callback` array literal -- the shape preg_replace_callback_array
+// takes. Keys (regex patterns) are skipped; each value runs through
+// phpCallableArg so string, `Class::method`, and `[$obj, 'm']` callbacks all
+// resolve.
+func (e *PHPExtractor) phpCallbackArrayValues(a *sitter.Node, src []byte) []phpCallableRef {
+	node := a
+	if a.Type() == "argument" && a.NamedChildCount() > 0 {
+		node = a.NamedChild(0)
+	}
+	if node == nil || node.Type() != "array_creation_expression" {
+		return nil
+	}
+	var out []phpCallableRef
+	for i := 0; i < int(node.NamedChildCount()); i++ {
+		el := node.NamedChild(i)
+		if el == nil || el.Type() != "array_element_initializer" {
+			continue
+		}
+		// The value side is the last named child: `key => value` has two,
+		// a bare `value` element has one.
+		val := el.NamedChild(int(el.NamedChildCount()) - 1)
+		if val == nil {
+			continue
+		}
+		if name, recvHint, ok := e.phpCallableArg(val, src); ok {
+			out = append(out, phpCallableRef{name: name, recvHint: recvHint})
+		}
+	}
+	return out
 }
 
 // phpCallableFromString parses a string callable into (function/method name,

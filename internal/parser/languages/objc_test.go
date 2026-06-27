@@ -91,3 +91,48 @@ func TestObjcPropertyTypeAndReceiver(t *testing.T) {
 	require.NotNil(t, byName["count"])
 	assert.Equal(t, "NSInteger", byName["count"].Meta["field_type"])
 }
+
+func TestObjCExtractor_SelectorFnValue(t *testing.T) {
+	const objc = `@implementation Widget
+- (void)doThing:(id)arg { }
+- (void)tap {
+    [self performSelector:@selector(doThing:)];
+}
+@end
+`
+	res, err := NewObjCExtractor().Extract("Widget.m", []byte(objc))
+	require.NoError(t, err)
+
+	var found *graph.Edge
+	for _, e := range res.Edges {
+		if e.Meta == nil {
+			continue
+		}
+		if v, _ := e.Meta["via"].(string); v != "callback_candidate" {
+			continue
+		}
+		if name, _ := e.Meta["fn_value_name"].(string); name == "doThing:" {
+			found = e
+		}
+	}
+	require.NotNil(t, found, "@selector(doThing:) should capture doThing: as a function value")
+	assert.Equal(t, "Widget.m::tap", found.From, "captured in the enclosing method")
+	assert.Equal(t, "selector", found.Meta["fn_ref_form"])
+}
+
+func TestObjCExtractor_ProtocolConformance(t *testing.T) {
+	const objc = `@interface Widget : NSObject <Drawable, Tappable>
+@end
+`
+	res, err := NewObjCExtractor().Extract("Widget.h", []byte(objc))
+	require.NoError(t, err)
+	var cls *graph.Node
+	for _, n := range res.Nodes {
+		if n.Name == "Widget" && n.Kind == graph.KindType {
+			cls = n
+		}
+	}
+	require.NotNil(t, cls, "interface Widget should be extracted")
+	require.NotNil(t, cls.Meta, "Widget should carry conformance meta")
+	assert.Equal(t, "Drawable,Tappable", cls.Meta["objc_protocols"])
+}

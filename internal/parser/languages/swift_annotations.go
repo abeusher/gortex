@@ -360,3 +360,55 @@ func swiftUserTypeName(node *sitter.Node, src []byte) string {
 	}
 	return last
 }
+
+// swiftHasAttr reports whether a declaration carries the named attribute
+// (e.g. "objc", "nonobjc", "objcMembers") among its modifiers.
+func swiftHasAttr(defNode *sitter.Node, attrName string, src []byte) bool {
+	mods := swiftModifiers(defNode)
+	if mods == nil {
+		return false
+	}
+	for i := 0; i < int(mods.NamedChildCount()); i++ {
+		attr := mods.NamedChild(i)
+		if attr == nil || attr.Type() != "attribute" {
+			continue
+		}
+		if name, _ := swiftAttributeNameAndArgs(attr, src); name == attrName {
+			return true
+		}
+	}
+	return false
+}
+
+// swiftObjCSelectorExposed computes the Objective-C selector a Swift method
+// is exposed under, accounting for an @objcMembers class that exposes every
+// member implicitly. The member's own @objc wins; otherwise, when the
+// enclosing class is @objcMembers and the member is not opted out with
+// @nonobjc, the selector is derived as if the member were @objc. Returns ""
+// when the member is not exposed to Objective-C.
+func swiftObjCSelectorExposed(defNode *sitter.Node, baseName string, classObjCMembers bool, src []byte) string {
+	if sel := swiftObjCSelector(defNode, baseName, src); sel != "" {
+		return sel
+	}
+	if classObjCMembers && !swiftHasAttr(defNode, "nonobjc", src) {
+		return buildSwiftObjCSelector(baseName, swiftArgLabels(swiftParamClause(defNode, src)))
+	}
+	return ""
+}
+
+// swiftObjCPropertySelectorsExposed mirrors swiftObjCPropertySelectors but
+// also exposes a property implicitly when its enclosing class is
+// @objcMembers and the property is not opted out with @nonobjc.
+func swiftObjCPropertySelectorsExposed(defNode *sitter.Node, name string, mutable, classObjCMembers bool, src []byte) (getter, setter string) {
+	if g, s := swiftObjCPropertySelectors(defNode, name, mutable, src); g != "" {
+		return g, s
+	}
+	if name != "" && classObjCMembers && !swiftHasAttr(defNode, "nonobjc", src) {
+		getter = name
+		if mutable {
+			setter = "set" + capitalizeFirst(getter) + ":"
+		}
+		return getter, setter
+	}
+	return "", ""
+}

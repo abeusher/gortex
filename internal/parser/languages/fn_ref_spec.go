@@ -109,15 +109,31 @@ func fnRefSpecFor(lang string) fnRefSpec {
 			idNodeTypes: []string{"identifier", "member_access_expression"},
 			dispatch:    astCalleeField,
 		}
-	case "java", "c", "cpp", "dart":
+	case "java", "c", "dart":
 		// Bare-identifier value idiom; AST dispatch tightens the call check
 		// (Java `method_invocation`, C/Dart `call_expression`).
 		return fnRefSpec{idNodeTypes: []string{"identifier"}, dispatch: astCalleeField}
+	case "cpp":
+		// Bare-identifier value idiom plus the C++ address-of forms: a `&fn`
+		// value-arg (pointer_expression) and a `&Cls::method` pointer-to-member
+		// (qualified_identifier). The pointer-to-member names a method of
+		// another class, so it resolves ungated.
+		return fnRefSpec{
+			idNodeTypes: []string{"identifier", "qualified_identifier", "scoped_identifier"},
+			unwrapForms: map[string]string{"pointer_expression": "address_of", "unary_expression": "address_of"},
+			dispatch:    astCalleeField,
+			ungated:     true,
+		}
 	case "php", "ruby":
 		// First-class refs are dominated by the special forms (PHP string
 		// callables, Ruby `method(:sym)` / `&:sym`); the bare path stays on the
 		// byte heuristic.
 		return fnRefSpec{idNodeTypes: []string{"identifier"}, dispatch: dispatchByteParen}
+	case "lua", "luau":
+		// Lua functions are first-class values: a bare `setCallback(onClick)`
+		// and a table-member `register(handlers.onTick)` both pass a function
+		// by value. A dot_index_expression resolves to its trailing field name.
+		return fnRefSpec{idNodeTypes: []string{"identifier", "dot_index_expression"}, dispatch: dispatchByteParen}
 	}
 	return defaultFnRefSpec
 }
@@ -148,6 +164,14 @@ func fnRefNodeName(n *sitter.Node, src []byte) string {
 		if name := n.ChildByFieldName("name"); name != nil {
 			return name.Content(src)
 		}
+	case "dot_index_expression":
+		// Lua `tbl.method` -- the trailing identifier names the function.
+		if f := n.ChildByFieldName("field"); f != nil {
+			return f.Content(src)
+		}
+		if k := int(n.NamedChildCount()); k > 0 {
+			return n.NamedChild(k - 1).Content(src)
+		}
 	}
 	return n.Content(src)
 }
@@ -157,6 +181,7 @@ func fnRefNodeName(n *sitter.Node, src []byte) string {
 // resolve cross-module (ungated) when the trailing name is not file-local.
 var qualifiedFnRefNodeTypes = map[string]bool{
 	"scoped_identifier":        true,
+	"qualified_identifier":     true,
 	"selector_expression":      true,
 	"member_expression":        true,
 	"attribute":                true,

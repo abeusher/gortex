@@ -14,14 +14,14 @@ import (
 var (
 	objcInterfaceRe = regexp.MustCompile(`(?m)^\s*@interface\s+(\w+)`)
 	// objcSuperRe captures the superclass of `@interface X : Super` (group 1).
-	objcSuperRe = regexp.MustCompile(`@interface\s+\w+\s*:\s*(\w+)`)
-	objcProtocolRe  = regexp.MustCompile(`(?m)^\s*@protocol\s+(\w+)`)
-	objcImplRe      = regexp.MustCompile(`(?m)^\s*@implementation\s+(\w+)`)
-	objcMethodRe    = regexp.MustCompile(`(?m)^\s*([-+])\s*\(\s*[^)]*\)\s*([A-Za-z_]\w*(?:\s*:\s*\([^)]*\)\s*\w+(?:\s+[A-Za-z_]\w*\s*:\s*\([^)]*\)\s*\w+)*)?)`)
-	objcFuncRe      = regexp.MustCompile(`(?m)^\s*(?:static\s+|extern\s+|inline\s+)*[A-Za-z_][\w\s\*]*?\s+([A-Za-z_]\w*)\s*\([^)]*\)\s*\{`)
-	objcImportQRe   = regexp.MustCompile(`(?m)^\s*#import\s+"([^"]+)"`)
-	objcImportARe   = regexp.MustCompile(`(?m)^\s*#import\s+<([^>]+)>`)
-	objcAtImportRe  = regexp.MustCompile(`(?m)^\s*@import\s+([\w.]+)`)
+	objcSuperRe    = regexp.MustCompile(`@interface\s+\w+\s*:\s*(\w+)`)
+	objcProtocolRe = regexp.MustCompile(`(?m)^\s*@protocol\s+(\w+)`)
+	objcImplRe     = regexp.MustCompile(`(?m)^\s*@implementation\s+(\w+)`)
+	objcMethodRe   = regexp.MustCompile(`(?m)^\s*([-+])\s*\(\s*[^)]*\)\s*([A-Za-z_]\w*(?:\s*:\s*\([^)]*\)\s*\w+(?:\s+[A-Za-z_]\w*\s*:\s*\([^)]*\)\s*\w+)*)?)`)
+	objcFuncRe     = regexp.MustCompile(`(?m)^\s*(?:static\s+|extern\s+|inline\s+)*[A-Za-z_][\w\s\*]*?\s+([A-Za-z_]\w*)\s*\([^)]*\)\s*\{`)
+	objcImportQRe  = regexp.MustCompile(`(?m)^\s*#import\s+"([^"]+)"`)
+	objcImportARe  = regexp.MustCompile(`(?m)^\s*#import\s+<([^>]+)>`)
+	objcAtImportRe = regexp.MustCompile(`(?m)^\s*@import\s+([\w.]+)`)
 )
 
 // ObjCExtractor extracts Objective-C / Objective-C++ source using regex.
@@ -108,6 +108,11 @@ func (e *ObjCExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 			if role := uikitRoleFor(map[string]bool{super: true}); role != "" {
 				stampObjCNodeMeta(result, filePath+"::"+name, "uikit_role", role)
 			}
+		}
+		// Protocol conformance: `@interface X : Base <P1, P2>` adopts P1, P2;
+		// stamp them for the Swift<->ObjC bridge synthesizer.
+		if protos := objcConformedProtocols(src, m[0]); protos != "" {
+			stampObjCNodeMeta(result, filePath+"::"+name, "objc_protocols", protos)
 		}
 	}
 	for _, m := range objcProtocolRe.FindAllSubmatchIndex(src, -1) {
@@ -255,6 +260,17 @@ func (e *ObjCExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 	mineRNNativeEmits(src, rnObjCSendEventRe, func(line int) string {
 		return objcEnclosing(methodRanges, line)
 	}, filePath, "objc", result)
+
+	// A custom paren-form sendEvent(...) wrapper (distinct from the bracketed
+	// sendEventWithName:) is also an RN emit; the two forms are syntactically
+	// disjoint, so mining it separately does not double-count.
+	mineRNNativeEmits(src, rnSendEventWrapperRe, func(line int) string {
+		return objcEnclosing(methodRanges, line)
+	}, filePath, "objc", result)
+
+	// @selector(doThing:) literals reference a method by name without a call
+	// edge; capture each as a function-as-value reference to the selector.
+	captureObjCSelectors(src, methodRanges, filePath, result)
 
 	// @property declarations become field members of their enclosing class,
 	// carrying the declared type and the owning class so the property is a
@@ -626,3 +642,30 @@ func objcComponentName(class string) string {
 }
 
 var _ parser.Extractor = (*ObjCExtractor)(nil)
+
+// objcConformedProtocols returns the comma-joined protocol names adopted on
+// an @interface declaration line (`@interface X : Base <P1, P2>` -> "P1,P2"),
+// or "" when none are adopted. The `<...>` clause on the declaration line is
+// the adopted-protocol list.
+func objcConformedProtocols(src []byte, from int) string {
+	end := from
+	for end < len(src) && src[end] != '\n' {
+		end++
+	}
+	line := string(src[from:end])
+	open := strings.IndexByte(line, '<')
+	if open < 0 {
+		return ""
+	}
+	closeIdx := strings.IndexByte(line[open:], '>')
+	if closeIdx < 0 {
+		return ""
+	}
+	var protos []string
+	for _, pr := range strings.Split(line[open+1:open+closeIdx], ",") {
+		if pr = strings.TrimSpace(pr); pr != "" {
+			protos = append(protos, pr)
+		}
+	}
+	return strings.Join(protos, ",")
+}

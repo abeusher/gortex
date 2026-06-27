@@ -95,6 +95,7 @@ const (
 	SynthSQLCallsite       = "sql-callsite"
 	SynthStoreFactory      = "store-factory"
 	SynthReduxThunk        = "redux-thunk"
+	SynthNgRxEffect        = "ngrx-effect"
 	SynthObjectRegistry    = "object-registry"
 	SynthRTKQuery          = "rtk-query"
 	SynthVuexDispatch      = "vuex-dispatch"
@@ -207,6 +208,10 @@ func defaultFrameworkSynthesizers() []FrameworkSynthesizer {
 		// After store-factory so its action nodes are indexed for the
 		// thunk → reducer cross-link.
 		synthFunc{name: SynthReduxThunk, fn: ResolveReduxThunkCalls},
+		// NgRx effects: a createEffect(() => actions$.pipe(ofType(X))) effect ->
+		// the action X it reacts to. After the store/thunk passes so action
+		// creator nodes are indexed.
+		synthFunc{name: SynthNgRxEffect, fn: ResolveNgRxEffects},
 		// Object-literal command/handler registry dispatch →
 		// `new registry[key]().execute()`. Runs before the speculative
 		// pass so a claimed dispatch site suppresses the hidden best-guess.

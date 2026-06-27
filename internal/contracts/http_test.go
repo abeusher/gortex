@@ -959,3 +959,45 @@ func fetchUsers() {
 		}
 	}
 }
+
+func TestHTTPExtractor_CSharp_RoutePrefixJoin(t *testing.T) {
+	src := []byte(`using Microsoft.AspNetCore.Mvc;
+
+[ApiController]
+[Route("api/[controller]")]
+public class UsersController : ControllerBase {
+    [HttpGet("{id}")]
+    public IActionResult GetById(int id) { return Ok(); }
+
+    [Route("search")]
+    public IActionResult Search() { return Ok(); }
+}
+`)
+	nodes := []*graph.Node{
+		{ID: "Users.cs::UsersController", Name: "UsersController", Kind: graph.KindType, FilePath: "Users.cs", StartLine: 5, EndLine: 11},
+		{ID: "Users.cs::UsersController.GetById", Name: "GetById", Kind: graph.KindMethod, FilePath: "Users.cs", StartLine: 6, EndLine: 7},
+		{ID: "Users.cs::UsersController.Search", Name: "Search", Kind: graph.KindMethod, FilePath: "Users.cs", StartLine: 9, EndLine: 10},
+	}
+	cs := (&HTTPExtractor{}).Extract("Users.cs", src, nodes, nil)
+	byID := map[string]Contract{}
+	var ids []string
+	for _, c := range cs {
+		byID[c.ID] = c
+		ids = append(ids, c.ID)
+	}
+
+	get, ok := byID["http::GET::/api/users/{p1}"]
+	if !ok {
+		t.Fatalf("expected prefix-joined GET route http::GET::/api/users/{p1}, got %v", ids)
+	}
+	if get.SymbolID != "Users.cs::UsersController.GetById" {
+		t.Errorf("GET route should bind GetById, got %q", get.SymbolID)
+	}
+	search, ok := byID["http::ANY::/api/users/search"]
+	if !ok {
+		t.Fatalf("expected verb-less route http::ANY::/api/users/search, got %v", ids)
+	}
+	if search.SymbolID != "Users.cs::UsersController.Search" {
+		t.Errorf("verb-less route should bind Search, got %q", search.SymbolID)
+	}
+}

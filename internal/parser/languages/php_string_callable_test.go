@@ -69,3 +69,27 @@ function run($a, $svc) {
 		t.Errorf("['Acme','isValid'] array callable not captured with recv hint (got: %v)", cands["isValid"])
 	}
 }
+
+func TestPHPStringCallable_ExtendedBuiltins(t *testing.T) {
+	src := []byte(`<?php
+function run($a, $b, $s, $obj) {
+    array_udiff($a, $b, 'cmp');
+    preg_replace_callback_array(['/x/' => 'cb', '/y/' => 'Acme::handle'], $s);
+    set_exception_handler('onError');
+    register_tick_function([$obj, 'tick']);
+}
+`)
+	res, err := NewPHPExtractor().Extract("a.php", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cands := fnValueCands(res)
+	for _, name := range []string{"cmp", "cb", "handle", "onError", "tick"} {
+		if _, ok := cands[name]; !ok {
+			t.Errorf("expected callable %q captured (got: %v)", name, keys(cands))
+		}
+	}
+	if m, ok := cands["handle"]; !ok || m["fn_ref_recv_hint"] != "Acme" {
+		t.Errorf("preg_replace_callback_array value Acme::handle recv hint = %v", cands["handle"])
+	}
+}

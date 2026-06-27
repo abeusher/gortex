@@ -131,3 +131,67 @@ class Plain: NSObject {
 		}
 	}
 }
+
+func TestSwift_ObjCMembersPropagation(t *testing.T) {
+	src := `@objcMembers
+class C {
+    func a() {}
+    @nonobjc func b() {}
+    func move(from x: Int, to y: Int) {}
+    var title: String = ""
+    @nonobjc var secret: String = ""
+}
+`
+	nodes, _ := runSwiftExtract(t, "C.swift", src)
+	sel := map[string]any{}
+	for _, n := range nodes {
+		if n.Meta == nil {
+			continue
+		}
+		if s, ok := n.Meta["objc_selector"]; ok {
+			sel[n.Name] = s
+		}
+	}
+	if sel["a"] != "a" {
+		t.Errorf("@objcMembers should expose a with selector a, got %v", sel["a"])
+	}
+	if sel["move"] != "moveFrom:to:" {
+		t.Errorf("@objcMembers should derive move(from:to:) selector moveFrom:to:, got %v", sel["move"])
+	}
+	if sel["title"] != "title" {
+		t.Errorf("@objcMembers should expose property title, got %v", sel["title"])
+	}
+	if _, ok := sel["b"]; ok {
+		t.Errorf("@nonobjc func b must not be exposed, got selector %v", sel["b"])
+	}
+	if _, ok := sel["secret"]; ok {
+		t.Errorf("@nonobjc var secret must not be exposed, got selector %v", sel["secret"])
+	}
+}
+
+func TestSwift_ObjCProtocolFlag(t *testing.T) {
+	src := `@objc protocol Drawable {
+    func draw()
+}
+protocol Plain {
+    func x()
+}
+`
+	nodes, _ := runSwiftExtract(t, "P.swift", src)
+	flag := map[string]any{}
+	for _, n := range nodes {
+		if n.Kind == graph.KindInterface {
+			if n.Meta != nil {
+				flag[n.Name] = n.Meta["objc"]
+			} else {
+				flag[n.Name] = nil
+			}
+		}
+	}
+	if flag["Drawable"] != true {
+		t.Errorf("@objc protocol Drawable should carry Meta[objc]=true, got %v", flag["Drawable"])
+	}
+	if flag["Plain"] == true {
+		t.Errorf("plain protocol Plain must not carry Meta[objc]=true")
+	}
+}
