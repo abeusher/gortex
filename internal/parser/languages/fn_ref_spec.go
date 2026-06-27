@@ -109,10 +109,21 @@ func fnRefSpecFor(lang string) fnRefSpec {
 			idNodeTypes: []string{"identifier", "member_access_expression"},
 			dispatch:    astCalleeField,
 		}
-	case "java", "c", "cpp", "dart":
+	case "java", "c", "dart":
 		// Bare-identifier value idiom; AST dispatch tightens the call check
 		// (Java `method_invocation`, C/Dart `call_expression`).
 		return fnRefSpec{idNodeTypes: []string{"identifier"}, dispatch: astCalleeField}
+	case "cpp":
+		// Bare-identifier value idiom plus the C++ address-of forms: a `&fn`
+		// value-arg (pointer_expression) and a `&Cls::method` pointer-to-member
+		// (qualified_identifier). The pointer-to-member names a method of
+		// another class, so it resolves ungated.
+		return fnRefSpec{
+			idNodeTypes: []string{"identifier", "qualified_identifier", "scoped_identifier"},
+			unwrapForms: map[string]string{"pointer_expression": "address_of", "unary_expression": "address_of"},
+			dispatch:    astCalleeField,
+			ungated:     true,
+		}
 	case "php", "ruby":
 		// First-class refs are dominated by the special forms (PHP string
 		// callables, Ruby `method(:sym)` / `&:sym`); the bare path stays on the
@@ -157,6 +168,7 @@ func fnRefNodeName(n *sitter.Node, src []byte) string {
 // resolve cross-module (ungated) when the trailing name is not file-local.
 var qualifiedFnRefNodeTypes = map[string]bool{
 	"scoped_identifier":        true,
+	"qualified_identifier":     true,
 	"selector_expression":      true,
 	"member_expression":        true,
 	"attribute":                true,
