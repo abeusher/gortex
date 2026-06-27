@@ -659,6 +659,15 @@ func (h *HTTPExtractor) extract(
 
 	var out []Contract
 
+	// C# ASP.NET attribute routing needs class context: a controller's
+	// class-level [Route("api/[controller]")] prefix and its verb-less
+	// [Route("...")] method routes. Scanned once, consumed below.
+	var csControllers []csController
+	var csVerbless []csVerblessRoute
+	if lang == "csharp" {
+		csControllers, csVerbless = csharpScanControllerRoutes(lines, fileNodes)
+	}
+
 	// File-based routing, Django/DRF/Flask, Rails resources, Express/Fastify
 	// object routes — every structural framework route pass — run through the
 	// FrameworkRoutePass registry (framework_registry.go) below. React Router
@@ -723,6 +732,9 @@ func (h *HTTPExtractor) extract(
 				subtree = true
 			}
 
+			if pat.role == RoleProvider && lang == "csharp" {
+				path = csharpJoinControllerRoute(path, csControllers, lineNum, csharpActionName(fileNodes, lineNum))
+			}
 			normPath, origNames := NormalizeHTTPPathWithParams(path)
 			contractID := fmt.Sprintf("http::%s::%s", method, normPath)
 
@@ -854,6 +866,8 @@ func (h *HTTPExtractor) extract(
 			out = append(out, c)
 		}
 	}
+
+	out = append(out, h.csharpVerblessContracts(filePath, lines, fileNodes, csControllers, csVerbless, lang, tree)...)
 
 	// Structural framework route passes — Django/DRF/Flask, Rails resources,
 	// file-based routes, Express/Fastify object forms — run through the
