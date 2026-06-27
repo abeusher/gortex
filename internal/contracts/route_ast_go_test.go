@@ -31,7 +31,7 @@ func fiberRoutes(app *fiber.App) {
 		t.Fatal(err)
 	}
 	defer tree.Close()
-	matches := detectGoRoutesAST(tree.RootNode(), src)
+	matches := detectGoRoutesAST(tree.RootNode(), src, "", "", nil)
 	if len(matches) != 6 {
 		t.Fatalf("matches: want 6, got %d (%+v)", len(matches), matches)
 	}
@@ -84,7 +84,7 @@ var httpPrefilterMarkers = map[string][][]byte{
 		t.Fatal(err)
 	}
 	defer tree.Close()
-	matches := detectGoRoutesAST(tree.RootNode(), src)
+	matches := detectGoRoutesAST(tree.RootNode(), src, "", "", nil)
 	if len(matches) != 0 {
 		t.Fatalf("AST detector matched non-routes: %+v", matches)
 	}
@@ -104,7 +104,7 @@ func fetch() {
 		t.Fatal(err)
 	}
 	defer tree.Close()
-	matches := detectGoRoutesAST(tree.RootNode(), src)
+	matches := detectGoRoutesAST(tree.RootNode(), src, "", "", nil)
 	if len(matches) != 0 {
 		t.Fatalf("matched http.Get consumer: %+v", matches)
 	}

@@ -24,7 +24,11 @@ type HTTPExtractor struct {
 	ClientAliases []string
 }
 
-var _ Extractor = (*HTTPExtractor)(nil)
+var (
+	_ Extractor           = (*HTTPExtractor)(nil)
+	_ TreeAwareExtractor  = (*HTTPExtractor)(nil)
+	_ StoreAwareExtractor = (*HTTPExtractor)(nil)
+)
 
 // SupportedLanguages returns the languages this extractor can analyse.
 func (h *HTTPExtractor) SupportedLanguages() []string {
@@ -609,7 +613,7 @@ var httpJvmMarkers = [][]byte{
 func (h *HTTPExtractor) Extract(filePath string, src []byte, nodes []*graph.Node, edges []*graph.Edge) []Contract {
 	tree := ParseTreeForLang(detectLanguage(filePath), src)
 	defer tree.Release()
-	return h.extract(filePath, src, nodes, edges, tree)
+	return h.extract(filePath, src, nodes, edges, tree, nil, "")
 }
 
 // ExtractWithTree is the tree-aware variant: enrichment uses BodyFacts
@@ -623,7 +627,28 @@ func (h *HTTPExtractor) ExtractWithTree(
 	edges []*graph.Edge,
 	tree *parser.ParseTree,
 ) []Contract {
-	return h.extract(filePath, src, nodes, edges, tree)
+	return h.extract(filePath, src, nodes, edges, tree, nil, "")
+}
+
+// ExtractWithStore is the store-aware variant: in addition to the tree-aware
+// enrichment, Go route path arguments are resolved graph-wide through the
+// constant store, so a const-referenced or composite-literal path now mints a
+// route. Falls back to a lazily-parsed tree when none is supplied (mirrors
+// Extract). Implements StoreAwareExtractor.
+func (h *HTTPExtractor) ExtractWithStore(
+	filePath string,
+	src []byte,
+	nodes []*graph.Node,
+	edges []*graph.Edge,
+	tree *parser.ParseTree,
+	store EndpointConstStore,
+	repoPrefix string,
+) []Contract {
+	if tree == nil {
+		tree = ParseTreeForLang(detectLanguage(filePath), src)
+		defer tree.Release()
+	}
+	return h.extract(filePath, src, nodes, edges, tree, store, repoPrefix)
 }
 
 func (h *HTTPExtractor) extract(
@@ -632,6 +657,8 @@ func (h *HTTPExtractor) extract(
 	nodes []*graph.Node,
 	edges []*graph.Edge,
 	tree *parser.ParseTree,
+	store EndpointConstStore,
+	repoPrefix string,
 ) []Contract {
 	lang := detectLanguage(filePath)
 	if markers, ok := httpPrefilterMarkers[lang]; ok && !srcHasAnyMarker(src, markers) {
@@ -683,7 +710,7 @@ func (h *HTTPExtractor) extract(
 	// eliminates the Fiber self-reflexive bug.
 	if lang == "go" && tree != nil && tree.Tree() != nil {
 		root := tree.Tree().RootNode()
-		matches := detectGoRoutesAST(root, src)
+		matches := detectGoRoutesAST(root, src, filePath, repoPrefix, store)
 		for _, rm := range matches {
 			c := buildGoRouteContract(rm, filePath, fileNodes, lines, lang, tree, text, src)
 			out = append(out, c)

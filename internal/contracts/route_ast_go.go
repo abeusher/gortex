@@ -27,13 +27,13 @@ type goRouteMatch struct {
 // in httpPatterns; structurally distinguishes a string literal inside
 // `[]byte(".GET(")` (which is *not* a route) from `.GET("/users", h)`
 // (which is) — the regex layer couldn't.
-func detectGoRoutesAST(root *sitter.Node, src []byte) []goRouteMatch {
+func detectGoRoutesAST(root *sitter.Node, src []byte, filePath, repoPrefix string, store EndpointConstStore) []goRouteMatch {
 	if root == nil {
 		return nil
 	}
 	var out []goRouteMatch
 	walkGoCallExprs(root, func(call *sitter.Node) {
-		if m, ok := goRouteFromCall(call, src); ok {
+		if m, ok := goRouteFromCall(call, src, filePath, repoPrefix, store); ok {
 			out = append(out, m)
 		}
 	})
@@ -63,7 +63,7 @@ func walkGoCallExprs(n *sitter.Node, fn func(*sitter.Node)) {
 // goRouteFromCall classifies a call_expression as an HTTP route
 // registration. Returns (match, true) when it matches one of the
 // four supported shapes; (zero, false) otherwise.
-func goRouteFromCall(call *sitter.Node, src []byte) (goRouteMatch, bool) {
+func goRouteFromCall(call *sitter.Node, src []byte, filePath, repoPrefix string, store EndpointConstStore) (goRouteMatch, bool) {
 	fn := call.ChildByFieldName("function")
 	if fn == nil || fn.Type() != "selector_expression" {
 		return goRouteMatch{}, false
@@ -83,9 +83,15 @@ func goRouteFromCall(call *sitter.Node, src []byte) (goRouteMatch, bool) {
 		return goRouteMatch{}, false
 	}
 
+	// Resolve the path argument graph-wide: a string literal, a const
+	// identifier (so `const P = "/api/x"; r.GET(P, h)` mints a route — even
+	// when P is defined in another file of the same repo), or a composite
+	// literal's endpoint field. forRoute=true vets a const / composite
+	// dereference through the route guard so a value that is really a
+	// filesystem path is dropped; a plain literal is returned unchanged.
 	pathArg := argList[0]
-	pathText, isString := stringLiteralValue(pathArg, src)
-	if !isString {
+	pathText, ok := ResolveEndpointArg(pathArg, src, filePath, repoPrefix, store, true)
+	if !ok {
 		return goRouteMatch{}, false
 	}
 

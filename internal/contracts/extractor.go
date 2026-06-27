@@ -34,3 +34,24 @@ type TreeAwareExtractor interface {
 		tree *parser.ParseTree,
 	) []Contract
 }
+
+// StoreAwareExtractor is an optional capability an extractor implements when it
+// can resolve constant / composite endpoint arguments graph-wide using the
+// graph's constant store. The orchestrator type-asserts and dispatches to
+// ExtractWithStore — in preference to ExtractWithTree / Extract — passing the
+// store and the repo prefix so the extractor can scope graph-wide const
+// lookups. A nil store is allowed (const dereference is then disabled and the
+// extractor behaves like its tree-aware path). Extractors that don't implement
+// it fall back to ExtractWithTree / Extract unchanged.
+type StoreAwareExtractor interface {
+	Extractor
+	ExtractWithStore(
+		filePath string,
+		src []byte,
+		nodes []*graph.Node,
+		edges []*graph.Edge,
+		tree *parser.ParseTree,
+		store EndpointConstStore,
+		repoPrefix string,
+	) []Contract
+}

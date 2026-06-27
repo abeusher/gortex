@@ -4870,9 +4870,20 @@ func (idx *Indexer) runContractExtractorsForFile(
 	// category so the dashboard can filter them out by default.
 	testSource := fixtures.TestContractSource(graphPath)
 	var out []contracts.Contract
+	// The graph store backs graph-wide constant resolution for endpoint
+	// arguments (a route path / queue / topic referenced by a const). Resolved
+	// once per call; nil when the backend can't satisfy the reader (const
+	// dereference is then disabled and store-aware extractors degrade to their
+	// tree-aware behaviour).
+	var endpointStore contracts.EndpointConstStore
+	if es, ok := idx.graph.(contracts.EndpointConstStore); ok {
+		endpointStore = es
+	}
 	for _, ex := range exts {
 		var found []contracts.Contract
-		if tae, ok := ex.(contracts.TreeAwareExtractor); ok && tree != nil {
+		if sae, ok := ex.(contracts.StoreAwareExtractor); ok {
+			found = sae.ExtractWithStore(graphPath, src, fileNodes, fileEdges, tree, endpointStore, idx.repoPrefix)
+		} else if tae, ok := ex.(contracts.TreeAwareExtractor); ok && tree != nil {
 			found = tae.ExtractWithTree(graphPath, src, fileNodes, fileEdges, tree)
 		} else {
 			found = ex.Extract(graphPath, src, fileNodes, fileEdges)
