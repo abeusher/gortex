@@ -613,6 +613,21 @@ func resolveSearchBackend(b search.Backend) searchBackendInfo {
 // fields (PID, uptime, socket, session count) are filled in by the
 // daemon itself before the response goes out.
 func (c *realController) Status(_ context.Context) (daemon.StatusResponse, error) {
+	// Compute the per-repo memory estimate BEFORE taking the coarse
+	// controller mutex. On the SQLite backend AllRepoMemoryEstimates is a
+	// COUNT … GROUP BY scan that turns pathologically slow under
+	// enrichment write load; holding c.mu across it stalls every other
+	// control request (status / track / reload) queued on the mutex — the
+	// daemon-looks-crashed symptom. Snapshot the graph handle under a
+	// brief lock, then run the (store-memoised) estimate lock-free.
+	c.mu.Lock()
+	g := c.graph
+	c.mu.Unlock()
+	var memEstimates map[string]graph.RepoMemoryEstimate
+	if g != nil {
+		memEstimates = g.AllRepoMemoryEstimates()
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -622,18 +637,11 @@ func (c *realController) Status(_ context.Context) (daemon.StatusResponse, error
 		totalNodes               int
 	)
 	if c.multiIndexer != nil {
-		// Pull every repo's running counters (node/edge counts + byte
-		// estimates) in one pass — O(shard count · repo count), no
-		// graph walk. This used to call c.graph.RepoStats() which
-		// walked every edge to attribute by source-repo (the per-edge
-		// fromNode lookup), and then c.graph.RepoMemoryEstimate(prefix)
-		// inside the per-repo loop — combined cost ~1.2s on a 1.1M-edge
-		// graph and the single biggest source of writer-lock blocking
-		// during warmup.
-		var memEstimates map[string]graph.RepoMemoryEstimate
-		if c.graph != nil {
-			memEstimates = c.graph.AllRepoMemoryEstimates()
-		}
+		// memEstimates (per-repo node/edge counts + byte estimates) was
+		// computed above, before the controller mutex was taken — see the
+		// note at the top of Status. The SQLite store memoises it so a
+		// burst of status polls collapses onto one COUNT … GROUP BY scan;
+		// the in-memory store serves maintained shard counters directly.
 
 		// Diagnostic: when AllMetadata has tracked repos but
 		// AllRepoMemoryEstimates returns nothing (or a much smaller

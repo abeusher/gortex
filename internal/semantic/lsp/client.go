@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"go.uber.org/zap"
 )
@@ -31,6 +32,16 @@ type Client struct {
 	pending   sync.Map // reqID → chan *jsonRPCResponse
 	logger    *zap.Logger
 	done      chan struct{}
+
+	// callTimeout bounds how long a single Call waits for a reply
+	// before giving up. Zero means unbounded (the historical
+	// behaviour). It is set after the initialize handshake completes
+	// (see Provider.ensureClient) so a wedged server — e.g. csharp-ls
+	// stuck loading an MSBuild workspace, alive but never replying —
+	// can no longer block an enrichment hover / findReferences Call
+	// forever. Stored atomically: SetCallTimeout may race the read
+	// loop and concurrent Call goroutines.
+	callTimeout atomic.Int64 // time.Duration nanoseconds
 
 	mu     sync.Mutex
 	closed bool
@@ -289,6 +300,12 @@ func (c *Client) OnRequest(method string, h RequestHandler) {
 // terminates (server exited or stdin/stdout error).
 func (c *Client) Done() <-chan struct{} { return c.done }
 
+// SetCallTimeout bounds how long subsequent Call invocations wait for a
+// reply. A non-positive duration restores the unbounded behaviour.
+// Callers typically set this only after the initialize handshake has
+// completed, leaving the (possibly slow) cold-workspace load unbounded.
+func (c *Client) SetCallTimeout(d time.Duration) { c.callTimeout.Store(int64(d)) }
+
 // Call sends a request and waits for the response.
 func (c *Client) Call(method string, params any, result any) error {
 	id := c.reqID.Add(1)
@@ -308,7 +325,17 @@ func (c *Client) Call(method string, params any, result any) error {
 		return fmt.Errorf("send %s: %w", method, err)
 	}
 
-	// Wait for response.
+	// Wait for response. A bounded callTimeout (set after the
+	// initialize handshake) guards against a server that is alive but
+	// never replies. A nil timer channel — callTimeout <= 0 — blocks
+	// forever in the select, preserving the historical unbounded
+	// behaviour for callers that never set a timeout.
+	var timeout <-chan time.Time
+	if d := time.Duration(c.callTimeout.Load()); d > 0 {
+		t := time.NewTimer(d)
+		defer t.Stop()
+		timeout = t.C
+	}
 	select {
 	case resp := <-respCh:
 		if resp.Error != nil {
@@ -320,6 +347,8 @@ func (c *Client) Call(method string, params any, result any) error {
 		return nil
 	case <-c.done:
 		return fmt.Errorf("LSP server exited")
+	case <-timeout:
+		return fmt.Errorf("LSP call %s: timeout after %s", method, time.Duration(c.callTimeout.Load()))
 	}
 }
 
@@ -421,6 +450,16 @@ func (c *Client) readResponses() {
 		c.mu.Unlock()
 	}()
 
+	// malformedFrames counts consecutive header blocks that yielded no
+	// usable Content-Length. A healthy server never does this; a
+	// desynced or chatty one can emit a run of blank / garbage lines
+	// that would otherwise spin this loop on `continue`, burning a core
+	// (and, since the read loop never returns, never closing c.done to
+	// unblock pending Call()s). We tolerate a bounded run so a transient
+	// desync self-heals, then drop the connection.
+	const maxMalformedFrames = 64
+	malformedFrames := 0
+
 	for {
 		// Read headers.
 		contentLength := -1
@@ -440,8 +479,15 @@ func (c *Client) readResponses() {
 		}
 
 		if contentLength < 0 {
+			malformedFrames++
+			if malformedFrames >= maxMalformedFrames {
+				c.logger.Debug("LSP: too many malformed frames, dropping connection",
+					zap.Int("count", malformedFrames))
+				return
+			}
 			continue
 		}
+		malformedFrames = 0
 
 		// Read body.
 		body := make([]byte, contentLength)

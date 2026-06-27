@@ -920,6 +920,32 @@ func (p *Provider) dialOrSpawn(workspaceRoot string) (*Client, error) {
 	return NewClient(p.command, p.args, p.env, workspaceRoot, p.logger)
 }
 
+// defaultLSPCallTimeout bounds a single post-initialize LSP request.
+// A wedged server — e.g. csharp-ls stuck loading an MSBuild workspace,
+// alive but never replying — would otherwise let an enrichment hover /
+// findReferences Call block forever and stall the whole enrichment
+// WaitGroup. The initialize handshake itself is left unbounded (a cold
+// .NET / Java workspace load can legitimately run for minutes).
+const defaultLSPCallTimeout = 30 * time.Second
+
+// lspCallTimeout resolves the post-initialize Call bound, honouring the
+// GORTEX_LSP_CALL_TIMEOUT env override (a Go duration such as "45s";
+// "0" / "off" / "none" disables the bound). An unparseable value falls
+// back to the default.
+func lspCallTimeout() time.Duration {
+	switch v := strings.TrimSpace(os.Getenv("GORTEX_LSP_CALL_TIMEOUT")); v {
+	case "":
+		return defaultLSPCallTimeout
+	case "0", "off", "none":
+		return 0
+	default:
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+		return defaultLSPCallTimeout
+	}
+}
+
 // ensureClient starts the LSP server if not already running, OR
 // reconnects if the previous client's transport went away (e.g. the
 // IDE that owned a passive-attach LSP restarted, closing the socket).
@@ -1100,6 +1126,11 @@ func (p *Provider) ensureClient(workspaceRoot string) error {
 		_ = client.Shutdown()
 		return fmt.Errorf("initialized: %w", err)
 	}
+
+	// The (possibly slow) cold-workspace load is done — bound every
+	// subsequent request so a server that wedges mid-session can no
+	// longer block an enrichment Call forever. See lspCallTimeout.
+	client.SetCallTimeout(lspCallTimeout())
 
 	p.client = client
 	return nil

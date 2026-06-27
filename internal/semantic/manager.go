@@ -2,7 +2,9 @@ package semantic
 
 import (
 	"fmt"
+	"os"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -364,6 +366,34 @@ func (m *Manager) runEnrichForProvider(g graph.Store, roots map[string]string, l
 	return results
 }
 
+// defaultEnrichRepoTimeout caps how long one provider's per-repo
+// enrichment may run before the manager abandons it and moves on. The
+// per-call LSP timeout (see lsp.Provider.ensureClient) already bounds a
+// single wedged request; this bounds a provider that is merely slow
+// across many symbols — e.g. a server stuck behind a never-finishing
+// MSBuild/Roslyn load — so it can no longer pin the enrichment WaitGroup
+// for hours. Generous on purpose: a legitimately large repo enriches
+// well within it. 0 / "off" disables the bound.
+const defaultEnrichRepoTimeout = 10 * time.Minute
+
+// enrichRepoTimeout resolves the per-repo enrichment deadline, honouring
+// the GORTEX_LSP_ENRICH_TIMEOUT env override (a Go duration such as
+// "5m"; "0" / "off" / "none" disables it). An unparseable value falls
+// back to the default.
+func enrichRepoTimeout() time.Duration {
+	switch v := strings.TrimSpace(os.Getenv("GORTEX_LSP_ENRICH_TIMEOUT")); v {
+	case "":
+		return defaultEnrichRepoTimeout
+	case "0", "off", "none":
+		return 0
+	default:
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+		return defaultEnrichRepoTimeout
+	}
+}
+
 // runEnrichOne runs one provider against one repo root and appends the
 // result. Split out of runEnrichForProvider so the Router-backed path can
 // fetch a per-repo provider instance (keyed by the repo's workspace) before
@@ -381,12 +411,50 @@ func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, p
 	// repo prefix (the MultiIndexer keys roots by prefix; the per-repo
 	// indexer passes its own RepoPrefix()); a repo-scoped provider uses
 	// it to scope file selection to the repo actually being enriched.
+	//
+	// Run the (possibly long) provider pass on its own goroutine and bound
+	// it with a per-repo deadline: a provider that is slow across many
+	// symbols — e.g. a server stuck behind an MSBuild/Roslyn load — must
+	// not pin the enrichment WaitGroup indefinitely. On deadline we log
+	// and move on; the detached goroutine still drains (its LSP calls are
+	// individually bounded and its graph mutations are internally
+	// synchronized) and exits on its own.
+	type enrichOutcome struct {
+		result *EnrichResult
+		err    error
+	}
+	done := make(chan enrichOutcome, 1)
+	go func() {
+		var result *EnrichResult
+		var err error
+		if rsp, ok := provider.(RepoScopedProvider); ok {
+			result, err = rsp.EnrichRepo(g, repoName, repoRoot)
+		} else {
+			result, err = provider.Enrich(g, repoRoot)
+		}
+		done <- enrichOutcome{result, err}
+	}()
+
 	var result *EnrichResult
 	var err error
-	if rsp, ok := provider.(RepoScopedProvider); ok {
-		result, err = rsp.EnrichRepo(g, repoName, repoRoot)
+	if d := enrichRepoTimeout(); d > 0 {
+		timer := time.NewTimer(d)
+		select {
+		case oc := <-done:
+			timer.Stop()
+			result, err = oc.result, oc.err
+		case <-timer.C:
+			m.logger.Warn("semantic enrichment exceeded per-repo deadline; abandoning",
+				zap.String("provider", provider.Name()),
+				zap.String("language", lang),
+				zap.String("repo", repoName),
+				zap.Duration("deadline", d),
+			)
+			return results
+		}
 	} else {
-		result, err = provider.Enrich(g, repoRoot)
+		oc := <-done
+		result, err = oc.result, oc.err
 	}
 	if err != nil {
 		m.logger.Warn("semantic enrichment failed",

@@ -90,6 +90,17 @@ type Store struct {
 	// makes SearchSymbolBundles fall through to the uncached path.
 	bundles *bundleCache
 
+	// memEst memoises AllRepoMemoryEstimates for a short TTL. That query
+	// is two COUNT(*) … GROUP BY repo scans; on a large graph under
+	// enrichment write load the pure-Go modernc sqlite count is
+	// pathologically slow, and the daemon status path can call it
+	// repeatedly. The TTL (and the mutex held across the recompute)
+	// collapses a burst of status polls onto a single scan; a few
+	// seconds of staleness is irrelevant for an advisory estimate.
+	memEstMu  sync.Mutex
+	memEstVal map[string]graph.RepoMemoryEstimate
+	memEstAt  time.Time
+
 	// Prepared statements (compiled once in Open, closed in Close).
 	stmtInsertNode         *sql.Stmt
 	stmtGetNode            *sql.Stmt
@@ -1433,7 +1444,30 @@ func (s *Store) RepoMemoryEstimate(repoPrefix string) graph.RepoMemoryEstimate {
 	return est
 }
 
+// memEstTTL bounds how long AllRepoMemoryEstimates serves a memoised
+// result before recomputing. The estimate is advisory (status display),
+// so a few seconds of staleness is fine, and the TTL keeps a burst of
+// status polls from each triggering a full COUNT … GROUP BY scan.
+const memEstTTL = 3 * time.Second
+
+func cloneRepoMemEstimates(m map[string]graph.RepoMemoryEstimate) map[string]graph.RepoMemoryEstimate {
+	out := make(map[string]graph.RepoMemoryEstimate, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
 func (s *Store) AllRepoMemoryEstimates() map[string]graph.RepoMemoryEstimate {
+	// Hold memEstMu across the recompute so a burst of concurrent status
+	// polls collapses onto one scan: the first caller computes and
+	// caches, the rest block briefly and then hit the fresh cache.
+	s.memEstMu.Lock()
+	defer s.memEstMu.Unlock()
+	if s.memEstVal != nil && time.Since(s.memEstAt) < memEstTTL {
+		return cloneRepoMemEstimates(s.memEstVal)
+	}
+
 	out := map[string]graph.RepoMemoryEstimate{}
 	rows, err := s.stmtAllRepoCountsNodes.Query()
 	if err != nil {
@@ -1474,7 +1508,12 @@ func (s *Store) AllRepoMemoryEstimates() map[string]graph.RepoMemoryEstimate {
 		out[repo] = est
 	}
 	_ = rows.Close()
-	return out
+
+	// Cache only on the full-success path — the early error returns above
+	// leave a partial `out` and must not poison the cache.
+	s.memEstVal = out
+	s.memEstAt = time.Now()
+	return cloneRepoMemEstimates(out)
 }
 
 // -- helpers --------------------------------------------------------------
