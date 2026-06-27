@@ -834,10 +834,61 @@ func (r *Resolver) ResolveFileAndIncoming(filePath string) *ResolveStats {
 	clear := r.buildPassIndexes()
 	defer clear()
 
+	// Warm the per-edge lookup cache for this file's pending forward and
+	// incoming edges. Without it the single-file path fires a fresh
+	// FindNodesByNameInRepo — a scanNode + meta-decode of every same-name
+	// candidate — once PER edge, re-materialising the same candidates for
+	// every edge that shares a name. Seeding the cache once (one batched
+	// FindNodesByNames, like ResolveAll) materialises each candidate once
+	// and the passes read it from memory.
+	r.warmLookupCache(r.pendingEdgesForFileAndIncoming(filePath))
+	defer r.clearLookupCache()
+
 	stats := &ResolveStats{}
 	r.resolveFileLocked(filePath, stats)
 	r.resolveIncomingLocked(filePath, stats)
 	return stats
+}
+
+// pendingEdgesForFileAndIncoming gathers the unresolved edges the forward
+// and reverse passes will visit — the file's own outgoing unresolved
+// edges plus the unresolved in-edges parked on the stub ids of the
+// referenceable symbols this file defines. It mirrors the edge walks
+// resolveFileEdgesLocked / resolveIncomingLocked perform, but only to seed
+// warmLookupCache; the result feeds caching, never resolution directly.
+func (r *Resolver) pendingEdgesForFileAndIncoming(filePath string) []*graph.Edge {
+	defNodes := r.graph.GetFileNodes(filePath)
+	var pending []*graph.Edge
+	seenNames := make(map[string]struct{}, len(defNodes))
+	for _, n := range defNodes {
+		if n == nil {
+			continue
+		}
+		for _, e := range r.graph.GetOutEdges(n.ID) {
+			if graph.IsUnresolvedTarget(e.To) {
+				pending = append(pending, e)
+			}
+		}
+		if n.Name == "" || !graph.IsReferenceableSymbol(n.Kind) {
+			continue
+		}
+		if _, dup := seenNames[n.Name]; dup {
+			continue
+		}
+		seenNames[n.Name] = struct{}{}
+		keys := []string{graph.UnresolvedMarker + n.Name}
+		if n.RepoPrefix != "" {
+			keys = append(keys, n.RepoPrefix+"::"+graph.UnresolvedMarker+n.Name)
+		}
+		for _, key := range keys {
+			for _, e := range r.graph.GetInEdges(key) {
+				if graph.IsUnresolvedTarget(e.To) {
+					pending = append(pending, e)
+				}
+			}
+		}
+	}
+	return pending
 }
 
 // ResolveFilesAndIncoming runs the forward and reverse passes for a
