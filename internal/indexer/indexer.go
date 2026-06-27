@@ -1893,17 +1893,35 @@ func (idx *Indexer) applyRepoPrefix(nodes []*graph.Node, edges []*graph.Edge) {
 	// interning each reference is a distinct `prefix + s` allocation —
 	// interning collapses them to one shared backing array, and edge
 	// endpoints end up sharing storage with the node ID they name.
+	//
+	// The file path is identical for every node and edge extracted from
+	// the same file — thousands of them. Concatenating `prefix + path`
+	// per reference would mint thousands of throwaway strings before
+	// interning collapses their storage. This per-call cache computes
+	// the interned prefixed path once per distinct raw path, so a file
+	// with N symbols pays one concatenation instead of N.
+	prefixedPath := make(map[string]string)
+	internFilePath := func(raw string) string {
+		if c, ok := prefixedPath[raw]; ok {
+			return c
+		}
+		c := intern.String(prefix + raw)
+		prefixedPath[raw] = c
+		return c
+	}
 	for _, n := range nodes {
 		n.ID = intern.String(prefix + n.ID)
-		n.FilePath = intern.String(prefix + n.FilePath)
+		n.FilePath = internFilePath(n.FilePath)
 		n.RepoPrefix = idx.repoPrefix
-		// Name and Language are low-cardinality and recur across
+		// Name, Language and Kind are low-cardinality and recur across
 		// thousands of nodes — method/function names like String, New,
-		// Get… and the ~20 distinct languages. Interning collapses
-		// each to a single backing array; it also shrinks the byName
-		// secondary index, whose keys are these same strings.
+		// Get…, the ~20 distinct languages, and the fixed set of node
+		// kinds. Interning collapses each to a single backing array; it
+		// also shrinks the byName secondary index, whose keys are these
+		// same strings.
 		n.Name = intern.String(n.Name)
 		n.Language = intern.String(n.Language)
+		n.Kind = graph.NodeKind(intern.String(string(n.Kind)))
 	}
 	for _, e := range edges {
 		e.From = intern.String(prefix + e.From)
@@ -1914,7 +1932,7 @@ func (idx *Indexer) applyRepoPrefix(nodes []*graph.Node, edges []*graph.Edge) {
 		} else {
 			e.To = intern.String(prefix + e.To)
 		}
-		e.FilePath = intern.String(prefix + e.FilePath)
+		e.FilePath = internFilePath(e.FilePath)
 	}
 }
 
