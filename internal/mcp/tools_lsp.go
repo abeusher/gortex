@@ -168,11 +168,32 @@ func (s *Server) handleGetCodeActions(ctx context.Context, req mcp.CallToolReque
 	})
 }
 
+// guardCallerPath confines an agent-supplied file path to an indexed
+// repository root. It is a no-op for the local CLI / control channel
+// (confineCallerPaths == false, e.g. the `gortex` CLI verbs). It returns a
+// non-nil error when an MCP agent names a path resolving outside every
+// indexed root, so a prompt-injected agent cannot drive an LSP write
+// (apply_code_action / fix_all_in_file) onto a file outside the repo that
+// the daemon user happens to be able to reach.
+func (s *Server) guardCallerPath(ctx context.Context, path string) error {
+	if !s.confineCallerPaths(ctx) {
+		return nil
+	}
+	abs, err := s.absolutePath(path)
+	if err != nil {
+		return err
+	}
+	return s.guardSymlinkWithinRepo(abs)
+}
+
 // handleApplyCodeAction implements the `apply_code_action` tool.
 func (s *Server) handleApplyCodeAction(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	path, err := req.RequireString("path")
 	if err != nil {
 		return mcp.NewToolResultError("path is required"), nil
+	}
+	if cerr := s.guardCallerPath(ctx, path); cerr != nil {
+		return mcp.NewToolResultError(cerr.Error()), nil
 	}
 	idx := req.GetInt("index", -1)
 	if idx < 0 {
@@ -220,6 +241,9 @@ func (s *Server) handleFixAllInFile(ctx context.Context, req mcp.CallToolRequest
 	path, err := req.RequireString("path")
 	if err != nil {
 		return mcp.NewToolResultError("path is required"), nil
+	}
+	if cerr := s.guardCallerPath(ctx, path); cerr != nil {
+		return mcp.NewToolResultError(cerr.Error()), nil
 	}
 	provider, absPath, err := s.lspProviderForPath(path)
 	if err != nil {
