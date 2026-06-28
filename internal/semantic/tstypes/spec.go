@@ -160,6 +160,21 @@ type NarrowFact struct {
 	Negated  bool
 }
 
+// SyntheticCall is one member call an expression desugars to: an operator
+// expression is sugar for a named member function (Kotlin `a + b` is
+// `a.plus(b)`, `a[i]` is `a.get(i)`, `a in b` is `b.contains(a)`). Receiver
+// is the AST node whose resolved type owns the desugared member — for most
+// operators the left operand, but for `in` it is the right operand (the
+// collection), so the binder types the correct side. Method is the desugared
+// member name. Args carries the argument expression nodes for completeness;
+// the apply phase resolves the call by member name on the receiver type and
+// does not consult argument types, so an empty Args never blocks resolution.
+type SyntheticCall struct {
+	Receiver *sitter.Node
+	Method   string
+	Args     []*sitter.Node
+}
+
 // LangSpec adapts the shared engine to one language's tree-sitter
 // grammar. The node-type sets drive the generic walk; the hooks decode
 // the handful of shapes that differ per grammar. Hooks may be nil when
@@ -317,6 +332,24 @@ type LangSpec struct {
 	// disables docblock typing entirely, so a language that leaves it unset
 	// behaves byte-for-byte as before.
 	DocType func(declNode *sitter.Node, src []byte) []DocTypeFact
+
+	// SyntheticCalls desugars an operator / sugar expression into zero or
+	// more member calls the language defines it to mean (Kotlin `a + b` ->
+	// `a.plus(b)`, `a[i]` -> `a.get(i)`, `a in b` -> `b.contains(a)`,
+	// `for (x in coll)` -> `coll.iterator()`, ...). The binder consults it on
+	// every node it walks and, for each returned fact, emits a call fact
+	// exactly as if the source had written `Receiver.Method(Args)` — so the
+	// standard receiver-typing and member-resolution path applies unchanged.
+	// A synthetic call therefore resolves to the operator function ONLY when
+	// the receiver's resolved type is an in-repo type that declares a member
+	// of the desugared name; an operator on a primitive / non-user receiver
+	// (`1 + 2`) types no in-repo member and emits no edge, and the engine
+	// never mints an unresolved-target edge for a miss. The resulting edge is
+	// a genuine resolution (the operator IS that call), so it lands at the
+	// direct AST confidence band, not the inferred band. nil (the default)
+	// disables operator desugaring entirely, so a language that leaves it
+	// unset behaves byte-for-byte as before.
+	SyntheticCalls func(n *sitter.Node, src []byte) []SyntheticCall
 }
 
 // inheritEdgeKinds returns the edge kinds methodOn climbs when looking

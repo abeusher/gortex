@@ -335,6 +335,213 @@ func TestKotlin_PlainTopLevelFunctionUnaffected(t *testing.T) {
 	}
 }
 
+// A binary `+` on a user type that declares `operator fun plus` desugars to
+// the member call `a.plus(b)` and resolves to that operator function at the
+// direct AST band.
+func TestKotlin_OperatorPlusResolvesToMember(t *testing.T) {
+	g, dir := buildFixture(t, map[string]string{
+		"A.kt": `class A {
+    operator fun plus(o: A): A {
+        return this
+    }
+}
+`,
+		"App.kt": `class App {
+    fun run(a: A, b: A) {
+        val c = a + b
+    }
+}
+`,
+	})
+	p := NewProvider(KotlinSpec(), zap.NewNop())
+	if _, err := p.Enrich(g, dir); err != nil {
+		t.Fatal(err)
+	}
+	caller := nodeByNameKind(t, g, "run", graph.KindMethod)
+	plus := nodeByNameKind(t, g, "plus", graph.KindMethod)
+	e := callEdgeTo(g, caller.ID, plus.ID)
+	if e == nil {
+		t.Fatalf("a + b did not desugar to A.plus; edges: %v", g.GetOutEdges(caller.ID))
+	}
+	assertASTProvenance(t, e, "kotlin-types")
+}
+
+// A subscript `a[i]` on a user type that declares `operator fun get` desugars
+// to `a.get(i)` and resolves to that operator function.
+func TestKotlin_OperatorGetResolvesToMember(t *testing.T) {
+	g, dir := buildFixture(t, map[string]string{
+		"A.kt": `class A {
+    operator fun get(i: Int): A {
+        return this
+    }
+}
+`,
+		"App.kt": `class App {
+    fun run(a: A) {
+        val c = a[0]
+    }
+}
+`,
+	})
+	p := NewProvider(KotlinSpec(), zap.NewNop())
+	if _, err := p.Enrich(g, dir); err != nil {
+		t.Fatal(err)
+	}
+	caller := nodeByNameKind(t, g, "run", graph.KindMethod)
+	get := nodeByNameKind(t, g, "get", graph.KindMethod)
+	e := callEdgeTo(g, caller.ID, get.ID)
+	if e == nil {
+		t.Fatalf("a[0] did not desugar to A.get; edges: %v", g.GetOutEdges(caller.ID))
+	}
+	assertASTProvenance(t, e, "kotlin-types")
+}
+
+// A subscript assignment `a[i] = v` on a user type that declares
+// `operator fun set` desugars to `a.set(i, v)` and resolves to it.
+func TestKotlin_OperatorSetResolvesToMember(t *testing.T) {
+	g, dir := buildFixture(t, map[string]string{
+		"A.kt": `class A {
+    operator fun set(i: Int, v: Int) {
+    }
+}
+`,
+		"App.kt": `class App {
+    fun run(a: A) {
+        a[0] = 5
+    }
+}
+`,
+	})
+	p := NewProvider(KotlinSpec(), zap.NewNop())
+	if _, err := p.Enrich(g, dir); err != nil {
+		t.Fatal(err)
+	}
+	caller := nodeByNameKind(t, g, "run", graph.KindMethod)
+	set := nodeByNameKind(t, g, "set", graph.KindMethod)
+	if callEdgeTo(g, caller.ID, set.ID) == nil {
+		t.Fatalf("a[0] = 5 did not desugar to A.set; edges: %v", g.GetOutEdges(caller.ID))
+	}
+}
+
+// A membership test `x in coll` desugars to `coll.contains(x)` — the RECEIVER
+// is the right-hand operand (the collection), so it resolves to the
+// collection type's `operator fun contains`, not the element's.
+func TestKotlin_OperatorInResolvesToContainsOnRHS(t *testing.T) {
+	g, dir := buildFixture(t, map[string]string{
+		"X.kt": `class X {
+}
+`,
+		"Coll.kt": `class Coll {
+    operator fun contains(x: X): Boolean {
+        return true
+    }
+}
+`,
+		"App.kt": `class App {
+    fun run(x: X, coll: Coll) {
+        val r = x in coll
+    }
+}
+`,
+	})
+	p := NewProvider(KotlinSpec(), zap.NewNop())
+	if _, err := p.Enrich(g, dir); err != nil {
+		t.Fatal(err)
+	}
+	caller := nodeByNameKind(t, g, "run", graph.KindMethod)
+	contains := nodeByNameKind(t, g, "contains", graph.KindMethod)
+	e := callEdgeTo(g, caller.ID, contains.ID)
+	if e == nil {
+		t.Fatalf("x in coll did not desugar to Coll.contains; edges: %v", g.GetOutEdges(caller.ID))
+	}
+	assertASTProvenance(t, e, "kotlin-types")
+}
+
+// A comparison `a < b` on a user type that declares `operator fun compareTo`
+// desugars to `a.compareTo(b)` and resolves to it (all of < > <= >= map to
+// compareTo).
+func TestKotlin_OperatorComparisonResolvesToCompareTo(t *testing.T) {
+	g, dir := buildFixture(t, map[string]string{
+		"A.kt": `class A {
+    operator fun compareTo(o: A): Int {
+        return 0
+    }
+}
+`,
+		"App.kt": `class App {
+    fun run(a: A, b: A) {
+        val r = a < b
+    }
+}
+`,
+	})
+	p := NewProvider(KotlinSpec(), zap.NewNop())
+	if _, err := p.Enrich(g, dir); err != nil {
+		t.Fatal(err)
+	}
+	caller := nodeByNameKind(t, g, "run", graph.KindMethod)
+	cmp := nodeByNameKind(t, g, "compareTo", graph.KindMethod)
+	e := callEdgeTo(g, caller.ID, cmp.ID)
+	if e == nil {
+		t.Fatalf("a < b did not desugar to A.compareTo; edges: %v", g.GetOutEdges(caller.ID))
+	}
+	assertASTProvenance(t, e, "kotlin-types")
+}
+
+// A for-loop `for (x in coll)` desugars to `coll.iterator()` and resolves to
+// the collection type's `operator fun iterator`.
+func TestKotlin_ForLoopResolvesToIterator(t *testing.T) {
+	g, dir := buildFixture(t, map[string]string{
+		"CollIter.kt": `class CollIter {
+}
+`,
+		"Coll.kt": `class Coll {
+    operator fun iterator(): CollIter {
+        return CollIter()
+    }
+}
+`,
+		"App.kt": `class App {
+    fun run(coll: Coll) {
+        for (x in coll) {
+        }
+    }
+}
+`,
+	})
+	p := NewProvider(KotlinSpec(), zap.NewNop())
+	if _, err := p.Enrich(g, dir); err != nil {
+		t.Fatal(err)
+	}
+	caller := nodeByNameKind(t, g, "run", graph.KindMethod)
+	iter := nodeByNameKind(t, g, "iterator", graph.KindMethod)
+	if callEdgeTo(g, caller.ID, iter.ID) == nil {
+		t.Fatalf("for (x in coll) did not desugar to Coll.iterator; edges: %v", g.GetOutEdges(caller.ID))
+	}
+}
+
+// `1 + 2` is an operator on a primitive — there is no in-repo type with a
+// `plus` member, so the desugaring resolves to nothing and emits NO edge, not
+// even a spurious unresolved one.
+func TestKotlin_PrimitiveOperatorEmitsNoEdge(t *testing.T) {
+	g, dir := buildFixture(t, map[string]string{
+		"App.kt": `class App {
+    fun run() {
+        val c = 1 + 2
+    }
+}
+`,
+	})
+	p := NewProvider(KotlinSpec(), zap.NewNop())
+	if _, err := p.Enrich(g, dir); err != nil {
+		t.Fatal(err)
+	}
+	caller := nodeByNameKind(t, g, "run", graph.KindMethod)
+	if edges := callEdgesNamed(g, caller.ID, "plus"); len(edges) != 0 {
+		t.Fatalf("1 + 2 minted a plus edge; want none, got: %v", edges)
+	}
+}
+
 // EnrichFile resolves only the named file's calls, leaving others alone.
 func TestKotlin_EnrichFileScopesToOneFile(t *testing.T) {
 	g, dir := buildFixture(t, map[string]string{

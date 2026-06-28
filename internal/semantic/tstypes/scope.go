@@ -373,6 +373,27 @@ func (b *binder) walk(n *sitter.Node, env *scopeEnv) {
 		}
 	}
 
+	// Operator desugaring: an operator / sugar expression is sugar for a
+	// named member call (Kotlin `a + b` => `a.plus(b)`). Gated on
+	// SyntheticCalls so every language that leaves the hook nil never enters
+	// here (byte-for-byte no-op). Each fact is grounded and emitted through
+	// the very same receiverFact path as a real `recv.method()` call, so a
+	// synthetic call resolves only when the receiver types to an in-repo
+	// member of the desugared name — an operator on a primitive / non-user
+	// receiver grounds nothing (or resolves to nothing) and emits no edge.
+	if b.spec.SyntheticCalls != nil {
+		for _, sc := range b.spec.SyntheticCalls(n, b.src) {
+			if sc.Method == "" || sc.Receiver == nil {
+				continue
+			}
+			if cf, grounded := b.receiverFact(sc.Receiver, env); grounded {
+				cf.line = nodeLine(n)
+				cf.method = sc.Method
+				b.facts.calls = append(b.facts.calls, cf)
+			}
+		}
+	}
+
 	// Type narrowing: an if-statement whose guard refines a variable's
 	// type. Gated on Narrowings + IfStmt so every language that leaves the
 	// hooks unset descends if-statements exactly as before (nil hook =

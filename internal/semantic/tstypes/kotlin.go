@@ -58,6 +58,13 @@ func KotlinSpec() *LangSpec {
 		// into resolving such calls against the receiver type, with real
 		// members winning over extensions.
 		ExtensionFunctions: true,
+		// Kotlin operators are sugar for named member functions (`a + b` is
+		// `a.plus(b)`, `a[i]` is `a.get(i)`, `a in b` is `b.contains(a)`).
+		// This desugars an operator expression into the member call it
+		// denotes, so an operator on a user type that declares the operator
+		// function resolves to that function — while an operator on a
+		// primitive (`1 + 2`) resolves to nothing.
+		SyntheticCalls: kotlinSyntheticCalls,
 	}
 }
 
@@ -418,4 +425,220 @@ func kotlinIsTypeName(name string) bool {
 		return false
 	}
 	return unicode.IsUpper([]rune(name)[0])
+}
+
+// kotlinBinaryOps maps each overloadable binary operator token to the member
+// function it desugars to. The receiver is the left operand for all of these.
+var kotlinBinaryOps = map[string]string{
+	"+":  "plus",
+	"-":  "minus",
+	"*":  "times",
+	"/":  "div",
+	"%":  "rem",
+	"..": "rangeTo",
+}
+
+// kotlinSyntheticCalls desugars a Kotlin operator / sugar expression into the
+// member call it denotes, so the binder can resolve `a + b` to a user type's
+// `operator fun plus`. It reads the GRAMMAR operator node (the unnamed token
+// child) rather than scanning the source text, and switches on the
+// expression node kind:
+//
+//   - additive / multiplicative / range:  a OP b  -> a.plus|minus|times|div|rem|rangeTo(b)
+//   - comparison (< > <= >=):              a OP b  -> a.compareTo(b)
+//   - subscript get:                       a[i]    -> a.get(i)
+//   - subscript set:                       a[i]=v  -> a.set(i, v)
+//   - membership (in / !in):               a in b  -> b.contains(a)   (receiver is the RHS)
+//   - increment / decrement (++ / --):     a++/--a -> a.inc() / a.dec()
+//   - for-loop:                            for (x in coll) -> coll.iterator()
+//
+// `is` / `!is` type checks (which share check_expression with `in`) and the
+// unary `-` / `+` / `!` prefixes (which share prefix_expression with `++` /
+// `--`) are deliberately NOT desugared — they are not the member-call sugar
+// this resolves. Anything else returns nil.
+func kotlinSyntheticCalls(n *sitter.Node, src []byte) []SyntheticCall {
+	switch n.Type() {
+	case "additive_expression", "multiplicative_expression", "range_expression":
+		method, ok := kotlinBinaryOps[kotlinOperatorToken(n, src)]
+		if !ok {
+			return nil
+		}
+		return kotlinBinaryCall(n, method)
+	case "comparison_expression":
+		// All four relational operators (< > <= >=) desugar to compareTo;
+		// equality (== !=) is a separate node and is not desugared here.
+		return kotlinBinaryCall(n, "compareTo")
+	case "indexing_expression":
+		recv := n.NamedChild(0)
+		if recv == nil {
+			return nil
+		}
+		return []SyntheticCall{{Receiver: recv, Method: "get", Args: kotlinIndexArgs(n)}}
+	case "assignment":
+		return kotlinIndexSet(n, src)
+	case "check_expression":
+		return kotlinMembershipCall(n, src)
+	case "prefix_expression", "postfix_expression":
+		return kotlinIncDecCall(n, src)
+	case "for_statement":
+		recv := kotlinForCollection(n)
+		if recv == nil {
+			return nil
+		}
+		return []SyntheticCall{{Receiver: recv, Method: "iterator"}}
+	}
+	return nil
+}
+
+// kotlinBinaryCall builds the desugared call for a two-operand operator whose
+// receiver is the left operand and whose single argument is the right operand.
+func kotlinBinaryCall(n *sitter.Node, method string) []SyntheticCall {
+	lhs := n.NamedChild(0)
+	if lhs == nil {
+		return nil
+	}
+	sc := SyntheticCall{Receiver: lhs, Method: method}
+	if rhs := kotlinLastNamedChild(n); rhs != nil && !rhs.Equal(lhs) {
+		sc.Args = []*sitter.Node{rhs}
+	}
+	return []SyntheticCall{sc}
+}
+
+// kotlinMembershipCall desugars a membership test. `a in b` and `a !in b`
+// share the check_expression node with `a is T` / `a !is T`; only the `in`
+// forms desugar — to `b.contains(a)`, whose RECEIVER is the right operand
+// (the collection), not the left. A type check (`is`) is skipped: it is not
+// a member-call desugaring.
+func kotlinMembershipCall(n *sitter.Node, src []byte) []SyntheticCall {
+	isIn := false
+	for i := 0; i < int(n.ChildCount()); i++ {
+		c := n.Child(i)
+		if c == nil || c.IsNamed() {
+			continue
+		}
+		switch c.Content(src) {
+		case "in":
+			isIn = true
+		case "is":
+			return nil
+		}
+	}
+	if !isIn {
+		return nil
+	}
+	lhs := n.NamedChild(0)
+	rhs := kotlinLastNamedChild(n)
+	if rhs == nil {
+		return nil
+	}
+	sc := SyntheticCall{Receiver: rhs, Method: "contains"}
+	if lhs != nil && !lhs.Equal(rhs) {
+		sc.Args = []*sitter.Node{lhs}
+	}
+	return []SyntheticCall{sc}
+}
+
+// kotlinIncDecCall desugars `a++` / `++a` to `a.inc()` and `a--` / `--a` to
+// `a.dec()`. The non-null assertion (`a!!`, which shares postfix_expression)
+// and the unary `-` / `+` / `!` prefixes are not desugared.
+func kotlinIncDecCall(n *sitter.Node, src []byte) []SyntheticCall {
+	var method string
+	switch kotlinOperatorToken(n, src) {
+	case "++":
+		method = "inc"
+	case "--":
+		method = "dec"
+	default:
+		return nil
+	}
+	recv := n.NamedChild(0)
+	if recv == nil {
+		return nil
+	}
+	return []SyntheticCall{{Receiver: recv, Method: method}}
+}
+
+// kotlinIndexSet desugars `a[i] = v` to `a.set(i, v)`. It fires only on a
+// plain `=` assignment whose target is a directly_assignable_expression
+// carrying an indexing_suffix — a plain `a = v` (no subscript) or an
+// augmented `a[i] += v` (operator token not `=`) is left alone.
+func kotlinIndexSet(n *sitter.Node, src []byte) []SyntheticCall {
+	if kotlinOperatorToken(n, src) != "=" {
+		return nil
+	}
+	target := n.NamedChild(0)
+	if target == nil || target.Type() != "directly_assignable_expression" {
+		return nil
+	}
+	suffix := firstChildOfType(target, "indexing_suffix")
+	if suffix == nil {
+		return nil
+	}
+	var recv *sitter.Node
+	for c := range target.NamedChildren() {
+		if c.Type() == "indexing_suffix" {
+			continue
+		}
+		recv = c
+		break
+	}
+	if recv == nil {
+		return nil
+	}
+	args := kotlinIndexArgs(target)
+	if rhs := kotlinLastNamedChild(n); rhs != nil && !rhs.Equal(target) {
+		args = append(args, rhs)
+	}
+	return []SyntheticCall{{Receiver: recv, Method: "set", Args: args}}
+}
+
+// kotlinIndexArgs returns the index expression nodes of an indexing_suffix
+// child of n (the `i` in `a[i]`), nil when there is none.
+func kotlinIndexArgs(n *sitter.Node) []*sitter.Node {
+	suffix := firstChildOfType(n, "indexing_suffix")
+	if suffix == nil {
+		return nil
+	}
+	var args []*sitter.Node
+	for c := range suffix.NamedChildren() {
+		args = append(args, c)
+	}
+	return args
+}
+
+// kotlinForCollection returns the iterated collection expression of a
+// for_statement: the named child that is neither the loop variable
+// declaration nor the loop body.
+func kotlinForCollection(n *sitter.Node) *sitter.Node {
+	for c := range n.NamedChildren() {
+		switch c.Type() {
+		case "variable_declaration", "multi_variable_declaration", "control_structure_body":
+			continue
+		default:
+			return c
+		}
+	}
+	return nil
+}
+
+// kotlinOperatorToken returns the text of n's operator token — its first
+// unnamed (anonymous) child, whose content is the literal operator (`+`,
+// `..`, `++`, `in` …). "" when n has no anonymous child.
+func kotlinOperatorToken(n *sitter.Node, src []byte) string {
+	for i := 0; i < int(n.ChildCount()); i++ {
+		c := n.Child(i)
+		if c != nil && !c.IsNamed() {
+			return c.Content(src)
+		}
+	}
+	return ""
+}
+
+// kotlinLastNamedChild returns n's last named child, nil when n has none.
+func kotlinLastNamedChild(n *sitter.Node) *sitter.Node {
+	cnt := int(n.NamedChildCount())
+	if cnt == 0 {
+		return nil
+	}
+	return n.NamedChild(cnt - 1)
 }
