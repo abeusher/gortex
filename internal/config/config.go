@@ -1434,14 +1434,18 @@ func (c SearchConfig) EffectiveKeywordSoupRewrite() string {
 // HybridBackend down-weights the vector channel for identifier-shaped
 // queries — never a replacement for text search. The default provider
 // is `static` (baked GloVe word vectors): it needs zero download and
-// is CPU-only, so semantic search is on by default at no setup cost.
+// is CPU-only. As of the lean-index default, the static provider no
+// longer builds a vector index automatically — FTS5/BM25 text search
+// serves the default, and the semantic channel turns on when a real
+// `local`/`api` provider (or `embedding.enabled: true`) is configured.
 type EmbeddingConfig struct {
 	// Enabled is tri-state. A nil pointer means "not configured" —
-	// the caller falls back to the default (semantic search ON with
-	// the static provider). An explicit `embedding.enabled: false`
-	// turns the vector channel off; `true` forces it on. Pointer so
-	// the loader can tell "absent" from "explicitly false", mirroring
-	// RespectGitignore.
+	// the vector channel is then built only when a real `local`/`api`
+	// provider is configured (the static default stays text-only). An
+	// explicit `embedding.enabled: false` turns the vector channel off;
+	// `true` forces it on, building whatever provider is configured
+	// (including the static one). Pointer so the loader can tell
+	// "absent" from "explicitly false", mirroring RespectGitignore.
 	Enabled *bool `mapstructure:"enabled" yaml:"enabled,omitempty"`
 
 	// Provider selects the embedding backend: `static` (baked GloVe,
