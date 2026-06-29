@@ -260,6 +260,38 @@ type Handler func(w http.ResponseWriter, r *http.Request)
 	assert.Contains(t, names, "Handler")
 }
 
+func TestGoExtractor_TypeFlavor(t *testing.T) {
+	src := []byte(`package main
+
+type Point struct{ X, Y int }
+type Stringer interface{ String() string }
+type ID = string
+type Celsius float64
+`)
+	e := NewGoExtractor()
+	result, err := e.Extract("types.go", src)
+	require.NoError(t, err)
+
+	point := nodeByName(result.Nodes, "Point")
+	require.NotNil(t, point)
+	assert.Equal(t, "struct", point.Meta["type_flavor"])
+
+	stringer := nodeByName(result.Nodes, "Stringer")
+	require.NotNil(t, stringer)
+	assert.Equal(t, graph.KindInterface, stringer.Kind)
+	assert.Equal(t, "interface", stringer.Meta["type_flavor"])
+
+	id := nodeByName(result.Nodes, "ID")
+	require.NotNil(t, id)
+	assert.Equal(t, "type_alias", id.Meta["type_flavor"])
+	// Dual-write: the legacy alias marker must survive beside type_flavor.
+	assert.Equal(t, true, id.Meta["alias"])
+
+	celsius := nodeByName(result.Nodes, "Celsius")
+	require.NotNil(t, celsius)
+	assert.Equal(t, "newtype", celsius.Meta["type_flavor"])
+}
+
 // --- Type environment tests ---
 
 func TestGoExtractor_TypeEnv_ExplicitVar(t *testing.T) {

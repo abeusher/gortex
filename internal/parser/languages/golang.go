@@ -1593,6 +1593,15 @@ func (e *GoExtractor) emitTypeDecl(m parser.QueryResult, filePath, fileID string
 		node.Meta["doc"] = doc
 	}
 	node.Meta["visibility"] = VisibilityByCase(name)
+	// Structural flavor: struct/interface bodies are discriminated above;
+	// everything else funnelling through `type X <named>` is a newtype.
+	flavor := "newtype"
+	if isInterface {
+		flavor = "interface"
+	} else if isStruct {
+		flavor = "struct"
+	}
+	node.Meta["type_flavor"] = flavor
 	result.Nodes = append(result.Nodes, node)
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
@@ -1826,6 +1835,7 @@ func (e *GoExtractor) emitTypeAlias(m parser.QueryResult, filePath, fileID strin
 		node.Meta["doc"] = doc
 	}
 	node.Meta["visibility"] = VisibilityByCase(name)
+	node.Meta["type_flavor"] = "type_alias"
 	result.Nodes = append(result.Nodes, node)
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
