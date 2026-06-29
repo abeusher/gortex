@@ -301,6 +301,17 @@ func (e *SwiftExtractor) emitTypeContainer(m parser.QueryResult, prefix, filePat
 		if prefix == "enum" {
 			meta["kind"] = "enum"
 		}
+		// Structural flavor: the class.* capture covers class/struct/actor
+		// alike, so the `prefix` param alone can't tell them apart — read the
+		// leading declaration keyword off the decl node. enum is determined
+		// by the prefix (its own capture).
+		flavor := "class"
+		if kw := swiftDeclKeyword(def.Node); kw != "" {
+			flavor = kw
+		} else if prefix == "enum" {
+			flavor = "enum"
+		}
+		meta["type_flavor"] = flavor
 		if doc := ExtractDocAbove(src, def.StartLine, DocLangSlashSlash); doc != "" {
 			meta["doc"] = doc
 		}
@@ -322,6 +333,7 @@ func (e *SwiftExtractor) emitTypeContainer(m parser.QueryResult, prefix, filePat
 					n.Meta = make(map[string]any)
 				}
 				n.Meta["kind"] = "enum"
+				n.Meta["type_flavor"] = "enum"
 				break
 			}
 		}
@@ -366,6 +378,27 @@ func (e *SwiftExtractor) emitTypeContainer(m parser.QueryResult, prefix, filePat
 	}
 }
 
+// swiftDeclKeyword reads the leading declaration keyword token off a
+// class.* capture node. tree-sitter-swift folds class/struct/actor/enum
+// into one class_declaration rule, so the keyword token is what tells
+// them apart. Returns "" when no recognised keyword is a direct child.
+func swiftDeclKeyword(node *sitter.Node) string {
+	if node == nil {
+		return ""
+	}
+	for i, n := 0, int(node.ChildCount()); i < n; i++ {
+		ch := node.Child(i)
+		if ch == nil {
+			continue
+		}
+		switch ch.Type() {
+		case "class", "struct", "actor", "enum":
+			return ch.Type()
+		}
+	}
+	return ""
+}
+
 // recordProtocolMethod walks up to the enclosing protocol_declaration
 // and appends the method name to its Meta["methods"] entry. Mirrors
 // legacy swQProtocolMethod nested capture.
@@ -393,7 +426,7 @@ func (e *SwiftExtractor) emitProtocol(m parser.QueryResult, filePath, fileID str
 		return
 	}
 	seen[id] = true
-	meta := map[string]any{"visibility": swiftVisibility(def.Node, src)}
+	meta := map[string]any{"visibility": swiftVisibility(def.Node, src), "type_flavor": "protocol"}
 	if swiftHasAttr(def.Node, "objc", src) {
 		meta["objc"] = true
 	}

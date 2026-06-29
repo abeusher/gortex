@@ -128,6 +128,41 @@ func TestSwiftExtractor_Enum(t *testing.T) {
 	assert.Equal(t, map[string]bool{"north": true, "south": true, "east": true, "west": true}, caseNames)
 }
 
+func TestSwiftExtractor_TypeFlavor(t *testing.T) {
+	src := []byte(`class Widget {}
+struct Point {}
+actor Bank {}
+enum Suit { case hearts }
+protocol Store {}
+`)
+	e := NewSwiftExtractor()
+	result, err := e.Extract("flavor.swift", src)
+	require.NoError(t, err)
+
+	widget := nodeByName(result.Nodes, "Widget")
+	require.NotNil(t, widget)
+	assert.Equal(t, "class", widget.Meta["type_flavor"])
+
+	point := nodeByName(result.Nodes, "Point")
+	require.NotNil(t, point)
+	assert.Equal(t, "struct", point.Meta["type_flavor"])
+
+	bank := nodeByName(result.Nodes, "Bank")
+	require.NotNil(t, bank)
+	assert.Equal(t, "actor", bank.Meta["type_flavor"])
+
+	suit := nodeByName(result.Nodes, "Suit")
+	require.NotNil(t, suit)
+	assert.Equal(t, "enum", suit.Meta["type_flavor"])
+	// Dual-write: the legacy enum marker stays beside type_flavor.
+	assert.Equal(t, "enum", suit.Meta["kind"])
+
+	store := nodeByName(result.Nodes, "Store")
+	require.NotNil(t, store)
+	assert.Equal(t, graph.KindInterface, store.Kind)
+	assert.Equal(t, "protocol", store.Meta["type_flavor"])
+}
+
 func TestSwiftExtractor_EnumAssociatedValues(t *testing.T) {
 	// Cases with associated values used to false-match label
 	// identifiers (`x` in `case labeled(x: Int)`) — confirm only the
