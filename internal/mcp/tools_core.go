@@ -822,7 +822,7 @@ func (s *Server) registerCoreTools() {
 	s.addTool(
 		mcp.NewTool("search_symbols",
 			mcp.WithDescription("Use instead of Grep to find symbols across the whole codebase. Supports natural language queries with camelCase-aware tokenization and BM25 ranking — 'validate token auth' finds validateToken, AuthMiddleware, parseJWT."),
-			mcp.WithString("query", mcp.Required(), mcp.Description("Search query — symbol name, concept, or keywords. Also accepts inline field-qualified clauses: `kind:function lang:go path:internal/ repo:gortex project:web validateToken` — recognised fields are kind, lang (aliases ts/js/py/rs/…), path, repo, project; everything else is free text. A field-qualified query that matches nothing retries on the free text alone (response carries `filters_relaxed: true`).")),
+			mcp.WithString("query", mcp.Required(), mcp.Description("Search query — symbol name, concept, or keywords. Also accepts inline field-qualified clauses: `kind:function lang:go path:internal/ repo:gortex project:web validateToken` — recognised fields are kind, flavor, lang (aliases ts/js/py/rs/…), path, repo, project; everything else is free text. A field-qualified query that matches nothing retries on the free text alone (response carries `filters_relaxed: true`).")),
 			mcp.WithNumber("limit", mcp.Description("Max results (default: 20)")),
 			mcp.WithString("cursor", mcp.Description("Opaque pagination cursor returned in `next_cursor` from a previous call. Pass it back to fetch the next page. Omit for the first page.")),
 			mcp.WithBoolean("paginate", mcp.Description("When true, the server caps each page at the project default budget and returns `next_cursor` for any tail. Implies the caller will follow `next_cursor` to walk the rest. Default false (full result inline; transport spills to disk if oversized).")),
@@ -836,6 +836,7 @@ func (s *Server) registerCoreTools() {
 			mcp.WithString("scope", mcp.Description("Name of a saved scope (see save_scope) — restricts results to that scope's repositories. Ignored when an explicit repo / project / ref is also given.")),
 			mcp.WithString("path", mcp.Description("Restrict results to one or more sub-paths (comma-separated) -- the monorepo-service slice (e.g. \"services/billing,libs/auth\"). Anchored, slash-segment-boundary prefixes relative to the repo root: \"services/billing\" matches services/billing/x.go, not other/services/billingX. Unions with any inline path: clause and a scope's saved paths.")),
 			mcp.WithString("kind", mcp.Description("Filter to one or more node kinds (comma-separated). Standard kinds: function, method, type, interface, variable, constant, field, file, package, import, contract. Coverage kinds: param, closure, enum_member, generic_param, module, table, column, config_key, flag, event, migration, fixture, todo, team, license, release, doc (Markdown prose section).")),
+			mcp.WithString("flavor", mcp.Description("Filter to one or more structural flavors (comma-separated, union). Values: class, struct, enum, interface, trait, protocol, object, record, type_alias, newtype, message, service, table, view, module, signature, type_def, instance, hook, play — matched against Meta[\"type_flavor\"] case-insensitively. The special value `component` spans both keys: it matches any UI component node (React / Vue / Svelte / SwiftUI / …). ANDs with kind:.")),
 			mcp.WithString("assist", mcp.Description("LLM assist mode: \"auto\" (default — engages on natural-language queries, skips identifier lookups), \"on\" (force engage), \"off\" (bypass), \"deep\" (on + a body-grounded verification pass that reads candidate code and HONESTLY drops irrelevant matches — slower, may return empty results when nothing genuinely matches). Requires an LLM provider configured via `llm.provider` (local / anthropic / openai / azure / ollama / claudecli / codex / copilot / cursor / opencode / gemini / bedrock / deepseek, or a registered custom provider); behaves as \"off\" when none is available.")),
 			mcp.WithBoolean("debug", mcp.Description("When true, attach a `rerank` block to the response carrying per-candidate scores and per-signal contributions from the 11-signal rerank pipeline (bm25, semantic, fan_in, hits, fan_out, churn, community, minhash, api_signature, type_signature, recency, feedback) plus the active per-signal weight map. Off by default; enable to inspect ranking decisions or tune `.gortex.yaml::search::weights`.")),
 			mcp.WithString("query_class", mcp.Description("Advisory hint that tunes the bm25-vs-semantic balance of the rerank: \"auto\" (default — detect from query shape), \"symbol\" (identifier / API lookup — BM25-heavy), \"concept\" (natural-language description — balanced), \"path\" (file-path query — most BM25-heavy), \"signature\" (type/function-signature fragment — BM25-leaning), \"keyword_soup\" (a degenerate boolean OR-list \u2014 suppresses LLM expansion and splits the soup into per-disjunct BM25 fetches; a `query_advice` nudge rides on the response). The class actually used is echoed back as `query_class` in the response.")),
@@ -1444,6 +1445,24 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	if kindArg == "" {
 		kindArg = fq.Kind
 	}
+	flavorArg := strings.TrimSpace(req.GetString("flavor", ""))
+	if flavorArg == "" {
+		flavorArg = fq.Flavor
+	}
+	// codegraph-compat shim: a kind: value that is actually a structural
+	// flavor (class/struct/enum/component) routes to the flavor filter so
+	// `kind:class` doesn't silently return an empty result set.
+	if kindArg != "" {
+		var movedFlavors string
+		kindArg, movedFlavors = reclassifyKindFlavor(kindArg)
+		if movedFlavors != "" {
+			if flavorArg == "" {
+				flavorArg = movedFlavors
+			} else {
+				flavorArg += "," + movedFlavors
+			}
+		}
+	}
 	pathFilter := s.resolvePathFilter(req, fq)
 
 	// applyAllPostFilters runs the full post-search filter sequence
@@ -1460,6 +1479,10 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 		}
 		// lang: / path: / repo: clauses from the field-qualified syntax.
 		cands = applyFieldFilters(cands, fq)
+		// flavor: clause / flavor param / reclassified kind: value.
+		if flavorArg != "" {
+			cands = applyFlavorFilter(cands, flavorArg)
+		}
 		// Sub-path scoping: anchored, slash-segment prefix narrowing
 		// below the repository grain. Distinct from the loose `path:`
 		// substring match in applyFieldFilters -- this is a
@@ -1477,7 +1500,7 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	// caller's repo / project scope), so an over-narrow or typo'd
 	// clause degrades to a useful result set instead of an empty one.
 	filtersRelaxed := false
-	if len(nodes) == 0 && q != "" && (kindArg != "" || fq.hasFieldFilters()) {
+	if len(nodes) == 0 && q != "" && (kindArg != "" || flavorArg != "" || fq.hasFieldFilters()) {
 		relaxed := filterNodes(s.engineFor(ctx).SearchSymbolsScoped(q, fetchLimit, scope), allowed)
 		if len(relaxed) > 0 {
 			nodes = relaxed
