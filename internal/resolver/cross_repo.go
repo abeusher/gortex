@@ -100,6 +100,17 @@ type CrossRepoResolver struct {
 	// repo B even if the module path matches.
 	depModuleIndex       map[string][]depModuleEntry
 	mu                   *sync.Mutex
+	// validateLiveness turns on the concurrent-edit guards in resolveEdge.
+	// Set only on the chunked resolve path (ResolveAll with chunking), where
+	// the pass releases mu between chunks so an interactive single-file edit
+	// can interleave and evict nodes/edges the once-built per-pass indexes
+	// still reference. With it on, resolveEdge skips an edge that is no
+	// longer live (reindexing an evicted edge half-resurrects it and can
+	// panic) and refuses a resolution whose target node was evicted (a
+	// dangling edge). Off (the default, and the whole-pass-locked path) it is
+	// a no-op: nothing can mutate the graph mid-pass, so every edge and
+	// candidate is live by construction.
+	validateLiveness bool
 	crossWorkspaceLookup CrossWorkspaceDepLookup
 	// npmAlias rewrites a JS/TS import specifier that matches an
 	// npm-alias dependency key in the importing file's nearest-
@@ -877,6 +888,13 @@ func (cr *CrossRepoResolver) cachedGetNodeByQualName(qualName string) *graph.Nod
 }
 
 func (cr *CrossRepoResolver) resolveEdge(e *graph.Edge, stats *CrossRepoStats, batch *[]graph.EdgeReindex) {
+	// On the chunked path a concurrent edit may have evicted this edge since
+	// the pending set was snapshotted. Resolving + reindexing an evicted edge
+	// half-resurrects it (re-adds its inEdges bucket while its outEdges slot
+	// is gone) and can panic; skip it — its file will re-resolve on its own.
+	if cr.validateLiveness && !edgeStillLive(cr.graph, e) {
+		return
+	}
 	oldTo := e.To
 	// UnresolvedName handles BOTH the bare `unresolved::X` and the
 	// multi-repo `<repo>::unresolved::X` forms; a plain TrimPrefix only
@@ -916,8 +934,41 @@ func (cr *CrossRepoResolver) resolveEdge(e *graph.Edge, stats *CrossRepoStats, b
 	}
 
 	if e.To != oldTo {
+		// On the chunked path the per-pass candidate indexes were built before
+		// inter-chunk yields, so a candidate may have been evicted by a
+		// concurrent edit. Refuse a resolution to a target that is no longer a
+		// live node (synthetic external placeholders are exempt — they are
+		// intentionally not graph nodes at resolve time); leave the edge
+		// unresolved rather than reindex it onto a missing target.
+		if cr.validateLiveness && !isSyntheticResolveTarget(e.To) && cr.graph.GetNode(e.To) == nil {
+			e.To = oldTo
+			return
+		}
 		*batch = append(*batch, graph.EdgeReindex{Edge: e, OldTo: oldTo})
 	}
+}
+
+// edgeStillLive reports whether e is currently present as an out-edge of its
+// source node — i.e. it was not evicted by a concurrent single-file edit
+// since the resolve pass snapshotted its pending set. GetOutEdges returns the
+// live stored *Edge pointers, so identity comparison is exact.
+func edgeStillLive(g graph.Store, e *graph.Edge) bool {
+	if e == nil {
+		return false
+	}
+	for _, oe := range g.GetOutEdges(e.From) {
+		if oe == e {
+			return true
+		}
+	}
+	return false
+}
+
+// isSyntheticResolveTarget reports whether a resolved target is an intentional
+// placeholder rather than a concrete graph node (so the chunked path's
+// target-liveness guard must not treat its absence as an evicted candidate).
+func isSyntheticResolveTarget(to string) bool {
+	return strings.HasPrefix(to, "external::") || strings.HasPrefix(to, "extern::")
 }
 
 // callerRepoPrefix returns the RepoPrefix of the node that owns the edge's From field.
