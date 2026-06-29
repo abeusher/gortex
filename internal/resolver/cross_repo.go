@@ -415,6 +415,9 @@ func (cr *CrossRepoResolver) ResolveAll() *CrossRepoStats {
 			}
 		}
 		if len(scBatch) > 0 {
+			if cr.validateLiveness {
+				scBatch = cr.filterLiveReindex(scBatch)
+			}
 			cr.graph.ReindexEdges(scBatch)
 			reindexTotal += len(scBatch)
 		}
@@ -918,13 +921,6 @@ func (cr *CrossRepoResolver) cachedGetNodeByQualName(qualName string) *graph.Nod
 }
 
 func (cr *CrossRepoResolver) resolveEdge(e *graph.Edge, stats *CrossRepoStats, batch *[]graph.EdgeReindex) {
-	// On the chunked path a concurrent edit may have evicted this edge since
-	// the pending set was snapshotted. Resolving + reindexing an evicted edge
-	// half-resurrects it (re-adds its inEdges bucket while its outEdges slot
-	// is gone) and can panic; skip it — its file will re-resolve on its own.
-	if cr.validateLiveness && !edgeStillLive(cr.graph, e) {
-		return
-	}
 	oldTo := e.To
 	// UnresolvedName handles BOTH the bare `unresolved::X` and the
 	// multi-repo `<repo>::unresolved::X` forms; a plain TrimPrefix only
@@ -964,18 +960,30 @@ func (cr *CrossRepoResolver) resolveEdge(e *graph.Edge, stats *CrossRepoStats, b
 	}
 
 	if e.To != oldTo {
-		// On the chunked path the per-pass candidate indexes were built before
-		// inter-chunk yields, so a candidate may have been evicted by a
-		// concurrent edit. Refuse a resolution to a target that is no longer a
-		// live node (synthetic external placeholders are exempt — they are
-		// intentionally not graph nodes at resolve time); leave the edge
-		// unresolved rather than reindex it onto a missing target.
-		if cr.validateLiveness && !isSyntheticResolveTarget(e.To) && cr.graph.GetNode(e.To) == nil {
-			e.To = oldTo
-			return
-		}
 		*batch = append(*batch, graph.EdgeReindex{Edge: e, OldTo: oldTo})
 	}
+}
+
+// filterLiveReindex validates a resolved batch before applying it on the
+// chunked path: a concurrent edit during an inter-chunk yield may have evicted
+// an edge (reindexing it half-resurrects it and can panic) or its resolved
+// target node (a dangling edge). Drop evicted edges; revert a resolution whose
+// target is gone. O(batch) — only the edges that actually resolved, NOT the
+// whole pending set (an O(pending*out-degree) per-edge check stalled the pass).
+func (cr *CrossRepoResolver) filterLiveReindex(batch []graph.EdgeReindex) []graph.EdgeReindex {
+	out := batch[:0]
+	for _, r := range batch {
+		e := r.Edge
+		if e == nil || !edgeStillLive(cr.graph, e) {
+			continue
+		}
+		if !isSyntheticResolveTarget(e.To) && cr.graph.GetNode(e.To) == nil {
+			e.To = r.OldTo
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
 }
 
 // edgeStillLive reports whether e is currently present as an out-edge of its
