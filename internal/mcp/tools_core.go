@@ -78,6 +78,8 @@ type toonNodeRow struct {
 	IsTest      bool   `toon:"is_test"`
 	TestRole    string `toon:"test_role"`
 	TestRunner  string `toon:"test_runner,omitempty"`
+	TypeFlavor  string `toon:"type_flavor,omitempty"`
+	UIComponent string `toon:"ui_component,omitempty"`
 }
 
 // toonEdgeRow is a TOON-optimized flat representation of a graph edge.
@@ -128,6 +130,8 @@ func nodesToTOONRows(nodes []*graph.Node) []toonNodeRow {
 		isTest, _ := n.Meta["is_test"].(bool)
 		testRole, _ := n.Meta["test_role"].(string)
 		testRunner, _ := n.Meta["test_runner"].(string)
+		typeFlavor, _ := n.Meta["type_flavor"].(string)
+		uiComponent, _ := n.Meta["ui_component"].(string)
 		encID, encName := graph.EnclosingFromID(n.ID, n.Kind)
 		rows = append(rows, toonNodeRow{
 			ID:          n.ID,
@@ -140,6 +144,8 @@ func nodesToTOONRows(nodes []*graph.Node) []toonNodeRow {
 			IsTest:      isTest,
 			TestRole:    testRole,
 			TestRunner:  testRunner,
+			TypeFlavor:  typeFlavor,
+			UIComponent: uiComponent,
 		})
 	}
 	return rows
@@ -2302,9 +2308,47 @@ func (s *Server) handleFindUsages(ctx context.Context, req mcp.CallToolRequest) 
 		return s.respondJSONOrTOON(ctx, req, groupUsagesByFile(sg))
 	}
 	if s.isGCX(ctx, req) {
-		return s.gcxResponseWithBudget(req)(encodeFindUsages(sg))
+		return s.gcxResponseWithBudget(req)(encodeFindUsages(sg, s.graph))
+	}
+	// Plain JSON gets curated usage rows that promote the resolved
+	// from_type_flavor / from_ui_component to top-level node fields, so
+	// they survive the meta-stripping degrade step. TOON / compact /
+	// diagram formats go through the shared subgraph renderer.
+	format := req.GetString("format", "")
+	if !s.isTOON(ctx, req) && !isCompact(req) && format != "mermaid" && format != "dot" {
+		sg.Nodes = s.withAbsPaths(sg.Nodes)
+		return s.respondJSONOrTOON(ctx, req, newUsageResponse(sg, s.graph))
 	}
 	return s.returnSubGraph(ctx, req, sg)
+}
+
+// usageNode wraps a find_usages node with the resolved from_* fields
+// promoted to top-level JSON (not nested under meta, so they survive
+// the meta-stripping degrade step). It is an mcp-package projection —
+// it never adds a field to the graph wire contract.
+type usageNode struct {
+	*graph.Node
+	FromTypeFlavor  string `json:"from_type_flavor,omitempty"`
+	FromUIComponent string `json:"from_ui_component,omitempty"`
+}
+
+// usageResponse is the curated find_usages JSON payload. It embeds the
+// SubGraph (so caveat / totals / edges marshal unchanged) and shadows
+// its Nodes with the from_*-enriched projection.
+type usageResponse struct {
+	*query.SubGraph
+	Nodes []usageNode `json:"nodes"`
+}
+
+// newUsageResponse resolves the from_* fields for each node (pure read
+// — never mutates the graph) and wraps the SubGraph for JSON output.
+func newUsageResponse(sg *query.SubGraph, g graph.Store) *usageResponse {
+	wrapped := make([]usageNode, 0, len(sg.Nodes))
+	for _, n := range sg.Nodes {
+		tf, uc := usageFromFlavor(g, n.ID, n)
+		wrapped = append(wrapped, usageNode{Node: n, FromTypeFlavor: tf, FromUIComponent: uc})
+	}
+	return &usageResponse{SubGraph: sg, Nodes: wrapped}
 }
 
 // annotateAndFilterUsageContext stamps each usage edge with its

@@ -30,6 +30,8 @@ func TestEncodeSearchSymbols_HeaderAndRows(t *testing.T) {
 		newTestNode("a.go::Foo", "Foo", graph.KindFunction, "a.go", 10),
 		newTestNode("b.go::Decoder.Bar", "Bar", graph.KindMethod, "b.go", 20),
 	}
+	nodes[0].Meta["type_flavor"] = "struct"
+	nodes[0].Meta["ui_component"] = "react"
 	payload, err := encodeSearchSymbols(nodes, 2, 10)
 	require.NoError(t, err)
 
@@ -37,7 +39,7 @@ func TestEncodeSearchSymbols_HeaderAndRows(t *testing.T) {
 	h, err := dec.Header()
 	require.NoError(t, err)
 	require.Equal(t, "search_symbols", h.Tool)
-	require.Equal(t, []string{"id", "kind", "name", "path", "path_abs", "line", "sig", "enclosing", "is_test", "test_role", "test_runner"}, h.Fields)
+	require.Equal(t, []string{"id", "kind", "name", "path", "path_abs", "line", "sig", "enclosing", "is_test", "test_role", "test_runner", "type_flavor", "ui_component"}, h.Fields)
 	require.Equal(t, "2", h.Meta["total"])
 	require.Equal(t, "false", h.Meta["truncated"])
 
@@ -55,6 +57,12 @@ func TestEncodeSearchSymbols_HeaderAndRows(t *testing.T) {
 	// A top-level function has no enclosing owner; a method does.
 	require.Equal(t, "", rows[0]["enclosing"], "a top-level function has no enclosing owner")
 	require.Equal(t, "Decoder", rows[1]["enclosing"], "a method reports its receiver type as the enclosing owner")
+	// New structural-flavor columns surface the node's own type_flavor /
+	// ui_component, empty when the node carries neither.
+	require.Equal(t, "struct", rows[0]["type_flavor"])
+	require.Equal(t, "react", rows[0]["ui_component"])
+	require.Equal(t, "", rows[1]["type_flavor"])
+	require.Equal(t, "", rows[1]["ui_component"])
 }
 
 func TestEncodeSearchSymbols_RespectsLimitAndTruncation(t *testing.T) {
@@ -216,7 +224,7 @@ func TestEncodeFindUsages_OneRowPerEdge(t *testing.T) {
 			{From: "a.go::Caller", To: "b.go::Target", Kind: "calls", Origin: "lsp_resolved", Confidence: 1.0},
 		},
 	}
-	payload, err := encodeFindUsages(sg)
+	payload, err := encodeFindUsages(sg, nil)
 	require.NoError(t, err)
 	dec := wire.NewDecoder(strings.NewReader(string(payload)))
 	_, err = dec.Header()
@@ -248,7 +256,7 @@ func TestEncodeFindUsages_FromLineIsCallSite(t *testing.T) {
 			{From: "a.go::Caller", To: "b.go::Target", Kind: "calls", Origin: "lsp_resolved", Confidence: 1.0, FilePath: "a.go", Line: 42},
 		},
 	}
-	payload, err := encodeFindUsages(sg)
+	payload, err := encodeFindUsages(sg, nil)
 	require.NoError(t, err)
 	dec := wire.NewDecoder(strings.NewReader(string(payload)))
 	_, err = dec.Header()
@@ -258,6 +266,38 @@ func TestEncodeFindUsages_FromLineIsCallSite(t *testing.T) {
 	require.Len(t, rows, 2)
 	require.Equal(t, "27", rows[0]["from_line"])
 	require.Equal(t, "42", rows[1]["from_line"])
+}
+
+// TestEncodeFindUsages_FromFlavor pins the owner-resolution surfacing:
+// the from_type_flavor column reports the FROM site's enclosing owner
+// type's flavor, and from_ui_component the FROM node's own framework.
+func TestEncodeFindUsages_FromFlavor(t *testing.T) {
+	g := graph.New()
+	owner := newTestNode("b.go::Svc", "Svc", graph.KindType, "b.go", 5)
+	owner.Meta["type_flavor"] = "struct"
+	caller := newTestNode("b.go::Svc.Run", "Run", graph.KindMethod, "b.go", 10)
+	caller.Meta["ui_component"] = "react"
+	target := newTestNode("c.go::Target", "Target", graph.KindFunction, "c.go", 20)
+	g.AddNode(owner)
+	g.AddNode(caller)
+	g.AddNode(target)
+
+	sg := &query.SubGraph{
+		Nodes: []*graph.Node{caller, target},
+		Edges: []*graph.Edge{
+			{From: "b.go::Svc.Run", To: "c.go::Target", Kind: "calls", Origin: "ast_resolved", Confidence: 1.0, Line: 12},
+		},
+	}
+	payload, err := encodeFindUsages(sg, g)
+	require.NoError(t, err)
+	dec := wire.NewDecoder(strings.NewReader(string(payload)))
+	_, err = dec.Header()
+	require.NoError(t, err)
+	rows, err := dec.All()
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	require.Equal(t, "struct", rows[0]["from_type_flavor"], "owner type's flavor")
+	require.Equal(t, "react", rows[0]["from_ui_component"], "caller's own ui_component")
 }
 
 func TestEncodeAnalyze_DeadCode(t *testing.T) {

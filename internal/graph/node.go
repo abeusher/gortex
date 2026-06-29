@@ -396,6 +396,16 @@ func (n *Node) Brief() map[string]any {
 	if v, ok := n.Meta["is_test_file"].(bool); ok && v {
 		b["is_test_file"] = true
 	}
+	// Structural flavor + UI-component framework — stamped by the
+	// language extractors. Surfacing them on the listing row lets an
+	// agent filter / triage by shape (struct vs class, react vs svelte)
+	// without a follow-up call.
+	if v, ok := n.Meta["type_flavor"].(string); ok && v != "" {
+		b["type_flavor"] = v
+	}
+	if v, ok := n.Meta["ui_component"].(string); ok && v != "" {
+		b["ui_component"] = v
+	}
 	// A prose-section node carries no signature -- surface a short
 	// snippet of its body text so a docs search result is
 	// self-describing without a follow-up read.

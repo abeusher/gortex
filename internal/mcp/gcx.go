@@ -149,6 +149,27 @@ func nodeTestRole(n *graph.Node) string {
 	return r
 }
 
+// nodeTypeFlavor returns the node's structural flavor (class / struct /
+// enum / interface / …) stamped by the language extractors, or "".
+func nodeTypeFlavor(n *graph.Node) string {
+	if n == nil || n.Meta == nil {
+		return ""
+	}
+	v, _ := n.Meta["type_flavor"].(string)
+	return v
+}
+
+// nodeUIComponent returns the node's UI-component framework name
+// (react / vue / svelte / swiftui / …) stamped on a detected component
+// node, or "".
+func nodeUIComponent(n *graph.Node) string {
+	if n == nil || n.Meta == nil {
+		return ""
+	}
+	v, _ := n.Meta["ui_component"].(string)
+	return v
+}
+
 // nodeTestRunner returns the node's resolved test-runner identifier —
 // "mocha" / "bun-test" / "jest" / "vitest" / "node-test" / "playwright"
 // / "cypress" / "gotest" / "pytest" / "unittest" / "rspec" / "minitest"
@@ -258,7 +279,7 @@ func encodeSearchSymbols(nodes []*graph.Node, total, limit int) ([]byte, error) 
 	}
 	var buf bytes.Buffer
 	enc := newGCX(&buf, "search_symbols",
-		[]string{"id", "kind", "name", "path", "path_abs", "line", "sig", "enclosing", "is_test", "test_role", "test_runner"},
+		[]string{"id", "kind", "name", "path", "path_abs", "line", "sig", "enclosing", "is_test", "test_role", "test_runner", "type_flavor", "ui_component"},
 		"total", fmt.Sprintf("%d", total),
 		"truncated", boolString(truncated),
 	)
@@ -282,6 +303,8 @@ func encodeSearchSymbols(nodes []*graph.Node, total, limit int) ([]byte, error) 
 			nodeIsTest(n),
 			nodeTestRole(n),
 			nodeTestRunner(n),
+			nodeTypeFlavor(n),
+			nodeUIComponent(n),
 		); err != nil {
 			return nil, err
 		}
@@ -364,12 +387,12 @@ func zeroEdgeCaveatMeta(c *graph.ZeroEdgeCaveat) []string {
 // encodeFindUsages emits one row per usage edge. Each row names the
 // caller symbol, its location, the edge kind, and the origin tier so
 // agents can filter without a second call.
-func encodeFindUsages(sg *query.SubGraph) ([]byte, error) {
+func encodeFindUsages(sg *query.SubGraph, g graph.Store) ([]byte, error) {
 	var buf bytes.Buffer
 	meta := []string{"edges", fmt.Sprintf("%d", len(sg.Edges))}
 	meta = append(meta, zeroEdgeCaveatMeta(sg.Caveat)...)
 	enc := newGCX(&buf, "find_usages",
-		[]string{"from", "to", "edge_kind", "context", "return_usage", "origin", "tier", "confidence", "from_name", "from_path", "from_line", "from_is_test", "from_test_role", "from_test_runner"},
+		[]string{"from", "to", "edge_kind", "context", "return_usage", "origin", "tier", "confidence", "from_name", "from_path", "from_line", "from_is_test", "from_test_role", "from_test_runner", "from_type_flavor", "from_ui_component"},
 		meta...,
 	)
 	nodeIdx := indexNodes(sg.Nodes)
@@ -397,9 +420,10 @@ func encodeFindUsages(sg *query.SubGraph) ([]byte, error) {
 		if tier == "" {
 			tier = graph.ResolvedBy(e.Origin)
 		}
+		ftf, fuc := usageFromFlavor(g, e.From, fn)
 		if err := enc.WriteRow(
 			e.From, e.To, string(e.Kind), e.Context, e.ReturnUsage, e.Origin, tier, e.Confidence,
-			fname, fpath, fline, nodeIsTest(fn), nodeTestRole(fn), nodeTestRunner(fn),
+			fname, fpath, fline, nodeIsTest(fn), nodeTestRole(fn), nodeTestRunner(fn), ftf, fuc,
 		); err != nil {
 			return nil, err
 		}
