@@ -176,7 +176,7 @@ func (e *JavaScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 			e.emitArrow(m, filePath, fileID, src, result, arrowNames, seenIDs)
 
 		case m.Captures["class.def"] != nil:
-			e.emitClass(m, filePath, fileID, result)
+			e.emitClass(m, filePath, fileID, src, result)
 
 		case m.Captures["objfn.def"] != nil:
 			registerObjMember(e.emitObjectArrowField(m, filePath, fileID, src, result))
@@ -269,7 +269,7 @@ func (e *JavaScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 		// re-attribution (see the TS extractor for the shared helper).
 		if v.name != "" && v.name[0] >= 'A' && v.name[0] <= 'Z' {
 			if kind, renderFn := reactHOCComponentKind(v.defNode, src); kind != "" {
-				node.Meta = map[string]any{"component": true, "component_kind": kind}
+				node.Meta = map[string]any{"component": true, "component_kind": kind, "ui_component": jsxFrameworkFromImports(v.defNode, src)}
 				if renderFn != nil {
 					if body := renderFn.ChildByFieldName("body"); body != nil {
 						emitJSXRenderEdges(id, body, src, filePath, result)
@@ -481,6 +481,7 @@ func (e *JavaScriptExtractor) emitFunction(m parser.QueryResult, filePath, fileI
 	if body := tsFunctionBody(def.Node); body != nil {
 		StampFunctionMetrics(node, body, "javascript")
 		emitJSXRenderEdges(id, body, src, filePath, result)
+		markFunctionComponent(node.Meta, name, body, def.Node, src, "function")
 	}
 }
 
@@ -513,6 +514,7 @@ func (e *JavaScriptExtractor) emitArrow(m parser.QueryResult, filePath, fileID s
 		}
 		StampFunctionMetrics(node, body, "javascript")
 		emitJSXRenderEdges(id, body, src, filePath, result)
+		markFunctionComponent(node.Meta, name, body, def.Node, src, "arrow")
 	}
 }
 
@@ -536,15 +538,25 @@ func jsArrowFunctionFromDef(def *sitter.Node) *sitter.Node {
 	return nil
 }
 
-func (e *JavaScriptExtractor) emitClass(m parser.QueryResult, filePath, fileID string, result *parser.ExtractionResult) {
+func (e *JavaScriptExtractor) emitClass(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult) {
 	name := m.Captures["class.name"].Text
 	def := m.Captures["class.def"]
 	id := filePath + "::" + name
+	meta := map[string]any{"type_flavor": "class"}
+	// Class component: a React-family base (Component / PureComponent) or
+	// a Web-Components base (HTMLElement / LitElement) makes this a
+	// component — heritage is the signal, so no JSX walk is needed.
+	if ext := jsxClassExtendsName(def.Node, src); ext != "" {
+		if ui, ck := classHeritageComponentUI(ext, def.Node, src); ui != "" {
+			meta["ui_component"] = ui
+			meta["component_kind"] = ck
+		}
+	}
 	result.Nodes = append(result.Nodes, &graph.Node{
 		ID: id, Kind: graph.KindType, Name: name,
 		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
 		Language: "javascript",
-		Meta:     map[string]any{"type_flavor": "class"},
+		Meta:     meta,
 	})
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
@@ -731,6 +743,7 @@ func (e *JavaScriptExtractor) emitObjectArrowField(m parser.QueryResult, filePat
 		}
 		StampFunctionMetrics(node, body, "javascript")
 		emitJSXRenderEdges(id, body, src, filePath, result)
+		markFunctionComponent(node.Meta, name, body, def.Node, src, "arrow")
 	}
 	if owner == "" {
 		return "", "", ""

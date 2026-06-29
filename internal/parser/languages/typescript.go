@@ -557,7 +557,7 @@ func (e *TypeScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 		// inline render function's JSX to the outer const (not the anon arrow).
 		if v.name != "" && v.name[0] >= 'A' && v.name[0] <= 'Z' {
 			if kind, renderFn := reactHOCComponentKind(v.defNode, src); kind != "" {
-				node.Meta = map[string]any{"component": true, "component_kind": kind}
+				node.Meta = map[string]any{"component": true, "component_kind": kind, "ui_component": jsxFrameworkFromImports(v.defNode, src)}
 				if renderFn != nil {
 					if body := renderFn.ChildByFieldName("body"); body != nil {
 						emitJSXRenderEdges(id, body, src, filePath, result)
@@ -690,6 +690,9 @@ func (e *TypeScriptExtractor) emitFunction(m parser.QueryResult, filePath, fileI
 	// every uppercase-first-letter element rendered inside the body.
 	if body := tsFunctionBody(def.Node); body != nil {
 		emitJSXRenderEdges(id, body, src, filePath, result)
+		// A PascalCase function that directly renders JSX is a function
+		// component — mark it with its framework + sub-shape.
+		markFunctionComponent(meta, name, body, def.Node, src, "function")
 	}
 }
 
@@ -738,6 +741,7 @@ func (e *TypeScriptExtractor) emitArrow(m parser.QueryResult, filePath, fileID s
 	if body := m.Captures["arrow.body"]; body != nil && body.Node != nil {
 		emitTSFunctionShape(id, body.Node, src, filePath, def.StartLine+1, result)
 		emitJSXRenderEdges(id, body.Node, src, filePath, result)
+		markFunctionComponent(meta, name, body.Node, def.Node, src, "arrow")
 	}
 	return name
 }
@@ -803,6 +807,7 @@ func (e *TypeScriptExtractor) emitArrowField(m parser.QueryResult, filePath, fil
 	if body := m.Captures["objfn.body"]; body != nil && body.Node != nil {
 		emitTSFunctionShape(id, body.Node, src, filePath, def.StartLine+1, result)
 		emitJSXRenderEdges(id, body.Node, src, filePath, result)
+		markFunctionComponent(meta, name, body.Node, def.Node, src, "arrow")
 	} else {
 		emitTSFunctionShape(id, def.Node, src, filePath, def.StartLine+1, result)
 	}
@@ -870,6 +875,15 @@ func (e *TypeScriptExtractor) emitClass(m parser.QueryResult, filePath, fileID s
 		meta["type_params"] = tp
 	}
 	meta["type_flavor"] = "class"
+	// Class component: a React-family base (Component / PureComponent) or
+	// a Web-Components base (HTMLElement / LitElement) makes this a
+	// component — heritage is the signal, so no JSX walk is needed.
+	if ext := jsxClassExtendsName(def.Node, src); ext != "" {
+		if ui, ck := classHeritageComponentUI(ext, def.Node, src); ui != "" {
+			meta["ui_component"] = ui
+			meta["component_kind"] = ck
+		}
+	}
 	result.Nodes = append(result.Nodes, &graph.Node{
 		ID: id, Kind: graph.KindType, Name: name,
 		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
