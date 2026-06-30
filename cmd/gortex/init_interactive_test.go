@@ -23,7 +23,7 @@ func TestInteractiveWizard_DefaultHooksYes(t *testing.T) {
 	// Pressing Enter at the hooks prompt defaults to yes.
 	choice, out := runWizard(t, "\n")
 	assert.True(t, choice.Hooks, "empty input must default to yes")
-	assert.Contains(t, out, "Install Claude Code hooks")
+	assert.Contains(t, out, "Install agent hooks")
 }
 
 func TestInteractiveWizard_DeclineHooks(t *testing.T) {
@@ -41,7 +41,7 @@ func TestInteractiveWizard_HooksPresetSkipsPrompt(t *testing.T) {
 	choice, ok := runInteractiveInit(in, &out, true)
 	assert.True(t, ok, "preset path must return ok without reading input")
 	assert.True(t, choice.Hooks, "preset default is Hooks=true; caller overrides later")
-	assert.NotContains(t, out.String(), "Install Claude Code hooks",
+	assert.NotContains(t, out.String(), "Install agent hooks",
 		"hooks prompt must be suppressed when hooksPreset=true")
 }
 

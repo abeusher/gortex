@@ -25,6 +25,11 @@ import (
 const Name = "codex"
 const DocsURL = "https://developers.openai.com/codex/mcp"
 
+const codexSessionStartMatcher = "startup|resume|clear|compact"
+const codexSessionStartMessage = "IMPORTANT: Prefer Gortex MCP tools (search_symbols, get_callers, get_file_summary, edit_file) over Read/Grep/Glob/Edit."
+const codexSessionStartCommand = "printf '%s\\n' '" + codexSessionStartMessage + "'"
+const codexSessionStartWindowsCommand = "powershell -NoProfile -Command \"Write-Output '" + codexSessionStartMessage + "'\""
+
 type Adapter struct{}
 
 func New() *Adapter                { return &Adapter{} }
@@ -48,10 +53,14 @@ func (a *Adapter) Detect(env agents.Env) (bool, error) {
 func (a *Adapter) Plan(env agents.Env) (*agents.Plan, error) {
 	p := &agents.Plan{}
 	if env.Home != "" {
+		keys := []string{"mcp_servers"}
+		if env.InstallHooks {
+			keys = append(keys, "hooks")
+		}
 		p.Files = append(p.Files, agents.FileAction{
 			Path:   filepath.Join(env.Home, ".codex", "config.toml"),
 			Action: agents.ActionWouldMerge,
-			Keys:   []string{"mcp_servers"},
+			Keys:   keys,
 		})
 	}
 	if env.Mode != agents.ModeGlobal && env.SkillsRouting != "" {
@@ -78,22 +87,27 @@ func (a *Adapter) Apply(env agents.Env, opts agents.ApplyOpts) (*agents.Result, 
 
 	path := filepath.Join(env.Home, ".codex", "config.toml")
 	action, err := agents.MergeTOML(env.Stderr, path, func(root map[string]any, _ bool) (bool, error) {
+		changed := false
 		servers, ok := root["mcp_servers"].(map[string]any)
 		if !ok {
 			servers = make(map[string]any)
 		}
-		if _, exists := servers["gortex"]; exists && !opts.Force {
-			return false, nil
+		if _, exists := servers["gortex"]; !exists || opts.Force {
+			servers["gortex"] = map[string]any{
+				"command": "gortex",
+				"args":    []string{"mcp"},
+				"env": map[string]any{
+					"GORTEX_INDEX_WORKERS": "8",
+				},
+			}
+			root["mcp_servers"] = servers
+			changed = true
 		}
-		servers["gortex"] = map[string]any{
-			"command": "gortex",
-			"args":    []string{"mcp"},
-			"env": map[string]any{
-				"GORTEX_INDEX_WORKERS": "8",
-			},
+
+		if env.InstallHooks && upsertSessionStartHook(root, opts) {
+			changed = true
 		}
-		root["mcp_servers"] = servers
-		return true, nil
+		return changed, nil
 	}, opts)
 	if err != nil {
 		return res, err
@@ -116,4 +130,95 @@ func (a *Adapter) Apply(env agents.Env, opts agents.ApplyOpts) (*agents.Result, 
 
 	res.Configured = true
 	return res, nil
+}
+
+func upsertSessionStartHook(root map[string]any, opts agents.ApplyOpts) bool {
+	hooks, ok := root["hooks"].(map[string]any)
+	if !ok {
+		if _, exists := root["hooks"]; exists {
+			return false
+		}
+		hooks = make(map[string]any)
+	}
+
+	entries, ok := codexHookList(hooks["SessionStart"])
+	if !ok {
+		return false
+	}
+
+	found := false
+	kept := make([]any, 0, len(entries)+1)
+	for _, entry := range entries {
+		if codexHookEntryIsGortexSessionStart(entry) {
+			found = true
+			if opts.Force {
+				continue
+			}
+		}
+		kept = append(kept, entry)
+	}
+	if found && !opts.Force {
+		return false
+	}
+
+	hooks["SessionStart"] = append(kept, codexSessionStartHookEntry())
+	root["hooks"] = hooks
+	return true
+}
+
+func codexHookList(v any) ([]any, bool) {
+	if v == nil {
+		return nil, true
+	}
+	switch list := v.(type) {
+	case []any:
+		return append([]any(nil), list...), true
+	case []map[string]any:
+		out := make([]any, 0, len(list))
+		for _, entry := range list {
+			out = append(out, entry)
+		}
+		return out, true
+	default:
+		return nil, false
+	}
+}
+
+func codexHookEntryIsGortexSessionStart(entry any) bool {
+	group, ok := entry.(map[string]any)
+	if !ok {
+		return false
+	}
+	handlers, ok := codexHookList(group["hooks"])
+	if !ok {
+		return false
+	}
+	for _, handler := range handlers {
+		hm, ok := handler.(map[string]any)
+		if !ok {
+			continue
+		}
+		if cmd, _ := hm["command"].(string); cmd == codexSessionStartCommand {
+			return true
+		}
+		if cmd, _ := hm["command_windows"].(string); cmd == codexSessionStartWindowsCommand {
+			return true
+		}
+	}
+	return false
+}
+
+func codexSessionStartHookEntry() map[string]any {
+	return map[string]any{
+		"matcher": codexSessionStartMatcher,
+		"hooks": []any{
+			map[string]any{
+				"type":            "command",
+				"command":         codexSessionStartCommand,
+				"command_windows": codexSessionStartWindowsCommand,
+				"timeout":         5,
+				"statusMessage":   "Loading Gortex graph orientation...",
+			},
+		},
+	}
 }

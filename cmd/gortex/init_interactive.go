@@ -38,7 +38,7 @@ func runInteractiveInit(in io.Reader, out io.Writer, hooksPreset bool) (interact
 		return choice, true
 	}
 
-	fmt.Fprint(out, "Install Claude Code hooks (PreToolUse + PreCompact + Stop)? [Y/n]: ")
+	fmt.Fprint(out, "Install agent hooks (Claude Code + Codex SessionStart where supported)? [Y/n]: ")
 	line, err := reader.ReadString('\n')
 	if err != nil {
 		return interactiveChoice{}, false

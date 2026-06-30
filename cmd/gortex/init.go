@@ -76,7 +76,7 @@ var initCmd = &cobra.Command{
 	Use:   "init [path]",
 	Short: "Wire Gortex into the current repository for every detected AI coding assistant",
 	Long: `Configure Gortex for this repository: per-repo MCP and instruction files for each
-detected assistant, optional Claude Code hooks, community-derived routing, and (with --analyze)
+detected assistant, optional agent hooks, community-derived routing, and (with --analyze)
 a richer CLAUDE.md overview.
 
 For one-time machine-wide setup (user MCP config, user skills /
@@ -87,8 +87,8 @@ Knowledge Items, user hooks), run ` + "`gortex install`" + ` once.`,
 
 func init() {
 	initCmd.Flags().BoolVar(&initAnalyze, "analyze", false, "index the repo to generate a richer CLAUDE.md with codebase overview")
-	initCmd.Flags().BoolVar(&initInstallHooks, "hooks", true, "install Claude Code hooks (PreToolUse + PreCompact + Stop); use --no-hooks to skip")
-	initCmd.Flags().BoolVar(&initNoHooks, "no-hooks", false, "skip installing Claude Code hooks (inverse of --hooks)")
+	initCmd.Flags().BoolVar(&initInstallHooks, "hooks", true, "install supported agent hooks; use --no-hooks to skip")
+	initCmd.Flags().BoolVar(&initNoHooks, "no-hooks", false, "skip installing supported agent hooks (inverse of --hooks)")
 	initCmd.Flags().BoolVar(&initHooksOnly, "hooks-only", false, "only install/update Claude Code hooks in .claude/settings.local.json, skip everything else")
 	initCmd.Flags().StringVar(&initHookMode, "hook-mode", "deny",
 		"hook posture: 'deny' (PreToolUse redirects Grep/Glob/Read of indexed source) or 'enrich' "+

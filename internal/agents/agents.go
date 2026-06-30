@@ -76,8 +76,8 @@ type Env struct {
 	Mode Mode
 
 	// InstallHooks is false when the user passed --no-hooks or
-	// answered "no" to the wizard. Only the Claude Code adapter
-	// currently honours it.
+	// answered "no" to the wizard. Hook-capable adapters use it to
+	// skip their lifecycle hook surfaces while still installing MCP.
 	InstallHooks bool
 
 	// HookMode is the posture for the PreToolUse / PostToolUse hook

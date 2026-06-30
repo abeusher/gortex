@@ -12,7 +12,7 @@ Just installed Gortex? This is the shortest path from "it's on my machine" to "i
 
 Setup is split into two commands so codebase-agnostic machinery lives once per user, not once per repo:
 
-- **`gortex install`** — run **once per machine**. Writes user-level artifacts: `~/.claude.json` (MCP config), `~/.claude/skills/gortex-*` (tool-usage skills), `~/.claude/commands/gortex-*.md` (slash commands), `~/.gemini/antigravity/` Knowledge Items, and (optionally) user-level Claude Code hooks. Also sets up the daemon — pass `--start` to spawn it, `--track` to register the current directory.
+- **`gortex install`** — run **once per machine**. Writes user-level artifacts: `~/.claude.json` (MCP config), `~/.claude/skills/gortex-*` (tool-usage skills), `~/.claude/commands/gortex-*.md` (slash commands), `~/.gemini/antigravity/` Knowledge Items, and (optionally) user-level hooks. Also sets up the daemon — pass `--start` to spawn it, `--track` to register the current directory.
 - **`gortex init`** — run **once per repo**. Writes per-repo artifacts: `.mcp.json`, `.claude/settings.{json,local.json}`, `CLAUDE.md` with the codebase overview and community routing, `.claude/skills/generated/` per-community SKILL.md files, and a marker-guarded community-routing block in every other detected agent's per-repo instructions file.
 
 You can run them independently — `gortex init` doesn't require `gortex install` first; it just writes less if the user-level wiring isn't there.
@@ -50,7 +50,7 @@ Open your AI assistant in that repo and ask it to do something real. It'll use G
 ```bash
 gortex install                    # MCP config, skills, slash commands, KIs at ~/
 gortex install --start --track    # also spawn the daemon + track current dir
-gortex install --no-hooks         # skip user-level Claude Code hooks
+gortex install --no-hooks         # skip user-level hooks
 ```
 
 This writes under `$HOME` only. It's idempotent — re-running it is safe. Think of it like `brew install`.

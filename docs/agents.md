@@ -6,11 +6,10 @@ machine. Seventeen adapters ship today.
 
 - `gortex install` writes user-level machinery: `~/.claude.json` MCP,
   `~/.claude/skills/gortex-*`, `~/.claude/commands/gortex-*.md`,
-  `~/.gemini/antigravity/` Knowledge Items, user-level Claude Code
-  hooks.
+  `~/.gemini/antigravity/` Knowledge Items, and user-level hooks.
 - `gortex init` writes per-repo machinery: `.mcp.json`, per-agent
   MCP configs (`.cursor/mcp.json`, `.vscode/mcp.json`, …), repo-local
-  Claude Code hooks, per-agent marker-guarded community-routing
+  hooks where supported, per-agent marker-guarded community-routing
   blocks, and `.claude/skills/generated/` per-community SKILL.md.
 
 Run `gortex init doctor` to see what's currently configured. Both
@@ -25,7 +24,7 @@ commands accept `--agents=<csv>` to constrain setup and
 | `aider`         | `.aiderignore` block, `CONVENTIONS.md` communities block                                        | project    | https://aider.chat/docs/config/aider_conf.html                      |
 | `antigravity`   | `~/.gemini/antigravity/mcp_config.json` + Knowledge Item                                        | user       | https://antigravity.google/docs/mcp                                 |
 | `cline`         | `cline_mcp_settings.json` (per VS Code / Cursor globalStorage), `.clinerules/gortex-communities.md` | both     | https://docs.cline.bot/mcp/mcp-overview                             |
-| `codex`         | `~/.codex/config.toml` (`[mcp_servers.gortex]`), `AGENTS.md` communities block                  | both       | https://developers.openai.com/codex/mcp                             |
+| `codex`         | `~/.codex/config.toml` (`[mcp_servers.gortex]` + `SessionStart` hook), `AGENTS.md` communities block | both       | https://developers.openai.com/codex/mcp                             |
 | `continue`      | `.continue/mcpServers/gortex.json`, `.continue/rules/gortex-communities.md`                     | project    | https://docs.continue.dev/customize/deep-dives/mcp                  |
 | `cursor`        | `.cursor/mcp.json` (project) or `~/.cursor/mcp.json`, `.cursor/rules/gortex-communities.mdc`    | both       | https://docs.cursor.com/en/context/mcp                              |
 | `gemini`        | `.gemini/settings.json` or `~/.gemini/settings.json`, `GEMINI.md` communities block             | both       | https://geminicli.com/docs/tools/mcp-server/                        |
@@ -195,7 +194,11 @@ directory that exists. Auto-approval field is `alwaysAllow` (not
 ### codex
 
 OpenAI Codex CLI stores config in `~/.codex/config.toml`. We
-upsert a `[mcp_servers.gortex]` table there.
+upsert a `[mcp_servers.gortex]` table there. When hooks are enabled
+(the default), we also add one user-level `SessionStart` hook matching
+`startup|resume|clear|compact`. It emits a short graph-tools
+orientation so new, resumed, cleared, and compacted Codex sessions see
+the same nudge without installing PreToolUse/PostToolUse hooks.
 
 ### continue
 

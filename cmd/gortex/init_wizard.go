@@ -46,7 +46,7 @@ var agentDetails = map[string]string{
 	"aider":       ".aider.conf.yml",
 	"antigravity": ".antigravity/mcp.json",
 	"cline":       ".clinerules + cline_mcp_settings.json",
-	"codex":       "AGENTS.md + config.toml",
+	"codex":       "AGENTS.md + config.toml hooks",
 	"continue":    ".continue/config.json",
 	"gemini":      ".gemini/settings.json",
 	"hermes":      "~/.hermes/config.yaml + profiles + skills",
@@ -158,9 +158,9 @@ func newInitWizardModel(rootPath string, registered []agents.Adapter, detected m
 	opts := tui.OptionsPanel{
 		Toggles: []tui.Toggle{
 			{
-				Label:  "Claude Code hooks",
-				Hint:   "PreToolUse + PreCompact + Stop",
-				Detail: "redirect Read/Grep/Glob of indexed source through the graph",
+				Label:  "Agent hooks",
+				Hint:   "Claude Code + Codex",
+				Detail: "inject graph orientation and redirect indexed source reads where supported",
 				On:     defaults.hooks,
 			},
 			{

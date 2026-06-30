@@ -64,8 +64,8 @@ func init() {
 	installCmd.Flags().BoolVar(&installJSON, "json", false, "emit a structured JSON report on stdout (banner still goes to stderr)")
 	installCmd.Flags().BoolVar(&installDryRun, "dry-run", false, "plan writes without modifying disk")
 	installCmd.Flags().BoolVar(&installForce, "force", false, "overwrite keys we would otherwise preserve during a merge")
-	installCmd.Flags().BoolVar(&installHooks, "hooks", true, "install user-level Claude Code hooks; use --no-hooks to skip")
-	installCmd.Flags().BoolVar(&installNoHooks, "no-hooks", false, "skip user-level Claude Code hooks (inverse of --hooks)")
+	installCmd.Flags().BoolVar(&installHooks, "hooks", true, "install user-level hooks for supported agents; use --no-hooks to skip")
+	installCmd.Flags().BoolVar(&installNoHooks, "no-hooks", false, "skip user-level hooks for supported agents (inverse of --hooks)")
 	installCmd.Flags().StringVar(&installHookMode, "hook-mode", "deny",
 		"hook posture: 'deny' (PreToolUse redirects Grep/Glob/Read of indexed source), 'enrich' "+
 			"(PreToolUse never denies; PostToolUse appends graph context after the tool runs — easier onboarding), "+
