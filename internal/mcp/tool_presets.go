@@ -53,8 +53,12 @@ const (
 // lazy_tools.go::hotEagerTools (the GORTEX_LAZY_TOOLS=1 eager set) — the
 // two answer different questions and are allowed to diverge.
 var corePresetTools = []string{
-	// orient
-	"smart_context", "get_repo_outline", "graph_stats",
+	// orient — index_health is the cheap liveness check the workflow
+	// recommends, so it ships eagerly too (no discovery round-trip for
+	// the documented first step). get_active_project stays deferred: it
+	// is only registered in multi-repo mode, so it can't be an
+	// unconditional core tool.
+	"smart_context", "get_repo_outline", "graph_stats", "index_health",
 	// search / navigate
 	"search_symbols", "search_text", "find_files", "find_usages",
 	"find_implementations", "get_callers", "get_call_chain",
