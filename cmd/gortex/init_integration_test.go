@@ -290,6 +290,94 @@ args = ["mcp", "--custom"]
 	}
 }
 
+func TestInitHooksOnlyRespectsAgentsAllowlist(t *testing.T) {
+	restore := saveInitGlobals(t)
+	defer restore()
+
+	repo := t.TempDir()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	initYes = true
+	initHooksOnly = true
+	initDryRun = false
+	initJSON = false
+	initAgents = "claude-code"
+
+	var stdout, stderr bytes.Buffer
+	initCmd.SetOut(&stdout)
+	initCmd.SetErr(&stderr)
+	t.Cleanup(func() {
+		initCmd.SetOut(nil)
+		initCmd.SetErr(nil)
+	})
+
+	if err := runInit(initCmd, []string{repo}); err != nil {
+		t.Fatalf("runInit: %v\nstderr: %s", err, stderr.String())
+	}
+
+	if _, err := os.Stat(filepath.Join(repo, ".claude", "settings.local.json")); err != nil {
+		t.Fatalf("expected Claude Code hooks to be refreshed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".codex", "config.toml")); !os.IsNotExist(err) {
+		t.Fatalf("--agents=claude-code should not write Codex config, stat err=%v", err)
+	}
+}
+
+func TestInitHooksOnlyRespectsAgentsSkip(t *testing.T) {
+	restore := saveInitGlobals(t)
+	defer restore()
+
+	repo := t.TempDir()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	codexDir := filepath.Join(home, ".codex")
+	if err := os.MkdirAll(codexDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	codexConfig := filepath.Join(codexDir, "config.toml")
+	seed := `model = "gpt-5-codex"
+
+[mcp_servers.gortex]
+command = "custom-gortex"
+`
+	if err := os.WriteFile(codexConfig, []byte(seed), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	initYes = true
+	initHooksOnly = true
+	initDryRun = false
+	initJSON = false
+	initAgentsSkip = "codex"
+
+	var stdout, stderr bytes.Buffer
+	initCmd.SetOut(&stdout)
+	initCmd.SetErr(&stderr)
+	t.Cleanup(func() {
+		initCmd.SetOut(nil)
+		initCmd.SetErr(nil)
+	})
+
+	if err := runInit(initCmd, []string{repo}); err != nil {
+		t.Fatalf("runInit: %v\nstderr: %s", err, stderr.String())
+	}
+
+	if _, err := os.Stat(filepath.Join(repo, ".claude", "settings.local.json")); err != nil {
+		t.Fatalf("expected Claude Code hooks to be refreshed: %v", err)
+	}
+	cfg := readTOMLFile(t, codexConfig)
+	if _, ok := cfg["hooks"]; ok {
+		t.Fatalf("--agents-skip=codex should not write Codex hooks: %#v", cfg["hooks"])
+	}
+	if cfg["model"] != "gpt-5-codex" {
+		t.Fatalf("Codex config was unexpectedly rewritten: %#v", cfg)
+	}
+}
+
 func TestInitHooksOnlyDryRunDoesNotWriteHooks(t *testing.T) {
 	restore := saveInitGlobals(t)
 	defer restore()

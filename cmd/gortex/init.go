@@ -344,15 +344,27 @@ func runInit(cmd *cobra.Command, args []string) (err error) {
 func runInitHooksOnly(cmd *cobra.Command, absRoot string) error {
 	opts := agents.ApplyOpts{DryRun: initDryRun, Force: initForce}
 
-	settingsPath := filepath.Join(absRoot, ".claude", "settings.local.json")
-	claudeAction, err := claudecode.InstallHookWithMode(cmd.ErrOrStderr(), settingsPath, initHookMode, opts)
+	registry := buildRegistry()
+	selected, err := registry.Filter(initAgents, initAgentsSkip)
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(cmd.ErrOrStderr(), "[gortex init --hooks-only] %s %s\n", claudeAction.Action, claudeAction.Path)
+	selectedAgents := make(map[string]bool, len(selected))
+	for _, a := range selected {
+		selectedAgents[a.Name()] = true
+	}
+
+	if selectedAgents[claudecode.Name] {
+		settingsPath := filepath.Join(absRoot, ".claude", "settings.local.json")
+		claudeAction, err := claudecode.InstallHookWithMode(cmd.ErrOrStderr(), settingsPath, initHookMode, opts)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(cmd.ErrOrStderr(), "[gortex init --hooks-only] %s %s\n", claudeAction.Action, claudeAction.Path)
+	}
 
 	home, _ := os.UserHomeDir()
-	if home == "" {
+	if home == "" || !selectedAgents[codex.Name] {
 		return nil
 	}
 	env := agents.Env{
