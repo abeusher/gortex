@@ -29,7 +29,10 @@ const minTierParamDescription = "Filter edges by minimum confidence tier. " +
 	"lsp_dispatch (interface→impl via semantic provider), " +
 	"ast_resolved (tree-sitter direct match), " +
 	"ast_inferred (type heuristic), " +
-	"text_matched (name-only). Omit for no filter. " +
+	"text_matched (name-only). When omitted, text_matched edges are " +
+	"auto-suppressed whenever resolver-verified evidence exists — the " +
+	"response then carries text_matched_suppressed with the hidden count; " +
+	"pass min_tier:\"text_matched\" to include them. " +
 	"Use lsp_resolved for high-stakes refactors where false positives are expensive."
 
 const includeSpeculativeParamDescription = "Include best-guess speculative " +
@@ -2227,6 +2230,11 @@ func (s *Server) handleGetCallers(ctx context.Context, req mcp.CallToolRequest) 
 	sg = filterSubGraphByResolvedScope(sg, resolved)
 	sg.FilterByMinTier(minTier)
 	sg.FilterSpeculative(req.GetBool("include_speculative", false))
+	if minTier == "" {
+		// Same adaptive default as find_usages: hide the name-only
+		// fan-out once resolver-verified callers exist.
+		sg.SuppressRedundantTextMatches()
+	}
 	enrichSubGraphEdges(sg)
 	annotateCallerConcurrency(eng.Reader(), sg, id)
 	if len(sg.Edges) == 0 {
@@ -2440,6 +2448,12 @@ func (s *Server) handleFindUsages(ctx context.Context, req mcp.CallToolRequest) 
 	sg = filterSubGraphByResolvedScope(sg, resolved)
 	sg.FilterByMinTier(minTier)
 	sg.FilterSpeculative(req.GetBool("include_speculative", false))
+	if minTier == "" {
+		// Adaptive default: with resolver-verified usages present, the
+		// text_matched fan-out is noise — suppress it and report the count
+		// via text_matched_suppressed. min_tier:"text_matched" restores it.
+		sg.SuppressRedundantTextMatches()
+	}
 	enrichSubGraphEdges(sg)
 	// Classify each usage's reference context (parameter_type / return_type
 	// / field / value / type / attribute / call) and optionally filter to
