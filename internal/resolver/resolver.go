@@ -123,6 +123,16 @@ type Resolver struct {
 	nodesByName     map[string][]*graph.Node
 	nodesByQualName map[string]*graph.Node
 
+	// importFilesByCaller memoises, per caller file, the set of file
+	// paths that file imports (direct EdgeImports targets plus files
+	// reached through transitive EdgeReExports barrel hops). Built
+	// lazily inside the parallel resolve workers — importFilesMu guards
+	// it — and cleared with the per-pass lookup caches. Consulted by
+	// pickImportEvidenceCallee to disambiguate bare JS/TS calls; see
+	// import_evidence.go for the precedence design.
+	importFilesByCaller map[string]map[string]struct{}
+	importFilesMu       sync.RWMutex
+
 	// incrementalSkip holds the source-shapes of a single re-resolved file's
 	// out-edges that were already unresolved before the edit; the forward
 	// pass skips them. Set/cleared around ResolveFileAndIncoming by the
@@ -699,6 +709,9 @@ func (r *Resolver) clearLookupCache() {
 	r.nodeByID = nil
 	r.nodesByName = nil
 	r.nodesByQualName = nil
+	r.importFilesMu.Lock()
+	r.importFilesByCaller = nil
+	r.importFilesMu.Unlock()
 }
 
 // cachedGetNode returns the node for id, consulting the per-pass
@@ -1734,6 +1747,47 @@ func (r *Resolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *Re
 			e.Meta = map[string]any{}
 		}
 		e.Meta["resolution"] = "scope"
+		stats.Resolved++
+		return
+	}
+
+	// File-local candidates outrank everything below: a symbol defined in
+	// the caller's own file is strictly more local than a same-directory
+	// neighbour in every language (in Go both are package scope, so the
+	// same-file pick is equally valid; in module-scoped languages only the
+	// same-file symbol is in scope at all). Without this tier a same-named
+	// nested helper in a NEIGHBOURING test file captures the calls the
+	// caller's own helper should receive — zustand's persistSync tests
+	// bound to persistAsync's `createStore` helper purely by candidate
+	// iteration order.
+	for _, c := range candidates {
+		if (c.Kind == graph.KindFunction || c.Kind == graph.KindMethod) &&
+			c.FilePath != "" && c.FilePath == e.FilePath {
+			e.To = c.ID
+			stats.Resolved++
+			return
+		}
+	}
+
+	// Import-evidence disambiguation (JS/TS only; see import_evidence.go
+	// for the full precedence design). The ES module system has no ambient
+	// directory scope, so before the locality cascade below can bind a
+	// same-dir shadow — and before cross-dir ambiguity guesses or refuses —
+	// ask the caller file's import closure. When the caller imports exactly
+	// one candidate's file (directly or through re-export/barrel hops) that
+	// import statement is structural, AST-grade evidence of the binding:
+	// resolve to it at OriginASTResolved, the tier resolveRendersChild's
+	// import-binding path already uses. A module-local candidate blocks the
+	// pick; no import or several imported candidates fall through to the
+	// existing cascade unchanged.
+	if pick := r.pickImportEvidenceCallee(e.FilePath, funcName, candidates); pick != nil {
+		e.To = pick.ID
+		e.Origin = graph.OriginASTResolved
+		e.Confidence = 0.9
+		if e.Meta == nil {
+			e.Meta = map[string]any{}
+		}
+		e.Meta["resolution"] = "import_closure"
 		stats.Resolved++
 		return
 	}
