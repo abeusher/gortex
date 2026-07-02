@@ -75,8 +75,16 @@ func NewCExtractor() *CExtractor {
 	}
 }
 
-func (e *CExtractor) Language() string     { return "c" }
-func (e *CExtractor) Extensions() []string { return []string{".c", ".h"} }
+func (e *CExtractor) Language() string { return "c" }
+
+// Extensions includes ".def" — the conventional extension for a generated C
+// fragment #include'd into a translation unit (an X-macro / command table like
+// redis's src/commands.def). No other extractor claims ".def"; a non-C ".def"
+// (a Windows linker module-definition file) degrades to tree-sitter ERROR nodes
+// and emits nothing meaningful. ".inc" is contested (assembly / PHP / Pascal),
+// so a clearly-C ".inc" fragment is routed to this extractor by content sniffing
+// (sniffAmbiguous) instead of an extension claim.
+func (e *CExtractor) Extensions() []string { return []string{".c", ".h", ".def"} }
 
 // --- Deferred match buffers ----------------------------------------
 
@@ -220,6 +228,7 @@ func (e *CExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRes
 	captureValueRefCandidates(result, root, filePath, src)
 	captureFnValueCandidates(result, root, filePath, src)
 	captureCFnPointerDispatch(result, root, filePath, src)
+	captureCFnAddressRefs(result, root, filePath, fileID, src)
 	return result, nil
 }
 
