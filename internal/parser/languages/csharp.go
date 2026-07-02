@@ -707,11 +707,16 @@ func (e *CSharpExtractor) emitMethod(m parser.QueryResult, filePath, fileID stri
 		return
 	}
 
-	// Interface methods: legacy only collected names; no graph node was
-	// emitted for them. Mirror that.
-	if owner.kind == "interface_declaration" {
+	// Interface members feed the interface node's method-name list (read
+	// back where interface nodes are stamped). Beyond that list they also
+	// need their own member-level node: a through-interface call site binds
+	// to the interface member, so find_usages can only answer — and the
+	// member-level dispatch synthesis can only fan out to implementations —
+	// when that node exists. A C# 8 default interface method carries a body
+	// and otherwise flows through the concrete-method path unchanged.
+	isIface := owner.kind == "interface_declaration"
+	if isIface {
 		ifaceMethods[owner.name] = append(ifaceMethods[owner.name], name)
-		return
 	}
 
 	id := filePath + "::" + owner.name + "." + name
@@ -722,9 +727,22 @@ func (e *CSharpExtractor) emitMethod(m parser.QueryResult, filePath, fileID stri
 		return
 	}
 	seen[id] = true
+	// Interface members are implicitly public; an explicit modifier (a C# 8
+	// default member marked private/protected) still wins via csharpVisibility.
+	defaultVis := VisibilityPrivate
+	if isIface {
+		defaultVis = VisibilityPublic
+	}
 	meta := map[string]any{
 		"receiver":   owner.name,
-		"visibility": csharpVisibility(def.Node, src, VisibilityPrivate),
+		"visibility": csharpVisibility(def.Node, src, defaultVis),
+	}
+	// Distinguish a bodyless interface declaration from a concrete method so
+	// dispatch synthesis and analyzers can tell them apart; a bodyless
+	// member must never be treated as a dead-code candidate just for lacking
+	// a body.
+	if isIface {
+		meta["iface_member"] = true
 	}
 	if rt := extractCSharpMethodReturnType(def.Node, src, name); rt != "" {
 		meta["return_type"] = rt
@@ -799,7 +817,7 @@ func (e *CSharpExtractor) emitConstructor(m parser.QueryResult, filePath, fileID
 
 func (e *CSharpExtractor) emitField(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool) {
 	def := m.Captures["field.def"]
-	owner := csharpDirectMemberOwner(def.Node, src, "class_declaration", "struct_declaration")
+	owner := csharpDirectMemberOwner(def.Node, src, "class_declaration", "struct_declaration", "interface_declaration")
 	if owner.kind == "" {
 		return
 	}
@@ -809,9 +827,18 @@ func (e *CSharpExtractor) emitField(m parser.QueryResult, filePath, fileID strin
 		return
 	}
 	seen[id] = true
+	// Interface fields (C# 8+ static/const members) are implicitly public.
+	isIface := owner.kind == "interface_declaration"
+	defaultVis := VisibilityPrivate
+	if isIface {
+		defaultVis = VisibilityPublic
+	}
 	meta := map[string]any{
 		"receiver":   owner.name,
-		"visibility": csharpVisibility(def.Node, src, VisibilityPrivate),
+		"visibility": csharpVisibility(def.Node, src, defaultVis),
+	}
+	if isIface {
+		meta["iface_member"] = true
 	}
 	// A field_declaration's type lives on its nested variable_declaration
 	// (`field_declaration → variable_declaration[type] → variable_declarator`),
@@ -857,7 +884,7 @@ func (e *CSharpExtractor) emitField(m parser.QueryResult, filePath, fileID strin
 
 func (e *CSharpExtractor) emitProperty(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool) {
 	def := m.Captures["prop.def"]
-	owner := csharpDirectMemberOwner(def.Node, src, "class_declaration", "struct_declaration")
+	owner := csharpDirectMemberOwner(def.Node, src, "class_declaration", "struct_declaration", "interface_declaration")
 	if owner.kind == "" {
 		return
 	}
@@ -867,10 +894,19 @@ func (e *CSharpExtractor) emitProperty(m parser.QueryResult, filePath, fileID st
 		return
 	}
 	seen[id] = true
+	// Interface properties are implicitly public; explicit modifiers still win.
+	isIface := owner.kind == "interface_declaration"
+	defaultVis := VisibilityPrivate
+	if isIface {
+		defaultVis = VisibilityPublic
+	}
 	meta := map[string]any{
 		"receiver":   owner.name,
-		"visibility": csharpVisibility(def.Node, src, VisibilityPrivate),
+		"visibility": csharpVisibility(def.Node, src, defaultVis),
 		"kind":       "property",
+	}
+	if isIface {
+		meta["iface_member"] = true
 	}
 	var propTypeRaw string
 	if t := def.Node.ChildByFieldName("type"); t != nil {
