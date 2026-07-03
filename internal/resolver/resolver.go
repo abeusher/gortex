@@ -1190,6 +1190,13 @@ func (r *Resolver) resolveIncomingLocked(filePath string, stats *ResolveStats) {
 				continue
 			}
 			oldTo, changed := r.resolveEdge(e, stats)
+			// Restore the provenance the restub stashed when the stub rebound
+			// to the same target it had before the re-parse (unchanged binding
+			// keeps its verified tier); always drops the transient stash keys,
+			// so a rebind elsewhere / a still-unresolved stub carries only the
+			// honest tier the resolver just assigned. Runs before the job is
+			// captured so the cross-package guard below sees the real origin.
+			graph.RestoreRestubProvenance(e)
 			if changed {
 				reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: e, OldTo: oldTo})
 				jobs = append(jobs, reindexJob{

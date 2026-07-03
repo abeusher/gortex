@@ -104,6 +104,87 @@ func TestIncrementalReindex_PreservesIncomingCallerEdges(t *testing.T) {
 		"re-adding Foo must rebind Bar's pending caller edge via the reverse pass")
 }
 
+// TestIncrementalReindex_DoubleCycle_PreservesIncomingTier is the F3
+// regression: re-parsing a definition file twice (append then revert — the
+// exact staleness-probe sequence) must not ratchet an incoming caller edge's
+// tier down or leave it a stub. Before the fix the first cycle preserved the
+// caller edge but the second could collapse it; this asserts stability across
+// BOTH cycles.
+func TestIncrementalReindex_DoubleCycle_PreservesIncomingTier(t *testing.T) {
+	dir := t.TempDir()
+	aPath := filepath.Join(dir, "a.go")
+	bPath := filepath.Join(dir, "b.go")
+	writeFile(t, aPath, "package p\n\nfunc Foo() {}\n")
+	writeFile(t, bPath, "package p\n\nfunc Bar() { Foo() }\n")
+
+	g := graph.New()
+	idx := New(g, newTestRegistry(), config.IndexConfig{Workers: 1}, zap.NewNop())
+	idx.search = search.NewBM25()
+	idx.SetRootPath(dir)
+	_, err := idx.IndexCtx(testCtx(), dir)
+	require.NoError(t, err)
+
+	fooID := fnNodeID(t, g, "a.go", "Foo")
+	barID := fnNodeID(t, g, "b.go", "Bar")
+	require.Equal(t, fooID, callTargetFrom(t, g, barID))
+
+	// Stamp B's incoming call edge compiler-grade.
+	e := callEdgeFrom(t, g, barID)
+	g.SetEdgeProvenance(e, graph.OriginLSPResolved)
+	e.Tier = graph.ResolvedBy(graph.OriginLSPResolved)
+
+	cycles := []string{
+		"package p\n\nfunc Foo() {}\n\nfunc Extra() {}\n", // append
+		"package p\n\nfunc Foo() {}\n",                     // revert
+	}
+	for i, content := range cycles {
+		writeFile(t, aPath, content)
+		require.NoError(t, idx.IndexFile(aPath))
+		after := callEdgeFrom(t, g, fnNodeID(t, g, "b.go", "Bar"))
+		assert.Falsef(t, graph.IsUnresolvedTarget(after.To),
+			"cycle %d: Bar's caller edge must not remain a stub", i)
+		assert.Equalf(t, fnNodeID(t, g, "a.go", "Foo"), after.To,
+			"cycle %d: Bar's caller edge must still resolve to Foo", i)
+		assert.Equalf(t, graph.OriginLSPResolved, after.Origin,
+			"cycle %d: incoming edge must keep its lsp origin (no ratchet-down)", i)
+	}
+}
+
+// TestIncrementalReindex_DeletedDefinition_NoStaleTierOnStub locks F3's
+// provenance honesty: when a definition is genuinely deleted, the incoming
+// caller edge reverts to an unresolved stub and must NOT keep claiming the
+// compiler-grade tier it carried while bound — an unresolved stub advertising
+// lsp_resolved is a provenance lie.
+func TestIncrementalReindex_DeletedDefinition_NoStaleTierOnStub(t *testing.T) {
+	dir := t.TempDir()
+	aPath := filepath.Join(dir, "a.go")
+	bPath := filepath.Join(dir, "b.go")
+	writeFile(t, aPath, "package p\n\nfunc Foo() {}\n")
+	writeFile(t, bPath, "package p\n\nfunc Bar() { Foo() }\n")
+
+	g := graph.New()
+	idx := New(g, newTestRegistry(), config.IndexConfig{Workers: 1}, zap.NewNop())
+	idx.search = search.NewBM25()
+	idx.SetRootPath(dir)
+	_, err := idx.IndexCtx(testCtx(), dir)
+	require.NoError(t, err)
+
+	barID := fnNodeID(t, g, "b.go", "Bar")
+	e := callEdgeFrom(t, g, barID)
+	g.SetEdgeProvenance(e, graph.OriginLSPResolved)
+	e.Tier = graph.ResolvedBy(graph.OriginLSPResolved)
+
+	idx.EvictFile(aPath)
+
+	stub := callEdgeFrom(t, g, barID)
+	require.True(t, graph.IsUnresolvedTarget(stub.To),
+		"deleting Foo must leave Bar's call as an unresolved stub")
+	assert.NotEqual(t, graph.OriginLSPResolved, stub.Origin,
+		"an unresolved stub must not keep advertising a compiler-grade origin")
+	assert.Empty(t, stub.Tier,
+		"an unresolved stub must not keep a resolved tier")
+}
+
 // TestEvictFile_DropsEnrichmentSidecars proves the change-A eviction
 // cascade: deleting a file drops its nodes' churn/coverage/blame
 // sidecar rows, leaving no orphan enrichment.

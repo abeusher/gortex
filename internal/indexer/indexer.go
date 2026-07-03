@@ -3602,6 +3602,12 @@ func (idx *Indexer) restubIncomingRefs(graphPath string) {
 				continue // already a pending stub
 			}
 			oldTo := e.To
+			// Stash + clear the edge's resolved provenance before restubbing:
+			// an `unresolved::` stub must not keep advertising a resolved
+			// tier. The incoming-resolve pass restores it verbatim if the stub
+			// rebinds to the same target (idempotent re-parse); a deleted or
+			// moved target leaves the stub honestly unresolved.
+			graph.StashRestubProvenance(e)
 			e.To = stub
 			batch = append(batch, graph.EdgeReindex{Edge: e, OldTo: oldTo})
 		}
