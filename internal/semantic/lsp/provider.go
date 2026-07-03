@@ -130,6 +130,41 @@ type Provider struct {
 	// backoff). Defaults to ensureClient. Injected in tests to swap in an
 	// in-memory piped client instead of spawning a subprocess.
 	connectOnce func(absRoot string) error
+
+	// reqStats counts the LSP request methods issued during the current
+	// enrichment pass. Reset at pass start and surfaced in the end-of-pass
+	// telemetry so the round-trip volume per method is observable.
+	reqStats requestStats
+}
+
+// requestStats holds one atomic counter per LSP request method the
+// enrichment pass issues, so the pass-complete log can report where the
+// round trips went.
+type requestStats struct {
+	references           atomic.Int64
+	implementations      atomic.Int64
+	definitions          atomic.Int64
+	hovers               atomic.Int64
+	prepareCallHierarchy atomic.Int64
+	outgoingCalls        atomic.Int64
+	incomingCalls        atomic.Int64
+	prepareTypeHierarchy atomic.Int64
+	supertypes           atomic.Int64
+	subtypes             atomic.Int64
+}
+
+// reset zeroes every counter at the start of an enrichment pass.
+func (r *requestStats) reset() {
+	r.references.Store(0)
+	r.implementations.Store(0)
+	r.definitions.Store(0)
+	r.hovers.Store(0)
+	r.prepareCallHierarchy.Store(0)
+	r.outgoingCalls.Store(0)
+	r.incomingCalls.Store(0)
+	r.prepareTypeHierarchy.Store(0)
+	r.supertypes.Store(0)
+	r.subtypes.Store(0)
 }
 
 // Dial-retry constants for passive-attach reconnect. The window
@@ -188,17 +223,17 @@ func NewProviderFromSpec(spec *ServerSpec, logger *zap.Logger) *Provider {
 		maxParallel = 10
 	}
 	p := &Provider{
-		command:          cmd,
-		args:             args,
-		env:              spec.Env,
-		languages:        spec.Languages,
-		daemon:           spec.Daemon,
-		maxParallel:      maxParallel,
-		logger:           logger,
-		spec:             spec,
-		docVersions:      map[string]int{},
-		openDocs:         map[string]bool{},
-		lastDiag:         map[string][]Diagnostic{},
+		command:            cmd,
+		args:               args,
+		env:                spec.Env,
+		languages:          spec.Languages,
+		daemon:             spec.Daemon,
+		maxParallel:        maxParallel,
+		logger:             logger,
+		spec:               spec,
+		docVersions:        map[string]int{},
+		openDocs:           map[string]bool{},
+		lastDiag:           map[string][]Diagnostic{},
 		diagWaiters:        map[string][]chan []Diagnostic{},
 		dynamicCaps:        map[string]Registration{},
 		connect:            spec.Connect,
@@ -333,7 +368,12 @@ func edgeExistsAt(g graph.Store, from, to string, kind graph.EdgeKind, line int)
 //
 // cache memoises verdicts per (file, line, name) within one enrichment
 // pass; multiple ambiguous edges can share a call site.
-func (p *Provider) definitionNodeAtSite(g graph.Store, repoPrefix, absRoot, siteRel string, siteLine int, name string, cache map[string]*graph.Node) (*graph.Node, bool) {
+//
+// content is the site file's bytes, already opened on the server and read
+// from disk by the caller (via the shared document session). A nil content
+// yields a no-verdict, matching the pre-session behaviour when the site
+// file could not be opened.
+func (p *Provider) definitionNodeAtSite(g graph.Store, repoPrefix, absRoot, siteRel string, siteLine int, name string, content []byte, cache map[string]*graph.Node) (*graph.Node, bool) {
 	if siteRel == "" || siteLine <= 0 || name == "" {
 		return nil, false
 	}
@@ -341,12 +381,7 @@ func (p *Provider) definitionNodeAtSite(g graph.Store, repoPrefix, absRoot, site
 	if cached, ok := cache[key]; ok {
 		return cached, true
 	}
-	if err := p.openDocument(absRoot, siteRel); err != nil {
-		return nil, false
-	}
-	defer func() { _ = p.closeDocument(filepath.Join(absRoot, siteRel)) }()
-
-	col, found := identifierColumnStrict(p.getSource(absRoot, siteRel), siteLine, name)
+	col, found := identifierColumnStrict(content, siteLine, name)
 	if !found {
 		// The identifier is not on the recorded line — a definition
 		// request would return junk for whatever token sits there.
@@ -515,6 +550,16 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// Reset the cross-pass reconnect counter so the metrics log reflects
 	// only this Enrich invocation.
 	p.reconnectAttempts.Store(0)
+	// Reset the per-method request counters so the pass-complete log
+	// reports only this invocation's round trips.
+	p.reqStats.reset()
+
+	// One document session shared by every phase below: a file didOpen'd
+	// by the interface pass stays warm for the confirm pass and the sweep
+	// instead of being reopened, and every open is paired with a didClose
+	// (evicted under cap, or by closeAll here at pass end).
+	session := newDocSession(p)
+	defer session.closeAll()
 
 	// Total symbols scoped to repo + language — langNodes already excludes
 	// file / import nodes and is filtered to this provider's languages.
@@ -567,14 +612,16 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		if !p.servesFile(rel) {
 			continue // never open a file this server can't compile
 		}
-		// Per-item doc lifecycle (no bulk pre-open): open this interface's
-		// file, query, close immediately so memory stays bounded.
-		if err := p.openDocument(absRoot, rel); err != nil {
+		// Open this interface's file through the shared session: the query
+		// runs while it is pinned, and release leaves it warm in the LRU so
+		// the confirm pass and sweep reuse it instead of reopening.
+		content, release, err := session.acquire(p.client, filepath.Join(absRoot, rel))
+		if err != nil {
 			continue
 		}
-		col := identifierColumn(p.getSource(absRoot, rel), n.StartLine, n.Name)
+		col := identifierColumn(content, n.StartLine, n.Name)
 		impls, err := p.findImplementations(absRoot, rel, line, col)
-		_ = p.closeDocument(filepath.Join(absRoot, rel))
+		release()
 		if err != nil || len(impls) == 0 {
 			continue
 		}
@@ -645,16 +692,14 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 					return
 				}
 				absPath := filepath.Join(absRoot, grp.rel)
-				content, err := os.ReadFile(absPath)
+				// The file is unique to this group, so no two goroutines open
+				// it; the session pins it for the group and leaves it warm for
+				// a later phase that shares the file.
+				content, release, err := session.acquire(p.client, absPath)
 				if err != nil {
 					return
 				}
-				// Per-goroutine didOpen against the shared client — the file
-				// is unique to this group, so no two goroutines open it.
-				if err := p.enrichOpenDoc(p.client, absPath, content); err != nil {
-					return
-				}
-				defer func() { _ = p.enrichCloseDoc(p.client, absPath) }()
+				defer release()
 				for _, t := range grp.targets {
 					if targetedCtx.Err() != nil {
 						return
@@ -703,7 +748,29 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// rebind the edge to the correct target instead of leaving a
 	// misattribution behind. Runs after the parallel sweep so arbitrary
 	// call-site document opens never overlap across goroutines.
+	//
+	// Sites are ordered by their call-site file so one session acquire
+	// serves every site in a file — a caller with many misbound sites in
+	// one file is opened once, not once per site. Stable so sites keep
+	// their relative order within a file.
+	sort.SliceStable(fallback, func(i, j int) bool {
+		return edgeSiteRelPath(fallback[i].edge, repoPrefix, nodeRelPath(fallback[i].node)) <
+			edgeSiteRelPath(fallback[j].edge, repoPrefix, nodeRelPath(fallback[j].node))
+	})
 	defSiteCache := map[string]*graph.Node{}
+	var (
+		curSiteRel string
+		curContent []byte
+		relSite    func()
+		siteOpen   bool
+	)
+	releaseSite := func() {
+		if siteOpen {
+			relSite()
+			siteOpen = false
+		}
+		curContent = nil
+	}
 	for _, t := range fallback {
 		if targetedCtx.Err() != nil {
 			break
@@ -717,8 +784,23 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		if !p.servesFile(siteRel) {
 			continue // never open a call-site file this server can't compile
 		}
+		// Hold one open document per run of same-file sites: acquire on the
+		// first site of a file, release when the file changes (and once more
+		// after the loop). A failed acquire yields nil content, which
+		// definitionNodeAtSite treats as a no-verdict — the same outcome the
+		// per-site openDocument failure produced before.
+		if siteRel != curSiteRel {
+			releaseSite()
+			curSiteRel = siteRel
+			content, release, err := session.acquire(p.client, filepath.Join(absRoot, siteRel))
+			if err == nil {
+				curContent = content
+				relSite = release
+				siteOpen = true
+			}
+		}
 		siteLine := t.edge.Line
-		cand, ok := p.definitionNodeAtSite(g, repoPrefix, absRoot, siteRel, siteLine, toNode.Name, defSiteCache)
+		cand, ok := p.definitionNodeAtSite(g, repoPrefix, absRoot, siteRel, siteLine, toNode.Name, curContent, defSiteCache)
 		switch {
 		case !ok || cand == nil:
 			// No verdict — leave the edge at its heuristic tier so
@@ -744,6 +826,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			result.EdgesConfirmed++
 		}
 	}
+	releaseSite()
 
 	// References-driven add pass: a server that enumerates references but has
 	// no call hierarchy (e.g. intelephense) never runs the per-file sweep's
@@ -752,7 +835,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// call edges. Runs under the targeted budget (before the hover sweep) so
 	// a deadline cut sheds hover work, not the recall-bearing add.
 	if p.Supports("textDocument/references") && !p.Supports("textDocument/prepareCallHierarchy") {
-		p.referencesAddPass(targetedCtx, g, repoPrefix, absRoot, langNodes, rmu, result)
+		p.referencesAddPass(targetedCtx, g, repoPrefix, absRoot, langNodes, rmu, session, result)
 	}
 
 	// Per-file document lifecycle + bounded concurrency. The original
@@ -961,53 +1044,22 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			}
 
 			absPath := filepath.Join(absRoot, ft.rel)
-			content, err := os.ReadFile(absPath)
+
+			// Pin the file open on the active client through the shared
+			// session for the whole span of this file's hierarchy + hover
+			// work — exactly one didOpen per file on the happy path, and the
+			// content is read from disk once. The session dedupes per
+			// (client, path), so a hover goroutine that reconnects re-opens
+			// the file on the fresh client (once) without a second open on
+			// the client this pin holds; closeAll pairs every open with a
+			// didClose at pass end.
+			content, release, err := session.acquire(activeClient.Load(), absPath)
 			if err != nil {
-				p.logger.Debug("LSP enrich: read source failed",
-					zap.String("file", ft.rel), zap.Error(err))
-				return
-			}
-
-			// ensureOpen opens the file on client c at most once per client.
-			// Tracking per client makes reconnection strict: the fresh client
-			// from a mid-flight reconnect starts with an empty open-set, so the
-			// file is re-opened on the new session (once, under openStateMu)
-			// rather than hovered against a document the dead session held.
-			// Every client we opened on is closed exactly once when the file
-			// is done, so didOpen / didClose stay paired on every session.
-			var openStateMu sync.Mutex
-			openedClients := map[*Client]bool{}
-			ensureOpen := func(c *Client) error {
-				openStateMu.Lock()
-				defer openStateMu.Unlock()
-				if openedClients[c] {
-					return nil
-				}
-				if err := p.enrichOpenDoc(c, absPath, content); err != nil {
-					return err
-				}
-				openedClients[c] = true
-				return nil
-			}
-			defer func() {
-				openStateMu.Lock()
-				clients := make([]*Client, 0, len(openedClients))
-				for c := range openedClients {
-					clients = append(clients, c)
-				}
-				openStateMu.Unlock()
-				for _, c := range clients {
-					_ = p.enrichCloseDoc(c, absPath)
-				}
-			}()
-
-			// Open once up front so the file is held open for the whole hover
-			// fan-out below — exactly one didOpen per file on the happy path.
-			if err := ensureOpen(activeClient.Load()); err != nil {
 				p.logger.Debug("LSP enrich: didOpen failed",
 					zap.String("file", ft.rel), zap.Error(err))
 				return
 			}
+			defer release()
 
 			// Per-file result buffers, flushed into the graph when this
 			// file finishes (or is cut mid-file by cancellation) —
@@ -1106,11 +1158,17 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 					}
 
 					c := activeClient.Load()
-					if err := ensureOpen(c); err != nil {
+					// Ensure the doc is open on this goroutine's client. On
+					// the happy path this dedupes against the file goroutine's
+					// pin (no didOpen); when the active client was swapped by a
+					// concurrent reconnect it opens the file on the new client.
+					_, releaseHover, err := session.acquire(c, absPath)
+					if err != nil {
 						p.logger.Debug("LSP enrich: didOpen failed",
 							zap.String("file", n.FilePath), zap.Error(err))
 						return
 					}
+					defer releaseHover()
 
 					col := identifierColumn(content, n.StartLine, n.Name)
 					hoverResult, err := p.hoverWith(c, absRoot, nodeRelPath(n), line, col)
@@ -1118,18 +1176,21 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 						// Server died mid-flight — recover once and retry this
 						// node's hover against the fresh session. The new client
 						// has no record of our document, so re-open it there
-						// (ensureOpen dedupes the re-open across this file's
+						// (the session dedupes the re-open across this file's
 						// goroutines) before retrying.
 						newC, rerr := reconnect(c)
 						if rerr != nil {
 							return // aborted; wg.Wait + abort check below handles it
 						}
 						c = newC
-						if err := ensureOpen(c); err != nil {
+						var releaseNew func()
+						_, releaseNew, err = session.acquire(c, absPath)
+						if err != nil {
 							p.logger.Debug("LSP enrich: reopen after reconnect failed",
 								zap.String("file", n.FilePath), zap.Error(err))
 							return
 						}
+						defer releaseNew()
 						hoverResult, err = p.hoverWith(c, absRoot, nodeRelPath(n), line, col)
 					}
 					if err != nil {
@@ -1180,7 +1241,10 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	}
 	wg.Wait()
 
-	// Enrichment metrics (acceptance criterion 6).
+	// Enrichment metrics (acceptance criterion 6): hover outcomes, the
+	// shared document session's open/reopen/eviction accounting, and the
+	// per-method request volume that drove the pass.
+	didOpens, reopenedFiles, docEvictions, peakOpenDocs := session.stats()
 	p.logger.Info("LSP enrich: hover phase complete",
 		zap.Int64("total_nodes", diagTotalNodes.Load()),
 		zap.Int64("hover_ok", diagHoverOK.Load()),
@@ -1190,6 +1254,20 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		zap.Int64("enriched", diagEnriched.Load()),
 		zap.Int64("skipped_no_position", diagNoPosition.Load()),
 		zap.Int64("reconnect_attempts", p.reconnectAttempts.Load()),
+		zap.Int("did_opens", didOpens),
+		zap.Int("reopened_files", reopenedFiles),
+		zap.Int("doc_evictions", docEvictions),
+		zap.Int("peak_open_docs", peakOpenDocs),
+		zap.Int64("req_references", p.reqStats.references.Load()),
+		zap.Int64("req_implementations", p.reqStats.implementations.Load()),
+		zap.Int64("req_definitions", p.reqStats.definitions.Load()),
+		zap.Int64("req_hovers", p.reqStats.hovers.Load()),
+		zap.Int64("req_prepare_call_hierarchy", p.reqStats.prepareCallHierarchy.Load()),
+		zap.Int64("req_outgoing_calls", p.reqStats.outgoingCalls.Load()),
+		zap.Int64("req_incoming_calls", p.reqStats.incomingCalls.Load()),
+		zap.Int64("req_prepare_type_hierarchy", p.reqStats.prepareTypeHierarchy.Load()),
+		zap.Int64("req_supertypes", p.reqStats.supertypes.Load()),
+		zap.Int64("req_subtypes", p.reqStats.subtypes.Load()),
 		zap.String("first_hover_value", diagFirstHoverValue),
 		zap.String("first_hover_error", diagFirstHoverError),
 		zap.String("first_node_name", diagFirstNodeName),
@@ -2035,6 +2113,7 @@ func (p *Provider) hoverWith(c *Client, repoRoot, relPath string, line, col int)
 		},
 	}
 
+	p.reqStats.hovers.Add(1)
 	var result HoverResult
 	if err := c.Call("textDocument/hover", params, &result); err != nil {
 		return nil, err
@@ -2162,6 +2241,7 @@ func (p *Provider) findImplementations(repoRoot, relPath string, line, col int) 
 		},
 	}
 
+	p.reqStats.implementations.Add(1)
 	var locations []Location
 	if err := p.client.Call("textDocument/implementation", params, &locations); err != nil {
 		return nil, err
@@ -2258,6 +2338,7 @@ func (p *Provider) findReferences(repoRoot, relPath string, line, col int) ([]Lo
 		Context: ReferenceContext{IncludeDeclaration: false},
 	}
 
+	p.reqStats.references.Add(1)
 	var locations []Location
 	if err := p.client.Call("textDocument/references", params, &locations); err != nil {
 		return nil, err
@@ -2281,6 +2362,7 @@ func (p *Provider) FindDefinition(repoRoot, relPath string, line, col int, timeo
 		TextDocument: TextDocumentIdentifier{URI: pathToURI(absPath)},
 		Position:     Position{Line: line, Character: col},
 	}
+	p.reqStats.definitions.Add(1)
 
 	type result struct {
 		locations []Location
@@ -2644,6 +2726,7 @@ func (p *Provider) prepareCallHierarchy(repoRoot, relPath string, line, col int)
 			Position:     Position{Line: line, Character: col},
 		},
 	}
+	p.reqStats.prepareCallHierarchy.Add(1)
 	var items []CallHierarchyItem
 	if err := p.client.Call("textDocument/prepareCallHierarchy", params, &items); err != nil {
 		return nil, err
@@ -2653,6 +2736,7 @@ func (p *Provider) prepareCallHierarchy(repoRoot, relPath string, line, col int)
 
 // outgoingCalls queries callHierarchy/outgoingCalls for one item.
 func (p *Provider) outgoingCalls(item CallHierarchyItem) ([]CallHierarchyOutgoingCall, error) {
+	p.reqStats.outgoingCalls.Add(1)
 	var calls []CallHierarchyOutgoingCall
 	if err := p.client.Call("callHierarchy/outgoingCalls",
 		CallHierarchyOutgoingCallsParams{Item: item}, &calls); err != nil {
@@ -2663,6 +2747,7 @@ func (p *Provider) outgoingCalls(item CallHierarchyItem) ([]CallHierarchyOutgoin
 
 // incomingCalls queries callHierarchy/incomingCalls for one item.
 func (p *Provider) incomingCalls(item CallHierarchyItem) ([]CallHierarchyIncomingCall, error) {
+	p.reqStats.incomingCalls.Add(1)
 	var calls []CallHierarchyIncomingCall
 	if err := p.client.Call("callHierarchy/incomingCalls",
 		CallHierarchyIncomingCallsParams{Item: item}, &calls); err != nil {
@@ -2680,6 +2765,7 @@ func (p *Provider) prepareTypeHierarchy(repoRoot, relPath string, line, col int)
 			Position:     Position{Line: line, Character: col},
 		},
 	}
+	p.reqStats.prepareTypeHierarchy.Add(1)
 	var items []TypeHierarchyItem
 	if err := p.client.Call("textDocument/prepareTypeHierarchy", params, &items); err != nil {
 		return nil, err
@@ -2689,6 +2775,7 @@ func (p *Provider) prepareTypeHierarchy(repoRoot, relPath string, line, col int)
 
 // supertypes queries typeHierarchy/supertypes.
 func (p *Provider) supertypes(item TypeHierarchyItem) ([]TypeHierarchyItem, error) {
+	p.reqStats.supertypes.Add(1)
 	var items []TypeHierarchyItem
 	if err := p.client.Call("typeHierarchy/supertypes",
 		TypeHierarchySupertypesParams{Item: item}, &items); err != nil {
@@ -2699,6 +2786,7 @@ func (p *Provider) supertypes(item TypeHierarchyItem) ([]TypeHierarchyItem, erro
 
 // subtypes queries typeHierarchy/subtypes.
 func (p *Provider) subtypes(item TypeHierarchyItem) ([]TypeHierarchyItem, error) {
+	p.reqStats.subtypes.Add(1)
 	var items []TypeHierarchyItem
 	if err := p.client.Call("typeHierarchy/subtypes",
 		TypeHierarchySubtypesParams{Item: item}, &items); err != nil {
