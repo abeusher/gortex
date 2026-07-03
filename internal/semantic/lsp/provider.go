@@ -745,6 +745,16 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		}
 	}
 
+	// References-driven add pass: a server that enumerates references but has
+	// no call hierarchy (e.g. intelephense) never runs the per-file sweep's
+	// hierarchy hops, so the dispatch call sites it can see are confirmed but
+	// never ADDED. Ask textDocument/references per declaration and mint those
+	// call edges. Runs under the targeted budget (before the hover sweep) so
+	// a deadline cut sheds hover work, not the recall-bearing add.
+	if p.Supports("textDocument/references") && !p.Supports("textDocument/prepareCallHierarchy") {
+		p.referencesAddPass(targetedCtx, g, repoPrefix, absRoot, langNodes, rmu, result)
+	}
+
 	// Per-file document lifecycle + bounded concurrency. The original
 	// implementation bulk-opened every target file up front and closed
 	// them all in one deferred sweep after a fully sequential hover loop —
