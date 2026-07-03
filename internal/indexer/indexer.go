@@ -6999,6 +6999,74 @@ func (idx *Indexer) HasChangesSinceMtimes(root string) bool {
 	return false
 }
 
+// ChangedSinceMtimes is the accumulating variant of HasChangesSinceMtimes:
+// it runs the SAME walk + IsStale staleness predicate + deletion-confirm
+// logic but, instead of short-circuiting on the first stale file, returns
+// the full changed and deleted sets as in-repo relative slash-paths.
+//
+// The warm-restart reconcile router uses the census to size the reconcile:
+// an empty result takes the fast no-op path, a small delta is scoped to
+// exactly those files (re-index the changed, evict the deleted), and only a
+// large-fraction churn falls back to a whole-repo re-track.
+//
+// changed holds files that are new or whose mtime drifted since the last
+// pass; deleted holds previously-indexed files confirmed gone from disk. A
+// walk (or abs-path) error returns a non-nil err with nil slices — the
+// caller treats that as "unknown, do a full re-track", exactly as
+// HasChangesSinceMtimes conservatively returns true on the same condition.
+func (idx *Indexer) ChangedSinceMtimes(root string) (changed []string, deleted []string, err error) {
+	absRoot, absErr := filepath.Abs(root)
+	if absErr != nil {
+		return nil, nil, absErr
+	}
+	idx.rootPath = absRoot
+
+	diskFiles := make(map[string]bool)
+	walkErr := filepath.WalkDir(absRoot, func(path string, d os.DirEntry, werr error) error {
+		if werr != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if idx.shouldPruneDir(path, absRoot) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if _, ok := idx.effectiveLanguage(path, nil); !ok {
+			return nil
+		}
+		if idx.shouldExclude(path, absRoot, false) {
+			return nil
+		}
+		rel := idx.relKey(path)
+		diskFiles[rel] = true
+		if idx.IsStale(rel) {
+			changed = append(changed, rel)
+		}
+		return nil
+	})
+	if walkErr != nil {
+		return nil, nil, walkErr
+	}
+
+	// Deletion check: a previously-indexed file absent from the walk and
+	// confirmed gone from disk counts as a change (its edges must drop).
+	idx.mtimeMu.RLock()
+	var candidates []string
+	for rel := range idx.fileMtimes {
+		if !diskFiles[rel] {
+			candidates = append(candidates, rel)
+		}
+	}
+	idx.mtimeMu.RUnlock()
+	for _, rel := range candidates {
+		if _, statErr := os.Stat(filepath.Join(absRoot, filepath.FromSlash(rel))); errors.Is(statErr, os.ErrNotExist) {
+			deleted = append(deleted, rel)
+		}
+	}
+	return changed, deleted, nil
+}
+
 func (idx *Indexer) IsStale(relPath string) bool {
 	relPath = pathkey.Normalize(filepath.ToSlash(relPath))
 

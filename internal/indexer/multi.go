@@ -1571,40 +1571,61 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 	idx.SetRootPath(absPath)
 	idx.SetFileMtimes(priorMtimes)
 
-	// Choose the reconcile strategy. A repo that changed while the
-	// daemon was down must NOT take IncrementalReindex's per-file path:
-	// re-resolving a changed file there goes through per-edge
-	// graph.ReindexEdges, and the per-edge write against a freshly
-	// reopened disk store is slow and unreliable. The shadow/bulk
-	// re-track path (IndexCtx) resolves in an in-memory shadow and
-	// commits one bulk load, so it never issues a per-edge write to the
-	// reopened store. It re-indexes the whole repo, but only repos that
-	// actually changed pay it, and it is reliable where the per-edge path
-	// is not. A repo with zero changes keeps the fast IncrementalReindex
-	// no-op (walk + 0 stale → return), which is what makes an unchanged
-	// warm restart near-instant.
-	// The shadow/bulk re-track path for the per-edge ReindexEdges
-	// problem applies ONLY to disk-backed stores, which is where the
-	// per-edge write to a reopened store is unreliable. The in-memory
-	// backend (*graph.Graph) has
-	// no reopen and no CGo write path, and IncrementalReindex is the
-	// authoritative path there — it evicts offline-deleted files in place
-	// (a re-track of a shared in-memory graph would not). Gate on the
-	// store type so the memory backend keeps its exact prior behaviour.
+	// Choose the reconcile strategy from a census of what changed on disk
+	// while the daemon was down. Scoped incremental is the default: re-index
+	// only the changed files and evict only the deleted ones, leaving the
+	// rest of the already-persisted graph untouched. A whole-repo re-track
+	// (IndexCtx — which evicts and re-parses every file, then bulk-drains)
+	// is reserved for the cases where scoping is unsafe or not worth it: the
+	// census could not be taken, the churn is a large fraction of the repo,
+	// or an operator forced it via GORTEX_WARMUP_FULL_RETRACK. A repo with
+	// zero changes keeps the fast IncrementalReindex no-op (walk + 0 stale →
+	// return), which is what makes an unchanged warm restart near-instant.
+	//
+	// The in-memory backend (*graph.Graph) keeps its exact prior behaviour:
+	// IncrementalReindex is the authoritative path there — it evicts
+	// offline-deleted files in place, has no reopened disk store, and so no
+	// per-edge write to route around. Gate on the store type.
 	_, memoryBacked := mi.graph.(*graph.Graph)
-	var result *IndexResult
-	if !memoryBacked && idx.HasChangesSinceMtimes(absPath) {
-		result, err = idx.IndexCtx(ctx, absPath)
-		if err == nil && result != nil {
-			// Signal "this repo did re-indexing work" to the warmup
-			// change-detector: a full re-track touches every file but
-			// the changed-file set is unknown, so StaleFileCount keeps
-			// its honest incremental-work meaning (0 here) and callers
-			// must key off FullRetrack instead.
-			result.FullRetrack = true
+	var (
+		result           *IndexResult
+		changed, deleted []string
+		route            = "incremental"
+	)
+	// fullRetrack is the whole-repo re-track — the ONE place FullRetrack is
+	// stamped. StaleFileCount keeps its honest incremental-work meaning (0
+	// here) because the changed-file set is not enumerated on this path, so
+	// callers must key "did this repo change" off FullRetrack instead.
+	fullRetrack := func() (*IndexResult, error) {
+		r, e := idx.IndexCtx(ctx, absPath)
+		if e == nil && r != nil {
+			r.FullRetrack = true
 		}
-	} else {
+		return r, e
+	}
+	switch {
+	case memoryBacked:
 		result, err = idx.IncrementalReindex(absPath)
+	default:
+		var censusErr error
+		changed, deleted, censusErr = idx.ChangedSinceMtimes(absPath)
+		churn := len(changed) + len(deleted)
+		priorCount := len(priorMtimes)
+		forceFull := os.Getenv("GORTEX_WARMUP_FULL_RETRACK") == "1"
+		switch {
+		case censusErr != nil || forceFull:
+			route = "full_retrack"
+			result, err = fullRetrack()
+		case churn == 0:
+			route = "incremental"
+			result, err = idx.IncrementalReindex(absPath)
+		case priorCount > 0 && churn*100 > priorCount*40:
+			route = "full_retrack"
+			result, err = fullRetrack()
+		default:
+			route = "scoped"
+			result, err = idx.IncrementalReindexPaths(absPath, append(changed, deleted...))
+		}
 	}
 	if err != nil {
 		return nil, fmt.Errorf("reconciling %s: %w", absPath, err)
@@ -1640,11 +1661,30 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 
 	mi.logger.Info("daemon: reconciled repo from snapshot",
 		zap.String("prefix", prefix),
+		zap.String("route", route),
+		zap.Int("changed", len(changed)),
+		zap.Int("deleted", len(deleted)),
 		zap.Bool("full_retrack", result.FullRetrack),
 		zap.Int("stale_files_reindexed", result.StaleFileCount),
 		zap.Duration("elapsed", time.Since(start)))
+	if len(changed) > 0 || len(deleted) > 0 {
+		mi.logger.Debug("daemon: reconcile changed-file census",
+			zap.String("prefix", prefix),
+			zap.Strings("changed", firstNStrings(changed, 5)),
+			zap.Strings("deleted", firstNStrings(deleted, 5)))
+	}
 
 	return result, nil
+}
+
+// firstNStrings returns at most the first n elements of s — used to cap the
+// changed/deleted samples in the reconcile debug log so a large-churn repo
+// does not dump thousands of paths into the log line.
+func firstNStrings(s []string, n int) []string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
 }
 
 // ReconcileAll runs IncrementalReindex on every tracked repo. Used by
