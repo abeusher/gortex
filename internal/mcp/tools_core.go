@@ -902,7 +902,7 @@ func (s *Server) registerCoreTools() {
 
 	s.addTool(
 		mcp.NewTool("search_symbols",
-			mcp.WithDescription("Use instead of Grep to find symbols across the whole codebase. Supports natural language queries with camelCase-aware tokenization and BM25 ranking — 'validate token auth' finds validateToken, AuthMiddleware, parseJWT."),
+			mcp.WithDescription("Use instead of Grep to find symbols across the whole codebase. Supports natural language queries with camelCase-aware tokenization and BM25 ranking — 'validate token auth' finds validateToken, AuthMiddleware, parseJWT. For the concrete types that implement an interface, or the methods that override a method, use find_implementations / find_overrides — a name search alone can't tell an implementor from an unrelated same-named symbol."),
 			mcp.WithString("query", mcp.Required(), mcp.Description("Search query — symbol name, concept, or keywords. Also accepts inline field-qualified clauses: `kind:function lang:go path:internal/ repo:gortex project:web validateToken` — recognised fields are kind, flavor, lang (aliases ts/js/py/rs/…), path, repo, project; everything else is free text. A field-qualified query that matches nothing retries on the free text alone (response carries `filters_relaxed: true`).")),
 			mcp.WithNumber("limit", mcp.Description("Max results (default: 20)")),
 			mcp.WithString("cursor", mcp.Description("Opaque pagination cursor returned in `next_cursor` from a previous call. Pass it back to fetch the next page. Omit for the first page.")),
@@ -1011,7 +1011,7 @@ func (s *Server) registerCoreTools() {
 
 	s.addTool(
 		mcp.NewTool("get_callers",
-			mcp.WithDescription("Returns all callers of a function without reading source. Use instead of Grep when you need to know who calls a function."),
+			mcp.WithDescription("Returns all callers of a function without reading source. Use instead of Grep when you need to know who calls a function. For every reference — not just call sites, but type uses, field access, and imports — use find_usages."),
 			mcp.WithString("id", mcp.Required(), mcp.Description("Function node ID")),
 			mcp.WithNumber("depth", mcp.Description("Traversal depth (default: 2)")),
 			mcp.WithNumber("limit", mcp.Description("Max nodes (default: 50)")),
@@ -1032,7 +1032,7 @@ func (s *Server) registerCoreTools() {
 
 	s.addTool(
 		mcp.NewTool("find_implementations",
-			mcp.WithDescription("Finds all concrete types that implement an interface. Use before changing an interface to identify all types that will be affected."),
+			mcp.WithDescription("Finds all concrete types that implement an interface — 'what implements X', interface satisfaction, which structs satisfy this contract. Use before changing an interface to identify all types that will be affected. For method-level overrides (which methods override this one, or the parents it overrides) use find_overrides."),
 			mcp.WithString("id", mcp.Required(), mcp.Description("Interface node ID")),
 			mcp.WithString("format", mcp.Description("Output format: json (default), gcx (GCX1 compact wire format), or toon")),
 			mcp.WithNumber("max_bytes", mcp.Description("Cap the marshaled response at this many bytes. The longest list is trimmed; truncation metadata rides on the response. Omit for no cap.")),
@@ -1087,7 +1087,7 @@ func (s *Server) registerCoreTools() {
 
 	s.addTool(
 		mcp.NewTool("find_usages",
-			mcp.WithDescription("Use instead of Grep to find every reference to a symbol across the codebase. Returns precise locations with zero false positives."),
+			mcp.WithDescription("Use instead of Grep to find every reference to a symbol across the codebase. Returns precise locations with zero false positives. For just the call sites of a function use get_callers; for the concrete types that implement an interface use find_implementations."),
 			mcp.WithString("id", mcp.Required(), mcp.Description("Node ID")),
 			mcp.WithNumber("limit", mcp.Description("Max nodes (default: 50)")),
 			mcp.WithBoolean("compact", mcp.Description("One-line-per-symbol text output (saves 50-70% tokens)")),
