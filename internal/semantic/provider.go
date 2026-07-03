@@ -86,6 +86,11 @@ type EnrichResult struct {
 	SymbolsTotal    int     `json:"symbols_total"`
 	CoveragePercent float64 `json:"coverage_percent"`
 	DurationMs      int64   `json:"duration_ms"`
+	// HoverCandidates is the post-filter count of symbols this pass selected
+	// for hover enrichment — total symbols minus file/import nodes and minus
+	// the nodes a prior pass already stamped. Deadline budgeting scales the
+	// per-repo enrichment window on this number.
+	HoverCandidates int `json:"hover_candidates,omitempty"`
 	// Partial reports that the pass was cut short (per-repo deadline /
 	// context cancellation) after landing some — but not all — of its
 	// work. The counters above reflect only what actually reached the

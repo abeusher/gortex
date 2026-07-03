@@ -398,6 +398,27 @@ func nodeHasSemanticType(n *graph.Node) bool {
 	return ok && s != ""
 }
 
+// nodeAlreadyStamped reports whether a prior enrichment pass already wrote a
+// semantic type onto the node. semantic.EnrichNodeMeta stamps semantic_type
+// (the load-bearing key) alongside semantic_source, and the stamp round-trips
+// through the store, so it persists across daemon restarts. A stamped node is
+// already covered — re-hovering it is redundant LSP work. An edited file
+// re-parses into fresh node objects with no Meta merge, so its symbols lose
+// the stamp and are re-selected naturally on the next pass.
+func nodeAlreadyStamped(n *graph.Node) bool {
+	if n == nil || n.Meta == nil {
+		return false
+	}
+	v, ok := n.Meta["semantic_type"]
+	if !ok {
+		return false
+	}
+	if s, isStr := v.(string); isStr {
+		return s != ""
+	}
+	return v != nil
+}
+
 // scopedPath re-attaches repoPrefix to a repo-relative path the language
 // server handed back: uriToPath returns repo-relative, but graph node
 // FilePaths are prefixed, so node lookups must re-prefix to match in a
@@ -579,6 +600,11 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	repoNodes := p.repoScopedNodes(g, repoPrefix)
 	langAllByID := make(map[string]*graph.Node, len(repoNodes))
 	langNodes := make([]*graph.Node, 0, len(repoNodes))
+	// Count symbol nodes a prior pass already stamped with a semantic type.
+	// Stamps persist in node Meta across restarts, so on a warm restart of an
+	// unchanged repo — or a changed repo where only a few files moved — most
+	// nodes are already covered and re-hovering them is redundant LSP work.
+	skippedAlreadyStamped := 0
 	for _, n := range repoNodes {
 		if n.RepoPrefix != repoPrefix || !p.languageMatches(n.Language) {
 			continue
@@ -591,6 +617,13 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		}
 		langAllByID[n.ID] = n
 		if n.Kind == graph.KindFile || n.Kind == graph.KindImport {
+			continue
+		}
+		// Skip symbols a prior enrichment pass already stamped — hover would
+		// only re-derive the same type. An edited file re-parses into fresh
+		// nodes with no Meta, so its symbols lose the stamp and re-enter here.
+		if nodeAlreadyStamped(n) {
+			skippedAlreadyStamped++
 			continue
 		}
 		langNodes = append(langNodes, n)
@@ -672,9 +705,15 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	session := newDocSession(p)
 	defer session.closeAll()
 
-	// Total symbols scoped to repo + language — langNodes already excludes
-	// file / import nodes and is filtered to this provider's languages.
-	result.SymbolsTotal = len(langNodes)
+	// Total symbols scoped to repo + language. langNodes now holds only the
+	// symbols this pass will hover (file / import nodes and already-stamped
+	// nodes excluded); HoverCandidates exposes that post-filter count for
+	// deadline budgeting. SymbolsTotal keeps whole-repo meaning by re-adding
+	// the already-stamped symbols, which are pre-seeded into SymbolsCovered
+	// since their semantic type is already in the graph.
+	result.HoverCandidates = len(langNodes)
+	result.SymbolsTotal = len(langNodes) + skippedAlreadyStamped
+	result.SymbolsCovered = skippedAlreadyStamped
 
 	// The graph-mutation blocks in this pass serialise on the backend
 	// resolve mutex (the same lock every other edge-mutating pass holds)
@@ -1451,8 +1490,10 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		zap.Int64("hover_nil", diagHoverNil.Load()),
 		zap.Int64("type_empty", diagTypeEmpty.Load()),
 		zap.Int64("enriched", diagEnriched.Load()),
+		zap.Int("skipped_already_stamped", skippedAlreadyStamped),
+		zap.Int("hover_candidates", result.HoverCandidates),
 		zap.Int64("skipped_no_position", diagNoPosition.Load()),
-		zap.Int64("skipped_already_stamped", diagHoverSkipped.Load()),
+		zap.Int64("hover_sweep_skipped", diagHoverSkipped.Load()),
 		zap.Int64("reconnect_attempts", p.reconnectAttempts.Load()),
 		zap.Int("did_opens", didOpens),
 		zap.Int("reopened_files", reopenedFiles),
