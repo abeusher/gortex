@@ -456,6 +456,13 @@ const (
 // Var (not const) so tests can shrink it.
 var enrichCancelGrace = 2 * time.Minute
 
+// enrichReadinessBudget bounds how long the manager waits for a ReadinessProber
+// provider's server to become ready (its Roslyn / MSBuild solution load to
+// finish) BEFORE the per-repo enrichment deadline starts. Capping the wait
+// keeps a server that never becomes ready from stalling the pipeline — the pass
+// then proceeds best-effort. Var (not const) so tests can shrink it.
+var enrichReadinessBudget = 3 * time.Minute
+
 // scaleEnrichTimeout returns the size-scaled per-repo enrichment
 // deadline for a repo with nodeCount enrichable nodes: floor + per-node
 // cost, capped at the ceiling. A fixed 10-minute bound was tuned for
@@ -575,6 +582,29 @@ func (m *Manager) EnrichmentStatuses() []EnrichmentStatus {
 // as "abandoned" in the enrichment status.
 func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, provider Provider, nodeCount int, results []*EnrichResult) []*EnrichResult {
 	start := time.Now()
+
+	// Readiness gate: a server whose workspace load continues past `initialize`
+	// (Roslyn / MSBuild, behind csharp-ls / OmniSharp) answers `initialize`
+	// quickly but serves empty results until the solution finishes loading.
+	// Bringing it to readiness BEFORE the enrichment deadline starts keeps that
+	// cold-load latency out of the query budget — without it the deadline
+	// elapses during the load and the pass lands zero edges. Only providers that
+	// opt in (ReadinessProber) pay it; a server ready right after initialize does
+	// not implement the interface, so gopls / rust-analyzer never wait. Bounded
+	// and best-effort: a probe timeout or error just proceeds.
+	if rp, ok := provider.(ReadinessProber); ok && enrichReadinessBudget > 0 {
+		rctx, rcancel := context.WithTimeout(context.Background(), enrichReadinessBudget)
+		if err := rp.WaitReady(rctx, repoRoot); err != nil {
+			m.logger.Debug("semantic enrichment: readiness probe did not confirm; proceeding best-effort",
+				zap.String("provider", provider.Name()),
+				zap.String("language", lang),
+				zap.String("repo", repoName),
+				zap.Error(err),
+			)
+		}
+		rcancel()
+	}
+
 	d := enrichRepoTimeout(nodeCount)
 	m.logger.Info("semantic enrichment starting",
 		zap.String("provider", provider.Name()),
