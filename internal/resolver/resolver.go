@@ -1811,10 +1811,18 @@ func (r *Resolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *Re
 		}
 	}
 
-	// Fall back to the first same-repo function/method match.
+	// Fall back to the first same-repo function/method match. This is a
+	// name-only guess (no directory/import evidence), so tag it text_matched
+	// — the weakest tier — so the redundant-text suppression drops it when a
+	// language server later confirms the real target, and the cross-package
+	// guard can revert it when unreachable. Same-file / same-directory picks
+	// above stay untagged (structural locality evidence) and survive.
 	for _, c := range candidates {
 		if c.Kind == graph.KindFunction || c.Kind == graph.KindMethod {
 			e.To = c.ID
+			if e.Origin == "" {
+				e.Origin = graph.OriginTextMatched
+			}
 			stats.Resolved++
 			return
 		}
@@ -2262,23 +2270,43 @@ func (r *Resolver) resolveMethodCall(e *graph.Edge, methodName string, stats *Re
 		}
 	}
 
+	// Every locality-fallback pick is a name-only guess: no receiver-type
+	// evidence tied the call to this method/function, only same-name +
+	// reachability. Tag it text_matched (unless the interface-dispatch or
+	// Java lone-definition branch above already stamped a tier) so
+	// redundant-text suppression drops it once a language server confirms the
+	// real target — a common method name like `Get` otherwise fans a call to
+	// every same-named method in the package. (Free-function calls resolve in
+	// resolveFunctionCall, whose same-directory pick stays untagged.)
 	if sameDirMethod != nil {
 		e.To = sameDirMethod.ID
+		if e.Origin == "" {
+			e.Origin = graph.OriginTextMatched
+		}
 		stats.Resolved++
 		return
 	}
 	if anyMethod != nil {
 		e.To = anyMethod.ID
+		if e.Origin == "" {
+			e.Origin = graph.OriginTextMatched
+		}
 		stats.Resolved++
 		return
 	}
 	if sameDirFunc != nil {
 		e.To = sameDirFunc.ID
+		if e.Origin == "" {
+			e.Origin = graph.OriginTextMatched
+		}
 		stats.Resolved++
 		return
 	}
 	if anyFunc != nil {
 		e.To = anyFunc.ID
+		if e.Origin == "" {
+			e.Origin = graph.OriginTextMatched
+		}
 		stats.Resolved++
 		return
 	}
