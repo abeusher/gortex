@@ -3998,6 +3998,11 @@ func flattenEmbedResults(results [][][]float32) [][]float32 {
 // AllNodes() path because nodes there carry an empty RepoPrefix and
 // GetRepoNodes("") would miss them.
 func (idx *Indexer) buildSearchIndex() {
+	// Start every build from a clean vector-build error: the degraded vector
+	// paths below set it, and a successful build (or a benign skip / no embedder)
+	// leaves it nil, so LastVectorBuildError always reflects the current pass.
+	idx.lastVectorBuildErr = nil
+
 	// Code-only enumeration: content (data_class=content) sections live in
 	// the content index, never the symbol search or the vector store, so the
 	// FTS loop below and collectEmbedTexts both skip them anyway. Fetching
@@ -4038,10 +4043,6 @@ func (idx *Indexer) buildSearchIndex() {
 	if idx.skipVectorBuild {
 		return
 	}
-
-	// Fresh attempt: clear any failure recorded by a previous build so the
-	// LastVectorBuildError seam reflects only this pass.
-	idx.lastVectorBuildErr = nil
 
 	// Provisional dimensionality: trust the embedder's own report.
 	// A provider that can't state its width yet (an APIProvider before

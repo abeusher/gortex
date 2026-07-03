@@ -2,6 +2,7 @@ package serverstack
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,6 +16,7 @@ import (
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/contracts"
 	"github.com/zzet/gortex/internal/daemon"
+	"github.com/zzet/gortex/internal/embedding"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
 	gortexmcp "github.com/zzet/gortex/internal/mcp"
@@ -432,10 +434,22 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 	// top-level keys — most often an `embedding:` block written in the wrong file.
 	embGlobal := cfg.Global
 	if embGlobal == nil {
-		embGlobal, _ = config.LoadGlobal()
+		var gerr error
+		if embGlobal, gerr = config.LoadGlobal(); gerr != nil {
+			// A malformed global file is otherwise silently ignored — exactly
+			// when its embedding/llm block would have taken effect.
+			logger.Warn("serverstack: global config could not be parsed — its embedding/llm block is ignored",
+				zap.Error(gerr))
+		}
 	}
 	conf.Embedding = embGlobal.MergeEmbeddingInto(conf.Embedding)
-	if unknown := config.UnknownGlobalKeys(); len(unknown) > 0 {
+	// Diagnose unknown keys in the file that was actually loaded (which may be an
+	// overridden path from cfg.Global), not always the default location.
+	globalPath := ""
+	if embGlobal != nil {
+		globalPath = embGlobal.ConfigPath()
+	}
+	if unknown := config.UnknownGlobalKeys(globalPath); len(unknown) > 0 {
 		logger.Warn("serverstack: ~/.gortex/config.yaml contains keys gortex does not recognize",
 			zap.Strings("keys", unknown),
 			zap.String("hint", "see docs/semantic-search.md for embedding config placement"))
@@ -464,13 +478,14 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 			}
 		}
 	}
-	// Surface every backend the local auto-selection tried. A degradation all
-	// the way to the static fallback is a real problem the user should see, so
-	// warn; the benign failures behind a successfully-chosen backend (e.g. the
-	// onnx/gomlx stubs in a default build) are only interesting when debugging.
-	degradedToStatic := embReport.Chosen == "static" && len(embReport.Attempts) > 0
+	// Surface every backend the local auto-selection tried. Warn per backend
+	// only when the outcome was actually degraded (fell to the static fallback,
+	// or built nothing) AND the backend could really have worked — a backend
+	// that is simply not compiled into this build (the onnx/gomlx stubs) is
+	// benign noise and stays at debug even on a degradation.
+	outcomeDegraded := (embedder == nil || embReport.Chosen == "static") && len(embReport.Attempts) > 0
 	for _, a := range embReport.Attempts {
-		if degradedToStatic {
+		if outcomeDegraded && !errors.Is(a.Err, embedding.ErrBackendNotCompiled) {
 			logger.Warn("serverstack: embedding backend unavailable — degraded to static fallback",
 				zap.String("backend", a.Backend), zap.Error(a.Err))
 		} else {

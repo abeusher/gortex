@@ -14,8 +14,15 @@ package embedding
 
 import (
 	"context"
+	"errors"
 	"fmt"
 )
+
+// ErrBackendNotCompiled marks a local-backend factory that failed only because
+// its build tag was not set (the onnx/gomlx stubs). Such a failure is benign
+// noise in a default build — callers use errors.Is to log it at debug rather
+// than warn even when the chain degrades to the static fallback.
+var ErrBackendNotCompiled = errors.New("embedding backend not compiled in")
 
 // Provider generates embedding vectors from text.
 type Provider interface {
