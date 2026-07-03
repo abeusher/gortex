@@ -22,6 +22,12 @@ type ResolveStats struct {
 	Resolved   int `json:"resolved"`
 	Unresolved int `json:"unresolved"`
 	External   int `json:"external"`
+	// PendingBefore / PendingAfter record the pending-edge count before and
+	// after the scope filter (see SetScope). Diagnostic only — the
+	// warm-restart master-resolve log surfaces them so a scoped pass's
+	// reduction is visible. Zero (omitted) on the unscoped whole-graph path.
+	PendingBefore int `json:"pending_before,omitempty"`
+	PendingAfter  int `json:"pending_after,omitempty"`
 }
 
 // Resolver resolves unresolved edge targets to actual graph node IDs.
@@ -172,6 +178,14 @@ type Resolver struct {
 	// workspace_membership.go for the contract. Set via
 	// SetWorkspaceMembership before ResolveAll runs.
 	workspaceMembers WorkspaceMembership
+
+	// scope, when non-empty, restricts the next ResolveAll pass to the
+	// pending edges that could resolve into one of the named repo
+	// prefixes — the warm-restart optimisation that avoids a whole-graph
+	// resolve when only a few of many tracked repos re-indexed. nil or
+	// empty means whole-graph, exactly the pre-scoping behaviour. Set via
+	// SetScope. Independent of any backend bulk-mode flag.
+	scope map[string]struct{}
 }
 
 // lspLocKey identifies a node by (filePath, 1-based line) and is the
@@ -207,6 +221,15 @@ func (r *Resolver) SetLogger(l *zap.Logger) {
 		l = zap.NewNop()
 	}
 	r.logger = l
+}
+
+// SetScope restricts the next ResolveAll pass to pending edges that could
+// resolve into one of the given repo prefixes (see the scope field). A nil
+// or empty map restores whole-graph resolution — byte-for-byte the
+// pre-scoping behaviour. The scope persists across calls until reset,
+// mirroring the other Set* configuration setters.
+func (r *Resolver) SetScope(prefixes map[string]struct{}) {
+	r.scope = prefixes
 }
 
 // SetGraph retargets the Resolver at a different Store. The indexer's
@@ -301,8 +324,17 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 	for e := range r.graph.EdgesWithUnresolvedTarget() {
 		pending = append(pending, e)
 	}
+	pendingBefore := len(pending)
+	// Scoped warm-restart resolve: when a set of changed repos is armed via
+	// SetScope, drop the pending edges that provably can't newly resolve into
+	// any of them. See filterPendingByScope for the conservative superset
+	// rule. nil / empty scope leaves pending untouched — exactly the
+	// whole-graph behaviour.
+	if len(r.scope) > 0 {
+		pending = filterPendingByScope(pending, r.scope)
+	}
 	if len(pending) == 0 {
-		return &ResolveStats{}
+		return &ResolveStats{PendingBefore: pendingBefore}
 	}
 
 	passStart := time.Now()
@@ -574,7 +606,61 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 		}
 		total.Unresolved += guarded
 	}
+	total.PendingBefore = pendingBefore
+	total.PendingAfter = len(pending)
 	return total
+}
+
+// filterPendingByScope keeps only the pending edges a scoped ResolveAll must
+// reconsider for the given changed-repo set. It is a conservative superset:
+// an unchanged repo's own edges that are already resolved never appear in
+// EdgesWithUnresolvedTarget, and the ones that remain unresolved there stay
+// unresolved whether or not this pass reconsiders them — so dropping them is
+// a pure work saving with no effect on the final resolved edge set. Filters
+// in place; the returned slice reuses pending's backing array.
+func filterPendingByScope(pending []*graph.Edge, scope map[string]struct{}) []*graph.Edge {
+	out := pending[:0]
+	for _, e := range pending {
+		if e == nil {
+			continue
+		}
+		if edgeInResolveScope(e, scope) {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// edgeInResolveScope reports whether a scoped ResolveAll pass must reconsider
+// a pending edge. An edge is in scope when any of three rules hold:
+//
+//   (a) it originates in a changed repo (its source could re-target),
+//   (b) its unresolved target is repo-qualified to a changed repo, or
+//   (c) its target is a bare, unqualified unresolved::Name — which could
+//       newly bind into any changed repo, so it is always reconsidered.
+//
+// Everything else — an edge from an unchanged repo whose target is
+// repo-qualified to another unchanged repo — is excluded.
+func edgeInResolveScope(e *graph.Edge, scope map[string]struct{}) bool {
+	// (a) Source repo is in scope.
+	if _, ok := scope[graph.RepoPrefixOfID(e.From)]; ok {
+		return true
+	}
+	// Repo prefix the target is pinned to, over both the unresolved
+	// (`<repo>::unresolved::Name`) and the general stub (`<repo>::kind::…`)
+	// encodings. Never a literal HasPrefix check — the helpers normalise the
+	// bare and repo-qualified forms.
+	targetRepo := graph.UnresolvedRepoPrefix(e.To)
+	if targetRepo == "" {
+		targetRepo = graph.StubRepoPrefix(e.To)
+	}
+	if targetRepo == "" {
+		// (c) Bare, unqualified unresolved::Name — could resolve anywhere.
+		return true
+	}
+	// (b) Target repo-qualified to a changed repo.
+	_, ok := scope[targetRepo]
+	return ok
 }
 
 // buildDirIndexes builds two lookup maps for resolveImport. Populated

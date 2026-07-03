@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -470,6 +471,27 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 		zap.Int("tracked_repos", len(repos)),
 		zap.Bool("global_passes", anyChanged))
 
+	// Materialize the changed-repo prefix set once. It feeds two consumers:
+	// the warm-restart resolve scope (RunPreEnrichResolve) and the end-batch
+	// clone-pass scope (ArmBatchScope). Building it once here avoids two
+	// separate walks of the sync.Map.
+	changed := make(map[string]struct{})
+	changedPrefixes.Range(func(k, _ any) bool {
+		if p, ok := k.(string); ok {
+			changed[p] = struct{}{}
+		}
+		return true
+	})
+
+	// Resolve scope: restrict the warm-restart master resolve to the repos
+	// that re-indexed, but only when every whole-graph-safety precondition
+	// holds (see warmupResolveScope). Any uncertainty drops to a nil scope ==
+	// whole-graph resolve, exactly the pre-scoping behaviour. The scoped
+	// global passes switch is honoured downstream in runMasterResolve,
+	// matching ArmBatchScope.
+	resolveScope := warmupResolveScope(changed, len(repos), anyChanged,
+		scopeUnknown.Load(), state.snapshotPartial, storeNeedsRebuild(state.graph))
+
 	// Resolve references ahead of the slow enrichment pass so find_usages /
 	// get_callers return complete results as soon as the daemon reports ready
 	// — independent of semantic enrichment. RunPreEnrichResolve materialises
@@ -480,7 +502,7 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	if anyChanged {
 		phaseStart = time.Now()
 		publishReadinessPhase(state, "resolve", false, nil)
-		state.multiIndexer.RunPreEnrichResolve(ctx)
+		state.multiIndexer.RunPreEnrichResolve(ctx, resolveScope)
 		logger.Info("daemon: warmup phase done",
 			zap.String("phase", "resolve"),
 			zap.Duration("elapsed", time.Since(phaseStart)))
@@ -613,13 +635,6 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// never skipped. ArmBatchScope is a no-op when scoped global passes are
 	// disabled or the set is empty (run every repo, the prior behaviour).
 	if anyChanged && !scopeUnknown.Load() {
-		changed := make(map[string]struct{})
-		changedPrefixes.Range(func(k, _ any) bool {
-			if p, ok := k.(string); ok {
-				changed[p] = struct{}{}
-			}
-			return true
-		})
 		state.multiIndexer.ArmBatchScope(changed)
 	}
 
@@ -773,6 +788,40 @@ func warmMtimePrefix(effective string, repoCount int) (prefix string, ok bool) {
 func storeNeedsRebuild(g any) bool {
 	rb, ok := g.(interface{ NeedsRebuild() bool })
 	return ok && rb.NeedsRebuild()
+}
+
+// warmupFullResolveForced reports whether the operator pinned the warm-restart
+// master resolve to the whole graph via GORTEX_WARMUP_FULL_RESOLVE=1 (or
+// "true"), overriding the changed-repo scoping. An escape hatch for the case
+// where a scoped resolve is suspected of missing edges.
+func warmupFullResolveForced() bool {
+	v := os.Getenv("GORTEX_WARMUP_FULL_RESOLVE")
+	return v == "1" || strings.EqualFold(v, "true")
+}
+
+// warmupResolveScope decides the changed-repo scope for the warm-restart
+// master resolve. It returns the changed set only when scoping is both safe
+// and beneficial; any whole-graph-safety precondition failure returns nil,
+// which runMasterResolve treats as a whole-graph resolve (the pre-scoping
+// behaviour). The guards mirror the reasons the reconcile loop already
+// distrusts a partial delta:
+//
+//   - !anyChanged: nothing re-indexed, the resolve is skipped entirely.
+//   - scopeUnknown: a changed repo's prefix was indeterminate — any per-repo
+//     uncertainty forces the whole-graph pass.
+//   - snapshotPartial: the load shed edges only a full pass can restore.
+//   - needsRebuild: the backend crossed a schema-rebuild rung.
+//   - GORTEX_WARMUP_FULL_RESOLVE=1: operator override.
+//   - empty / all-repos-changed: scoping gains nothing over the full pass.
+func warmupResolveScope(changed map[string]struct{}, totalRepos int, anyChanged, scopeUnknown, snapshotPartial, needsRebuild bool) map[string]struct{} {
+	switch {
+	case !anyChanged, scopeUnknown, snapshotPartial, needsRebuild, warmupFullResolveForced():
+		return nil
+	case len(changed) == 0, len(changed) >= totalRepos:
+		return nil
+	default:
+		return changed
+	}
 }
 
 // priorMtimesForEntry finds the snapshotted FileMtimes map for a

@@ -438,14 +438,20 @@ func (mi *MultiIndexer) RunDeferredPassesAll(ctx context.Context) {
 	// enrichment + contract passes just added. The references-completeness
 	// resolve already ran ahead of enrichment in RunPreEnrichResolve, so this
 	// is the idempotent catch-up pass for edges minted during enrichment.
-	mi.runMasterResolve()
+	// Whole-graph (nil scope): enrichment can mint placeholder edges in any
+	// repo, and scoping this catch-up is left to a follow-up.
+	mi.runMasterResolve(nil)
 }
 
 // runMasterResolve runs one same-repo resolver over the whole shared graph,
 // lifting every placeholder edge to its canonical target. Split out so the
 // pre-enrichment resolve stage (RunPreEnrichResolve) and the post-enrichment
 // catch-up (RunDeferredPassesAll) share one implementation.
-func (mi *MultiIndexer) runMasterResolve() {
+// scope, when non-empty, restricts the pass to the edges that could resolve
+// into one of the named changed repos (see resolver.SetScope). It is honoured
+// only when scoped global passes are enabled; a nil / empty scope or a
+// disabled switch runs the whole-graph resolve, exactly the prior behaviour.
+func (mi *MultiIndexer) runMasterResolve(scope map[string]struct{}) {
 	if mi.graph == nil {
 		return
 	}
@@ -459,9 +465,18 @@ func (mi *MultiIndexer) runMasterResolve() {
 	master.SetNpmAliasResolver(mi.npmAliasResolver())
 	master.SetPathAliasResolver(mi.pathAliasResolver())
 	master.SetWorkspaceMembership(mi.workspaceMembershipResolver())
+	scoped := len(scope) > 0 && mi.scopedGlobalPassesEnabled()
+	if scoped {
+		master.SetScope(scope)
+	}
 	mt := time.Now()
-	master.ResolveAll()
-	mi.logger.Info("DEFERRED-TIMING master.ResolveAll", zap.Duration("elapsed", time.Since(mt)))
+	stats := master.ResolveAll()
+	mi.logger.Info("DEFERRED-TIMING master.ResolveAll",
+		zap.Duration("elapsed", time.Since(mt)),
+		zap.Bool("scoped", scoped),
+		zap.Int("scope_repos", len(scope)),
+		zap.Int("pending_before", stats.PendingBefore),
+		zap.Int("pending_after", stats.PendingAfter))
 }
 
 // RunPreEnrichResolve runs the resolution stage that makes references queryable
@@ -476,7 +491,12 @@ func (mi *MultiIndexer) runMasterResolve() {
 // The daemon warmup calls this between the parallel parse and the enrichment
 // phase, then marks itself ready — so find_usages / get_callers return complete
 // results as soon as the graph is queryable, independent of enrichment.
-func (mi *MultiIndexer) RunPreEnrichResolve(ctx context.Context) {
+// scope, when non-empty, restricts the same-repo master resolve to the
+// changed repos (see runMasterResolve / resolver.SetScope). The daemon warmup
+// passes the set of repos that re-indexed so a warm restart of one repo out of
+// many skips a whole-graph resolve; a nil / empty scope keeps the whole-graph
+// behaviour. The cross-repo resolve stays whole-graph regardless.
+func (mi *MultiIndexer) RunPreEnrichResolve(ctx context.Context, scope map[string]struct{}) {
 	mi.mu.RLock()
 	indexers := make([]*Indexer, 0, len(mi.indexers))
 	for _, idx := range mi.indexers {
@@ -486,7 +506,7 @@ func (mi *MultiIndexer) RunPreEnrichResolve(ctx context.Context) {
 	for _, idx := range indexers {
 		idx.runDeferredGoMod()
 	}
-	mi.runMasterResolve()
+	mi.runMasterResolve(scope)
 	// Cross-repo references resolve here too so a multi-repo workspace is fully
 	// queryable at "ready", not just within each repo.
 	mi.runCrossRepoResolve(false)
