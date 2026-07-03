@@ -64,9 +64,17 @@ type IndexResult struct {
 	StaleFileCount int `json:"stale_file_count,omitempty"`
 	// FailedFiles lists files an incremental pass could not index even
 	// after one retry — a parse error, or a file locked or removed
-	// mid-pass. Their mtime is never recorded, so the next incremental
-	// pass retries them, and a caller can replay them explicitly.
-	// Empty on a clean pass and on full-index passes.
+	// mid-pass. A caller can replay them explicitly. Whether the next
+	// incremental pass retries them on its own depends on the failure:
+	// a file whose bytes could not even be read (locked, permission
+	// denied, removed mid-walk) never gets an mtime recorded, so it
+	// stays stale and is retried on every subsequent pass; a file that
+	// was read but failed to parse (syntax error, crash-isolation
+	// quarantine, extraction timeout) DOES get its current on-disk
+	// mtime recorded, so it is retried only once its content changes
+	// again — this keeps a warm restart from perpetually treating the
+	// whole repo as changed because of one unparseable file. Empty on
+	// a clean pass and on full-index passes.
 	FailedFiles []string `json:"failed_files,omitempty"`
 	// QuarantinedFiles is the number of files held in the parser
 	// crash-isolation quarantine after this pass — files that
@@ -3189,6 +3197,17 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 		// timeout). Do NOT evict — the file's prior nodes/edges/search
 		// entries stay intact. A stale-but-present file beats an empty
 		// one, and the next successful re-index swaps cleanly.
+		//
+		// The bytes were read successfully (src above), so this is a
+		// stable fact about the file's current on-disk content, not a
+		// transient "couldn't even open it" failure (that case returns
+		// earlier, before relPath/mtime bookkeeping, and deliberately
+		// leaves the mtime unrecorded so it keeps retrying). Recording
+		// the mtime here keeps a warm restart's HasChangesSinceMtimes
+		// from perpetually seeing this one unparseable file as "the
+		// repo changed" and routing the whole repo through the
+		// expensive shadow re-track path on every restart.
+		idx.recordFileMtime(relPath, absPath)
 		return err
 	}
 
@@ -3382,22 +3401,33 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 	// Update mtime for this file. relPath is already the canonical
 	// key (relKey applied slash + NFC), so the mtime entry lines up
 	// with the graph file-node key and with the bulk-walk mtimes.
-	if info, err := os.Stat(absPath); err == nil {
-		mtime := info.ModTime().UnixNano()
-		idx.mtimeMu.Lock()
-		idx.fileMtimes[relPath] = mtime
-		idx.mtimeMu.Unlock()
-		// Also persist through the store's FileMtime sidecar so the
-		// next warm restart sees this incremental update without
-		// having to wait for the periodic gob snapshot to roll it.
-		// Per-file write is ~1ms on the on-disk backend; trivial under
-		// steady-state file-watcher load.
-		if w, ok := idx.graph.(graph.FileMtimeWriter); ok {
-			_ = w.BulkSetFileMtimes(idx.repoPrefix, map[string]int64{relPath: mtime})
-		}
-	}
+	idx.recordFileMtime(relPath, absPath)
 
 	return nil
+}
+
+// recordFileMtime restamps the recorded mtime for relPath (a canonical
+// relKey, not repo-prefixed) from absPath's current on-disk mtime, both
+// in the in-memory map and — when the backend supports it — the store's
+// FileMtime sidecar. Per-file write is ~1ms on the on-disk backend;
+// trivial under steady-state file-watcher load. A missing/unstatable
+// file is a no-op; a persist error is logged but non-fatal, since the
+// in-memory map (which the current process trusts) is already correct.
+func (idx *Indexer) recordFileMtime(relPath, absPath string) {
+	info, err := os.Stat(absPath)
+	if err != nil {
+		return
+	}
+	mtime := info.ModTime().UnixNano()
+	idx.mtimeMu.Lock()
+	idx.fileMtimes[relPath] = mtime
+	idx.mtimeMu.Unlock()
+	if w, ok := idx.graph.(graph.FileMtimeWriter); ok {
+		if err := w.BulkSetFileMtimes(idx.repoPrefix, map[string]int64{relPath: mtime}); err != nil {
+			idx.logger.Warn("persist file mtime failed",
+				zap.String("repo", idx.repoPrefix), zap.String("file", relPath), zap.Error(err))
+		}
+	}
 }
 
 // StructuralSymbols parses a file from its current on-disk content and
@@ -4399,6 +4429,14 @@ func (idx *Indexer) FileMtimes() map[string]int64 {
 // mtime must advance past the save so the poller's mtime sweep does
 // not keep re-flagging the same untouched file. A file absent from
 // disk or never indexed is a no-op.
+//
+// The in-memory map is what the current process's poller and
+// IsStale checks trust, but a warm restart trusts the persisted
+// FileMtime sidecar instead — without also writing through to it here,
+// a single inert save during a session left the persisted row at its
+// pre-save value, so the next restart's HasChangesSinceMtimes saw this
+// file as changed and re-tracked the whole repo. Mirrors the per-file
+// indexFile persist (recordFileMtime); a no-op on the in-memory backend.
 func (idx *Indexer) RefreshFileMtime(filePath string) {
 	absPath, err := filepath.Abs(filePath)
 	if err != nil {
@@ -4411,11 +4449,22 @@ func (idx *Indexer) RefreshFileMtime(filePath string) {
 	// relKey (slash + NFC) so the lookup hits the same fileMtimes
 	// entry the index walk created for a non-ASCII filename.
 	key := idx.relKey(absPath)
+	mtime := info.ModTime().UnixNano()
 	idx.mtimeMu.Lock()
-	if _, tracked := idx.fileMtimes[key]; tracked {
-		idx.fileMtimes[key] = info.ModTime().UnixNano()
+	_, tracked := idx.fileMtimes[key]
+	if tracked {
+		idx.fileMtimes[key] = mtime
 	}
 	idx.mtimeMu.Unlock()
+	if !tracked {
+		return
+	}
+	if w, ok := idx.graph.(graph.FileMtimeWriter); ok {
+		if err := w.BulkSetFileMtimes(idx.repoPrefix, map[string]int64{key: mtime}); err != nil {
+			idx.logger.Warn("persist file mtime failed",
+				zap.String("repo", idx.repoPrefix), zap.String("file", key), zap.Error(err))
+		}
+	}
 }
 
 // pruneDeletedFileMtimes drops the persisted mtime rows for files the
@@ -4855,9 +4904,12 @@ func (idx *Indexer) IncrementalReindex(root string) (*IndexResult, error) {
 	// Re-index stale files. A file that fails — most often because it
 	// was locked or mid-write when the walk caught it — is collected
 	// and retried once below. A failure that survives the retry is
-	// surfaced on IndexResult.FailedFiles so the caller can replay it;
-	// since a failed file's mtime is never recorded, it also stays
-	// stale for the next incremental pass.
+	// surfaced on IndexResult.FailedFiles so the caller can replay it.
+	// A file whose bytes couldn't be read at all keeps no mtime
+	// recorded, so it stays stale for the next incremental pass; a
+	// file that read but failed to parse gets its mtime recorded (see
+	// indexFile's result==nil branch), so it stops being retried until
+	// its content changes again — see IndexResult.FailedFiles.
 	var failedFiles []string
 	for _, f := range staleFiles {
 		if err := idx.IndexFile(f); err != nil {
