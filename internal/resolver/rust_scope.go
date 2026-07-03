@@ -75,7 +75,9 @@ func ResolveRustScopeCalls(g graph.Store) int {
 		return bound
 	}
 
-	resolved := 0
+	// Trait-impl override edges bind independently of unresolved call edges,
+	// so resolve them before the call-edge early-out below.
+	resolved := resolveRustTraitOverrides(g, idx)
 	var reindexBatch []graph.EdgeReindex
 
 	// Collect candidate edges (still-unresolved Rust EdgeCalls) plus the
@@ -102,7 +104,7 @@ func ResolveRustScopeCalls(g graph.Store) int {
 		}
 	}
 	if len(cands) == 0 {
-		return bound
+		return bound + resolved
 	}
 
 	fromList := make([]string, 0, len(fromIDs))
@@ -140,11 +142,82 @@ func ResolveRustScopeCalls(g graph.Store) int {
 	return bound + resolved
 }
 
+// resolveRustTraitOverrides binds the unresolved EdgeOverrides the extractor
+// emits for `impl Trait for Type` methods (target unresolved::<Trait>.<method>)
+// to the trait declaration's method node. The trait may live in another file
+// or crate, so the binding runs off the trait-method index rather than the
+// caller's file. Returns the number of override edges bound.
+func resolveRustTraitOverrides(g graph.Store, idx *rustScopeIndex) int {
+	var cands []*graph.Edge
+	fromIDs := make(map[string]struct{})
+	for e := range g.EdgesByKind(graph.EdgeOverrides) {
+		if e == nil || !graph.IsUnresolvedTarget(e.To) {
+			continue
+		}
+		if _, _, ok := parseRustOverrideTarget(e.To); !ok {
+			continue
+		}
+		cands = append(cands, e)
+		if e.From != "" {
+			fromIDs[e.From] = struct{}{}
+		}
+	}
+	if len(cands) == 0 {
+		return 0
+	}
+	fromList := make([]string, 0, len(fromIDs))
+	for id := range fromIDs {
+		fromList = append(fromList, id)
+	}
+	fromNodes := g.GetNodesByIDs(fromList)
+
+	bound := 0
+	var batch []graph.EdgeReindex
+	for _, e := range cands {
+		trait, method, _ := parseRustOverrideTarget(e.To)
+		from := fromNodes[e.From]
+		if from == nil || from.Language != "rust" {
+			continue
+		}
+		target := idx.uniqueTraitMethod(from.RepoPrefix, trait, method)
+		if target == "" || target == e.To {
+			continue
+		}
+		oldTo := e.To
+		e.To = target
+		e.Origin = graph.OriginASTResolved
+		e.Confidence = 1.0
+		e.ConfidenceLabel = graph.ConfidenceLabelFor(graph.EdgeOverrides, 1.0)
+		if e.Meta == nil {
+			e.Meta = map[string]any{}
+		}
+		e.Meta["rust_resolution"] = "trait_override"
+		batch = append(batch, graph.EdgeReindex{Edge: e, OldTo: oldTo})
+		bound++
+	}
+	if len(batch) > 0 {
+		g.ReindexEdges(batch)
+	}
+	return bound
+}
+
+// parseRustOverrideTarget splits an unresolved::<Trait>.<method> override
+// target into its trait + method components.
+func parseRustOverrideTarget(to string) (trait, method string, ok bool) {
+	name := graph.UnresolvedName(to)
+	i := strings.LastIndex(name, ".")
+	if i <= 0 || i >= len(name)-1 {
+		return "", "", false
+	}
+	return name[:i], name[i+1:], true
+}
+
 // rustScopeEdgeCandidate reports whether an unresolved call edge is one
-// this pass can attempt: a path call (Meta["rust_path"] set) or a
-// self/Self selector call (Meta["rust_recv"] in {self, Self}). Every
-// other selector call is left to the generic resolver's receiver-type
-// cascade.
+// this pass can attempt: a path call (Meta["rust_path"] set), a self/Self
+// selector call (Meta["rust_recv"] in {self, Self}), or a selector call on
+// a typed receiver (Meta["receiver_type"] set) that the generic resolver
+// left unresolved because it keys methods by their verbatim (generic)
+// receiver. Every other selector call is left to the generic resolver.
 func rustScopeEdgeCandidate(e *graph.Edge) bool {
 	if e.Meta == nil {
 		return false
@@ -153,6 +226,12 @@ func rustScopeEdgeCandidate(e *graph.Edge) bool {
 		return true
 	}
 	if r, _ := e.Meta["rust_recv"].(string); r == "self" || r == "Self" {
+		return true
+	}
+	if rt, _ := e.Meta["receiver_type"].(string); rt != "" {
+		return true
+	}
+	if ex, _ := e.Meta["rust_recv_expr"].(string); strings.HasPrefix(ex, "self.") {
 		return true
 	}
 	return false
@@ -170,6 +249,9 @@ type rustScopeIndex struct {
 	// paramsByOwner: caller function/method ID → set of param names,
 	// for local-shadows-import precedence.
 	paramsByOwner map[string]map[string]struct{}
+	// fieldTypesByOwner: (repo, ownerType, fieldName) → declared field type
+	// (base name), for walking self.<field>.<field> receiver chains.
+	fieldTypesByOwner map[rustFieldKey]string
 
 	lastOrigin     string
 	lastConfidence float64
@@ -186,15 +268,22 @@ type rustNameKey struct {
 	name string
 }
 
+type rustFieldKey struct {
+	repo  string
+	owner string
+	field string
+}
+
 // buildRustScopeIndex walks the graph once and indexes Rust method
 // owners, free functions, and caller params. Returns nil when the graph
 // has no Rust methods or functions (the pass is a no-op for non-Rust
 // graphs).
 func buildRustScopeIndex(g graph.Store) *rustScopeIndex {
 	idx := &rustScopeIndex{
-		methodsByOwner:  map[rustOwnerKey][]*graph.Node{},
-		freeFuncsByName: map[rustNameKey][]*graph.Node{},
-		paramsByOwner:   map[string]map[string]struct{}{},
+		methodsByOwner:    map[rustOwnerKey][]*graph.Node{},
+		freeFuncsByName:   map[rustNameKey][]*graph.Node{},
+		paramsByOwner:     map[string]map[string]struct{}{},
+		fieldTypesByOwner: map[rustFieldKey]string{},
 	}
 	any := false
 	for n := range g.NodesByKind(graph.KindMethod) {
@@ -205,8 +294,15 @@ func buildRustScopeIndex(g graph.Store) *rustScopeIndex {
 		if owner == "" {
 			continue
 		}
-		idx.methodsByOwner[rustOwnerKey{repo: n.RepoPrefix, owner: owner}] = append(
-			idx.methodsByOwner[rustOwnerKey{repo: n.RepoPrefix, owner: owner}], n)
+		// Index under the verbatim owner AND a generics/lifetime-stripped
+		// base (Candidate<'a> -> Candidate) so a call qualifier or inferred
+		// receiver_type that names the base binds to a method whose impl type
+		// carries generic args. The module path is kept to avoid cross-module
+		// name collisions (io::Error stays io::Error).
+		for _, key := range rustOwnerLookupKeys(owner) {
+			k := rustOwnerKey{repo: n.RepoPrefix, owner: key}
+			idx.methodsByOwner[k] = append(idx.methodsByOwner[k], n)
+		}
 		any = true
 	}
 	for n := range g.NodesByKind(graph.KindFunction) {
@@ -237,6 +333,23 @@ func buildRustScopeIndex(g graph.Store) *rustScopeIndex {
 		}
 		set[n.Name] = struct{}{}
 	}
+	// Struct fields carry their declared type + owner in Meta, indexed by
+	// generics-stripped base names so a self.<field> chain can be walked.
+	for n := range g.NodesByKind(graph.KindField) {
+		if n == nil || n.Language != "rust" {
+			continue
+		}
+		owner, _ := n.Meta["receiver"].(string)
+		ft, _ := n.Meta["field_type"].(string)
+		if owner == "" || ft == "" {
+			continue
+		}
+		idx.fieldTypesByOwner[rustFieldKey{
+			repo:  n.RepoPrefix,
+			owner: rustBaseTypeName(owner),
+			field: n.Name,
+		}] = rustBaseTypeName(ft)
+	}
 	return idx
 }
 
@@ -264,6 +377,36 @@ func (idx *rustScopeIndex) resolve(e *graph.Edge, caller *graph.Node) string {
 			return id
 		}
 		return ""
+	}
+
+	// Selector call on a self-rooted field-access receiver
+	// (`self.config.line_term.as_byte()`). Walk the field types from the
+	// enclosing impl type down the chain, then bind the method on the type
+	// the chain lands on.
+	if expr, _ := e.Meta["rust_recv_expr"].(string); strings.HasPrefix(expr, "self.") {
+		if name := selectorCallName(e.To); name != "" {
+			if t := idx.fieldWalk(repo, nodeReceiverType(caller), expr); t != "" {
+				if id := idx.uniqueMethod(repo, t, name); id != "" {
+					idx.set(graph.OriginASTResolved, 0.82, "field_receiver")
+					return id
+				}
+			}
+		}
+	}
+
+	// Selector call on a typed variable/param (`mat.buffer()` where
+	// `mat: &SinkMatch<'_>`). The generic resolver keys methods by their
+	// verbatim receiver ("SinkMatch<'b>"), so a generics-stripped inferred
+	// receiver_type ("SinkMatch") misses it. The scope index carries a
+	// base-name alias, so bind here when the type owns exactly one such
+	// method.
+	if rt, _ := e.Meta["receiver_type"].(string); rt != "" {
+		if name := selectorCallName(e.To); name != "" {
+			if id := idx.uniqueMethod(repo, rustBaseTypeName(rt), name); id != "" {
+				idx.set(graph.OriginASTResolved, 0.88, "receiver_type")
+				return id
+			}
+		}
 	}
 
 	path, _ := e.Meta["rust_path"].(string)
@@ -296,6 +439,23 @@ func (idx *rustScopeIndex) resolve(e *graph.Edge, caller *graph.Node) string {
 		// this is structurally resolved within that type.
 		if id := idx.uniqueMethod(repo, qualifier, last); id != "" {
 			idx.set(graph.OriginASTResolved, 0.9, "impl_owner")
+			return id
+		}
+		// Ambiguous by type name alone — the same type name is defined in
+		// more than one crate/module (e.g. grep::regex::RegexMatcherBuilder
+		// and grep::pcre2::RegexMatcherBuilder). Disambiguate with the
+		// qualified path's crate/module segments: bind to the candidate
+		// whose file lives under a directory named by a path segment.
+		if id := idx.methodByPathSegments(repo, qualifier, last, segments); id != "" {
+			idx.set(graph.OriginASTResolved, 0.9, "impl_owner_path")
+			return id
+		}
+		// Still ambiguous, and the call named no disambiguating path segment
+		// (bare `RegexMatcherBuilder::new()`). Prefer the candidate defined in
+		// the caller's own crate: a same-crate associated-function call almost
+		// always means the same-crate type.
+		if id := idx.methodBySameCrate(repo, qualifier, last, caller.FilePath); id != "" {
+			idx.set(graph.OriginASTResolved, 0.85, "impl_owner_crate")
 			return id
 		}
 		return ""
@@ -334,6 +494,120 @@ func (idx *rustScopeIndex) uniqueMethod(repo, owner, name string) string {
 		}
 		if hit != "" && hit != m.ID {
 			return "" // ambiguous
+		}
+		hit = m.ID
+	}
+	return hit
+}
+
+// methodByPathSegments disambiguates a Type::method call whose type name is
+// defined in more than one crate/module by matching the qualified path's
+// crate/module segments (grep::regex::Foo::bar -> a candidate whose file
+// lives under a `regex` directory) against each candidate's file path.
+// Returns the ID only when exactly one candidate matches a path segment.
+func (idx *rustScopeIndex) methodByPathSegments(repo, owner, name string, segments []string) string {
+	cands := idx.methodsByOwner[rustOwnerKey{repo: repo, owner: owner}]
+	var hit string
+	for _, m := range cands {
+		if m.Name != name {
+			continue
+		}
+		for _, seg := range segments {
+			if seg == "" || seg == owner || seg == name {
+				continue
+			}
+			if strings.Contains(m.FilePath, "/"+seg+"/") {
+				if hit != "" && hit != m.ID {
+					return "" // more than one crate/module matched
+				}
+				hit = m.ID
+				break
+			}
+		}
+	}
+	return hit
+}
+
+// methodBySameCrate disambiguates a `Type::method` call that names no
+// disambiguating path segment by preferring the candidate defined in the
+// caller's own crate. Returns the ID only when exactly one candidate lives
+// in that crate.
+func (idx *rustScopeIndex) methodBySameCrate(repo, owner, name, callerFile string) string {
+	callerCrate := rustCrateOf(callerFile)
+	if callerCrate == "" {
+		return ""
+	}
+	cands := idx.methodsByOwner[rustOwnerKey{repo: repo, owner: owner}]
+	var hit string
+	for _, m := range cands {
+		if m.Name != name {
+			continue
+		}
+		if rustCrateOf(m.FilePath) != callerCrate {
+			continue
+		}
+		if hit != "" && hit != m.ID {
+			return "" // more than one candidate in the caller's crate
+		}
+		hit = m.ID
+	}
+	return hit
+}
+
+// fieldWalk resolves the type a self-rooted field-access receiver lands on.
+// Given the enclosing impl type (`Searcher`) and a receiver expression
+// (`self.config.line_term`), it walks each field via the field-type index —
+// Searcher.config -> Config, Config.line_term -> LineTerminator — and
+// returns the final type, or "" if any hop is unknown or ambiguous.
+func (idx *rustScopeIndex) fieldWalk(repo, implType, expr string) string {
+	t := rustBaseTypeName(implType)
+	if t == "" {
+		return ""
+	}
+	fields := strings.Split(strings.TrimPrefix(expr, "self."), ".")
+	for _, f := range fields {
+		if f == "" {
+			return ""
+		}
+		next := idx.fieldTypesByOwner[rustFieldKey{repo: repo, owner: t, field: f}]
+		if next == "" {
+			return ""
+		}
+		t = next
+	}
+	return t
+}
+
+// rustCrateOf returns a stable identifier for the crate a Rust source file
+// belongs to: the path up to (and excluding) the "/src/" segment that marks
+// a cargo crate root (crates/regex/src/matcher.rs -> "crates/regex",
+// myproj/src/lib.rs -> "myproj"). Files with no "/src/" segment — flat
+// scripts, test-dir files, or synthetic fixtures — have no determinable
+// crate and return "", so the same-crate tiebreaker stays conservative and
+// never guesses across an unknown boundary.
+func rustCrateOf(path string) string {
+	if i := strings.Index(path, "/src/"); i >= 0 {
+		return path[:i]
+	}
+	return ""
+}
+
+// uniqueTraitMethod returns the ID of the single trait-declaration method
+// named `name` owned by trait `owner` in repo, or "" on no match or
+// ambiguity. Only nodes marked Meta["trait_decl"]="true" qualify, so an
+// inherent method on a same-named type is never mistaken for the trait's.
+func (idx *rustScopeIndex) uniqueTraitMethod(repo, owner, name string) string {
+	cands := idx.methodsByOwner[rustOwnerKey{repo: repo, owner: owner}]
+	var hit string
+	for _, m := range cands {
+		if m.Name != name || m.Meta == nil {
+			continue
+		}
+		if td, _ := m.Meta["trait_decl"].(string); td != "true" {
+			continue
+		}
+		if hit != "" && hit != m.ID {
+			return ""
 		}
 		hit = m.ID
 	}
@@ -419,4 +693,37 @@ func rustParentDir(path string) string {
 		return path[:i]
 	}
 	return ""
+}
+
+// rustOwnerLookupKeys returns the keys a method's verbatim owner type should
+// be indexed under: the verbatim text plus a generics/lifetime/ref-stripped
+// base (module path kept). "Candidate<'a>" -> ["Candidate<'a>", "Candidate"];
+// "io::Error" -> ["io::Error"]; "Foo" -> ["Foo"].
+func rustOwnerLookupKeys(owner string) []string {
+	keys := []string{owner}
+	if base := rustBaseTypeName(owner); base != "" && base != owner {
+		keys = append(keys, base)
+	}
+	return keys
+}
+
+// rustBaseTypeName strips references, a leading lifetime and generic args from
+// a verbatim Rust type, keeping the module path: "&'a mut Candidate<'a>" ->
+// "Candidate", "io::Error" -> "io::Error".
+func rustBaseTypeName(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.TrimPrefix(s, "&mut ")
+	s = strings.TrimPrefix(s, "&")
+	s = strings.TrimSpace(s)
+	if strings.HasPrefix(s, "'") {
+		if i := strings.IndexByte(s, ' '); i >= 0 {
+			s = strings.TrimSpace(s[i+1:])
+			s = strings.TrimPrefix(s, "mut ")
+			s = strings.TrimSpace(s)
+		}
+	}
+	if i := strings.Index(s, "<"); i >= 0 {
+		s = strings.TrimSpace(s[:i])
+	}
+	return s
 }

@@ -112,6 +112,14 @@ type rustDeferredLet struct {
 	value    *sitter.Node // RHS expression node, or nil
 }
 
+// rustFuncDef buffers a function/method definition node for the post-emit
+// per-function receiver-scope build (paramsByFunc).
+type rustFuncDef struct {
+	node  *sitter.Node
+	owner string // impl/trait type that self binds to; "" for free functions
+	line  int    // 1-based start line, mapped back to the emitted id via funcRanges
+}
+
 func (e *RustExtractor) Extract(filePath string, src []byte) (*parser.ExtractionResult, error) {
 	tree, err := parser.ParseFile(src, e.lang)
 	if err != nil {
@@ -136,15 +144,24 @@ func (e *RustExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 
 	var calls []rustDeferredCall
 	var lets []rustDeferredLet
+	var funcDefs []rustFuncDef
 
 	parser.EachMatch(e.qAll, root, src, func(m parser.QueryResult) {
 		switch {
 
 		case m.Captures["func.def"] != nil:
 			e.emitFunction(m, filePath, fileID, src, result, seen, annotationSeen)
+			fd := m.Captures["func.def"]
+			owner := rustImplMethodReceiver(fd.Node, src)
+			if owner == "" {
+				owner = rustTraitMethodOwner(fd.Node, src)
+			}
+			funcDefs = append(funcDefs, rustFuncDef{node: fd.Node, owner: owner, line: fd.StartLine + 1})
 
 		case m.Captures["sig.def"] != nil:
-			e.recordTraitMethod(m, src, traitMethods)
+			e.recordTraitMethod(m, filePath, fileID, src, result, traitMethods, seen, annotationSeen)
+			sd := m.Captures["sig.def"]
+			funcDefs = append(funcDefs, rustFuncDef{node: sd.Node, owner: rustTraitMethodOwner(sd.Node, src), line: sd.StartLine + 1})
 
 		case m.Captures["struct.def"] != nil:
 			e.emitStruct(m, filePath, fileID, src, result, seen, annotationSeen)
@@ -271,6 +288,21 @@ func (e *RustExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 	// their enclosing definition.
 	funcRanges := buildFuncRanges(result)
 
+	// Per-function receiver scope: map each function/method's parameters and
+	// self receiver to their types so a selector call on a parameter receiver
+	// (args.foo()) resolves — mirroring Go's paramsByFunc. Keyed by the
+	// enclosing function id via funcRanges.
+	paramsByFunc := make(map[string]map[string]string)
+	for _, fd := range funcDefs {
+		id := findEnclosingFunc(funcRanges, fd.line)
+		if id == "" {
+			continue
+		}
+		if pm := rustFuncParamTypes(fd.node, fd.owner, src); len(pm) > 0 {
+			paramsByFunc[id] = pm
+		}
+	}
+
 	// Emit a cross-file type-usage edge for every `let x: Type = ...`
 	// binding annotation. Without this a type referenced only in a local
 	// binding (never in a param/return) is invisible to find_usages
@@ -291,14 +323,19 @@ func (e *RustExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 	for _, c := range calls {
 		callerID := findEnclosingFunc(funcRanges, c.line)
 		if callerID == "" {
-			continue
+			// A call outside any function body — e.g. inside a const/static
+			// initialiser (`const ALIASES = [alias(...), alias(...)]`).
+			// Attribute it to the file node instead of dropping the site, so
+			// find_usages still surfaces the call. Mirrors the let-binding
+			// type-use pass's file-node fallback.
+			callerID = fileID
 		}
 		if c.isSelector {
 			edge := &graph.Edge{
 				From: callerID, To: "unresolved::*." + c.name,
 				Kind: graph.EdgeCalls, FilePath: filePath, Line: c.line,
 			}
-			if recvType, ok := tenv[c.receiver]; ok {
+			if recvType, ok := lookupRustRecvType(paramsByFunc, tenv, callerID, c.receiver); ok {
 				edge.Meta = map[string]any{"receiver_type": recvType}
 			} else if strings.Contains(c.receiver, ".") || strings.Contains(c.receiver, "(") {
 				stampFactoryChainReceiver(edge, c.receiver, resolveChainType(c.receiver, tenv, result))
@@ -313,6 +350,16 @@ func (e *RustExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 					edge.Meta = map[string]any{}
 				}
 				edge.Meta["rust_recv"] = c.receiver
+			} else if _, hasType := edge.Meta["receiver_type"]; !hasType &&
+				strings.HasPrefix(c.receiver, "self.") && !strings.ContainsAny(c.receiver, "()[]") {
+				// A field-access receiver rooted at self (self.config.line_term
+				// .method()). Its type can't be read from a single param/local,
+				// but the scope resolver can walk the struct field types from the
+				// enclosing impl type. Record the chain so it can.
+				if edge.Meta == nil {
+					edge.Meta = map[string]any{}
+				}
+				edge.Meta["rust_recv_expr"] = c.receiver
 			}
 			stampReturnUsage(edge, c.returnUsage)
 			result.Edges = append(result.Edges, edge)
@@ -417,14 +464,35 @@ func (e *RustExtractor) emitFunction(m parser.QueryResult, filePath, fileID stri
 		result.Edges = append(result.Edges, &graph.Edge{
 			From: id, To: typeID, Kind: graph.EdgeMemberOf, FilePath: filePath, Line: startLine1,
 		})
+		// `impl Trait for Type` methods override the trait declaration's
+		// method. Emit a method-level EdgeOverrides so find_implementations
+		// pairs them and find_usages can fan dispatch sites out through the
+		// trait — resolved (possibly cross-file) by the Rust scope pass. This
+		// covers impls on external types (io::Error) that inferOverrides
+		// cannot, since inferOverrides needs both endpoints to be local type
+		// nodes and an external type has none.
+		if traitBase := rustImplTraitName(def.Node, src); traitBase != "" {
+			result.Edges = append(result.Edges, &graph.Edge{
+				From: id, To: "unresolved::" + traitBase + "." + name,
+				Kind: graph.EdgeOverrides, FilePath: filePath, Line: startLine1,
+			})
+		}
 		emitRustAnnotationEdges(rustCollectAttributes(def.Node), id, filePath, src, result, annotationSeen)
 		emitRustThrowsEdges(def.Node, src, id, filePath, startLine1, result)
 		emitRustFunctionShape(id, def.Node, src, filePath, startLine1, result)
 		return
 	}
 
-	// Free function (or trait default-impl). Mirror the legacy
-	// rsQFunction pass — emit as KindFunction.
+	// A fn directly inside a trait body is a default-method declaration:
+	// emit it as <file>::<Trait>.<method> (KindMethod) like the impl case
+	// rather than a bare free function, so trait-dispatch resolution and
+	// find_implementations pairing see a consistent method node.
+	if traitName := rustTraitMethodOwner(def.Node, src); traitName != "" {
+		e.emitTraitMethodNode(traitName, name, def, filePath, fileID, src, result, seen, annotationSeen)
+		return
+	}
+
+	// Free function. Mirror the legacy rsQFunction pass — emit as KindFunction.
 	id, ok := disambiguateID(seen, filePath+"::"+name, startLine1)
 	if !ok {
 		return
@@ -779,7 +847,7 @@ func rustVisibility(item *sitter.Node, src []byte) string {
 	return VisibilityPrivate
 }
 
-func (e *RustExtractor) recordTraitMethod(m parser.QueryResult, src []byte, traitMethods map[string][]string) {
+func (e *RustExtractor) recordTraitMethod(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, traitMethods map[string][]string, seen, annotationSeen map[string]bool) {
 	def := m.Captures["sig.def"]
 	traitNode := findEnclosingRustContainer(def.Node, "trait_item")
 	if traitNode == nil {
@@ -789,7 +857,12 @@ func (e *RustExtractor) recordTraitMethod(m parser.QueryResult, src []byte, trai
 	if traitName == "" {
 		return
 	}
-	traitMethods[traitName] = append(traitMethods[traitName], m.Captures["sig.name"].Text)
+	name := m.Captures["sig.name"].Text
+	traitMethods[traitName] = append(traitMethods[traitName], name)
+	// A dyn-dispatch call site binds to the trait *declaration*, so the
+	// signature needs its own <file>::<Trait>.<method> node for find_usages
+	// to answer and for inferOverrides to pair impl methods against it.
+	e.emitTraitMethodNode(traitName, name, def, filePath, fileID, src, result, seen, annotationSeen)
 }
 
 func (e *RustExtractor) emitStruct(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen, annotationSeen map[string]bool) {
@@ -1026,6 +1099,119 @@ func rustImplMethodReceiver(fn *sitter.Node, src []byte) string {
 	return typeNode.Content(src)
 }
 
+// rustTraitMethodOwner returns the trait name when fn is a direct member
+// of a trait_item's declaration_list — a trait-method declaration (a
+// signature or a default-body method). Mirrors rustImplMethodReceiver but
+// for trait bodies; returns "" for impl bodies, nested fns and free fns.
+func rustTraitMethodOwner(fn *sitter.Node, src []byte) string {
+	if fn == nil {
+		return ""
+	}
+	parent := fn.Parent()
+	if parent == nil || parent.Type() != "declaration_list" {
+		return ""
+	}
+	grand := parent.Parent()
+	if grand == nil || grand.Type() != "trait_item" {
+		return ""
+	}
+	nameNode := grand.ChildByFieldName("name")
+	if nameNode == nil {
+		return ""
+	}
+	return nameNode.Content(src)
+}
+
+// rustImplTraitName returns the base name of the trait a fn's enclosing
+// impl block implements (`impl Trait for Type`), or "" when fn is not an
+// impl method or the impl is inherent (`impl Type`). Unwraps scoped and
+// generic trait paths (fmt::Display -> Display, Iterator<Item=u8> ->
+// Iterator).
+func rustImplTraitName(fn *sitter.Node, src []byte) string {
+	if fn == nil {
+		return ""
+	}
+	parent := fn.Parent()
+	if parent == nil || parent.Type() != "declaration_list" {
+		return ""
+	}
+	impl := parent.Parent()
+	if impl == nil || impl.Type() != "impl_item" {
+		return ""
+	}
+	tr := impl.ChildByFieldName("trait")
+	if tr == nil {
+		return ""
+	}
+	return rustTraitPathBaseName(tr.Content(src))
+}
+
+// rustTraitPathBaseName reduces a trait reference (possibly scoped and/or
+// generic) to its base type name: `fmt::Display` -> `Display`,
+// `Iterator<Item = u8>` -> `Iterator`.
+func rustTraitPathBaseName(s string) string {
+	s = strings.TrimSpace(s)
+	if i := strings.Index(s, "<"); i >= 0 {
+		s = s[:i]
+	}
+	if i := strings.LastIndex(s, "::"); i >= 0 {
+		s = s[i+2:]
+	}
+	return strings.TrimSpace(s)
+}
+
+// emitTraitMethodNode emits a KindMethod node for a trait-declaration
+// method — a signature (function_signature_item, no body) or a default
+// method (function_item with a body). Named <file>::<Trait>.<method> so
+// the id scheme matches impl methods; EdgeMemberOf points at the trait's
+// interface node so inferOverrides pairs each concrete impl method against
+// its declaration. Meta["trait_decl"]="true" marks the node as a
+// declaration rather than a concrete impl.
+func (e *RustExtractor) emitTraitMethodNode(traitName, name string, def *parser.CapturedNode, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen, annotationSeen map[string]bool) {
+	if def == nil || def.Node == nil {
+		return
+	}
+	startLine1 := def.StartLine + 1
+	id, ok := disambiguateID(seen, filePath+"::"+traitName+"."+name, startLine1)
+	if !ok {
+		return
+	}
+	complexity, cognitive, loopDepth := 0, 0, 0
+	if body := def.Node.ChildByFieldName("body"); body != nil {
+		complexity, cognitive, loopDepth = BodyComplexityMetrics(body, "rust")
+	}
+	meta := map[string]any{
+		"receiver":   traitName,
+		"trait_decl": "true",
+		"signature":  "fn " + name + "(...)",
+		"visibility": rustVisibility(def.Node, src),
+	}
+	if doc := ExtractDocAbove(src, def.StartLine, DocLangSlashSlash); doc != "" {
+		meta["doc"] = doc
+	}
+	if rt := extractRustReturnType(def.Node, src); rt != "" {
+		meta["return_type"] = rt
+	}
+	if tps := rustTypeParams(def.Node, src); len(tps) > 0 {
+		meta["type_params"] = tps
+	}
+	ApplyComplexityMeta(meta, complexity, cognitive, loopDepth)
+	result.Nodes = append(result.Nodes, &graph.Node{
+		ID: id, Kind: graph.KindMethod, Name: name,
+		FilePath: filePath, StartLine: startLine1, EndLine: def.EndLine + 1,
+		Language: "rust", Meta: meta,
+	})
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: startLine1,
+	})
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: id, To: filePath + "::" + traitName, Kind: graph.EdgeMemberOf, FilePath: filePath, Line: startLine1,
+	})
+	emitRustAnnotationEdges(rustCollectAttributes(def.Node), id, filePath, src, result, annotationSeen)
+	emitRustThrowsEdges(def.Node, src, id, filePath, startLine1, result)
+	emitRustFunctionShape(id, def.Node, src, filePath, startLine1, result)
+}
+
 // rustDeclName returns the source text of the `name` field on a Rust
 // declaration node (struct_item, enum_item, trait_item, etc.).
 func rustDeclName(decl *sitter.Node, src []byte) string {
@@ -1095,6 +1281,61 @@ func normalizeRustTypeName(t string) string {
 		return ""
 	}
 	return t
+}
+
+// rustFuncParamTypes returns a map from parameter name to its normalized,
+// non-primitive type for a function/method node. A self parameter binds to
+// ownerType (the enclosing impl/trait type) when known. Mirrors Go's
+// paramsByFunc so a selector call on a parameter or self receiver resolves.
+func rustFuncParamTypes(fn *sitter.Node, ownerType string, src []byte) map[string]string {
+	if fn == nil {
+		return nil
+	}
+	params := fn.ChildByFieldName("parameters")
+	if params == nil {
+		return nil
+	}
+	out := map[string]string{}
+	for i, n := 0, int(params.NamedChildCount()); i < n; i++ {
+		p := params.NamedChild(i)
+		if p == nil {
+			continue
+		}
+		switch p.Type() {
+		case "self_parameter":
+			if ownerType != "" {
+				out["self"] = ownerType
+			}
+		case "parameter":
+			pat := p.ChildByFieldName("pattern")
+			ty := p.ChildByFieldName("type")
+			if pat == nil || ty == nil {
+				continue
+			}
+			if t := normalizeRustTypeName(ty.Content(src)); t != "" {
+				out[pat.Content(src)] = t
+			}
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// lookupRustRecvType resolves a selector-call receiver name to a type,
+// checking the caller's own parameter/self scope before the file-wide let
+// environment so a parameter shadows a same-named binding elsewhere.
+func lookupRustRecvType(paramsByFunc map[string]map[string]string, tenv typeEnv, callerID, name string) (string, bool) {
+	if callerID != "" {
+		if scope, ok := paramsByFunc[callerID]; ok {
+			if t, ok := scope[name]; ok {
+				return t, true
+			}
+		}
+	}
+	t, ok := tenv[name]
+	return t, ok
 }
 
 // inferTypeFromRustExpr inspects a tree-sitter expression node to infer

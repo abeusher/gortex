@@ -1431,6 +1431,14 @@ func (r *Resolver) resolveEdge(e *graph.Edge, stats *ResolveStats) (oldTo string
 		// for calls edges, resolve as a function (original behavior).
 		if e.Kind == graph.EdgeInstantiates || e.Kind == graph.EdgeReferences {
 			r.resolveTypeOrFunc(e, target, stats)
+		} else if rp, _ := e.Meta["rust_path"].(string); strings.Contains(rp, "::") {
+			// A Rust qualified path call (`MatchStrategy::new`,
+			// `crate::mod::baz`) keeps its full path in Meta["rust_path"].
+			// The generic function-call cascade only sees the trailing
+			// segment ("new"), so it would mis-bind the call to the first
+			// same-named symbol. Leave it unresolved for the SynthRustScope
+			// pass, which reads the qualifier and binds the right owner.
+			break
 		} else {
 			before := e.To
 			r.resolveFunctionCall(e, target, stats)
@@ -1811,10 +1819,18 @@ func (r *Resolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *Re
 		}
 	}
 
-	// Fall back to the first same-repo function/method match.
+	// Fall back to the first same-repo function/method match. This is a
+	// name-only guess (no directory/import evidence), so tag it text_matched
+	// — the weakest tier — so the redundant-text suppression drops it when a
+	// language server later confirms the real target, and the cross-package
+	// guard can revert it when unreachable. Same-file / same-directory picks
+	// above stay untagged (structural locality evidence) and survive.
 	for _, c := range candidates {
 		if c.Kind == graph.KindFunction || c.Kind == graph.KindMethod {
 			e.To = c.ID
+			if e.Origin == "" {
+				e.Origin = graph.OriginTextMatched
+			}
 			stats.Resolved++
 			return
 		}
@@ -2078,6 +2094,12 @@ func (r *Resolver) resolveMethodCall(e *graph.Edge, methodName string, stats *Re
 	// only survivor — so the exact-type match must see every candidate, not
 	// just the reachable ones.
 	if receiverType != "" {
+		// An exact receiver-type match is structural evidence — the
+		// receiver's type is known and the method belongs to it — so it
+		// resolves at ast_resolved (not the name-only ast_inferred tier the
+		// cross-package guard reverts) and does not need import-reachability
+		// corroboration, which Rust re-exports and unsplit `use a::{b, c}`
+		// import groups routinely leave unresolved.
 		// Pass 1: same-directory + exact type match (highest confidence).
 		for _, c := range rawCandidates {
 			if c.Kind == graph.KindMethod &&
@@ -2085,18 +2107,30 @@ func (r *Resolver) resolveMethodCall(e *graph.Edge, methodName string, stats *Re
 				nodeReceiverType(c) == receiverType {
 				e.To = c.ID
 				e.Confidence = 0.95
+				e.Origin = graph.OriginASTResolved
 				stats.Resolved++
 				return
 			}
 		}
-		// Pass 2: exact type match, any directory.
+		// Pass 2: exact type match, any directory, over the UNFILTERED
+		// candidate set with a uniqueness guard (so a same-named type in
+		// another package is never mis-picked).
+		var exact *graph.Node
 		for _, c := range rawCandidates {
 			if c.Kind == graph.KindMethod && nodeReceiverType(c) == receiverType {
-				e.To = c.ID
-				e.Confidence = 0.9
-				stats.Resolved++
-				return
+				if exact != nil && exact.ID != c.ID {
+					exact = nil
+					break
+				}
+				exact = c
 			}
+		}
+		if exact != nil {
+			e.To = exact.ID
+			e.Confidence = 0.85
+			e.Origin = graph.OriginASTResolved
+			stats.Resolved++
+			return
 		}
 		// Pass 2b: DI useClass binding. When receiver_type is an
 		// abstract/base class that has no method of this name (Passes
@@ -2244,23 +2278,43 @@ func (r *Resolver) resolveMethodCall(e *graph.Edge, methodName string, stats *Re
 		}
 	}
 
+	// Every locality-fallback pick is a name-only guess: no receiver-type
+	// evidence tied the call to this method/function, only same-name +
+	// reachability. Tag it text_matched (unless the interface-dispatch or
+	// Java lone-definition branch above already stamped a tier) so
+	// redundant-text suppression drops it once a language server confirms the
+	// real target — a common method name like `Get` otherwise fans a call to
+	// every same-named method in the package. (Free-function calls resolve in
+	// resolveFunctionCall, whose same-directory pick stays untagged.)
 	if sameDirMethod != nil {
 		e.To = sameDirMethod.ID
+		if e.Origin == "" {
+			e.Origin = graph.OriginTextMatched
+		}
 		stats.Resolved++
 		return
 	}
 	if anyMethod != nil {
 		e.To = anyMethod.ID
+		if e.Origin == "" {
+			e.Origin = graph.OriginTextMatched
+		}
 		stats.Resolved++
 		return
 	}
 	if sameDirFunc != nil {
 		e.To = sameDirFunc.ID
+		if e.Origin == "" {
+			e.Origin = graph.OriginTextMatched
+		}
 		stats.Resolved++
 		return
 	}
 	if anyFunc != nil {
 		e.To = anyFunc.ID
+		if e.Origin == "" {
+			e.Origin = graph.OriginTextMatched
+		}
 		stats.Resolved++
 		return
 	}
