@@ -97,6 +97,18 @@ func TestGateToolCallFrame(t *testing.T) {
 	inactive := gortexmcp.NewToolSurface(gortexmcp.ToolPolicyConfig{}, zap.NewNop())
 	_, gated = gateToolCallFrame(blocked, inactive)
 	require.False(t, gated)
+
+	// Defer mode trims tools/list but never gates calls — non-listed
+	// tools stay reachable, mirroring server-side tools_search promotion.
+	deferred := gortexmcp.NewToolSurface(gortexmcp.ToolPolicyConfig{
+		Allow: []string{"search_symbols", "edit_file"}, Mode: "defer",
+	}, zap.NewNop())
+	require.True(t, deferred.Active())
+	require.False(t, deferred.GateCalls())
+	_, gated = gateToolCallFrame(blocked, deferred)
+	require.False(t, gated, "defer mode must not gate tools/call")
+	trimmed := filterToolsListFrame([]byte(`{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"analyze"},{"name":"edit_file"}]}}`+"\n"), deferred)
+	require.NotContains(t, string(trimmed), "analyze", "defer mode still trims tools/list")
 }
 
 func TestToolPolicyConfigFromFlags(t *testing.T) {
