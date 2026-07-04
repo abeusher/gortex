@@ -111,3 +111,75 @@ func TestRenderDaemonHeader_SearchBackendRow(t *testing.T) {
 	assert.Contains(t, out, "65000")
 	assert.Contains(t, out, "/tmp/gortex/bleve.scorch")
 }
+
+func TestRenderDaemonHeader_WarmupLabel(t *testing.T) {
+	st := sampleStatus()
+	st.Ready = true
+	st.EnrichmentComplete = false
+	st.WarmupSeconds = 203
+	var buf bytes.Buffer
+	renderDaemonHeader(&buf, st)
+	out := buf.String()
+	assert.Contains(t, out, "warmup 3m23s", "the state row must label total time-to-queryable as warmup, not resolve")
+	assert.NotContains(t, out, "resolve 203s")
+	assert.NotContains(t, out, "(resolve ")
+}
+
+func TestRenderDaemonHeader_EnrichmentProgress_NoSummary(t *testing.T) {
+	st := sampleStatus()
+	st.Ready = true
+	st.EnrichmentComplete = false
+	st.Enrichment = nil
+	var buf bytes.Buffer
+	renderDaemonHeader(&buf, st)
+	assert.Contains(t, buf.String(), "enrichment in progress")
+}
+
+func TestRenderDaemonHeader_EnrichmentProgress_WithCurrent(t *testing.T) {
+	st := sampleStatus()
+	st.Ready = true
+	st.EnrichmentComplete = false
+	st.Enrichment = &daemon.EnrichmentProgress{
+		Running:    true,
+		ReposTotal: 22,
+		ReposDone:  3,
+		Current: &daemon.EnrichmentCurrent{
+			Repo:            "gortex",
+			Provider:        "gopls",
+			ElapsedSeconds:  240,
+			DeadlineSeconds: 900,
+		},
+	}
+	var buf bytes.Buffer
+	renderDaemonHeader(&buf, st)
+	out := buf.String()
+	assert.Contains(t, out, "enriching 3/22")
+	assert.Contains(t, out, "gortex")
+	assert.Contains(t, out, "4m0s/15m0s")
+}
+
+func TestRenderDaemonHeader_EnrichmentProgress_NoCurrentPass(t *testing.T) {
+	st := sampleStatus()
+	st.Ready = true
+	st.EnrichmentComplete = false
+	st.Enrichment = &daemon.EnrichmentProgress{
+		Running:    false,
+		ReposTotal: 5,
+		ReposDone:  5,
+	}
+	var buf bytes.Buffer
+	renderDaemonHeader(&buf, st)
+	assert.Contains(t, buf.String(), "enriching 5/5 repos")
+}
+
+func TestRenderDaemonHeader_ReadyAndEnriched_NoWarmupLabelChange(t *testing.T) {
+	st := sampleStatus()
+	st.Ready = true
+	st.EnrichmentComplete = true
+	st.EnrichSeconds = 300
+	var buf bytes.Buffer
+	renderDaemonHeader(&buf, st)
+	out := buf.String()
+	assert.Contains(t, out, "ready (warmup 5m0s)")
+	assert.NotContains(t, out, "enrichment in progress")
+}

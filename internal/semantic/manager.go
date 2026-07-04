@@ -604,8 +604,17 @@ func (m *Manager) setEnrichStatus(repo, provider, lang, state string, deadline t
 		st.Degraded = result.Degraded
 		st.DegradedReason = result.DegradedReason
 	}
+	key := repo + "\x00" + provider
 	m.mu.Lock()
-	m.enrichStatus[repo+"\x00"+provider] = st
+	if state == EnrichStateRunning {
+		st.StartedAt = time.Now()
+	} else if prev, ok := m.enrichStatus[key]; ok {
+		// Carry the running pass's start time forward onto its terminal
+		// status so a caller that only polls after completion can still
+		// compute how long the pass actually ran.
+		st.StartedAt = prev.StartedAt
+	}
+	m.enrichStatus[key] = st
 	m.mu.Unlock()
 }
 

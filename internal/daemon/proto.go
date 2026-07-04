@@ -180,6 +180,12 @@ type StatusResponse struct {
 	EnrichmentComplete bool  `json:"enrichment_complete"`
 	EnrichSeconds      int64 `json:"enrich_seconds,omitempty"`
 
+	// Enrichment reports live semantic-enrichment progress (repos
+	// finished vs total, and the in-flight pass) so a client sees a
+	// number instead of a mute "enrichment in progress". Nil when no
+	// semantic manager is wired or it has never run a pass.
+	Enrichment *EnrichmentProgress `json:"enrichment,omitempty"`
+
 	// Workspaces aggregates TrackedRepos by workspace slug. Empty
 	// when no repo declares one (every repo defaults to its own
 	// workspace; the table form is more compact in that case).
@@ -237,6 +243,34 @@ type LSPActiveProvider struct {
 	LastUsed  string `json:"last_used"` // RFC3339
 }
 
+// EnrichmentProgress summarizes the semantic-enrichment manager's
+// per-(repo, provider) status list into the counts a status line
+// needs: how many repos have finished, and which pass (if any) is
+// running right now.
+type EnrichmentProgress struct {
+	// Running is true while at least one (repo, provider) pass is in
+	// the "running" state.
+	Running bool `json:"running"`
+	// ReposTotal is the number of distinct repos the manager has ever
+	// recorded a pass for. ReposDone is the subset of those where
+	// every recorded provider has reached a terminal state (completed,
+	// partial, abandoned, or failed).
+	ReposTotal int `json:"repos_total"`
+	ReposDone  int `json:"repos_done"`
+	// Current is the in-flight pass, when Running is true.
+	Current *EnrichmentCurrent `json:"current,omitempty"`
+}
+
+// EnrichmentCurrent is the one (repo, provider) enrichment pass
+// currently running, with how long it has been running and (when
+// known) its deadline.
+type EnrichmentCurrent struct {
+	Repo            string  `json:"repo"`
+	Provider        string  `json:"provider"`
+	ElapsedSeconds  float64 `json:"elapsed_seconds"`
+	DeadlineSeconds float64 `json:"deadline_seconds,omitempty"`
+}
+
 // RuntimeStats captures Go runtime.MemStats fields users care about
 // when diagnosing daemon memory: live vs reserve, GC pressure, and
 // goroutine count. All byte fields are raw (not human-formatted).
@@ -256,11 +290,16 @@ type RuntimeStats struct {
 // repo breakdown with the right mental model. Bleve with the default
 // gtreap KV store costs ~32 KiB per document; BM25 costs ~2 KiB.
 type SearchBackendStats struct {
-	Name      string `json:"name"`                 // "bm25" | "bleve-memory" | "bleve-disk"
+	Name      string `json:"name"`                 // "bm25" | "bleve-memory" | "bleve-disk" | "sqlite-fts5"
 	DocCount  int    `json:"doc_count"`            // indexed documents across all repos
 	Bytes     uint64 `json:"bytes"`                // approximate heap footprint
 	DiskPath  string `json:"disk_path,omitempty"`  // set only when Name == "bleve-disk"
 	DiskBytes uint64 `json:"disk_bytes,omitempty"` // current on-disk size for "bleve-disk"
+	// DiskResident marks a backend (e.g. "sqlite-fts5") that has no
+	// meaningful heap footprint of its own — its index lives inside the
+	// graph store's own file — and no cheap byte count is available
+	// either. Rendering must not print a fabricated "heap=0 B" for it.
+	DiskResident bool `json:"disk_resident,omitempty"`
 }
 
 // SearchSymbolsParams is the payload for ControlSearchSymbols.

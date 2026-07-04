@@ -163,15 +163,20 @@ const (
 // enrichment pass. Exposed through index_health so consumers can tell a
 // fully-enriched graph from one whose LSP pass was cut or abandoned.
 type EnrichmentStatus struct {
-	Repo            string  `json:"repo"`
-	Provider        string  `json:"provider"`
-	Language        string  `json:"language,omitempty"`
-	State           string  `json:"state"`
-	DeadlineSeconds float64 `json:"deadline_seconds,omitempty"`
-	DurationMs      int64   `json:"duration_ms,omitempty"`
-	EdgesConfirmed  int     `json:"edges_confirmed"`
-	EdgesAdded      int     `json:"edges_added"`
-	NodesEnriched   int     `json:"nodes_enriched"`
+	Repo     string `json:"repo"`
+	Provider string `json:"provider"`
+	Language string `json:"language,omitempty"`
+	State    string `json:"state"`
+	// StartedAt is stamped when the pass enters EnrichStateRunning — the
+	// only state where "how long has this been going" is meaningful.
+	// Consumed by the daemon status surface to render a live elapsed
+	// time next to the per-repo deadline instead of a mute "in progress".
+	StartedAt       time.Time `json:"started_at,omitempty"`
+	DeadlineSeconds float64   `json:"deadline_seconds,omitempty"`
+	DurationMs      int64     `json:"duration_ms,omitempty"`
+	EdgesConfirmed  int       `json:"edges_confirmed"`
+	EdgesAdded      int       `json:"edges_added"`
+	NodesEnriched   int       `json:"nodes_enriched"`
 	// Add-phase coverage — the targets eligible for the hover/references
 	// pass, how many were visited, and why the pass stopped. Always emitted
 	// so a "completed" state that covered < 100% of targets is legible as a
