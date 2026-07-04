@@ -501,7 +501,7 @@ func (mi *MultiIndexer) runMasterResolve(scope map[string]struct{}) {
 // changed repos (see runMasterResolve / resolver.SetScope). The daemon warmup
 // passes the set of repos that re-indexed so a warm restart of one repo out of
 // many skips a whole-graph resolve; a nil / empty scope keeps the whole-graph
-// behaviour. The cross-repo resolve stays whole-graph regardless.
+// behaviour. The cross-repo resolve is scoped to the same changed repos.
 func (mi *MultiIndexer) RunPreEnrichResolve(ctx context.Context, scope map[string]struct{}) {
 	mi.mu.RLock()
 	indexers := make([]*Indexer, 0, len(mi.indexers))
@@ -514,8 +514,9 @@ func (mi *MultiIndexer) RunPreEnrichResolve(ctx context.Context, scope map[strin
 	}
 	mi.runMasterResolve(scope)
 	// Cross-repo references resolve here too so a multi-repo workspace is fully
-	// queryable at "ready", not just within each repo.
-	mi.runCrossRepoResolve(false)
+	// queryable at "ready", not just within each repo. Scoped to the changed
+	// repos on a warm restart, mirroring the same-repo master resolve above.
+	mi.runCrossRepoResolve(false, scope)
 }
 
 // runDeferredEnrichParallel runs each indexer's semantic enrichment in a

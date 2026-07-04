@@ -274,7 +274,7 @@ func (mi *MultiIndexer) BackfillWorkspaceSlugs() (nodesStamped, contractsStamped
 // the daemon needs to refresh cross-repo edges without re-indexing
 // every file. Idempotent — safe to call repeatedly.
 func (mi *MultiIndexer) RunGlobalResolve() {
-	mi.runCrossRepoResolve(true)
+	mi.runCrossRepoResolve(true, nil)
 }
 
 // runCrossRepoResolve runs the cross-repo resolver over the shared graph,
@@ -282,7 +282,13 @@ func (mi *MultiIndexer) RunGlobalResolve() {
 // true it also reconciles contract-bridge edges; the pre-enrichment resolve
 // stage (RunPreEnrichResolve) passes false because the contract pass has not
 // committed its nodes yet.
-func (mi *MultiIndexer) runCrossRepoResolve(reconcileContracts bool) {
+// scope, when non-empty and scoped global passes are enabled, restricts the
+// cross-repo resolve to the changed repos' own out-edges (see
+// CrossRepoResolver.ResolveForRepos) — the warm-restart optimisation that
+// avoids a whole-graph cross-repo pass when only a few of many tracked repos
+// re-indexed. A nil / empty scope or a disabled switch runs the whole-graph
+// ResolveAll, exactly the prior behaviour.
+func (mi *MultiIndexer) runCrossRepoResolve(reconcileContracts bool, scope map[string]struct{}) {
 	if mi == nil || mi.graph == nil {
 		return
 	}
@@ -293,7 +299,11 @@ func (mi *MultiIndexer) runCrossRepoResolve(reconcileContracts bool) {
 	cr.SetPathAliasResolver(mi.pathAliasResolver())
 	cr.SetWorkspaceMembership(mi.workspaceMembershipResolver())
 	mi.applyRemoteStitch(cr)
-	cr.ResolveAll()
+	if len(scope) > 0 && mi.scopedGlobalPassesEnabled() {
+		cr.ResolveForRepos(scope)
+	} else {
+		cr.ResolveAll()
+	}
 	if reconcileContracts {
 		mi.ReconcileContractEdges()
 	}
