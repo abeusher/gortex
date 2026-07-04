@@ -45,8 +45,11 @@ func proxyToolSurface() *gortexmcp.ToolSurface {
 // synthesized JSON-RPC error reply (to write back to the client) and
 // gated=true — the original frame must NOT reach the daemon, so a client
 // that hard-codes a hidden tool name cannot bypass the restriction.
+// Only hide mode gates calls: in defer mode the surface trims tools/list
+// but keeps every tool callable, mirroring the server-side defer
+// semantics where tools_search promotion makes deferred tools live.
 func gateToolCallFrame(line []byte, surface *gortexmcp.ToolSurface) (reply []byte, gated bool) {
-	if !surface.Active() {
+	if !surface.GateCalls() {
 		return nil, false
 	}
 	var msg struct {

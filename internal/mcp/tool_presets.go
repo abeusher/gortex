@@ -374,6 +374,15 @@ func (s *ToolSurface) Allows(name string) bool {
 	return s.p.allows(name)
 }
 
+// GateCalls reports whether disallowed tools should be blocked at call
+// time. True only for an active surface in hide mode; defer mode keeps
+// non-listed tools reachable (the proxy analogue of the server keeping
+// deferred tools callable after a tools_search promotion). A nil or
+// inactive surface gates nothing.
+func (s *ToolSurface) GateCalls() bool {
+	return s != nil && s.p.hideMode()
+}
+
 // Preset returns the resolved preset label (full / readonly / edit / nav
 // / custom) for logging.
 func (s *ToolSurface) Preset() string {
