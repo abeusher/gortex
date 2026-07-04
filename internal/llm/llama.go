@@ -10,6 +10,31 @@ package llm
 #include <llama.h>
 #include <ggml-backend.h>
 #include <stdlib.h>
+
+// gortexLlamaLogCallback is defined (and //export'd to C) in
+// llama_log.go. It is declared here rather than pulled in via the
+// generated _cgo_export.h so this preamble stays self-contained; the
+// two files agree on the plain-C signature (int, char*, void*) to
+// avoid any enum-typedef mismatch with ggml_log_callback.
+extern void gortexLlamaLogCallback(int level, char* text, void* user_data);
+
+// gortexLlamaLogShim adapts the plain-C exported callback to the exact
+// function-pointer type llama_log_set/ggml_log_set expect.
+static void gortexLlamaLogShim(enum ggml_log_level level, const char * text, void * user_data) {
+	gortexLlamaLogCallback((int)level, (char*)text, user_data);
+}
+
+// gortexInstallLlamaLog registers the shim with both llama.cpp's and
+// ggml's own logging hook. Both exist as separate registries in
+// current llama.cpp/ggml releases; whichever one a given build's
+// tensor-load/backend trace actually flows through, this routes it to
+// the Go side instead of the default stderr callback. Kept as a plain
+// C helper (rather than passing the function pointer through cgo)
+// since cgo cannot reference an unapplied C function as a value.
+static void gortexInstallLlamaLog(void) {
+	llama_log_set(gortexLlamaLogShim, NULL);
+	ggml_log_set(gortexLlamaLogShim, NULL);
+}
 */
 import "C"
 
@@ -26,6 +51,15 @@ var (
 
 func initBackend() {
 	backendOnce.Do(func() {
+		// Install our callback before touching anything else: both
+		// llama.cpp and ggml log via their own default callback
+		// (straight to stderr) until overridden, and ggml_backend_load_all
+		// / model load emit hundreds of tensor/pipeline trace lines
+		// through it. Routing both APIs' hooks to the same shim means
+		// whichever one a given build actually uses, the lines land in
+		// the Go logger (info/debug dropped, warn/error kept) instead
+		// of on raw stderr.
+		C.gortexInstallLlamaLog()
 		// ggml backends (CPU, Metal, CUDA, ...) ship as plugins in
 		// recent ggml; llama_backend_init no longer registers them.
 		C.ggml_backend_load_all()

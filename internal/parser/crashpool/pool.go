@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+
+	"github.com/zzet/gortex/internal/procio"
 )
 
 // defaultRequestTimeout bounds one parse round-trip. A worker that
@@ -97,11 +99,13 @@ func (p *Pool) Stats() (spawns, crashes int64) {
 	return p.spawns.Load(), p.crashes.Load()
 }
 
-// spawn starts one worker subprocess.
+// spawn starts one worker subprocess. Its stderr is not inherited: a
+// scanner goroutine routes it through the pool's Logger as structured,
+// rate-limited Warn entries instead of raw text landing wherever the
+// daemon's own stderr is wired to.
 func (p *Pool) spawn() (*procWorker, error) {
 	p.spawns.Add(1)
 	cmd := exec.Command(p.cfg.Argv[0], p.cfg.Argv[1:]...) //nolint:gosec // argv is internal, not user-derived
-	cmd.Stderr = os.Stderr
 	if len(p.cfg.Env) > 0 {
 		cmd.Env = append(os.Environ(), p.cfg.Env...)
 	}
@@ -114,10 +118,16 @@ func (p *Pool) spawn() (*procWorker, error) {
 		_ = stdin.Close()
 		return nil, err
 	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		_ = stdin.Close()
+		return nil, err
+	}
 	if err := cmd.Start(); err != nil {
 		_ = stdin.Close()
 		return nil, err
 	}
+	procio.StderrWatcher{Logger: p.cfg.Logger, Tag: "crashpool worker"}.Watch(stderr)
 	return &procWorker{
 		cmd:   cmd,
 		enc:   gob.NewEncoder(stdin),

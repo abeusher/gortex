@@ -150,6 +150,12 @@ func (p *Provider) Loaded() bool {
 // after an idle unload. On any error it frees whatever it allocated and
 // returns — the gate stays unloaded and a later Complete retries.
 func (p *Provider) loadResources() error {
+	// Route llama.cpp / ggml's own log callback (tensor load traces,
+	// ggml_metal pipeline compiles, ...) through the same logger instead
+	// of their default stderr callback. Set on every load (not just
+	// once) so a SetLogger call that arrives after construction but
+	// before the first Complete still takes effect.
+	llm.SetLogger(p.log())
 	p.log().Info("loading local model",
 		zap.String("model", p.cfg.Model),
 		zap.Int("gpu_layers", p.cfg.GPULayers))
