@@ -186,6 +186,15 @@ type Resolver struct {
 	// empty means whole-graph, exactly the pre-scoping behaviour. Set via
 	// SetScope. Independent of any backend bulk-mode flag.
 	scope map[string]struct{}
+
+	// stampTerminal, when true, lets a FULL (unscoped) ResolveAll durably mark
+	// the edges it concludes are permanently external / stdlib / definition-
+	// less so a later SCOPED warm resolve can skip re-feeding them (see
+	// terminal.go). Only the whole-graph master resolve — which has global
+	// evidence — enables it; per-repo and single-file passes leave it false so
+	// a partially-indexed graph never stamps a false "no definition". Set via
+	// SetStampTerminal.
+	stampTerminal bool
 }
 
 // lspLocKey identifies a node by (filePath, 1-based line) and is the
@@ -230,6 +239,15 @@ func (r *Resolver) SetLogger(l *zap.Logger) {
 // mirroring the other Set* configuration setters.
 func (r *Resolver) SetScope(prefixes map[string]struct{}) {
 	r.scope = prefixes
+}
+
+// SetStampTerminal enables durable terminal-edge stamping for the next FULL
+// (unscoped) ResolveAll pass (see the stampTerminal field and terminal.go). It
+// is a no-op on scoped passes, which lack the global evidence to conclude an
+// edge is permanently unbindable. Only the whole-graph master resolve should
+// enable it.
+func (r *Resolver) SetStampTerminal(on bool) {
+	r.stampTerminal = on
 }
 
 // SetGraph retargets the Resolver at a different Store. The indexer's
@@ -333,6 +351,15 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 	if len(r.scope) > 0 {
 		pending = filterPendingByScope(pending, r.scope)
 	}
+	// Terminal-edge skip: on a scoped warm pass, drop the edges a prior FULL
+	// pass durably flagged as permanently external / stdlib / definition-less
+	// (see terminal.go), unless they are anchored to a changed repo. A full /
+	// unscoped pass (scope empty), and the GORTEX_WARMUP_FULL_RESOLVE override,
+	// ignore the flag and re-examine everything so a stamp self-heals.
+	terminalSkipped := 0
+	if len(r.scope) > 0 && !warmupFullResolve() {
+		pending, terminalSkipped = filterTerminalSkip(pending, r.scope)
+	}
 	if len(pending) == 0 {
 		return &ResolveStats{PendingBefore: pendingBefore}
 	}
@@ -340,6 +367,7 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 	passStart := time.Now()
 	r.logger.Info("resolver: pass start",
 		zap.Int("pending", len(pending)),
+		zap.Int("terminal_skipped", terminalSkipped),
 		zap.Bool("backend_bulk", backendResolverEnabled()))
 	var processed atomic.Int64
 	progressDone := make(chan struct{})
@@ -431,6 +459,14 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 					oldTo, changed := r.resolveEdge(clone, ws)
 					processed.Add(1)
 					if changed {
+						// A now-resolved edge sheds any durable terminal-skip
+						// flag it carried (full self-healing pass): it has left
+						// the pending set, so a later scoped pass must not treat
+						// the flag as live. The cleared Meta rides the reindex
+						// below (To changed => the row is rewritten).
+						if !graph.IsUnresolvedTarget(clone.To) {
+							clearEdgeTerminal(clone)
+						}
 						jobs = append(jobs, reindexJob{
 							edge:       e,
 							oldTo:      oldTo,
@@ -589,6 +625,20 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 	// chain, and interface/abstract/trait override families fanned out to
 	// every implementation. Same post-guard placement as the Java pass.
 	r.resolvePHPOverrideDispatch()
+
+	// Terminal-edge reconciliation: only a FULL (unscoped) pass has the global
+	// evidence to conclude an edge is permanently unbindable, so it durably
+	// stamps the newly-terminal edges and un-stamps any that regained a
+	// candidate. Gated to the master resolve via SetStampTerminal so a
+	// partially-indexed per-repo pass never stamps a false "no definition".
+	if r.stampTerminal && len(r.scope) == 0 {
+		stamped, unstamped := r.reconcileTerminalStamps()
+		if stamped > 0 || unstamped > 0 {
+			r.logger.Info("resolver: terminal stamps",
+				zap.Int("stamped", stamped),
+				zap.Int("unstamped", unstamped))
+		}
+	}
 
 	total := &ResolveStats{}
 	for i := range allStats {

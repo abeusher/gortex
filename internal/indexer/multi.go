@@ -457,6 +457,12 @@ func (mi *MultiIndexer) runMasterResolve(scope map[string]struct{}) {
 	}
 	master := resolver.New(mi.graph)
 	master.SetLogger(mi.logger)
+	// The master resolve is the only pass with whole-graph evidence, so it is
+	// the one allowed to durably flag terminally-unresolved edges (permanently
+	// external / stdlib / definition-less) that a later scoped warm resolve can
+	// skip. A scoped master pass leaves the flag alone (stamping is gated on an
+	// empty scope inside ResolveAll); only a full pass stamps and self-heals.
+	master.SetStampTerminal(true)
 	// Mirror the resolve-time LSP helper onto the master pass so TS/JS-family
 	// edges pick up LSP-precision answers just like the per-repo passes do.
 	if mi.resolverLSPHelper != nil {

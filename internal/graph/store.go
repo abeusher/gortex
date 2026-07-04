@@ -1069,6 +1069,18 @@ type EdgePersister interface {
 	PersistEdgeAttributes(e *Edge)
 }
 
+// EdgeMetaBatchPersister is the batched sibling of EdgePersister for passes
+// that durably rewrite the attribute columns (Meta in particular) of many
+// edges in one sweep — the resolver's terminal-skip stamping walks the whole
+// unresolved population and flips a durable flag on the permanently external /
+// stdlib / definition-less edges. A disk backend amortises the per-edge
+// transaction overhead across the batch. The in-memory backend never
+// implements it: a read hands back the live *Edge pointer, so an in-place Meta
+// mutation is already durable and the caller's type assertion simply fails.
+type EdgeMetaBatchPersister interface {
+	PersistEdgeAttributesBatch(edges []*Edge)
+}
+
 // CloneShingleWriter is an optional capability backends MAY implement
 // to persist each function/method node's MinHash shingle set (a
 // []uint64) keyed by node id. Lifting this state into the same backend

@@ -870,6 +870,57 @@ func (s *Store) PersistEdgeAttributes(e *graph.Edge) {
 	}
 }
 
+// Compile-time assertion: *Store satisfies the batched meta persister.
+var _ graph.EdgeMetaBatchPersister = (*Store)(nil)
+
+// PersistEdgeAttributesBatch is the batched form of PersistEdgeAttributes:
+// it rewrites the mutable attribute columns (confidence, confidence_label,
+// origin, tier, meta) for every edge in the batch, chunking the writes into
+// reindexChunkSize-row transactions re-using one prepared statement. The
+// resolver's terminal-skip stamping calls it to persist a Meta flag across a
+// large slice of edges without paying a BEGIN/COMMIT per edge. A row with no
+// matching key is a silent no-op (UPDATE ... WHERE matches nothing).
+func (s *Store) PersistEdgeAttributesBatch(edges []*graph.Edge) {
+	if len(edges) == 0 {
+		return
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	for i := 0; i < len(edges); i += reindexChunkSize {
+		end := minInt(i+reindexChunkSize, len(edges))
+		chunk := edges[i:end]
+		tx, err := s.db.Begin()
+		if err != nil {
+			panicOnFatal(err)
+			return
+		}
+		updStmt := tx.Stmt(s.stmtUpdateEdgeAttrs)
+		for _, e := range chunk {
+			if e == nil {
+				continue
+			}
+			metaBlob, err := encodeMeta(e.Meta)
+			if err != nil {
+				_ = tx.Rollback()
+				panicOnFatal(err)
+				return
+			}
+			if _, err := updStmt.Exec(
+				e.Confidence, e.ConfidenceLabel, e.Origin, e.Tier, metaBlob,
+				e.From, e.To, string(e.Kind), e.FilePath, e.Line,
+			); err != nil {
+				_ = tx.Rollback()
+				panicOnFatal(err)
+				return
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			panicOnFatal(err)
+			return
+		}
+	}
+}
+
 // ReindexEdge updates the stored row after e.To has been mutated from
 // oldTo to e.To. Implemented as delete-old + insert-new under the
 // same write lock (SQLite's UNIQUE constraint on (from,to,kind,file,
