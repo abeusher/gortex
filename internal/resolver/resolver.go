@@ -115,6 +115,20 @@ type Resolver struct {
 	// mid-pass. Set only inside ResolveAll.
 	validateLiveness bool
 
+	// bulkMode is set true by ResolveAll for the duration of its parallel
+	// worker fan-out and dropped around the inter-chunk mutex yield. While it
+	// is on, resolveEdge skips the synchronous per-edge tryResolveViaLSP
+	// round-trip: an LSP definition lookup serialises inside the helper, so a
+	// TS/JS-dense chunk otherwise degenerates to serial-LSP-latency × chunk
+	// size while every other worker idles at the barrier. The heuristic
+	// cascade still runs; edges it leaves unresolved that the helper could
+	// bind are collected and resolved once, off the barrier, in a deferred
+	// batch after the loop (see resolveDeferredLSP). Dropped around the yield
+	// so an interactive ResolveFile that interleaves on a shared Resolver
+	// instance still gets inline LSP precision. Independent of scope /
+	// validateLiveness; never set on any single-file path.
+	bulkMode bool
+
 	// lookupCache holds per-pass batched results from GetNodesByIDs /
 	// FindNodesByNames. Populated by ResolveAll/ResolveFile before
 	// the worker fan-out and cleared on return. Workers consult these
@@ -410,6 +424,14 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 	// post-resolve passes once, after the loop. GORTEX_RESOLVE_CHUNK=0 restores
 	// the whole-pass-locked path.
 	r.validateLiveness = resolveChunkEnabled()
+	// Bulk mode: the parallel workers below skip the synchronous per-edge LSP
+	// round-trip (see the bulkMode field) and instead collect the still-
+	// unresolved LSP-eligible edges into deferredLSP, which one deferred batch
+	// binds after the loop. Reset unconditionally on return so a leaked true
+	// can never disable inline LSP on a later single-file ResolveFile.
+	r.bulkMode = true
+	defer func() { r.bulkMode = false }()
+	var deferredLSP []*graph.Edge
 	superChunk := len(pending)
 	if r.validateLiveness {
 		if sz := resolveChunkSize(); sz < superChunk {
@@ -438,6 +460,7 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 		}
 		perWorkerStats := make([]ResolveStats, workers)
 		perWorkerJobs := make([][]reindexJob, workers)
+		perWorkerDeferred := make([][]*graph.Edge, workers)
 		var wg sync.WaitGroup
 		chunk := (len(scPending) + workers - 1) / workers
 		for w := 0; w < workers; w++ {
@@ -454,6 +477,7 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 				defer wg.Done()
 				ws := &perWorkerStats[idx]
 				jobs := make([]reindexJob, 0, len(slice))
+				var deferred []*graph.Edge
 				for _, e := range slice {
 					clone := cloneEdgeForResolve(e)
 					oldTo, changed := r.resolveEdge(clone, ws)
@@ -477,10 +501,17 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 							origin:     clone.Origin,
 							meta:       clone.Meta,
 						})
+					} else if r.lspDeferEligible(e) {
+						// The heuristic cascade left this LSP-eligible edge
+						// unresolved and bulk mode skipped the inline LSP round-
+						// trip. Collect it for the post-loop deferred batch so the
+						// helper is consulted off the parallel worker barrier.
+						deferred = append(deferred, e)
 					}
 					releaseResolverClone(clone)
 				}
 				perWorkerJobs[idx] = jobs
+				perWorkerDeferred[idx] = deferred
 			}(w, scPending[start:end])
 		}
 		wg.Wait()
@@ -513,21 +544,45 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 		}
 		allJobs = append(allJobs, perWorkerJobs...)
 		allStats = append(allStats, perWorkerStats...)
+		for i := range perWorkerDeferred {
+			deferredLSP = append(deferredLSP, perWorkerDeferred[i]...)
+		}
 
 		// Hand the resolve mutex to any waiting interactive edit before the
-		// next chunk.
+		// next chunk. Drop bulk mode across the hand-off so an interleaving
+		// single-file ResolveFile on a shared instance resolves LSP-first.
 		if r.validateLiveness && hi < len(pending) {
+			r.bulkMode = false
 			r.mu.Unlock()
 			runtime.Gosched()
 			r.mu.Lock()
+			r.bulkMode = true
 		}
 	}
 	close(progressDone)
+
+	// Deferred LSP batch: bind the still-unresolved LSP-eligible edges the
+	// parallel workers collected, now that the compute barrier is behind us.
+	// Runs before the tail attribution passes so external-call
+	// materialisation sees the LSP-resolved targets, exactly as the inline
+	// (non-bulk) path would.
+	lspDeferred := len(deferredLSP)
+	lspBatchResolved := 0
+	if lspDeferred > 0 {
+		lspBatchResolved = r.resolveDeferredLSP(deferredLSP)
+	}
+	// Bulk mode covers only the parallel compute + the deferred LSP batch; the
+	// guard and tail attribution passes below run identically to the single-
+	// file path. (The deferred defer() is the panic-safety net.)
+	r.bulkMode = false
+
 	computeElapsed := time.Since(passStart)
 	r.logger.Info("resolver: compute done",
 		zap.Int("pending", len(pending)),
 		zap.Int("reindex_batch", reindexTotal),
 		zap.Int("super_chunk", superChunk),
+		zap.Int("lsp_deferred", lspDeferred),
+		zap.Int("lsp_batch_resolved", lspBatchResolved),
 		zap.Duration("elapsed", computeElapsed))
 
 	// Cross-package name-match guard. The heuristic fallbacks above can
@@ -632,6 +687,18 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 			total.Resolved = 0
 		}
 		total.Unresolved += guarded
+	}
+	// Fold the deferred LSP batch into the pass total. Each edge was tallied
+	// Unresolved by the heuristic cascade that left it pending; binding it in
+	// the batch moves it back to Resolved, matching the non-bulk path where
+	// the inline LSP win would have counted a Resolved and no Unresolved.
+	if lspBatchResolved > 0 {
+		total.Resolved += lspBatchResolved
+		if total.Unresolved >= lspBatchResolved {
+			total.Unresolved -= lspBatchResolved
+		} else {
+			total.Unresolved = 0
+		}
 	}
 	total.PendingBefore = pendingBefore
 	total.PendingAfter = len(pending)
@@ -779,6 +846,7 @@ func (r *Resolver) warmLookupCache(pending []*graph.Edge) {
 	if len(pending) == 0 {
 		return
 	}
+	warmStart := time.Now()
 	idSet := make(map[string]struct{}, len(pending)*2)
 	nameSet := make(map[string]struct{}, len(pending))
 	qualNameSet := make(map[string]struct{})
@@ -826,8 +894,15 @@ func (r *Resolver) warmLookupCache(pending []*graph.Edge) {
 	for n := range nameSet {
 		names = append(names, n)
 	}
-	r.nodeByID = r.graph.GetNodesByIDs(ids)
-	r.nodesByName = r.graph.FindNodesByNames(names)
+	// Both the id and name key sets run to ~0.5M keys on a cold warmup, and
+	// each backed store call was a single serial round trip before the first
+	// progress tick — the silent 3-6s start-up gap. Split each into per-CPU
+	// batches issued concurrently: both graph backends serve concurrent point
+	// reads safely (in-memory takes per-shard RLocks; sqlite pools NumCPU WAL
+	// reader connections), which is the same property the resolver's worker
+	// fan-out below already depends on.
+	r.nodeByID = r.parallelGetNodesByIDs(ids)
+	r.nodesByName = r.parallelFindNodesByNames(names)
 	// Authoritative negatives: a name we queried that has NO node in the
 	// graph (stdlib / external method calls — *.QueryRow, *.Errorf,
 	// *.Fatalf, *.StringVar, … — dominate the pending set) must be
@@ -881,6 +956,107 @@ func (r *Resolver) warmLookupCache(pending []*graph.Edge) {
 			}
 		}
 	}
+	// Make the previously-silent warm phase observable — the batched store
+	// reads over ~0.5M keys land before the first compute progress tick.
+	r.logger.Info("resolver: warm lookup cache",
+		zap.Int("ids", len(ids)),
+		zap.Int("names", len(names)),
+		zap.Int("qual_names", len(qualNameSet)),
+		zap.Duration("elapsed", time.Since(warmStart)))
+}
+
+// parallelGetNodesByIDs is the concurrent form of Store.GetNodesByIDs used to
+// pre-warm the resolver's per-pass id cache: it splits ids into up to NumCPU
+// batches issued on their own goroutines and merges the per-batch maps. ids is
+// already deduped by warmLookupCache, so a key lands in exactly one batch and
+// the merge never has to reconcile collisions. Small inputs fall through to a
+// single call, where the goroutine + merge overhead would dominate.
+func (r *Resolver) parallelGetNodesByIDs(ids []string) map[string]*graph.Node {
+	batches := lookupWarmBatches(len(ids))
+	if batches <= 1 {
+		return r.graph.GetNodesByIDs(ids)
+	}
+	parts := make([]map[string]*graph.Node, batches)
+	chunk := (len(ids) + batches - 1) / batches
+	var wg sync.WaitGroup
+	for b := 0; b < batches; b++ {
+		start := b * chunk
+		end := start + chunk
+		if end > len(ids) {
+			end = len(ids)
+		}
+		if start >= end {
+			continue
+		}
+		wg.Add(1)
+		go func(bi int, sub []string) {
+			defer wg.Done()
+			parts[bi] = r.graph.GetNodesByIDs(sub)
+		}(b, ids[start:end])
+	}
+	wg.Wait()
+	out := make(map[string]*graph.Node, len(ids))
+	for _, m := range parts {
+		for k, v := range m {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+// parallelFindNodesByNames is the concurrent form of Store.FindNodesByNames.
+// names is deduped by warmLookupCache, so each name resolves in exactly one
+// batch and the merge is a plain key copy (no per-name slice concat across
+// batches). Small inputs fall through to a single call.
+func (r *Resolver) parallelFindNodesByNames(names []string) map[string][]*graph.Node {
+	batches := lookupWarmBatches(len(names))
+	if batches <= 1 {
+		return r.graph.FindNodesByNames(names)
+	}
+	parts := make([]map[string][]*graph.Node, batches)
+	chunk := (len(names) + batches - 1) / batches
+	var wg sync.WaitGroup
+	for b := 0; b < batches; b++ {
+		start := b * chunk
+		end := start + chunk
+		if end > len(names) {
+			end = len(names)
+		}
+		if start >= end {
+			continue
+		}
+		wg.Add(1)
+		go func(bi int, sub []string) {
+			defer wg.Done()
+			parts[bi] = r.graph.FindNodesByNames(sub)
+		}(b, names[start:end])
+	}
+	wg.Wait()
+	out := make(map[string][]*graph.Node, len(names))
+	for _, m := range parts {
+		for k, v := range m {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+// lookupWarmBatches picks the goroutine count for the parallel warm-cache
+// helpers: one per minLookupWarmBatch keys, capped at NumCPU, and 1 (serial)
+// below the threshold so tiny key sets skip the fan-out overhead entirely.
+func lookupWarmBatches(n int) int {
+	const minLookupWarmBatch = 4096
+	if n <= minLookupWarmBatch {
+		return 1
+	}
+	batches := (n + minLookupWarmBatch - 1) / minLookupWarmBatch
+	if cpus := runtime.NumCPU(); batches > cpus {
+		batches = cpus
+	}
+	if batches < 1 {
+		batches = 1
+	}
+	return batches
 }
 
 func (r *Resolver) clearLookupCache() {
@@ -1527,7 +1703,15 @@ func (r *Resolver) resolveEdge(e *graph.Edge, stats *ResolveStats) (oldTo string
 	// skipped. When it loses (no helper, no answer, no match), we
 	// fall through to the existing heuristic cascade unchanged so
 	// the edge still gets the best best-effort target.
-	if r.tryResolveViaLSP(e, target, stats) {
+	//
+	// In bulk mode (a whole-graph ResolveAll warmup pass) the inline
+	// round-trip is skipped: the definition lookup serialises inside the
+	// helper, so paying it here parks the parallel workers on the helper
+	// lock. ResolveAll instead collects the edges the heuristic cascade
+	// leaves unresolved and binds them in one deferred batch after the loop
+	// (see resolveDeferredLSP + lspDeferEligible). Single-file paths keep
+	// bulkMode false, so an interactive edit still resolves LSP-first.
+	if !r.bulkMode && r.tryResolveViaLSP(e, target, stats) {
 		return oldTo, e.To != oldTo
 	}
 

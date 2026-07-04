@@ -2,6 +2,7 @@ package resolver
 
 import (
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -102,6 +103,93 @@ func (r *Resolver) tryResolveViaLSP(e *graph.Edge, target string, stats *Resolve
 
 	stats.Resolved++
 	return true
+}
+
+// lspDeferEligible reports whether a bulk-mode ResolveAll should collect e
+// for the deferred LSP batch: the heuristic cascade left it unresolved and the
+// installed helper claims its file. Mirrors tryResolveViaLSP's up-front gating
+// (helper present, real file position, supported extension, a bare identifier
+// the helper can locate) so the batch only carries edges the helper could
+// actually bind. Read-only; safe to call from the parallel resolve workers,
+// which already call SupportsPath via the inline path today.
+func (r *Resolver) lspDeferEligible(e *graph.Edge) bool {
+	if r.lspHelper == nil || e == nil || e.FilePath == "" || e.Line <= 0 {
+		return false
+	}
+	if !graph.IsUnresolvedTarget(e.To) {
+		return false
+	}
+	if !r.lspHelper.SupportsPath(e.FilePath) {
+		return false
+	}
+	target := graph.UnresolvedName(e.To)
+	if target == "" {
+		target = strings.TrimPrefix(e.To, unresolvedPrefix)
+	}
+	return identifierFromTarget(target) != ""
+}
+
+// resolveDeferredLSP binds the edges the bulk-mode compute loop collected —
+// LSP-eligible edges the heuristic cascade left unresolved — through the
+// installed helper, applying every hit via one ReindexEdges call. It runs
+// AFTER the parallel chunk loop so a synchronous textDocument/definition
+// round-trip never stalls the heuristic worker fan-out at its barrier.
+//
+// The helper serialises its own language-server calls, so the batch walks the
+// edges serially, grouped by file for locality in the helper's open-file set
+// and lookupNodeByLocation's per-file index. With a single installed helper
+// there is no cross-helper parallelism to exploit — the win is that these
+// calls no longer contend on the helper lock inside the parallel workers, and
+// that the balanced heuristic phase completes without LSP stragglers.
+//
+// Caller holds r.mu (the deferred batch is invoked from inside ResolveAll,
+// while the per-pass lookup / lsp indexes are still live). Returns the number
+// of edges the helper bound; ResolveAll folds it into the pass total.
+func (r *Resolver) resolveDeferredLSP(edges []*graph.Edge) int {
+	if len(edges) == 0 || r.lspHelper == nil {
+		return 0
+	}
+	byFile := make(map[string][]*graph.Edge, len(edges))
+	files := make([]string, 0, len(edges))
+	for _, e := range edges {
+		if e == nil {
+			continue
+		}
+		if _, seen := byFile[e.FilePath]; !seen {
+			files = append(files, e.FilePath)
+		}
+		byFile[e.FilePath] = append(byFile[e.FilePath], e)
+	}
+	sort.Strings(files)
+
+	var stats ResolveStats
+	reindexBatch := make([]graph.EdgeReindex, 0, len(edges))
+	for _, f := range files {
+		for _, e := range byFile[f] {
+			// A concurrent single-file edit during an inter-chunk yield may
+			// have resolved or evicted this edge since it was collected;
+			// skip anything no longer unresolved or no longer in the graph so
+			// we neither double-bind nor half-resurrect an evicted edge.
+			if !graph.IsUnresolvedTarget(e.To) {
+				continue
+			}
+			if r.validateLiveness && !edgeStillLive(r.graph, e) {
+				continue
+			}
+			oldTo := e.To
+			target := graph.UnresolvedName(e.To)
+			if target == "" {
+				target = strings.TrimPrefix(e.To, unresolvedPrefix)
+			}
+			if r.tryResolveViaLSP(e, target, &stats) {
+				reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: e, OldTo: oldTo})
+			}
+		}
+	}
+	if len(reindexBatch) > 0 {
+		r.graph.ReindexEdges(reindexBatch)
+	}
+	return stats.Resolved
 }
 
 // identifierFromTarget extracts the bare identifier from a resolver

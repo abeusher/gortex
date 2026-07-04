@@ -13,11 +13,13 @@ import (
 // tests. exts narrows which file paths it claims; defs is the
 // canonical mapping from (callerPath, line, name) → (defPath, line).
 type fakeLSPHelper struct {
-	exts   []string
-	defs   map[lspKey]lspAnswer
-	calls  int
-	mu     sync.Mutex
-	hangCh chan struct{} // optional: when non-nil, blocks Definition until closed (timeout testing)
+	exts        []string
+	defs        map[lspKey]lspAnswer
+	calls       int
+	inFlight    int
+	maxInFlight int // high-water mark of concurrent Definition calls
+	mu          sync.Mutex
+	hangCh      chan struct{} // optional: when non-nil, blocks Definition until closed (timeout testing)
 }
 
 type lspKey struct {
@@ -46,10 +48,17 @@ func (f *fakeLSPHelper) SupportsPath(relPath string) bool {
 func (f *fakeLSPHelper) Definition(relPath string, line int, name string) (string, int, bool) {
 	f.mu.Lock()
 	f.calls++
+	f.inFlight++
+	if f.inFlight > f.maxInFlight {
+		f.maxInFlight = f.inFlight
+	}
 	f.mu.Unlock()
 	if f.hangCh != nil {
 		<-f.hangCh
 	}
+	f.mu.Lock()
+	f.inFlight--
+	f.mu.Unlock()
 	a, ok := f.defs[lspKey{path: relPath, line: line, name: name}]
 	if !ok {
 		return "", 0, false
@@ -66,6 +75,12 @@ func hasSuffix(s, suffix string) bool {
 // AST resolver can find a same-named target anywhere in the repo
 // (potentially the wrong one); the LSP definition lookup pins the
 // edge to the precise re-exported declaration.
+//
+// Driven through the single-file ResolveFile path: that is where the LSP
+// helper is consulted inline (LSP-first), the behaviour an interactive edit
+// relies on. A whole-graph ResolveAll runs in bulk mode, where LSP is deferred
+// to a post-loop mop-up for the edges the heuristic cascade leaves unresolved
+// (see TestLSPHotPath_BulkDefersLSP*).
 func TestLSPHotPath_BarrelReExport(t *testing.T) {
 	g := graph.New()
 	// Files
@@ -106,7 +121,7 @@ func TestLSPHotPath_BarrelReExport(t *testing.T) {
 
 	r := New(g)
 	r.SetLSPHelper(helper)
-	stats := r.ResolveAll()
+	stats := r.ResolveFile("src/caller.ts")
 
 	require.Equal(t, 1, stats.Resolved)
 	assert.Equal(t, "src/real.ts::doWork", callEdge.To, "edge must bind to LSP-reported definition, not the decoy")
@@ -260,7 +275,7 @@ func TestLSPHotPath_MethodSelector(t *testing.T) {
 
 	r := New(g)
 	r.SetLSPHelper(helper)
-	stats := r.ResolveAll()
+	stats := r.ResolveFile("src/caller.ts")
 
 	require.Equal(t, 1, stats.Resolved)
 	assert.Equal(t, "src/svc.ts::Service.handle", callEdge.To)
@@ -302,7 +317,7 @@ func TestLSPHotPath_MethodValueReadPromotesToReferences(t *testing.T) {
 
 	r := New(g)
 	r.SetLSPHelper(helper)
-	stats := r.ResolveAll()
+	stats := r.ResolveFile("src/routes.go")
 
 	require.Equal(t, 1, stats.Resolved)
 	assert.Equal(t, "src/handler.go::Handler.HandleHealth", readEdge.To)
@@ -342,7 +357,7 @@ func TestLSPHotPath_FunctionValueReadPromotesToReferences(t *testing.T) {
 
 	r := New(g)
 	r.SetLSPHelper(helper)
-	stats := r.ResolveAll()
+	stats := r.ResolveFile("cmd/x/main.go")
 
 	require.Equal(t, 1, stats.Resolved)
 	assert.Equal(t, "cmd/x/clean.go::runClean", readEdge.To)
@@ -452,7 +467,7 @@ func TestLSPHotPath_LSPIndexCaching(t *testing.T) {
 
 	r := New(g)
 	r.SetLSPHelper(helper)
-	stats := r.ResolveAll()
+	stats := r.ResolveFile("src/caller.ts")
 
 	require.Equal(t, 2, stats.Resolved)
 	assert.Equal(t, "src/svc.ts::theTarget", e1.To)
@@ -490,4 +505,125 @@ func TestLSPHotPath_NoOpAfterFileMiss(t *testing.T) {
 	// has nothing to find either, so the edge is left unresolved.
 	assert.Equal(t, 0, stats.Resolved)
 	assert.Equal(t, 1, stats.Unresolved)
+}
+
+// TestLSPHotPath_BulkDefersLSP_ResolvesUnresolved — the deferral contract on
+// the whole-graph ResolveAll (bulk) path. The heuristic cascade cannot bind
+// the call (there is no graph node named "doThing"), so the edge is collected
+// and bound in the post-loop deferred LSP batch instead of an inline round-
+// trip inside the parallel workers. resolveEdge never consults the helper in
+// bulk mode, so the single recorded call can only have come from the deferred
+// batch, and maxInFlight==1 confirms the batch ran the call serially, off the
+// parallel worker barrier.
+func TestLSPHotPath_BulkDefersLSP_ResolvesUnresolved(t *testing.T) {
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "src/caller.ts", Kind: graph.KindFile, Name: "caller.ts", FilePath: "src/caller.ts", Language: "typescript"})
+	g.AddNode(&graph.Node{ID: "src/svc.ts", Kind: graph.KindFile, Name: "svc.ts", FilePath: "src/svc.ts", Language: "typescript"})
+	// The definition the LSP reports lives under a different name than the
+	// call site uses (a rename / barrel re-export), so the name-only heuristic
+	// finds nothing to bind — only the LSP location lookup can resolve it.
+	g.AddNode(&graph.Node{
+		ID: "src/svc.ts::renamedTarget", Kind: graph.KindFunction, Name: "renamedTarget",
+		FilePath: "src/svc.ts", StartLine: 5, EndLine: 7, Language: "typescript",
+	})
+	g.AddNode(&graph.Node{ID: "src/caller.ts::callIt", Kind: graph.KindFunction, Name: "callIt", FilePath: "src/caller.ts", Language: "typescript"})
+
+	callEdge := &graph.Edge{
+		From: "src/caller.ts::callIt", To: "unresolved::doThing",
+		Kind: graph.EdgeCalls, FilePath: "src/caller.ts", Line: 3,
+	}
+	g.AddEdge(callEdge)
+
+	helper := &fakeLSPHelper{
+		exts: []string{".ts"},
+		defs: map[lspKey]lspAnswer{
+			{path: "src/caller.ts", line: 3, name: "doThing"}: {defPath: "src/svc.ts", defLine: 5},
+		},
+	}
+
+	r := New(g)
+	r.SetLSPHelper(helper)
+	stats := r.ResolveAll()
+
+	require.Equal(t, 1, stats.Resolved)
+	assert.Equal(t, "src/svc.ts::renamedTarget", callEdge.To, "deferred LSP batch must bind the heuristic-unresolved edge")
+	assert.Equal(t, graph.OriginLSPResolved, callEdge.Origin)
+	require.NotNil(t, callEdge.Meta)
+	assert.Equal(t, "lsp", callEdge.Meta["resolved_by"])
+	assert.Equal(t, 1, helper.calls, "helper is consulted exactly once, in the deferred batch")
+	assert.Equal(t, 1, helper.maxInFlight, "deferred LSP calls run serially, off the parallel worker barrier")
+}
+
+// TestLSPHotPath_BulkSkipsInlineLSPWhenHeuristicResolves — the other half of
+// the deferral contract: during the bulk chunk loop the helper is never
+// consulted. Here the heuristic resolves the call itself (the single same-dir
+// candidate), so the edge is not collected for the deferred batch and the LSP
+// helper records zero calls — the edge binds by heuristic, not by LSP.
+func TestLSPHotPath_BulkSkipsInlineLSPWhenHeuristicResolves(t *testing.T) {
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "src/caller.ts", Kind: graph.KindFile, Name: "caller.ts", FilePath: "src/caller.ts", Language: "typescript"})
+	g.AddNode(&graph.Node{ID: "src/svc.ts", Kind: graph.KindFile, Name: "svc.ts", FilePath: "src/svc.ts", Language: "typescript"})
+	g.AddNode(&graph.Node{
+		ID: "src/svc.ts::realFn", Kind: graph.KindFunction, Name: "realFn",
+		FilePath: "src/svc.ts", StartLine: 4, EndLine: 6, Language: "typescript",
+	})
+	g.AddNode(&graph.Node{ID: "src/caller.ts::callIt", Kind: graph.KindFunction, Name: "callIt", FilePath: "src/caller.ts", Language: "typescript"})
+
+	callEdge := &graph.Edge{
+		From: "src/caller.ts::callIt", To: "unresolved::realFn",
+		Kind: graph.EdgeCalls, FilePath: "src/caller.ts", Line: 3,
+	}
+	g.AddEdge(callEdge)
+
+	// The helper CAN answer, but bulk mode must never consult it inline for an
+	// edge the heuristic already resolves.
+	helper := &fakeLSPHelper{
+		exts: []string{".ts"},
+		defs: map[lspKey]lspAnswer{
+			{path: "src/caller.ts", line: 3, name: "realFn"}: {defPath: "src/svc.ts", defLine: 4},
+		},
+	}
+
+	r := New(g)
+	r.SetLSPHelper(helper)
+	stats := r.ResolveAll()
+
+	require.Equal(t, 1, stats.Resolved)
+	assert.Equal(t, "src/svc.ts::realFn", callEdge.To)
+	assert.Equal(t, 0, helper.calls, "bulk mode must not consult the helper during the chunk loop for a heuristic-resolved edge")
+	assert.NotEqual(t, graph.OriginLSPResolved, callEdge.Origin, "resolved by heuristic, not LSP")
+}
+
+// TestLSPHotPath_BulkDeferRespectsKindGate — a deferred edge whose LSP target
+// is an unacceptable kind (a file node for a calls edge) is rejected by the
+// same kind-gate the inline path applies, and left unresolved rather than
+// mis-bound.
+func TestLSPHotPath_BulkDeferRespectsKindGate(t *testing.T) {
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "src/caller.ts", Kind: graph.KindFile, Name: "caller.ts", FilePath: "src/caller.ts", Language: "typescript", StartLine: 1})
+	g.AddNode(&graph.Node{ID: "src/util.ts", Kind: graph.KindFile, Name: "util.ts", FilePath: "src/util.ts", Language: "typescript", StartLine: 1})
+	g.AddNode(&graph.Node{ID: "src/caller.ts::callIt", Kind: graph.KindFunction, Name: "callIt", FilePath: "src/caller.ts", Language: "typescript"})
+
+	callEdge := &graph.Edge{
+		From: "src/caller.ts::callIt", To: "unresolved::missing",
+		Kind: graph.EdgeCalls, FilePath: "src/caller.ts", Line: 2,
+	}
+	g.AddEdge(callEdge)
+
+	// LSP points at the util.ts FILE node (line 1) — the kind-gate must reject
+	// binding a calls edge to a file.
+	helper := &fakeLSPHelper{
+		exts: []string{".ts"},
+		defs: map[lspKey]lspAnswer{
+			{path: "src/caller.ts", line: 2, name: "missing"}: {defPath: "src/util.ts", defLine: 1},
+		},
+	}
+
+	r := New(g)
+	r.SetLSPHelper(helper)
+	stats := r.ResolveAll()
+
+	assert.Equal(t, 0, stats.Resolved)
+	assert.Equal(t, 1, helper.calls, "deferred batch attempted the bind")
+	assert.True(t, graph.IsUnresolvedTarget(callEdge.To), "kind-gated LSP answer must leave the edge unresolved")
 }
