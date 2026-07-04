@@ -413,6 +413,30 @@ func (mi *MultiIndexer) BeginParallelBatch() {
 // GORTEX_WARMUP_FORCE_ENRICH) rather than skipped as unchanged. Sampled
 // before runDeferredEnrichParallel runs, since a successful non-partial
 // pass clears the flag it reads.
+// SeedPendingEnrichAll re-arms the deferred-enrichment gate for every tracked
+// repo whose persisted enrichment is known-incomplete at its current clean HEAD
+// (see Indexer.MaybeSeedPendingEnrich). The daemon warmup calls it after the
+// parallel parse and before RunDeferredPassesAll so a repo left partial or
+// abandoned by a prior process resumes even when no file changed this run.
+// Returns the number of repos that will enrich (already pending plus newly
+// seeded) — the caller uses a non-zero count to run the deferred passes on a
+// warm restart that changed nothing on disk.
+func (mi *MultiIndexer) SeedPendingEnrichAll() int {
+	mi.mu.RLock()
+	live := make([]*Indexer, 0, len(mi.indexers))
+	for _, idx := range mi.indexers {
+		live = append(live, idx)
+	}
+	mi.mu.RUnlock()
+	pending := 0
+	for _, idx := range live {
+		if idx.MaybeSeedPendingEnrich() {
+			pending++
+		}
+	}
+	return pending
+}
+
 func (mi *MultiIndexer) RunDeferredPassesAll(ctx context.Context) int {
 	mi.mu.RLock()
 	indexers := make([]*Indexer, 0, len(mi.indexers))

@@ -557,13 +557,27 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 		markReady()
 	}
 
+	// Resume enrichment for any repo a prior process left partial / abandoned.
+	// pendingEnrich reflects only this run's re-indexing work, so an unchanged
+	// repo whose completion marker is absent (a cut-short pass writes none)
+	// would never re-run its semantic pass. Seeding re-arms the gate from the
+	// persisted marker so the deferred pass below resumes it — and runs that
+	// block even on a warm restart that changed nothing on disk (anyChanged is
+	// false). Cheap for a fully-enriched workspace: each already-complete repo
+	// pays only a git rev-parse plus one marker lookup.
+	enrichPending := state.multiIndexer.SeedPendingEnrichAll()
+	if enrichPending > 0 && !anyChanged {
+		logger.Info("daemon: warmup resuming incomplete enrichment on an otherwise-unchanged restart",
+			zap.Int("repos_pending_enrich", enrichPending))
+	}
+
 	// Drain deferred per-repo passes (semantic enrich / contract
 	// extract+commit) serially across the indexers the parallel loop
 	// populated. These run after ready: enrichment is a precision upgrade on
 	// top of the already-queryable reference graph. RunDeferredPassesAll
 	// re-runs the master resolver at its tail to lift placeholder edges the
 	// enrichment + contract passes add.
-	if anyChanged {
+	if anyChanged || enrichPending > 0 {
 		phaseStart = time.Now()
 		publishReadinessPhase(state, "deferred_passes_all", true, nil)
 		timings.enrichScheduled = state.multiIndexer.RunDeferredPassesAll(ctx)

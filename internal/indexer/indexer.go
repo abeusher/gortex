@@ -1059,7 +1059,60 @@ func (idx *Indexer) runDeferredEnrich() {
 	// again) retries the enrichment rather than trusting an incomplete graph.
 	if !partialRepos[idx.repoPrefix] {
 		idx.pendingEnrich.Store(false)
+		// Persist a whole-repo completion marker at this HEAD so the next warm
+		// restart can tell, with one lookup, that this repo's enrichment finished
+		// and MaybeSeedPendingEnrich need not resume it. A partial / abandoned
+		// pass takes the other branch and writes no marker, so the absent marker
+		// re-arms the pass on the next start. No-op on a dirty tree / empty sha.
+		idx.semanticMgr.RecordRepoEnrichmentComplete(idx.graph, idx.repoPrefix, sha, dirty)
 	}
+}
+
+// MaybeSeedPendingEnrich re-arms the deferred-enrichment gate for a repo whose
+// persisted enrichment is known-incomplete at the current clean HEAD, so a warm
+// restart resumes a semantic pass a prior process left partial or abandoned.
+//
+// pendingEnrich otherwise reflects only re-indexing work performed THIS run, so
+// an unchanged repo whose first enrichment was cut short by the per-repo
+// deadline would short-circuit runDeferredEnrich on every subsequent restart —
+// its whole-repo completion marker is absent (a partial pass writes none) yet no
+// file changed to raise the flag. The daemon warmup calls this after the parse
+// phase, before draining the deferred passes.
+//
+// Returns whether this repo will enrich (already pending, or newly seeded). A
+// no-op — false — for a repo without semantic providers, on a non-git tree (no
+// reliable freshness signal), on a backend that does not persist enrichment
+// state (it re-indexes from scratch each restart anyway), when the completion
+// marker already records the current HEAD, or on a dirty tree (the marker is
+// never written or trusted against uncommitted content, and resuming every
+// restart while the tree stays dirty would defeat the warm-restart fast path).
+func (idx *Indexer) MaybeSeedPendingEnrich() bool {
+	if idx.semanticMgr == nil || !idx.semanticMgr.Enabled() || !idx.semanticMgr.HasProviders() {
+		return false
+	}
+	if idx.pendingEnrich.Load() {
+		// This run's re-indexing work already armed the gate.
+		return true
+	}
+	// Cheap probe first: only the sha is needed to tell a repo whose marker is
+	// already current (the common warm-restart case) from one that must resume,
+	// so the slower git status shell-out is deferred to the resume path below.
+	sha := repoHead(idx.rootPath)
+	if sha == "" {
+		return false
+	}
+	current, persisted := idx.semanticMgr.RepoEnrichmentMarkerState(idx.graph, idx.repoPrefix, sha)
+	if !persisted || current {
+		return false
+	}
+	if _, dirty := repoHeadAndDirty(idx.rootPath); dirty {
+		return false
+	}
+	idx.logger.Info("deferred enrichment re-armed: persisted enrichment incomplete",
+		zap.String("repo", idx.repoPrefix),
+		zap.String("sha", sha))
+	idx.pendingEnrich.Store(true)
+	return true
 }
 
 // runDeferredContracts extracts and commits this repo's contract nodes and

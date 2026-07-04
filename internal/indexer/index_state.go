@@ -80,3 +80,18 @@ func repoHeadAndDirty(rootAbs string) (sha string, dirty bool) {
 	}
 	return sha, status != ""
 }
+
+// repoHead returns the working tree's current commit SHA, or "" for a non-git
+// directory or any git error. A lighter probe than repoHeadAndDirty when the
+// caller does not yet need the dirty bit — it skips the git status shell-out,
+// which is the slow half on a large repo. The dirty bit is fetched separately
+// (via repoHeadAndDirty) only when the cheap sha check leaves the decision open.
+func repoHead(rootAbs string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	sha, err := gitcmd.Output(ctx, rootAbs, "rev-parse", "HEAD")
+	if err != nil {
+		return ""
+	}
+	return sha
+}

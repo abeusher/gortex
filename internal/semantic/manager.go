@@ -744,6 +744,50 @@ func (m *Manager) recordEnrichMarker(g graph.Store, repoPrefix, provider string,
 	}
 }
 
+// repoEnrichMarkerProvider is the reserved provider key under which the
+// whole-repo enrichment completion marker is stored in the per-(repo, provider)
+// enrichment_state table. No language provider is named this, so the row never
+// collides with a real provider's marker. It records the git revision at which
+// EVERY applicable provider finished a non-partial pass for the repo, letting a
+// warm restart decide — with a single keyed lookup, without re-deriving which
+// providers apply — whether the persisted graph's enrichment is complete or was
+// cut short (partial / abandoned) and must be resumed.
+const repoEnrichMarkerProvider = "__repo__"
+
+// RecordRepoEnrichmentComplete persists the whole-repo enrichment completion
+// marker at sha. The deferred-enrichment driver calls it once a repo's pass
+// finished with no provider left partial / abandoned / failed. It shares
+// recordEnrichMarker's discipline: a no-op on an empty sha or a dirty tree (the
+// marker must describe the committed state the sha names) and on a backend that
+// does not persist enrichment state.
+func (m *Manager) RecordRepoEnrichmentComplete(g graph.Store, repoPrefix, sha string, dirty bool) {
+	m.recordEnrichMarker(g, repoPrefix, repoEnrichMarkerProvider, RepoEnrichState{SHA: sha, Dirty: dirty}, 0)
+}
+
+// RepoEnrichmentMarkerState reports the whole-repo enrichment completion marker
+// for repoPrefix against sha. persisted is false when the backend does not
+// durably store enrichment state (the in-memory graph) — the caller then has no
+// completeness signal from the marker and must not force a pass on marker
+// evidence alone. When persisted is true, current reports whether a marker
+// exists and records exactly sha, i.e. the repo's enrichment finished at this
+// clean HEAD and need not be resumed on restart. A read error or an empty sha
+// yields (false, true): no positive evidence of completeness, but the backend
+// does persist state.
+func (m *Manager) RepoEnrichmentMarkerState(g graph.Store, repoPrefix, sha string) (current, persisted bool) {
+	store, ok := g.(graph.EnrichmentStateStore)
+	if !ok {
+		return false, false
+	}
+	if sha == "" {
+		return false, true
+	}
+	marker, found, err := store.GetEnrichmentState(repoPrefix, repoEnrichMarkerProvider)
+	if err != nil || !found {
+		return false, true
+	}
+	return marker.IndexedSHA == sha, true
+}
+
 // shortSHA truncates a git revision to its 7-char prefix for logging; a
 // shorter or empty sha is returned as-is.
 func shortSHA(sha string) string {
