@@ -42,7 +42,7 @@ gortex install --no-hooks           # skip user-level hook installation
 
 # Daemon lifecycle (also spawned by `gortex install --start`):
 gortex daemon start --detach        # spawn in background
-gortex daemon status                # PID, uptime, memory, tracked repos, sessions, server roster
+gortex daemon status                # PID, uptime, memory, tracked repos, sessions, server roster, search backend, warmup + enrichment progress
 gortex daemon stop                  # graceful shutdown + final snapshot
 gortex daemon restart               # stop + start
 gortex daemon reload                # re-read config, pick up new/removed repos

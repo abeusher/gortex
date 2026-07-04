@@ -115,9 +115,11 @@ llm:
     complex_model: claude-opus-4-7    # multi-hop / refactor-scale runs
 ```
 
+**Local provider idle unload.** The in-process llama.cpp model is unloaded after sitting idle (freeing its memory), and reloaded lazily on the next call. Default idle TTL is 10 minutes; override with `GORTEX_LLM_IDLE_TTL` (a verbatim Go duration, e.g. `5m`); `0` / `off` / `none` disables idle unloading, keeping the model resident once loaded.
+
 When `llm.routing.enabled` is true, each `ask` run is scored by graph-derived task complexity — chain-tracing mode, multi-hop keywords, and how broad a slice of the multi-repo graph is in scope — and dispatched to `simple_model` or `complex_model` *within the active provider* (a cheap single-hop lookup costs less; a cross-system trace gets the capable model). The chosen `model` and `complexity` ride on the `ask` response. An empty tier model falls back to the provider's configured model.
 
-Env overrides: `GORTEX_LLM_PROVIDER`, `GORTEX_LLM_MODEL` (targets the active provider's model — for `azure` it sets the deployment), `GORTEX_LLM_MAX_STEPS`, `GORTEX_LLM_{CLAUDECLI,CODEX,COPILOT,CURSOR,OPENCODE}_BINARY`, `GORTEX_LLM_BEDROCK_REGION`, `GORTEX_LLM_AZURE_{ENDPOINT,DEPLOYMENT,API_VERSION}`, `GORTEX_LLM_EFFORT`, and `GORTEX_LLM_ANTHROPIC_{PROMPT_CACHING,THINKING_MODE,HAIKU_MODEL,SONNET_MODEL,OPUS_MODEL}`. API keys are read from the env var named by `api_key_env` — never stored in the config file.
+Env overrides: `GORTEX_LLM_PROVIDER`, `GORTEX_LLM_MODEL` (targets the active provider's model — for `azure` it sets the deployment), `GORTEX_LLM_MAX_STEPS`, `GORTEX_LLM_{CLAUDECLI,CODEX,COPILOT,CURSOR,OPENCODE}_BINARY`, `GORTEX_LLM_BEDROCK_REGION`, `GORTEX_LLM_AZURE_{ENDPOINT,DEPLOYMENT,API_VERSION}`, `GORTEX_LLM_EFFORT`, `GORTEX_LLM_IDLE_TTL` (`local` provider only), and `GORTEX_LLM_ANTHROPIC_{PROMPT_CACHING,THINKING_MODE,HAIKU_MODEL,SONNET_MODEL,OPUS_MODEL}`. API keys are read from the env var named by `api_key_env` — never stored in the config file.
 
 If the active provider can't be constructed (missing model or API key, `local` without a `-tags llama` build, `claudecli` / `codex` without the `claude` / `codex` binary on `$PATH`, `bedrock` without AWS credentials), the daemon logs a warning and the LLM features stay absent — the rest of Gortex is unaffected. If the `ask` tool isn't in `tools/list`, no provider is configured.
 
