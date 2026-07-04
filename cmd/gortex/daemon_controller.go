@@ -24,6 +24,7 @@ import (
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/releases"
 	"github.com/zzet/gortex/internal/search"
+	"github.com/zzet/gortex/internal/semantic"
 	"github.com/zzet/gortex/internal/semantic/lsp"
 )
 
@@ -560,9 +561,14 @@ type searchBackendInfo struct {
 // on-disk size.
 //
 // Real-world unwrap order: Swappable → HybridBackend → (text, vector).
-// The text side is itself a concrete BM25/Bleve. Both layers have to
-// be peeled; if we stop early we fall into the default branch and the
-// status reports "unknown" — which was the bug users saw.
+// The text side is itself a concrete BM25/Bleve/SymbolSearcherBackend.
+// Both layers have to be peeled; if we stop early we fall into the
+// default branch and the status reports "unknown" — which was the bug
+// users saw. When the store implements graph.SymbolSearcher, the
+// indexer wires up a *search.SymbolSearcherBackend instead of building
+// an in-process BM25/Bleve index at all (see initialSearchBackend in
+// internal/indexer/indexer.go) — that case has to be matched
+// explicitly too, or it falls into the same "unknown" default.
 func resolveSearchBackend(b search.Backend) searchBackendInfo {
 	out := searchBackendInfo{}
 	if b == nil {
@@ -601,6 +607,16 @@ func resolveSearchBackend(b search.Backend) searchBackendInfo {
 		out.Name = "bm25"
 		out.DocCount = back.Count()
 		out.Bytes = back.SizeBytes()
+	case *search.SymbolSearcherBackend:
+		// The FTS5 index lives inside the graph store's own file, not a
+		// separate in-memory structure — there is no honest byte count
+		// to report here (Count() is only a since-construction delta,
+		// documented as non-authoritative on the adapter itself). Report
+		// the backend truthfully as disk-resident instead of printing a
+		// fabricated "heap=0 B".
+		out.Name = "sqlite-fts5"
+		out.DocCount = back.Count()
+		out.DiskResident = true
 	default:
 		out.Name = "unknown"
 		out.DocCount = b.Count()
@@ -798,6 +814,7 @@ func (c *realController) Status(_ context.Context) (daemon.StatusResponse, error
 		ConfiguredServers:  c.collectConfiguredServers(),
 		LocalServerSlug:    c.localServerSlug(),
 		LSPRouter:          c.collectLSPRouterStatus(),
+		Enrichment:         c.collectEnrichmentProgress(),
 	}, nil
 	// MCPSessions is populated by the daemon Server (it owns the
 	// SessionRegistry — the controller doesn't have a back-pointer).
@@ -869,6 +886,68 @@ func (c *realController) collectLSPRouterStatus() *daemon.LSPRouterStatus {
 			Workspace: s.Workspace,
 			LastUsed:  s.LastUsed.Format(time.RFC3339),
 		})
+	}
+	return out
+}
+
+// collectEnrichmentProgress reflects the semantic manager's per-(repo,
+// provider) enrichment statuses into the compact summary the daemon
+// status line needs. Returns nil when no semantic manager is wired, or
+// it has never recorded a pass — the "enrichment in progress" state
+// with nothing behind it is exactly the bug this closes.
+func (c *realController) collectEnrichmentProgress() *daemon.EnrichmentProgress {
+	if c.indexer == nil {
+		return nil
+	}
+	semMgr := c.indexer.SemanticManager()
+	if semMgr == nil {
+		return nil
+	}
+	return enrichmentProgressFromStatuses(semMgr.EnrichmentStatuses())
+}
+
+// enrichmentProgressFromStatuses is the pure reduction behind
+// collectEnrichmentProgress, split out so it can be unit tested
+// against literal semantic.EnrichmentStatus rows without wiring a
+// live indexer + semantic manager. A repo counts as done once every
+// provider recorded for it has reached a terminal state; the first
+// running row (in the manager's stable repo/provider order) becomes
+// Current.
+func enrichmentProgressFromStatuses(statuses []semantic.EnrichmentStatus) *daemon.EnrichmentProgress {
+	if len(statuses) == 0 {
+		return nil
+	}
+
+	out := &daemon.EnrichmentProgress{}
+	repoDone := make(map[string]bool)
+	repoSeen := make(map[string]bool)
+	for _, st := range statuses {
+		repoSeen[st.Repo] = true
+		if _, ok := repoDone[st.Repo]; !ok {
+			repoDone[st.Repo] = true // assume done until a non-terminal provider says otherwise
+		}
+		switch st.State {
+		case semantic.EnrichStateRunning:
+			out.Running = true
+			repoDone[st.Repo] = false
+			if out.Current == nil {
+				cur := &daemon.EnrichmentCurrent{
+					Repo:            st.Repo,
+					Provider:        st.Provider,
+					DeadlineSeconds: st.DeadlineSeconds,
+				}
+				if !st.StartedAt.IsZero() {
+					cur.ElapsedSeconds = time.Since(st.StartedAt).Seconds()
+				}
+				out.Current = cur
+			}
+		}
+	}
+	out.ReposTotal = len(repoSeen)
+	for _, done := range repoDone {
+		if done {
+			out.ReposDone++
+		}
 	}
 	return out
 }

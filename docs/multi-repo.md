@@ -77,6 +77,9 @@ Environment variables:
 
 - `GORTEX_RECONCILE_INTERVAL` — janitor tick that walks every tracked repo and runs `IncrementalReindex` against disk. Insurance against fsnotify gaps on NFS/SMB mounts, inotify watch-limit exhaustion, or daemon downtime where edits happened offline. Default `1h`; `"0"` or `"off"` disables; otherwise any Go duration string (e.g., `15m`).
 - The daemon also watches each tracked repo's `.git/HEAD`, so branch switches and rebases reconcile incrementally (via `git diff --name-status`) rather than by re-indexing every changed file individually — no configuration needed.
+- `GORTEX_WARMUP_FULL_RETRACK=1` — force every repo through a whole-repo re-track (evict + re-parse every file) on the next warm restart instead of the default scoped reconcile. An escape hatch for when the on-disk change census itself is suspect.
+- `GORTEX_WARMUP_FULL_RESOLVE=1` — force the warm-restart master resolve to re-examine the whole graph instead of scoping to changed repos; also makes the resolver ignore the durable terminal-edge stamp and re-attempt every previously-given-up-on edge. Use when a scoped resolve is suspected of missing edges.
+- `GORTEX_WARMUP_FORCE_ENRICH=1` — bypass the persisted per-repo enrichment-completion markers and re-run semantic enrichment for every repo on warm restart, even ones whose marker already matches HEAD on a clean tree.
 
 ## CLI
 

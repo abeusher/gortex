@@ -282,6 +282,16 @@ func (mi *MultiIndexer) RunGlobalResolve() {
 // true it also reconciles contract-bridge edges; the pre-enrichment resolve
 // stage (RunPreEnrichResolve) passes false because the contract pass has not
 // committed its nodes yet.
+//
+// The pass is deliberately whole-graph. Unlike the same-repo master resolve
+// (which the warm restart scopes to the changed repos), the cross-repo pass
+// cannot be scoped to the changed repos' own out-edges: an INBOUND reference
+// from an unchanged repo into a symbol a changed repo just added is owned by
+// the unchanged repo, so a changed-repo-scoped edge set never contains it, and
+// a bare unresolved name gives no hint which repo it will bind into. Resolving
+// only the changed repos' out-edges here left those inbound edges unbound until
+// the post-enrichment global resolve, so cross-repo queries returned incomplete
+// results for the whole enrichment window even though the daemon reported ready.
 func (mi *MultiIndexer) runCrossRepoResolve(reconcileContracts bool) {
 	if mi == nil || mi.graph == nil {
 		return

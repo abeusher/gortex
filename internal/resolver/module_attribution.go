@@ -49,6 +49,11 @@ func (r *Resolver) attributeNonGoModuleImports() {
 		if !strings.HasPrefix(e.To, "external::") {
 			continue
 		}
+		// Scoped warm pass: an unchanged repo's external imports were already
+		// attributed by a prior full pass, so only reconsider the changed repos.
+		if !r.edgeFromInScope(e.From) {
+			continue
+		}
 		lang, ok := fileLang[e.From]
 		if !ok {
 			continue
@@ -99,6 +104,11 @@ func (r *Resolver) attributeNonGoModuleImports() {
 	// the per-rewrite check into a constant-time lookup.
 	existingDepends := make(map[string]map[string]struct{})
 	for e := range r.graph.EdgesByKind(graph.EdgeDependsOnModule) {
+		// Only the rewrites' own callers (in scope) are queried below, so a
+		// scoped pass needs the dedupe index for just those repos.
+		if !r.edgeFromInScope(e.From) {
+			continue
+		}
 		set := existingDepends[e.From]
 		if set == nil {
 			set = make(map[string]struct{})

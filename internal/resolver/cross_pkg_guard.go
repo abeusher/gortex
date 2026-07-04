@@ -59,6 +59,17 @@ func (r *Resolver) guardCrossPackageCallEdges(jobs []reindexJob, closure map[str
 		if r.validateLiveness && !edgeStillLive(r.graph, j.edge) {
 			continue
 		}
+		// The deferred LSP batch may have re-bound (or confirmed) this edge
+		// after the heuristic job was recorded, stamping it OriginLSPResolved —
+		// compiler-grade evidence the name-only fallback this guard polices
+		// never had. j.origin still holds the stale heuristic tier, so trust
+		// the live edge: never revert an LSP-owned binding. (The batch now
+		// overrides confident heuristic binds, so a recorded job's target can
+		// be LSP-owned; before, the batch only touched heuristic-unresolved
+		// edges, disjoint from these jobs, and this never fired.)
+		if j.edge.Origin == graph.OriginLSPResolved {
+			continue
+		}
 		if !isCallLikeEdge(j.kind) {
 			continue
 		}
@@ -281,6 +292,26 @@ func (r *Resolver) hasInRepoType(typeName, repo string) bool {
 // that the pre-resolution reachability index (keyed on directory-shaped
 // import paths) structurally misses.
 func (r *Resolver) buildImportClosure() map[string]map[string]struct{} {
+	return r.buildImportClosureFiltered(nil)
+}
+
+// buildImportClosureFiltered is buildImportClosure restricted to a set of repo
+// prefixes: it seeds the closure only for files owned by those repos and only
+// walks import edges whose caller sits in one of them. Each import edge
+// contributes solely to its own caller's closure entry, so a caller in the set
+// gets the same reachable-dir set it would in the whole-graph build — the guard
+// queries the closure only for those callers, so its verdicts are unchanged.
+// Re-export edges stay unfiltered: a caller in the set may import a barrel that
+// re-exports from a repo outside it, and the transitive barrel walk must still
+// reach it. A nil repos set builds the whole-graph closure.
+func (r *Resolver) buildImportClosureFiltered(repos map[string]struct{}) map[string]map[string]struct{} {
+	inScope := func(id string) bool {
+		if repos == nil {
+			return true
+		}
+		_, ok := repos[graph.RepoPrefixOfID(id)]
+		return ok
+	}
 	closure := make(map[string]map[string]struct{})
 	add := func(file, dir string) {
 		if file == "" || dir == "" {
@@ -294,7 +325,7 @@ func (r *Resolver) buildImportClosure() map[string]map[string]struct{} {
 		set[dir] = struct{}{}
 	}
 	for n := range r.graph.NodesByKind(graph.KindFile) {
-		if n.FilePath != "" {
+		if n.FilePath != "" && inScope(n.ID) {
 			add(n.FilePath, filepath.Dir(n.FilePath))
 		}
 	}
@@ -332,6 +363,11 @@ func (r *Resolver) buildImportClosure() map[string]map[string]struct{} {
 		// out-of-repo stub — neither names an in-repo directory that a
 		// name-only call candidate could legitimately live in.
 		if skipTarget(e.To) {
+			continue
+		}
+		// An import edge only extends its own caller's closure entry, so on a
+		// scoped build we need just the edges whose caller is in scope.
+		if !inScope(e.From) {
 			continue
 		}
 		imports = append(imports, e)

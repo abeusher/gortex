@@ -407,13 +407,53 @@ func (mi *MultiIndexer) BeginParallelBatch() {
 // suppressed here because resolver.ResolveAll walks the entire shared graph
 // — paying it R times is O(R · E). One master resolver.New(graph).ResolveAll
 // runs at the end to lift the placeholder edges enrichment + contracts added.
-func (mi *MultiIndexer) RunDeferredPassesAll(ctx context.Context) {
+//
+// Returns the number of repos whose deferred semantic enrichment was
+// actually dispatched (pendingEnrich set, or forced via
+// GORTEX_WARMUP_FORCE_ENRICH) rather than skipped as unchanged. Sampled
+// before runDeferredEnrichParallel runs, since a successful non-partial
+// pass clears the flag it reads.
+// SeedPendingEnrichAll re-arms the deferred-enrichment gate for every tracked
+// repo whose persisted enrichment is known-incomplete at its current clean HEAD
+// (see Indexer.MaybeSeedPendingEnrich). The daemon warmup calls it after the
+// parallel parse and before RunDeferredPassesAll so a repo left partial or
+// abandoned by a prior process resumes even when no file changed this run.
+// Returns the number of repos that will enrich (already pending plus newly
+// seeded) — the caller uses a non-zero count to run the deferred passes on a
+// warm restart that changed nothing on disk.
+func (mi *MultiIndexer) SeedPendingEnrichAll() int {
+	mi.mu.RLock()
+	live := make([]*Indexer, 0, len(mi.indexers))
+	for _, idx := range mi.indexers {
+		live = append(live, idx)
+	}
+	mi.mu.RUnlock()
+	pending := 0
+	for _, idx := range live {
+		if idx.MaybeSeedPendingEnrich() {
+			pending++
+		}
+	}
+	return pending
+}
+
+func (mi *MultiIndexer) RunDeferredPassesAll(ctx context.Context) int {
 	mi.mu.RLock()
 	indexers := make([]*Indexer, 0, len(mi.indexers))
 	for _, idx := range mi.indexers {
 		indexers = append(indexers, idx)
 	}
 	mi.mu.RUnlock()
+	forced := os.Getenv("GORTEX_WARMUP_FORCE_ENRICH") == "1"
+	enrichScheduled := 0
+	for _, idx := range indexers {
+		if idx.semanticMgr == nil || !idx.semanticMgr.Enabled() || !idx.semanticMgr.HasProviders() {
+			continue
+		}
+		if idx.pendingEnrich.Load() || forced {
+			enrichScheduled++
+		}
+	}
 	for _, idx := range indexers {
 		idx.SetSkipResolveInDeferred(true)
 	}
@@ -438,19 +478,32 @@ func (mi *MultiIndexer) RunDeferredPassesAll(ctx context.Context) {
 	// enrichment + contract passes just added. The references-completeness
 	// resolve already ran ahead of enrichment in RunPreEnrichResolve, so this
 	// is the idempotent catch-up pass for edges minted during enrichment.
-	mi.runMasterResolve()
+	// Whole-graph (nil scope): enrichment can mint placeholder edges in any
+	// repo, and scoping this catch-up is left to a follow-up.
+	mi.runMasterResolve(nil)
+	return enrichScheduled
 }
 
 // runMasterResolve runs one same-repo resolver over the whole shared graph,
 // lifting every placeholder edge to its canonical target. Split out so the
 // pre-enrichment resolve stage (RunPreEnrichResolve) and the post-enrichment
 // catch-up (RunDeferredPassesAll) share one implementation.
-func (mi *MultiIndexer) runMasterResolve() {
+// scope, when non-empty, restricts the pass to the edges that could resolve
+// into one of the named changed repos (see resolver.SetScope). It is honoured
+// only when scoped global passes are enabled; a nil / empty scope or a
+// disabled switch runs the whole-graph resolve, exactly the prior behaviour.
+func (mi *MultiIndexer) runMasterResolve(scope map[string]struct{}) {
 	if mi.graph == nil {
 		return
 	}
 	master := resolver.New(mi.graph)
 	master.SetLogger(mi.logger)
+	// The master resolve is the only pass with whole-graph evidence, so it is
+	// the one allowed to durably flag terminally-unresolved edges (permanently
+	// external / stdlib / definition-less) that a later scoped warm resolve can
+	// skip. A scoped master pass leaves the flag alone (stamping is gated on an
+	// empty scope inside ResolveAll); only a full pass stamps and self-heals.
+	master.SetStampTerminal(true)
 	// Mirror the resolve-time LSP helper onto the master pass so TS/JS-family
 	// edges pick up LSP-precision answers just like the per-repo passes do.
 	if mi.resolverLSPHelper != nil {
@@ -459,9 +512,18 @@ func (mi *MultiIndexer) runMasterResolve() {
 	master.SetNpmAliasResolver(mi.npmAliasResolver())
 	master.SetPathAliasResolver(mi.pathAliasResolver())
 	master.SetWorkspaceMembership(mi.workspaceMembershipResolver())
+	scoped := len(scope) > 0 && mi.scopedGlobalPassesEnabled()
+	if scoped {
+		master.SetScope(scope)
+	}
 	mt := time.Now()
-	master.ResolveAll()
-	mi.logger.Info("DEFERRED-TIMING master.ResolveAll", zap.Duration("elapsed", time.Since(mt)))
+	stats := master.ResolveAll()
+	mi.logger.Info("DEFERRED-TIMING master.ResolveAll",
+		zap.Duration("elapsed", time.Since(mt)),
+		zap.Bool("scoped", scoped),
+		zap.Int("scope_repos", len(scope)),
+		zap.Int("pending_before", stats.PendingBefore),
+		zap.Int("pending_after", stats.PendingAfter))
 }
 
 // RunPreEnrichResolve runs the resolution stage that makes references queryable
@@ -476,7 +538,15 @@ func (mi *MultiIndexer) runMasterResolve() {
 // The daemon warmup calls this between the parallel parse and the enrichment
 // phase, then marks itself ready — so find_usages / get_callers return complete
 // results as soon as the graph is queryable, independent of enrichment.
-func (mi *MultiIndexer) RunPreEnrichResolve(ctx context.Context) {
+// scope, when non-empty, restricts the same-repo master resolve to the
+// changed repos (see runMasterResolve / resolver.SetScope). The daemon warmup
+// passes the set of repos that re-indexed so a warm restart of one repo out of
+// many skips a whole-graph same-repo resolve; a nil / empty scope keeps the
+// whole-graph behaviour. The cross-repo resolve below stays whole-graph
+// regardless — it is the only pass that binds an unchanged repo's inbound
+// reference into a symbol a changed repo just added, and those inbound edges
+// must be resolved before the daemon reports ready (see runCrossRepoResolve).
+func (mi *MultiIndexer) RunPreEnrichResolve(ctx context.Context, scope map[string]struct{}) {
 	mi.mu.RLock()
 	indexers := make([]*Indexer, 0, len(mi.indexers))
 	for _, idx := range mi.indexers {
@@ -486,9 +556,10 @@ func (mi *MultiIndexer) RunPreEnrichResolve(ctx context.Context) {
 	for _, idx := range indexers {
 		idx.runDeferredGoMod()
 	}
-	mi.runMasterResolve()
+	mi.runMasterResolve(scope)
 	// Cross-repo references resolve here too so a multi-repo workspace is fully
-	// queryable at "ready", not just within each repo.
+	// queryable at "ready", not just within each repo. Whole-graph so inbound
+	// references from unchanged repos into the changed repos bind before ready.
 	mi.runCrossRepoResolve(false)
 }
 
@@ -498,7 +569,25 @@ func (mi *MultiIndexer) RunPreEnrichResolve(ctx context.Context) {
 // repo's LSP provider in-use for the duration of its pass, so the router's
 // LRU evictor never closes a provider another repo is still enriching against.
 func (mi *MultiIndexer) runDeferredEnrichParallel(indexers []*Indexer) {
+	// Per-repo language sets computed once from a single graph-stats scan,
+	// shared by the spec-grouped ordering and the batch pool-raise sizing
+	// so the Manager's per-repo enrichment scan is not duplicated here.
+	langSets := mi.batchLanguageSets(indexers)
+	// Deterministic, spec-grouped order: repos needing the same language
+	// servers run contiguously so the router's capped provider pool cycles
+	// through far fewer distinct (spec, workspace) keys — a warmed server
+	// stays alive across the runs that need it instead of being evicted and
+	// respawned per repo.
+	indexers = orderIndexersBySpecGroup(indexers, langSets)
+
 	conc := enrichConcurrency(len(indexers))
+
+	// Temporarily raise the router's live-provider cap for the batch so the
+	// concurrent passes don't evict each other's warmed servers, restoring
+	// it (and logging the churn observed) when the batch drains.
+	restore := mi.scopeRouterPoolForBatch(langSets, conc)
+	defer restore()
+
 	if conc <= 1 {
 		for _, idx := range indexers {
 			idx.runDeferredEnrich()
@@ -517,6 +606,125 @@ func (mi *MultiIndexer) runDeferredEnrichParallel(indexers []*Indexer) {
 		}(idx)
 	}
 	wg.Wait()
+}
+
+// maxBatchProviders caps the temporary live-provider pool raise during
+// batch enrichment. Even a batch touching many distinct language servers
+// at high concurrency is held to this ceiling so warmup cannot spawn an
+// unbounded number of LSP subprocesses at once.
+const maxBatchProviders = 12
+
+// batchLanguageSets returns each indexer's sorted set of present languages,
+// computed from a single RepoStats scan (one pass over the shared graph)
+// rather than a per-repo node scan. The sets drive both the spec-grouped
+// enrich ordering and the batch pool-raise sizing.
+func (mi *MultiIndexer) batchLanguageSets(indexers []*Indexer) map[*Indexer][]string {
+	out := make(map[*Indexer][]string, len(indexers))
+	var stats map[string]graph.GraphStats
+	if mi.graph != nil {
+		stats = mi.graph.RepoStats()
+	}
+	for _, idx := range indexers {
+		var langs []string
+		if s, ok := stats[idx.repoPrefix]; ok {
+			for l := range s.ByLanguage {
+				langs = append(langs, l)
+			}
+		}
+		sort.Strings(langs)
+		out[idx] = langs
+	}
+	return out
+}
+
+// orderIndexersBySpecGroup returns a stable, deterministic ordering of
+// indexers grouped by their language set (so repos needing the same LSP
+// servers run contiguously), breaking ties by repo prefix. It does not
+// mutate the input slice.
+func orderIndexersBySpecGroup(indexers []*Indexer, langSets map[*Indexer][]string) []*Indexer {
+	out := make([]*Indexer, len(indexers))
+	copy(out, indexers)
+	sort.SliceStable(out, func(i, j int) bool {
+		ki := strings.Join(langSets[out[i]], ",")
+		kj := strings.Join(langSets[out[j]], ",")
+		if ki != kj {
+			return ki < kj
+		}
+		return out[i].repoPrefix < out[j].repoPrefix
+	})
+	return out
+}
+
+// distinctBatchSpecs counts the enabled, available LSP specs whose
+// languages intersect any language present in the batch — i.e. how many
+// distinct language servers the batch will actually drive.
+func distinctBatchSpecs(langSets map[*Indexer][]string, router semantic.LSPRouter) int {
+	langs := make(map[string]bool)
+	for _, ls := range langSets {
+		for _, l := range ls {
+			langs[l] = true
+		}
+	}
+	if len(langs) == 0 {
+		return 0
+	}
+	seen := make(map[string]bool)
+	for _, name := range router.EnabledSpecNames() {
+		if !router.SpecAvailable(name) {
+			continue
+		}
+		for _, l := range router.SpecLanguages(name) {
+			if langs[l] {
+				seen[name] = true
+				break
+			}
+		}
+	}
+	return len(seen)
+}
+
+// scopeRouterPoolForBatch raises the LSP router's live-provider cap to
+// enrichConcurrency × distinct-provider-specs (ceiling maxBatchProviders)
+// for the duration of a batch enrichment pass, so the concurrent passes
+// don't evict each other's warmed servers. It returns a restore closure
+// that puts the cap back and logs the eviction churn observed during the
+// batch. Safe no-op when no router is installed.
+func (mi *MultiIndexer) scopeRouterPoolForBatch(langSets map[*Indexer][]string, conc int) func() {
+	if mi.semanticMgr == nil {
+		return func() {}
+	}
+	router := mi.semanticMgr.LSPRouter()
+	if router == nil {
+		return func() {}
+	}
+	before := router.EvictionCount()
+	old := router.MaxAlive()
+	raised := false
+	if specs := distinctBatchSpecs(langSets, router); specs > 0 {
+		needed := conc * specs
+		if needed > maxBatchProviders {
+			needed = maxBatchProviders
+		}
+		if needed > old {
+			router.SetMaxAlive(needed)
+			raised = true
+			mi.logger.Info("LSP router pool temporarily raised for batch enrichment",
+				zap.Int("from", old),
+				zap.Int("to", needed),
+				zap.Int("distinct_specs", specs),
+				zap.Int("concurrency", conc),
+			)
+		}
+	}
+	return func() {
+		if raised {
+			router.SetMaxAlive(old)
+		}
+		mi.logger.Info("batch enrichment LSP provider churn",
+			zap.Uint64("evictions", router.EvictionCount()-before),
+			zap.Bool("pool_raised", raised),
+		)
+	}
 }
 
 // enrichConcurrency caps how many repos enrich at once during batch warmup.
@@ -1571,39 +1779,61 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 	idx.SetRootPath(absPath)
 	idx.SetFileMtimes(priorMtimes)
 
-	// Choose the reconcile strategy. A repo that changed while the
-	// daemon was down must NOT take IncrementalReindex's per-file path:
-	// re-resolving a changed file there goes through per-edge
-	// graph.ReindexEdges, and the per-edge write against a freshly
-	// reopened disk store is slow and unreliable. The shadow/bulk
-	// re-track path (IndexCtx) resolves in an in-memory shadow and
-	// commits one bulk load, so it never issues a per-edge write to the
-	// reopened store. It re-indexes the whole repo, but only repos that
-	// actually changed pay it, and it is reliable where the per-edge path
-	// is not. A repo with zero changes keeps the fast IncrementalReindex
-	// no-op (walk + 0 stale → return), which is what makes an unchanged
-	// warm restart near-instant.
-	// The shadow/bulk re-track path for the per-edge ReindexEdges
-	// problem applies ONLY to disk-backed stores, which is where the
-	// per-edge write to a reopened store is unreliable. The in-memory
-	// backend (*graph.Graph) has
-	// no reopen and no CGo write path, and IncrementalReindex is the
-	// authoritative path there — it evicts offline-deleted files in place
-	// (a re-track of a shared in-memory graph would not). Gate on the
-	// store type so the memory backend keeps its exact prior behaviour.
+	// Choose the reconcile strategy from a census of what changed on disk
+	// while the daemon was down. Scoped incremental is the default: re-index
+	// only the changed files and evict only the deleted ones, leaving the
+	// rest of the already-persisted graph untouched. A whole-repo re-track
+	// (IndexCtx — which evicts and re-parses every file, then bulk-drains)
+	// is reserved for the cases where scoping is unsafe or not worth it: the
+	// census could not be taken, the churn is a large fraction of the repo,
+	// or an operator forced it via GORTEX_WARMUP_FULL_RETRACK. A repo with
+	// zero changes keeps the fast IncrementalReindex no-op (walk + 0 stale →
+	// return), which is what makes an unchanged warm restart near-instant.
+	//
+	// The in-memory backend (*graph.Graph) keeps its exact prior behaviour:
+	// IncrementalReindex is the authoritative path there — it evicts
+	// offline-deleted files in place, has no reopened disk store, and so no
+	// per-edge write to route around. Gate on the store type.
 	_, memoryBacked := mi.graph.(*graph.Graph)
-	var result *IndexResult
-	if !memoryBacked && idx.HasChangesSinceMtimes(absPath) {
-		result, err = idx.IndexCtx(ctx, absPath)
-		if err == nil && result != nil && result.StaleFileCount == 0 {
-			// Signal "this repo did re-indexing work" to the warmup
-			// change-detector (which keys on StaleFileCount): a full
-			// re-track touches every file, so the daemon's global
-			// resolution passes must run.
-			result.StaleFileCount = result.FileCount
+	var (
+		result           *IndexResult
+		changed, deleted []string
+		route            = "incremental"
+	)
+	// fullRetrack is the whole-repo re-track — the ONE place FullRetrack is
+	// stamped. StaleFileCount keeps its honest incremental-work meaning (0
+	// here) because the changed-file set is not enumerated on this path, so
+	// callers must key "did this repo change" off FullRetrack instead.
+	fullRetrack := func() (*IndexResult, error) {
+		r, e := idx.IndexCtx(ctx, absPath)
+		if e == nil && r != nil {
+			r.FullRetrack = true
 		}
-	} else {
+		return r, e
+	}
+	switch {
+	case memoryBacked:
 		result, err = idx.IncrementalReindex(absPath)
+	default:
+		var censusErr error
+		changed, deleted, censusErr = idx.ChangedSinceMtimes(absPath)
+		churn := len(changed) + len(deleted)
+		priorCount := len(priorMtimes)
+		forceFull := os.Getenv("GORTEX_WARMUP_FULL_RETRACK") == "1"
+		switch {
+		case censusErr != nil || forceFull:
+			route = "full_retrack"
+			result, err = fullRetrack()
+		case churn == 0:
+			route = "incremental"
+			result, err = idx.IncrementalReindex(absPath)
+		case priorCount > 0 && churn*100 > priorCount*40:
+			route = "full_retrack"
+			result, err = fullRetrack()
+		default:
+			route = "scoped"
+			result, err = idx.IncrementalReindexPaths(absPath, append(changed, deleted...))
+		}
 	}
 	if err != nil {
 		return nil, fmt.Errorf("reconciling %s: %w", absPath, err)
@@ -1639,10 +1869,30 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 
 	mi.logger.Info("daemon: reconciled repo from snapshot",
 		zap.String("prefix", prefix),
+		zap.String("route", route),
+		zap.Int("changed", len(changed)),
+		zap.Int("deleted", len(deleted)),
+		zap.Bool("full_retrack", result.FullRetrack),
 		zap.Int("stale_files_reindexed", result.StaleFileCount),
 		zap.Duration("elapsed", time.Since(start)))
+	if len(changed) > 0 || len(deleted) > 0 {
+		mi.logger.Debug("daemon: reconcile changed-file census",
+			zap.String("prefix", prefix),
+			zap.Strings("changed", firstNStrings(changed, 5)),
+			zap.Strings("deleted", firstNStrings(deleted, 5)))
+	}
 
 	return result, nil
+}
+
+// firstNStrings returns at most the first n elements of s — used to cap the
+// changed/deleted samples in the reconcile debug log so a large-churn repo
+// does not dump thousands of paths into the log line.
+func firstNStrings(s []string, n int) []string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
 }
 
 // ReconcileAll runs IncrementalReindex on every tracked repo. Used by

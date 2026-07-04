@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+
+	"github.com/zzet/gortex/internal/procio"
 )
 
 // Client manages a JSON-RPC 2.0 connection to an LSP server.
@@ -94,15 +96,22 @@ type SpawnTransport struct {
 	Env           []string
 	WorkspaceRoot string
 
+	// Logger receives the subprocess's stderr, routed through
+	// procio.StderrWatcher instead of being inherited raw. Nil drains
+	// stderr silently (no log spam, but also no visibility).
+	Logger *zap.Logger
+
 	cmd *exec.Cmd
 }
 
 // Start spawns the subprocess and returns its stdin / stdout. Errors
-// from pipe construction or exec.Start are returned verbatim.
+// from pipe construction or exec.Start are returned verbatim. stderr is
+// not inherited: a per-process scanner goroutine routes it through
+// Logger as structured, rate-limited Warn entries so a disconnect spam
+// or crash backtrace can't flood the daemon's log with raw text.
 func (s *SpawnTransport) Start() (io.WriteCloser, io.Reader, error) {
 	cmd := exec.Command(s.Command, s.Args...)
 	cmd.Dir = s.WorkspaceRoot
-	cmd.Stderr = os.Stderr
 	if len(s.Env) > 0 {
 		cmd.Env = append(os.Environ(), s.Env...)
 	}
@@ -114,10 +123,15 @@ func (s *SpawnTransport) Start() (io.WriteCloser, io.Reader, error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("stdout pipe: %w", err)
 	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return nil, nil, fmt.Errorf("stderr pipe: %w", err)
+	}
 	if err := cmd.Start(); err != nil {
 		return nil, nil, fmt.Errorf("start %s: %w", s.Command, err)
 	}
 	s.cmd = cmd
+	procio.StderrWatcher{Logger: s.Logger, Tag: s.Description()}.Watch(stderr)
 	return stdin, stdout, nil
 }
 
@@ -250,6 +264,7 @@ func NewClient(command string, args, env []string, workspaceRoot string, logger 
 		Args:          args,
 		Env:           env,
 		WorkspaceRoot: workspaceRoot,
+		Logger:        logger,
 	}, logger)
 }
 

@@ -2,6 +2,7 @@ package semantic
 
 import (
 	"context"
+	"time"
 
 	"github.com/zzet/gortex/internal/graph"
 )
@@ -47,6 +48,16 @@ type RepoScopedProvider interface {
 	EnrichRepo(g graph.Store, repoPrefix, repoRoot string) (*EnrichResult, error)
 }
 
+// EnrichDeadlinePolicy computes the per-repo enrichment context deadline
+// from the post-filter unenriched candidate count — the symbols a prior
+// pass has NOT already stamped, i.e. the work that actually remains. It
+// lets a ContextEnricher size its own window AFTER candidate selection: a
+// warm restart with few unstamped nodes lands a small budget, while a cold
+// repo (nothing stamped) keeps the full size-scaled headroom. A non-positive
+// return means "no deadline" — the pass runs unbounded. A nil policy is
+// equivalent (the un-contexted Enrich / EnrichRepo entry points pass nil).
+type EnrichDeadlinePolicy func(candidates int) time.Duration
+
 // ContextEnricher is an optional interface a Provider MAY implement to
 // receive a cancellation context for its per-repo pass. Providers that
 // implement it are cancelled *cooperatively* at the Manager's per-repo
@@ -54,8 +65,14 @@ type RepoScopedProvider interface {
 // has completed, marks the result Partial, and returns — so a deadline
 // never discards finished enrichment and never leaks a goroutine that
 // keeps mutating the graph after the pass was "abandoned".
+//
+// deadline (may be nil) sizes the pass's own context bound lazily, from the
+// count of candidates left after already-stamped nodes are skipped — so the
+// budget tracks the real remaining work rather than the whole-repo node
+// count. The Manager keeps a generous outer ceiling on the context it passes
+// in; the provider narrows it via deadline once selection is done.
 type ContextEnricher interface {
-	EnrichRepoContext(ctx context.Context, g graph.Store, repoPrefix, repoRoot string) (*EnrichResult, error)
+	EnrichRepoContext(ctx context.Context, g graph.Store, repoPrefix, repoRoot string, deadline EnrichDeadlinePolicy) (*EnrichResult, error)
 }
 
 // ReadinessProber is an optional interface a Provider MAY implement when its
@@ -86,6 +103,17 @@ type EnrichResult struct {
 	SymbolsTotal    int     `json:"symbols_total"`
 	CoveragePercent float64 `json:"coverage_percent"`
 	DurationMs      int64   `json:"duration_ms"`
+	// HoverCandidates is the post-filter count of symbols this pass selected
+	// for hover enrichment — total symbols minus file/import nodes and minus
+	// the nodes a prior pass already stamped. Deadline budgeting scales the
+	// per-repo enrichment window on this number.
+	HoverCandidates int `json:"hover_candidates,omitempty"`
+	// BudgetSeconds is the per-repo enrichment deadline this pass derived
+	// lazily from HoverCandidates via the EnrichDeadlinePolicy, in seconds.
+	// The Manager surfaces it as the enrichment status deadline so the health
+	// surface reflects the actual (candidate-scaled) window, not the whole-repo
+	// estimate. 0 means the pass ran unbounded (nil policy / non-positive bound).
+	BudgetSeconds float64 `json:"budget_seconds,omitempty"`
 	// Partial reports that the pass was cut short (per-repo deadline /
 	// context cancellation) after landing some — but not all — of its
 	// work. The counters above reflect only what actually reached the
@@ -135,15 +163,20 @@ const (
 // enrichment pass. Exposed through index_health so consumers can tell a
 // fully-enriched graph from one whose LSP pass was cut or abandoned.
 type EnrichmentStatus struct {
-	Repo            string  `json:"repo"`
-	Provider        string  `json:"provider"`
-	Language        string  `json:"language,omitempty"`
-	State           string  `json:"state"`
-	DeadlineSeconds float64 `json:"deadline_seconds,omitempty"`
-	DurationMs      int64   `json:"duration_ms,omitempty"`
-	EdgesConfirmed  int     `json:"edges_confirmed"`
-	EdgesAdded      int     `json:"edges_added"`
-	NodesEnriched   int     `json:"nodes_enriched"`
+	Repo     string `json:"repo"`
+	Provider string `json:"provider"`
+	Language string `json:"language,omitempty"`
+	State    string `json:"state"`
+	// StartedAt is stamped when the pass enters EnrichStateRunning — the
+	// only state where "how long has this been going" is meaningful.
+	// Consumed by the daemon status surface to render a live elapsed
+	// time next to the per-repo deadline instead of a mute "in progress".
+	StartedAt       time.Time `json:"started_at,omitempty"`
+	DeadlineSeconds float64   `json:"deadline_seconds,omitempty"`
+	DurationMs      int64     `json:"duration_ms,omitempty"`
+	EdgesConfirmed  int       `json:"edges_confirmed"`
+	EdgesAdded      int       `json:"edges_added"`
+	NodesEnriched   int       `json:"nodes_enriched"`
 	// Add-phase coverage — the targets eligible for the hover/references
 	// pass, how many were visited, and why the pass stopped. Always emitted
 	// so a "completed" state that covered < 100% of targets is legible as a

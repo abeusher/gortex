@@ -167,6 +167,12 @@ func (r *Resolver) resolveRelativeImports() {
 	// disk backends only enumerate import edges instead of every
 	// edge in the graph.
 	for e := range r.graph.EdgesByKind(graph.EdgeImports) {
+		// Scoped warm pass: an unchanged repo's imports were already resolved (or
+		// left permanently external) by a prior full pass, so reconsidering them
+		// is a no-op. Skip them to keep the pass proportional to the changed set.
+		if !r.edgeFromInScope(e.From) {
+			continue
+		}
 		lang, ok := fileLang[e.From]
 		if !ok {
 			continue

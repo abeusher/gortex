@@ -64,9 +64,17 @@ type IndexResult struct {
 	StaleFileCount int `json:"stale_file_count,omitempty"`
 	// FailedFiles lists files an incremental pass could not index even
 	// after one retry — a parse error, or a file locked or removed
-	// mid-pass. Their mtime is never recorded, so the next incremental
-	// pass retries them, and a caller can replay them explicitly.
-	// Empty on a clean pass and on full-index passes.
+	// mid-pass. A caller can replay them explicitly. Whether the next
+	// incremental pass retries them on its own depends on the failure:
+	// a file whose bytes could not even be read (locked, permission
+	// denied, removed mid-walk) never gets an mtime recorded, so it
+	// stays stale and is retried on every subsequent pass; a file that
+	// was read but failed to parse (syntax error, crash-isolation
+	// quarantine, extraction timeout) DOES get its current on-disk
+	// mtime recorded, so it is retried only once its content changes
+	// again — this keeps a warm restart from perpetually treating the
+	// whole repo as changed because of one unparseable file. Empty on
+	// a clean pass and on full-index passes.
 	FailedFiles []string `json:"failed_files,omitempty"`
 	// QuarantinedFiles is the number of files held in the parser
 	// crash-isolation quarantine after this pass — files that
@@ -89,9 +97,17 @@ type IndexResult struct {
 	// are zero across every repo, the persisted graph already carries
 	// every resolved / derived edge and the global resolution passes can
 	// be skipped entirely (the warm-restart fast path).
-	DeletedFileCount int          `json:"deleted_file_count,omitempty"`
-	DurationMs       int64        `json:"duration_ms"`
-	Errors           []IndexError `json:"errors,omitempty"`
+	DeletedFileCount int `json:"deleted_file_count,omitempty"`
+	// FullRetrack is true when this result came from a whole-repo
+	// re-track (IndexCtx) rather than an incremental pass — i.e. the
+	// changed-file set is unknown and StaleFileCount does NOT reflect
+	// "how many files changed" (it keeps its normal incremental-work
+	// meaning and is 0 here). Callers that gate global re-resolution on
+	// "did this repo change" must OR in FullRetrack alongside
+	// StaleFileCount / DeletedFileCount.
+	FullRetrack bool         `json:"full_retrack,omitempty"`
+	DurationMs  int64        `json:"duration_ms"`
+	Errors      []IndexError `json:"errors,omitempty"`
 	// RepoPrefix is the prefix the repo was actually registered under.
 	// It usually equals config.ResolvePrefix(entry), but a git worktree
 	// tracked as an independent instance gets a derived `<base>@<tag>`
@@ -305,6 +321,43 @@ type Indexer struct {
 	// AllEdges().
 	deferResolve       bool
 	pendingContractReg *contracts.Registry
+
+	// pendingEnrich is raised by an index pass that did real work — IndexCtx
+	// that observed files (or a whole-repo re-track) and IncrementalReindex /
+	// IncrementalReindexPaths that re-indexed or evicted at least one file. It
+	// is cleared only after runDeferredEnrich completes a fully non-partial
+	// semantic enrichment for this repo. The daemon warmup enriches every
+	// indexer it collected, so this gates the (multi-minute LSP hover) pass to
+	// repos that actually changed: an unchanged repo on a warm restart would
+	// otherwise re-confirm nothing for 10+ minutes. A partial / abandoned /
+	// failed enrich leaves it set so a later deferred pass retries.
+	pendingEnrich atomic.Bool
+
+	// fullReindexed is raised by a whole-repo (re-)parse — IndexCtx, reached
+	// via a full re-track, a cold TrackRepo, or a snapshot-partial forced full
+	// walk — which evicts and re-creates every node and edge for the repo. That
+	// drops the LSP hover-enrichment edges a static re-parse cannot reproduce,
+	// so the deferred-enrichment pass must re-run even when the persisted
+	// completion marker still records the repo's HEAD on a clean tree. It
+	// threads Force into RepoEnrichState so enrichMarkerCurrent stops gating the
+	// pass out. A fresh Indexer per daemon run starts it false, so it only ever
+	// reflects work this run performed.
+	fullReindexed atomic.Bool
+
+	// reparsedThisRun is the scoped analogue of fullReindexed: it is raised by a
+	// scoped incremental pass that re-parsed at least one stale file this run —
+	// IncrementalReindexPaths / IncrementalReindex with a non-zero
+	// StaleFileCount. A scoped re-parse evicts and re-creates just the changed
+	// files' nodes, dropping THEIR hover-enrichment edges exactly as a whole-repo
+	// re-parse drops every node's, so the deferred pass must likewise run past
+	// the completion marker at an unchanged clean HEAD — otherwise the re-parsed
+	// files' LSP edges stay durably gone until the repo's HEAD moves or its tree
+	// goes dirty. runDeferredEnrich ORs it into RepoEnrichState.Force; because the
+	// hover provider skips already-stamped nodes, the marker bypass re-hovers only
+	// the freshly-unstamped re-parsed files, not the whole repo, so the cost stays
+	// bounded. fullReindexed stays clear on the scoped paths — this flag keeps the
+	// two claims distinct. A fresh Indexer per daemon run starts it false.
+	reparsedThisRun atomic.Bool
 
 	// deferGlobalPasses, when set, makes IndexCtx and IncrementalReindex
 	// skip the graph-wide derivation passes (InferImplements,
@@ -949,10 +1002,43 @@ func (idx *Indexer) runDeferredEnrich() {
 	if idx.semanticMgr == nil || !idx.semanticMgr.Enabled() || !idx.semanticMgr.HasProviders() {
 		return
 	}
+	// Gate the pass to repos that actually changed. The daemon warmup collects
+	// every indexer and enriches them all, but an unchanged repo's persisted
+	// graph already carries its enrichment edges — re-running gopls hover for
+	// it confirms nothing over many minutes. GORTEX_WARMUP_FORCE_ENRICH=1
+	// bypasses the gate for a full re-enrich.
+	forced := os.Getenv("GORTEX_WARMUP_FORCE_ENRICH") == "1"
+	if !idx.pendingEnrich.Load() {
+		if !forced {
+			idx.logger.Info("deferred enrichment skipped",
+				zap.String("repo", idx.repoPrefix),
+				zap.String("reason", "unchanged"))
+			return
+		}
+		idx.logger.Info("deferred enrichment forced despite no pending changes",
+			zap.String("repo", idx.repoPrefix))
+	}
 	// Key by the repo prefix so a repo-scoped provider can scope file
 	// selection to this repo (empty in single-repo mode).
 	roots := map[string]string{idx.repoPrefix: idx.rootPath}
-	results, err := idx.semanticMgr.EnrichAll(idx.graph, roots)
+	// Compute the repo's git freshness ONCE and thread it in so the manager's
+	// per-provider skip gate and the completion-marker write agree on the
+	// identical (sha, dirty): a provider whose persisted marker still matches
+	// HEAD on a clean tree is skipped instead of re-running its hover pass.
+	sha, dirty := repoHeadAndDirty(idx.rootPath)
+	// A re-parse this run evicted the persisted hover edges of the re-parsed
+	// files, so force the pass past the completion-marker gate — an unchanged
+	// clean HEAD would otherwise skip re-enrichment and leave those files' LSP
+	// edges durably gone. fullReindexed covers a whole-repo re-parse (IndexCtx);
+	// reparsedThisRun covers a scoped incremental re-parse that dropped only the
+	// changed files' edges. Either forces the pass; the provider re-hovers only
+	// the freshly-unstamped nodes, so a scoped force stays bounded to those files.
+	opts := semantic.EnrichOptions{
+		RepoState: map[string]semantic.RepoEnrichState{
+			idx.repoPrefix: {SHA: sha, Dirty: dirty, Force: idx.fullReindexed.Load() || idx.reparsedThisRun.Load()},
+		},
+	}
+	results, partialRepos, err := idx.semanticMgr.EnrichAll(idx.graph, roots, opts)
 	if err != nil {
 		idx.logger.Warn("semantic enrichment failed", zap.Error(err))
 		return
@@ -967,6 +1053,66 @@ func (idx *Indexer) runDeferredEnrich() {
 			zap.Float64("coverage", r.CoveragePercent),
 		)
 	}
+	// Clear the pending marker only when every provider that ran for this repo
+	// finished non-partial. A partial / abandoned / failed pass leaves it set
+	// so a later deferred pass (or the next restart, once the repo changes
+	// again) retries the enrichment rather than trusting an incomplete graph.
+	if !partialRepos[idx.repoPrefix] {
+		idx.pendingEnrich.Store(false)
+		// Persist a whole-repo completion marker at this HEAD so the next warm
+		// restart can tell, with one lookup, that this repo's enrichment finished
+		// and MaybeSeedPendingEnrich need not resume it. A partial / abandoned
+		// pass takes the other branch and writes no marker, so the absent marker
+		// re-arms the pass on the next start. No-op on a dirty tree / empty sha.
+		idx.semanticMgr.RecordRepoEnrichmentComplete(idx.graph, idx.repoPrefix, sha, dirty)
+	}
+}
+
+// MaybeSeedPendingEnrich re-arms the deferred-enrichment gate for a repo whose
+// persisted enrichment is known-incomplete at the current clean HEAD, so a warm
+// restart resumes a semantic pass a prior process left partial or abandoned.
+//
+// pendingEnrich otherwise reflects only re-indexing work performed THIS run, so
+// an unchanged repo whose first enrichment was cut short by the per-repo
+// deadline would short-circuit runDeferredEnrich on every subsequent restart —
+// its whole-repo completion marker is absent (a partial pass writes none) yet no
+// file changed to raise the flag. The daemon warmup calls this after the parse
+// phase, before draining the deferred passes.
+//
+// Returns whether this repo will enrich (already pending, or newly seeded). A
+// no-op — false — for a repo without semantic providers, on a non-git tree (no
+// reliable freshness signal), on a backend that does not persist enrichment
+// state (it re-indexes from scratch each restart anyway), when the completion
+// marker already records the current HEAD, or on a dirty tree (the marker is
+// never written or trusted against uncommitted content, and resuming every
+// restart while the tree stays dirty would defeat the warm-restart fast path).
+func (idx *Indexer) MaybeSeedPendingEnrich() bool {
+	if idx.semanticMgr == nil || !idx.semanticMgr.Enabled() || !idx.semanticMgr.HasProviders() {
+		return false
+	}
+	if idx.pendingEnrich.Load() {
+		// This run's re-indexing work already armed the gate.
+		return true
+	}
+	// Cheap probe first: only the sha is needed to tell a repo whose marker is
+	// already current (the common warm-restart case) from one that must resume,
+	// so the slower git status shell-out is deferred to the resume path below.
+	sha := repoHead(idx.rootPath)
+	if sha == "" {
+		return false
+	}
+	current, persisted := idx.semanticMgr.RepoEnrichmentMarkerState(idx.graph, idx.repoPrefix, sha)
+	if !persisted || current {
+		return false
+	}
+	if _, dirty := repoHeadAndDirty(idx.rootPath); dirty {
+		return false
+	}
+	idx.logger.Info("deferred enrichment re-armed: persisted enrichment incomplete",
+		zap.String("repo", idx.repoPrefix),
+		zap.String("sha", sha))
+	idx.pendingEnrich.Store(true)
+	return true
 }
 
 // runDeferredContracts extracts and commits this repo's contract nodes and
@@ -987,6 +1133,16 @@ func (idx *Indexer) runDeferredContracts() {
 
 // RootPath returns the root path used for relative path computation.
 func (idx *Indexer) RootPath() string { return idx.rootPath }
+
+// storeRootPath records the repository root, skipping a redundant
+// self-assignment. The watcher goroutine reads idx.rootPath without a
+// lock, so re-storing the identical value from a concurrent reindex or
+// mtime-census pass would be a data race for no observable change.
+func (idx *Indexer) storeRootPath(absRoot string) {
+	if idx.rootPath != absRoot {
+		idx.rootPath = absRoot
+	}
+}
 
 // populateCppIncludeDirs reconstructs each C/C++ source file's include search
 // path from compile_commands.json and hands it to the resolver, so a quoted
@@ -2855,7 +3011,10 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 			// Key by the repo prefix so a repo-scoped provider can scope
 			// file selection to this repo (empty in single-repo mode).
 			roots := map[string]string{idx.repoPrefix: absRoot}
-			results, err := idx.semanticMgr.EnrichAll(idx.graph, roots)
+			// The inline full-index path does not gate or persist enrichment
+			// markers (a zero EnrichOptions): the deferred warmup path owns the
+			// skip-on-restart optimisation.
+			results, _, err := idx.semanticMgr.EnrichAll(idx.graph, roots, semantic.EnrichOptions{})
 			if err != nil {
 				idx.logger.Warn("semantic enrichment failed", zap.Error(err))
 			} else if len(results) > 0 {
@@ -3036,6 +3195,16 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 		Errors:           errors,
 	}
 	idx.warnIfEdgeSanityViolated(result)
+	// A whole-repo (re-)track that observed files did work: mark the repo for
+	// deferred semantic enrichment. FullRetrack is stamped by the multi-repo
+	// caller after this returns, so FileCount carries the signal here.
+	if result.FileCount > 0 || result.FullRetrack {
+		idx.pendingEnrich.Store(true)
+		// IndexCtx re-parsed every file, dropping this repo's hover-enrichment
+		// edges — force the deferred pass past the completion-marker gate so
+		// they are restored even at an unchanged clean HEAD.
+		idx.fullReindexed.Store(true)
+	}
 	return result, nil
 }
 
@@ -3189,6 +3358,17 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 		// timeout). Do NOT evict — the file's prior nodes/edges/search
 		// entries stay intact. A stale-but-present file beats an empty
 		// one, and the next successful re-index swaps cleanly.
+		//
+		// The bytes were read successfully (src above), so this is a
+		// stable fact about the file's current on-disk content, not a
+		// transient "couldn't even open it" failure (that case returns
+		// earlier, before relPath/mtime bookkeeping, and deliberately
+		// leaves the mtime unrecorded so it keeps retrying). Recording
+		// the mtime here keeps a warm restart's HasChangesSinceMtimes
+		// from perpetually seeing this one unparseable file as "the
+		// repo changed" and routing the whole repo through the
+		// expensive shadow re-track path on every restart.
+		idx.recordFileMtime(relPath, absPath)
 		return err
 	}
 
@@ -3382,22 +3562,33 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 	// Update mtime for this file. relPath is already the canonical
 	// key (relKey applied slash + NFC), so the mtime entry lines up
 	// with the graph file-node key and with the bulk-walk mtimes.
-	if info, err := os.Stat(absPath); err == nil {
-		mtime := info.ModTime().UnixNano()
-		idx.mtimeMu.Lock()
-		idx.fileMtimes[relPath] = mtime
-		idx.mtimeMu.Unlock()
-		// Also persist through the store's FileMtime sidecar so the
-		// next warm restart sees this incremental update without
-		// having to wait for the periodic gob snapshot to roll it.
-		// Per-file write is ~1ms on the on-disk backend; trivial under
-		// steady-state file-watcher load.
-		if w, ok := idx.graph.(graph.FileMtimeWriter); ok {
-			_ = w.BulkSetFileMtimes(idx.repoPrefix, map[string]int64{relPath: mtime})
-		}
-	}
+	idx.recordFileMtime(relPath, absPath)
 
 	return nil
+}
+
+// recordFileMtime restamps the recorded mtime for relPath (a canonical
+// relKey, not repo-prefixed) from absPath's current on-disk mtime, both
+// in the in-memory map and — when the backend supports it — the store's
+// FileMtime sidecar. Per-file write is ~1ms on the on-disk backend;
+// trivial under steady-state file-watcher load. A missing/unstatable
+// file is a no-op; a persist error is logged but non-fatal, since the
+// in-memory map (which the current process trusts) is already correct.
+func (idx *Indexer) recordFileMtime(relPath, absPath string) {
+	info, err := os.Stat(absPath)
+	if err != nil {
+		return
+	}
+	mtime := info.ModTime().UnixNano()
+	idx.mtimeMu.Lock()
+	idx.fileMtimes[relPath] = mtime
+	idx.mtimeMu.Unlock()
+	if w, ok := idx.graph.(graph.FileMtimeWriter); ok {
+		if err := w.BulkSetFileMtimes(idx.repoPrefix, map[string]int64{relPath: mtime}); err != nil {
+			idx.logger.Warn("persist file mtime failed",
+				zap.String("repo", idx.repoPrefix), zap.String("file", relPath), zap.Error(err))
+		}
+	}
 }
 
 // StructuralSymbols parses a file from its current on-disk content and
@@ -4399,6 +4590,14 @@ func (idx *Indexer) FileMtimes() map[string]int64 {
 // mtime must advance past the save so the poller's mtime sweep does
 // not keep re-flagging the same untouched file. A file absent from
 // disk or never indexed is a no-op.
+//
+// The in-memory map is what the current process's poller and
+// IsStale checks trust, but a warm restart trusts the persisted
+// FileMtime sidecar instead — without also writing through to it here,
+// a single inert save during a session left the persisted row at its
+// pre-save value, so the next restart's HasChangesSinceMtimes saw this
+// file as changed and re-tracked the whole repo. Mirrors the per-file
+// indexFile persist (recordFileMtime); a no-op on the in-memory backend.
 func (idx *Indexer) RefreshFileMtime(filePath string) {
 	absPath, err := filepath.Abs(filePath)
 	if err != nil {
@@ -4411,11 +4610,22 @@ func (idx *Indexer) RefreshFileMtime(filePath string) {
 	// relKey (slash + NFC) so the lookup hits the same fileMtimes
 	// entry the index walk created for a non-ASCII filename.
 	key := idx.relKey(absPath)
+	mtime := info.ModTime().UnixNano()
 	idx.mtimeMu.Lock()
-	if _, tracked := idx.fileMtimes[key]; tracked {
-		idx.fileMtimes[key] = info.ModTime().UnixNano()
+	_, tracked := idx.fileMtimes[key]
+	if tracked {
+		idx.fileMtimes[key] = mtime
 	}
 	idx.mtimeMu.Unlock()
+	if !tracked {
+		return
+	}
+	if w, ok := idx.graph.(graph.FileMtimeWriter); ok {
+		if err := w.BulkSetFileMtimes(idx.repoPrefix, map[string]int64{key: mtime}); err != nil {
+			idx.logger.Warn("persist file mtime failed",
+				zap.String("repo", idx.repoPrefix), zap.String("file", key), zap.Error(err))
+		}
+	}
 }
 
 // pruneDeletedFileMtimes drops the persisted mtime rows for files the
@@ -4452,7 +4662,7 @@ func (idx *Indexer) SetRootPath(root string) {
 	if err != nil {
 		abs = root
 	}
-	idx.rootPath = abs
+	idx.storeRootPath(abs)
 }
 
 // IncrementalReindexPaths re-indexes only the files reachable from the
@@ -4479,7 +4689,7 @@ func (idx *Indexer) IncrementalReindexPaths(root string, paths []string) (*Index
 	if err != nil {
 		return nil, err
 	}
-	idx.rootPath = absRoot
+	idx.storeRootPath(absRoot)
 
 	// scopeRels holds the repo-relative slash-paths the caller asked to
 	// reindex — used both to drive the discovery walk and to bound
@@ -4712,6 +4922,18 @@ func (idx *Indexer) IncrementalReindexPaths(root string, paths []string) (*Index
 		DurationMs:       time.Since(start).Milliseconds(),
 	}
 	idx.warnIfEdgeSanityViolated(result)
+	// An incremental pass that re-indexed or evicted at least one file did
+	// work — mark the repo for deferred semantic enrichment. A zero-change
+	// reconcile leaves the marker untouched so an unchanged repo is skipped.
+	if result.StaleFileCount > 0 || result.DeletedFileCount > 0 {
+		idx.pendingEnrich.Store(true)
+	}
+	// A re-parsed stale file's hover-enrichment edges were evicted with its old
+	// nodes, so force the deferred pass past the completion marker (a deletion
+	// evicts nodes but creates no fresh unstamped ones, so it alone does not).
+	if result.StaleFileCount > 0 {
+		idx.reparsedThisRun.Store(true)
+	}
 	return result, nil
 }
 
@@ -4742,7 +4964,7 @@ func (idx *Indexer) IncrementalReindex(root string) (*IndexResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	idx.rootPath = absRoot
+	idx.storeRootPath(absRoot)
 
 	// Collect files currently on disk.
 	diskFiles := make(map[string]bool)
@@ -4855,9 +5077,12 @@ func (idx *Indexer) IncrementalReindex(root string) (*IndexResult, error) {
 	// Re-index stale files. A file that fails — most often because it
 	// was locked or mid-write when the walk caught it — is collected
 	// and retried once below. A failure that survives the retry is
-	// surfaced on IndexResult.FailedFiles so the caller can replay it;
-	// since a failed file's mtime is never recorded, it also stays
-	// stale for the next incremental pass.
+	// surfaced on IndexResult.FailedFiles so the caller can replay it.
+	// A file whose bytes couldn't be read at all keeps no mtime
+	// recorded, so it stays stale for the next incremental pass; a
+	// file that read but failed to parse gets its mtime recorded (see
+	// indexFile's result==nil branch), so it stops being retried until
+	// its content changes again — see IndexResult.FailedFiles.
 	var failedFiles []string
 	for _, f := range staleFiles {
 		if err := idx.IndexFile(f); err != nil {
@@ -4947,6 +5172,18 @@ func (idx *Indexer) IncrementalReindex(root string) (*IndexResult, error) {
 		DurationMs:       time.Since(start).Milliseconds(),
 	}
 	idx.warnIfEdgeSanityViolated(result)
+	// An incremental pass that re-indexed or evicted at least one file did
+	// work — mark the repo for deferred semantic enrichment. A zero-change
+	// reconcile leaves the marker untouched so an unchanged repo is skipped.
+	if result.StaleFileCount > 0 || result.DeletedFileCount > 0 {
+		idx.pendingEnrich.Store(true)
+	}
+	// A re-parsed stale file's hover-enrichment edges were evicted with its old
+	// nodes, so force the deferred pass past the completion marker (a deletion
+	// evicts nodes but creates no fresh unstamped ones, so it alone does not).
+	if result.StaleFileCount > 0 {
+		idx.reparsedThisRun.Store(true)
+	}
 	return result, nil
 }
 
@@ -6887,7 +7124,7 @@ func (idx *Indexer) HasChangesSinceMtimes(root string) bool {
 	if err != nil {
 		return true
 	}
-	idx.rootPath = absRoot
+	idx.storeRootPath(absRoot)
 
 	diskFiles := make(map[string]bool)
 	errStop := errors.New("stop-walk")
@@ -6937,6 +7174,74 @@ func (idx *Indexer) HasChangesSinceMtimes(root string) bool {
 		}
 	}
 	return false
+}
+
+// ChangedSinceMtimes is the accumulating variant of HasChangesSinceMtimes:
+// it runs the SAME walk + IsStale staleness predicate + deletion-confirm
+// logic but, instead of short-circuiting on the first stale file, returns
+// the full changed and deleted sets as in-repo relative slash-paths.
+//
+// The warm-restart reconcile router uses the census to size the reconcile:
+// an empty result takes the fast no-op path, a small delta is scoped to
+// exactly those files (re-index the changed, evict the deleted), and only a
+// large-fraction churn falls back to a whole-repo re-track.
+//
+// changed holds files that are new or whose mtime drifted since the last
+// pass; deleted holds previously-indexed files confirmed gone from disk. A
+// walk (or abs-path) error returns a non-nil err with nil slices — the
+// caller treats that as "unknown, do a full re-track", exactly as
+// HasChangesSinceMtimes conservatively returns true on the same condition.
+func (idx *Indexer) ChangedSinceMtimes(root string) (changed []string, deleted []string, err error) {
+	absRoot, absErr := filepath.Abs(root)
+	if absErr != nil {
+		return nil, nil, absErr
+	}
+	idx.storeRootPath(absRoot)
+
+	diskFiles := make(map[string]bool)
+	walkErr := filepath.WalkDir(absRoot, func(path string, d os.DirEntry, werr error) error {
+		if werr != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if idx.shouldPruneDir(path, absRoot) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if _, ok := idx.effectiveLanguage(path, nil); !ok {
+			return nil
+		}
+		if idx.shouldExclude(path, absRoot, false) {
+			return nil
+		}
+		rel := idx.relKey(path)
+		diskFiles[rel] = true
+		if idx.IsStale(rel) {
+			changed = append(changed, rel)
+		}
+		return nil
+	})
+	if walkErr != nil {
+		return nil, nil, walkErr
+	}
+
+	// Deletion check: a previously-indexed file absent from the walk and
+	// confirmed gone from disk counts as a change (its edges must drop).
+	idx.mtimeMu.RLock()
+	var candidates []string
+	for rel := range idx.fileMtimes {
+		if !diskFiles[rel] {
+			candidates = append(candidates, rel)
+		}
+	}
+	idx.mtimeMu.RUnlock()
+	for _, rel := range candidates {
+		if _, statErr := os.Stat(filepath.Join(absRoot, filepath.FromSlash(rel))); errors.Is(statErr, os.ErrNotExist) {
+			deleted = append(deleted, rel)
+		}
+	}
+	return changed, deleted, nil
 }
 
 func (idx *Indexer) IsStale(relPath string) bool {

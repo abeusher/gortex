@@ -532,17 +532,19 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		// queryable — ahead of the slow enrichment pass — so clients can
 		// start issuing find_usages / get_callers immediately. Enrichment
 		// continues in this goroutine afterward and finishes at MarkEnriched.
+		var queryableElapsed time.Duration
 		markReady := func() {
 			elapsed := time.Since(start)
+			queryableElapsed = elapsed
 			controller.MarkReady(elapsed)
-			logger.Info("daemon: graph queryable", zap.Duration("resolve", elapsed))
+			logger.Info("daemon: graph queryable", zap.Duration("warmup", elapsed))
 			publishReadinessPhase(state, "ready", true, map[string]any{
 				"queryable":      true,
 				"warmup_seconds": int64(elapsed.Seconds()),
 				"warmup_ms":      elapsed.Milliseconds(),
 			})
 		}
-		mw := warmupDaemonState(state, logger, markReady)
+		mw, warmup := warmupDaemonState(state, logger, markReady)
 		controller.AttachWatcher(mw)
 		// Wire the daemon's MultiWatcher into the per-server history
 		// surface so `get_recent_changes` and `get_symbol_history` see
@@ -593,6 +595,7 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 			"warmup_seconds": int64(elapsed.Seconds()),
 			"warmup_ms":      elapsed.Milliseconds(),
 		})
+		logWarmupSummary(logger, warmup, queryableElapsed, elapsed)
 	}()
 
 	return srv.Serve()
@@ -1121,8 +1124,9 @@ func renderDaemonHeader(w io.Writer, st daemon.StatusResponse) {
 	case st.Ready:
 		t.AppendRow(table.Row{
 			"state",
-			fmt.Sprintf("ready — queryable (resolve %s); enrichment in progress",
-				formatDuration(time.Duration(st.WarmupSeconds)*time.Second)),
+			fmt.Sprintf("ready — queryable (warmup %s);%s",
+				formatDuration(time.Duration(st.WarmupSeconds)*time.Second),
+				formatEnrichmentProgress(st.Enrichment)),
 		})
 	default:
 		t.AppendRow(table.Row{"state", "warming up (socket reachable, resolving references)"})
@@ -1138,6 +1142,14 @@ func renderDaemonHeader(w io.Writer, st daemon.StatusResponse) {
 				"%s  docs=%d  heap=%s  disk=%s  path=%s",
 				sb.Name, sb.DocCount, formatBytes(sb.Bytes),
 				formatBytes(sb.DiskBytes), sb.DiskPath)})
+		case sb.DiskResident:
+			// No heap footprint to report — the index lives inside the
+			// graph store's own file, not a separate in-memory
+			// structure. Printing "heap=0 B" here would read as "this
+			// backend costs nothing", which is false.
+			t.AppendRow(table.Row{"search", fmt.Sprintf(
+				"%s  docs=%d  disk-resident (indexed in the graph store)",
+				sb.Name, sb.DocCount)})
 		default:
 			t.AppendRow(table.Row{"search", fmt.Sprintf(
 				"%s  docs=%d  heap=%s", sb.Name, sb.DocCount, formatBytes(sb.Bytes))})
@@ -1163,6 +1175,29 @@ func renderDaemonHeader(w io.Writer, st daemon.StatusResponse) {
 			st.PProfAddr, st.PProfAddr)})
 	}
 	t.Render()
+}
+
+// formatEnrichmentProgress renders the semantic-enrichment progress
+// suffix appended to the "state" row while Ready but not yet
+// EnrichmentComplete. Falls back to the old mute message when no
+// progress summary is available (no semantic manager wired, or an
+// older daemon build reporting a nil Enrichment) — the row still says
+// something instead of going blank.
+func formatEnrichmentProgress(e *daemon.EnrichmentProgress) string {
+	if e == nil {
+		return " enrichment in progress"
+	}
+	if e.Current == nil {
+		return fmt.Sprintf(" enriching %d/%d repos", e.ReposDone, e.ReposTotal)
+	}
+	elapsed := formatDuration(time.Duration(e.Current.ElapsedSeconds * float64(time.Second)))
+	if e.Current.DeadlineSeconds > 0 {
+		deadline := formatDuration(time.Duration(e.Current.DeadlineSeconds * float64(time.Second)))
+		return fmt.Sprintf(" enriching %d/%d (%s, %s/%s)",
+			e.ReposDone, e.ReposTotal, e.Current.Repo, elapsed, deadline)
+	}
+	return fmt.Sprintf(" enriching %d/%d (%s, %s)",
+		e.ReposDone, e.ReposTotal, e.Current.Repo, elapsed)
 }
 
 // renderDaemonRepos writes the per-repo breakdown as a single table.

@@ -9,6 +9,10 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
+
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/parser"
 )
@@ -28,6 +32,9 @@ func TestMain(m *testing.M) {
 		os.Exit(0)
 	case "slow":
 		testSlowWorker()
+		os.Exit(0)
+	case "stderr":
+		testStderrWorker()
 		os.Exit(0)
 	default:
 		os.Exit(m.Run())
@@ -99,6 +106,29 @@ func testSlowWorker() {
 		}
 		time.Sleep(3 * time.Second)
 		if enc.Encode(&extractResponse{Seq: req.Seq}) != nil {
+			return
+		}
+	}
+}
+
+// testStderrWorker writes a fixed burst of lines to stderr before
+// serving normally — used to exercise crashpool's stderr-routing path
+// (a real worker prints panic/runtime diagnostics to stderr on the way
+// down; this simulates that without actually crashing).
+func testStderrWorker() {
+	for i := 1; i <= 2; i++ {
+		fmt.Fprintf(os.Stderr, "worker stderr line %d\n", i)
+	}
+	reg := mockRegistry()
+	dec := gob.NewDecoder(os.Stdin)
+	enc := gob.NewEncoder(os.Stdout)
+	for {
+		var req extractRequest
+		if dec.Decode(&req) != nil {
+			return
+		}
+		resp := serveOne(reg, req)
+		if enc.Encode(&resp) != nil {
 			return
 		}
 	}
@@ -206,4 +236,33 @@ func TestPool_ClosedRejects(t *testing.T) {
 func TestNewPool_EmptyArgv(t *testing.T) {
 	_, err := NewPool(Config{Workers: 1})
 	require.Error(t, err)
+}
+
+// TestPool_RoutesWorkerStderrThroughLogger verifies a worker's stderr
+// is no longer inherited raw (which, in the daemon, would mean writing
+// straight into daemon.log) but routed through cfg.Logger as
+// structured, tagged Warn entries.
+func TestPool_RoutesWorkerStderrThroughLogger(t *testing.T) {
+	core, obs := observer.New(zapcore.DebugLevel)
+	logger := zap.New(core)
+
+	p := newTestPool(t, "stderr", Config{Workers: 1, Logger: logger})
+
+	res := p.Submit("main.mock", "mock", []byte("x"))
+	require.False(t, res.Bad())
+
+	deadline := time.Now().Add(3 * time.Second)
+	for obs.Len() < 2 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	var lines []string
+	for _, e := range obs.All() {
+		require.Equal(t, "subprocess stderr", e.Message)
+		require.Equal(t, "crashpool worker", e.ContextMap()["tag"])
+		line, _ := e.ContextMap()["line"].(string)
+		lines = append(lines, line)
+	}
+	require.Contains(t, lines, "worker stderr line 1")
+	require.Contains(t, lines, "worker stderr line 2")
 }

@@ -22,6 +22,12 @@ type ResolveStats struct {
 	Resolved   int `json:"resolved"`
 	Unresolved int `json:"unresolved"`
 	External   int `json:"external"`
+	// PendingBefore / PendingAfter record the pending-edge count before and
+	// after the scope filter (see SetScope). Diagnostic only — the
+	// warm-restart master-resolve log surfaces them so a scoped pass's
+	// reduction is visible. Zero (omitted) on the unscoped whole-graph path.
+	PendingBefore int `json:"pending_before,omitempty"`
+	PendingAfter  int `json:"pending_after,omitempty"`
 }
 
 // Resolver resolves unresolved edge targets to actual graph node IDs.
@@ -44,6 +50,13 @@ type Resolver struct {
 	logger       *zap.Logger
 	dirIndex     map[string][]*graph.Node
 	lastDirIndex map[string][]*graph.Node
+	// receiverTypeIdxByDir memoizes, per package directory, the Go type index
+	// the per-file method-receiver rebind builds. On a scoped tail that visits
+	// every file of a D-file package, building it once per package (O(D)) rather
+	// than once per file (O(D^2) GetFileNodes) removes the quadratic. Cleared
+	// with dirIndex — it is only valid while the type nodes it indexes are held
+	// stable for the duration of one ResolveAll/ResolveFile pass.
+	receiverTypeIdxByDir map[string]map[pkgKey]string
 	// cppIncludeDirs maps a repo-relative C/C++ source file to its ordered
 	// include search path (the `-I` / `-isystem` dirs from compile_commands.json),
 	// so a quoted/angle include resolves against the real compiler dir set
@@ -109,6 +122,20 @@ type Resolver struct {
 	// mid-pass. Set only inside ResolveAll.
 	validateLiveness bool
 
+	// bulkMode is set true by ResolveAll for the duration of its parallel
+	// worker fan-out and dropped around the inter-chunk mutex yield. While it
+	// is on, resolveEdge skips the synchronous per-edge tryResolveViaLSP
+	// round-trip: an LSP definition lookup serialises inside the helper, so a
+	// TS/JS-dense chunk otherwise degenerates to serial-LSP-latency × chunk
+	// size while every other worker idles at the barrier. The heuristic
+	// cascade still runs; edges it leaves unresolved that the helper could
+	// bind are collected and resolved once, off the barrier, in a deferred
+	// batch after the loop (see resolveDeferredLSP). Dropped around the yield
+	// so an interactive ResolveFile that interleaves on a shared Resolver
+	// instance still gets inline LSP precision. Independent of scope /
+	// validateLiveness; never set on any single-file path.
+	bulkMode bool
+
 	// lookupCache holds per-pass batched results from GetNodesByIDs /
 	// FindNodesByNames. Populated by ResolveAll/ResolveFile before
 	// the worker fan-out and cleared on return. Workers consult these
@@ -172,6 +199,23 @@ type Resolver struct {
 	// workspace_membership.go for the contract. Set via
 	// SetWorkspaceMembership before ResolveAll runs.
 	workspaceMembers WorkspaceMembership
+
+	// scope, when non-empty, restricts the next ResolveAll pass to the
+	// pending edges that could resolve into one of the named repo
+	// prefixes — the warm-restart optimisation that avoids a whole-graph
+	// resolve when only a few of many tracked repos re-indexed. nil or
+	// empty means whole-graph, exactly the pre-scoping behaviour. Set via
+	// SetScope. Independent of any backend bulk-mode flag.
+	scope map[string]struct{}
+
+	// stampTerminal, when true, lets a FULL (unscoped) ResolveAll durably mark
+	// the edges it concludes are permanently external / stdlib / definition-
+	// less so a later SCOPED warm resolve can skip re-feeding them (see
+	// terminal.go). Only the whole-graph master resolve — which has global
+	// evidence — enables it; per-repo and single-file passes leave it false so
+	// a partially-indexed graph never stamps a false "no definition". Set via
+	// SetStampTerminal.
+	stampTerminal bool
 }
 
 // lspLocKey identifies a node by (filePath, 1-based line) and is the
@@ -207,6 +251,24 @@ func (r *Resolver) SetLogger(l *zap.Logger) {
 		l = zap.NewNop()
 	}
 	r.logger = l
+}
+
+// SetScope restricts the next ResolveAll pass to pending edges that could
+// resolve into one of the given repo prefixes (see the scope field). A nil
+// or empty map restores whole-graph resolution — byte-for-byte the
+// pre-scoping behaviour. The scope persists across calls until reset,
+// mirroring the other Set* configuration setters.
+func (r *Resolver) SetScope(prefixes map[string]struct{}) {
+	r.scope = prefixes
+}
+
+// SetStampTerminal enables durable terminal-edge stamping for the next FULL
+// (unscoped) ResolveAll pass (see the stampTerminal field and terminal.go). It
+// is a no-op on scoped passes, which lack the global evidence to conclude an
+// edge is permanently unbindable. Only the whole-graph master resolve should
+// enable it.
+func (r *Resolver) SetStampTerminal(on bool) {
+	r.stampTerminal = on
 }
 
 // SetGraph retargets the Resolver at a different Store. The indexer's
@@ -301,13 +363,32 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 	for e := range r.graph.EdgesWithUnresolvedTarget() {
 		pending = append(pending, e)
 	}
+	pendingBefore := len(pending)
+	// Scoped warm-restart resolve: when a set of changed repos is armed via
+	// SetScope, drop the pending edges that provably can't newly resolve into
+	// any of them. See filterPendingByScope for the conservative superset
+	// rule. nil / empty scope leaves pending untouched — exactly the
+	// whole-graph behaviour.
+	if len(r.scope) > 0 {
+		pending = filterPendingByScope(pending, r.scope)
+	}
+	// Terminal-edge skip: on a scoped warm pass, drop the edges a prior FULL
+	// pass durably flagged as permanently external / stdlib / definition-less
+	// (see terminal.go), unless they are anchored to a changed repo. A full /
+	// unscoped pass (scope empty), and the GORTEX_WARMUP_FULL_RESOLVE override,
+	// ignore the flag and re-examine everything so a stamp self-heals.
+	terminalSkipped := 0
+	if len(r.scope) > 0 && !warmupFullResolve() {
+		pending, terminalSkipped = filterTerminalSkip(pending, r.scope)
+	}
 	if len(pending) == 0 {
-		return &ResolveStats{}
+		return &ResolveStats{PendingBefore: pendingBefore}
 	}
 
 	passStart := time.Now()
 	r.logger.Info("resolver: pass start",
 		zap.Int("pending", len(pending)),
+		zap.Int("terminal_skipped", terminalSkipped),
 		zap.Bool("backend_bulk", backendResolverEnabled()))
 	var processed atomic.Int64
 	progressDone := make(chan struct{})
@@ -350,6 +431,14 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 	// post-resolve passes once, after the loop. GORTEX_RESOLVE_CHUNK=0 restores
 	// the whole-pass-locked path.
 	r.validateLiveness = resolveChunkEnabled()
+	// Bulk mode: the parallel workers below skip the synchronous per-edge LSP
+	// round-trip (see the bulkMode field) and instead collect the still-
+	// unresolved LSP-eligible edges into deferredLSP, which one deferred batch
+	// binds after the loop. Reset unconditionally on return so a leaked true
+	// can never disable inline LSP on a later single-file ResolveFile.
+	r.bulkMode = true
+	defer func() { r.bulkMode = false }()
+	var deferredLSP []deferredLSPEdge
 	superChunk := len(pending)
 	if r.validateLiveness {
 		if sz := resolveChunkSize(); sz < superChunk {
@@ -378,6 +467,7 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 		}
 		perWorkerStats := make([]ResolveStats, workers)
 		perWorkerJobs := make([][]reindexJob, workers)
+		perWorkerDeferred := make([][]deferredLSPEdge, workers)
 		var wg sync.WaitGroup
 		chunk := (len(scPending) + workers - 1) / workers
 		for w := 0; w < workers; w++ {
@@ -394,11 +484,31 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 				defer wg.Done()
 				ws := &perWorkerStats[idx]
 				jobs := make([]reindexJob, 0, len(slice))
+				var deferred []deferredLSPEdge
 				for _, e := range slice {
+					// Capture LSP eligibility + the pre-heuristic identifier
+					// BEFORE resolveEdge runs: e.To is still the `unresolved::`
+					// stub here (the real edge is rewritten only in the apply
+					// phase below), so this sees the pre-heuristic target even
+					// for an edge the heuristic then confidently (mis)binds.
+					// Collecting EVERY LSP-eligible edge — not only the ones the
+					// heuristic leaves unresolved — is what preserves the LSP-
+					// first override the inline path applies: the post-loop batch
+					// re-binds via the type-aware helper, correcting a confident-
+					// but-wrong heuristic bind (see resolveDeferredLSP).
+					lspTarget, lspElig := r.lspDeferTarget(e)
 					clone := cloneEdgeForResolve(e)
 					oldTo, changed := r.resolveEdge(clone, ws)
 					processed.Add(1)
 					if changed {
+						// A now-resolved edge sheds any durable terminal-skip
+						// flag it carried (full self-healing pass): it has left
+						// the pending set, so a later scoped pass must not treat
+						// the flag as live. The cleared Meta rides the reindex
+						// below (To changed => the row is rewritten).
+						if !graph.IsUnresolvedTarget(clone.To) {
+							clearEdgeTerminal(clone)
+						}
 						jobs = append(jobs, reindexJob{
 							edge:       e,
 							oldTo:      oldTo,
@@ -410,9 +520,18 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 							meta:       clone.Meta,
 						})
 					}
+					if lspElig {
+						// Bulk mode skipped the inline LSP round-trip; collect the
+						// edge for the post-loop deferred batch so the helper is
+						// consulted off the parallel worker barrier. Independent of
+						// `changed`: a heuristic-resolved edge is still deferred so
+						// LSP retains override authority.
+						deferred = append(deferred, deferredLSPEdge{edge: e, target: lspTarget})
+					}
 					releaseResolverClone(clone)
 				}
 				perWorkerJobs[idx] = jobs
+				perWorkerDeferred[idx] = deferred
 			}(w, scPending[start:end])
 		}
 		wg.Wait()
@@ -445,21 +564,45 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 		}
 		allJobs = append(allJobs, perWorkerJobs...)
 		allStats = append(allStats, perWorkerStats...)
+		for i := range perWorkerDeferred {
+			deferredLSP = append(deferredLSP, perWorkerDeferred[i]...)
+		}
 
 		// Hand the resolve mutex to any waiting interactive edit before the
-		// next chunk.
+		// next chunk. Drop bulk mode across the hand-off so an interleaving
+		// single-file ResolveFile on a shared instance resolves LSP-first.
 		if r.validateLiveness && hi < len(pending) {
+			r.bulkMode = false
 			r.mu.Unlock()
 			runtime.Gosched()
 			r.mu.Lock()
+			r.bulkMode = true
 		}
 	}
 	close(progressDone)
+
+	// Deferred LSP batch: bind the still-unresolved LSP-eligible edges the
+	// parallel workers collected, now that the compute barrier is behind us.
+	// Runs before the tail attribution passes so external-call
+	// materialisation sees the LSP-resolved targets, exactly as the inline
+	// (non-bulk) path would.
+	lspDeferred := len(deferredLSP)
+	lspBatchResolved := 0
+	if lspDeferred > 0 {
+		lspBatchResolved = r.resolveDeferredLSP(deferredLSP)
+	}
+	// Bulk mode covers only the parallel compute + the deferred LSP batch; the
+	// guard and tail attribution passes below run identically to the single-
+	// file path. (The deferred defer() is the panic-safety net.)
+	r.bulkMode = false
+
 	computeElapsed := time.Since(passStart)
 	r.logger.Info("resolver: compute done",
 		zap.Int("pending", len(pending)),
 		zap.Int("reindex_batch", reindexTotal),
 		zap.Int("super_chunk", superChunk),
+		zap.Int("lsp_deferred", lspDeferred),
+		zap.Int("lsp_batch_resolved", lspBatchResolved),
 		zap.Duration("elapsed", computeElapsed))
 
 	// Cross-package name-match guard. The heuristic fallbacks above can
@@ -470,59 +613,42 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 	// closure is built once and shared; each job still carries its
 	// pre-resolution target so a reverted edge is restored exactly.
 	guarded := 0
-	if closure := r.buildImportClosure(); len(closure) > 0 {
+	// The guard consults the import-reachability closure only for the caller
+	// files of the jobs the compute loop resolved. On a scoped warm pass those
+	// jobs live in the changed repos (plus any repo whose bare-name call
+	// resolved in place), so build the closure for just those repos rather than
+	// scanning every file + import edge in the workspace — the entries for the
+	// queried callers stay byte-identical, so the guard's verdicts are
+	// unchanged. An empty scope builds the whole-graph closure.
+	if closure := r.importClosureForJobs(allJobs); len(closure) > 0 {
 		for i := range allJobs {
 			guarded += r.guardCrossPackageCallEdges(allJobs[i], closure)
 		}
 	}
 
-	// Rebind cross-file Go method receivers onto the canonical type
-	// node ID. The Go extractor builds the EdgeMemberOf target as
-	// `<methodfile>::TypeName` because it parses one file at a time;
-	// methods declared in files other than the type's defining file
-	// point at a phantom ID until this pass collapses them onto the
-	// real `<typefile>::TypeName` node. See rebindGoMethodReceivers
-	// for the full rationale (InferImplements + find_implementations
-	// + class_hierarchy correctness all ride on this).
-	r.rebindGoMethodReceivers()
-
-	// Scope-aware bare-name binding. Walks `unresolved::<name>` edges
-	// whose source is inside a function and rewrites them onto the
-	// matching KindLocal / KindParam node when exactly one in-scope
-	// binding wins under the Go shadowing rules. Without this pass
-	// the worker-pool fallback would scan FindNodesByName(name)
-	// across the whole graph and fall through to `unresolved::*` for
-	// every common identifier (err / data / src / ...). The bind
-	// uses #77's KindLocal nodes — pre-#77 there was nothing to
-	// bind to.
-	r.bindBareNameScopeRefs()
-
-	// Bind in-body references to a function's own generic type
-	// parameters (`var x T`, `func F[T any]() T { ... }`) onto the
-	// pre-existing KindGenericParam nodes — without this pass they
-	// stayed as `unresolved::T` even though the parser had already
-	// materialised the tparam node.
-	r.bindGenericParamRefs()
-
-	// Attribute Go language intrinsics (append / len / make / string
-	// / int / ...) to canonical `builtin::go::*` IDs and materialise
-	// one KindBuiltin node per unique builtin. Eliminates ~50k of
-	// the bare-name `unresolved::*` population on a Go-heavy
-	// codebase and turns the analytics queries that need these
-	// targets (`find_usages(builtin::go::type::float64)` for
-	// type-drift analysis) into one-hop lookups.
-	r.attributeGoBuiltins()
-
-	// Materialise stdlib / dep / external call targets as
-	// KindFunction nodes with KindModule parents so cross-package
-	// queries (`find_usages(stdlib::fmt::Sprintf)`,
-	// `get_callers(dep::github.com/stretchr/testify/assert::True)`,
-	// "what's our usage surface on encoding/json") become one-hop
-	// lookups. Must run AFTER resolveExtern (which classifies
-	// `unresolved::extern::*` into the stdlib/dep/external buckets)
-	// so we materialise the post-classification state, not the
-	// pre-classification shape.
-	r.attributeGoExternalCalls()
+	// Post-resolution Go attribution passes: method-receiver rebind, bare-name
+	// and generic-param binding, builtin + external-call materialisation. Each
+	// pass carries its own rationale on its definition; the order is
+	// load-bearing (bare-name binding precedes builtin attribution so a local
+	// named `len` shadows the builtin). On a scoped warm restart the same five
+	// passes run per-file over just the changed repos: the per-file equivalents
+	// reproduce the whole-graph effect without the whole-graph index builds
+	// (scanning every KindLocal, every Go type) that dominate a warm restart,
+	// and unchanged repos are already in their post-full-resolve steady state,
+	// so their edges are no-ops here.
+	// Past a per-repo file budget the per-file dispatch's O(files) store round
+	// trips (plus the per-package type-index builds behind the receiver rebind)
+	// cost more than a single whole-graph streaming sweep. The two produce the
+	// identical edge set — the attribution passes are idempotent and re-running
+	// them over an unchanged repo is a no-op — so a large changed repo is routed
+	// through the streaming path instead of the per-file storm.
+	if len(r.scope) == 0 || r.scopedTailExceedsFileBudget() {
+		r.runFileAttributionPassesLocked()
+	} else {
+		for _, fp := range r.scopedFiles() {
+			r.runFileAttributionPassesForFileLocked(fp)
+		}
+	}
 
 	// Relative-import resolution for Python and Dart files. Runs
 	// before module attribution so internal-target stems never get
@@ -558,6 +684,20 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 	// every implementation. Same post-guard placement as the Java pass.
 	r.resolvePHPOverrideDispatch()
 
+	// Terminal-edge reconciliation: only a FULL (unscoped) pass has the global
+	// evidence to conclude an edge is permanently unbindable, so it durably
+	// stamps the newly-terminal edges and un-stamps any that regained a
+	// candidate. Gated to the master resolve via SetStampTerminal so a
+	// partially-indexed per-repo pass never stamps a false "no definition".
+	if r.stampTerminal && len(r.scope) == 0 {
+		stamped, unstamped := r.reconcileTerminalStamps()
+		if stamped > 0 || unstamped > 0 {
+			r.logger.Info("resolver: terminal stamps",
+				zap.Int("stamped", stamped),
+				zap.Int("unstamped", unstamped))
+		}
+	}
+
 	total := &ResolveStats{}
 	for i := range allStats {
 		total.Resolved += allStats[i].Resolved
@@ -574,7 +714,161 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 		}
 		total.Unresolved += guarded
 	}
+	// Fold the deferred LSP batch into the pass total. Each edge was tallied
+	// Unresolved by the heuristic cascade that left it pending; binding it in
+	// the batch moves it back to Resolved, matching the non-bulk path where
+	// the inline LSP win would have counted a Resolved and no Unresolved.
+	if lspBatchResolved > 0 {
+		total.Resolved += lspBatchResolved
+		if total.Unresolved >= lspBatchResolved {
+			total.Unresolved -= lspBatchResolved
+		} else {
+			total.Unresolved = 0
+		}
+	}
+	total.PendingBefore = pendingBefore
+	total.PendingAfter = len(pending)
 	return total
+}
+
+// filterPendingByScope keeps only the pending edges a scoped ResolveAll must
+// reconsider for the given changed-repo set. It is a conservative superset:
+// an unchanged repo's own edges that are already resolved never appear in
+// EdgesWithUnresolvedTarget, and the ones that remain unresolved there stay
+// unresolved whether or not this pass reconsiders them — so dropping them is
+// a pure work saving with no effect on the final resolved edge set. Filters
+// in place; the returned slice reuses pending's backing array.
+func filterPendingByScope(pending []*graph.Edge, scope map[string]struct{}) []*graph.Edge {
+	out := pending[:0]
+	for _, e := range pending {
+		if e == nil {
+			continue
+		}
+		if edgeInResolveScope(e, scope) {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// edgeInResolveScope reports whether a scoped ResolveAll pass must reconsider
+// a pending edge. An edge is in scope when any of three rules hold:
+//
+//	(a) it originates in a changed repo (its source could re-target),
+//	(b) its unresolved target is repo-qualified to a changed repo, or
+//	(c) its target is a bare, unqualified unresolved::Name — which could
+//	    newly bind into any changed repo, so it is always reconsidered.
+//
+// Everything else — an edge from an unchanged repo whose target is
+// repo-qualified to another unchanged repo — is excluded.
+func edgeInResolveScope(e *graph.Edge, scope map[string]struct{}) bool {
+	// (a) Source repo is in scope.
+	if _, ok := scope[graph.RepoPrefixOfID(e.From)]; ok {
+		return true
+	}
+	// Repo prefix the target is pinned to, over both the unresolved
+	// (`<repo>::unresolved::Name`) and the general stub (`<repo>::kind::…`)
+	// encodings. Never a literal HasPrefix check — the helpers normalise the
+	// bare and repo-qualified forms.
+	targetRepo := graph.UnresolvedRepoPrefix(e.To)
+	if targetRepo == "" {
+		targetRepo = graph.StubRepoPrefix(e.To)
+	}
+	if targetRepo == "" {
+		// (c) Bare, unqualified unresolved::Name — could resolve anywhere.
+		return true
+	}
+	// (b) Target repo-qualified to a changed repo.
+	_, ok := scope[targetRepo]
+	return ok
+}
+
+// edgeFromInScope reports whether an edge's source repo is within the active
+// resolve scope. An empty scope (whole-graph resolve) returns true for every
+// edge, so a scoped tail pass degenerates to today's behaviour. Backs the
+// post-resolve passes that have no per-file sibling: an unchanged repo's edges
+// are already in their post-full-resolve steady state, so re-running these
+// passes over them is a no-op and skipping them is a pure work saving.
+func (r *Resolver) edgeFromInScope(from string) bool {
+	if len(r.scope) == 0 {
+		return true
+	}
+	_, ok := r.scope[graph.RepoPrefixOfID(from)]
+	return ok
+}
+
+// scopedTailFileBudget bounds how many files a single changed repo may hold
+// before the scoped per-file attribution tail is abandoned for the whole-graph
+// streaming passes. Above it the per-file store round trips dominate one
+// streaming sweep, so a large changed repo among small siblings would otherwise
+// make the "incremental" warm restart's pre-ready phase slower than a full one.
+// A var (not const) so tests can drive both branches on small fixtures.
+var scopedTailFileBudget = 2000
+
+// scopedTailExceedsFileBudget reports whether any repo in the active scope holds
+// more KindFile nodes than scopedTailFileBudget. It reads the already-built
+// dirIndex (no extra store materialization) and early-returns as soon as one
+// repo crosses the budget, so a large changed repo never pays the per-file
+// dispatch's O(files) query storm just to discover it should have streamed.
+// Callers gate on len(r.scope) > 0 first.
+func (r *Resolver) scopedTailExceedsFileBudget() bool {
+	perRepo := make(map[string]int, len(r.scope))
+	for _, nodes := range r.dirIndex {
+		for _, n := range nodes {
+			if n == nil {
+				continue
+			}
+			prefix := n.RepoPrefix
+			if prefix == "" {
+				prefix = graph.RepoPrefixOfID(n.ID)
+			}
+			if _, ok := r.scope[prefix]; !ok {
+				continue
+			}
+			perRepo[prefix]++
+			if perRepo[prefix] > scopedTailFileBudget {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// scopedFiles returns the file paths of every KindFile node owned by a repo in
+// the active resolve scope. Callers gate on len(r.scope) > 0 first, so an empty
+// scope yields nothing. Backs the per-file dispatch of the post-resolve Go
+// attribution passes on a scoped warm restart.
+func (r *Resolver) scopedFiles() []string {
+	var files []string
+	for prefix := range r.scope {
+		for _, n := range r.graph.GetRepoNodes(prefix) {
+			if n != nil && n.Kind == graph.KindFile && n.FilePath != "" {
+				files = append(files, n.FilePath)
+			}
+		}
+	}
+	return files
+}
+
+// importClosureForJobs builds the import-reachability closure the cross-package
+// guard consults. On an unscoped pass it is the whole-graph closure. On a
+// scoped pass it is restricted to the repos that own the resolved jobs' caller
+// nodes — the only files the guard ever queries — which keeps the closure
+// entries for those callers byte-identical to the whole-graph build while
+// skipping the unchanged workspace's file + import scan.
+func (r *Resolver) importClosureForJobs(allJobs [][]reindexJob) map[string]map[string]struct{} {
+	if len(r.scope) == 0 {
+		return r.buildImportClosure()
+	}
+	repos := make(map[string]struct{})
+	for i := range allJobs {
+		for j := range allJobs[i] {
+			if e := allJobs[i][j].edge; e != nil {
+				repos[graph.RepoPrefixOfID(e.From)] = struct{}{}
+			}
+		}
+	}
+	return r.buildImportClosureFiltered(repos)
 }
 
 // buildDirIndexes builds two lookup maps for resolveImport. Populated
@@ -602,6 +896,7 @@ func (r *Resolver) buildDirIndexes() {
 func (r *Resolver) clearDirIndexes() {
 	r.dirIndex = nil
 	r.lastDirIndex = nil
+	r.receiverTypeIdxByDir = nil
 }
 
 // warmLookupCache batches the per-edge GetNode / FindNodesByName
@@ -615,6 +910,7 @@ func (r *Resolver) warmLookupCache(pending []*graph.Edge) {
 	if len(pending) == 0 {
 		return
 	}
+	warmStart := time.Now()
 	idSet := make(map[string]struct{}, len(pending)*2)
 	nameSet := make(map[string]struct{}, len(pending))
 	qualNameSet := make(map[string]struct{})
@@ -662,8 +958,15 @@ func (r *Resolver) warmLookupCache(pending []*graph.Edge) {
 	for n := range nameSet {
 		names = append(names, n)
 	}
-	r.nodeByID = r.graph.GetNodesByIDs(ids)
-	r.nodesByName = r.graph.FindNodesByNames(names)
+	// Both the id and name key sets run to ~0.5M keys on a cold warmup, and
+	// each backed store call was a single serial round trip before the first
+	// progress tick — the silent 3-6s start-up gap. Split each into per-CPU
+	// batches issued concurrently: both graph backends serve concurrent point
+	// reads safely (in-memory takes per-shard RLocks; sqlite pools NumCPU WAL
+	// reader connections), which is the same property the resolver's worker
+	// fan-out below already depends on.
+	r.nodeByID = r.parallelGetNodesByIDs(ids)
+	r.nodesByName = r.parallelFindNodesByNames(names)
 	// Authoritative negatives: a name we queried that has NO node in the
 	// graph (stdlib / external method calls — *.QueryRow, *.Errorf,
 	// *.Fatalf, *.StringVar, … — dominate the pending set) must be
@@ -717,6 +1020,107 @@ func (r *Resolver) warmLookupCache(pending []*graph.Edge) {
 			}
 		}
 	}
+	// Make the previously-silent warm phase observable — the batched store
+	// reads over ~0.5M keys land before the first compute progress tick.
+	r.logger.Info("resolver: warm lookup cache",
+		zap.Int("ids", len(ids)),
+		zap.Int("names", len(names)),
+		zap.Int("qual_names", len(qualNameSet)),
+		zap.Duration("elapsed", time.Since(warmStart)))
+}
+
+// parallelGetNodesByIDs is the concurrent form of Store.GetNodesByIDs used to
+// pre-warm the resolver's per-pass id cache: it splits ids into up to NumCPU
+// batches issued on their own goroutines and merges the per-batch maps. ids is
+// already deduped by warmLookupCache, so a key lands in exactly one batch and
+// the merge never has to reconcile collisions. Small inputs fall through to a
+// single call, where the goroutine + merge overhead would dominate.
+func (r *Resolver) parallelGetNodesByIDs(ids []string) map[string]*graph.Node {
+	batches := lookupWarmBatches(len(ids))
+	if batches <= 1 {
+		return r.graph.GetNodesByIDs(ids)
+	}
+	parts := make([]map[string]*graph.Node, batches)
+	chunk := (len(ids) + batches - 1) / batches
+	var wg sync.WaitGroup
+	for b := 0; b < batches; b++ {
+		start := b * chunk
+		end := start + chunk
+		if end > len(ids) {
+			end = len(ids)
+		}
+		if start >= end {
+			continue
+		}
+		wg.Add(1)
+		go func(bi int, sub []string) {
+			defer wg.Done()
+			parts[bi] = r.graph.GetNodesByIDs(sub)
+		}(b, ids[start:end])
+	}
+	wg.Wait()
+	out := make(map[string]*graph.Node, len(ids))
+	for _, m := range parts {
+		for k, v := range m {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+// parallelFindNodesByNames is the concurrent form of Store.FindNodesByNames.
+// names is deduped by warmLookupCache, so each name resolves in exactly one
+// batch and the merge is a plain key copy (no per-name slice concat across
+// batches). Small inputs fall through to a single call.
+func (r *Resolver) parallelFindNodesByNames(names []string) map[string][]*graph.Node {
+	batches := lookupWarmBatches(len(names))
+	if batches <= 1 {
+		return r.graph.FindNodesByNames(names)
+	}
+	parts := make([]map[string][]*graph.Node, batches)
+	chunk := (len(names) + batches - 1) / batches
+	var wg sync.WaitGroup
+	for b := 0; b < batches; b++ {
+		start := b * chunk
+		end := start + chunk
+		if end > len(names) {
+			end = len(names)
+		}
+		if start >= end {
+			continue
+		}
+		wg.Add(1)
+		go func(bi int, sub []string) {
+			defer wg.Done()
+			parts[bi] = r.graph.FindNodesByNames(sub)
+		}(b, names[start:end])
+	}
+	wg.Wait()
+	out := make(map[string][]*graph.Node, len(names))
+	for _, m := range parts {
+		for k, v := range m {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+// lookupWarmBatches picks the goroutine count for the parallel warm-cache
+// helpers: one per minLookupWarmBatch keys, capped at NumCPU, and 1 (serial)
+// below the threshold so tiny key sets skip the fan-out overhead entirely.
+func lookupWarmBatches(n int) int {
+	const minLookupWarmBatch = 4096
+	if n <= minLookupWarmBatch {
+		return 1
+	}
+	batches := (n + minLookupWarmBatch - 1) / minLookupWarmBatch
+	if cpus := runtime.NumCPU(); batches > cpus {
+		batches = cpus
+	}
+	if batches < 1 {
+		batches = 1
+	}
+	return batches
 }
 
 func (r *Resolver) clearLookupCache() {
@@ -1363,7 +1767,18 @@ func (r *Resolver) resolveEdge(e *graph.Edge, stats *ResolveStats) (oldTo string
 	// skipped. When it loses (no helper, no answer, no match), we
 	// fall through to the existing heuristic cascade unchanged so
 	// the edge still gets the best best-effort target.
-	if r.tryResolveViaLSP(e, target, stats) {
+	//
+	// In bulk mode (a whole-graph ResolveAll warmup pass) the inline
+	// round-trip is skipped: the definition lookup serialises inside the
+	// helper, so paying it here parks the parallel workers on the helper
+	// lock. ResolveAll instead collects EVERY LSP-eligible edge and binds
+	// them in one deferred batch after the loop (see resolveDeferredLSP +
+	// lspDeferTarget). Deferring only the heuristic-unresolved edges would
+	// let a confident heuristic mis-bind escape LSP correction, so the batch
+	// re-binds heuristic-resolved edges too — retaining the LSP-first
+	// override this inline branch gives single-file paths, where bulkMode is
+	// false and an interactive edit still resolves LSP-first.
+	if !r.bulkMode && r.tryResolveViaLSP(e, target, stats) {
 		return oldTo, e.To != oldTo
 	}
 

@@ -1,0 +1,242 @@
+package resolver
+
+import (
+	"os"
+	"strings"
+
+	"github.com/zzet/gortex/internal/graph"
+)
+
+// Terminal-edge skipping. The warm-restart pending population is dominated by
+// permanently external / stdlib / definition-less stubs — `*.Errorf`,
+// `*.QueryRow`, `<vector>`, a bare `unresolved::Name` no repo defines — that
+// are re-fed to and re-fail every scoped warm resolve, forever (see the
+// warmLookupCache 200k-external-method-stub note). A FULL (unscoped) resolve
+// has the global evidence to conclude such an edge can never bind; it stamps a
+// durable flag so a later SCOPED pass can drop it up front. Full passes ignore
+// the flag and re-examine everything, so a stamp self-heals the moment a
+// matching definition appears.
+
+const (
+	// metaResolveTerminal marks an unresolved edge the resolver has concluded
+	// is permanently unbindable. Read by the scoped pending-scan skip.
+	metaResolveTerminal = "resolve_terminal"
+	// metaResolveTerminalReason carries a short human-readable reason for the
+	// stamp (aligned by string value with internal/analyzer's outcome vocab).
+	metaResolveTerminalReason = "resolve_terminal_reason"
+)
+
+// Terminal reasons. These deliberately match internal/analyzer's resolution-
+// outcome constants by STRING VALUE (the analyzer imports resolver, so resolver
+// cannot import the analyzer's constants) so both surfaces speak one vocabulary.
+const (
+	terminalReasonNoDefinition = "no_definition"
+	terminalReasonStubOnly     = "stub_only"
+	terminalReasonStdlibHeader = "stdlib_header"
+)
+
+// warmupFullResolve reports whether the operator forced the warm-restart
+// master resolve to re-examine every edge (ignoring the durable terminal
+// flag). The daemon already translates this override into a nil resolve scope,
+// so the scope-empty path covers it; the resolver honours it directly too so a
+// scoped pass under the override still self-heals.
+func warmupFullResolve() bool {
+	v := os.Getenv("GORTEX_WARMUP_FULL_RESOLVE")
+	return v == "1" || strings.EqualFold(v, "true")
+}
+
+// edgeTerminalFlag reports whether e carries a live resolve_terminal stamp.
+func edgeTerminalFlag(e *graph.Edge) bool {
+	if e == nil || e.Meta == nil {
+		return false
+	}
+	v, ok := e.Meta[metaResolveTerminal].(bool)
+	return ok && v
+}
+
+// setEdgeTerminal stamps e as terminal in place (allocating Meta if needed).
+func setEdgeTerminal(e *graph.Edge, reason string) {
+	if e == nil {
+		return
+	}
+	if e.Meta == nil {
+		e.Meta = make(map[string]any, 2)
+	}
+	e.Meta[metaResolveTerminal] = true
+	if reason != "" {
+		e.Meta[metaResolveTerminalReason] = reason
+	}
+}
+
+// clearEdgeTerminal drops any resolve_terminal stamp from e in place.
+func clearEdgeTerminal(e *graph.Edge) {
+	if e == nil || e.Meta == nil {
+		return
+	}
+	delete(e.Meta, metaResolveTerminal)
+	delete(e.Meta, metaResolveTerminalReason)
+}
+
+// classifyTerminal decides whether an unresolved edge is permanently
+// unbindable and, if so, the reason. It is the resolver-native twin of
+// internal/analyzer.ClassifyUnresolved (which resolver cannot import): an edge
+// is terminal only when NO real definition of its name exists anywhere in the
+// graph (the name matches nothing, or only stub / external placeholders) or the
+// target is a C/C++ standard-library angle-include. An edge with any real
+// in-graph candidate — same-language (candidate_out_of_scope /
+// ambiguous_multi_match) or a different language family (cross_language_only) —
+// is genuinely pending and NEVER stamped, so more evidence can still bind it.
+func (r *Resolver) classifyTerminal(e *graph.Edge) (reason string, terminal bool) {
+	if e == nil || !graph.IsUnresolvedTarget(e.To) {
+		return "", false
+	}
+	target := graph.UnresolvedName(e.To)
+
+	// C/C++/ObjC standard-library angle-include (<stdio.h>, <vector>, …):
+	// external by construction, deliberately never bound to an in-tree file of
+	// the same basename. A quoted / non-system include may still resolve to a
+	// local header, so it stays pending.
+	if e.Kind == graph.EdgeImports && strings.HasPrefix(target, "import::") {
+		if k, _ := e.Meta["include_kind"].(string); k == "system" {
+			if IsCppStdlibHeader(strings.TrimPrefix(target, "import::")) {
+				return terminalReasonStdlibHeader, true
+			}
+		}
+		return "", false
+	}
+
+	name := identifierFromTarget(target)
+	if name == "" {
+		// Module-path shapes (import:: / pyrel:: / grpc::) are owned by
+		// dedicated whole-graph passes; never classified terminal here.
+		return "", false
+	}
+
+	fromLang := ""
+	if n := r.cachedGetNode(e.From); n != nil {
+		fromLang = n.Language
+	}
+	var realSameLang, realOtherLang, stubs int
+	for _, n := range r.cachedFindNodesByName(name) {
+		if n == nil {
+			continue
+		}
+		if graph.IsStub(n.ID) {
+			stubs++
+			continue
+		}
+		if !nodeIsDefinitionKind(n.Kind) {
+			continue
+		}
+		if fromLang != "" && n.Language != "" && !sameLanguageFamily(fromLang, n.Language) {
+			realOtherLang++
+			continue
+		}
+		realSameLang++
+	}
+	switch {
+	case realSameLang >= 1 || realOtherLang >= 1:
+		// A real definition exists — genuinely pending, not terminal.
+		return "", false
+	case stubs >= 1:
+		return terminalReasonStubOnly, true
+	default:
+		return terminalReasonNoDefinition, true
+	}
+}
+
+// nodeIsDefinitionKind reports whether a node kind is a callable / type
+// definition an unresolved call or reference could legitimately bind to. Kept
+// resolver-local (the analyzer's identical helper is package-private) so this
+// package takes no analyzer dependency.
+func nodeIsDefinitionKind(k graph.NodeKind) bool {
+	switch k {
+	case graph.KindFunction, graph.KindMethod, graph.KindType,
+		graph.KindInterface, graph.KindVariable, graph.KindConstant, graph.KindField:
+		return true
+	}
+	return false
+}
+
+// filterTerminalSkip drops the terminally-unresolved edges a scoped pass need
+// not reconsider, composing with (running AFTER) filterPendingByScope. A
+// terminal edge is kept only when it is specifically anchored to a changed
+// repo — its source could re-target, or its target is repo-qualified to a repo
+// that just re-indexed. A terminal edge that survived the scope filter only
+// because it is a bare, unqualified name is dropped: no definition exists and
+// no changed repo owns it, so it would re-fail. (A changed repo that newly ADDS
+// a matching name binds the edge in the subsequent whole-graph cross-repo
+// resolve, which is unaffected by this flag — so the drop is a pure work
+// saving.) Filters in place; the returned slice reuses pending's backing array.
+func filterTerminalSkip(pending []*graph.Edge, scope map[string]struct{}) (kept []*graph.Edge, skipped int) {
+	out := pending[:0]
+	for _, e := range pending {
+		if e == nil {
+			continue
+		}
+		if !edgeTerminalFlag(e) || terminalEdgeAnchoredToScope(e, scope) {
+			out = append(out, e)
+			continue
+		}
+		skipped++
+	}
+	return out, skipped
+}
+
+// terminalEdgeAnchoredToScope reports whether a terminal edge is tied to a
+// changed repo (source repo in scope, or target repo-qualified to a changed
+// repo). It mirrors edgeInResolveScope MINUS the bare-unqualified rule — a bare
+// terminal edge is exactly the skippable case.
+func terminalEdgeAnchoredToScope(e *graph.Edge, scope map[string]struct{}) bool {
+	if _, ok := scope[graph.RepoPrefixOfID(e.From)]; ok {
+		return true
+	}
+	targetRepo := graph.UnresolvedRepoPrefix(e.To)
+	if targetRepo == "" {
+		targetRepo = graph.StubRepoPrefix(e.To)
+	}
+	if targetRepo == "" {
+		return false
+	}
+	_, ok := scope[targetRepo]
+	return ok
+}
+
+// reconcileTerminalStamps runs at the END of a FULL (unscoped) ResolveAll: it
+// re-classifies every edge still unresolved after all post-passes and brings
+// its durable terminal flag into agreement with the current global evidence —
+// stamping the newly-terminal, un-stamping any edge that used to be terminal
+// but now has a real candidate (self-healing). Edges already in the right state
+// are left untouched, so a converged graph performs no writes on later full
+// passes. Persisted via the batched EdgePersister capability; the in-memory
+// backend's in-place Meta mutation is already durable, so its missing
+// capability is a no-op. Returns the counts stamped / un-stamped.
+func (r *Resolver) reconcileTerminalStamps() (stamped, unstamped int) {
+	var stillPending []*graph.Edge
+	for e := range r.graph.EdgesWithUnresolvedTarget() {
+		if e != nil {
+			stillPending = append(stillPending, e)
+		}
+	}
+	var changed []*graph.Edge
+	for _, e := range stillPending {
+		reason, terminal := r.classifyTerminal(e)
+		marked := edgeTerminalFlag(e)
+		switch {
+		case terminal && !marked:
+			setEdgeTerminal(e, reason)
+			changed = append(changed, e)
+			stamped++
+		case !terminal && marked:
+			clearEdgeTerminal(e)
+			changed = append(changed, e)
+			unstamped++
+		}
+	}
+	if len(changed) > 0 {
+		if p, ok := r.graph.(graph.EdgeMetaBatchPersister); ok {
+			p.PersistEdgeAttributesBatch(changed)
+		}
+	}
+	return stamped, unstamped
+}

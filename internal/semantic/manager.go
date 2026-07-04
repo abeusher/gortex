@@ -58,6 +58,17 @@ type LSPRouter interface {
 	// mid-pass by another repo's concurrent spawn.
 	ReleaseSpecWorkspace(name, workspace string)
 
+	// MaxAlive returns the current live-provider cap (zero = unbounded),
+	// and SetMaxAlive changes it at runtime. Batch enrichment raises the
+	// cap for the duration of a multi-repo pass so concurrent passes do
+	// not evict each other's warmed servers, then restores it.
+	MaxAlive() int
+	SetMaxAlive(n int)
+
+	// EvictionCount returns the lifetime count of LRU evictions, sampled
+	// before/after a batch to observe provider churn.
+	EvictionCount() uint64
+
 	// Close shuts down every active provider. Called by Manager.Close.
 	Close() error
 }
@@ -140,11 +151,61 @@ func (m *Manager) LSPRouter() LSPRouter {
 	return m.lspRouter
 }
 
+// RepoEnrichState is the git freshness of one repo at enrichment time: the
+// HEAD commit the graph reflects and whether the working tree carried
+// uncommitted changes. The deferred-enrichment caller computes it once and
+// threads it in so the per-provider skip gate and the completion-marker write
+// agree on the identical (sha, dirty).
+type RepoEnrichState struct {
+	SHA   string
+	Dirty bool
+	// Force bypasses the completion-marker skip gate for this repo even when
+	// the marker still records SHA on a clean tree. The deferred-enrichment
+	// caller sets it when the repo was whole-repo re-parsed this run (a full
+	// re-track / cold TrackRepo via IndexCtx): that pass evicts and re-creates
+	// every node and edge, so it drops the LSP hover-enrichment edges the
+	// marker claims are present. Without the bypass the marker would skip the
+	// re-enrichment and the graph would be durably left missing that repo's
+	// enrichment edges until HEAD moves or the tree goes dirty. The clean
+	// non-partial completion still refreshes the marker afterwards.
+	Force bool
+}
+
+// EnrichOptions carries the optional per-repo freshness inputs to EnrichAll.
+// A zero value disables both the skip gate and the marker write — every
+// provider runs and nothing is persisted, matching the pre-feature behaviour
+// the tests and the inline full-index path want. Only the deferred-enrichment
+// path (a warm restart re-enriching persisted repos) supplies it.
+type EnrichOptions struct {
+	// RepoState maps a repo prefix (a roots key) to the git freshness the
+	// caller observed for it. When an entry has a non-empty SHA, EnrichAll
+	// (a) skips a provider whose persisted completion marker records the same
+	// SHA on a clean tree, and (b) writes/refreshes that marker on the
+	// provider's non-partial completion. A repo absent from the map — or with
+	// an empty SHA — is never gated (always enriched) and never marked: the
+	// same "no freshness evidence, don't skip" default the language-presence
+	// gate uses.
+	RepoState map[string]RepoEnrichState
+}
+
 // EnrichAll runs all available providers against the graph.
 // For each language, only the highest-priority available provider runs.
-func (m *Manager) EnrichAll(g graph.Store, roots map[string]string) ([]*EnrichResult, error) {
+//
+// The second return value reports, per repo prefix, whether that repo's
+// enrichment was left incomplete — true when any provider it ran was cut
+// short (Partial), abandoned at its deadline, or failed. A repo whose every
+// provider finished cleanly (or that had no eligible provider) is absent from
+// the map. Callers gating deferred-enrichment retries key off this: a partial
+// repo keeps its pending marker so a later pass retries instead of trusting an
+// incomplete graph.
+//
+// opts threads the per-repo git freshness so a provider whose persisted
+// completion marker still matches HEAD on a clean tree is skipped instead of
+// re-running its (minutes-long) hover pass; a zero value gates nothing.
+func (m *Manager) EnrichAll(g graph.Store, roots map[string]string, opts EnrichOptions) ([]*EnrichResult, map[string]bool, error) {
+	partial := make(map[string]bool)
 	if !m.config.Enabled {
-		return nil, nil
+		return nil, partial, nil
 	}
 
 	// Build a map of language → sorted providers (by priority from config).
@@ -204,7 +265,7 @@ func (m *Manager) EnrichAll(g graph.Store, roots map[string]string) ([]*EnrichRe
 			continue
 		}
 
-		results = m.runEnrichForProvider(g, roots, lang, provider, nodeCounts, results)
+		results = m.runEnrichForProvider(g, roots, lang, provider, nodeCounts, opts, results, partial)
 	}
 
 	// Router-backed LSP providers: arbitrate by priority per language
@@ -278,7 +339,7 @@ func (m *Manager) EnrichAll(g graph.Store, roots map[string]string) ([]*EnrichRe
 					if len(langs) == 0 {
 						return
 					}
-					results = m.runEnrichOne(g, repoName, repoRoot, langs[0], provider, nodeCounts[repoName], results)
+					results = m.runEnrichOne(g, repoName, repoRoot, langs[0], provider, nodeCounts[repoName], opts.RepoState[repoName], results, partial)
 				}()
 			}
 		}
@@ -298,10 +359,10 @@ func (m *Manager) EnrichAll(g graph.Store, roots map[string]string) ([]*EnrichRe
 		if gateOnPresence && !anyLangPresent(langs, present) {
 			continue
 		}
-		results = m.runEnrichForProvider(g, roots, langs[0], p, nodeCounts, results)
+		results = m.runEnrichForProvider(g, roots, langs[0], p, nodeCounts, opts, results, partial)
 	}
 
-	return results, nil
+	return results, partial, nil
 }
 
 // repoLanguages returns the union of languages present (in symbol-bearing
@@ -425,9 +486,9 @@ func (m *Manager) configPriorityFor(name string) (int, bool) {
 // repo root and appends the results. Extracted so EnrichAll can share
 // the logging + lastResults bookkeeping between eager and Router-backed
 // providers.
-func (m *Manager) runEnrichForProvider(g graph.Store, roots map[string]string, lang string, provider Provider, nodeCounts map[string]int, results []*EnrichResult) []*EnrichResult {
+func (m *Manager) runEnrichForProvider(g graph.Store, roots map[string]string, lang string, provider Provider, nodeCounts map[string]int, opts EnrichOptions, results []*EnrichResult, partial map[string]bool) []*EnrichResult {
 	for _, repoName := range sortedRootNames(roots, nodeCounts) {
-		results = m.runEnrichOne(g, repoName, roots[repoName], lang, provider, nodeCounts[repoName], results)
+		results = m.runEnrichOne(g, repoName, roots[repoName], lang, provider, nodeCounts[repoName], opts.RepoState[repoName], results, partial)
 	}
 	return results
 }
@@ -499,6 +560,29 @@ func enrichRepoTimeout(nodeCount int) time.Duration {
 	}
 }
 
+// enrichOuterCeiling is the generous outer bound the Manager places on a
+// ContextEnricher's context and its abandon-grace timer. The provider narrows
+// it to a lazy, candidate-scaled deadline once selection is done (see
+// EnrichDeadlinePolicy) — so the outer path is sized to the hard per-repo
+// ceiling, NOT the whole-repo node estimate, which is exactly the headroom
+// lazy budgeting reclaims. This only ever backstops a provider wedged in an
+// uncancellable call. GORTEX_LSP_ENRICH_TIMEOUT pins it verbatim (matching the
+// inner enrichRepoTimeout policy so the override still wins end to end);
+// "0" / "off" / "none" disables the bound; garbage falls back to the ceiling.
+func enrichOuterCeiling() time.Duration {
+	switch v := strings.TrimSpace(os.Getenv("GORTEX_LSP_ENRICH_TIMEOUT")); v {
+	case "":
+		return maxEnrichRepoTimeout
+	case "0", "off", "none":
+		return 0
+	default:
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+		return maxEnrichRepoTimeout
+	}
+}
+
 // setEnrichStatus records the lifecycle state of one (repo, provider)
 // enrichment pass for the index_health surface. result may be nil.
 func (m *Manager) setEnrichStatus(repo, provider, lang, state string, deadline time.Duration, result *EnrichResult, detail string) {
@@ -530,8 +614,17 @@ func (m *Manager) setEnrichStatus(repo, provider, lang, state string, deadline t
 		st.Degraded = result.Degraded
 		st.DegradedReason = result.DegradedReason
 	}
+	key := repo + "\x00" + provider
 	m.mu.Lock()
-	m.enrichStatus[repo+"\x00"+provider] = st
+	if state == EnrichStateRunning {
+		st.StartedAt = time.Now()
+	} else if prev, ok := m.enrichStatus[key]; ok {
+		// Carry the running pass's start time forward onto its terminal
+		// status so a caller that only polls after completion can still
+		// compute how long the pass actually ran.
+		st.StartedAt = prev.StartedAt
+	}
+	m.enrichStatus[key] = st
 	m.mu.Unlock()
 }
 
@@ -569,6 +662,141 @@ func (m *Manager) EnrichmentStatuses() []EnrichmentStatus {
 	return out
 }
 
+// EnrichmentActive reports whether any per-(repo, provider) enrichment
+// pass is currently in the running state. The LLM lifecycle gate uses it
+// to defer an expensive local-model cold load while enrichment is in
+// flight — the two must not contend for CPU/GPU/RAM on a small machine.
+func (m *Manager) EnrichmentActive() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, st := range m.enrichStatus {
+		if st.State == EnrichStateRunning {
+			return true
+		}
+	}
+	return false
+}
+
+// enrichMarkerCurrent reports whether the persisted completion marker for
+// (repoPrefix, provider) already records rs.SHA on a clean tree, so a
+// re-enrichment would confirm nothing. It returns false — never skip — when:
+// GORTEX_WARMUP_FORCE_ENRICH=1 forces a full re-enrich, the caller flagged the
+// repo rs.Force (it was whole-repo re-parsed this run, so its persisted
+// enrichment edges were evicted), the caller supplied no sha (no reliable
+// freshness signal), the working tree is dirty, the backend does not persist
+// enrichment state, no marker row exists, or the recorded sha differs. The env
+// override composes with the repo-level pending gate the deferred-enrichment
+// caller applies before ever reaching here.
+func (m *Manager) enrichMarkerCurrent(g graph.Store, repoPrefix, provider string, rs RepoEnrichState) bool {
+	if os.Getenv("GORTEX_WARMUP_FORCE_ENRICH") == "1" {
+		return false
+	}
+	// A full re-track re-parsed every file and dropped this repo's hover
+	// edges, so the marker's implicit invariant ("marker present + sha match
+	// ⇒ the graph carries the enrichment edges") no longer holds — re-enrich
+	// even though the sha still matches on a clean tree.
+	if rs.Force {
+		return false
+	}
+	if rs.SHA == "" || rs.Dirty {
+		return false
+	}
+	store, ok := g.(graph.EnrichmentStateStore)
+	if !ok {
+		return false
+	}
+	marker, found, err := store.GetEnrichmentState(repoPrefix, provider)
+	if err != nil || !found {
+		return false
+	}
+	return marker.IndexedSHA == rs.SHA
+}
+
+// recordEnrichMarker persists the completion marker for a provider that
+// finished a non-partial pass, so a later restart can skip it while the repo
+// sits at the same clean sha. No-op when the caller supplied no sha (nothing
+// to key freshness on), the working tree is dirty (the pass enriched
+// uncommitted content, so its edges do not describe the committed state the
+// HEAD sha names — the read gate enrichMarkerCurrent likewise refuses to skip
+// on a dirty tree, and recording here would be honored as authoritative once
+// the tree becomes clean at the same sha), or the backend does not persist
+// enrichment state.
+func (m *Manager) recordEnrichMarker(g graph.Store, repoPrefix, provider string, rs RepoEnrichState, coverage float64) {
+	if rs.SHA == "" || rs.Dirty {
+		return
+	}
+	store, ok := g.(graph.EnrichmentStateStore)
+	if !ok {
+		return
+	}
+	if err := store.SetEnrichmentState(graph.EnrichmentState{
+		RepoPrefix:  repoPrefix,
+		Provider:    provider,
+		IndexedSHA:  rs.SHA,
+		CompletedAt: time.Now().Unix(),
+		Coverage:    coverage,
+	}); err != nil {
+		m.logger.Warn("persist enrichment marker failed",
+			zap.String("repo", repoPrefix),
+			zap.String("provider", provider),
+			zap.Error(err),
+		)
+	}
+}
+
+// repoEnrichMarkerProvider is the reserved provider key under which the
+// whole-repo enrichment completion marker is stored in the per-(repo, provider)
+// enrichment_state table. No language provider is named this, so the row never
+// collides with a real provider's marker. It records the git revision at which
+// EVERY applicable provider finished a non-partial pass for the repo, letting a
+// warm restart decide — with a single keyed lookup, without re-deriving which
+// providers apply — whether the persisted graph's enrichment is complete or was
+// cut short (partial / abandoned) and must be resumed.
+const repoEnrichMarkerProvider = "__repo__"
+
+// RecordRepoEnrichmentComplete persists the whole-repo enrichment completion
+// marker at sha. The deferred-enrichment driver calls it once a repo's pass
+// finished with no provider left partial / abandoned / failed. It shares
+// recordEnrichMarker's discipline: a no-op on an empty sha or a dirty tree (the
+// marker must describe the committed state the sha names) and on a backend that
+// does not persist enrichment state.
+func (m *Manager) RecordRepoEnrichmentComplete(g graph.Store, repoPrefix, sha string, dirty bool) {
+	m.recordEnrichMarker(g, repoPrefix, repoEnrichMarkerProvider, RepoEnrichState{SHA: sha, Dirty: dirty}, 0)
+}
+
+// RepoEnrichmentMarkerState reports the whole-repo enrichment completion marker
+// for repoPrefix against sha. persisted is false when the backend does not
+// durably store enrichment state (the in-memory graph) — the caller then has no
+// completeness signal from the marker and must not force a pass on marker
+// evidence alone. When persisted is true, current reports whether a marker
+// exists and records exactly sha, i.e. the repo's enrichment finished at this
+// clean HEAD and need not be resumed on restart. A read error or an empty sha
+// yields (false, true): no positive evidence of completeness, but the backend
+// does persist state.
+func (m *Manager) RepoEnrichmentMarkerState(g graph.Store, repoPrefix, sha string) (current, persisted bool) {
+	store, ok := g.(graph.EnrichmentStateStore)
+	if !ok {
+		return false, false
+	}
+	if sha == "" {
+		return false, true
+	}
+	marker, found, err := store.GetEnrichmentState(repoPrefix, repoEnrichMarkerProvider)
+	if err != nil || !found {
+		return false, true
+	}
+	return marker.IndexedSHA == sha, true
+}
+
+// shortSHA truncates a git revision to its 7-char prefix for logging; a
+// shorter or empty sha is returned as-is.
+func shortSHA(sha string) string {
+	if len(sha) > 7 {
+		return sha[:7]
+	}
+	return sha
+}
+
 // runEnrichOne runs one provider against one repo root and appends the
 // result. Split out of runEnrichForProvider so the Router-backed path can
 // fetch a per-repo provider instance (keyed by the repo's workspace) before
@@ -582,7 +810,27 @@ func (m *Manager) EnrichmentStatuses() []EnrichmentStatus {
 // return — nothing completed is discarded and no goroutine is detached.
 // Legacy providers keep the old detach-on-deadline behaviour, recorded
 // as "abandoned" in the enrichment status.
-func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, provider Provider, nodeCount int, results []*EnrichResult) []*EnrichResult {
+//
+// partial records repos left incomplete: any provider that was abandoned,
+// failed, or returned a Partial result flips partial[repoName] so the caller
+// knows the repo's enrichment must be retried.
+func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, provider Provider, nodeCount int, rs RepoEnrichState, results []*EnrichResult, partial map[string]bool) []*EnrichResult {
+	// Skip a provider whose persisted completion marker already records this
+	// repo's current HEAD on a clean tree: re-running its hover pass would
+	// confirm the edges the persisted graph already carries. Only the
+	// deferred-enrichment caller supplies a marker sha; every other caller
+	// passes a zero RepoEnrichState, so enrichMarkerCurrent returns false and
+	// nothing is gated.
+	if m.enrichMarkerCurrent(g, repoName, provider.Name(), rs) {
+		m.logger.Info("semantic enrichment skipped: completion marker current",
+			zap.String("provider", provider.Name()),
+			zap.String("language", lang),
+			zap.String("repo", repoName),
+			zap.String("sha", shortSHA(rs.SHA)),
+		)
+		return results
+	}
+
 	start := time.Now()
 
 	// Readiness gate: a server whose workspace load continues past `initialize`
@@ -607,7 +855,19 @@ func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, p
 		rcancel()
 	}
 
-	d := enrichRepoTimeout(nodeCount)
+	_, isContextEnricher := provider.(ContextEnricher)
+	// A ContextEnricher derives its real per-repo deadline lazily from the
+	// post-filter candidate count (see EnrichDeadlinePolicy) — the Manager only
+	// holds a generous outer ceiling so a wedged pass can't pin the WaitGroup.
+	// Legacy providers, which never select candidates, keep the eager whole-repo
+	// scaled deadline. d is updated to the provider's lazy value (once known)
+	// before the terminal status is recorded.
+	var d time.Duration
+	if isContextEnricher {
+		d = enrichOuterCeiling()
+	} else {
+		d = enrichRepoTimeout(nodeCount)
+	}
 	m.logger.Info("semantic enrichment starting",
 		zap.String("provider", provider.Name()),
 		zap.String("language", lang),
@@ -624,13 +884,15 @@ func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, p
 	var result *EnrichResult
 	var err error
 	if ce, ok := provider.(ContextEnricher); ok {
-		// Cooperative path: the provider checks ctx between work items,
-		// lands completed work incrementally, and returns a Partial
-		// result once ctx expires at the deadline. We still wait for it
-		// on a goroutine with a bounded grace window past the deadline:
-		// a provider wedged in an uncancellable call (e.g. an unbounded
-		// LSP initialize) must not pin the enrichment WaitGroup forever
-		// — that liveness guarantee is what the old detach provided.
+		// Cooperative path: ctx carries only the generous outer ceiling; the
+		// provider narrows it to a lazy, candidate-scaled deadline (via the
+		// enrichRepoTimeout policy) once selection is done, checks it between
+		// work items, lands completed work incrementally, and returns a Partial
+		// result once it expires. We still wait on a goroutine with a bounded
+		// grace window past the ceiling: a provider wedged in an uncancellable
+		// call (e.g. an unbounded LSP initialize) must not pin the enrichment
+		// WaitGroup forever — that liveness guarantee is what the old detach
+		// provided.
 		ctx := context.Background()
 		var cancel context.CancelFunc
 		if d > 0 {
@@ -643,7 +905,11 @@ func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, p
 		}
 		done := make(chan enrichOutcome, 1)
 		go func() {
-			r, e := ce.EnrichRepoContext(ctx, g, repoName, repoRoot)
+			// enrichRepoTimeout is the lazy deadline policy: the provider calls
+			// it with its post-filter candidate count to size its own context
+			// bound (and honour the GORTEX_LSP_ENRICH_TIMEOUT override) inside
+			// the generous outer ceiling already on ctx.
+			r, e := ce.EnrichRepoContext(ctx, g, repoName, repoRoot, enrichRepoTimeout)
 			done <- enrichOutcome{r, e}
 		}()
 		if d > 0 {
@@ -662,6 +928,7 @@ func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, p
 				)
 				m.setEnrichStatus(repoName, provider.Name(), lang, EnrichStateAbandoned, d, nil,
 					"provider did not return within the post-deadline grace window; incrementally landed work is kept, the final result was discarded")
+				partial[repoName] = true
 				return results
 			}
 		} else {
@@ -706,12 +973,19 @@ func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, p
 				)
 				m.setEnrichStatus(repoName, provider.Name(), lang, EnrichStateAbandoned, d, nil,
 					"per-repo deadline exceeded; provider detached and its result discarded")
+				partial[repoName] = true
 				return results
 			}
 		} else {
 			oc := <-done
 			result, err = oc.result, oc.err
 		}
+	}
+	// Surface the deadline the ContextEnricher actually derived from its
+	// candidate count (lazy budgeting) rather than the outer ceiling. 0 means
+	// the pass ran unbounded or was a legacy provider; keep d as computed.
+	if result != nil && result.BudgetSeconds > 0 {
+		d = time.Duration(result.BudgetSeconds * float64(time.Second))
 	}
 	if err != nil {
 		m.logger.Warn("semantic enrichment failed",
@@ -720,6 +994,7 @@ func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, p
 			zap.Error(err),
 		)
 		m.setEnrichStatus(repoName, provider.Name(), lang, EnrichStateFailed, d, result, err.Error())
+		partial[repoName] = true
 		return results
 	}
 
@@ -734,6 +1009,7 @@ func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, p
 		state := EnrichStateCompleted
 		if result.Partial {
 			state = EnrichStatePartial
+			partial[repoName] = true
 		}
 		// A degraded (compile-db-missing) pass completes normally; surface its
 		// reason as the status detail when there is no abort reason to report.
@@ -742,6 +1018,15 @@ func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, p
 			detail = result.DegradedReason
 		}
 		m.setEnrichStatus(repoName, provider.Name(), lang, state, d, result, detail)
+
+		// Persist the completion marker only for a clean, non-partial pass so a
+		// later restart can skip it while the repo sits at the same sha. A
+		// partial / cut pass writes NOTHING — its marker must not claim the
+		// repo is fully enriched. recordEnrichMarker is a no-op when the caller
+		// supplied no sha or the backend does not persist enrichment state.
+		if !result.Partial {
+			m.recordEnrichMarker(g, repoName, provider.Name(), rs, result.CoveragePercent)
+		}
 
 		m.logger.Info("semantic enrichment complete",
 			zap.String("provider", provider.Name()),

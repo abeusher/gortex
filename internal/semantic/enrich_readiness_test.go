@@ -41,7 +41,7 @@ func (s *slowSolutionProvider) WaitReady(ctx context.Context, repoRoot string) e
 	return nil
 }
 
-func (s *slowSolutionProvider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPrefix, repoRoot string) (*EnrichResult, error) {
+func (s *slowSolutionProvider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPrefix, repoRoot string, deadline EnrichDeadlinePolicy) (*EnrichResult, error) {
 	res := &EnrichResult{Provider: s.name, Language: s.languages[0]}
 	// A solution-load server serves empty results until its load finishes; the
 	// readiness gate must run first for the pass to land any edges.
@@ -58,7 +58,7 @@ func TestRunEnrichOne_ReadinessGate(t *testing.T) {
 	mgr := NewManager(Config{Enabled: true}, zap.NewNop())
 	p := &slowSolutionProvider{name: "csharp-like", languages: []string{"csharp"}}
 
-	results := mgr.runEnrichOne(graph.New(), "repo", "/tmp/repo", "csharp", p, 10, nil)
+	results := mgr.runEnrichOne(graph.New(), "repo", "/tmp/repo", "csharp", p, 10, RepoEnrichState{}, nil, map[string]bool{})
 
 	require.True(t, p.waited, "readiness prober must be invoked before the enrichment pass")
 	require.Len(t, results, 1)
@@ -74,7 +74,7 @@ func TestRunEnrichOne_FastProviderSkipsReadiness(t *testing.T) {
 	// mockProvider (from manager_test.go) does not implement ReadinessProber.
 	p := &mockProvider{name: "gopls-like", languages: []string{"go"}, available: true}
 
-	results := mgr.runEnrichOne(graph.New(), "repo", "/tmp/repo", "go", p, 10, nil)
+	results := mgr.runEnrichOne(graph.New(), "repo", "/tmp/repo", "go", p, 10, RepoEnrichState{}, nil, map[string]bool{})
 
 	require.Len(t, results, 1, "a fast provider still runs; the readiness gate is simply skipped")
 	assert.Equal(t, "gopls-like", results[0].Provider)

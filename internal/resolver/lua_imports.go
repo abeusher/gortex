@@ -48,6 +48,11 @@ func (r *Resolver) resolveLuaRequires() {
 		if e == nil || !strings.HasPrefix(e.To, "unresolved::import::") {
 			continue
 		}
+		// Scoped warm pass: an unchanged repo's requires were already bound by a
+		// prior full pass, so only reconsider the changed repos' imports.
+		if !r.edgeFromInScope(e.From) {
+			continue
+		}
 		if lang := fileLang[e.From]; lang != "lua" && lang != "luau" {
 			continue
 		}

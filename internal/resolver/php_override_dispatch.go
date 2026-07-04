@@ -52,6 +52,12 @@ func (r *Resolver) resolvePHPOverrideDispatch() int {
 		if e == nil || e.IsSpeculative() {
 			continue
 		}
+		// Scoped warm pass: an unchanged repo's calls were already dispatched (or
+		// left ambiguous) by a prior full pass over the same hierarchy, so only
+		// reconsider the changed repos' calls.
+		if !r.edgeFromInScope(e.From) {
+			continue
+		}
 		name := javaUnresolvedMemberName(e.To)
 		if name == "" || strings.HasSuffix(name, ".<init>") {
 			continue

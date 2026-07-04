@@ -1025,6 +1025,35 @@ type FileMtimeDeleter interface {
 	DeleteFileMtimes(repoPrefix string, paths []string) error
 }
 
+// EnrichmentState is the per-(repo, provider) completion marker for
+// semantic enrichment: the git revision the provider last enriched the repo
+// at, when it finished, and the coverage it reached. Enrichment completion
+// otherwise lives only in an in-memory map, so a restart forgets it and
+// re-runs full LSP hover passes even though the persisted graph already
+// carries the edges. Persisting this row lets the deferred-enrichment gate
+// skip a provider whose IndexedSHA still matches HEAD on a clean tree.
+type EnrichmentState struct {
+	RepoPrefix  string
+	Provider    string
+	IndexedSHA  string
+	CompletedAt int64 // unix seconds
+	Coverage    float64
+}
+
+// EnrichmentStateStore is an optional capability backends MAY implement to
+// persist and read back the per-(repo, provider) enrichment completion
+// marker. Backends without durable state (the in-memory graph) simply do
+// not implement it — the manager type-asserts and, when the assertion
+// fails, gates nothing (it always enriches), which is the safe default.
+//
+// GetEnrichmentState's bool is false when no row has been recorded yet (a
+// never-enriched or pre-feature repo/provider), which the gate treats as
+// "freshness unknown" and never blocks on.
+type EnrichmentStateStore interface {
+	GetEnrichmentState(repoPrefix, provider string) (EnrichmentState, bool, error)
+	SetEnrichmentState(state EnrichmentState) error
+}
+
 // EdgePersister is an optional capability backends MAY implement to
 // durably rewrite the mutable attribute columns (Confidence,
 // ConfidenceLabel, Origin, Tier, Meta) of an edge already present in the
@@ -1038,6 +1067,18 @@ type FileMtimeDeleter interface {
 // so every backend keeps it. A no matching row is a no-op.
 type EdgePersister interface {
 	PersistEdgeAttributes(e *Edge)
+}
+
+// EdgeMetaBatchPersister is the batched sibling of EdgePersister for passes
+// that durably rewrite the attribute columns (Meta in particular) of many
+// edges in one sweep — the resolver's terminal-skip stamping walks the whole
+// unresolved population and flips a durable flag on the permanently external /
+// stdlib / definition-less edges. A disk backend amortises the per-edge
+// transaction overhead across the batch. The in-memory backend never
+// implements it: a read hands back the live *Edge pointer, so an in-place Meta
+// mutation is already durable and the caller's type assertion simply fails.
+type EdgeMetaBatchPersister interface {
+	PersistEdgeAttributesBatch(edges []*Edge)
 }
 
 // CloneShingleWriter is an optional capability backends MAY implement

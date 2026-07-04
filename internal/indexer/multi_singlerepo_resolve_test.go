@@ -1,6 +1,7 @@
 package indexer
 
 import (
+	"context"
 	"path/filepath"
 	"testing"
 
@@ -104,4 +105,42 @@ func TestMultiIndexer_ResolveFilePath_UnprefixedMultiRepoStaysEmpty(t *testing.T
 
 	assert.Empty(t, mi.ResolveFilePath("main.go"),
 		"bare path with two tracked repos is ambiguous and must not resolve")
+}
+
+// TestMultiIndexer_RunPreEnrichResolve_BindsInboundCrossRepoEdge is the
+// warm-restart completeness regression: on a partial restart where only the
+// provider repo re-indexed, RunPreEnrichResolve scopes the same-repo master
+// resolve to that repo but must still bind an unchanged consumer repo's inbound
+// cross-repo reference — before the daemon flips ready. Scoping the cross-repo
+// pass to the changed provider's own out-edges left the consumer-owned inbound
+// edge unresolved for the whole enrichment window despite a "ready" daemon.
+func TestMultiIndexer_RunPreEnrichResolve_BindsInboundCrossRepoEdge(t *testing.T) {
+	tmpCfg := filepath.Join(t.TempDir(), "config.yaml")
+	gc := &config.GlobalConfig{}
+	gc.SetConfigPath(tmpCfg)
+	require.NoError(t, gc.Save())
+	cm, err := config.NewConfigManager(tmpCfg)
+	require.NoError(t, err)
+
+	g := graph.New()
+	// Unchanged consumer repo-a: a call with no local definition (bare
+	// unresolved), in a shared workspace so the cross-repo boundary is open.
+	g.AddNode(&graph.Node{ID: "repo-a/a.go::Caller", Kind: graph.KindFunction, Name: "Caller", FilePath: "repo-a/a.go", Language: "go", RepoPrefix: "repo-a", WorkspaceID: "shared"})
+	// Changed provider repo-b: just added Foo, plus its file node for import
+	// reachability.
+	g.AddNode(&graph.Node{ID: "repo-b/b.go::Foo", Kind: graph.KindFunction, Name: "Foo", FilePath: "repo-b/b.go", Language: "go", RepoPrefix: "repo-b", WorkspaceID: "shared"})
+	g.AddNode(&graph.Node{ID: "repo-b/b.go", Kind: graph.KindFile, Name: "repo-b/b.go", FilePath: "repo-b/b.go", Language: "go", RepoPrefix: "repo-b", WorkspaceID: "shared"})
+	g.AddEdge(&graph.Edge{From: "repo-a/a.go", To: "repo-b/b.go", Kind: graph.EdgeImports, FilePath: "repo-a/a.go", Line: 1})
+
+	inbound := &graph.Edge{From: "repo-a/a.go::Caller", To: "unresolved::Foo", Kind: graph.EdgeCalls, FilePath: "repo-a/a.go", Line: 5}
+	g.AddEdge(inbound)
+
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+
+	// Scoped warm restart: only the provider repo-b re-indexed.
+	mi.RunPreEnrichResolve(context.Background(), map[string]struct{}{"repo-b": {}})
+
+	assert.Equal(t, "repo-b/b.go::Foo", inbound.To,
+		"pre-enrich resolve must bind the unchanged consumer's inbound edge into the changed provider before ready")
+	assert.True(t, inbound.CrossRepo)
 }
