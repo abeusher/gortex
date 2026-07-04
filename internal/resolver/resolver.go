@@ -538,59 +538,36 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 	// closure is built once and shared; each job still carries its
 	// pre-resolution target so a reverted edge is restored exactly.
 	guarded := 0
-	if closure := r.buildImportClosure(); len(closure) > 0 {
+	// The guard consults the import-reachability closure only for the caller
+	// files of the jobs the compute loop resolved. On a scoped warm pass those
+	// jobs live in the changed repos (plus any repo whose bare-name call
+	// resolved in place), so build the closure for just those repos rather than
+	// scanning every file + import edge in the workspace — the entries for the
+	// queried callers stay byte-identical, so the guard's verdicts are
+	// unchanged. An empty scope builds the whole-graph closure.
+	if closure := r.importClosureForJobs(allJobs); len(closure) > 0 {
 		for i := range allJobs {
 			guarded += r.guardCrossPackageCallEdges(allJobs[i], closure)
 		}
 	}
 
-	// Rebind cross-file Go method receivers onto the canonical type
-	// node ID. The Go extractor builds the EdgeMemberOf target as
-	// `<methodfile>::TypeName` because it parses one file at a time;
-	// methods declared in files other than the type's defining file
-	// point at a phantom ID until this pass collapses them onto the
-	// real `<typefile>::TypeName` node. See rebindGoMethodReceivers
-	// for the full rationale (InferImplements + find_implementations
-	// + class_hierarchy correctness all ride on this).
-	r.rebindGoMethodReceivers()
-
-	// Scope-aware bare-name binding. Walks `unresolved::<name>` edges
-	// whose source is inside a function and rewrites them onto the
-	// matching KindLocal / KindParam node when exactly one in-scope
-	// binding wins under the Go shadowing rules. Without this pass
-	// the worker-pool fallback would scan FindNodesByName(name)
-	// across the whole graph and fall through to `unresolved::*` for
-	// every common identifier (err / data / src / ...). The bind
-	// uses #77's KindLocal nodes — pre-#77 there was nothing to
-	// bind to.
-	r.bindBareNameScopeRefs()
-
-	// Bind in-body references to a function's own generic type
-	// parameters (`var x T`, `func F[T any]() T { ... }`) onto the
-	// pre-existing KindGenericParam nodes — without this pass they
-	// stayed as `unresolved::T` even though the parser had already
-	// materialised the tparam node.
-	r.bindGenericParamRefs()
-
-	// Attribute Go language intrinsics (append / len / make / string
-	// / int / ...) to canonical `builtin::go::*` IDs and materialise
-	// one KindBuiltin node per unique builtin. Eliminates ~50k of
-	// the bare-name `unresolved::*` population on a Go-heavy
-	// codebase and turns the analytics queries that need these
-	// targets (`find_usages(builtin::go::type::float64)` for
-	// type-drift analysis) into one-hop lookups.
-	r.attributeGoBuiltins()
-
-	// Materialise stdlib / dep / external call targets as
-	// KindFunction nodes with KindModule parents so cross-package
-	// queries (`find_usages(stdlib::fmt::Sprintf)`,
-	// `get_callers(dep::github.com/stretchr/testify/assert::True)`,
-	// "what's our usage surface on encoding/json") become one-hop
-	// lookups. Must run AFTER resolveExtern (which classifies
-	// `unresolved::extern::*` into the stdlib/dep/external buckets)
-	// so we materialise the post-classification state, not the
-	// pre-classification shape.
-	r.attributeGoExternalCalls()
+	// Post-resolution Go attribution passes: method-receiver rebind, bare-name
+	// and generic-param binding, builtin + external-call materialisation. Each
+	// pass carries its own rationale on its definition; the order is
+	// load-bearing (bare-name binding precedes builtin attribution so a local
+	// named `len` shadows the builtin). On a scoped warm restart the same five
+	// passes run per-file over just the changed repos: the per-file equivalents
+	// reproduce the whole-graph effect without the whole-graph index builds
+	// (scanning every KindLocal, every Go type) that dominate a warm restart,
+	// and unchanged repos are already in their post-full-resolve steady state,
+	// so their edges are no-ops here.
+	if len(r.scope) == 0 {
+		r.runFileAttributionPassesLocked()
+	} else {
+		for _, fp := range r.scopedFiles() {
+			r.runFileAttributionPassesForFileLocked(fp)
+		}
+	}
 
 	// Relative-import resolution for Python and Dart files. Runs
 	// before module attribution so internal-target stems never get
@@ -711,6 +688,57 @@ func edgeInResolveScope(e *graph.Edge, scope map[string]struct{}) bool {
 	// (b) Target repo-qualified to a changed repo.
 	_, ok := scope[targetRepo]
 	return ok
+}
+
+// edgeFromInScope reports whether an edge's source repo is within the active
+// resolve scope. An empty scope (whole-graph resolve) returns true for every
+// edge, so a scoped tail pass degenerates to today's behaviour. Backs the
+// post-resolve passes that have no per-file sibling: an unchanged repo's edges
+// are already in their post-full-resolve steady state, so re-running these
+// passes over them is a no-op and skipping them is a pure work saving.
+func (r *Resolver) edgeFromInScope(from string) bool {
+	if len(r.scope) == 0 {
+		return true
+	}
+	_, ok := r.scope[graph.RepoPrefixOfID(from)]
+	return ok
+}
+
+// scopedFiles returns the file paths of every KindFile node owned by a repo in
+// the active resolve scope. Callers gate on len(r.scope) > 0 first, so an empty
+// scope yields nothing. Backs the per-file dispatch of the post-resolve Go
+// attribution passes on a scoped warm restart.
+func (r *Resolver) scopedFiles() []string {
+	var files []string
+	for prefix := range r.scope {
+		for _, n := range r.graph.GetRepoNodes(prefix) {
+			if n != nil && n.Kind == graph.KindFile && n.FilePath != "" {
+				files = append(files, n.FilePath)
+			}
+		}
+	}
+	return files
+}
+
+// importClosureForJobs builds the import-reachability closure the cross-package
+// guard consults. On an unscoped pass it is the whole-graph closure. On a
+// scoped pass it is restricted to the repos that own the resolved jobs' caller
+// nodes — the only files the guard ever queries — which keeps the closure
+// entries for those callers byte-identical to the whole-graph build while
+// skipping the unchanged workspace's file + import scan.
+func (r *Resolver) importClosureForJobs(allJobs [][]reindexJob) map[string]map[string]struct{} {
+	if len(r.scope) == 0 {
+		return r.buildImportClosure()
+	}
+	repos := make(map[string]struct{})
+	for i := range allJobs {
+		for j := range allJobs[i] {
+			if e := allJobs[i][j].edge; e != nil {
+				repos[graph.RepoPrefixOfID(e.From)] = struct{}{}
+			}
+		}
+	}
+	return r.buildImportClosureFiltered(repos)
 }
 
 // buildDirIndexes builds two lookup maps for resolveImport. Populated

@@ -33,6 +33,11 @@ func (r *Resolver) resolveRazorUsings() {
 		if e == nil || !strings.HasPrefix(e.To, "unresolved::razor_using::") {
 			continue
 		}
+		// Scoped warm pass: only the changed repos carry fresh @using markers; an
+		// unchanged repo's were consumed (and removed) by a prior full pass.
+		if !r.edgeFromInScope(e.From) {
+			continue
+		}
 		if ns := strings.TrimPrefix(e.To, "unresolved::razor_using::"); ns != "" {
 			usingsByFile[e.From] = append(usingsByFile[e.From], ns)
 		}
@@ -88,6 +93,9 @@ func (r *Resolver) resolveRazorUsings() {
 	var reindexBatch []graph.EdgeReindex
 	for e := range r.graph.EdgesByKind(graph.EdgeReferences) {
 		if e == nil || !strings.HasPrefix(e.To, "unresolved::") {
+			continue
+		}
+		if !r.edgeFromInScope(e.From) {
 			continue
 		}
 		name := strings.TrimPrefix(e.To, "unresolved::")
