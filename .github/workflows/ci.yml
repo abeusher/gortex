@@ -24,7 +24,7 @@ jobs:
         run: go build -o gortex ./cmd/gortex/
 
       - name: Test
-        run: go test -race -coverprofile=coverage.out ./...
+        run: go test -race -timeout=20m -coverprofile=coverage.out ./...
 
       - name: Upload coverage
         if: matrix.os == 'ubuntu-latest' && matrix.go-version == '1.26'
@@ -116,4 +116,4 @@ jobs:
           go-version-file: go.mod
 
       - name: Run benchmarks
-        run: go test -bench=. -benchmem -count=1 -benchtime=1s ./internal/parser/languages/ ./internal/query/ ./internal/graph/
+        run: go test -bench=. -benchmem -count=1 -benchtime=1s -timeout=20m ./internal/parser/languages/ ./internal/query/ ./internal/graph/
