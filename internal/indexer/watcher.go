@@ -927,6 +927,9 @@ func (w *Watcher) drainStorm() {
 // / index dispatch, but without per-file resolver work. The caller is
 // responsible for running indexer.ResolveAll() after the batch.
 func (w *Watcher) patchGraphNoResolve(path string, kind ChangeKind) {
+	// Same disk-truth reconciliation as patchGraph: a storm-batched
+	// replace must not be evicted as a delete when the file is present.
+	kind = w.reconcileKindWithDisk(path, kind)
 	switch kind {
 	case ChangeCreated, ChangeModified:
 		if err := w.indexer.IndexFileNoResolve(path); err != nil {
@@ -938,9 +941,44 @@ func (w *Watcher) patchGraphNoResolve(path string, kind ChangeKind) {
 	}
 }
 
+// reconcileKindWithDisk corrects an event kind against the file's actual
+// on-disk state at patch time. FSEvents accumulates flags per path, so an
+// atomic replace — git checkout writing a temp file and renaming it over the
+// target, or an unlink + recreate — surfaces with ItemRemoved / ItemRenamed
+// set even though a file is right back at the same path with a new inode.
+// pickKind ranks Remove and Rename above Modify, so it classifies that replace
+// as a deletion; the delete branch then EvictFiles the definition and stubs
+// its cross-file callers with nothing to rebind them, and find_usages goes
+// silently to zero. By the time the debounced patch runs the filesystem has
+// settled, so the path's existence is authoritative: a delete/rename whose
+// path is still a regular file is really a modify (re-parse + rebind incoming
+// refs), and a create/modify whose path has vanished is really a delete. An
+// in-place write (same inode) is already a bare Modify, so it is unaffected.
+func (w *Watcher) reconcileKindWithDisk(path string, kind ChangeKind) ChangeKind {
+	info, err := os.Stat(path)
+	exists := err == nil && info.Mode().IsRegular()
+	switch kind {
+	case ChangeDeleted, ChangeRenamed:
+		if exists {
+			return ChangeModified
+		}
+	case ChangeCreated, ChangeModified:
+		if !exists {
+			return ChangeDeleted
+		}
+	}
+	return kind
+}
+
 func (w *Watcher) patchGraph(path string, kind ChangeKind) {
 	w.patchMu.Lock()
 	defer w.patchMu.Unlock()
+	// A replace/revert (rename-over or unlink+recreate) reaches us as a
+	// delete/rename even though a file is right back at the same path;
+	// reconcile against disk so it takes the parse-then-swap + incoming-
+	// rebind modify path instead of a hard evict that would silently zero
+	// the definition's callers. A vanished create/modify becomes a delete.
+	kind = w.reconcileKindWithDisk(path, kind)
 	start := time.Now()
 	var nodesAdded, nodesRemoved, edgesAdded, edgesRemoved int
 
