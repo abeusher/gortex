@@ -159,6 +159,16 @@ func (m *Manager) LSPRouter() LSPRouter {
 type RepoEnrichState struct {
 	SHA   string
 	Dirty bool
+	// Force bypasses the completion-marker skip gate for this repo even when
+	// the marker still records SHA on a clean tree. The deferred-enrichment
+	// caller sets it when the repo was whole-repo re-parsed this run (a full
+	// re-track / cold TrackRepo via IndexCtx): that pass evicts and re-creates
+	// every node and edge, so it drops the LSP hover-enrichment edges the
+	// marker claims are present. Without the bypass the marker would skip the
+	// re-enrichment and the graph would be durably left missing that repo's
+	// enrichment edges until HEAD moves or the tree goes dirty. The clean
+	// non-partial completion still refreshes the marker afterwards.
+	Force bool
 }
 
 // EnrichOptions carries the optional per-repo freshness inputs to EnrichAll.
@@ -670,13 +680,22 @@ func (m *Manager) EnrichmentActive() bool {
 // enrichMarkerCurrent reports whether the persisted completion marker for
 // (repoPrefix, provider) already records rs.SHA on a clean tree, so a
 // re-enrichment would confirm nothing. It returns false — never skip — when:
-// GORTEX_WARMUP_FORCE_ENRICH=1 forces a full re-enrich, the caller supplied
-// no sha (no reliable freshness signal), the working tree is dirty, the
-// backend does not persist enrichment state, no marker row exists, or the
-// recorded sha differs. The env override composes with the repo-level pending
-// gate the deferred-enrichment caller applies before ever reaching here.
+// GORTEX_WARMUP_FORCE_ENRICH=1 forces a full re-enrich, the caller flagged the
+// repo rs.Force (it was whole-repo re-parsed this run, so its persisted
+// enrichment edges were evicted), the caller supplied no sha (no reliable
+// freshness signal), the working tree is dirty, the backend does not persist
+// enrichment state, no marker row exists, or the recorded sha differs. The env
+// override composes with the repo-level pending gate the deferred-enrichment
+// caller applies before ever reaching here.
 func (m *Manager) enrichMarkerCurrent(g graph.Store, repoPrefix, provider string, rs RepoEnrichState) bool {
 	if os.Getenv("GORTEX_WARMUP_FORCE_ENRICH") == "1" {
+		return false
+	}
+	// A full re-track re-parsed every file and dropped this repo's hover
+	// edges, so the marker's implicit invariant ("marker present + sha match
+	// ⇒ the graph carries the enrichment edges") no longer holds — re-enrich
+	// even though the sha still matches on a clean tree.
+	if rs.Force {
 		return false
 	}
 	if rs.SHA == "" || rs.Dirty {

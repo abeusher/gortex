@@ -100,6 +100,44 @@ func Hello() {}
 	assert.Greater(t, result.EdgeCount, 0)
 }
 
+// TestIndexCtx_FlagsFullReindexForEnrichForce locks the wiring the enrichment
+// completion marker depends on: a whole-repo IndexCtx re-parse evicts and
+// re-creates every node/edge (dropping the repo's LSP hover-enrichment edges),
+// so it must flag fullReindexed. runDeferredEnrich threads that into
+// RepoEnrichState.Force to re-run enrichment past the marker gate even at an
+// unchanged clean HEAD — without it a full re-track durably drops the repo's
+// enrichment edges.
+func TestIndexCtx_FlagsFullReindexForEnrichForce(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "main.go"), "package main\n\nfunc Hello() {}\n")
+
+	g := graph.New()
+	idx := newTestIndexer(g)
+	require.False(t, idx.fullReindexed.Load(), "a fresh indexer has re-parsed nothing")
+
+	_, err := idx.Index(dir)
+	require.NoError(t, err)
+	assert.True(t, idx.fullReindexed.Load(),
+		"a whole-repo re-parse must flag fullReindexed so deferred enrichment forces past the completion marker")
+}
+
+// TestIncrementalReindexPaths_LeavesFullReindexClear is the boundary: a scoped
+// incremental re-parse touches only the changed files and leaves every other
+// file's enrichment edges intact, so it must NOT force a whole-repo re-enrich
+// (which would re-run the multi-minute hover pass on every scoped save).
+func TestIncrementalReindexPaths_LeavesFullReindexClear(t *testing.T) {
+	dir := t.TempDir()
+	main := filepath.Join(dir, "main.go")
+	writeFile(t, main, "package main\n\nfunc Hello() {}\n")
+
+	g := graph.New()
+	idx := newTestIndexer(g)
+	_, err := idx.IncrementalReindexPaths(dir, []string{main})
+	require.NoError(t, err)
+	assert.False(t, idx.fullReindexed.Load(),
+		"a scoped incremental re-parse must leave fullReindexed clear")
+}
+
 func TestIndex_MultipleFiles(t *testing.T) {
 	dir := setupTestDir(t)
 

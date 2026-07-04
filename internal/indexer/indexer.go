@@ -333,6 +333,18 @@ type Indexer struct {
 	// failed enrich leaves it set so a later deferred pass retries.
 	pendingEnrich atomic.Bool
 
+	// fullReindexed is raised by a whole-repo (re-)parse — IndexCtx, reached
+	// via a full re-track, a cold TrackRepo, or a snapshot-partial forced full
+	// walk — which evicts and re-creates every node and edge for the repo. That
+	// drops the LSP hover-enrichment edges a static re-parse cannot reproduce,
+	// so the deferred-enrichment pass must re-run even when the persisted
+	// completion marker still records the repo's HEAD on a clean tree. It
+	// threads Force into RepoEnrichState so enrichMarkerCurrent stops gating the
+	// pass out (a scoped IncrementalReindex, which re-parses only changed files,
+	// leaves it clear). A fresh Indexer per daemon run starts it false, so it
+	// only ever reflects work this run performed.
+	fullReindexed atomic.Bool
+
 	// deferGlobalPasses, when set, makes IndexCtx and IncrementalReindex
 	// skip the graph-wide derivation passes (InferImplements,
 	// InferOverrides, markTestSymbolsAndEmitEdges). These passes walk the
@@ -1000,9 +1012,12 @@ func (idx *Indexer) runDeferredEnrich() {
 	// identical (sha, dirty): a provider whose persisted marker still matches
 	// HEAD on a clean tree is skipped instead of re-running its hover pass.
 	sha, dirty := repoHeadAndDirty(idx.rootPath)
+	// A whole-repo re-parse this run evicted the persisted hover edges, so force
+	// the pass past the completion-marker gate — an unchanged clean HEAD would
+	// otherwise skip re-enrichment and leave the repo's LSP edges durably gone.
 	opts := semantic.EnrichOptions{
 		RepoState: map[string]semantic.RepoEnrichState{
-			idx.repoPrefix: {SHA: sha, Dirty: dirty},
+			idx.repoPrefix: {SHA: sha, Dirty: dirty, Force: idx.fullReindexed.Load()},
 		},
 	}
 	results, partialRepos, err := idx.semanticMgr.EnrichAll(idx.graph, roots, opts)
@@ -3104,6 +3119,10 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 	// caller after this returns, so FileCount carries the signal here.
 	if result.FileCount > 0 || result.FullRetrack {
 		idx.pendingEnrich.Store(true)
+		// IndexCtx re-parsed every file, dropping this repo's hover-enrichment
+		// edges — force the deferred pass past the completion-marker gate so
+		// they are restored even at an unchanged clean HEAD.
+		idx.fullReindexed.Store(true)
 	}
 	return result, nil
 }

@@ -208,6 +208,36 @@ func TestEnrichAll_ForceEnvBypassesMarkerGate(t *testing.T) {
 	assert.Len(t, results, 1)
 }
 
+// TestEnrichAll_ForceRepoStateBypassesMarkerGate: a repo flagged Force in its
+// RepoEnrichState re-runs the provider even when the completion marker still
+// records its sha on a clean tree. A whole-repo re-track sets Force because it
+// evicted the persisted enrichment edges the marker claims are present, so
+// skipping re-enrichment would leave the graph durably missing them.
+func TestEnrichAll_ForceRepoStateBypassesMarkerGate(t *testing.T) {
+	mgr, ran := markerManager(t)
+	g := newMarkerStore(t)
+	require.NoError(t, g.SetEnrichmentState(graph.EnrichmentState{
+		RepoPrefix: markerRepo, Provider: "test-go", IndexedSHA: "abc123",
+	}))
+
+	opts := EnrichOptions{RepoState: map[string]RepoEnrichState{
+		markerRepo: {SHA: "abc123", Force: true},
+	}}
+	results, partial, err := mgr.EnrichAll(g, markerRoots(t), opts)
+	require.NoError(t, err)
+	assert.True(t, *ran, "Force must bypass the marker skip gate even at a matching clean sha")
+	require.Len(t, results, 1)
+	assert.False(t, partial[markerRepo])
+
+	// The clean non-partial completion refreshed the marker at the same sha, so
+	// a later unchanged restart (Force=false) skips again — Force invalidates
+	// the stale marker, it does not stop the pass from recording a fresh one.
+	got, found, err := g.GetEnrichmentState(markerRepo, "test-go")
+	require.NoError(t, err)
+	require.True(t, found, "a forced clean completion must still persist a marker")
+	assert.Equal(t, "abc123", got.IndexedSHA)
+}
+
 // TestEnrichAll_MemoryBackendNeverGates: a backend that does not persist
 // enrichment state (the in-memory graph) never gates — the type assertion
 // fails, so the provider always runs even with a current-looking sha.
