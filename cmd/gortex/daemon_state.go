@@ -194,16 +194,41 @@ func buildDaemonState(logger *zap.Logger) (*daemonState, error) {
 	}, nil
 }
 
+// warmupTimings collects the per-phase costs of one warmupDaemonState run so
+// the caller can emit a single summary line instead of reconstructing what a
+// restart did from five differently-shaped per-phase log lines. Populated by
+// capturing the same phaseStart/time.Since pairs the existing per-phase logs
+// already compute — those logs stay untouched; this just also keeps the
+// values around instead of discarding them.
+type warmupTimings struct {
+	parse         time.Duration
+	resolve       time.Duration
+	globalResolve time.Duration
+	endBatch      time.Duration
+	// reposChanged is the number of tracked repos whose reindex actually did
+	// work this warmup (cold track, or a reconcile with stale/deleted files).
+	reposChanged int
+	// filesReindexed sums, across every changed repo, either FileCount (a
+	// full retrack) or StaleFileCount+DeletedFileCount (an incremental
+	// reconcile).
+	filesReindexed int
+	// enrichScheduled is the number of repos whose deferred semantic
+	// enrichment was actually dispatched, as returned by RunDeferredPassesAll.
+	enrichScheduled int
+}
+
 // warmupDaemonState performs the per-repo parse loop, resolves references,
 // runs the background enrichment, and brings up the MultiWatcher. Split out
 // from buildDaemonState so the daemon can open its socket and accept
 // connections before this work finishes. markReady is invoked once references
 // are resolved and the graph is queryable — ahead of the slow enrichment pass
 // — so the daemon reports ready as soon as find_usages / get_callers return
-// complete results, not after enrichment finishes.
-func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func()) *indexer.MultiWatcher {
+// complete results, not after enrichment finishes. The returned *warmupTimings
+// is never nil — daemon.go uses it to emit a one-line warmup summary.
+func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func()) (*indexer.MultiWatcher, *warmupTimings) {
+	timings := &warmupTimings{}
 	if state.multiIndexer == nil || state.configManager == nil {
-		return nil
+		return nil, timings
 	}
 
 	ctx := progress.WithReporter(context.Background(), progress.Nop{})
@@ -295,6 +320,11 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// pure recomputation and get skipped, which is what makes a true warm
 	// restart near-instant instead of replaying the full cold-warmup cost.
 	var changedRepos atomic.Int64
+	// filesReindexed sums the actual file-level work behind changedRepos: a
+	// full retrack counts its whole FileCount, an incremental reconcile
+	// counts only the files it touched (stale + deleted). Read once into
+	// timings.filesReindexed after wg.Wait() below.
+	var filesReindexed atomic.Int64
 	// changedPrefixes records the repo prefix of every repo that did indexing
 	// work, so the end-of-warmup RunGlobalGraphPasses can scope the per-repo
 	// clone detection + Rebuild to just those repos instead of every tracked
@@ -384,6 +414,7 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 							scopeUnknown.Store(true)
 						case res != nil && (res.StaleFileCount > 0 || res.DeletedFileCount > 0 || len(res.FailedFiles) > 0 || res.FullRetrack):
 							changedRepos.Add(1)
+							filesReindexed.Add(int64(reconcileFileCount(res)))
 							if res.RepoPrefix != "" {
 								changedPrefixes.Store(res.RepoPrefix, struct{}{})
 							} else {
@@ -424,6 +455,9 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 								zap.String("path", entry.Path), zap.Error(err))
 							scopeUnknown.Store(true)
 						} else if res != nil && res.RepoPrefix != "" {
+							// A cold TrackRepoCtx is itself a full retrack — its
+							// FileCount is the whole repo's file-level work.
+							filesReindexed.Add(int64(res.FileCount))
 							changedPrefixes.Store(res.RepoPrefix, struct{}{})
 						} else {
 							scopeUnknown.Store(true)
@@ -445,6 +479,8 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	}
 	close(jobs)
 	wg.Wait()
+	timings.parse = time.Since(phaseStart)
+	timings.filesReindexed = int(filesReindexed.Load())
 	logger.Info("daemon: warmup phase done",
 		zap.String("phase", "parallel_parse"),
 		zap.Duration("elapsed", time.Since(phaseStart)))
@@ -466,6 +502,7 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// The in-memory backend reaches here too, but its snapshot replay
 	// already restored the derived edges, so the skip is equally safe.
 	anyChanged := changedRepos.Load() > 0
+	timings.reposChanged = int(changedRepos.Load())
 	logger.Info("daemon: warmup change detection",
 		zap.Int64("changed_repos", changedRepos.Load()),
 		zap.Int("tracked_repos", len(repos)),
@@ -503,6 +540,7 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 		phaseStart = time.Now()
 		publishReadinessPhase(state, "resolve", false, nil)
 		state.multiIndexer.RunPreEnrichResolve(ctx, resolveScope)
+		timings.resolve = time.Since(phaseStart)
 		logger.Info("daemon: warmup phase done",
 			zap.String("phase", "resolve"),
 			zap.Duration("elapsed", time.Since(phaseStart)))
@@ -528,7 +566,7 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	if anyChanged {
 		phaseStart = time.Now()
 		publishReadinessPhase(state, "deferred_passes_all", true, nil)
-		state.multiIndexer.RunDeferredPassesAll(ctx)
+		timings.enrichScheduled = state.multiIndexer.RunDeferredPassesAll(ctx)
 		logger.Info("daemon: warmup phase done",
 			zap.String("phase", "deferred_passes_all"),
 			zap.Duration("elapsed", time.Since(phaseStart)))
@@ -612,6 +650,7 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 		phaseStart = time.Now()
 		publishReadinessPhase(state, "global_resolve", true, nil)
 		state.multiIndexer.RunGlobalResolve()
+		timings.globalResolve = time.Since(phaseStart)
 		logger.Info("daemon: warmup phase done",
 			zap.String("phase", "global_resolve"),
 			zap.Duration("elapsed", time.Since(phaseStart)))
@@ -645,6 +684,7 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	} else {
 		state.multiIndexer.ResetBatch()
 	}
+	timings.endBatch = time.Since(phaseStart)
 	logger.Info("daemon: warmup phase done",
 		zap.String("phase", "end_batch"),
 		zap.Duration("elapsed", time.Since(phaseStart)))
@@ -680,17 +720,40 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	mw, err := indexer.NewMultiWatcher(state.multiIndexer, watchCfgs, logger)
 	if err != nil {
 		logger.Warn("daemon: multi-watcher init failed", zap.Error(err))
-		return nil
+		return nil, timings
 	}
 	if err := mw.Start(); err != nil {
 		logger.Warn("daemon: multi-watcher start failed", zap.Error(err))
-		return nil
+		return nil, timings
 	}
 	logger.Info("daemon: watching", zap.Int("repos", len(watchCfgs)))
 	publishReadinessPhase(state, "watcher_started", true, map[string]any{
 		"watched_repos": len(watchCfgs),
 	})
-	return mw
+	return mw, timings
+}
+
+// logWarmupSummary emits the one-line warmup recap: reconstructing what a
+// restart did otherwise means joining the parallel_parse / resolve /
+// deferred_passes_all / global_resolve / end_batch per-phase log lines (each
+// logged separately, above, as the phases run) plus the separate "graph
+// queryable" / "enrichment complete" lines. queryable is the elapsed time at
+// markReady (find_usages / get_callers become complete); total is the
+// elapsed time at MarkEnriched (the full warmup, including enrichment).
+func logWarmupSummary(logger *zap.Logger, warmup *warmupTimings, queryable, total time.Duration) {
+	if logger == nil || warmup == nil {
+		return
+	}
+	logger.Info("daemon: warmup summary",
+		zap.Float64("parse_s", warmup.parse.Seconds()),
+		zap.Float64("resolve_s", warmup.resolve.Seconds()),
+		zap.Float64("global_resolve_s", warmup.globalResolve.Seconds()),
+		zap.Float64("end_batch_s", warmup.endBatch.Seconds()),
+		zap.Float64("queryable_s", queryable.Seconds()),
+		zap.Int("repos_changed", warmup.reposChanged),
+		zap.Int("files_reindexed", warmup.filesReindexed),
+		zap.Int("enrich_scheduled", warmup.enrichScheduled),
+		zap.Float64("total_s", total.Seconds()))
 }
 
 // publishReadinessPhase forwards a workspace_readiness phase
@@ -775,6 +838,22 @@ func warmMtimePrefix(effective string, repoCount int) (prefix string, ok bool) {
 		return "", false
 	}
 	return effective, true
+}
+
+// reconcileFileCount returns the number of files to count as "reindexed"
+// for one repo's ReconcileRepoCtx result, for the warmup summary's
+// filesReindexed total. A full retrack has no enumerated changed-file set
+// (see the fullRetrack comment in ReconcileRepoCtx), so its whole FileCount
+// stands in for the work done; an incremental reconcile counts only the
+// files it actually touched (stale + deleted).
+func reconcileFileCount(res *indexer.IndexResult) int {
+	if res == nil {
+		return 0
+	}
+	if res.FullRetrack {
+		return res.FileCount
+	}
+	return res.StaleFileCount + res.DeletedFileCount
 }
 
 // storeNeedsRebuild reports whether the backend signalled, via the optional

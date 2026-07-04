@@ -407,13 +407,29 @@ func (mi *MultiIndexer) BeginParallelBatch() {
 // suppressed here because resolver.ResolveAll walks the entire shared graph
 // — paying it R times is O(R · E). One master resolver.New(graph).ResolveAll
 // runs at the end to lift the placeholder edges enrichment + contracts added.
-func (mi *MultiIndexer) RunDeferredPassesAll(ctx context.Context) {
+//
+// Returns the number of repos whose deferred semantic enrichment was
+// actually dispatched (pendingEnrich set, or forced via
+// GORTEX_WARMUP_FORCE_ENRICH) rather than skipped as unchanged. Sampled
+// before runDeferredEnrichParallel runs, since a successful non-partial
+// pass clears the flag it reads.
+func (mi *MultiIndexer) RunDeferredPassesAll(ctx context.Context) int {
 	mi.mu.RLock()
 	indexers := make([]*Indexer, 0, len(mi.indexers))
 	for _, idx := range mi.indexers {
 		indexers = append(indexers, idx)
 	}
 	mi.mu.RUnlock()
+	forced := os.Getenv("GORTEX_WARMUP_FORCE_ENRICH") == "1"
+	enrichScheduled := 0
+	for _, idx := range indexers {
+		if idx.semanticMgr == nil || !idx.semanticMgr.Enabled() || !idx.semanticMgr.HasProviders() {
+			continue
+		}
+		if idx.pendingEnrich.Load() || forced {
+			enrichScheduled++
+		}
+	}
 	for _, idx := range indexers {
 		idx.SetSkipResolveInDeferred(true)
 	}
@@ -441,6 +457,7 @@ func (mi *MultiIndexer) RunDeferredPassesAll(ctx context.Context) {
 	// Whole-graph (nil scope): enrichment can mint placeholder edges in any
 	// repo, and scoping this catch-up is left to a follow-up.
 	mi.runMasterResolve(nil)
+	return enrichScheduled
 }
 
 // runMasterResolve runs one same-repo resolver over the whole shared graph,

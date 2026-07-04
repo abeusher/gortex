@@ -532,8 +532,10 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		// queryable — ahead of the slow enrichment pass — so clients can
 		// start issuing find_usages / get_callers immediately. Enrichment
 		// continues in this goroutine afterward and finishes at MarkEnriched.
+		var queryableElapsed time.Duration
 		markReady := func() {
 			elapsed := time.Since(start)
+			queryableElapsed = elapsed
 			controller.MarkReady(elapsed)
 			logger.Info("daemon: graph queryable", zap.Duration("warmup", elapsed))
 			publishReadinessPhase(state, "ready", true, map[string]any{
@@ -542,7 +544,7 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 				"warmup_ms":      elapsed.Milliseconds(),
 			})
 		}
-		mw := warmupDaemonState(state, logger, markReady)
+		mw, warmup := warmupDaemonState(state, logger, markReady)
 		controller.AttachWatcher(mw)
 		// Wire the daemon's MultiWatcher into the per-server history
 		// surface so `get_recent_changes` and `get_symbol_history` see
@@ -593,6 +595,7 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 			"warmup_seconds": int64(elapsed.Seconds()),
 			"warmup_ms":      elapsed.Milliseconds(),
 		})
+		logWarmupSummary(logger, warmup, queryableElapsed, elapsed)
 	}()
 
 	return srv.Serve()
