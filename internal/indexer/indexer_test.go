@@ -124,7 +124,10 @@ func TestIndexCtx_FlagsFullReindexForEnrichForce(t *testing.T) {
 // TestIncrementalReindexPaths_LeavesFullReindexClear is the boundary: a scoped
 // incremental re-parse touches only the changed files and leaves every other
 // file's enrichment edges intact, so it must NOT force a whole-repo re-enrich
-// (which would re-run the multi-minute hover pass on every scoped save).
+// (which would re-run the multi-minute hover pass on every scoped save). It
+// must, however, flag reparsedThisRun — the re-parsed file's own hover edges
+// WERE evicted, so the deferred pass still has to run past the completion
+// marker, just scoped to that file rather than the whole repo.
 func TestIncrementalReindexPaths_LeavesFullReindexClear(t *testing.T) {
 	dir := t.TempDir()
 	main := filepath.Join(dir, "main.go")
@@ -132,10 +135,86 @@ func TestIncrementalReindexPaths_LeavesFullReindexClear(t *testing.T) {
 
 	g := graph.New()
 	idx := newTestIndexer(g)
-	_, err := idx.IncrementalReindexPaths(dir, []string{main})
+	result, err := idx.IncrementalReindexPaths(dir, []string{main})
 	require.NoError(t, err)
+	require.Positive(t, result.StaleFileCount, "the fresh file must re-parse")
 	assert.False(t, idx.fullReindexed.Load(),
 		"a scoped incremental re-parse must leave fullReindexed clear")
+	assert.True(t, idx.reparsedThisRun.Load(),
+		"a scoped incremental re-parse still evicted the changed file's hover edges, so it must flag reparsedThisRun to force the deferred enrich past the completion marker")
+}
+
+// TestIncrementalReindexPaths_MtimeBumpFlagsReparse mirrors the durable-loss
+// scenario: after a repo is indexed and its enrichment marker recorded at a
+// clean HEAD, a git checkout-and-back / stash-pop / no-op save bumps a file's
+// mtime without changing its content or moving HEAD. The scoped warm-restart
+// route re-parses the mtime-drifted file (dropping its hover edges), so it must
+// flag reparsedThisRun — otherwise runDeferredEnrich builds Force=false, the
+// completion marker still matches on the clean tree, and the re-parsed file's
+// LSP edges stay durably gone.
+func TestIncrementalReindexPaths_MtimeBumpFlagsReparse(t *testing.T) {
+	dir := t.TempDir()
+	main := filepath.Join(dir, "main.go")
+	const content = "package main\n\nfunc Hello() {}\n"
+	writeFile(t, main, content)
+
+	g := graph.New()
+	idx := newTestIndexer(g)
+	_, err := idx.Index(dir)
+	require.NoError(t, err)
+	require.False(t, idx.reparsedThisRun.Load(),
+		"reparsedThisRun is a scoped-path flag; a full Index uses fullReindexed instead")
+
+	// Same bytes, later mtime — a touch / checkout-roundtrip, content unchanged.
+	bumpMtime(t, main, content)
+	result, err := idx.IncrementalReindexPaths(dir, []string{main})
+	require.NoError(t, err)
+	require.Positive(t, result.StaleFileCount,
+		"an mtime bump must classify the content-identical file as stale and re-parse it")
+	assert.True(t, idx.reparsedThisRun.Load(),
+		"a scoped re-parse of an mtime-drifted file must force the deferred enrich past the completion marker")
+}
+
+// TestIncrementalReindex_MtimeBumpFlagsReparse is the whole-root sibling of
+// TestIncrementalReindexPaths_MtimeBumpFlagsReparse: the non-scoped incremental
+// path also re-parses mtime-drifted files and must flag reparsedThisRun.
+func TestIncrementalReindex_MtimeBumpFlagsReparse(t *testing.T) {
+	dir := t.TempDir()
+	main := filepath.Join(dir, "main.go")
+	const content = "package main\n\nfunc Hello() {}\n"
+	writeFile(t, main, content)
+
+	g := graph.New()
+	idx := newTestIndexer(g)
+	_, err := idx.Index(dir)
+	require.NoError(t, err)
+	require.False(t, idx.reparsedThisRun.Load())
+
+	bumpMtime(t, main, content)
+	result, err := idx.IncrementalReindex(dir)
+	require.NoError(t, err)
+	require.Positive(t, result.StaleFileCount)
+	assert.True(t, idx.reparsedThisRun.Load(),
+		"a whole-root incremental re-parse must also force the deferred enrich past the completion marker")
+}
+
+// TestIncrementalReindex_NoChangeLeavesReparseClear guards the other side: a
+// zero-change reconcile re-parses nothing, so reparsedThisRun stays clear and an
+// unchanged repo at a current marker is legitimately skipped.
+func TestIncrementalReindex_NoChangeLeavesReparseClear(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "main.go"), "package main\n\nfunc Hello() {}\n")
+
+	g := graph.New()
+	idx := newTestIndexer(g)
+	_, err := idx.Index(dir)
+	require.NoError(t, err)
+
+	result, err := idx.IncrementalReindex(dir)
+	require.NoError(t, err)
+	require.Zero(t, result.StaleFileCount, "nothing changed on disk")
+	assert.False(t, idx.reparsedThisRun.Load(),
+		"a zero-change reconcile must not force re-enrichment")
 }
 
 func TestIndex_MultipleFiles(t *testing.T) {

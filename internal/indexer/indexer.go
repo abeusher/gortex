@@ -340,10 +340,24 @@ type Indexer struct {
 	// so the deferred-enrichment pass must re-run even when the persisted
 	// completion marker still records the repo's HEAD on a clean tree. It
 	// threads Force into RepoEnrichState so enrichMarkerCurrent stops gating the
-	// pass out (a scoped IncrementalReindex, which re-parses only changed files,
-	// leaves it clear). A fresh Indexer per daemon run starts it false, so it
-	// only ever reflects work this run performed.
+	// pass out. A fresh Indexer per daemon run starts it false, so it only ever
+	// reflects work this run performed.
 	fullReindexed atomic.Bool
+
+	// reparsedThisRun is the scoped analogue of fullReindexed: it is raised by a
+	// scoped incremental pass that re-parsed at least one stale file this run —
+	// IncrementalReindexPaths / IncrementalReindex with a non-zero
+	// StaleFileCount. A scoped re-parse evicts and re-creates just the changed
+	// files' nodes, dropping THEIR hover-enrichment edges exactly as a whole-repo
+	// re-parse drops every node's, so the deferred pass must likewise run past
+	// the completion marker at an unchanged clean HEAD — otherwise the re-parsed
+	// files' LSP edges stay durably gone until the repo's HEAD moves or its tree
+	// goes dirty. runDeferredEnrich ORs it into RepoEnrichState.Force; because the
+	// hover provider skips already-stamped nodes, the marker bypass re-hovers only
+	// the freshly-unstamped re-parsed files, not the whole repo, so the cost stays
+	// bounded. fullReindexed stays clear on the scoped paths — this flag keeps the
+	// two claims distinct. A fresh Indexer per daemon run starts it false.
+	reparsedThisRun atomic.Bool
 
 	// deferGlobalPasses, when set, makes IndexCtx and IncrementalReindex
 	// skip the graph-wide derivation passes (InferImplements,
@@ -1012,12 +1026,16 @@ func (idx *Indexer) runDeferredEnrich() {
 	// identical (sha, dirty): a provider whose persisted marker still matches
 	// HEAD on a clean tree is skipped instead of re-running its hover pass.
 	sha, dirty := repoHeadAndDirty(idx.rootPath)
-	// A whole-repo re-parse this run evicted the persisted hover edges, so force
-	// the pass past the completion-marker gate — an unchanged clean HEAD would
-	// otherwise skip re-enrichment and leave the repo's LSP edges durably gone.
+	// A re-parse this run evicted the persisted hover edges of the re-parsed
+	// files, so force the pass past the completion-marker gate — an unchanged
+	// clean HEAD would otherwise skip re-enrichment and leave those files' LSP
+	// edges durably gone. fullReindexed covers a whole-repo re-parse (IndexCtx);
+	// reparsedThisRun covers a scoped incremental re-parse that dropped only the
+	// changed files' edges. Either forces the pass; the provider re-hovers only
+	// the freshly-unstamped nodes, so a scoped force stays bounded to those files.
 	opts := semantic.EnrichOptions{
 		RepoState: map[string]semantic.RepoEnrichState{
-			idx.repoPrefix: {SHA: sha, Dirty: dirty, Force: idx.fullReindexed.Load()},
+			idx.repoPrefix: {SHA: sha, Dirty: dirty, Force: idx.fullReindexed.Load() || idx.reparsedThisRun.Load()},
 		},
 	}
 	results, partialRepos, err := idx.semanticMgr.EnrichAll(idx.graph, roots, opts)
@@ -4857,6 +4875,12 @@ func (idx *Indexer) IncrementalReindexPaths(root string, paths []string) (*Index
 	if result.StaleFileCount > 0 || result.DeletedFileCount > 0 {
 		idx.pendingEnrich.Store(true)
 	}
+	// A re-parsed stale file's hover-enrichment edges were evicted with its old
+	// nodes, so force the deferred pass past the completion marker (a deletion
+	// evicts nodes but creates no fresh unstamped ones, so it alone does not).
+	if result.StaleFileCount > 0 {
+		idx.reparsedThisRun.Store(true)
+	}
 	return result, nil
 }
 
@@ -5100,6 +5124,12 @@ func (idx *Indexer) IncrementalReindex(root string) (*IndexResult, error) {
 	// reconcile leaves the marker untouched so an unchanged repo is skipped.
 	if result.StaleFileCount > 0 || result.DeletedFileCount > 0 {
 		idx.pendingEnrich.Store(true)
+	}
+	// A re-parsed stale file's hover-enrichment edges were evicted with its old
+	// nodes, so force the deferred pass past the completion marker (a deletion
+	// evicts nodes but creates no fresh unstamped ones, so it alone does not).
+	if result.StaleFileCount > 0 {
+		idx.reparsedThisRun.Store(true)
 	}
 	return result, nil
 }
