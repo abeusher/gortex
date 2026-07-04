@@ -16,6 +16,7 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/llm"
+	"github.com/zzet/gortex/internal/persistence"
 	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/review"
 )
@@ -601,8 +602,14 @@ func TestSuppressFinding_SuppressesAcrossReviews(t *testing.T) {
 	dir, file := reviewGitRepo(t)
 	srv := indexedSiblingServer(t, dir)
 	// Wire a sidecar-backed suppression store at a temp cache dir.
-	srv.InitSuppressions(t.TempDir(), dir)
+	cacheDir := t.TempDir()
+	srv.InitSuppressions(cacheDir, dir)
 	require.NotNil(t, srv.suppressions)
+	t.Cleanup(func() {
+		sidecar, err := persistence.OpenSidecar(persistence.DefaultSidecarPath(cacheDir))
+		require.NoError(t, err)
+		require.NoError(t, sidecar.Close())
+	})
 
 	// First review: the finding is present and carries an identity key.
 	out := decodeReview(t, callReview(t, srv, map[string]any{"base": "base-ref"}))
