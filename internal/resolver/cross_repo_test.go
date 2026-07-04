@@ -315,74 +315,33 @@ func TestCrossRepoResolveAll_RefusesCrossWorkspaceNameCollision(t *testing.T) {
 	assert.False(t, edge.CrossRepo)
 }
 
-// TestCrossRepoResolveForRepos is the multi-prefix form of
-// TestCrossRepoResolveForRepo: unioning several repos' edge sets and resolving
-// them in one pass must resolve exactly those repos' out-edges and leave every
-// other repo's edges untouched.
-func TestCrossRepoResolveForRepos(t *testing.T) {
+// TestCrossRepoResolveAll_BindsInboundEdgeIntoChangedRepo locks the warm-restart
+// completeness guarantee: when an unchanged consumer repo already holds a bare
+// unresolved reference and a provider repo later adds the matching definition,
+// the whole-graph cross-repo resolve must bind that inbound reference. A pass
+// scoped to only the changed provider's OWN out-edges would never see the
+// consumer-owned edge, which is why the pre-enrich cross-repo resolve stays
+// whole-graph.
+func TestCrossRepoResolveAll_BindsInboundEdgeIntoChangedRepo(t *testing.T) {
 	g := graph.New()
 
-	// repoA and repoC each call into repoB; repoD calls into repoB too but is
-	// left out of the scope, so its edge must stay unresolved.
-	g.AddNode(&graph.Node{ID: "repoA/a.go::Foo", Kind: graph.KindFunction, Name: "Foo", FilePath: "repoA/a.go", Language: "go", RepoPrefix: "repoA"})
-	g.AddNode(&graph.Node{ID: "repoC/c.go::Qux", Kind: graph.KindFunction, Name: "Qux", FilePath: "repoC/c.go", Language: "go", RepoPrefix: "repoC"})
-	g.AddNode(&graph.Node{ID: "repoD/d.go::Zap", Kind: graph.KindFunction, Name: "Zap", FilePath: "repoD/d.go", Language: "go", RepoPrefix: "repoD"})
-	g.AddNode(&graph.Node{ID: "repoB/b.go::Bar", Kind: graph.KindFunction, Name: "Bar", FilePath: "repoB/b.go", Language: "go", RepoPrefix: "repoB"})
-
+	// Unchanged consumer repoA: a call with no local definition — bare unresolved.
+	g.AddNode(&graph.Node{ID: "repoA/a.go::Caller", Kind: graph.KindFunction, Name: "Caller", FilePath: "repoA/a.go", Language: "go", RepoPrefix: "repoA"})
+	// Changed provider repoB: just added Foo.
+	g.AddNode(&graph.Node{ID: "repoB/b.go::Foo", Kind: graph.KindFunction, Name: "Foo", FilePath: "repoB/b.go", Language: "go", RepoPrefix: "repoB"})
 	wireImport(g, "repoA/a.go", "repoB", "repoB/b.go")
-	wireImport(g, "repoC/c.go", "repoB", "repoB/b.go")
-	wireImport(g, "repoD/d.go", "repoB", "repoB/b.go")
 
-	edgeA := &graph.Edge{From: "repoA/a.go::Foo", To: "unresolved::Bar", Kind: graph.EdgeCalls, FilePath: "repoA/a.go", Line: 5}
-	edgeC := &graph.Edge{From: "repoC/c.go::Qux", To: "unresolved::Bar", Kind: graph.EdgeCalls, FilePath: "repoC/c.go", Line: 5}
-	edgeD := &graph.Edge{From: "repoD/d.go::Zap", To: "unresolved::Bar", Kind: graph.EdgeCalls, FilePath: "repoD/d.go", Line: 5}
-	g.AddEdge(edgeA)
-	g.AddEdge(edgeC)
-	g.AddEdge(edgeD)
+	inbound := &graph.Edge{From: "repoA/a.go::Caller", To: "unresolved::Foo", Kind: graph.EdgeCalls, FilePath: "repoA/a.go", Line: 5}
+	g.AddEdge(inbound)
 
-	cr := NewCrossRepo(g)
-	stats := cr.ResolveForRepos(map[string]struct{}{"repoA": {}, "repoC": {}})
+	// The edge is owned by the unchanged consumer, so it is absent from the
+	// changed provider's own out-edge set (graph.GetRepoEdges("repoB")).
+	require.Empty(t, g.GetRepoEdges("repoB"),
+		"the inbound edge must not appear in the changed provider's own out-edges")
 
-	assert.Equal(t, 2, stats.Resolved)
-	assert.Equal(t, 2, stats.CrossRepoEdges)
-	assert.Equal(t, "repoB/b.go::Bar", edgeA.To)
-	assert.Equal(t, "repoB/b.go::Bar", edgeC.To)
-	assert.True(t, edgeA.CrossRepo)
-	assert.True(t, edgeC.CrossRepo)
-	// repoD was outside the scope — its edge stays unresolved.
-	assert.Equal(t, "unresolved::Bar", edgeD.To)
+	NewCrossRepo(g).ResolveAll()
 
-	// Empty scope is a no-op.
-	empty := NewCrossRepo(graph.New()).ResolveForRepos(nil)
-	require.NotNil(t, empty)
-	assert.Equal(t, 0, empty.Resolved)
-}
-
-// TestCrossRepoResolveForRepos_EqualsFull is the equivalence gate for the
-// scoped cross-repo warm restart: when the only unresolved cross-repo edges
-// originate in the changed repo, a scoped ResolveForRepos and a full ResolveAll
-// on an identical twin must land the same edge set.
-func TestCrossRepoResolveForRepos_EqualsFull(t *testing.T) {
-	build := func(s graph.Store) {
-		// repoA (changed / consumer) has a fresh unresolved cross-repo call into
-		// repoB (unchanged / provider), whose own edges are all resolved.
-		s.AddNode(&graph.Node{ID: "repoA/a.go::Foo", Kind: graph.KindFunction, Name: "Foo", FilePath: "repoA/a.go", Language: "go", RepoPrefix: "repoA"})
-		s.AddNode(&graph.Node{ID: "repoB/b.go::Bar", Kind: graph.KindFunction, Name: "Bar", FilePath: "repoB/b.go", Language: "go", RepoPrefix: "repoB"})
-		s.AddNode(&graph.Node{ID: "repoB/b.go::CallerB", Kind: graph.KindFunction, Name: "CallerB", FilePath: "repoB/b.go", Language: "go", RepoPrefix: "repoB"})
-		wireImport(s, "repoA/a.go", "repoB", "repoB/b.go")
-		s.AddEdge(&graph.Edge{From: "repoA/a.go::Foo", To: "unresolved::Bar", Kind: graph.EdgeCalls, FilePath: "repoA/a.go", Line: 5})
-		s.AddEdge(&graph.Edge{From: "repoB/b.go::CallerB", To: "repoB/b.go::Bar", Kind: graph.EdgeCalls, FilePath: "repoB/b.go", Line: 7, Origin: graph.OriginASTResolved})
-	}
-	scopedStore := graph.New()
-	build(scopedStore)
-	twinStore := graph.New()
-	build(twinStore)
-
-	NewCrossRepo(scopedStore).ResolveForRepos(map[string]struct{}{"repoA": {}})
-	NewCrossRepo(twinStore).ResolveAll()
-
-	assert.Equal(t, storeEdgeSet(twinStore), storeEdgeSet(scopedStore),
-		"scoped and full cross-repo resolve must produce identical edge sets")
-	assert.True(t, hasCallEdge(scopedStore, "repoA/a.go::Foo", "repoB/b.go::Bar"),
-		"the changed repo's cross-repo call must resolve under the scoped pass")
+	assert.Equal(t, "repoB/b.go::Foo", inbound.To,
+		"the whole-graph cross-repo resolve must bind the unchanged consumer's inbound reference into the changed provider")
+	assert.True(t, inbound.CrossRepo)
 }

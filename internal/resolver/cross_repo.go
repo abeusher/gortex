@@ -456,28 +456,6 @@ func (cr *CrossRepoResolver) ResolveForRepo(repoPrefix string) *CrossRepoStats {
 	return cr.resolveScopedLocked(cr.graph.GetRepoEdges(repoPrefix))
 }
 
-// ResolveForRepos resolves the unresolved out-edges of every node in the given
-// repositories in one pass — the multi-repo warm-restart form of
-// ResolveForRepo. It unions each repo's edge set (graph.GetRepoEdges) and runs
-// resolveScopedLocked ONCE, so the shared per-pass indexes and the cross_repo_*
-// materialisation (DetectCrossRepoEdges) are built a single time rather than
-// once per repo. An empty set is a no-op. Like ResolveForRepo it resolves the
-// scoped repos' OWN out-edges; an inbound reference from an unchanged repo into
-// a changed one is left to the periodic full ResolveAll (the same trade-off
-// ResolveForRepo / ResolveForFile already make).
-func (cr *CrossRepoResolver) ResolveForRepos(prefixes map[string]struct{}) *CrossRepoStats {
-	cr.mu.Lock()
-	defer cr.mu.Unlock()
-	if len(prefixes) == 0 {
-		return &CrossRepoStats{ByRepo: make(map[string]int)}
-	}
-	var edges []*graph.Edge
-	for p := range prefixes {
-		edges = append(edges, cr.graph.GetRepoEdges(p)...)
-	}
-	return cr.resolveScopedLocked(edges)
-}
-
 // ResolveForFile is the watcher fast path: it re-resolves only the
 // out-edges of the changed file, not the whole repo. The watcher fires
 // after every single-file save, and the old ResolveForRepo path
