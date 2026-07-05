@@ -290,6 +290,15 @@ func openWith(path string, current int, migrations []schemaMigration, allowRebui
 		_ = db.Close()
 		return nil, fmt.Errorf("sqlite schema: %w", err)
 	}
+	// Add the promoted node columns to databases created before they
+	// existed (CREATE TABLE IF NOT EXISTS won't alter an existing table).
+	// Must run before the droppable-index loop below — nodes_semantic_pending
+	// references a promoted column — and before prepare(), whose node INSERT
+	// references them too.
+	if err := ensureNodeColumns(db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("sqlite node columns: %w", err)
+	}
 	// Create the droppable secondary indexes from the shared set so their
 	// initial-creation DDL is byte-identical to the DDL the bulk-load fast
 	// path rebuilds them with (BeginBulkLoad drops these, FlushBulk
@@ -311,14 +320,6 @@ func openWith(path string, current int, migrations []schemaMigration, allowRebui
 		_ = db.Close()
 		return nil, fmt.Errorf("sqlite edges_external index: %w", err)
 	}
-	// Add the promoted node columns to databases created before they
-	// existed (CREATE TABLE IF NOT EXISTS won't alter an existing table).
-	// Must run before prepare(), whose node INSERT references them.
-	if err := ensureNodeColumns(db); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("sqlite node columns: %w", err)
-	}
-
 	// Backfill the FTS rowid sidecar for databases built before it existed,
 	// so the first incremental UpsertSymbolFTS on an already-indexed symbol
 	// can do its O(log n) docid delete instead of leaking a duplicate row.
@@ -467,7 +468,7 @@ func (s *Store) prepare() error {
 	const nodeCols = lookupNodeCols
 
 	prep(&s.stmtInsertNode,
-		`INSERT OR REPLACE INTO nodes (`+nodeCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+		`INSERT OR REPLACE INTO nodes (`+nodeCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
 	prep(&s.stmtGetNode,
 		`SELECT `+nodeCols+` FROM nodes WHERE id = ?`)
 	prep(&s.stmtGetNodeByQual,
@@ -581,7 +582,7 @@ func scanNode(scanner interface {
 		&n.RepoPrefix, &n.WorkspaceID, &n.ProjectID,
 		&p.sig, &p.vis, &p.doc, &p.external, &p.returnType,
 		&p.isAsync, &p.isStatic, &p.isAbstract, &p.isExported, &p.updatedAt,
-		&p.dataClass, &metaBlob,
+		&p.dataClass, &p.semanticType, &p.semanticSource, &metaBlob,
 	)
 	if err != nil {
 		return nil, err
@@ -596,6 +597,35 @@ func scanNode(scanner interface {
 	// Restore the promoted columns into Meta. They are authoritative for
 	// rows written after the promotion; a NULL column (legacy gob rows)
 	// is left alone so the blob-carried value survives.
+	restorePromotedMeta(&n, p)
+	return &n, nil
+}
+
+// scanNodeLight scans the same columns as scanNode minus the trailing meta
+// blob — no decodeMeta call, so no JSON/gob parse per row. Promoted columns
+// still restore into Meta via restorePromotedMeta, so any caller that only
+// reads a promoted key (signature, visibility, ..., semantic_type) sees the
+// exact values scanNode would produce; only non-promoted content still
+// living in the row's blob is absent. See graph.LightNodeReader: a node
+// from this scan must never be round-tripped back through AddNode/AddBatch.
+func scanNodeLight(scanner interface {
+	Scan(...any) error
+}) (*graph.Node, error) {
+	var (
+		n graph.Node
+		p promotedNodeMeta
+	)
+	err := scanner.Scan(
+		&n.ID, &n.Kind, &n.Name, &n.QualName, &n.FilePath,
+		&n.StartLine, &n.EndLine, &n.StartColumn, &n.EndColumn, &n.Language,
+		&n.RepoPrefix, &n.WorkspaceID, &n.ProjectID,
+		&p.sig, &p.vis, &p.doc, &p.external, &p.returnType,
+		&p.isAsync, &p.isStatic, &p.isAbstract, &p.isExported, &p.updatedAt,
+		&p.dataClass, &p.semanticType, &p.semanticSource,
+	)
+	if err != nil {
+		return nil, err
+	}
 	restorePromotedMeta(&n, p)
 	return &n, nil
 }
@@ -691,7 +721,7 @@ func (s *Store) insertNodeLocked(stmt *sql.Stmt, n *graph.Node) error {
 		n.RepoPrefix, n.WorkspaceID, n.ProjectID,
 		p.sig, p.vis, p.doc, p.external, p.returnType,
 		p.isAsync, p.isStatic, p.isAbstract, p.isExported, p.updatedAt,
-		p.dataClass, metaBlob,
+		p.dataClass, p.semanticType, p.semanticSource, metaBlob,
 	)
 	return err
 }
@@ -1257,6 +1287,30 @@ func (s *Store) GetRepoNonContentNodes(repoPrefix string) []*graph.Node {
 		return s.scanNodeQuery(`SELECT ` + lookupNodeCols + ` FROM nodes WHERE ` + filter)
 	}
 	return s.scanNodeQuery(`SELECT `+lookupNodeCols+` FROM nodes WHERE repo_prefix = ? AND `+filter, repoPrefix)
+}
+
+// GetRepoNodesLight is the graph.LightNodeReader fast path: repo_prefix
+// still uses the nodes_by_repo index, but the meta column is left out of
+// the projection entirely, so a repo's already-enriched majority never
+// crosses the driver boundary as a blob to decode. See LightNodeReader's
+// doc for the read-only-use invariant this projection depends on.
+func (s *Store) GetRepoNodesLight(repoPrefix string) []*graph.Node {
+	rows, err := s.db.Query(`SELECT `+lookupNodeColsLight+` FROM nodes WHERE repo_prefix = ?`, repoPrefix)
+	if err != nil {
+		panicOnFatal(err)
+		return nil
+	}
+	defer rows.Close()
+	var out []*graph.Node
+	for rows.Next() {
+		n, err := scanNodeLight(rows)
+		if err != nil {
+			panicOnFatal(err)
+			return out
+		}
+		out = append(out, n)
+	}
+	return out
 }
 
 // scanNodeQuery runs an ad-hoc node SELECT (columns = lookupNodeCols) and
