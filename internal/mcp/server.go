@@ -238,6 +238,11 @@ type Server struct {
 	feedback         *feedbackManager
 	notes            *notesManager
 	memories         *memoryManager
+	// promotedTools is the per-workspace learned tool surface: deferred
+	// tools promoted into the eager surface after use, persisted so the
+	// learning survives daemon restarts (with demotion after disuse). Nil
+	// until InitLearnedTools wires it.
+	promotedTools *promotedToolsManager
 	// globalMemories holds the user-level memory store shared across
 	// every workspace this user touches — lives at ~/.gortex/memories/.
 	// Tools default to the workspace store; `scope:"global"` routes
@@ -1478,6 +1483,98 @@ func (s *Server) InitFeedback(cacheDir, repoPath string) {
 // to the tools, just doesn't flush to disk).
 func (s *Server) InitNotes(cacheDir, repoPath string) {
 	s.notes = newNotesManager(cacheDir, repoPath)
+}
+
+// InitLearnedTools wires the per-workspace learned tool surface and hydrates
+// it: it advances the session epoch, demotes promotions unused past the
+// hysteresis window, and re-promotes the survivors into the eager surface so
+// a tool the team promoted last session is already live this session. Call
+// after NewServer (once the register sweep has deferred the cold tools).
+// Empty arguments yield an in-memory-only, non-persistent surface.
+func (s *Server) InitLearnedTools(cacheDir, repoPath string) {
+	s.promotedTools = newPromotedToolsManager(cacheDir, repoPath)
+	for _, name := range s.promotedTools.Load() {
+		// Re-promote persisted tools so they ship in the cold tools/list.
+		// EnsureToolPromoted is a no-op for a tool that is not deferred
+		// (already live, or absent), so this is safe under any preset.
+		s.EnsureToolPromoted(name)
+	}
+}
+
+// RecordLearnedPromotion persists that a deferred tool was promoted (or
+// re-used) for the session's workspace, so the learned surface survives a
+// daemon restart. cwd resolves the workspace for diagnostics. A no-op when
+// the learned surface is not wired.
+func (s *Server) RecordLearnedPromotion(name, cwd string) {
+	if s == nil || s.promotedTools == nil || name == "" {
+		return
+	}
+	// Floor / always-eager tools are never "learned" — only tools that were
+	// genuinely deferred and promoted on demand belong in the learned set.
+	if isAlwaysKeptTool(name) {
+		return
+	}
+	s.promotedTools.Record(name, s.workspaceIDForCWD(cwd))
+}
+
+// isLearnedPromoted reports whether a tool is in the per-workspace learned
+// surface — used to keep a learned tool visible on the lean agent surface
+// (which would otherwise narrow it out).
+func (s *Server) isLearnedPromoted(name string) bool {
+	return s != nil && s.promotedTools.Has(name)
+}
+
+// ActivePreset returns the server's global tool-surface preset label + mode
+// for status / introspection. The per-session default may differ (a known
+// coding-agent client defaults to `agent`); this reports the server-level
+// baseline.
+func (s *Server) ActivePreset() (preset, mode string) {
+	if s == nil || s.toolPolicy == nil {
+		return "full", ""
+	}
+	return s.toolPolicy.preset, s.toolPolicy.mode
+}
+
+// LearnedToolCount returns the size of the per-workspace learned tool
+// surface (deferred tools promoted through use, persisted across restarts).
+func (s *Server) LearnedToolCount() int {
+	if s == nil {
+		return 0
+	}
+	return s.promotedTools.Count()
+}
+
+// LearnedToolNames returns the learned tool surface, sorted.
+func (s *Server) LearnedToolNames() []string {
+	if s == nil {
+		return nil
+	}
+	return s.promotedTools.Names()
+}
+
+// NoteToolUse records a call to a tool for the learned-surface. It persists
+// only tools that were genuinely deferred (newly promoted this call) or are
+// already in the learned set — never the eager floor — so the learned
+// surface tracks exactly the tools worth promoting for this workspace.
+func (s *Server) NoteToolUse(name, cwd string, newlyPromoted bool) {
+	if s == nil || s.promotedTools == nil || name == "" {
+		return
+	}
+	if newlyPromoted || s.isLearnedPromoted(name) {
+		s.RecordLearnedPromotion(name, cwd)
+	}
+}
+
+// workspaceIDForCWD best-effort resolves a workspace slug from a session
+// cwd for learned-promotion diagnostics; returns "" when it cannot.
+func (s *Server) workspaceIDForCWD(cwd string) string {
+	if s == nil || s.multiIndexer == nil || cwd == "" {
+		return ""
+	}
+	if ws, _, _, ok := s.multiIndexer.ScopeForCWD(cwd); ok {
+		return ws
+	}
+	return ""
 }
 
 // InitMemories initializes the cross-session development-memory

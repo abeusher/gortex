@@ -217,6 +217,14 @@ type StatusResponse struct {
 	// `default` or the first entry. Empty when no servers.toml.
 	LocalServerSlug string `json:"local_server_slug,omitempty"`
 
+	// ToolPreset / ToolPresetMode report the active MCP tool-surface preset
+	// and mode; LearnedTools is the per-workspace learned-promotion count
+	// (deferred tools promoted through use, persisted across restarts). Empty
+	// / zero on a control-only daemon.
+	ToolPreset     string `json:"tool_preset,omitempty"`
+	ToolPresetMode string `json:"tool_preset_mode,omitempty"`
+	LearnedTools   int    `json:"learned_tools,omitempty"`
+
 	// LSPRouter reports the daemon's LSP-router state — every
 	// registered spec, whether its binary resolves on PATH, and
 	// every alive (spec, workspace) subprocess. Empty when no LSP

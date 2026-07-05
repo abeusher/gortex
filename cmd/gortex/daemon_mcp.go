@@ -135,7 +135,11 @@ func (d *mcpDispatcher) Dispatch(ctx context.Context, sess *daemon.Session, fram
 	// tools_search stays the discovery path; a hide-mode tool is never deferred,
 	// so this never bypasses the hide gate.
 	if name := peekFrameToolName(frame); name != "" {
-		d.srv.EnsureToolPromoted(name)
+		newly := d.srv.EnsureToolPromoted(name)
+		// Record a call to a deferred/learned tool so the per-workspace
+		// learned surface promotes it into the cold list next session (and a
+		// stale promotion's demotion clock resets on continued use).
+		d.srv.NoteToolUse(name, sess.CWD, newly)
 	}
 
 	// HandleMessage returns either a JSONRPCResponse, a JSONRPCError, or

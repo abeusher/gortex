@@ -3108,6 +3108,16 @@ func (s *Server) buildIndexHealthPayload() map[string]any {
 		// resolution regression rather than silently serving a shrunken graph.
 		"resolution_regressions": indexer.ResolutionRegressions(),
 	}
+	// Tool-surface state: the active global preset (the per-session default
+	// may differ by client) and the per-workspace learned surface size, so
+	// the tool policy is inspectable without a separate call.
+	preset, presetMode := s.ActivePreset()
+	result["tool_preset"] = preset
+	result["tool_preset_mode"] = presetMode
+	if n := s.LearnedToolCount(); n > 0 {
+		result["learned_tools"] = n
+		result["learned_tool_names"] = s.LearnedToolNames()
+	}
 	if indexedFileCount > 0 {
 		result["indexed_file_count"] = indexedFileCount
 	}

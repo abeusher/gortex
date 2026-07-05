@@ -102,7 +102,12 @@ func (s *Server) shapeToolSurface(tools []mcp.Tool, p *toolPolicy) []mcp.Tool {
 		}
 		return narrowToPolicy(tools, p)
 	}
-	kept := narrowToPolicy(tools, p)
+	kept := make([]mcp.Tool, 0, len(tools))
+	for _, t := range tools {
+		if s.sessionAllows(p, t.Name) {
+			kept = append(kept, t)
+		}
+	}
 	// Widen with the deferred catalogue's finished (scrubbed + budget-
 	// annotated) schemas for the tools this policy allows but the daemon held
 	// back under its global preset.
@@ -113,7 +118,7 @@ func (s *Server) shapeToolSurface(tools []mcp.Tool, p *toolPolicy) []mcp.Tool {
 		}
 		widened := false
 		for _, name := range s.lazy.DeferredNames() {
-			if present[name] || !p.allows(name) {
+			if present[name] || !s.sessionAllows(p, name) {
 				continue
 			}
 			if dt, ok := s.lazy.DeferredTool(name); ok {
@@ -126,6 +131,17 @@ func (s *Server) shapeToolSurface(tools []mcp.Tool, p *toolPolicy) []mcp.Tool {
 		}
 	}
 	return kept
+}
+
+// sessionAllows reports whether a tool belongs on this session's surface:
+// the policy's own allow-set, plus — on the lean agent surface — any tool in
+// the per-workspace LEARNED set (a deferred tool the team promoted through
+// use, which would otherwise be narrowed out of the strict agent roster).
+func (s *Server) sessionAllows(p *toolPolicy, name string) bool {
+	if p.allows(name) {
+		return true
+	}
+	return p.lean && s.isLearnedPromoted(name)
 }
 
 // narrowToPolicy keeps only the tools the policy allows, preserving order.
