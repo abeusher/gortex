@@ -559,6 +559,27 @@ type sessionState struct {
 	// on the first nav call and freed with the rest of sessionState on
 	// disconnect.
 	cursor *navCursor
+
+	// emittedCues records which proactive related_tools discovery cues have
+	// already been shown this session, so each is emitted at most once (a
+	// repeated hint is noise). Keyed by the cue's tool name.
+	emittedCues map[string]bool
+}
+
+// markCueOnce records that a related_tools cue keyed by `key` has been
+// emitted this session; it returns true only the FIRST time, so a caller
+// emits the cue iff this returns true.
+func (ss *sessionState) markCueOnce(key string) bool {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	if ss.emittedCues[key] {
+		return false
+	}
+	if ss.emittedCues == nil {
+		ss.emittedCues = make(map[string]bool, 4)
+	}
+	ss.emittedCues[key] = true
+	return true
 }
 
 type lastSearchState struct {
