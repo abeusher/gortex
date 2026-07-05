@@ -20,7 +20,6 @@
 [![Windows](https://img.shields.io/badge/Windows-supported-blue.svg)](#)
 
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/zzet/gortex/badge)](https://scorecard.dev/viewer/?uri=github.com/zzet/gortex)
-[![Go Report Card](https://goreportcard.com/badge/github.com/zzet/gortex)](https://goreportcard.com/report/github.com/zzet/gortex)
 [![Go Reference](https://pkg.go.dev/badge/github.com/zzet/gortex.svg)](https://pkg.go.dev/github.com/zzet/gortex)
   <br />
   <a href="https://trendshift.io/repositories/36832" target="_blank"><img src="https://trendshift.io/api/badge/repositories/36832" alt="zzet%2Fgortex | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
