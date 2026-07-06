@@ -35,7 +35,7 @@ Gortex is running as an MCP server. It indexes this repository into an in-memory
 
 ## MANDATORY: Use Gortex tools instead of file reads
 
-You **MUST** prefer Gortex graph queries over file reads on every task in this repo. These are not suggestions — the tools below replace the corresponding read/grep flows.
+You **MUST** prefer Gortex graph queries over file reads on every task in this repo. These are not suggestions — the tools below replace the corresponding read/grep flows. From a shell (no MCP tools), every tool below is reachable as ` + "`gortex call <tool> --arg k=v`" + ` (e.g. ` + "`gortex call read_file --arg path=<file>`" + `) — there is no bare ` + "`gortex <tool>`" + ` verb.
 
 ### Navigation and Reading
 
