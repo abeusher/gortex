@@ -332,13 +332,16 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 			goMode = goanalysis.ModeCallGraph
 		}
 		goProvider := goanalysis.NewProvider(goMode, goTypesIncludeTests(), logger)
-		// The go/packages "go-types" provider is a full `go list ./...` +
-		// go/types pass over the module on every index — tens of seconds per
-		// Go module per warmup, and on an already-resolved graph it routinely
-		// confirms zero new edges (the always-on go-ast-types tree-sitter
-		// floor already covers Go). Keep it as the contracts binding resolver,
-		// but only register it for enrichment when explicitly opted in.
-		if goTypesEnrichEnabled(conf.Semantic) {
+		// The go/packages "go-types" provider owns Go enrichment when the
+		// toolchain is present: it type-checks the module once in-process and
+		// stamps every symbol's exact type plus resolves stdlib/dep calls to
+		// real nodes, in a fraction of the time the per-request gopls LSP pass
+		// takes (which additionally leaves external calls as dead stubs). As an
+		// eager provider it claims the "go" language slot, so the LSP router's
+		// gopls spec is skipped as a gap-filler and never spawns. Registration
+		// is gated on Available() (a `go` toolchain on PATH): without it the
+		// slot stays open and gopls / the tree-sitter floor serve Go instead.
+		if goTypesEnrichEnabled(conf.Semantic) && goProvider.Available() {
 			semMgr.RegisterProvider(goProvider)
 		}
 		contracts.SetBindingResolver(goProvider)
@@ -665,15 +668,20 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 	return s, nil
 }
 
-// goTypesEnrichEnabled reports whether the heavyweight go/packages
-// "go-types" enrichment provider should be registered. Default OFF — the
-// always-on go-ast-types tree-sitter floor serves Go resolution at a
-// fraction of the cost. GORTEX_GO_TYPES=1/0 overrides the config key.
+// goTypesEnrichEnabled reports whether the in-process go/packages "go-types"
+// enrichment provider should be registered for Go. Default ON: it is both
+// faster and more complete than driving gopls over LSP (see the registration
+// site), and registration is separately gated on the toolchain being present.
+// Precedence: GORTEX_GO_TYPES=1/0 wins, then an explicit semantic.go_types
+// config value, then the on-by-default.
 func goTypesEnrichEnabled(sem config.SemanticConfig) bool {
 	if v := os.Getenv("GORTEX_GO_TYPES"); v != "" {
 		return v == "1" || strings.EqualFold(v, "true")
 	}
-	return sem.GoTypesEnabledOrDefault()
+	if sem.GoTypes != nil {
+		return *sem.GoTypes
+	}
+	return true
 }
 
 // goTypesIncludeTests reports whether the go-types provider should load
