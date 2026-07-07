@@ -331,7 +331,7 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 		if cfg.SemanticMode == "callgraph" {
 			goMode = goanalysis.ModeCallGraph
 		}
-		goProvider := goanalysis.NewProvider(goMode, false, logger)
+		goProvider := goanalysis.NewProvider(goMode, goTypesIncludeTests(), logger)
 		// The go/packages "go-types" provider is a full `go list ./...` +
 		// go/types pass over the module on every index — tens of seconds per
 		// Go module per warmup, and on an already-resolved graph it routinely
@@ -674,4 +674,14 @@ func goTypesEnrichEnabled(sem config.SemanticConfig) bool {
 		return v == "1" || strings.EqualFold(v, "true")
 	}
 	return sem.GoTypesEnabledOrDefault()
+}
+
+// goTypesIncludeTests reports whether the go-types provider should load
+// _test.go files (and each package's external test variant). Loading them
+// roughly doubles the go/packages work per module, so it is OFF by default;
+// GORTEX_GO_TYPES_TESTS=1 opts in to stamp test-file symbols too (LSP hover
+// covers them, so the opt-in closes that coverage gap when it matters).
+func goTypesIncludeTests() bool {
+	return os.Getenv("GORTEX_GO_TYPES_TESTS") == "1" ||
+		strings.EqualFold(os.Getenv("GORTEX_GO_TYPES_TESTS"), "true")
 }
