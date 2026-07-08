@@ -26,7 +26,7 @@ const lookupNodeCols = `id, kind, name, qual_name, file_path, start_line, end_li
 // can never drift out of sync with lookupNodeCols / scanNode.
 var lookupNodeColsLight = strings.TrimSuffix(lookupNodeCols, ", meta")
 
-const lookupEdgeCols = `from_id, to_id, kind, file_path, line, confidence, confidence_label, origin, tier, cross_repo, meta`
+const lookupEdgeCols = `from_id, to_id, kind, file_path, line, confidence, confidence_label, origin, tier, cross_repo, meta, resolve_terminal, resolve_terminal_reason`
 
 // FindNodesByNameContaining returns nodes whose Name contains substr,
 // case-insensitively (SQLite's LIKE is ASCII case-insensitive). An empty
