@@ -738,6 +738,47 @@ func (c *realController) Status(_ context.Context) (daemon.StatusResponse, error
 			}
 		}
 
+		// One repo in a multi-repo workspace can still hold all its nodes
+		// under repo_prefix="" while its metadata says prefixed — the same
+		// desync as the sole-repo case but with a second repo present (it was
+		// indexed solo, then another repo joined while the daemon was down, so
+		// warmup stamped it prefixed without restamping its nodes; the
+		// migrateLoneUnprefixedRepoCtx guard needs len(repos)==1, which is
+		// false mid-warmup-loop). Its per-prefix bucket is then empty and it
+		// would under-count. Attribute the unaccounted ("") node pool to it —
+		// but only when exactly one tracked repo lacks a live bucket, because
+		// the "" pool is a single undifferentiated pool and more than one
+		// empty-bucket repo is ambiguous. The pool also carries a small number
+		// of synthetic cross-repo/global nodes (<1% of a real graph), so the
+		// attribution is approximate, not exact.
+		var orphanOwner string
+		orphanOwnerCount := 0
+		if !soleRepo {
+			for prefix, meta := range allMeta {
+				if meta == nil {
+					continue
+				}
+				if est, ok := memEstimates[prefix]; !ok || est.NodeCount == 0 {
+					orphanOwner = prefix
+					orphanOwnerCount++
+				}
+			}
+		}
+		orphanNodes, orphanEdges := 0, 0
+		if orphanOwnerCount == 1 && g != nil {
+			orphanNodes, orphanEdges = wholeStoreNodes, wholeStoreEdges
+			for _, est := range memEstimates {
+				orphanNodes -= est.NodeCount
+				orphanEdges -= est.EdgeCount
+			}
+			if orphanNodes < 0 {
+				orphanNodes = 0
+			}
+			if orphanEdges < 0 {
+				orphanEdges = 0
+			}
+		}
+
 		// Search and vector backends are process-wide (one shared index
 		// across all repos), so we compute the global size once and
 		// split it proportionally to each repo's node share. Not exact,
@@ -756,6 +797,7 @@ func (c *realController) Status(_ context.Context) (daemon.StatusResponse, error
 			for _, est := range memEstimates {
 				totalNodes += est.NodeCount
 			}
+			totalNodes += orphanNodes
 			if totalNodes == 0 {
 				for _, meta := range allMeta {
 					if meta != nil {
@@ -781,7 +823,16 @@ func (c *realController) Status(_ context.Context) (daemon.StatusResponse, error
 				nodes = wholeStoreNodes
 				edges = wholeStoreEdges
 			default:
-				if est, ok := memEstimates[prefix]; ok {
+				est, ok := memEstimates[prefix]
+				switch {
+				case orphanOwnerCount == 1 && prefix == orphanOwner:
+					// This repo's nodes are the unaccounted "" pool — see the
+					// note above. Approximate (includes a little synthetic
+					// cross-repo overhead), but far closer than the frozen
+					// near-empty RepoMetadata fallback.
+					nodes = orphanNodes
+					edges = orphanEdges
+				case ok:
 					nodes = est.NodeCount
 					edges = est.EdgeCount
 					mem.NodesBytes = est.NodeBytes

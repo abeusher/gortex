@@ -11,6 +11,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/parser"
@@ -170,4 +171,97 @@ func TestStatus_SoleRepoDesyncedToPrefixed_ReportsWholeStore(t *testing.T) {
 		"a sole tracked repo's status row must reflect the whole store even when its nodes are unprefixed but its metadata says prefixed")
 	assert.Equal(t, fullEdges, resp.TrackedRepos[0].Edges,
 		"edges must likewise reflect the whole store, matching `gortex query stats`")
+}
+
+// TestStatus_MultiRepoDesync_AttributesUnaccountedPool covers the multi-repo
+// variant: repo A is indexed solo (nodes under repo_prefix=""), then repo B is
+// added while the daemon is down. At the next warm restart A is reconciled
+// first with an empty mi.repos, so the lone-repo migration never fires and A's
+// metadata is stamped prefixed while its nodes stay unprefixed — leaving A's
+// per-prefix bucket empty. B indexes normally. Because exactly one tracked
+// repo lacks a live bucket, `daemon status` attributes the unaccounted (mostly
+// "") node pool to A instead of falling back to its near-empty frozen count.
+func TestStatus_MultiRepoDesync_AttributesUnaccountedPool(t *testing.T) {
+	dirA := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dirA, "a.go"),
+		[]byte("package a\n\nfunc A() {}\nfunc A2() { A() }\n"), 0o644))
+	dirB := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dirB, "b.go"),
+		[]byte("package b\n\nfunc B() {}\nfunc B2() { B() }\nfunc B3() { B2() }\n"), 0o644))
+
+	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
+	gc := &config.GlobalConfig{Repos: []config.RepoEntry{{Path: dirA}}}
+	gc.SetConfigPath(cfgPath)
+	require.NoError(t, gc.Save())
+	cm, err := config.NewConfigManager(cfgPath)
+	require.NoError(t, err)
+
+	reg := parser.NewRegistry()
+	languages.RegisterAll(reg)
+
+	// First index: A is the sole configured repo → indexed unprefixed.
+	g := graph.New()
+	mi1 := indexer.NewMultiIndexer(g, reg, search.NewBM25(), cm, zap.NewNop())
+	_, err = mi1.IndexAll()
+	require.NoError(t, err)
+	var priorA map[string]int64
+	for _, m := range mi1.AllMetadata() {
+		require.True(t, m.Unprefixed)
+		priorA = m.FileMtimes
+	}
+	require.NotEmpty(t, priorA)
+
+	// B is added to the config while the daemon is "down".
+	require.NoError(t, cm.Global().AddRepo(config.RepoEntry{Path: dirB}))
+
+	// Warm restart over the same graph store: reconcile A (from its persisted
+	// mtimes — stays unprefixed in the store), then track B fresh.
+	mi2 := indexer.NewMultiIndexer(g, reg, search.NewBM25(), cm, zap.NewNop())
+	_, err = mi2.ReconcileRepoCtx(context.Background(), config.RepoEntry{Path: dirA}, priorA)
+	require.NoError(t, err)
+	_, err = mi2.TrackRepoCtx(context.Background(), config.RepoEntry{Path: dirB})
+	require.NoError(t, err)
+
+	metas := mi2.AllMetadata()
+	require.Len(t, metas, 2)
+	var prefixA, prefixB string
+	for p, m := range metas {
+		if m.RootPath == dirA {
+			prefixA = p
+			require.False(t, m.Unprefixed, "A desynced to prefixed metadata")
+		} else {
+			prefixB = p
+		}
+	}
+	require.NotEmpty(t, prefixA)
+	require.NotEmpty(t, prefixB)
+
+	// A's bucket is empty (its nodes are still under ""); B's is populated.
+	bucketA := g.RepoMemoryEstimate(prefixA).NodeCount
+	bucketB := g.RepoMemoryEstimate(prefixB).NodeCount
+	require.Zero(t, bucketA, "A's per-prefix bucket must be empty — its nodes carry repo_prefix=''")
+	require.Positive(t, bucketB, "B must have a populated per-prefix bucket")
+
+	// Expected attribution: the unaccounted pool (whole store minus B's
+	// bucket) goes to A, the lone empty-bucket repo.
+	expectedA := g.NodeCount() - bucketB
+	require.Greater(t, expectedA, 1, "sanity: A must own a real (non-near-empty) node pool for this test to be meaningful")
+
+	c := &realController{graph: g, multiIndexer: mi2, configManager: cm, logger: zap.NewNop()}
+	resp, err := c.Status(context.Background())
+	require.NoError(t, err)
+	require.Len(t, resp.TrackedRepos, 2)
+
+	rows := map[string]daemon.TrackedRepoStatus{}
+	for _, r := range resp.TrackedRepos {
+		rows[r.Prefix] = r
+	}
+	assert.Equal(t, expectedA, rows[prefixA].Nodes,
+		"A's row must reflect the unaccounted node pool it owns, not the near-empty frozen count")
+	assert.Equal(t, bucketB, rows[prefixB].Nodes,
+		"B's row must keep reflecting its own live per-prefix bucket")
+	assert.Greater(t, rows[prefixA].Nodes, bucketA,
+		"A's attributed pool must beat its former near-empty per-prefix bucket count")
+	assert.Equal(t, g.NodeCount(), rows[prefixA].Nodes+rows[prefixB].Nodes,
+		"the two rows together must account for the whole store")
 }
