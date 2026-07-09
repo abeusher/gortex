@@ -179,8 +179,8 @@ func f16ToF32(h uint16) float32 {
 	sign := uint32(h>>15) << 31
 	exp := uint32(h>>10) & 0x1f
 	man := uint32(h) & 0x3ff
-	switch {
-	case exp == 0:
+	switch exp {
+	case 0:
 		if man == 0 {
 			return math.Float32frombits(sign)
 		}
@@ -192,7 +192,7 @@ func f16ToF32(h uint16) float32 {
 		}
 		man &= 0x3ff
 		return math.Float32frombits(sign | e<<23 | man<<13)
-	case exp == 0x1f:
+	case 0x1f:
 		return math.Float32frombits(sign | 0xff<<23 | man<<13)
 	default:
 		return math.Float32frombits(sign | (exp+112)<<23 | man<<13)

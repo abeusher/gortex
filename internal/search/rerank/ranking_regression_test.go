@@ -20,7 +20,7 @@ func bagEmbed(vocab []string) func(string) []float32 {
 	return func(text string) []float32 {
 		v := make([]float32, len(vocab))
 		for _, tok := range strings.FieldsFunc(strings.ToLower(text), func(r rune) bool {
-			return !(r >= 'a' && r <= 'z')
+			return r < 'a' || r > 'z'
 		}) {
 			if i, ok := idx[tok]; ok {
 				v[i] += 1

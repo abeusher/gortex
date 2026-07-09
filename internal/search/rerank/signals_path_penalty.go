@@ -230,7 +230,7 @@ func supportFileDemotion(c *Candidate, ctx *Context) float64 {
 		}
 	}
 	fp := c.Node.FilePath
-	pen := PathPenaltyUncatched
+	var pen float64
 	if ctx != nil && ctx.pathPenaltyCache != nil {
 		if cached, ok := ctx.pathPenaltyCache[fp]; ok {
 			pen = cached
