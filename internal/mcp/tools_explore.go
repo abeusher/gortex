@@ -101,18 +101,42 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	// Over-fetch, then keep the top maxSymbols that are real localization
 	// targets — params / locals / closures / imports are never a place a
 	// developer edits to fix a report, and they otherwise consume ranking
-	// slots and clutter the file map.
-	fetch := clampInt(maxSymbols*3, maxSymbols, 60)
+	// slots and clutter the file map. Test-source symbols are demoted, not
+	// dropped: production code is where a report is resolved, but a task
+	// genuinely about tests still gets them when production hits run out.
+	fetch := clampInt(maxSymbols*4, maxSymbols, 80)
 	ranked := eng.SearchSymbolsRanked(task, fetch, opts, rctx)
-	cands := make([]*rerank.Candidate, 0, maxSymbols)
+	var prod, test []*rerank.Candidate
 	for _, c := range ranked {
 		if c == nil || c.Node == nil || !exploreLocalizableKind(c.Node.Kind) {
 			continue
 		}
-		cands = append(cands, c)
-		if len(cands) >= maxSymbols {
-			break
+		isTest, _ := c.Node.Meta["is_test"].(bool)
+		if isTest || !exploreCodeDefinitionKind(c.Node.Kind) {
+			test = append(test, c)
+		} else {
+			prod = append(prod, c)
 		}
+	}
+	// Bounded per-file diversification (the same demote-only mechanism the
+	// ranked search head uses): a localization neighborhood that spans
+	// files beats one file's cluster of sibling shims crowding out every
+	// other candidate. Nothing is dropped — capped files' extra hits move
+	// below not-yet-capped files.
+	prodNodes := make([]*graph.Node, len(prod))
+	for i, c := range prod {
+		prodNodes[i] = c.Node
+	}
+	_, prod = diversifyByFile(prodNodes, prod, defaultMaxPerFile)
+	cands := prod
+	if len(cands) > maxSymbols {
+		cands = cands[:maxSymbols]
+	} else if len(cands) < maxSymbols {
+		room := maxSymbols - len(cands)
+		if room > len(test) {
+			room = len(test)
+		}
+		cands = append(cands, test[:room]...)
 	}
 	if len(cands) == 0 {
 		return mcp.NewToolResultText(fmt.Sprintf(
@@ -218,6 +242,22 @@ func (s *Server) renderExplore(task string, targets []exploreTarget, budget int)
 		fmt.Fprintf(&b, "  (Some bodies are elided under the %d-token budget; every candidate's location is still listed above — fetch an elided body with get_symbol_source / batch_symbols using the exact `id:` shown on its line.)\n", budget)
 	}
 	return b.String()
+}
+
+// exploreCodeDefinitionKind reports whether a node kind is a code
+// definition a developer edits to resolve a report. Non-code graph
+// nodes (doc sections, packages, resources, contracts, ...) can rank —
+// they are demoted to the fallback pool alongside test symbols rather
+// than dropped, so a genuinely docs-shaped task still reaches them.
+func exploreCodeDefinitionKind(k graph.NodeKind) bool {
+	switch k {
+	case graph.KindFunction, graph.KindMethod, graph.KindType,
+		graph.KindInterface, graph.KindField, graph.KindConstant,
+		graph.KindVariable, graph.KindEnumMember, graph.KindMacro:
+		return true
+	default:
+		return false
+	}
 }
 
 // exploreLocalizableKind reports whether a node kind is a place a
