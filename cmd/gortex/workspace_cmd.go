@@ -15,6 +15,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/progress"
 	"github.com/zzet/gortex/internal/tui"
 )
@@ -181,12 +182,12 @@ func matchRepo(repos []config.RepoEntry, target string) (int, error) {
 			return i, nil
 		}
 		ra, _ := filepath.Abs(r.Path)
-		if ra == abs {
+		if pathkey.EqualPaths(ra, abs) {
 			return i, nil
 		}
 		// Allow short suffix matches like "tuck-api" against
 		// "/Users/x/code/work/tuck-api".
-		if strings.HasSuffix(r.Path, "/"+target) {
+		if strings.HasSuffix(r.Path, string(filepath.Separator)+target) {
 			return i, nil
 		}
 	}

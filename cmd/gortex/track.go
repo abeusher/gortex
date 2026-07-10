@@ -13,6 +13,7 @@ import (
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/progress"
 	"github.com/zzet/gortex/internal/tui"
 )
@@ -108,7 +109,7 @@ func runTrack(cmd *cobra.Command, args []string) error {
 	}
 	already := false
 	for _, existing := range gc.Repos {
-		if existingAbs, _ := filepath.Abs(existing.Path); existingAbs == absPath {
+		if existingAbs, _ := filepath.Abs(existing.Path); pathkey.SamePathIdentity(existingAbs, absPath) {
 			already = true
 			break
 		}
@@ -175,7 +176,7 @@ func runTrack(cmd *cobra.Command, args []string) error {
 // daemon status, or -1 if the daemon has not registered the repo yet.
 func repoNodeCount(st daemon.StatusResponse, absPath string) int {
 	for _, r := range st.TrackedRepos {
-		if ra, err := filepath.Abs(r.Path); err == nil && ra == absPath {
+		if ra, err := filepath.Abs(r.Path); err == nil && pathkey.EqualPaths(ra, absPath) {
 			return r.Nodes
 		}
 	}
@@ -343,6 +344,14 @@ func runUntrack(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("resolving path %s: %w", rawPath, err)
 		}
 		target = abs
+	} else if info, statErr := os.Stat(rawPath); statErr == nil && info.IsDir() {
+		// A relative arg that names an existing directory (e.g. `foo/bar`
+		// from cwd) is a path, not a prefix — absolutise it so it resolves
+		// against the tracked roots. A bare prefix that names no directory
+		// keeps its as-is behaviour.
+		if abs, err := filepath.Abs(rawPath); err == nil {
+			target = abs
+		}
 	}
 
 	emitUntrackBanner(w, target, daemon.IsRunning())

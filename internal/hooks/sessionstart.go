@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/zzet/gortex/internal/daemon"
+	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/toolref"
 )
 
@@ -213,7 +214,7 @@ func classifyCwd(cwd string, repos []daemon.TrackedRepoStatus) (exact *daemon.Tr
 	for i := range repos {
 		repo := repos[i]
 		repoPath := filepath.Clean(repo.Path)
-		if repoPath == cwd {
+		if pathkey.EqualPaths(repoPath, cwd) {
 			exact = &repos[i]
 			continue
 		}
@@ -224,18 +225,13 @@ func classifyCwd(cwd string, repos []daemon.TrackedRepoStatus) (exact *daemon.Tr
 	return exact, contained
 }
 
-// hasPathPrefix reports whether path is rooted at prefix. Filepath
-// equality alone is wrong (`/foo/barbaz` would match `/foo/bar`) so
-// we require either equality or that the next char after prefix is
-// a separator.
+// hasPathPrefix reports whether path is rooted at prefix. It delegates to
+// pathkey.HasPathPrefix, which handles component boundaries (`/foo/barbaz`
+// must not match `/foo/bar`), the separator-root edge, and — on a
+// case-insensitive filesystem — case-only differences between the cwd and
+// a tracked root (#277).
 func hasPathPrefix(path, prefix string) bool {
-	if path == prefix {
-		return true
-	}
-	if !strings.HasPrefix(path, prefix) {
-		return false
-	}
-	return len(path) > len(prefix) && (path[len(prefix)] == filepath.Separator || prefix == string(filepath.Separator))
+	return pathkey.HasPathPrefix(path, prefix)
 }
 
 // rulePreamble is the short, always-present rule restatement. The
