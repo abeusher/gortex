@@ -106,6 +106,38 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	// genuinely about tests still gets them when production hits run out.
 	fetch := clampInt(maxSymbols*4, maxSymbols, 80)
 	ranked := eng.SearchSymbolsRanked(task, fetch, opts, rctx)
+	// Resilience ladder: a warm-restarted daemon can transiently return an
+	// empty scoped ranked result (workspace stamps not yet backfilled, or
+	// search bundles served before their node payloads re-materialise)
+	// while the index itself is fine. A one-shot verb must not answer
+	// "nothing matched" for an index that is merely re-warming, so relax in
+	// two steps — unscoped ranked, then unscoped BM25 — re-applying the
+	// repo boundary as a post-filter to preserve multi-repo hygiene.
+	repoAllowed := func(n *graph.Node) bool {
+		return len(resolved.RepoAllow) == 0 || resolved.RepoAllow[n.RepoPrefix]
+	}
+	if len(ranked) == 0 {
+		for _, c := range eng.SearchSymbolsRanked(task, fetch, query.QueryOptions{}, rctx) {
+			if c != nil && c.Node != nil && repoAllowed(c.Node) {
+				ranked = append(ranked, c)
+			}
+		}
+	}
+	if len(ranked) == 0 {
+		// Last rung: the per-term OR-merge the ranked search handler itself
+		// falls back on — whole-sentence MATCH semantics differ between the
+		// in-memory and disk-resident search backends, and per-term fetch +
+		// merge works on both.
+		nodes, _ := fetchAndMergeBM25Timed(eng, task, exploreLexicalTerms(task), fetch, opts, nil)
+		if len(nodes) == 0 && (opts.WorkspaceID != "" || opts.ProjectID != "" || len(opts.RepoAllow) > 0) {
+			nodes, _ = fetchAndMergeBM25Timed(eng, task, exploreLexicalTerms(task), fetch, query.QueryOptions{}, nil)
+		}
+		for i, n := range nodes {
+			if n != nil && repoAllowed(n) {
+				ranked = append(ranked, &rerank.Candidate{Node: n, TextRank: i, VectorRank: -1})
+			}
+		}
+	}
 	var prod, test []*rerank.Candidate
 	for _, c := range ranked {
 		if c == nil || c.Node == nil || !exploreLocalizableKind(c.Node.Kind) {
@@ -327,6 +359,31 @@ func fenceLang(lang string) string {
 		return ""
 	}
 	return lang
+}
+
+// exploreLexicalTerms splits free task text into the distinct word/identifier
+// terms (length >= 3, capped) that feed the per-term BM25 OR-merge fallback.
+// Purely lexical — no vocabulary, no language model.
+func exploreLexicalTerms(task string) []string {
+	const maxTerms = 12
+	seen := map[string]struct{}{}
+	var out []string
+	for _, f := range strings.Fields(task) {
+		f = strings.Trim(f, "\"'`.,;:()[]{}<>!?—-")
+		if len(f) < 3 {
+			continue
+		}
+		key := strings.ToLower(f)
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, f)
+		if len(out) >= maxTerms {
+			break
+		}
+	}
+	return out
 }
 
 func estimateTokens(s string) int { return len(s) / exploreCharsPerToken }
