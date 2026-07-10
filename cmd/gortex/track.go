@@ -197,9 +197,19 @@ func indexSettled(st daemon.StatusResponse, absPath string, prevNodes int) (sett
 }
 
 // waitForRepoIndexed polls the daemon until the repo at absPath has settled
-// (see indexSettled) or timeout elapses. timeout <= 0 waits forever.
+// (see indexSettled) or timeout elapses. timeout <= 0 waits forever. On a TTY
+// the wait renders as a live step with the node count ticking up; on a pipe
+// (or with --no-progress) it prints one start line, slow heartbeats, and the
+// settle summary.
 func waitForRepoIndexed(w io.Writer, absPath string, timeout time.Duration) error {
-	fmt.Fprintf(w, "  waiting for indexing to settle (--wait)…\n")
+	tr := progress.NewTracker(w)
+	if noProgress {
+		tr = progress.NewTracker(w, progress.WithoutAnimation())
+	}
+	tr.Start("waiting for indexing to settle (--wait)")
+	step := tr.StartStep("indexing " + filepath.Base(absPath))
+	step.SetUnit("nodes")
+
 	var deadline time.Time
 	if timeout > 0 {
 		deadline = time.Now().Add(timeout)
@@ -208,14 +218,20 @@ func waitForRepoIndexed(w io.Writer, absPath string, timeout time.Duration) erro
 	for {
 		if st, err := trackStatusFn(); err == nil {
 			settled, nodes := indexSettled(st, absPath, prevNodes)
+			if nodes > 0 {
+				step.Progress(int64(nodes), 0)
+			}
 			if settled {
-				fmt.Fprintf(w, "  indexed: %d nodes\n", nodes)
+				step.DoneAs("index settled")
+				tr.Done("indexed", humanizeInt(nodes)+" nodes")
 				return nil
 			}
 			prevNodes = nodes
 		}
 		if timeout > 0 && time.Now().After(deadline) {
-			return fmt.Errorf("--wait: timed out after %s waiting for %s to index", timeout, absPath)
+			err := fmt.Errorf("--wait: timed out after %s waiting for %s to index", timeout, absPath)
+			tr.Fail(err)
+			return err
 		}
 		time.Sleep(trackPollInterval)
 	}

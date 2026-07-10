@@ -54,8 +54,9 @@ func Row(key, details string, keyWidth int) string {
 	return styleKey.Render(padRight(key, keyWidth)) + "  " + styleVal.Render(details)
 }
 
-// Step renders a numbered step ("  1.  text") with the index in soft blue.
-func Step(n int, text string) string {
+// NumberedStep renders a numbered step ("  1.  text") with the index in soft
+// blue. Used by post-run summary cards for "next steps" hints.
+func NumberedStep(n int, text string) string {
 	return styleStep.Render(fmt.Sprintf("%d.", n)) + "  " + styleVal.Render(text)
 }
 

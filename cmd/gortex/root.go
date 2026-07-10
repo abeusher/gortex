@@ -11,6 +11,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/zzet/gortex/internal/persistence"
 	"github.com/zzet/gortex/internal/platform"
+	"github.com/zzet/gortex/internal/progress"
 	"github.com/zzet/gortex/internal/telemetry"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -139,7 +140,7 @@ func recordCLIUsage(cmd *cobra.Command, store *telemetry.Store, getenv func(stri
 func init() {
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default .gortex.yaml)")
 	rootCmd.PersistentFlags().StringVar(&logLevel, "log-level", "info", "log level: debug|info|warn|error")
-	rootCmd.PersistentFlags().BoolVar(&noProgress, "no-progress", false, "disable the animated progress spinner (also honored: NO_COLOR, TERM=dumb, non-TTY stderr)")
+	rootCmd.PersistentFlags().BoolVar(&noProgress, "no-progress", false, "disable animated progress output (also honored: NO_COLOR, TERM=dumb, CI, non-TTY stderr)")
 }
 
 func newLogger() *zap.Logger {
@@ -171,7 +172,11 @@ func execute() {
 	if maybeToolInvocationHint(os.Stderr, os.Args[1:]) {
 		os.Exit(1)
 	}
-	if err := rootCmd.Execute(); err != nil {
+	err := rootCmd.Execute()
+	// A command that errored out (or was interrupted) mid-animation leaves
+	// the cursor hidden; re-show it before any exit path. No-op otherwise.
+	progress.RestoreTerminal()
+	if err != nil {
 		var ec *exitCodeError
 		if errors.As(err, &ec) {
 			if ec.msg != "" {

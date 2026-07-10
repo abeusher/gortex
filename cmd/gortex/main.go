@@ -1,5 +1,7 @@
 package main
 
+import "github.com/zzet/gortex/internal/progress"
+
 // Build-time variables injected via `-X` ldflags. goreleaser populates
 // them from git state; `make build` does the same via Makefile variables.
 // When built with plain `go build`, all three stay at their defaults and
@@ -13,5 +15,8 @@ var (
 )
 
 func main() {
+	// A panic that unwinds out of a command must not leave the terminal with
+	// a hidden cursor from a live progress animation.
+	defer progress.RestoreTerminal()
 	execute()
 }

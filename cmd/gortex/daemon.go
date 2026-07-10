@@ -842,9 +842,9 @@ func emitDaemonStartSummary(w io.Writer, pid int, elapsed time.Duration) {
 	fmt.Fprintln(w, "     "+progress.Row("log", daemon.LogFilePath(), 8))
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "     "+progress.Heading("next"))
-	fmt.Fprintln(w, "     "+progress.Step(1, "track a repo:    gortex track <path>"))
-	fmt.Fprintln(w, "     "+progress.Step(2, "watch status:    gortex daemon status --watch"))
-	fmt.Fprintln(w, "     "+progress.Step(3, "shut down:       gortex daemon stop"))
+	fmt.Fprintln(w, "     "+progress.NumberedStep(1, "track a repo:    gortex track <path>"))
+	fmt.Fprintln(w, "     "+progress.NumberedStep(2, "watch status:    gortex daemon status --watch"))
+	fmt.Fprintln(w, "     "+progress.NumberedStep(3, "shut down:       gortex daemon stop"))
 	fmt.Fprintln(w)
 }
 
