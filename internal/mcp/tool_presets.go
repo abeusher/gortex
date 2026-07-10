@@ -54,12 +54,14 @@ const (
 // lazy_tools.go::hotEagerTools (the GORTEX_LAZY_TOOLS=1 eager set) — the
 // two answer different questions and are allowed to diverge.
 var corePresetTools = []string{
-	// orient — index_health is the cheap liveness check the workflow
-	// recommends, so it ships eagerly too (no discovery round-trip for
-	// the documented first step). get_active_project stays deferred: it
-	// is only registered in multi-repo mode, so it can't be an
-	// unconditional core tool.
-	"smart_context", "get_repo_outline", "graph_stats", "index_health",
+	// orient — explore is the one-shot localization verb, the loud first
+	// move for any task-shaped request (ranked neighborhood + source +
+	// call paths in one call). index_health is the cheap liveness check
+	// the workflow recommends, so it ships eagerly too (no discovery
+	// round-trip for the documented first step). get_active_project stays
+	// deferred: it is only registered in multi-repo mode, so it can't be
+	// an unconditional core tool.
+	"explore", "smart_context", "get_repo_outline", "graph_stats", "index_health",
 	// search / navigate
 	"search_symbols", "search_text", "find_files", "find_usages",
 	"find_implementations", "get_callers", "get_call_chain",
@@ -87,13 +89,17 @@ var corePresetTools = []string{
 // callable by name via promote-on-demand). tool_profile / tools_search are
 // always kept on top (isAlwaysKeptTool).
 var agentFloorTools = []string{
+	// orient — explore is the one-shot localization verb: the obvious
+	// opening move for any task-shaped request. It returns the ranked
+	// neighborhood (symbols + source + call paths + file map) in one
+	// call, folding the granular search/read/callers loop the agent would
+	// otherwise grind through into a single turn.
+	"explore", "smart_context", "index_health",
 	// search / navigate
 	"search_symbols", "find_usages", "find_implementations",
 	"get_callers", "get_call_chain", "get_dependencies", "get_dependents",
 	// read
 	"get_symbol_source", "get_file_summary", "get_editing_context", "read_file",
-	// orient
-	"smart_context", "index_health",
 	// edit / verify
 	"edit_file", "write_file", "verify_change",
 }
@@ -135,6 +141,7 @@ var editPresetTools = []string{
 // navPresetTools is the read-only navigation / exploration surface — no
 // editing tools at all.
 var navPresetTools = []string{
+	"explore",
 	"smart_context", "get_editing_context", "read_file", "get_symbol_source",
 	"get_file_summary", "get_symbol",
 	"search_symbols", "search_text", "find_files", "find_usages",

@@ -1375,6 +1375,7 @@ func NewServer(engine *query.Engine, g graph.Store, idx *indexer.Indexer, watche
 	s.registerToolsSearch()
 
 	s.registerCoreTools()
+	s.registerExploreTool()
 	s.registerFindFilesTool()
 	s.registerCodingTools()
 	s.registerMoveInlineTools()
