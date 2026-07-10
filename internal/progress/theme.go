@@ -2,6 +2,27 @@ package progress
 
 import "github.com/charmbracelet/lipgloss"
 
+// Cozy palette — gortex mark. One source of truth for brand color across the
+// binary; the tracker binds these to its own writer-scoped renderer, while
+// the static helpers below use the package-global styles.
+var (
+	colPerim     = lipgloss.Color("#F0F0F0")
+	colInner     = lipgloss.Color("#46464E")
+	colAccent    = lipgloss.Color("#5FD67A")
+	colAccentDim = lipgloss.Color("#4FB268")
+	colFg        = lipgloss.Color("#F4F3EF")
+	colFgDim     = lipgloss.Color("#969699")
+	colErr       = lipgloss.Color("#F06E64")
+
+	stylePerim  = lipgloss.NewStyle().Foreground(colPerim)
+	styleInner  = lipgloss.NewStyle().Foreground(colInner)
+	styleAccent = lipgloss.NewStyle().Foreground(colAccent)
+	styleLabel  = lipgloss.NewStyle().Bold(true).Foreground(colFg)
+	styleSub    = lipgloss.NewStyle().Foreground(colFgDim)
+	styleOK     = lipgloss.NewStyle().Foreground(colAccent)
+	styleX      = lipgloss.NewStyle().Foreground(colErr)
+)
+
 // Exported palette — kept as a thin re-export layer over the package-private
 // `col*` constants so the rest of the binary (cmd/gortex, internal/tui) can
 // share one source of truth for brand colour without each callsite hard-coding
@@ -40,22 +61,6 @@ var (
 	StyleStrong  = styleStrong
 	StyleBox     = styleBox
 )
-
-// MeshLogo renders one static frame of the gortex mesh logo with the active
-// node fixed at tick % 12. Used by banner panels that want the brand mark
-// without owning a live spinner.
-func MeshLogo(tick int) string {
-	return meshFrame(tick)
-}
-
-// MeshLogoLines returns the number of vertical rows the mesh logo occupies.
-// Exported so wizard / dashboard layouts can reserve space without re-counting
-// the constant.
-func MeshLogoLines() int { return 5 }
-
-// MeshLogoWidth returns the rendered visual width of the mesh logo in cells.
-// 5 cells × "● " spacing = 9 chars.
-func MeshLogoWidth() int { return 9 }
 
 // PaletteFg / PaletteAccent / PaletteErr expose the resolved lipgloss colors
 // for callers that need to apply them to a freshly-built style (rather than

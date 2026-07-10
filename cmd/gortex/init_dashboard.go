@@ -41,17 +41,53 @@ type initProgress interface {
 	Fail(err error)
 }
 
-// spinnerProgress wraps the legacy Spinner so it satisfies initProgress.
-type spinnerProgress struct{ sp *progress.Spinner }
+// trackerProgress drives the banner-preset Tracker: the gortex mark lighting
+// up across the planned stages, a live status line, and one checklist row per
+// stage. It is the default init / install surface; with --no-progress (or on
+// a pipe) the same driver degrades to clean line output.
+type trackerProgress struct {
+	t     *progress.Tracker
+	steps map[string]*progress.Step
+}
 
-func (s *spinnerProgress) Start(label string)       { s.sp.Start(label) }
-func (s *spinnerProgress) Stage(name, sub string)   { s.sp.Set(name, sub) }
-func (s *spinnerProgress) Sub(sub string)           { s.sp.Set("", sub) }
-func (s *spinnerProgress) StageDone(_, sub string)  { s.sp.Set("", sub) }
-func (s *spinnerProgress) Reporter() progress.Reporter { return s.sp }
-func (s *spinnerProgress) Enabled() bool            { return s.sp.Enabled() }
-func (s *spinnerProgress) Done()                    { s.sp.Done() }
-func (s *spinnerProgress) Fail(err error)           { s.sp.Fail(err) }
+// newTrackerProgress plans the given stages up front so the checklist shows
+// the whole run from the first frame — pending rows fill in as stages start,
+// and the planned count is what lets the logo light up proportionally.
+func newTrackerProgress(w io.Writer, stages []string, plain bool) *trackerProgress {
+	opts := []progress.TrackerOption{progress.WithLogo()}
+	if plain {
+		opts = append(opts, progress.WithoutAnimation())
+	}
+	t := progress.NewTracker(w, opts...)
+	tp := &trackerProgress{t: t, steps: make(map[string]*progress.Step, len(stages))}
+	for _, s := range stages {
+		tp.steps[s] = t.AddStep(s)
+	}
+	return tp
+}
+
+func (p *trackerProgress) Start(label string) { p.t.Start(label) }
+
+func (p *trackerProgress) Stage(name, sub string) {
+	p.steps[name] = p.t.StartStep(name)
+	p.t.SetStatus(sub)
+}
+
+func (p *trackerProgress) Sub(sub string) { p.t.SetStatus(sub) }
+
+func (p *trackerProgress) StageDone(name, sub string) {
+	if s, ok := p.steps[name]; ok {
+		s.Done()
+	}
+	if sub != "" {
+		p.t.SetStatus(sub)
+	}
+}
+
+func (p *trackerProgress) Reporter() progress.Reporter { return p.t }
+func (p *trackerProgress) Enabled() bool               { return p.t.Animated() }
+func (p *trackerProgress) Done()                       { p.t.Done("ready", "") }
+func (p *trackerProgress) Fail(err error)              { p.t.Fail(err) }
 
 // dashboardProgress wraps a running Dashboard tea.Program so it satisfies
 // initProgress. Wait blocks until the program exits.
@@ -206,25 +242,24 @@ var wizardSelectedDashboard bool
 
 // selectInitProgress returns the right initProgress surface for the current
 // run. Order of precedence:
-//   * --no-progress: plain text spinner (no animation, no dashboard).
-//   * Wizard ran successfully: dashboard.
-//   * Otherwise: legacy mesh spinner (TTY-detected internally).
+//   - --no-progress: the tracker in plain line mode (no animation, no dashboard).
+//   - Wizard ran successfully: dashboard.
+//   - Otherwise: the banner tracker — gortex mark, status line, and the
+//     planned stage checklist (TTY-detected internally).
 //
 // The dashboard is only worth standing up after the wizard has cleared the
 // alt-screen — otherwise it competes with the wizard's own draw cycle.
 func selectInitProgress(w io.Writer) initProgress {
+	stages := buildInitStages(initAnalyze, initSkills)
 	if noProgress {
-		sp := progress.NewSpinner(w)
-		sp.Disable()
-		return &spinnerProgress{sp: sp}
+		return newTrackerProgress(w, stages, true)
 	}
 	if wizardSelectedDashboard {
-		stages := buildInitStages(initAnalyze, initSkills)
 		if s := startInitDashboard(w, stages); s != nil {
 			return newDashboardProgress(s)
 		}
 	}
-	return &spinnerProgress{sp: progress.NewSpinner(w)}
+	return newTrackerProgress(w, stages, false)
 }
 
 // ensure unused-import linter doesn't trip on context until callers wire it

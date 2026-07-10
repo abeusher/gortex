@@ -8,7 +8,6 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/zzet/gortex/internal/agents"
-	"github.com/zzet/gortex/internal/progress"
 )
 
 // installWizardSelectedDashboard mirrors wizardSelectedDashboard but for the
@@ -94,21 +93,20 @@ func newInstallWizardModel(home string, registered []agents.Adapter, detected ma
 }
 
 // selectInstallProgress returns the right initProgress surface for the
-// install run. Same precedence as init: --no-progress → plain text spinner;
-// wizard ran → dashboard; otherwise legacy spinner.
+// install run. Same precedence as init: --no-progress → plain line tracker;
+// wizard ran → dashboard; otherwise the banner tracker.
 func selectInstallProgress(w io.Writer) initProgress {
+	stages := []string{stageAdapters}
 	if noProgress {
-		sp := progress.NewSpinner(w)
-		sp.Disable()
-		return &spinnerProgress{sp: sp}
+		return newTrackerProgress(w, stages, true)
 	}
 	if installWizardSelectedDashboard {
 		// Install has exactly one high-level stage (adapters); the dashboard
 		// is still valuable because it shows the per-adapter sub-status as a
 		// framed live view instead of a single line that scrolls past.
-		if s := startInitDashboard(w, []string{stageAdapters}); s != nil {
+		if s := startInitDashboard(w, stages); s != nil {
 			return newDashboardProgress(s)
 		}
 	}
-	return &spinnerProgress{sp: progress.NewSpinner(w)}
+	return newTrackerProgress(w, stages, false)
 }
