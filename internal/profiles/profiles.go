@@ -78,6 +78,8 @@ type Profile struct {
 // both the `localization` tool preset (internal/mcp) and the rule
 // table in the localization instructions body.
 var localizationEagerTools = []string{
+	// the one-shot localization opener
+	"explore",
 	// orient
 	"smart_context", "index_health",
 	// search

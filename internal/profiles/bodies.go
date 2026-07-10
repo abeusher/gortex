@@ -36,8 +36,16 @@ A Gortex daemon is configured machine-wide via the §gortex§ MCP server. Whenev
 
 // sectionFullRuleTable is the classic nine-row instead-of table used
 // by the core and full profiles.
+// sectionExploreOpener positions the one-shot localization verb as
+// the opening move (standard rendering; the lean profile carries its
+// own condensed line).
+var sectionExploreOpener = bt(`**Start every task with §explore§.** Describe the request in plain words (paste the issue, name the area) and it returns the ranked localization neighborhood — the likely-involved symbols with their source, call paths, and the files to change — in ONE call. Answer or start editing from its output; the granular tools below are for following up on one specific symbol.
+
+`)
+
 var sectionFullRuleTable = bt(`| Instead of...                       | Use...                                   |
 |-------------------------------------|------------------------------------------|
+| Localizing a task / bug / "where is X" | §explore§ (one call: ranked neighborhood + source + call paths) |
 | §Grep§ / §grep§ / §rg§ for a symbol | §search_symbols§ (BM25 + camelCase-aware) |
 | §Grep§ for references               | §find_usages§ (zero false positives)     |
 | Reading / grepping to find callers  | §get_callers§ / §get_call_chain§         |
@@ -45,6 +53,7 @@ var sectionFullRuleTable = bt(`| Instead of...                       | Use...   
 | §Read§ a file for one symbol        | §get_symbol_source§ (§compress_bodies:true§ for the signature only) |
 | §Read§ to understand a file         | §get_file_summary§ / §get_editing_context§ |
 | §Read§ a non-indexed / raw file     | §read_file§                              |
+| §Read§ several symbols' bodies at once | §batch_symbols§ (one call, many bodies) |
 | Multiple reads to explore a task    | §smart_context§ (one call)               |
 | §Edit§ / §Write§ source             | §edit_file§ / §write_file§ / §edit_symbol§ / §rename_symbol§ / §batch_edit§ |
 
@@ -115,6 +124,7 @@ var fullSurfaceLine = bt(`**§tools_search§** — under this profile the server
 // profile-switch discovery line.
 func coreBody() string {
 	return sectionHeader(false) +
+		sectionExploreOpener +
 		sectionFullRuleTable +
 		sectionCLIFallback +
 		sectionReadDiscipline +
@@ -127,6 +137,7 @@ func coreBody() string {
 // surface.
 func fullBody() string {
 	return sectionHeader(false) +
+		sectionExploreOpener +
 		sectionFullRuleTable +
 		sectionCLIFallback +
 		sectionReadDiscipline +
@@ -144,6 +155,7 @@ type localizationRow struct {
 }
 
 var localizationRows = []localizationRow{
+	{"explore", "Localizing a task / bug / \"where is X\"", "§explore§ (one call: ranked neighborhood + source + call paths)"},
 	{"search_symbols", "§Grep§ / §rg§ for a symbol", "§search_symbols§ (BM25 + camelCase-aware)"},
 	{"search_text", "§Grep§ for a literal / regex", "§search_text§ (trigram-indexed)"},
 	{"find_usages", "§Grep§ for references", "§find_usages§ (zero false positives)"},
@@ -179,11 +191,11 @@ func localizationTable() string {
 // gortex://guide.
 func localizationBody() string {
 	return sectionHeader(true) +
-		bt(`**Open every localization task with one call:** §smart_context task:"<what you are looking for>"§ — candidate symbols, source, and callers in one shot. Go targeted from its results instead of re-searching.
+		bt(`**Open every localization task with one call:** §explore§ with the request text in plain words — the ranked localization neighborhood (likely symbols + source + call paths + files to change) in one shot. Go targeted from its output instead of re-searching.
 
 `) +
 		localizationTable() +
-		bt(`Read the real body (§get_symbol_source§, without §compress_bodies§) before you change or depend on a symbol. **No MCP mounted?** Any tool works from a shell: §gortex call <tool> --arg k=v§.
+		bt(`Read the real body (§get_symbol_source§, without §compress_bodies§) before you change or depend on a symbol; §smart_context§ assembles the broader working set when explore's neighborhood is not enough. **No MCP mounted?** Any tool works from a shell: §gortex call <tool> --arg k=v§.
 
 `) +
 		sectionMemoryLean +

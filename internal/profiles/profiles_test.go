@@ -18,7 +18,7 @@ import (
 var bodyByteCeilings = map[string]int{
 	"core":         6656,
 	"full":         6912,
-	"localization": 2048,
+	"localization": 2304, // explore opener + row joined at the explore-branch consolidation
 }
 
 func TestProfileBodyByteCeilings(t *testing.T) {

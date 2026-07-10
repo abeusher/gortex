@@ -88,7 +88,7 @@ func TestPromptInjection_LeanTier(t *testing.T) {
 	if !strings.Contains(lean, "Alpha") {
 		t.Errorf("lean tier dropped the top hit:\n%s", lean)
 	}
-	if !strings.Contains(lean, "get_symbol_source") || !strings.Contains(lean, "smart_context") {
+	if !strings.Contains(lean, "get_symbol_source") || !strings.Contains(lean, "explore") {
 		t.Errorf("lean tier lost the tool cues:\n%s", lean)
 	}
 

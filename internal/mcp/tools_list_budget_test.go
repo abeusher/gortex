@@ -59,7 +59,14 @@ const agentPresetByteCeiling = 28200
 // localization preset (the `localization` instruction profile's tool
 // surface). It must stay well under the agent floor — the profile
 // exists to cut the per-turn schema tax.
-const localizationPresetByteCeiling = 20000
+//
+// Re-based 20000 → 21000 when the surface deliberately grew 12 → 14
+// tools: `explore` (the one-shot opener the profile is built around)
+// and `batch_symbols` (bench-measured: one extra median turn per
+// session without a multi-symbol read). Measured after the growth:
+// 20432 bytes — still ~27% under the agent floor, with slack so any
+// further description creep fails loudly.
+const localizationPresetByteCeiling = 21000
 
 // TestToolsListByteCeilings is the permanent measurement gate: it prints the
 // cold tools/list byte cost of every preset and asserts the agent preset
