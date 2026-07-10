@@ -12,6 +12,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/zzet/gortex/internal/llm"
+	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/platform"
 )
 
@@ -425,10 +426,14 @@ func (gc *GlobalConfig) AddRepo(entry RepoEntry) error {
 	}
 	entry.Path = absPath
 
-	// Check for duplicate path.
+	// Check for duplicate path. Compare on folded identity so a
+	// case-only or Unicode-normalisation variant of an already-tracked
+	// directory on a case-insensitive filesystem is recognised as the
+	// same repo. The existing entry's stored Path spelling is preserved
+	// as the identity anchor — we never append a second entry for it.
 	for _, existing := range gc.Repos {
 		existingAbs := normalizePath(existing.Path)
-		if existingAbs == absPath {
+		if pathkey.SamePathIdentity(existingAbs, absPath) {
 			return nil // already tracked, skip
 		}
 	}
@@ -447,13 +452,53 @@ func (gc *GlobalConfig) RemoveRepo(path string) error {
 
 	for i, entry := range gc.Repos {
 		entryAbs := normalizePath(entry.Path)
-		if entryAbs == absPath {
+		if pathkey.SamePathIdentity(entryAbs, absPath) {
 			gc.Repos = append(gc.Repos[:i], gc.Repos[i+1:]...)
 			return nil
 		}
 	}
 
 	return fmt.Errorf("repository not found: %s", path)
+}
+
+// DedupeRepos removes tracked-repo entries that name the same directory as
+// an earlier entry but differ only in path spelling — letter case or
+// Unicode normalisation — on a case-insensitive filesystem. It is the
+// startup-healing pass for configs that already accumulated a duplicate
+// (issue #270): before folding was applied, two casings of one directory
+// could each become a tracked entry, flipping the daemon into multi-repo
+// mode and desyncing the graph.
+//
+// The FIRST entry for each directory is kept: it is the oldest and the one
+// whose repo prefix most likely already owns the indexed graph. Later
+// duplicates are returned so the caller can log which spelling was dropped
+// and persist the cleaned list. A surviving entry's stored Path is never
+// rewritten — its spelling is identity-bearing.
+func (gc *GlobalConfig) DedupeRepos() (removed []RepoEntry) {
+	if len(gc.Repos) < 2 {
+		return nil
+	}
+	kept := make([]RepoEntry, 0, len(gc.Repos))
+	for _, entry := range gc.Repos {
+		entryAbs := normalizePath(entry.Path)
+		dup := false
+		for _, k := range kept {
+			if pathkey.SamePathIdentity(normalizePath(k.Path), entryAbs) {
+				dup = true
+				break
+			}
+		}
+		if dup {
+			removed = append(removed, entry)
+			continue
+		}
+		kept = append(kept, entry)
+	}
+	if len(removed) == 0 {
+		return nil
+	}
+	gc.Repos = kept
+	return removed
 }
 
 // ResolveRepos returns the effective repo list for a given project name.

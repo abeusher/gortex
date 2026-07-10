@@ -19,6 +19,7 @@ import (
 	"github.com/zzet/gortex/internal/embedding"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/parser"
+	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/progress"
 	"github.com/zzet/gortex/internal/resolver"
 	"github.com/zzet/gortex/internal/search"
@@ -1167,7 +1168,7 @@ func (mi *MultiIndexer) migrateLoneUnprefixedRepoCtx(ctx context.Context) {
 	entry := config.RepoEntry{Path: oldMeta.RootPath, Name: oldPrefix}
 	if mi.configMgr != nil {
 		for _, e := range mi.configMgr.Global().Repos {
-			if e.Path == oldMeta.RootPath {
+			if pathkey.EqualPaths(e.Path, oldMeta.RootPath) {
 				entry = e
 				break
 			}
@@ -1563,7 +1564,7 @@ func (mi *MultiIndexer) resolveTrackPrefix(entry *config.RepoEntry, absPath stri
 	mi.mu.RLock()
 	existing, ok := mi.repos[prefix]
 	mi.mu.RUnlock()
-	if ok && existing != nil && existing.RootPath != absPath {
+	if ok && existing != nil && !pathkey.SamePathIdentity(existing.RootPath, absPath) {
 		prefix = name + "-" + shortPathHash(absPath)
 	}
 
@@ -1602,6 +1603,36 @@ func EffectiveRepoPrefix(cm *config.ConfigManager, entry config.RepoEntry) strin
 	return name
 }
 
+// foldDistinctRepoCount counts configured repos by folded path identity,
+// so two entries that name the same directory under different spellings
+// (case or Unicode normalisation on a case-insensitive filesystem) count
+// once. It backstops the willBeMultiRepo decision: startup healing already
+// prunes such duplicates, but a not-yet-pruned config must not be allowed
+// to flip the graph into prefixed-ID mode for what is really one repo.
+func foldDistinctRepoCount(repos []config.RepoEntry) int {
+	n := 0
+	seen := make([]string, 0, len(repos))
+	for _, e := range repos {
+		abs, err := filepath.Abs(e.Path)
+		if err != nil {
+			abs = e.Path
+		}
+		dup := false
+		for _, s := range seen {
+			if pathkey.EqualPaths(s, abs) {
+				dup = true
+				break
+			}
+		}
+		if dup {
+			continue
+		}
+		seen = append(seen, abs)
+		n++
+	}
+	return n
+}
+
 // TrackRepoCtx is TrackRepo with a context, allowing callers to pipe progress
 // reporters (via progress.WithReporter) through to the underlying Index call.
 func (mi *MultiIndexer) TrackRepoCtx(ctx context.Context, entry config.RepoEntry) (*IndexResult, error) {
@@ -1609,6 +1640,11 @@ func (mi *MultiIndexer) TrackRepoCtx(ctx context.Context, entry config.RepoEntry
 	if err != nil {
 		return nil, fmt.Errorf("resolving path %s: %w", entry.Path, err)
 	}
+	// Normalise the volume (upper-case a Windows drive letter) so a newly
+	// tracked path converges with os.Getwd's convention. The volume is
+	// never part of a repo basename, so this cannot rotate a repo prefix;
+	// no-op on POSIX.
+	absPath = pathkey.NormalizeVolume(absPath)
 
 	// Validate path exists and is a directory.
 	info, err := os.Stat(absPath)
@@ -1640,11 +1676,22 @@ func (mi *MultiIndexer) TrackRepoCtx(ctx context.Context, entry config.RepoEntry
 	// matching impossible to express).
 	prefix, cfg := mi.resolveTrackPrefix(&entry, absPath, identity)
 
-	// Check if already tracked.
+	// Check if already tracked. The prefix-keyed check catches the common
+	// case; the path scan additionally catches a case-only or Unicode
+	// spelling variant of an already-tracked directory on a
+	// case-insensitive filesystem (which resolves to a different derived
+	// prefix and would otherwise be minted as a bogus second instance —
+	// the very thing that flips the daemon into multi-repo mode, #270).
 	mi.mu.RLock()
 	if _, exists := mi.repos[prefix]; exists {
 		mi.mu.RUnlock()
 		return nil, nil // already tracked
+	}
+	for _, meta := range mi.repos {
+		if meta != nil && pathkey.SamePathIdentity(meta.RootPath, absPath) {
+			mi.mu.RUnlock()
+			return nil, nil // same directory, different path spelling
+		}
 	}
 	hook := mi.onRepoTracked
 	mi.mu.RUnlock()
@@ -1662,7 +1709,7 @@ func (mi *MultiIndexer) TrackRepoCtx(ctx context.Context, entry config.RepoEntry
 	// the same graph and halving cross-file edge density.
 	totalConfigured := 1 // ourselves
 	if mi.configMgr != nil {
-		totalConfigured = len(mi.configMgr.Global().Repos)
+		totalConfigured = foldDistinctRepoCount(mi.configMgr.Global().Repos)
 	}
 	willBeMultiRepo := len(mi.repos)+1 >= 2 || totalConfigured >= 2
 
@@ -1747,6 +1794,9 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 	if err != nil {
 		return nil, fmt.Errorf("resolving path %s: %w", entry.Path, err)
 	}
+	// Normalise the volume (upper-case a Windows drive letter) to converge
+	// with os.Getwd's convention. Cosmetic; never touches the basename.
+	absPath = pathkey.NormalizeVolume(absPath)
 	info, err := os.Stat(absPath)
 	if err != nil {
 		return nil, fmt.Errorf("path does not exist: %s", absPath)
@@ -1786,7 +1836,7 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 
 	totalConfigured := 1
 	if mi.configMgr != nil {
-		totalConfigured = len(mi.configMgr.Global().Repos)
+		totalConfigured = foldDistinctRepoCount(mi.configMgr.Global().Repos)
 	}
 	willBeMultiRepo := len(mi.repos)+1 >= 2 || totalConfigured >= 2
 
@@ -2157,7 +2207,12 @@ func (mi *MultiIndexer) RepoForFile(filePath string) string {
 	var bestLen int
 
 	for prefix, meta := range mi.repos {
-		if strings.HasPrefix(absPath, meta.RootPath+string(filepath.Separator)) || absPath == meta.RootPath {
+		// Fold-aware containment so a case-variant file path still maps
+		// to its repo on a case-insensitive filesystem. Longest-root-wins
+		// breaks ties by nesting depth; nested roots share a prefix, so
+		// the raw RootPath length orders them the same as their folded
+		// forms would.
+		if pathkey.HasPathPrefix(absPath, meta.RootPath) {
 			if len(meta.RootPath) > bestLen {
 				bestLen = len(meta.RootPath)
 				bestPrefix = prefix

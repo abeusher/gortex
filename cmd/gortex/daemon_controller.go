@@ -22,6 +22,7 @@ import (
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/releases"
 	"github.com/zzet/gortex/internal/search"
 	"github.com/zzet/gortex/internal/semantic"
@@ -396,10 +397,17 @@ func (c *realController) Untrack(_ context.Context, p daemon.UntrackParams) (jso
 	}
 
 	prefix := p.PathOrPrefix
-	// Resolve path → prefix if an absolute or relative path was given.
+	// Resolve path → prefix if an absolute path was given. Absolutise (to
+	// Clean) and compare with fold-aware EqualPaths so a case-variant
+	// spelling of a tracked root on a case-insensitive filesystem still
+	// resolves to the right prefix.
 	if filepath.IsAbs(p.PathOrPrefix) {
+		abs, err := filepath.Abs(p.PathOrPrefix)
+		if err != nil {
+			abs = p.PathOrPrefix
+		}
 		for pfx, meta := range c.multiIndexer.AllMetadata() {
-			if meta.RootPath == p.PathOrPrefix {
+			if pathkey.EqualPaths(meta.RootPath, abs) {
 				prefix = pfx
 				break
 			}

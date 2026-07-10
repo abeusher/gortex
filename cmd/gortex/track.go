@@ -13,6 +13,7 @@ import (
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/progress"
 	"github.com/zzet/gortex/internal/tui"
 )
@@ -81,11 +82,15 @@ func runTrack(cmd *cobra.Command, args []string) error {
 	rawPath := args[0]
 	w := cmd.ErrOrStderr()
 
-	// Resolve to absolute path.
+	// Resolve to absolute path. Normalise the volume (upper-case a Windows
+	// drive letter) for this NEW entry so it converges with os.Getwd's
+	// convention — the volume is never part of a repo basename, so this is
+	// cosmetic and cannot rotate a repo prefix. No-op on POSIX.
 	absPath, err := filepath.Abs(rawPath)
 	if err != nil {
 		return fmt.Errorf("resolving path %s: %w", rawPath, err)
 	}
+	absPath = pathkey.NormalizeVolume(absPath)
 
 	// Validate path exists and is a directory.
 	info, err := os.Stat(absPath)
@@ -106,9 +111,12 @@ func runTrack(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("loading global config: %w", err)
 	}
+	// Heal any pre-existing duplicate case-variant entries so the track
+	// path (and the persisted config) sees a clean list (#270).
+	healDuplicateRepos(gc, nil)
 	already := false
 	for _, existing := range gc.Repos {
-		if existingAbs, _ := filepath.Abs(existing.Path); existingAbs == absPath {
+		if existingAbs, _ := filepath.Abs(existing.Path); pathkey.SamePathIdentity(existingAbs, absPath) {
 			already = true
 			break
 		}
@@ -175,7 +183,7 @@ func runTrack(cmd *cobra.Command, args []string) error {
 // daemon status, or -1 if the daemon has not registered the repo yet.
 func repoNodeCount(st daemon.StatusResponse, absPath string) int {
 	for _, r := range st.TrackedRepos {
-		if ra, err := filepath.Abs(r.Path); err == nil && ra == absPath {
+		if ra, err := filepath.Abs(r.Path); err == nil && pathkey.EqualPaths(ra, absPath) {
 			return r.Nodes
 		}
 	}
@@ -343,6 +351,14 @@ func runUntrack(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("resolving path %s: %w", rawPath, err)
 		}
 		target = abs
+	} else if info, statErr := os.Stat(rawPath); statErr == nil && info.IsDir() {
+		// A relative arg that names an existing directory (e.g. `foo/bar`
+		// from cwd) is a path, not a prefix — absolutise it so it resolves
+		// against the tracked roots. A bare prefix that names no directory
+		// keeps its as-is behaviour.
+		if abs, err := filepath.Abs(rawPath); err == nil {
+			target = abs
+		}
 	}
 
 	emitUntrackBanner(w, target, daemon.IsRunning())

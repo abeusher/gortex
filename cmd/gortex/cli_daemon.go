@@ -6,9 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
-	"strings"
 
 	"github.com/zzet/gortex/internal/daemon"
+	"github.com/zzet/gortex/internal/pathkey"
 )
 
 // ErrNoExecutor signals that no warm daemon owns the repo and no explicit
@@ -158,7 +158,7 @@ func daemonOwnsRepo(abs string) bool {
 		if repo.Path == "" {
 			continue
 		}
-		if abs == repo.Path || strings.HasPrefix(abs, repo.Path+string(filepath.Separator)) {
+		if pathkey.HasPathPrefix(abs, repo.Path) {
 			return true
 		}
 	}
