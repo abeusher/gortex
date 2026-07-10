@@ -20,6 +20,7 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
 	gortexmcp "github.com/zzet/gortex/internal/mcp"
+	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/platform"
 	"github.com/zzet/gortex/internal/progress"
 	"github.com/zzet/gortex/internal/semantic/lsp"
@@ -225,6 +226,43 @@ type warmupTimings struct {
 // — so the daemon reports ready as soon as find_usages / get_callers return
 // complete results, not after enrichment finishes. The returned *warmupTimings
 // is never nil — daemon.go uses it to emit a one-line warmup summary.
+// healDuplicateRepos drops tracked-repo entries that name the same
+// directory as an earlier entry under a different path spelling — letter
+// case or Unicode normalisation on a case-insensitive filesystem — logs
+// each drop, and persists the cleaned config. Returns the number of
+// entries removed. It is the startup / load-time repair for configs that
+// accumulated a duplicate before folding was applied (#270): a duplicate
+// reaching the warmup loop would flip the daemon into multi-repo mode and
+// desync the graph. The FIRST (oldest) spelling of each directory is kept.
+func healDuplicateRepos(gc *config.GlobalConfig, logger *zap.Logger) int {
+	if gc == nil {
+		return 0
+	}
+	removed := gc.DedupeRepos()
+	if len(removed) == 0 {
+		return 0
+	}
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+	for _, r := range removed {
+		kept := r.Path
+		for _, k := range gc.Repos {
+			if pathkey.SamePathIdentity(k.Path, r.Path) {
+				kept = k.Path
+				break
+			}
+		}
+		logger.Warn("dropping duplicate tracked-repo entry (same directory, different path spelling)",
+			zap.String("dropped", r.Path),
+			zap.String("kept", kept))
+	}
+	if err := gc.Save(); err != nil {
+		logger.Warn("persisting deduped repo config failed", zap.Error(err))
+	}
+	return len(removed)
+}
+
 func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func()) (*indexer.MultiWatcher, *warmupTimings) {
 	timings := &warmupTimings{}
 	if state.multiIndexer == nil || state.configManager == nil {
@@ -243,6 +281,13 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// per-repo passes serially before the global resolve. Without this
 	// batch wrapper, a 100+ repo warmup is O(R · global_size).
 	state.multiIndexer.BeginParallelBatch()
+
+	// Heal any duplicate tracked-repo entries that name the same directory
+	// under a different path spelling (case, or Unicode normalisation)
+	// BEFORE the warmup loop registers them. Two spellings of one directory
+	// would otherwise both reach the indexer and flip the daemon into
+	// multi-repo mode, desyncing the unprefixed graph (#270).
+	healDuplicateRepos(state.configManager.Global(), logger)
 
 	repos := state.configManager.Global().Repos
 

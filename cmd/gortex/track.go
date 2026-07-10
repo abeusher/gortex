@@ -111,6 +111,9 @@ func runTrack(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("loading global config: %w", err)
 	}
+	// Heal any pre-existing duplicate case-variant entries so the track
+	// path (and the persisted config) sees a clean list (#270).
+	healDuplicateRepos(gc, nil)
 	already := false
 	for _, existing := range gc.Repos {
 		if existingAbs, _ := filepath.Abs(existing.Path); pathkey.SamePathIdentity(existingAbs, absPath) {
