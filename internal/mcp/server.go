@@ -241,9 +241,9 @@ type Server struct {
 	// instead of re-spawning the language server. An entry is recorded after
 	// the first attempt (success or empty) to bound per-query LSP work.
 	refsConfirmed sync.Map // symbolID → struct{}
-	feedback         *feedbackManager
-	notes            *notesManager
-	memories         *memoryManager
+	feedback      *feedbackManager
+	notes         *notesManager
+	memories      *memoryManager
 	// promotedTools is the per-workspace learned tool surface: deferred
 	// tools promoted into the eager surface after use, persisted so the
 	// learning survives daemon restarts (with demotion after disuse). Nil
@@ -560,6 +560,11 @@ type sessionState struct {
 	// lazily on first capture.
 	responses *responseBuffer
 
+	// momentumReads counts this session's read/navigate tool calls;
+	// momentumNudged latches the one-shot momentum note (momentum.go).
+	momentumReads  int
+	momentumNudged bool
+
 	// cursor is the per-session stateful navigation cursor used by the
 	// nav tool — a current symbol plus a back-history. Allocated lazily
 	// on the first nav call and freed with the rest of sessionState on
@@ -794,7 +799,6 @@ func (ss *sessionState) recordToolPolicy(spec, mode string) {
 	ss.resolvedToolPolicy = nil
 	ss.toolPolicyResolved = false
 }
-
 
 // snapshotClientName returns the captured client name under the
 // session lock. Returns empty when the `initialize` frame hasn't

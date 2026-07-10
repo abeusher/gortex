@@ -167,6 +167,12 @@ func (s *Server) wrapToolHandler(h mcpserver.ToolHandlerFunc) mcpserver.ToolHand
 		if hErr == nil {
 			s.captureResponse(ctx, req.Params.Name, res)
 		}
+		// One-shot momentum note: after many read calls in one session,
+		// remind the agent that what it already holds is citeable
+		// (momentum.go). No-op for non-read tools and error results.
+		if hErr == nil {
+			res = s.maybeAttachMomentumNote(ctx, req.Params.Name, res)
+		}
 		return res, hErr
 	}
 }
