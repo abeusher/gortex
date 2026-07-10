@@ -173,6 +173,7 @@ The generic relay: invoke any tool the daemon's MCP surface registers, even one 
 | `--quiet` | suppress the mutating-tool stderr note |
 
 ```bash
+gortex call explore --arg task="login handler 500s when the session cookie is expired"
 gortex call smart_context --arg task="add rate limiting to the login handler"
 gortex call find_usages --arg id="internal/auth/login.go::Login" --format gcx
 gortex call overlay_push --json-file ./buffer.json          # reach a deferred tool by name

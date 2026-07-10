@@ -37,9 +37,12 @@ const (
 	exploreMaxBudgetTokens     = 24000
 	exploreDefaultMaxSymbols   = 10
 	exploreMaxMaxSymbols       = 30
-	exploreHotBodies           = 6 // top-ranked targets shown at full source
 	exploreRingCap             = 5 // callers / callees shown per target
 	exploreCharsPerToken       = 4 // coarse token estimate for budgeting
+	// exploreBodyBudgetShare caps any single full body at this fraction of
+	// the total budget, so one huge top-ranked symbol cannot starve the
+	// rest of the neighborhood of their bodies.
+	exploreBodyBudgetShare = 3
 )
 
 // registerExploreTool wires the one-shot localization verb into the tool
@@ -166,7 +169,7 @@ func (s *Server) renderExplore(task string, targets []exploreTarget, budget int)
 		addFile(path, n.Name)
 
 		var head strings.Builder
-		fmt.Fprintf(&head, "\n%d. %s  %s  ·  %s\n", i+1, n.Name, n.Kind, nodeLoc(n))
+		fmt.Fprintf(&head, "\n%d. %s  %s  ·  %s  ·  id: %s\n", i+1, n.Name, n.Kind, nodeLoc(n), n.ID)
 		if len(t.callers) > 0 {
 			fmt.Fprintf(&head, "   ^ callers: %s\n", joinNeighbors(t.callers))
 		}
@@ -176,13 +179,15 @@ func (s *Server) renderExplore(task string, targets []exploreTarget, budget int)
 		b.WriteString(head.String())
 		used += estimateTokens(head.String())
 
-		// Source body: full for the top-ranked targets while the budget
-		// holds; signature stub otherwise. The header/locations above are
-		// always emitted so file-hit / symbol-hit never depend on budget.
+		// Source body: full while the budget holds (rank decides order, the
+		// budget decides where full source stops; no single body may take
+		// more than 1/exploreBodyBudgetShare of the whole budget), signature
+		// stub otherwise. The header/locations above are always emitted so
+		// file-hit / symbol-hit never depend on budget.
 		body := ""
 		if t.source != "" {
-			full := i < exploreHotBodies
-			if full && used+estimateTokens(t.source) <= budget {
+			cost := estimateTokens(t.source)
+			if used+cost <= budget && cost <= budget/exploreBodyBudgetShare {
 				body = t.source
 			} else {
 				if sig, err := elide.CompressString(t.source, n.Language); err == nil && sig != "" {
@@ -192,8 +197,8 @@ func (s *Server) renderExplore(task string, targets []exploreTarget, budget int)
 				}
 				if used+estimateTokens(body) > budget {
 					body = ""
-					truncated = true
 				}
+				truncated = true
 			}
 		}
 		if body != "" {
@@ -210,7 +215,7 @@ func (s *Server) renderExplore(task string, targets []exploreTarget, budget int)
 	fmt.Fprintf(&b, "\n— Completeness: %d candidate symbol(s) across %d file(s); callers/callees resolved server-side from the graph. This is the ranked neighborhood for the request — a location not listed here is not on the ranked path. Answer (FILES / SYMBOLS / EVIDENCE) or start editing directly from this; the paths and line numbers above are real and citeable.\n",
 		len(targets), len(fileOrder))
 	if truncated {
-		fmt.Fprintf(&b, "  (Source bodies truncated at the %d-token budget; every candidate's location is still listed above — fetch an elided body with get_symbol_source / batch_symbols if needed.)\n", budget)
+		fmt.Fprintf(&b, "  (Some bodies are elided under the %d-token budget; every candidate's location is still listed above — fetch an elided body with get_symbol_source / batch_symbols using the exact `id:` shown on its line.)\n", budget)
 	}
 	return b.String()
 }

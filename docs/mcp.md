@@ -58,8 +58,8 @@ Six built-in presets:
 
 | Preset | Surface |
 |--------|---------|
-| `agent` (**default for known coding-agent clients**) | the lean coding-agent working set (~16 tools): search/navigate + read + orient + edit/verify. Parameter descriptions are compacted (the full prose is one `tools_search` / `full` hop away). Aliases: `coding-agent` |
-| `core` (**default for editors / unknown clients**) | the curated dev-cycle set (~34 tools): orient + search/navigate + read + edit + verify/test + `analyze` + review + the memory workflow. Aliases: `default`, `classic` |
+| `agent` (**default for known coding-agent clients**) | the lean coding-agent working set (~20 tools): `explore` (the one-shot localization verb) + search/navigate + read (incl. `batch_symbols`) + orient + edit/verify. Parameter descriptions are compacted (the full prose is one `tools_search` / `full` hop away). Aliases: `coding-agent` |
+| `core` (**default for editors / unknown clients**) | the curated dev-cycle set (~35 tools): orient (incl. `explore`) + search/navigate + read + edit + verify/test + `analyze` + review + the memory workflow. Aliases: `default`, `classic` |
 | `full` | every tool (the pre-`core` behaviour — opt back in here) |
 | `readonly` | everything except the mutating tools (`edit_file`, `write_file`, `index_repository`, …) |
 | `edit` | the minimal headless editing set — orient + navigate + mutate + verify (`smart_context`, `search_symbols`, `find_files`, `edit_file`, `verify_change`, `get_test_targets`, …) |
@@ -218,6 +218,7 @@ Four additional push channels modeled on `subscribe_diagnostics` — per-session
 
 | Tool | Description |
 |------|-------------|
+| `explore` | One-shot localization: free task/bug text in, the ranked neighborhood out — likely symbols with source + call paths (1-hop callers/callees), a file map, and a completeness cue, packed under a `token_budget` (default 9000; bodies demote to signatures past it, truncation reported honestly). The opening move for any task-shaped request — folds the whole search/read/callers exploration phase into one call |
 | `smart_context` | Task-aware minimal context — replaces 5-10 exploration calls. The working set is ranked through the full rerank pipeline. Always emits a `blast_radius` block (callers grouped by file + covering tests + a `no covering tests found` warning) and a file-clustered `working_set`; seed count and `token_budget` scale with graph size when unset. `fidelity: "graded"` returns a graph-distance-tiered `context_manifest` (large interchangeable symbol families are skeletonized to one representative) under one `token_budget`; `estimate: true` projects token cost without fetching; `if_none_match` dedups an unchanged pack to `not_modified` |
 | `get_edit_plan` | Dependency-ordered edit sequence for multi-file refactors |
 | `get_test_targets` | Maps changed symbols to test files and run commands |
