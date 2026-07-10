@@ -104,12 +104,18 @@ func Table() []Profile {
 			body:     coreBody,
 		},
 		{
-			Name:       "localization",
-			Summary:    "lean code-finding surface — minimal ambient, ~12 eager tools",
-			ToolPreset: "localization",
+			Name:    "localization",
+			Summary: "lean code-finding guidance — diet instructions body, proven tool surface",
+			// ToolPreset is intentionally empty: the profile diets the
+			// @-included body (the per-turn ambient) and keeps the
+			// client-aware default tool surface. The deeper 14-tool
+			// `localization` preset (built from EagerTools below) stays
+			// available via GORTEX_TOOLS=localization — benchmarked, it
+			// cut tools/list ~30% but cost file-hits on cap-adjacent
+			// sessions, so it is opt-in rather than the profile default.
 			EagerTools: localizationEagerTools,
 			Skills:     []string{"gortex-explore", "gortex-guide", "gortex-debug"},
-			HookTier:   HookTierLean,
+			HookTier:   HookTierStandard,
 			body:       localizationBody,
 		},
 		{

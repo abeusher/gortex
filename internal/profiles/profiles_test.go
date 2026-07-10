@@ -162,8 +162,8 @@ func TestGenerateAndSwitch(t *testing.T) {
 	if got := ActiveName(dir); got != "localization" {
 		t.Errorf("ActiveName = %q after switch, want localization", got)
 	}
-	if Active(dir).HookTier != HookTierLean {
-		t.Error("active profile did not carry the lean hook tier")
+	if Active(dir).HookTier != HookTierStandard {
+		t.Error("localization ships the standard hook tier (the lean tier is opt-in machinery)")
 	}
 
 	// Re-generate keeps the switched selection.
