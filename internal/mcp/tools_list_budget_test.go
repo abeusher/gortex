@@ -47,7 +47,13 @@ const (
 // agentPresetByteCeiling is the hard budget for the coding-agent preset's
 // cold tools/list. Blowing it (a future tool or description balloon) fails
 // this test loudly instead of silently regressing the schema tax.
-const agentPresetByteCeiling = 27000
+//
+// Re-based 27000 → 28200 when the floor deliberately grew 18 → 20 tools
+// (the `explore` one-shot localization verb + `batch_symbols`, its
+// follow-up reader). Measured cost after the addition: 27883 bytes —
+// the ceiling keeps ~300 bytes of slack, so any further description
+// creep still fails loudly.
+const agentPresetByteCeiling = 28200
 
 // TestToolsListByteCeilings is the permanent measurement gate: it prints the
 // cold tools/list byte cost of every preset and asserts the agent preset

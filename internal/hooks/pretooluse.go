@@ -287,7 +287,7 @@ func adaptiveNudge(input HookInput, isGortexMCP bool, result enrichResult) enric
 func nudgeReason(guidance string) string {
 	var b strings.Builder
 	b.WriteString("[Gortex] You've made several raw file-search calls in a row. ")
-	b.WriteString("Prefer Gortex graph tools — `search_symbols`, `find_usages`, `get_callers`, `get_symbol_source`, `smart_context` — they are faster and far more precise.\n")
+	b.WriteString("Localizing a task? Call `explore` — one call returns the ranked neighborhood (likely symbols + source + call paths) and ends the search/read loop. Otherwise prefer `search_symbols`, `find_usages`, `get_callers`, `get_symbol_source` — all faster and far more precise than raw search.\n")
 	b.WriteString(toolref.FallbackLine("search_symbols"))
 	if guidance != "" {
 		b.WriteString(guidance)
@@ -347,10 +347,10 @@ func enrichRead(toolInput map[string]any, cwd string) enrichResult {
 	if fileIndexed {
 		var reason strings.Builder
 		fmt.Fprintf(&reason, "[Gortex] BLOCKED: Read of %s (%d symbols indexed). Use graph tools instead:\n", filePath, symbolCount)
-		reason.WriteString("  - `get_symbol_source` — read one symbol (80%% fewer tokens)\n")
+		reason.WriteString("  - `explore` — localizing a task? one call: ranked symbols + source + call paths\n")
+		reason.WriteString("  - `get_symbol_source` — read one symbol (80% fewer tokens)\n")
 		reason.WriteString("  - `get_editing_context` — full file context before editing\n")
 		reason.WriteString("  - `get_file_summary` — all symbols and imports\n")
-		reason.WriteString("  - `smart_context` — task-aware minimal context\n")
 		reason.WriteString("  - `batch_symbols` — multiple symbols in one call\n")
 		reason.WriteString(gcxTip)
 		reason.WriteString(toolref.FallbackLine("get_symbol_source"))
@@ -364,10 +364,10 @@ func enrichRead(toolInput map[string]any, cwd string) enrichResult {
 	// File not indexed — allow with advisory.
 	var guidance strings.Builder
 	guidance.WriteString("[Gortex] PREFER graph tools over Read for source files:\n")
+	guidance.WriteString("  - Localizing a whole task (a bug / \"where is X\"): use `explore` (ranked neighborhood + source + call paths in one call)\n")
 	guidance.WriteString("  - To read one symbol: use `get_symbol_source` (80% fewer tokens)\n")
 	guidance.WriteString("  - To understand a file before editing: use `get_editing_context`\n")
 	guidance.WriteString("  - To get a file overview: use `get_file_summary`\n")
-	guidance.WriteString("  - For task-level context: use `smart_context`\n")
 	guidance.WriteString(gcxTip)
 	guidance.WriteString(toolref.FallbackLine("get_symbol_source"))
 
@@ -619,6 +619,7 @@ func splitAlternation(pattern string) []string {
 func defaultGrepGuidance() string {
 	var b strings.Builder
 	b.WriteString("[Gortex] PREFER graph tools over Grep:\n")
+	b.WriteString("  - Localizing a task / bug (not a single symbol): use `explore` (ranked neighborhood + source + call paths in one call)\n")
 	b.WriteString("  - To find a symbol by name: use `search_symbols` (BM25 + camelCase-aware)\n")
 	b.WriteString("  - To find all references: use `find_usages` (zero false positives)\n")
 	b.WriteString("  - To find callers: use `get_callers`\n")
@@ -648,6 +649,7 @@ func formatGrepDeny(pattern string, hits []grepSymbolHit) string {
 		fmt.Fprintf(&b, "  ... and %d more\n", len(hits)-maxShown)
 	}
 	b.WriteString("\n")
+	b.WriteString("Localizing a task rather than one symbol? `explore` returns the ranked neighborhood (symbols + source + call paths) in one call.\n")
 	b.WriteString(gcxTip)
 	b.WriteString(toolref.FallbackLine("search_symbols"))
 	b.WriteString("To force text search, add a regex metachar (e.g. \\b) or quote the pattern.")

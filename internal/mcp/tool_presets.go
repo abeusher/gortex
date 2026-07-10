@@ -98,8 +98,11 @@ var agentFloorTools = []string{
 	// search / navigate
 	"search_symbols", "find_usages", "find_implementations",
 	"get_callers", "get_call_chain", "get_dependencies", "get_dependents",
-	// read
-	"get_symbol_source", "get_file_summary", "get_editing_context", "read_file",
+	// read — batch_symbols is the follow-up reader after explore: it
+	// fetches many bodies in one call, so a residual read loop collapses
+	// into a single turn.
+	"get_symbol_source", "batch_symbols", "get_file_summary",
+	"get_editing_context", "read_file",
 	// edit / verify
 	"edit_file", "write_file", "verify_change",
 }

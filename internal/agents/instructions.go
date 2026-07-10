@@ -59,8 +59,11 @@ const GlobalInstructionsBody = `## MANDATORY: Use Gortex MCP tools instead of Re
 
 A Gortex daemon is configured machine-wide via the ` + "`" + `gortex` + "`" + ` MCP server. Whenever you operate on indexed source (any repo the daemon tracks — check ` + "`" + `gortex daemon status` + "`" + `), you MUST prefer graph queries over file reads. PreToolUse hooks deny ` + "`" + `Read` + "`" + ` / ` + "`" + `Grep` + "`" + ` / ` + "`" + `Glob` + "`" + ` against indexed source — the deny message names the right tool.
 
+**Start every task with ` + "`" + `explore` + "`" + `.** Describe the request in plain words (paste the issue, name the area) and it returns the ranked localization neighborhood — the likely-involved symbols with their source, call paths, and the files to change — in ONE call. Answer or start editing from its output; the granular tools below are for following up on one specific symbol.
+
 | Instead of...                       | Use...                                   |
 |-------------------------------------|------------------------------------------|
+| Localizing a task / bug / "where is X" | ` + "`" + `explore` + "`" + ` (one call: ranked neighborhood + source + call paths) |
 | ` + "`" + `Grep` + "`" + ` / ` + "`" + `grep` + "`" + ` / ` + "`" + `rg` + "`" + ` for a symbol | ` + "`" + `search_symbols` + "`" + ` (BM25 + camelCase-aware) |
 | ` + "`" + `Grep` + "`" + ` for references               | ` + "`" + `find_usages` + "`" + ` (zero false positives)     |
 | Reading / grepping to find callers  | ` + "`" + `get_callers` + "`" + ` / ` + "`" + `get_call_chain` + "`" + `         |
@@ -68,7 +71,7 @@ A Gortex daemon is configured machine-wide via the ` + "`" + `gortex` + "`" + ` 
 | ` + "`" + `Read` + "`" + ` a file for one symbol        | ` + "`" + `get_symbol_source` + "`" + ` (` + "`" + `compress_bodies:true` + "`" + ` for the signature only) |
 | ` + "`" + `Read` + "`" + ` to understand a file         | ` + "`" + `get_file_summary` + "`" + ` / ` + "`" + `get_editing_context` + "`" + ` |
 | ` + "`" + `Read` + "`" + ` a non-indexed / raw file     | ` + "`" + `read_file` + "`" + `                              |
-| Multiple reads to explore a task    | ` + "`" + `smart_context` + "`" + ` (one call)               |
+| ` + "`" + `Read` + "`" + ` several symbols' bodies at once | ` + "`" + `batch_symbols` + "`" + ` (one call, many bodies)   |
 | ` + "`" + `Edit` + "`" + ` / ` + "`" + `Write` + "`" + ` source             | ` + "`" + `edit_file` + "`" + ` / ` + "`" + `write_file` + "`" + ` / ` + "`" + `edit_symbol` + "`" + ` / ` + "`" + `rename_symbol` + "`" + ` / ` + "`" + `batch_edit` + "`" + ` |
 
 **CLI fallback (no MCP):** every tool above is reachable from a shell as ` + "`" + `gortex call <tool> --arg k=v` + "`" + ` (e.g. ` + "`" + `gortex call read_file --arg path=<file>` + "`" + `) — there is no bare ` + "`" + `gortex <tool>` + "`" + ` verb.
@@ -103,15 +106,18 @@ const InstructionsBody = `## MANDATORY: Use Gortex MCP tools instead of Read/Gre
 
 Gortex runs as an MCP server for this repository. You MUST prefer graph queries over file reads on every task — PreToolUse hooks deny ` + "`" + `Read` + "`" + ` / ` + "`" + `Grep` + "`" + ` / ` + "`" + `Glob` + "`" + ` against indexed source, and the deny message names the right tool.
 
+**Start every task with ` + "`" + `explore` + "`" + `.** Describe the request in plain words (paste the issue, name the area) and it returns the ranked localization neighborhood — the likely-involved symbols with their source, call paths, and the files to change — in ONE call. Answer or start editing from its output; the granular tools below are for following up on one specific symbol.
+
 | Instead of...                       | Use...                                   |
 |-------------------------------------|------------------------------------------|
+| Localizing a task / bug / "where is X" | ` + "`" + `explore` + "`" + ` (one call: ranked neighborhood + source + call paths) |
 | ` + "`" + `Grep` + "`" + ` for a symbol                 | ` + "`" + `search_symbols` + "`" + ` (BM25 + camelCase-aware) |
 | ` + "`" + `Grep` + "`" + ` for references               | ` + "`" + `find_usages` + "`" + ` (zero false positives)     |
 | Reading / grepping to find callers  | ` + "`" + `get_callers` + "`" + ` / ` + "`" + `get_call_chain` + "`" + `         |
 | ` + "`" + `Read` + "`" + ` a file for one symbol        | ` + "`" + `get_symbol_source` + "`" + ` (` + "`" + `compress_bodies:true` + "`" + ` for the signature only) |
 | ` + "`" + `Read` + "`" + ` to understand a file         | ` + "`" + `get_file_summary` + "`" + ` / ` + "`" + `get_editing_context` + "`" + ` |
 | ` + "`" + `Read` + "`" + ` a non-indexed / raw file     | ` + "`" + `read_file` + "`" + `                              |
-| 5-10 reads to explore a task        | ` + "`" + `smart_context` + "`" + ` (one call)               |
+| ` + "`" + `Read` + "`" + ` several symbols' bodies at once | ` + "`" + `batch_symbols` + "`" + ` (one call, many bodies)   |
 | ` + "`" + `Edit` + "`" + ` / ` + "`" + `Write` + "`" + ` source             | ` + "`" + `edit_file` + "`" + ` / ` + "`" + `write_file` + "`" + ` / ` + "`" + `edit_symbol` + "`" + ` / ` + "`" + `rename_symbol` + "`" + ` / ` + "`" + `batch_edit` + "`" + ` |
 
 **CLI fallback (no MCP):** every tool above is reachable from a shell as ` + "`" + `gortex call <tool> --arg k=v` + "`" + ` (e.g. ` + "`" + `gortex call read_file --arg path=<file>` + "`" + `) — there is no bare ` + "`" + `gortex <tool>` + "`" + ` verb.

@@ -240,9 +240,9 @@ func hasPathPrefix(path, prefix string) bool {
 // to reach for graph tools first.
 func rulePreamble() string {
 	return "**Rule:** Use Gortex MCP tools for code operations in this repo. Prefer:\n" +
+		"- **`explore` first for any task or bug report** — one call returns the ranked neighborhood (likely symbols + their source + call paths + the files to change); answer or start editing from it\n" +
 		"- `search_symbols` / `find_usages` / `get_callers` over `grep` / `Grep`\n" +
-		"- `get_symbol_source` / `get_file_summary` / `get_editing_context` over `Read`\n" +
-		"- `smart_context` over multiple Read/Grep calls when starting a task\n" +
+		"- `get_symbol_source` / `batch_symbols` / `get_file_summary` over `Read`\n" +
 		"- `edit_symbol` / `edit_file` / `rename_symbol` over `Edit` / `Write` for indexed source\n\n" +
 		"Pre-tool hooks will deny attempts to Read/Grep/Glob indexed source files; the deny message names the right tool.\n" +
 		"Shell only (no MCP tools)? Reach any tool with `gortex call <tool> --arg k=v` (e.g. `" + toolref.CLIFallback("get_symbol_source") + "`) — there is no bare `gortex <tool>` verb.\n"
