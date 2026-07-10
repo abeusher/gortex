@@ -60,7 +60,7 @@ func (s *Server) registerCodingTools() {
 
 	s.addTool(
 		mcp.NewTool("get_symbol_source",
-			mcp.WithDescription("Returns the source code of a specific symbol (function, method, type) without reading the entire file. Use instead of Read when you know which symbol you need — saves 70-80% of tokens compared to reading the whole file."),
+			mcp.WithDescription("Returns the source code of a specific symbol (function, method, type) without reading the entire file. Use instead of Read when you know which symbol you need — saves 70-80% of tokens compared to reading the whole file. Fetching several symbols, or still localizing a task? batch_symbols reads many bodies in one call; explore returns the whole ranked neighborhood (source + call paths) for a task in one call."),
 			mcp.WithString("id", mcp.Required(), mcp.Description("Symbol node ID (e.g. pkg/server.go::HandleRequest)")),
 			mcp.WithNumber("context_lines", mcp.Description("Extra lines above/below the symbol (default: 3)")),
 			mcp.WithString("if_none_match", mcp.Description("ETag from a previous response — returns not_modified if content unchanged")),

@@ -1100,8 +1100,8 @@ type MultiRepoOptions struct {
 // the graph tools over raw file reads, and where to start."
 const serverInstructions = `Gortex is a code-intelligence graph server — it indexes repositories into a queryable knowledge graph. Prefer its graph tools over raw file reads and text search:
 
-- Start any task with smart_context: it assembles the minimal relevant working set (symbols, sources, edit plan) in one call.
-- Use search_symbols (BM25, camelCase-aware) instead of grep; find_usages / get_callers for references and callers; get_symbol_source to read one symbol without its whole file.
+- START WITH explore FOR EVERY TASK-SHAPED REQUEST (a bug report, a feature, "where is / how does X work"): one call returns the ranked neighborhood — the likely symbols with their source, call paths, and the files to change. Answer or start editing directly from its output instead of chaining search/read/callers calls; its locations are graph-verified, so no re-checking with file reads is needed.
+- For one known symbol: search_symbols (BM25, camelCase-aware) to find it, get_symbol_source to read it, batch_symbols for several bodies in one call; find_usages / get_callers for references and callers.
 - Before editing, call get_editing_context on the file; for refactors use edit_symbol / rename_symbol / batch_edit.
 - The cold tools/list shows a core set — call tools_search to discover the rest of the catalogue on demand.
 - Pass format:"gcx" to list-shaped tools for a compact, round-trippable wire format (~27% fewer tokens).

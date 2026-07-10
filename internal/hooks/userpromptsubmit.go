@@ -114,8 +114,10 @@ func buildPromptInjection(hits []grepSymbolHit) string {
 			fmt.Fprintf(&sb, "- `%s` (%s) — %s\n", h.Name, kind, h.FilePath)
 		}
 	}
-	sb.WriteString("\nRead any of them with `get_symbol_source`, trace with `find_usages` / `get_callers`, " +
-		"or call `smart_context` for the full working set. These are indexed graph facts — prefer them over grep/Read. " +
-		"Shell only (no MCP tools)? Reach any with `gortex call <tool> --arg k=v` (e.g. `" + toolref.CLIFallback("get_symbol_source") + "`).\n")
+	sb.WriteString("\nThese are leads, not the full picture — call `explore` with the request text to get the ranked " +
+		"neighborhood (these symbols and their siblings, WITH source + call paths + the files to change) in one call, " +
+		"then answer or edit directly from it. To read just one of them use `get_symbol_source` (several: `batch_symbols`); " +
+		"trace with `find_usages` / `get_callers`. These are indexed graph facts — prefer them over grep/Read. " +
+		"Shell only (no MCP tools)? Reach any with `gortex call <tool> --arg k=v` (e.g. `" + toolref.CLIFallback("explore") + "`).\n")
 	return sb.String()
 }
