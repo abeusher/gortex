@@ -14,6 +14,7 @@ import (
 	"github.com/zzet/gortex/internal/agents"
 	"github.com/zzet/gortex/internal/agents/claudecode"
 	"github.com/zzet/gortex/internal/daemon"
+	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/platform"
 	"github.com/zzet/gortex/internal/progress"
 	"github.com/zzet/gortex/internal/telemetry"
@@ -303,7 +304,10 @@ func runInstallFollowUps(cmd *cobra.Command) error {
 	}
 
 	if installTrackRepo {
-		abs := mustAbs(installTrackPath)
+		// Normalise the volume for this NEW tracked path so a Windows drive
+		// letter converges with os.Getwd's upper-case convention before the
+		// daemon stores it. No-op on POSIX; never touches the basename.
+		abs := pathkey.NormalizeVolume(mustAbs(installTrackPath))
 		if !daemon.IsRunning() {
 			fmt.Fprintln(w, "[gortex install] ⚠ skipping --track: daemon is not running (try `gortex daemon start`)")
 		} else {

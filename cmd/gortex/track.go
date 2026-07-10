@@ -82,11 +82,15 @@ func runTrack(cmd *cobra.Command, args []string) error {
 	rawPath := args[0]
 	w := cmd.ErrOrStderr()
 
-	// Resolve to absolute path.
+	// Resolve to absolute path. Normalise the volume (upper-case a Windows
+	// drive letter) for this NEW entry so it converges with os.Getwd's
+	// convention — the volume is never part of a repo basename, so this is
+	// cosmetic and cannot rotate a repo prefix. No-op on POSIX.
 	absPath, err := filepath.Abs(rawPath)
 	if err != nil {
 		return fmt.Errorf("resolving path %s: %w", rawPath, err)
 	}
+	absPath = pathkey.NormalizeVolume(absPath)
 
 	// Validate path exists and is a directory.
 	info, err := os.Stat(absPath)

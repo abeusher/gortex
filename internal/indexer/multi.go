@@ -1640,6 +1640,11 @@ func (mi *MultiIndexer) TrackRepoCtx(ctx context.Context, entry config.RepoEntry
 	if err != nil {
 		return nil, fmt.Errorf("resolving path %s: %w", entry.Path, err)
 	}
+	// Normalise the volume (upper-case a Windows drive letter) so a newly
+	// tracked path converges with os.Getwd's convention. The volume is
+	// never part of a repo basename, so this cannot rotate a repo prefix;
+	// no-op on POSIX.
+	absPath = pathkey.NormalizeVolume(absPath)
 
 	// Validate path exists and is a directory.
 	info, err := os.Stat(absPath)
@@ -1789,6 +1794,9 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 	if err != nil {
 		return nil, fmt.Errorf("resolving path %s: %w", entry.Path, err)
 	}
+	// Normalise the volume (upper-case a Windows drive letter) to converge
+	// with os.Getwd's convention. Cosmetic; never touches the basename.
+	absPath = pathkey.NormalizeVolume(absPath)
 	info, err := os.Stat(absPath)
 	if err != nil {
 		return nil, fmt.Errorf("path does not exist: %s", absPath)

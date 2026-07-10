@@ -173,6 +173,18 @@ func TestNormalizeVolume(t *testing.T) {
 	}
 }
 
+// TestNormalizeVolume_Idempotent proves store-time volume normalization is
+// stable: applying it in the CLI (runTrack / install) and again in the
+// daemon's TrackRepoCtx / ReconcileRepoCtx never drifts the stored path.
+func TestNormalizeVolume_Idempotent(t *testing.T) {
+	for _, in := range []string{`c:\x`, `C:\x`, `\\srv\share\dir`, "/Users/me/p", "relative/p", ""} {
+		once := NormalizeVolume(in)
+		if twice := NormalizeVolume(once); twice != once {
+			t.Errorf("NormalizeVolume not idempotent for %q: once=%q twice=%q", in, once, twice)
+		}
+	}
+}
+
 func TestVolumeNameLen(t *testing.T) {
 	cases := []struct {
 		in   string
