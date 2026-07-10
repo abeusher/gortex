@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/zzet/gortex/internal/profiles"
 	"github.com/zzet/gortex/internal/toolref"
 )
 
@@ -92,17 +93,28 @@ func promptQuery(prompt string) string {
 	return ""
 }
 
+// maxInjectedHitsLean is the per-turn cap under the lean hook tier —
+// the block keeps its cues but stops paying for marginal hits.
+const maxInjectedHitsLean = 3
+
 // buildPromptInjection renders the additionalContext block from search hits.
 func buildPromptInjection(hits []grepSymbolHit) string {
 	if len(hits) == 0 {
 		return ""
 	}
-	if len(hits) > maxInjectedHits {
-		hits = hits[:maxInjectedHits]
+	lean := activeHookTier() == profiles.HookTierLean
+	limit := maxInjectedHits
+	if lean {
+		limit = maxInjectedHitsLean
+	}
+	if len(hits) > limit {
+		hits = hits[:limit]
 	}
 	var sb strings.Builder
 	sb.WriteString("## Gortex — relevant indexed symbols for your request\n\n")
-	sb.WriteString("Before reaching for grep/Read, these graph symbols look relevant to what you just asked:\n\n")
+	if !lean {
+		sb.WriteString("Before reaching for grep/Read, these graph symbols look relevant to what you just asked:\n\n")
+	}
 	for _, h := range hits {
 		kind := h.Kind
 		if kind == "" {
@@ -114,10 +126,15 @@ func buildPromptInjection(hits []grepSymbolHit) string {
 			fmt.Fprintf(&sb, "- `%s` (%s) — %s\n", h.Name, kind, h.FilePath)
 		}
 	}
-	sb.WriteString("\nThese are leads, not the full picture — call `explore` with the request text to get the ranked " +
-		"neighborhood (these symbols and their siblings, WITH source + call paths + the files to change) in one call, " +
-		"then answer or edit directly from it. To read just one of them use `get_symbol_source` (several: `batch_symbols`); " +
-		"trace with `find_usages` / `get_callers`. These are indexed graph facts — prefer them over grep/Read. " +
-		"Shell only (no MCP tools)? Reach any with `gortex call <tool> --arg k=v` (e.g. `" + toolref.CLIFallback("explore") + "`).\n")
+	if lean {
+		sb.WriteString("\nLeads, not the full picture — call `explore` with the request text for the ranked neighborhood " +
+			"in one call; `get_symbol_source` reads one symbol. Prefer these graph facts over grep/Read.\n")
+	} else {
+		sb.WriteString("\nThese are leads, not the full picture — call `explore` with the request text to get the ranked " +
+			"neighborhood (these symbols and their siblings, WITH source + call paths + the files to change) in one call, " +
+			"then answer or edit directly from it. To read just one of them use `get_symbol_source` (several: `batch_symbols`); " +
+			"trace with `find_usages` / `get_callers`. These are indexed graph facts — prefer them over grep/Read. " +
+			"Shell only (no MCP tools)? Reach any with `gortex call <tool> --arg k=v` (e.g. `" + toolref.CLIFallback("explore") + "`).\n")
+	}
 	return sb.String()
 }
