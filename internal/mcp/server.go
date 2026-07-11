@@ -1476,6 +1476,16 @@ func (s *Server) SetLLMService(service *svc.Service) {
 	s.registerLLMTools()
 }
 
+// LLMService returns the attached LLM service, or nil when none was configured
+// (no provider, or provider construction failed). The daemon's shared-server
+// wiring uses it to register the service's Close in the process cleanup chain —
+// honouring the "caller owns Close" lifecycle noted on SetLLMService — so a
+// graceful shutdown unloads the loaded model instead of leaning on the idle
+// reaper as the only unload path.
+func (s *Server) LLMService() *svc.Service {
+	return s.llmService
+}
+
 // SetupLLM is the convenience constructor used by daemon entrypoints.
 // It builds an in-process backend wired to this server's engine +
 // contract registry, constructs the service from cfg, and attaches

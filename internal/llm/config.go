@@ -169,6 +169,11 @@ type LocalConfig struct {
 	// Template is the chat-template family: "chatml" (Qwen2.5,
 	// Hermes-3) or "llama3" (Llama-3.x native). Defaults to "chatml".
 	Template string `mapstructure:"template" yaml:"template,omitempty"`
+	// IdleTTL is the idle window after which the loaded model is unloaded to
+	// reclaim its (V)RAM — a Go duration string ("10m", the default when
+	// empty). "0"/"off"/"none" keeps the model resident once loaded. The
+	// GORTEX_LLM_IDLE_TTL env var overrides this at runtime (env wins).
+	IdleTTL string `mapstructure:"idle_ttl" yaml:"idle_ttl,omitempty"`
 }
 
 // RemoteConfig is the sub-block shared by the HTTP API providers

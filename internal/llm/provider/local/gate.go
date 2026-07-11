@@ -22,14 +22,21 @@ var errGateClosed = errors.New("local: provider closed")
 // unloaded when GORTEX_LLM_IDLE_TTL is unset.
 const defaultIdleTTL = 10 * time.Minute
 
-// idleTTLFromEnv resolves the idle-unload TTL from GORTEX_LLM_IDLE_TTL.
-// The value is a verbatim Go duration (e.g. "5m"); "0" / "off" / "none"
-// disables idle unloading (the model, once loaded, stays resident); an
-// unset or unparseable value falls back to defaultIdleTTL. Parsed the
-// same way the enrichment timeout override is (see
+// idleTTLFromEnv resolves the idle-unload TTL. Precedence: the
+// GORTEX_LLM_IDLE_TTL env var wins when set (non-empty); otherwise the
+// llm.local.idle_ttl config value (configTTL); otherwise defaultIdleTTL. In
+// either source the value is a verbatim Go duration ("5m"); "0" / "off" /
+// "none" disables idle unloading (the model, once loaded, stays resident); an
+// unset or unparseable value falls back to defaultIdleTTL. Env wins so an
+// operator can override a checked-in config at runtime without editing the
+// file. Parsed the same way the enrichment timeout override is (see
 // semantic.enrichRepoTimeout).
-func idleTTLFromEnv() time.Duration {
-	switch v := strings.TrimSpace(os.Getenv("GORTEX_LLM_IDLE_TTL")); v {
+func idleTTLFromEnv(configTTL string) time.Duration {
+	v := strings.TrimSpace(os.Getenv("GORTEX_LLM_IDLE_TTL"))
+	if v == "" {
+		v = strings.TrimSpace(configTTL)
+	}
+	switch v {
 	case "":
 		return defaultIdleTTL
 	case "0", "off", "none":
