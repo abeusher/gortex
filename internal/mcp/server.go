@@ -567,8 +567,16 @@ type sessionState struct {
 
 	// momentumReads counts this session's read/navigate tool calls;
 	// momentumNudged latches the one-shot momentum note (momentum.go).
-	momentumReads  int
-	momentumNudged bool
+	// momentumStreak counts CONSECUTIVE granular reads (broken by
+	// explore / smart_context and by any non-read call);
+	// momentumEscalated latches the one-shot escalation note and
+	// momentumExploreUsed records whether explore ran this session
+	// (it drives the escalation's wording).
+	momentumReads       int
+	momentumNudged      bool
+	momentumStreak      int
+	momentumEscalated   bool
+	momentumExploreUsed bool
 
 	// cursor is the per-session stateful navigation cursor used by the
 	// nav tool — a current symbol plus a back-history. Allocated lazily

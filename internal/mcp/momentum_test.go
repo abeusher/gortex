@@ -55,3 +55,78 @@ func TestMomentumNoteIgnoresNonReadAndErrors(t *testing.T) {
 		}
 	}
 }
+
+// escalationMarker is the load-bearing substring of the level-2 note —
+// distinct from the level-1 note's text so the tests can tell them apart.
+const escalationMarker = "answer NOW"
+
+func TestMomentumEscalationFiresOnceOnGranularStreak(t *testing.T) {
+	s := &Server{session: &sessionState{}}
+	ctx := WithSessionID(context.Background(), "sess_escalate")
+
+	for i := 1; i < momentumEscalateStreak; i++ {
+		res := s.maybeAttachMomentumNote(ctx, "get_symbol_source", mcp.NewToolResultText("ok"))
+		if strings.Contains(momentumTextOf(res), escalationMarker) {
+			t.Fatalf("escalation fired early at streak %d", i)
+		}
+	}
+	res := s.maybeAttachMomentumNote(ctx, "get_callers", mcp.NewToolResultText("ok"))
+	text := momentumTextOf(res)
+	if !strings.Contains(text, escalationMarker) {
+		t.Fatalf("escalation did not fire at streak %d: %q", momentumEscalateStreak, text)
+	}
+	// Wording: names the deliverable and, explore being unused, the one-call
+	// alternative.
+	if !strings.Contains(text, "file and the symbol") {
+		t.Errorf("escalation must ask for file+symbol: %q", text)
+	}
+	if !strings.Contains(text, "explore") {
+		t.Errorf("escalation must name explore when it was never used: %q", text)
+	}
+	// One-shot: a continuing streak never re-fires it.
+	res = s.maybeAttachMomentumNote(ctx, "read_file", mcp.NewToolResultText("ok"))
+	if strings.Contains(momentumTextOf(res), escalationMarker) {
+		t.Fatal("escalation fired twice in one session")
+	}
+}
+
+func TestMomentumEscalationOmitsExploreWhenAlreadyUsed(t *testing.T) {
+	s := &Server{session: &sessionState{}}
+	ctx := WithSessionID(context.Background(), "sess_escalate_used")
+
+	// explore ran once; the session then grinds a full granular streak.
+	s.maybeAttachMomentumNote(ctx, "explore", mcp.NewToolResultText("ok"))
+	var text string
+	for i := 0; i < momentumEscalateStreak; i++ {
+		res := s.maybeAttachMomentumNote(ctx, "get_symbol_source", mcp.NewToolResultText("ok"))
+		text = momentumTextOf(res)
+	}
+	if !strings.Contains(text, escalationMarker) {
+		t.Fatalf("escalation did not fire after a full post-explore streak: %q", text)
+	}
+	if strings.Contains(text, "explore") {
+		t.Errorf("escalation must not re-suggest explore after it was used: %q", text)
+	}
+}
+
+func TestMomentumEscalationNoFireOnHealthySessions(t *testing.T) {
+	// explore (or any action call) breaks the streak, so a session that
+	// interleaves one-shot orientation or edits with short read runs is
+	// never escalated at.
+	for name, breaker := range map[string]string{"explore": "explore", "action": "edit_file"} {
+		s := &Server{session: &sessionState{}}
+		ctx := WithSessionID(context.Background(), "sess_healthy_"+name)
+		for round := 0; round < 3; round++ {
+			for i := 0; i < momentumEscalateStreak-1; i++ {
+				res := s.maybeAttachMomentumNote(ctx, "get_symbol_source", mcp.NewToolResultText("ok"))
+				if strings.Contains(momentumTextOf(res), escalationMarker) {
+					t.Fatalf("[%s] escalation fired on a healthy session (round %d read %d)", name, round, i)
+				}
+			}
+			res := s.maybeAttachMomentumNote(ctx, breaker, mcp.NewToolResultText("ok"))
+			if strings.Contains(momentumTextOf(res), escalationMarker) {
+				t.Fatalf("[%s] escalation fired on the streak-breaking call", name)
+			}
+		}
+	}
+}
