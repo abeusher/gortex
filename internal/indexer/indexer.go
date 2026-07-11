@@ -493,7 +493,52 @@ func searchIndexFields(n *graph.Node, projectName string) []string {
 		return []string{n.Name, indexedPath, body}
 	}
 	sig, _ := n.Meta["signature"].(string)
-	return []string{n.Name, indexedPath, sig}
+	// A symbol's doc comment is the natural-language statement of what it
+	// does — precisely the vocabulary a task-intent query carries ("union
+	// the two sequences", "performs matching on the ignore files") when it
+	// names no identifier verbatim. The identifier and signature alone
+	// answer name lookups; the doc summary is what lets an intent query
+	// reach the definition at all. Only the leading summary is indexed
+	// (docSummary), so a long doc block's examples and edge-case prose
+	// can't dilute the name/signature tokens under BM25 length
+	// normalisation. Empty doc → empty field, dropped by the caller, so a
+	// symbol with no doc indexes exactly as before.
+	doc, _ := n.Meta["doc"].(string)
+	return []string{n.Name, indexedPath, sig, docSummary(doc)}
+}
+
+// docSummaryMaxRunes bounds how much of a doc comment enters the search
+// document. The leading summary is the highest-signal part; the rest of a
+// long doc — parameter lists, example code blocks, edge-case notes — is
+// lower-signal and, unbounded, would dominate the token bag and dilute the
+// identifier under BM25 length normalisation. The bound keeps the doc's
+// contribution on the order of a signature's. It is a generic document-size
+// budget, independent of any repository or corpus.
+const docSummaryMaxRunes = 280
+
+// docSummary returns the leading summary of a doc comment for the search
+// index: the first paragraph (up to the first blank line), trimmed and
+// bounded to docSummaryMaxRunes. Doc comments across languages put the
+// one-line / one-paragraph summary first and defer detail and examples to
+// later paragraphs, so the first paragraph is the highest-signal slice.
+// Empty in → empty out.
+func docSummary(doc string) string {
+	if doc == "" {
+		return ""
+	}
+	// Normalise CRLF so the blank-line cut is newline-style-agnostic.
+	if strings.Contains(doc, "\r") {
+		doc = strings.ReplaceAll(doc, "\r\n", "\n")
+		doc = strings.ReplaceAll(doc, "\r", "\n")
+	}
+	if i := strings.Index(doc, "\n\n"); i >= 0 {
+		doc = doc[:i]
+	}
+	doc = strings.TrimSpace(doc)
+	if r := []rune(doc); len(r) > docSummaryMaxRunes {
+		doc = strings.TrimSpace(string(r[:docSummaryMaxRunes]))
+	}
+	return doc
 }
 
 // vectorSearcherDelegate is the search.VectorDelegate-shaped
