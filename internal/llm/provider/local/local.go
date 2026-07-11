@@ -102,7 +102,7 @@ func New(cfg llm.LocalConfig) (llm.Provider, error) {
 	if cfg.Ctx <= 0 {
 		cfg.Ctx = 4096
 	}
-	p := &Provider{cfg: cfg, tmpl: tmpl, ttl: idleTTLFromEnv()}
+	p := &Provider{cfg: cfg, tmpl: tmpl, ttl: idleTTLFromEnv(cfg.IdleTTL)}
 	p.gate = newIdleGate(p.loadResources, p.unloadResources)
 	// The idle reaper only runs when a TTL is configured; a disabled TTL
 	// (GORTEX_LLM_IDLE_TTL=0/off/none) keeps the model resident once

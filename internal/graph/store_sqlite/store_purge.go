@@ -1,0 +1,310 @@
+package store_sqlite
+
+import (
+	"database/sql"
+	"fmt"
+	"strings"
+)
+
+// This file adds the repo-scoped store hygiene the base eviction path lacks.
+// EvictRepo (store.go) deletes ONLY nodes+edges, but a repo owns fifteen
+// other repo_prefix-keyed sidecar tables (file_mtimes, repo_index_state,
+// enrichment_state, clone_shingles, constant_values, files, ref_facts,
+// vectors, churn/coverage/release/blame_enrichment, symbol_fts,
+// symbol_fts_rowid, content_fts — see schema.go). Untracking a repo through
+// EvictRepo leaks every one of them, so a long-lived store accumulates
+// sidecar rows for repos removed from config long ago. PurgeRepo clears a
+// repo whole; OrphanRepoPrefixes finds prefixes that outlived their config
+// entry; RekeyRepoPrefix moves a lone repo's residue when it earns a prefix.
+//
+// INVARIANT — the empty repo_prefix is NEVER purged. In a live multi-repo
+// store repo_prefix='' identifies SYNTHETIC GLOBAL EXTERNALS (external_call
+// ::dep:* / builtin:: / module:: nodes shared across every repo) and, in a
+// single-repo store, the sole repo's live data. Deleting '' rows would strip
+// the shared externals out from under every repo, or wipe the lone repo.
+// Every method here refuses or excludes ''.
+
+// purgeSidecarTables are the repo_prefix-keyed sidecar tables PurgeRepo
+// clears for a prefix, alongside nodes+edges. Each carries a repo_prefix
+// column a plain `DELETE ... WHERE repo_prefix = ?` keys on. The two FTS5
+// vtables (symbol_fts, content_fts) carry repo_prefix UNINDEXED, so their
+// delete is a full scan — acceptable for a purge (a rare, whole-repo op),
+// unlike the per-edit hot path. `vectors` is deliberately absent: it has NO
+// repo_prefix column (keyed by node_id alone), so PurgeRepo deletes its rows
+// by node-id membership instead (see deleteByIDColumnsTx below).
+var purgeSidecarTables = []string{
+	"file_mtimes",
+	"repo_index_state",
+	"enrichment_state",
+	"clone_shingles",
+	"constant_values",
+	"files",
+	"ref_facts",
+	"churn_enrichment",
+	"coverage_enrichment",
+	"release_enrichment",
+	"blame_enrichment",
+	"symbol_fts",
+	"symbol_fts_rowid",
+	"content_fts",
+}
+
+// PurgeRepo deletes EVERY row a repo owns — nodes, edges, and all fifteen
+// repo_prefix-keyed sidecar tables (purgeSidecarTables + vectors) — in one
+// transaction. It is the complete form of EvictRepo (which drops only
+// nodes+edges), wired into UntrackRepo so removing a repo from config leaves
+// no residue. Refuses prefix=="" (shared global externals / solo-mode live
+// data — see the file-level INVARIANT).
+func (s *Store) PurgeRepo(prefix string) error {
+	if prefix == "" {
+		return fmt.Errorf("store_sqlite: PurgeRepo refuses empty repo prefix (would delete shared global externals / solo-repo data)")
+	}
+
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
+
+	// Collect this repo's node IDs first: edges and vectors are keyed off
+	// them (edges by from_id/to_id, vectors by node_id — neither carries a
+	// repo_prefix column). Edge deletion semantics mirror evictByScopeLocked
+	// (store.go): delete every edge touching one of these nodes, then the
+	// nodes themselves.
+	ids, err := repoNodeIDsTx(tx, prefix)
+	if err != nil {
+		return err
+	}
+	if err := deleteByIDColumnsTx(tx, "edges", []string{"from_id", "to_id"}, ids); err != nil {
+		return fmt.Errorf("store_sqlite: PurgeRepo edges: %w", err)
+	}
+	if err := deleteByIDColumnsTx(tx, "vectors", []string{"node_id"}, ids); err != nil {
+		return fmt.Errorf("store_sqlite: PurgeRepo vectors: %w", err)
+	}
+
+	for _, table := range purgeSidecarTables {
+		if _, err := tx.Exec(`DELETE FROM `+table+` WHERE repo_prefix = ?`, prefix); err != nil {
+			return fmt.Errorf("store_sqlite: PurgeRepo %s: %w", table, err)
+		}
+	}
+
+	if _, err := tx.Exec(`DELETE FROM nodes WHERE repo_prefix = ?`, prefix); err != nil {
+		return fmt.Errorf("store_sqlite: PurgeRepo nodes: %w", err)
+	}
+
+	return tx.Commit()
+}
+
+// orphanScanTables are the tables OrphanRepoPrefixes unions DISTINCT
+// repo_prefix over. These five span the residue space: nodes (the primary
+// keyed store), file_mtimes + repo_index_state (the warm-restart provenance
+// that lingers when nodes are gone but sidecars survive — the exact shape a
+// leaked untrack leaves), enrichment_state (per-provider provenance), and
+// files (per-file metadata). A prefix whose nodes are gone but whose
+// sidecars remain is invisible to a nodes-only scan, which is why the
+// sidecar tables are unioned in; scanning still more tables would only
+// rediscover the same prefixes at higher cost.
+var orphanScanTables = []string{
+	"nodes",
+	"file_mtimes",
+	"repo_index_state",
+	"enrichment_state",
+	"files",
+}
+
+// OrphanRepoPrefixes returns every repo_prefix present in the store but
+// absent from known — repos whose rows outlived their config entry (an
+// untrack that predated PurgeRepo, or a repo dropped straight from config
+// with no untrack at all). The empty prefix is NEVER reported (shared global
+// externals / solo data). known is matched case-insensitively as a safety
+// net, so a case-only spelling drift on a case-insensitive filesystem can
+// never flag a still-tracked repo as an orphan (the #270 failure mode).
+// Startup warmup feeds the result to PurgeRepo.
+func (s *Store) OrphanRepoPrefixes(known []string) []string {
+	knownFold := make(map[string]struct{}, len(known))
+	for _, k := range known {
+		if k == "" {
+			continue
+		}
+		knownFold[strings.ToLower(k)] = struct{}{}
+	}
+
+	seen := make(map[string]struct{})
+	var out []string
+	for _, table := range orphanScanTables {
+		// WHERE repo_prefix <> '' both excludes the protected empty prefix
+		// and lets the nodes scan ride the partial nodes_by_repo index
+		// (defined WHERE repo_prefix <> ''). A table absent on an older
+		// schema simply contributes nothing.
+		rows, err := s.db.Query(`SELECT DISTINCT repo_prefix FROM ` + table + ` WHERE repo_prefix <> ''`)
+		if err != nil {
+			continue
+		}
+		for rows.Next() {
+			var p string
+			if err := rows.Scan(&p); err != nil {
+				break
+			}
+			if p == "" {
+				continue
+			}
+			if _, ok := knownFold[strings.ToLower(p)]; ok {
+				continue
+			}
+			if _, dup := seen[p]; dup {
+				continue
+			}
+			seen[p] = struct{}{}
+			out = append(out, p)
+		}
+		_ = rows.Close()
+	}
+	return out
+}
+
+// rekeyMoveTables are the sidecar tables RekeyRepoPrefix relabels from old
+// to new. Every one is keyed by repo_prefix (+ file_path or provider), NOT
+// by node_id, so its row content survives a node-id change: file_mtimes /
+// files by (repo_prefix, file_path); repo_index_state / enrichment_state by
+// repo_prefix (+ provider). At a solo->multi migration every '' row in these
+// belongs to the one migrating repo — global externals live in the NODES
+// table and hold NO rows here — so moving them wholesale is safe. UPDATE OR
+// REPLACE folds any row the re-mint re-index already wrote under new
+// (identical content: same files, same mtimes, same commit) instead of
+// tripping the primary-key conflict a plain UPDATE would.
+var rekeyMoveTables = []string{
+	"file_mtimes",
+	"files",
+	"repo_index_state",
+	"enrichment_state",
+}
+
+// rekeyDropTables are the sidecar tables RekeyRepoPrefix DROPS (rather than
+// relabels) for old. Every one is keyed by node_id, and the solo->multi
+// re-mint changes every node id (unprefixed `pkg::X` -> `<new>::pkg::X`), so
+// these old-id rows are already dangling against the evicted unprefixed
+// nodes. Relabeling their repo_prefix would just move dangling rows under
+// new — and let, e.g., the clone reseed load a shingle set for a node that
+// no longer exists. Dropping them is correct: the re-mint re-index rewrites
+// the index-time sidecars (constant_values, ref_facts, clone_shingles) under
+// the new node ids, and the enrichment sidecars (churn/coverage/release/
+// blame) must re-run for the new ids regardless. The FTS vtables sit here
+// too — their rows carry the old node ids, and UPDATE over an FTS5 UNINDEXED
+// column is awkward, so delete-then-reindex is the clean path.
+var rekeyDropTables = []string{
+	"clone_shingles",
+	"constant_values",
+	"ref_facts",
+	"churn_enrichment",
+	"coverage_enrichment",
+	"release_enrichment",
+	"blame_enrichment",
+	"symbol_fts",
+	"symbol_fts_rowid",
+	"content_fts",
+}
+
+// RekeyRepoPrefix moves a repo's sidecar residue from old to new the moment a
+// solo (unprefixed) repo earns a real prefix because a second repo joined —
+// the migrateLoneUnprefixedRepoCtx path. The prefix/path-keyed provenance
+// tables (rekeyMoveTables) are relabeled so warm restart finds the repo's
+// mtimes + freshness under new instead of full-re-tracking it; the
+// node_id-keyed tables (rekeyDropTables) are dropped because the re-mint
+// changed every node id out from under them (see the two table lists for the
+// per-table rationale).
+//
+// Refuses new=="" (cannot rekey INTO the protected empty prefix). old=="" IS
+// allowed — that is the whole point, since solo repos index unprefixed — and
+// is safe here because this method touches SIDECAR tables ONLY; the synthetic
+// global externals that also carry repo_prefix='' live in the NODES table,
+// which RekeyRepoPrefix never writes.
+func (s *Store) RekeyRepoPrefix(oldPrefix, newPrefix string) error {
+	if newPrefix == "" {
+		return fmt.Errorf("store_sqlite: RekeyRepoPrefix refuses empty destination prefix")
+	}
+	if oldPrefix == newPrefix {
+		return nil
+	}
+
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
+
+	for _, table := range rekeyMoveTables {
+		if _, err := tx.Exec(`UPDATE OR REPLACE `+table+` SET repo_prefix = ? WHERE repo_prefix = ?`, newPrefix, oldPrefix); err != nil {
+			return fmt.Errorf("store_sqlite: RekeyRepoPrefix move %s: %w", table, err)
+		}
+	}
+	for _, table := range rekeyDropTables {
+		if _, err := tx.Exec(`DELETE FROM `+table+` WHERE repo_prefix = ?`, oldPrefix); err != nil {
+			return fmt.Errorf("store_sqlite: RekeyRepoPrefix drop %s: %w", table, err)
+		}
+	}
+	// vectors is intentionally omitted: it has NO repo_prefix column (keyed
+	// by node_id alone), so it cannot be addressed here by prefix. Any ''
+	// embeddings are node_id-keyed against now-evicted unprefixed ids —
+	// dangling, and absent in the common case (embeddings are opt-in). They
+	// are left to a node-membership vector GC rather than guessed at here.
+
+	return tx.Commit()
+}
+
+// repoNodeIDsTx returns every node id in repoPrefix, read inside tx. The
+// caller holds writeMu. Rows are fully drained + closed before the caller
+// issues writes on the same tx — SQLite forbids an open read cursor while
+// writing on the same connection.
+func repoNodeIDsTx(tx *sql.Tx, repoPrefix string) ([]string, error) {
+	rows, err := tx.Query(`SELECT id FROM nodes WHERE repo_prefix = ?`, repoPrefix)
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	_ = rows.Close()
+	return ids, nil
+}
+
+// deleteByIDColumnsTx deletes rows from table where ANY of cols matches one
+// of ids, chunked so each statement stays under SQLite's 999 bound-variable
+// limit. Mirrors evictByScopeLocked's chunked from_id/to_id edge delete
+// (store.go) — the semantics source for edge eviction. Empty ids is a no-op.
+func deleteByIDColumnsTx(tx *sql.Tx, table string, cols, ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	const chunk = 900
+	for _, col := range cols {
+		for start := 0; start < len(ids); start += chunk {
+			end := minInt(start+chunk, len(ids))
+			batch := ids[start:end]
+			placeholders := strings.TrimSuffix(strings.Repeat("?,", len(batch)), ",")
+			args := make([]any, len(batch))
+			for i, id := range batch {
+				args[i] = id
+			}
+			if _, err := tx.Exec(`DELETE FROM `+table+` WHERE `+col+` IN (`+placeholders+`)`, args...); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}

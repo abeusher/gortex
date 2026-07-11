@@ -172,7 +172,9 @@ type Store interface {
 	// "unresolved::" prefix. The resolver's main loop calls this
 	// once per pass; on disk backends it should range-scan a
 	// to-keyed index over the single contiguous "unresolved::" slice
-	// rather than materialise the whole edges table.
+	// rather than materialise the whole edges table. Gate-owned fn-value
+	// placeholders (FnValuePlaceholderMarker) are excluded — the master
+	// resolver never binds them; the fn-value gate scans them itself by kind.
 	EdgesWithUnresolvedTarget() iter.Seq[*Edge]
 
 	// --- Batched point lookups -------------------------------------
@@ -1066,6 +1068,52 @@ type EnrichmentStateStore interface {
 // fall back to the full scan.
 type LightNodeReader interface {
 	GetRepoNodesLight(repoPrefix string) []*Node
+}
+
+// LightEdgeScanner is an optional store capability: a kind-scoped edge scan
+// that skips decoding each row's opaque meta blob. AllEdgesLight returns the
+// edges whose Kind is in kinds (an empty kinds list means every kind), Meta
+// left nil, with only the struct columns plus the promoted edge fields
+// (Origin/Tier/Confidence/ConfidenceLabel/CrossRepo/Line) populated.
+//
+// The warm-restart centrality/analysis passes (PageRank, HITS, adjacency CSR,
+// process discovery, Leiden) each scan the whole call/reference edge set on
+// every run. On a large multi-repo graph AllEdges() materialises millions of
+// Meta maps those passes never read — the per-edge JSON decode + map
+// allocation dominates the scan and inflates warm-restart heap. This capability
+// serves the same rows without that cost.
+//
+// Contract drift, documented once: the ONE Meta key any of these passes still
+// consults sits inside graph.ProvenanceWeight, and only for legacy rows whose
+// Origin column is empty (it falls back to Meta["semantic_source"] to
+// reconstruct the origin). Rows written since the origin-column promotion carry
+// Origin directly, so ProvenanceWeight never touches Meta for them; on a
+// meta-less legacy row it degrades to the default AST-inferred weight. That
+// drift is accepted — the promotion is long-shipped and these passes produce
+// approximate rankings, not exact values. Callers MUST NOT rely on any other
+// Meta content from a light edge. The in-memory backend returns its live edges
+// as-is (Meta present) rather than copy every edge just to strip Meta — the
+// contract only promises Meta MAY be absent, so a correct caller reads only the
+// promoted fields regardless of backend.
+type LightEdgeScanner interface {
+	AllEdgesLight(kinds ...EdgeKind) []*Edge
+}
+
+// FnValuePlaceholderScanner is an optional store capability: a scan restricted
+// to the fn-value gate's placeholder namespace (FnValuePlaceholderMarker, both
+// the bare `unresolved::fnvalue::<name>` and the multi-repo
+// `<repoPrefix>::unresolved::fnvalue::<name>` COPY-rewrite forms). The gate
+// (resolver.ResolveFnValueCallbacks) is the sole consumer and needs only these
+// placeholders, but its generic path scans the entire EdgeReferences kind —
+// placeholders plus every real reference edge — and Go-filters by Meta["via"].
+// On a large multi-repo graph that materialises millions of reference edges on
+// every whole-graph synthesizer pass just to keep a handful of placeholders.
+// Backends that can range-scan the namespace on a to-keyed index implement
+// this; others are served by the gate's EdgesByKind(references) fallback. Meta
+// IS populated — the gate reads Meta["via"] and the captured fn_value_name off
+// each placeholder.
+type FnValuePlaceholderScanner interface {
+	FnValuePlaceholderEdges() iter.Seq[*Edge]
 }
 
 // EdgePersister is an optional capability backends MAY implement to

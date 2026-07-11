@@ -664,6 +664,14 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 	}
 	if global != nil {
 		srv.SetupLLM(global.MergeLLMInto(conf.LLM))
+		// SetupLLM constructs the LLM service lazily and attaches it; nothing
+		// else frees it, so a graceful shutdown would leave a loaded local
+		// model resident (only the idle reaper unloads at runtime). Register
+		// its Close in the cleanup chain — the "caller owns Close" contract
+		// SetLLMService documents.
+		if llmSvc := srv.LLMService(); llmSvc != nil {
+			s.cleanup = append(s.cleanup, func() { _ = llmSvc.Close() })
+		}
 	}
 
 	return s, nil

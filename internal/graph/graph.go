@@ -1151,7 +1151,11 @@ func (g *Graph) FindNodesByNames(names []string) map[string][]*Node {
 // EdgesWithUnresolvedTarget yields every edge whose To has the
 // "unresolved::" prefix — the resolver's main pending-edge filter.
 // In-memory iterates all edges and prefix-checks; disk backends back
-// it with a range scan on a to-keyed index.
+// it with a range scan on a to-keyed index. Gate-owned fn-value
+// placeholders (`unresolved::fnvalue::<name>`) are excluded: the master
+// resolver can never bind them, so surfacing them here only bloats the
+// pending set it reconciles every pass — the fn-value gate scans them
+// itself via EdgesByKind(references).
 func (g *Graph) EdgesWithUnresolvedTarget() iter.Seq[*Edge] {
 	return func(yield func(*Edge) bool) {
 		for _, e := range g.AllEdges() {
@@ -1163,7 +1167,8 @@ func (g *Graph) EdgesWithUnresolvedTarget() iter.Seq[*Edge] {
 			// form that the disk backend's bulk-load rewrite produces. A bare
 			// HasPrefix check silently skipped every prefixed stub, so the
 			// Go resolver never got a second pass at multi-repo edges.
-			if !IsUnresolvedTarget(e.To) {
+			// IsFnValuePlaceholder drops the gate-owned fnvalue sub-namespace.
+			if !IsUnresolvedTarget(e.To) || IsFnValuePlaceholder(e.To) {
 				continue
 			}
 			if !yield(e) {
@@ -1171,6 +1176,93 @@ func (g *Graph) EdgesWithUnresolvedTarget() iter.Seq[*Edge] {
 			}
 		}
 	}
+}
+
+// FnValuePlaceholderEdges implements graph.FnValuePlaceholderScanner: it yields
+// every edge whose To is a fn-value gate placeholder (both the bare and the
+// multi-repo COPY-rewrite forms) — the exact inverse of the exclusion
+// EdgesWithUnresolvedTarget applies. Full edges with Meta intact, since the gate
+// reads Meta["via"] and the captured fn_value_name off each one.
+func (g *Graph) FnValuePlaceholderEdges() iter.Seq[*Edge] {
+	return func(yield func(*Edge) bool) {
+		for _, e := range g.AllEdges() {
+			if e == nil || !IsFnValuePlaceholder(e.To) {
+				continue
+			}
+			if !yield(e) {
+				return
+			}
+		}
+	}
+}
+
+// AllEdgesLight implements graph.LightEdgeScanner for the in-memory backend.
+// There is no separate meta blob to skip here — the edges are live structs — so
+// it returns the matching edges as-is, Meta present. Honouring the "Meta
+// absent" half of the contract would mean copying every edge to strip Meta,
+// doubling heap for zero benefit; the contract only promises Meta MAY be absent
+// and correct callers read only the promoted fields either way. An empty kinds
+// list returns every edge.
+func (g *Graph) AllEdgesLight(kinds ...EdgeKind) []*Edge {
+	all := g.AllEdges()
+	if len(kinds) == 0 {
+		return all
+	}
+	want := make(map[EdgeKind]struct{}, len(kinds))
+	for _, k := range kinds {
+		if k != "" {
+			want[k] = struct{}{}
+		}
+	}
+	if len(want) == 0 {
+		return nil
+	}
+	out := make([]*Edge, 0, len(all))
+	for _, e := range all {
+		if e != nil {
+			if _, ok := want[e.Kind]; ok {
+				out = append(out, e)
+			}
+		}
+	}
+	return out
+}
+
+// EdgesForKindsLight returns the edges of the given kinds (an empty kinds list
+// means every kind) for a whole-graph scan, preferring the meta-less
+// LightEdgeScanner capability when the store implements it (skips the per-edge
+// Meta decode on disk backends) and otherwise falling back to AllEdges() with a
+// Go-side kind filter. See LightEdgeScanner for the Meta-presence contract:
+// callers must read only the promoted edge fields, never arbitrary Meta.
+func EdgesForKindsLight(g Store, kinds ...EdgeKind) []*Edge {
+	if g == nil {
+		return nil
+	}
+	if sc, ok := g.(LightEdgeScanner); ok {
+		return sc.AllEdgesLight(kinds...)
+	}
+	all := g.AllEdges()
+	if len(kinds) == 0 {
+		return all
+	}
+	want := make(map[EdgeKind]struct{}, len(kinds))
+	for _, k := range kinds {
+		if k != "" {
+			want[k] = struct{}{}
+		}
+	}
+	if len(want) == 0 {
+		return nil
+	}
+	out := make([]*Edge, 0, len(all))
+	for _, e := range all {
+		if e != nil {
+			if _, ok := want[e.Kind]; ok {
+				out = append(out, e)
+			}
+		}
+	}
+	return out
 }
 
 // DeadCodeCandidates is the in-memory reference implementation of

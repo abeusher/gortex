@@ -343,9 +343,12 @@ func openWith(path string, current int, migrations []schemaMigration, allowRebui
 		return nil, fmt.Errorf("sqlite fts rowid backfill: %w", err)
 	}
 
-	// Apply any in-place migration steps (none on a fresh, baseline, or wiped
-	// DB), then stamp the current schema version. After a wipe the store is
-	// empty and the daemon's normal indexing repopulates it.
+	// Apply any in-place migration steps, then stamp the current schema version.
+	// Fresh and pre-versioning (stored==0) stores run the in-place steps too —
+	// they are idempotent and no-op on an empty or already-clean store — so the
+	// first in-place migration ships without forcing every non-daemon Open to
+	// pass WithRebuild. A wipe plan carries no in-place steps, and after a wipe
+	// the store is empty and the daemon's normal indexing repopulates it.
 	if plan.stamp {
 		if err := applyInPlaceMigrations(db, plan.inPlace); err != nil {
 			_ = db.Close()
@@ -538,7 +541,9 @@ func (s *Store) prepare() error {
 		`INSERT OR IGNORE INTO edges (`+edgeCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
 	prep(&s.stmtOutEdges,
 		`SELECT `+edgeCols+` FROM edges WHERE from_id = ?`)
-	const edgeColsLight = `from_id, to_id, kind, file_path, line, confidence, confidence_label, origin, tier, cross_repo`
+	// edgeColsLight is the package-level meta-less projection (store_light_edges.go),
+	// shared with AllEdgesLight so this prepared statement and the whole-graph scan
+	// can never drift apart.
 	prep(&s.stmtOutEdgesLight,
 		`SELECT `+edgeColsLight+` FROM edges WHERE from_id = ?`)
 	prep(&s.stmtInEdges,
@@ -1751,6 +1756,14 @@ func (s *Store) AllRepoMemoryEstimates() map[string]graph.RepoMemoryEstimate {
 // callers stay quiet. The graph.Store interface deliberately does not
 // surface errors -- it mirrors the in-memory store's "everything
 // succeeds" contract -- so a fatal storage failure cannot be ignored.
+//
+// Caller contract: on a teardown-race error panicOnFatal RETURNS rather than
+// panicking, so a caller that keeps using the query result after it returns
+// MUST nil-check first. `rows, err := db.Query(...); panicOnFatal(err)` leaves
+// rows == nil on a swallowed error, and the subsequent rows.Close() /
+// rows.Next() would SIGSEGV — the aggregator reads early-return their empty
+// value on nil rows for exactly this reason. In one line: fatal panics; a
+// teardown-race read returns empty.
 func panicOnFatal(err error) {
 	if err == nil {
 		return
@@ -1836,11 +1849,21 @@ func (s *Store) NodesByKind(kind graph.NodeKind) iter.Seq[*graph.Node] {
 // equivalent to_id-based OR query on a real 26-repo store (7.96s -> 2.95s for
 // the same 847,684-row result) because the boolean index's bookmark lookups
 // land in ascending rowid order, unlike a to_id-ordered index's.
+//
+// Gate-owned fn-value placeholders (graph.FnValuePlaceholderMarker,
+// `unresolved::fnvalue::<name>`) are excluded on top of is_unresolved: the
+// master resolver can never bind them, so they are pure pending-set bloat here
+// (a live store held millions). The bare form is dropped by the range predicate
+// — which rides edges_by_to(to_id) — using the ':;' range end from
+// isUnresolvedColumnDDL's idiom (';' == ':'+1); the multi-repo COPY-rewrite form
+// is dropped by the NOT LIKE, matching IsFnValuePlaceholder's infix shape.
 func (s *Store) EdgesWithUnresolvedTarget() iter.Seq[*graph.Edge] {
 	return func(yield func(*graph.Edge) bool) {
 		out := s.queryEdgesSQL(`
 SELECT from_id, to_id, kind, file_path, line, confidence, confidence_label, origin, tier, cross_repo, meta, resolve_terminal, resolve_terminal_reason
-FROM edges WHERE is_unresolved = 1`)
+FROM edges WHERE is_unresolved = 1
+  AND NOT (to_id >= 'unresolved::fnvalue::' AND to_id < 'unresolved::fnvalue:;')
+  AND to_id NOT LIKE '%::unresolved::fnvalue::%'`)
 		for _, e := range out {
 			if !yield(e) {
 				return

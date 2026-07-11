@@ -291,6 +291,55 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 
 	repos := state.configManager.Global().Repos
 
+	// Purge orphaned repo prefixes BEFORE the warmup loop re-registers the
+	// tracked repos, while the store still reflects the prior run's state. A
+	// repo removed from config (or untracked before the sidecar-aware purge
+	// existed) can leave its nodes+edges AND its fifteen repo_prefix-keyed
+	// sidecar tables (file_mtimes, *_enrichment, symbol_fts, content_fts, ...)
+	// behind — a long-lived store then carries thousands of rows for a repo
+	// gone long ago. Key the tracked repos through the same EffectiveRepoPrefix
+	// the warm mtime lookup + LSP-helper registry use (so the comparison
+	// matches what the indexer actually wrote), ask the store for any DISTINCT
+	// prefix outside that set, and PurgeRepo each. '' is never an orphan
+	// (shared global externals / solo data). Capability-probed, so only the
+	// sidecar-bearing on-disk store participates; the in-memory store skips it.
+	if orphaner, ok := state.graph.(interface {
+		OrphanRepoPrefixes(known []string) []string
+	}); ok {
+		if purger, ok := state.graph.(interface{ PurgeRepo(string) error }); ok {
+			known := make([]string, 0, len(repos))
+			for _, entry := range repos {
+				p := strings.TrimPrefix(indexer.EffectiveRepoPrefix(state.configManager, entry), "/")
+				if p != "" {
+					known = append(known, p)
+				}
+			}
+			for _, prefix := range orphaner.OrphanRepoPrefixes(known) {
+				if err := purger.PurgeRepo(prefix); err != nil {
+					logger.Warn("daemon: purging orphaned repo prefix failed",
+						zap.String("prefix", prefix), zap.Error(err))
+					continue
+				}
+				logger.Info("daemon: purged orphaned repo prefix (no tracked repo in config keys under it)",
+					zap.String("prefix", prefix))
+			}
+		}
+	}
+
+	// One-time store compaction, guarded (see daemon_compact.go). Placed HERE
+	// on purpose: after the orphan purge, so the pages it just freed are
+	// measured and reclaimed in the same pass; before the warmup re-index loop
+	// and the resolver/enrichment passes, whose writes would reuse freelist
+	// pages mid-measurement and whose readers would contend with VACUUM's
+	// exclusive lock. The socket is already listening (it opens before this
+	// goroutine by design), but at this point in boot the daemon's own
+	// workload is quiet and a rare early client query either finishes first or
+	// makes the VACUUM fail cleanly at busy_timeout — a skip, not a fault.
+	// Running before the socket opened instead would hold the daemon
+	// unreachable for the whole VACUUM, turning a compacting boot into an
+	// apparent hang.
+	maybeCompactStore(state.graph, logger)
+
 	// Register a per-repo resolver-time LSP helper for every
 	// tracked repo BEFORE the parallel warmup loop fires. The
 	// helpers are lazy: language servers are not spawned until the

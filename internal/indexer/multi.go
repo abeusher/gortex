@@ -1191,6 +1191,27 @@ func (mi *MultiIndexer) migrateLoneUnprefixedRepoCtx(ctx context.Context) {
 		mi.graph.EvictFile(path)
 	}
 
+	// EvictFile clears only nodes+edges; the solo repo's sidecar rows
+	// (file_mtimes, repo_index_state, enrichment_state, ...) were written
+	// under the empty prefix and would otherwise be orphaned — the very next
+	// warm restart would look for mtimes under the new prefix, find zero, and
+	// full-re-track a repo that never changed. Re-key the '' sidecar residue
+	// onto the new prefix. The re-mint re-index above already wrote fresh
+	// new-prefix rows; RekeyRepoPrefix folds the prefix/path-keyed ones and
+	// drops the node_id-keyed ones (whose ids changed under the re-mint) —
+	// see its per-table rationale. Safe on '': the store is still single-repo
+	// here, so '' holds only this repo's data (the synthetic global externals
+	// a multi-repo graph parks under '' live in NODES, which the rekey — a
+	// sidecar-only operation — never touches).
+	if rk, ok := mi.graph.(interface {
+		RekeyRepoPrefix(oldPrefix, newPrefix string) error
+	}); ok {
+		if err := rk.RekeyRepoPrefix("", oldPrefix); err != nil {
+			mi.logger.Warn("re-keying lone repo sidecar rows failed; orphaned '' rows remain until purge",
+				zap.String("prefix", oldPrefix), zap.Error(err))
+		}
+	}
+
 	mi.mu.Lock()
 	mi.repos[oldPrefix] = &RepoMetadata{
 		RepoPrefix:    oldPrefix,
@@ -2083,7 +2104,24 @@ func (mi *MultiIndexer) UntrackRepo(repoPrefix string) (int, int) {
 			nodesRemoved += n
 			edgesRemoved += e
 		}
+	} else if purger, ok := mi.graph.(interface{ PurgeRepo(string) error }); ok {
+		// Prefer the full sidecar-aware purge. EvictRepo drops only
+		// nodes+edges and leaves fifteen repo_prefix-keyed sidecar tables
+		// (file_mtimes, *_enrichment, symbol_fts, content_fts, ...) behind,
+		// which accumulate across untrack/retrack cycles until they dominate
+		// a long-lived store. PurgeRepo clears them in one transaction. It
+		// returns no counts, so report the repo's last-index metadata as the
+		// removed estimate; fall back to EvictRepo (real counts) on error.
+		if err := purger.PurgeRepo(repoPrefix); err != nil {
+			mi.logger.Warn("purge repo failed; falling back to node/edge eviction",
+				zap.String("prefix", repoPrefix), zap.Error(err))
+			nodesRemoved, edgesRemoved = mi.graph.EvictRepo(repoPrefix)
+		} else {
+			nodesRemoved, edgesRemoved = meta.NodeCount, meta.EdgeCount
+		}
 	} else {
+		// Backends without the purge capability (the in-memory store has no
+		// sidecars, so EvictRepo is already complete there).
 		nodesRemoved, edgesRemoved = mi.graph.EvictRepo(repoPrefix)
 	}
 

@@ -24,9 +24,12 @@ import (
 // top of this skeleton.
 
 // fnValueUnresolvedPrefix is the synthetic-target namespace a captured
-// function value occupies until the gate binds it. Kept human-readable
-// (the bare name is appended) to match Gortex's navigable-ID convention.
-const fnValueUnresolvedPrefix = "unresolved::fnvalue::"
+// function value occupies until the gate binds it — the graph-owned
+// graph.FnValuePlaceholderMarker, aliased here so the emit sites read locally
+// and the resolver's pending-scan exclusion keys off the same constant. Kept
+// human-readable (the bare name is appended) to match Gortex's navigable-ID
+// convention.
+const fnValueUnresolvedPrefix = graph.FnValuePlaceholderMarker
 
 // fnValueCandidateVia marks a placeholder edge as awaiting the callback gate.
 // It mirrors the resolver-side constant of the same value; the two packages
