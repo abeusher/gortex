@@ -1151,7 +1151,11 @@ func (g *Graph) FindNodesByNames(names []string) map[string][]*Node {
 // EdgesWithUnresolvedTarget yields every edge whose To has the
 // "unresolved::" prefix — the resolver's main pending-edge filter.
 // In-memory iterates all edges and prefix-checks; disk backends back
-// it with a range scan on a to-keyed index.
+// it with a range scan on a to-keyed index. Gate-owned fn-value
+// placeholders (`unresolved::fnvalue::<name>`) are excluded: the master
+// resolver can never bind them, so surfacing them here only bloats the
+// pending set it reconciles every pass — the fn-value gate scans them
+// itself via EdgesByKind(references).
 func (g *Graph) EdgesWithUnresolvedTarget() iter.Seq[*Edge] {
 	return func(yield func(*Edge) bool) {
 		for _, e := range g.AllEdges() {
@@ -1163,7 +1167,8 @@ func (g *Graph) EdgesWithUnresolvedTarget() iter.Seq[*Edge] {
 			// form that the disk backend's bulk-load rewrite produces. A bare
 			// HasPrefix check silently skipped every prefixed stub, so the
 			// Go resolver never got a second pass at multi-repo edges.
-			if !IsUnresolvedTarget(e.To) {
+			// IsFnValuePlaceholder drops the gate-owned fnvalue sub-namespace.
+			if !IsUnresolvedTarget(e.To) || IsFnValuePlaceholder(e.To) {
 				continue
 			}
 			if !yield(e) {

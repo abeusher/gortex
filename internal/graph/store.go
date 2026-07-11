@@ -172,7 +172,9 @@ type Store interface {
 	// "unresolved::" prefix. The resolver's main loop calls this
 	// once per pass; on disk backends it should range-scan a
 	// to-keyed index over the single contiguous "unresolved::" slice
-	// rather than materialise the whole edges table.
+	// rather than materialise the whole edges table. Gate-owned fn-value
+	// placeholders (FnValuePlaceholderMarker) are excluded — the master
+	// resolver never binds them; the fn-value gate scans them itself by kind.
 	EdgesWithUnresolvedTarget() iter.Seq[*Edge]
 
 	// --- Batched point lookups -------------------------------------

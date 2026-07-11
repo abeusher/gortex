@@ -141,6 +141,16 @@ func StubRest(id string) string {
 // data-flow tracker) don't have to know the encoding.
 const UnresolvedMarker = "unresolved::"
 
+// FnValuePlaceholderMarker is the sub-namespace the function-as-value capture
+// gate (parser/languages/fn_value_capture.go) owns inside the unresolved
+// space: a captured function value parks at `unresolved::fnvalue::<name>` until
+// resolver.ResolveFnValueCallbacks binds it to a same-file definition. These
+// placeholders are scaffolding for that gate alone — the master name resolver
+// can never bind them — so the resolver pending scan (EdgesWithUnresolvedTarget)
+// excludes the namespace via IsFnValuePlaceholder; the gate finds them itself
+// by walking EdgesByKind(references).
+const FnValuePlaceholderMarker = UnresolvedMarker + "fnvalue::"
+
 // IsUnresolvedTarget reports whether id names an unresolved
 // extractor stub in either the bare or the multi-repo form.
 func IsUnresolvedTarget(id string) bool {
@@ -151,6 +161,21 @@ func IsUnresolvedTarget(id string) bool {
 		return true
 	}
 	return strings.Contains(id, "::"+UnresolvedMarker)
+}
+
+// IsFnValuePlaceholder reports whether id is a fn-value gate placeholder in
+// either the bare `unresolved::fnvalue::<name>` form or the multi-repo
+// `<repoPrefix>::unresolved::fnvalue::<name>` COPY-rewrite form — mirroring
+// IsUnresolvedTarget's two shapes. The fn-value gate owns this namespace; the
+// resolver pending scan excludes it.
+func IsFnValuePlaceholder(id string) bool {
+	if id == "" {
+		return false
+	}
+	if strings.HasPrefix(id, FnValuePlaceholderMarker) {
+		return true
+	}
+	return strings.Contains(id, "::"+FnValuePlaceholderMarker)
 }
 
 // UnresolvedName returns the bare symbol name encoded in an

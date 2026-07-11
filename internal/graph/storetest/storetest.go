@@ -944,23 +944,38 @@ func testEdgesWithUnresolvedTarget(t *testing.T, factory Factory) {
 	// the canonical matcher for both encodings.
 	e5 := mkEdge("a", "gortex::unresolved::Baz", graph.EdgeCalls)
 	e5.Line = 5
+	// Gate-owned fn-value placeholders: a captured function value parks at
+	// `unresolved::fnvalue::<name>` (bare and multi-repo forms) until the
+	// callback gate binds it. is_unresolved is 1 for them (they live in the
+	// unresolved space), but the master resolver can never bind them, so the
+	// pending scan MUST exclude both forms — otherwise they are pure bloat on
+	// the set the resolver reconciles every pass.
+	e6 := mkEdge("a", "unresolved::fnvalue::handler", graph.EdgeReferences)
+	e6.Line = 6
+	e7 := mkEdge("a", "gortex::unresolved::fnvalue::handler", graph.EdgeReferences)
+	e7.Line = 7
 	s.AddEdge(e1)
 	s.AddEdge(e2)
 	s.AddEdge(e3)
 	s.AddEdge(e4)
 	s.AddEdge(e5)
+	s.AddEdge(e6)
+	s.AddEdge(e7)
 
 	var unres []*graph.Edge
 	for e := range s.EdgesWithUnresolvedTarget() {
 		unres = append(unres, e)
 	}
 	if len(unres) != 3 {
-		t.Fatalf("EdgesWithUnresolvedTarget yielded %d, want 3 (unresolved::Foo, unresolved::Bar, gortex::unresolved::Baz)", len(unres))
+		t.Fatalf("EdgesWithUnresolvedTarget yielded %d, want 3 (unresolved::Foo, unresolved::Bar, gortex::unresolved::Baz); fn-value placeholders must be excluded", len(unres))
 	}
 	gotPrefixed := false
 	for _, e := range unres {
 		if !graph.IsUnresolvedTarget(e.To) {
 			t.Fatalf("yielded edge has non-unresolved To: %s", e.To)
+		}
+		if graph.IsFnValuePlaceholder(e.To) {
+			t.Fatalf("EdgesWithUnresolvedTarget yielded a gate-owned fn-value placeholder %q: the resolver pending scan must exclude both the bare and multi-repo forms", e.To)
 		}
 		if e.To == "gortex::unresolved::Baz" {
 			gotPrefixed = true

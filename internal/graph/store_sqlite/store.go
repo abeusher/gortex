@@ -1836,11 +1836,21 @@ func (s *Store) NodesByKind(kind graph.NodeKind) iter.Seq[*graph.Node] {
 // equivalent to_id-based OR query on a real 26-repo store (7.96s -> 2.95s for
 // the same 847,684-row result) because the boolean index's bookmark lookups
 // land in ascending rowid order, unlike a to_id-ordered index's.
+//
+// Gate-owned fn-value placeholders (graph.FnValuePlaceholderMarker,
+// `unresolved::fnvalue::<name>`) are excluded on top of is_unresolved: the
+// master resolver can never bind them, so they are pure pending-set bloat here
+// (a live store held millions). The bare form is dropped by the range predicate
+// — which rides edges_by_to(to_id) — using the ':;' range end from
+// isUnresolvedColumnDDL's idiom (';' == ':'+1); the multi-repo COPY-rewrite form
+// is dropped by the NOT LIKE, matching IsFnValuePlaceholder's infix shape.
 func (s *Store) EdgesWithUnresolvedTarget() iter.Seq[*graph.Edge] {
 	return func(yield func(*graph.Edge) bool) {
 		out := s.queryEdgesSQL(`
 SELECT from_id, to_id, kind, file_path, line, confidence, confidence_label, origin, tier, cross_repo, meta, resolve_terminal, resolve_terminal_reason
-FROM edges WHERE is_unresolved = 1`)
+FROM edges WHERE is_unresolved = 1
+  AND NOT (to_id >= 'unresolved::fnvalue::' AND to_id < 'unresolved::fnvalue:;')
+  AND to_id NOT LIKE '%::unresolved::fnvalue::%'`)
 		for _, e := range out {
 			if !yield(e) {
 				return
