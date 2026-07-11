@@ -326,6 +326,20 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 		}
 	}
 
+	// One-time store compaction, guarded (see daemon_compact.go). Placed HERE
+	// on purpose: after the orphan purge, so the pages it just freed are
+	// measured and reclaimed in the same pass; before the warmup re-index loop
+	// and the resolver/enrichment passes, whose writes would reuse freelist
+	// pages mid-measurement and whose readers would contend with VACUUM's
+	// exclusive lock. The socket is already listening (it opens before this
+	// goroutine by design), but at this point in boot the daemon's own
+	// workload is quiet and a rare early client query either finishes first or
+	// makes the VACUUM fail cleanly at busy_timeout — a skip, not a fault.
+	// Running before the socket opened instead would hold the daemon
+	// unreachable for the whole VACUUM, turning a compacting boot into an
+	// apparent hang.
+	maybeCompactStore(state.graph, logger)
+
 	// Register a per-repo resolver-time LSP helper for every
 	// tracked repo BEFORE the parallel warmup loop fires. The
 	// helpers are lazy: language servers are not spawned until the
