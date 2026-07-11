@@ -75,7 +75,7 @@ const InstructionsBody = `## MANDATORY: Use Gortex MCP tools instead of Read/Gre
 
 Gortex runs as an MCP server for this repository. You MUST prefer graph queries over file reads on every task — PreToolUse hooks deny ` + "`" + `Read` + "`" + ` / ` + "`" + `Grep` + "`" + ` / ` + "`" + `Glob` + "`" + ` against indexed source, and the deny message names the right tool.
 
-**Start every task with ` + "`" + `explore` + "`" + `.** Describe the request in plain words (paste the issue, name the area) and it returns the ranked localization neighborhood — the likely-involved symbols with their source, call paths, and the files to change — in ONE call. Answer or start editing from its output; the granular tools below are for following up on one specific symbol.
+**Start every task with ` + "`" + `explore` + "`" + `.** Describe the request in plain words (paste the whole issue — it is distilled server-side; you do not have to hand-craft a query) and it returns the ranked localization neighborhood — the likely-involved symbols with their source, call paths, and the files to change — in ONE call. Answer or start editing from its output; the source it returned is already in context, so do not re-open those files with ` + "`" + `Read` + "`" + ` / ` + "`" + `Glob` + "`" + ` — read more of a listed symbol with ` + "`" + `get_symbol_source` + "`" + ` / ` + "`" + `batch_symbols` + "`" + ` on its ` + "`" + `id:` + "`" + `.
 
 | Instead of...                       | Use...                                   |
 |-------------------------------------|------------------------------------------|

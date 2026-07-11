@@ -346,12 +346,12 @@ func enrichRead(toolInput map[string]any, cwd string) enrichResult {
 	// If the file is indexed, BLOCK the read and provide graph alternatives.
 	if fileIndexed {
 		var reason strings.Builder
-		fmt.Fprintf(&reason, "[Gortex] BLOCKED: Read of %s (%d symbols indexed). Use graph tools instead:\n", filePath, symbolCount)
-		reason.WriteString("  - `explore` — localizing a task? one call: ranked symbols + source + call paths\n")
-		reason.WriteString("  - `get_symbol_source` — read one symbol (80% fewer tokens)\n")
+		fmt.Fprintf(&reason, "[Gortex] BLOCKED: Read of %s (%d symbols indexed). Read it through a graph tool instead:\n", filePath, symbolCount)
+		reason.WriteString("  - `get_symbol_source` — read one symbol (80% fewer tokens); if `explore` already returned this file, its source is in context — read a listed symbol by its `id:`\n")
+		reason.WriteString("  - `batch_symbols` — several symbols in one call\n")
 		reason.WriteString("  - `get_editing_context` — full file context before editing\n")
 		reason.WriteString("  - `get_file_summary` — all symbols and imports\n")
-		reason.WriteString("  - `batch_symbols` — multiple symbols in one call\n")
+		reason.WriteString("  - `explore` — if you have not localized yet: one call for the ranked symbols + source + call paths\n")
 		reason.WriteString(gcxTip)
 		reason.WriteString(toolref.FallbackLine("get_symbol_source"))
 

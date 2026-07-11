@@ -191,7 +191,7 @@ func localizationTable() string {
 // gortex://guide.
 func localizationBody() string {
 	return sectionHeader(true) +
-		bt(`**Open every localization task with one call:** §explore§ with the request text in plain words — the ranked localization neighborhood (likely symbols + source + call paths + files to change) in one shot. Go targeted from its output instead of re-searching.
+		bt(`**Open every localization task with §explore§** (paste the whole issue — distilled server-side): the ranked neighborhood in one call. Answer from its output; its source is in context — don't re-open those files with §Read§/§Glob§, read one with §get_symbol_source§/§batch_symbols§.
 
 `) +
 		localizationTable() +

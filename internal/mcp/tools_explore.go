@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -97,7 +98,18 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		ProjectID:   resolved.ProjectID,
 		RepoAllow:   resolved.RepoAllow,
 	}
-	rctx := s.buildRerankContext(ctx, task)
+	// The task text is pasted verbatim by the agent and is frequently a
+	// whole issue report — a title, then a body of repro commands, stack
+	// traces, environment tables and issue-template prompts. Fed raw to
+	// retrieval, that body's command-line flags and log lines out-weigh the
+	// one-line defect description and pull ranking toward the flag-definition
+	// and entry-point files instead of the fix site. shapeExploreQuery
+	// distils the report to its retrieval signal (lead weighted, boilerplate
+	// dropped) before search; a short focused query is passed through
+	// untouched. The original task is still shown in the header so the agent
+	// sees what it asked.
+	searchQuery := shapeExploreQuery(task)
+	rctx := s.buildRerankContext(ctx, searchQuery)
 	// Over-fetch, then keep the top maxSymbols that are real localization
 	// targets — params / locals / closures / imports are never a place a
 	// developer edits to fix a report, and they otherwise consume ranking
@@ -105,7 +117,7 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	// dropped: production code is where a report is resolved, but a task
 	// genuinely about tests still gets them when production hits run out.
 	fetch := clampInt(maxSymbols*4, maxSymbols, 80)
-	ranked := eng.SearchSymbolsRanked(task, fetch, opts, rctx)
+	ranked := eng.SearchSymbolsRanked(searchQuery, fetch, opts, rctx)
 	// Resilience ladder: a warm-restarted daemon can transiently return an
 	// empty scoped ranked result (workspace stamps not yet backfilled, or
 	// search bundles served before their node payloads re-materialise)
@@ -117,7 +129,7 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		return len(resolved.RepoAllow) == 0 || resolved.RepoAllow[n.RepoPrefix]
 	}
 	if len(ranked) == 0 {
-		for _, c := range eng.SearchSymbolsRanked(task, fetch, query.QueryOptions{}, rctx) {
+		for _, c := range eng.SearchSymbolsRanked(searchQuery, fetch, query.QueryOptions{}, rctx) {
 			if c != nil && c.Node != nil && repoAllowed(c.Node) {
 				ranked = append(ranked, c)
 			}
@@ -128,9 +140,9 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		// falls back on — whole-sentence MATCH semantics differ between the
 		// in-memory and disk-resident search backends, and per-term fetch +
 		// merge works on both.
-		nodes, _ := fetchAndMergeBM25Timed(eng, task, exploreLexicalTerms(task), fetch, opts, nil)
+		nodes, _ := fetchAndMergeBM25Timed(eng, searchQuery, exploreLexicalTerms(searchQuery), fetch, opts, nil)
 		if len(nodes) == 0 && (opts.WorkspaceID != "" || opts.ProjectID != "" || len(opts.RepoAllow) > 0) {
-			nodes, _ = fetchAndMergeBM25Timed(eng, task, exploreLexicalTerms(task), fetch, query.QueryOptions{}, nil)
+			nodes, _ = fetchAndMergeBM25Timed(eng, searchQuery, exploreLexicalTerms(searchQuery), fetch, query.QueryOptions{}, nil)
 		}
 		for i, n := range nodes {
 			if n != nil && repoAllowed(n) {
@@ -270,6 +282,11 @@ func (s *Server) renderExplore(task string, targets []exploreTarget, budget int)
 
 	fmt.Fprintf(&b, "\n— Completeness: %d candidate symbol(s) across %d file(s); callers/callees resolved server-side from the graph. This is the ranked neighborhood for the request — a location not listed here is not on the ranked path. Answer (FILES / SYMBOLS / EVIDENCE) or start editing directly from this; the paths and line numbers above are real and citeable.\n",
 		len(targets), len(fileOrder))
+	// Terminality affordance: the source for each listed symbol is already in
+	// this response. Re-opening these files with Read / Glob is the measured
+	// wasted-turn trap (the indexed-source deny-hook rejects it); the follow-up
+	// reader is get_symbol_source / batch_symbols on the `id:` shown above.
+	b.WriteString("  The source for each symbol is included above — do not re-open these files with Read/Glob; read more of any listed symbol with get_symbol_source / batch_symbols using its exact `id:`.\n")
 	if truncated {
 		fmt.Fprintf(&b, "  (Some bodies are elided under the %d-token budget; every candidate's location is still listed above — fetch an elided body with get_symbol_source / batch_symbols using the exact `id:` shown on its line.)\n", budget)
 	}
@@ -359,6 +376,115 @@ func fenceLang(lang string) string {
 		return ""
 	}
 	return lang
+}
+
+// Query-shaping tuning. Generic structural thresholds — no vocabulary, no
+// dependence on any corpus or task set.
+const (
+	// shapeMinReportChars is the size above which a multi-line task is
+	// treated as a pasted report worth distilling. Below it (or single-line)
+	// the task is a focused query and passes through untouched.
+	shapeMinReportChars = 300
+	// shapeBodyMaxRunes bounds the distilled body so its bulk cannot re-drown
+	// the weighted lead under BM25 length normalisation.
+	shapeBodyMaxRunes = 400
+	// shapeMinLineWords drops lines shorter than this many words — the
+	// environment answers ("14.1.0", "Cargo", "macOS 26.5") and one-word
+	// section headers a report body is padded with.
+	shapeMinLineWords = 4
+)
+
+var (
+	// A fenced code block: repro commands, log dumps, stack traces, sample
+	// code. High-noise for LOCALIZATION (it names the invocation, not the
+	// fix site), so it is removed before the body is distilled.
+	reFenceBlock = regexp.MustCompile("(?s)```.*?```")
+	reInlineCode = regexp.MustCompile("`[^`]*`")
+	reURL        = regexp.MustCompile(`https?://\S+`)
+	// Collapse runs of whitespace (incl. newlines) to single spaces.
+	reWhitespace = regexp.MustCompile(`\s+`)
+)
+
+// shapeExploreQuery distils a pasted issue/report into the query that best
+// localizes it, using only markdown/text structure — no vocabulary, no
+// language model, nothing derived from any task set.
+//
+// The problem it solves: an agent commonly pastes a whole issue as the task —
+// a one-line title followed by a body of repro commands, stack traces,
+// environment tables and issue-template prompts. Fed raw to BM25 the body's
+// command-line flags and log lines out-weigh the single defect sentence and
+// pull ranking toward the flag-definition / entry-point files rather than the
+// fix site. The fix is structural de-noising:
+//
+//   - the first non-empty line is the lead (a report's headline) and is
+//     repeated once so its high-signal tokens are not drowned by the body;
+//   - fenced code blocks, inline code and URLs are dropped from the body;
+//   - body lines that are markdown headers/quotes, issue-template prompts
+//     (they end in "?") or too short to be prose (environment answers, section
+//     labels) are dropped;
+//   - the surviving prose is bounded so it cannot re-drown the lead.
+//
+// A short or single-line task is a focused query already and is returned
+// unchanged — the shaping only engages for report-shaped input.
+func shapeExploreQuery(task string) string {
+	trimmed := strings.TrimSpace(task)
+	// Focused query: single line, or short enough that there is no report
+	// body to distil. Leave it exactly as the caller wrote it.
+	if !strings.ContainsAny(trimmed, "\n\r") || len(trimmed) < shapeMinReportChars {
+		return task
+	}
+
+	// Lead = the first non-empty line (the report's headline).
+	lead := ""
+	rest := trimmed
+	for _, ln := range strings.Split(trimmed, "\n") {
+		if s := strings.TrimSpace(ln); s != "" {
+			lead = s
+			if idx := strings.Index(trimmed, ln); idx >= 0 {
+				rest = trimmed[idx+len(ln):]
+			}
+			break
+		}
+	}
+
+	body := shapeReportBody(rest)
+	// Weight the lead by repeating it once, then append the distilled body.
+	shaped := lead + ". " + lead
+	if body != "" {
+		shaped += ". " + body
+	}
+	return strings.TrimSpace(reWhitespace.ReplaceAllString(shaped, " "))
+}
+
+// shapeReportBody strips code / URLs and boilerplate lines from a report body
+// and returns the surviving prose, whitespace-collapsed and rune-bounded.
+func shapeReportBody(body string) string {
+	body = reFenceBlock.ReplaceAllString(body, " ")
+	body = reInlineCode.ReplaceAllString(body, " ")
+	body = reURL.ReplaceAllString(body, " ")
+	var keep []string
+	for _, ln := range strings.Split(body, "\n") {
+		s := strings.TrimSpace(ln)
+		if s == "" {
+			continue
+		}
+		if strings.HasPrefix(s, "#") || strings.HasPrefix(s, ">") {
+			continue // markdown header / block quote
+		}
+		if strings.HasSuffix(s, "?") {
+			continue // issue-template prompt ("What version are you using?")
+		}
+		if len(strings.Fields(s)) < shapeMinLineWords {
+			continue // environment answer / one-word section label
+		}
+		keep = append(keep, s)
+	}
+	prose := reWhitespace.ReplaceAllString(strings.Join(keep, " "), " ")
+	prose = strings.TrimSpace(prose)
+	if r := []rune(prose); len(r) > shapeBodyMaxRunes {
+		prose = strings.TrimSpace(string(r[:shapeBodyMaxRunes]))
+	}
+	return prose
 }
 
 // exploreLexicalTerms splits free task text into the distinct word/identifier
