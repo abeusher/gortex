@@ -120,6 +120,49 @@ func TestDispatcher_TrackedCWD_Passes(t *testing.T) {
 	}
 }
 
+func TestDispatcher_FacadeHiddenDeferredCallDoesNotPromote(t *testing.T) {
+	t.Setenv("GORTEX_LAZY_TOOLS", "1")
+	tracked := t.TempDir()
+	d, _ := trackedPathMCPSetup(t, tracked)
+	sess := &daemon.Session{
+		ID:       "sess_facade_no_promote",
+		CWD:      tracked,
+		ToolSpec: "facade-v1",
+	}
+
+	initFrame := []byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"codex","version":"1.0"}}}`)
+	initReply, err := d.Dispatch(context.Background(), sess, initFrame)
+	require.NoError(t, err)
+	require.NotNil(t, initReply)
+
+	const hidden = "get_architecture"
+	_, liveBefore := d.srv.MCPServer().ListTools()[hidden]
+	require.False(t, liveBefore, "fixture must start with the legacy tool deferred")
+
+	hiddenFrame := []byte(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_architecture","arguments":{}}}`)
+	hiddenReply, err := d.Dispatch(context.Background(), sess, hiddenFrame)
+	require.NoError(t, err)
+	require.NotNil(t, hiddenReply)
+	var rejected struct {
+		Error any `json:"error"`
+	}
+	require.NoError(t, json.Unmarshal(hiddenReply, &rejected))
+	require.NotNil(t, rejected.Error, "hidden legacy call must be rejected by the facade surface")
+
+	_, liveAfter := d.srv.MCPServer().ListTools()[hidden]
+	require.False(t, liveAfter,
+		"dispatcher must not globally promote a hidden legacy tool before rejecting the call")
+
+	// The supported facade route reaches the captured cold handler directly
+	// and likewise leaves the legacy schema deferred.
+	facadeFrame := []byte(`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"analyze","arguments":{"kind":"architecture"}}}`)
+	facadeReply, err := d.Dispatch(context.Background(), sess, facadeFrame)
+	require.NoError(t, err)
+	require.NotNil(t, facadeReply)
+	_, liveAfterFacade := d.srv.MCPServer().ListTools()[hidden]
+	require.False(t, liveAfterFacade, "facade dispatch must not promote the captured legacy schema")
+}
+
 func TestDispatcher_SubdirectoryOfTrackedRoot_Passes(t *testing.T) {
 	tracked := t.TempDir()
 	// A nested path inside a tracked root also counts as tracked — an

@@ -2,6 +2,7 @@
 
 Gortex exposes a knowledge-graph query surface over the [Model Context Protocol](https://modelcontextprotocol.io): **100+ tools, 18 resources, 3 prompts**. Agents call the same surface from stdio, the daemon Unix socket, or the MCP 2026 Streamable HTTP endpoint.
 
+- [Facade v1 (lean agent surface)](#facade-v1-lean-agent-surface)
 - [Tool discovery (lazy mode)](#tool-discovery-lazy-mode)
 - [Restricting the tool surface (presets)](#restricting-the-tool-surface-presets)
 - [Core navigation](#core-navigation)
@@ -24,6 +25,29 @@ Gortex exposes a knowledge-graph query surface over the [Model Context Protocol]
 - [Speculative execution](#speculative-execution)
 - [MCP resources (18)](#mcp-resources-18)
 - [MCP prompts (3)](#mcp-prompts-3)
+
+## Facade v1 (lean agent surface)
+
+`facade-v1` consolidates the legacy catalogue into 21 domain tools with compact, stable schemas. Codex selects it automatically in `hide` mode unless an explicit tool preset overrides it; force it for any MCP connection with:
+
+```bash
+GORTEX_TOOLS=facade-v1 gortex mcp
+```
+
+With that preset, Codex receives all 21 names in its first `tools/list`: `explore`, `search`, `read`, `relations`, `trace`, `analyze`, `ask`, `change`, `review`, `pr`, `recall`, `workspace`, `response`, `capabilities`, `edit`, `refactor`, `remember`, `workspace_admin`, `overlay`, `session`, and `publish_review`. They are static for the session—there is no `tools_search` promotion or `tools/list_changed` dependency. `capabilities` discovers operation schemas, not additional tool names. Session-lifetime controls use `session`, for example `{"operation":"subscribe","channel":"diagnostics"}`; durable workspace changes remain under `workspace_admin`.
+
+```jsonc
+// Read a source file.
+{"name":"read","arguments":{"operation":"file","target":{"file":"internal/mcp/server.go"}}}
+
+// Preview a guarded file edit; omit dry_run (or set false) to apply it.
+{"name":"edit","arguments":{"operation":"file","target":{"file":"internal/mcp/server.go"},"match":"old text","replacement":"new text","dry_run":true}}
+
+// Fetch the exact schema for a read operation.
+{"name":"capabilities","arguments":{"domain":"read","operation":"file","detail":"schema"}}
+```
+
+The facade delegates to the existing handlers. Existing `agent`, `core`, `full`, and specialist presets retain their legacy schemas; the CLI, HTTP routes, and legacy MCP names remain compatible. Names shared by both surfaces (such as `explore`, `analyze`, and `review`) advertise the facade schema only inside a `facade-v1` session. See the [MCP facade v1 specification](mcp-facade-v1.md) for effects, schemas, migration, and acceptance gates.
 
 ## Tool discovery (lazy mode)
 
@@ -54,11 +78,12 @@ Returned tools are auto-promoted (`promote:false` opts out) and the server fires
 
 The full ~180-tool surface is more than many agents need. A **tool preset** picks what the server publishes — the basis both for the lean shipped default and for a minimal, headless editing harness (an agent on a trusted box driving a remote daemon through a small, fixed tool set).
 
-Seven built-in presets:
+Eight built-in presets:
 
 | Preset | Surface |
 |--------|---------|
-| `agent` (**default for known coding-agent clients**) | the lean coding-agent working set (~20 tools): `explore` (the one-shot localization verb) + search/navigate + read (incl. `batch_symbols`) + orient + edit/verify. Parameter descriptions are compacted (the full prose is one `tools_search` / `full` hop away). Aliases: `coding-agent` |
+| `facade-v1` (**default for Codex**) | 21 static, effect-homogeneous domain tools; operation schemas are discovered through `capabilities`, with no tool promotion. Aliases: `facade`, `agent-v2` |
+| `agent` (**default for other known coding-agent clients**) | the lean coding-agent working set (~20 tools): `explore` (the one-shot localization verb) + search/navigate + read (incl. `batch_symbols`) + orient + edit/verify. Parameter descriptions are compacted (the full prose is one `tools_search` / `full` hop away). Aliases: `coding-agent` |
 | `core` (**default for editors / unknown clients**) | the curated dev-cycle set (~35 tools): orient (incl. `explore`) + search/navigate + read + edit + verify/test + `analyze` + review + the memory workflow. Aliases: `default`, `classic` |
 | `full` | every tool (the pre-`core` behaviour — opt back in here) |
 | `readonly` | everything except the mutating tools (`edit_file`, `write_file`, `index_repository`, …) |
@@ -66,16 +91,16 @@ Seven built-in presets:
 | `nav` | read-only navigation / exploration; no editors |
 | `localization` | the diet "where is the code that does X" set (~10 tools, read-only, compacted descriptions): `smart_context` + search + trace + read. The eager list is sourced from the instruction-profile table, so this surface and the `localization` profile's instructions body cannot drift. Aliases: `locate`, `find` |
 
-`tool_profile` and `tools_search` are always kept. Layer per-tool deltas on any preset with `allow` / `deny`.
+For legacy presets, `tool_profile` and `tools_search` are always kept. Facade-v1 uses `capabilities` instead. Layer per-tool deltas on any preset with `allow` / `deny`.
 
-**Client-aware default.** With no `GORTEX_TOOLS` / config preset, the server picks the default per connection: a **known coding-agent client** (the same set that defaults the wire format to GCX — `claude-code`, `cursor`, `vscode`, `zed`, `aider`, `kilocode`, `opencode`, `openclaw`, `codex`, `omp-coding-agent`) gets `agent`; every other client keeps `core`. `GORTEX_TOOLS` always overrides. The `gortex mcp` proxy forwards its `GORTEX_TOOLS` / `--tools` to the daemon in the handshake, so a client's preset applies over the shared daemon (it can both narrow and widen the surface, not just subtract).
+**Client-aware default.** With no `GORTEX_TOOLS` / config preset, the server picks the default per connection: Codex gets `facade-v1` in `hide` mode; other known coding-agent clients (the set that defaults the wire format to GCX — `claude-code`, `cursor`, `vscode`, `zed`, `aider`, `kilocode`, `opencode`, `openclaw`, `omp-coding-agent`) get `agent`; every other client keeps `core`. `GORTEX_TOOLS` always overrides. The `gortex mcp` proxy forwards its `GORTEX_TOOLS` / `--tools` to the daemon in the handshake, so a client's preset applies over the shared daemon (it can both narrow and widen the surface, not just subtract).
 
 **Instruction profiles.** The machine's active instruction profile (`gortex instructions switch <core|localization|full>` — see [`cli.md`](cli.md#gortex-instructions--instruction-profiles)) can carry a tool preset; sessions pick it up between the forwarded spec and the client-aware default. Full precedence: **forwarded spec (`GORTEX_TOOLS` / `--tools`) > operator-pinned `mcp.tools` config > active instruction profile > client-aware default > server default**. The shipped `core` profile carries no preset, so nothing changes until a machine explicitly switches; profile changes apply to new sessions only.
 
 **Two modes** (`mode`):
 
 - `defer` (the default mode for `core`) — non-allowed tools are kept out of the cold `tools/list` but stay reachable through `tools_search`, which returns their schema inline and promotes them (firing `notifications/tools/list_changed`). The lean-but-complete surface: nothing is lost, the rare tool is one discovery call away.
-- `hide` (the default mode for the explicit `edit` / `nav` / `readonly` harness presets) — non-allowed tools are removed from `tools/list` **and** calls to them are hard-blocked. The locked-down surface; works identically on every client.
+- `hide` (the default for `facade-v1` and the explicit `edit` / `nav` / `readonly` harness presets) — non-allowed tools are removed from `tools/list` **and** calls to them are hard-blocked. The locked-down surface; works identically on every client.
 
 Select a preset three ways (precedence: **env > flag > config > default**):
 
@@ -83,7 +108,7 @@ Select a preset three ways (precedence: **env > flag > config > default**):
 # .gortex.yaml — config file
 mcp:
   tools:
-    preset: full          # agent | core (default) | full | readonly | edit | nav
+    preset: full          # facade-v1 | agent | core (default) | full | readonly | edit | nav
     mode: defer           # defer | hide
     allow: [find_files]   # add tools on top of the preset
     deny: [write_file]    # remove tools from the preset

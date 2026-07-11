@@ -69,8 +69,9 @@ var hostContexts = []hostContext{
 	{
 		name:    "codex",
 		matches: []string{"codex"},
-		instruction: "Gortex is available as an MCP server. Use search_symbols and smart_context to " +
-			"locate code before editing, and verify changes with check_guards and get_test_targets.",
+		instruction: "Gortex facade-v1 is available directly through MCP. Start with explore, then use " +
+			"search/read/relations instead of shell source inspection; mutate through edit/refactor and " +
+			"verify the result with change. Use capabilities for operation-specific schemas.",
 	},
 }
 

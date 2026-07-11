@@ -140,14 +140,17 @@ func (d *mcpDispatcher) Dispatch(ctx context.Context, sess *daemon.Session, fram
 	// tools_search promotes them. A direct call by name (the CLI's `gortex call`
 	// and the curated `gortex` verbs reach the daemon this way) promotes it
 	// first, so a known tool name is reachable without a discovery round-trip.
-	// tools_search stays the discovery path; a hide-mode tool is never deferred,
-	// so this never bypasses the hide gate.
+	// tools_search stays the discovery path. Check the effective session surface
+	// before touching the process-global lazy registry: otherwise a facade-v1
+	// client hard-calling a hidden legacy name could promote it (and emit
+	// list_changed) before the MCP surface filter rejected the call.
 	if name := peekFrameToolName(frame); name != "" {
-		newly := d.srv.EnsureToolPromoted(name)
-		// Record a call to a deferred/learned tool so the per-workspace
-		// learned surface promotes it into the cold list next session (and a
-		// stale promotion's demotion clock resets on continued use).
-		d.srv.NoteToolUse(name, sess.CWD, newly)
+		if d.srv.IsToolEnabledForSession(ctx, name) {
+			newly := d.srv.EnsureToolPromotedForSession(ctx, name)
+			// Record only permitted calls to deferred/learned tools so a rejected
+			// hidden call cannot refresh learned-surface state.
+			d.srv.NoteToolUse(name, sess.CWD, newly)
+		}
 	}
 
 	// HandleMessage returns either a JSONRPCResponse, a JSONRPCError, or

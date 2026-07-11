@@ -421,6 +421,12 @@ type Server struct {
 	// is explicitly disabled — see lazyEnabledFromEnv.
 	lazy *lazyToolRegistry
 
+	// facades maps the stable facade-v1 operation surface to the existing
+	// handlers. It captures registrations before lazy routing, so a facade can
+	// invoke a cold legacy implementation without promoting or re-advertising
+	// that legacy tool.
+	facades *facadeRegistry
+
 	// toolPolicy restricts the published tool surface to a named preset
 	// / allow-deny set (see tool_presets.go). Resolved at construction
 	// from MultiRepoOptions.ToolPolicy (the mcp.tools config block) plus
@@ -1126,6 +1132,12 @@ const serverInstructions = `Gortex is a code-intelligence graph server — it in
 
 ` + sharedParamLegend
 
+// facadeServerInstructions is intentionally terse because some MCP hosts
+// repeat initialize instructions beside every rendered tool. Operation detail
+// lives behind capabilities; repeating the legacy shared-parameter legend
+// would erase most of facade-v1's context savings.
+const facadeServerInstructions = `Gortex facade-v1 is a compact code-intelligence surface. Start task-shaped work with explore. Use search/read/relations/trace for source intelligence, change for impact and verification, and edit/refactor for mutations. Call capabilities for an operation's exact schema. Prefer these MCP tools over shell file reads and text search.`
+
 // ServerInstructionsUntracked is the inactive-state `instructions` variant
 // returned when a session's cwd is not covered by any tracked repo. Rather than
 // poisoning the connection with an errored initialize, the handshake succeeds
@@ -1155,16 +1167,23 @@ func ServerInstructionsUntracked(cwd string, roots ...string) string {
 	return msg
 }
 
-// afterInitializeInstructions is the server's OnAfterInitialize hook: it
-// rewrites the initialize result's Instructions to the variant that fits THIS
-// connection's cwd. Because it runs inside the handshake, every MCP client —
-// not just ones that execute a SessionStart hook — learns the live workspace
-// shape and warmup state directly from initialize. See stateAwareInstructions.
-func (s *Server) afterInitializeInstructions(ctx context.Context, _ any, _ *mcp.InitializeRequest, result *mcp.InitializeResult) {
-	if s == nil || result == nil {
+// afterInitializeInstructions is the server's OnAfterInitialize hook. It
+// records clientInfo on THIS session before tools/list is served, then rewrites
+// the initialize result's Instructions to the cwd-aware variant. Recording the
+// client here keeps embedded/raw HandleMessage users on the same client-aware
+// tool policy as the daemon path, whose dispatcher also snoops initialize.
+func (s *Server) afterInitializeInstructions(ctx context.Context, _ any, req *mcp.InitializeRequest, result *mcp.InitializeResult) {
+	if s == nil {
 		return
 	}
-	result.Instructions = s.stateAwareInstructions(SessionCWDFromContext(ctx))
+	if req != nil {
+		s.sessionFor(ctx).recordClientName(req.Params.ClientInfo.Name)
+	}
+	if result == nil {
+		return
+	}
+	result.Instructions = s.stateAwareInstructionsForPolicy(
+		SessionCWDFromContext(ctx), s.effectiveSessionPolicy(ctx))
 }
 
 // stateAwareInstructions chooses the initialize `instructions` text for a
@@ -1189,15 +1208,35 @@ func (s *Server) trackedRepoRoots() []string {
 }
 
 func (s *Server) stateAwareInstructions(cwd string) string {
+	return s.stateAwareInstructionsWithBase(cwd, serverInstructions)
+}
+
+func (s *Server) stateAwareInstructionsForClient(cwd, client string) string {
+	preset := ""
+	if resolveHostContext(client).name == "codex" {
+		preset = FacadeSurfaceVersion
+	}
+	return s.stateAwareInstructionsForPolicy(cwd, &toolPolicy{preset: preset})
+}
+
+func (s *Server) stateAwareInstructionsForPolicy(cwd string, policy *toolPolicy) string {
+	base := serverInstructions
+	if policy != nil && policy.preset == FacadeSurfaceVersion {
+		base = facadeServerInstructions
+	}
+	return s.stateAwareInstructionsWithBase(cwd, base)
+}
+
+func (s *Server) stateAwareInstructionsWithBase(cwd, base string) string {
 	if s.multiIndexer != nil && strings.TrimSpace(cwd) != "" {
 		if _, _, _, ok := s.multiIndexer.ScopeForCWD(cwd); !ok {
 			return ServerInstructionsUntracked(cwd, s.trackedRepoRoots()...)
 		}
 	}
 	if facts := s.liveInstructionFacts(cwd); facts != "" {
-		return serverInstructions + "\n\n" + facts
+		return base + "\n\n" + facts
 	}
-	return serverInstructions
+	return base
 }
 
 // liveInstructionFacts renders the per-connection state block appended to the
@@ -1302,6 +1341,7 @@ func NewServer(engine *query.Engine, g graph.Store, idx *indexer.Indexer, watche
 		pprCache:   newPPRWalkCache(),
 		packCache:  newPackDeltaCache(),
 		prCache:    newPRCache(prCacheTTL),
+		facades:    newFacadeRegistry(),
 	}
 	// Wire the process-wide tokenStats as the parent of every
 	// per-session counter so record() fanout aggregates daemon-wide.
@@ -1470,6 +1510,11 @@ func NewServer(engine *query.Engine, g graph.Store, idx *indexer.Indexer, watche
 	// Always registered — they degrade cleanly in single-project mode
 	// to a one-member view.
 	s.registerWorkspaceTools()
+
+	// Register the stable facade surface only after the legacy sweep, so every
+	// operation has captured its existing implementation. Facade dispatchers
+	// are installed live and session-filtered; they never rely on promotion.
+	s.registerFacadeTools()
 
 	// LLM-backed tools (`ask`) are NOT registered here — they're
 	// gated on SetLLMService being called with an enabled service,
@@ -2483,24 +2528,46 @@ func (s *Server) MCPServer() *server.MCPServer {
 // session context burn for token-economical clients while keeping
 // the full surface reachable through a one-call discovery hop.
 func (s *Server) addTool(tool mcp.Tool, handler server.ToolHandlerFunc) {
-	// Scrub control characters / ANSI escapes out of the tool's text
-	// before it reaches any client's tools/list rendering. tool is a
-	// value copy, so this mutates only the registered instance.
-	scrubToolText(&tool)
-	// Embed a project-size-scaled exploration-call budget in navigation
-	// tools' descriptions so the model self-throttles. Runs before the
-	// deferred-vs-live split so a tool keeps the hint after promotion.
-	s.annotateToolBudget(&tool)
-	// Replace the recurring-parameter prose (format / max_bytes / cursor /
-	// fields / scope / repo / project / workspace / ref) with a terse gloss;
-	// the full semantics live once in the server instructions legend. Runs
-	// before the split so deferred tools carry the compact schema too.
-	compactSharedToolParams(&tool)
+	handler = s.prepareTool(&tool, handler)
 	if s.lazy != nil && s.lazy.IsDeferred(tool.Name) {
 		s.lazy.Register(tool, handler)
 		return
 	}
 	s.mcpServer.AddTool(tool, s.wrapToolHandler(handler))
+}
+
+// addControlTool registers a live tool that must manage overlay state/views
+// itself. Unlike a bare mcpServer.AddTool it still captures facade adapters and
+// applies gates, sanitization, telemetry, logging, panic recovery, and response
+// middleware. These tools stay live because they are session/control recovery
+// paths or optional subsystems registered after the initial lazy sweep.
+func (s *Server) addControlTool(tool mcp.Tool, handler server.ToolHandlerFunc) {
+	handler = s.prepareTool(&tool, handler)
+	s.mcpServer.AddTool(tool, s.wrapControlToolHandler(handler))
+}
+
+func (s *Server) prepareTool(tool *mcp.Tool, handler server.ToolHandlerFunc) server.ToolHandlerFunc {
+	// Scrub control characters / ANSI escapes out of the tool's text
+	// before it reaches any client's tools/list rendering. tool is a
+	// value copy, so this mutates only the registered instance.
+	scrubToolText(tool)
+	// Embed a project-size-scaled exploration-call budget in navigation
+	// tools' descriptions so the model self-throttles. Runs before the
+	// deferred-vs-live split so a tool keeps the hint after promotion.
+	s.annotateToolBudget(tool)
+	// Replace the recurring-parameter prose (format / max_bytes / cursor /
+	// fields / scope / repo / project / workspace / ref) with a terse gloss;
+	// the full semantics live once in the server instructions legend. Runs
+	// before the split so deferred tools carry the compact schema too.
+	compactSharedToolParams(tool)
+	// Capture the finished schema plus the unwrapped legacy implementation
+	// before lazy routing. Reused facade names receive a compatibility wrapper
+	// that keeps their old call shape outside facade-v1 sessions.
+	if s.facades != nil {
+		s.facades.capture(*tool, handler)
+		handler = s.wrapLegacyFacade(tool.Name, handler)
+	}
+	return handler
 }
 
 // attachLazyRegistry wires the deferred catalog to the live MCP
@@ -2537,6 +2604,21 @@ func (s *Server) EnsureToolPromoted(name string) bool {
 		return false
 	}
 	return len(s.lazy.Promote(name)) > 0
+}
+
+// EnsureToolPromotedForSession is the per-connection promote-on-demand entry
+// point used by the daemon dispatcher. Live/absent names take the cheap no-op
+// path; a genuinely deferred name is promoted only when ctx's effective
+// surface permits calling it. This prevents a hide-mode request from mutating
+// the shared lazy registry before the MCP call gate rejects the tool.
+func (s *Server) EnsureToolPromotedForSession(ctx context.Context, name string) bool {
+	if s == nil || s.lazy == nil || name == "" || !s.lazy.IsDeferred(name) {
+		return false
+	}
+	if !s.IsToolEnabledForSession(ctx, name) {
+		return false
+	}
+	return s.EnsureToolPromoted(name)
 }
 
 // SetContractRegistry sets an explicit contract registry override for the MCP

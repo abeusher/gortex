@@ -124,6 +124,11 @@ var agentTailTools = []string{
 // regression test (TestAgentPresetByteCeiling).
 var agentPresetTools = append([]string{}, agentFloorTools...)
 
+// facadePresetTools is the complete, static facade-v1 surface. All names are
+// registered live and carry compact schemas; capabilities discovers operation
+// details without promoting more tools into tools/list.
+var facadePresetTools = facadeToolNames()
+
 // editPresetTools is the minimal headless code-editing surface: orient,
 // navigate, mutate, verify. Sized so an agent can edit code safely on a
 // remote box without the full 170-tool catalogue. tool_profile and
@@ -174,6 +179,8 @@ func builtinToolPresetSet(name string) (set map[string]bool, denyMutating, known
 		return toToolSet(corePresetTools), false, true
 	case "agent", "coding-agent":
 		return toToolSet(agentPresetTools), false, true
+	case FacadeSurfaceVersion, "facade", "agent-v2":
+		return toToolSet(facadePresetTools), false, true
 	case "readonly", "read-only", "read_only":
 		return nil, true, true
 	case "edit", "editor", "edit-harness":
@@ -188,7 +195,7 @@ func builtinToolPresetSet(name string) (set map[string]bool, denyMutating, known
 }
 
 // builtinPresetNames lists the recognised preset names for diagnostics.
-var builtinPresetNames = []string{"agent", "core", "full", "readonly", "edit", "nav", "localization"}
+var builtinPresetNames = []string{"agent", FacadeSurfaceVersion, "core", "full", "readonly", "edit", "nav", "localization"}
 
 // toolPolicy is the resolved, in-memory restriction applied to the tool
 // surface by the lazy registry (defer mode) and toolSurfaceFilter /
@@ -260,6 +267,8 @@ func newToolPolicy(cfg ToolPolicyConfig, logger *zap.Logger) *toolPolicy {
 			label = "core"
 		case "coding-agent":
 			label = "agent"
+		case "facade", "agent-v2":
+			label = FacadeSurfaceVersion
 		case "locate", "find":
 			label = "localization"
 		}
@@ -282,7 +291,7 @@ func newToolPolicy(cfg ToolPolicyConfig, logger *zap.Logger) *toolPolicy {
 		allow:        allow,
 		deny:         deny,
 		active:       active,
-		lean:         label == "agent" || label == "localization",
+		lean:         label == "agent" || label == "localization" || label == FacadeSurfaceVersion,
 	}
 }
 
@@ -304,6 +313,12 @@ func (p *toolPolicy) allows(name string) bool {
 		return false
 	}
 	if isAlwaysKeptTool(name) {
+		// capabilities replaces legacy discovery/introspection on the closed
+		// facade-v1 surface. Keeping these two names would make tools/list and
+		// the hard call gate disagree.
+		if p.preset == FacadeSurfaceVersion {
+			return false
+		}
 		return true
 	}
 	if p.allow[name] {
@@ -516,10 +531,21 @@ func (s *Server) resolveSessionPolicy(spec, mode, client string) *toolPolicy {
 		switch {
 		case strings.TrimSpace(mode) != "":
 			cfg.Mode = mode
+		case isFacadePreset(cfg.Preset):
+			// facade-v1 is a closed, versioned contract. A bare forwarded
+			// GORTEX_TOOLS=facade-v1 must not inherit the daemon's usual
+			// core/defer mode and silently weaken its direct-call gate.
+			cfg.Mode = toolPolicyModeHide
 		case s.toolPolicy != nil:
 			cfg.Mode = s.toolPolicy.mode
 		}
 		return newToolPolicy(cfg, s.logger)
+	}
+	// A deliberate server/operator policy outranks machine instruction
+	// profiles and client-aware defaults. Returning nil makes
+	// effectiveSessionPolicy fall back to the already-resolved global policy.
+	if s.toolPolicyOperatorPinned {
+		return nil
 	}
 	if p := s.instructionProfilePolicy(); p != nil {
 		return p
@@ -528,6 +554,15 @@ func (s *Server) resolveSessionPolicy(spec, mode, client string) *toolPolicy {
 		return p
 	}
 	return nil
+}
+
+func isFacadePreset(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case FacadeSurfaceVersion, "facade", "agent-v2":
+		return true
+	default:
+		return false
+	}
 }
 
 // activeInstructionPreset reads the machine's active instruction
@@ -586,6 +621,14 @@ func operatorPinnedToolPolicy(base ToolPolicyConfig) bool {
 // the server's global preset. GORTEX_TOOLS always overrides, because a
 // forwarded spec is resolved before this in resolveSessionPolicy.
 func (s *Server) clientDefaultPolicy(client string) *toolPolicy {
+	// Codex gets the versioned facade surface from its first tools/list. Hide
+	// mode is deliberate: the facade handlers call captured legacy
+	// implementations internally, while direct legacy calls cannot bypass the
+	// negotiated surface. Resolve the host before the exact known-agent map so
+	// supported clientInfo aliases such as "openai-codex" behave like "codex".
+	if resolveHostContext(client).name == "codex" {
+		return newToolPolicy(ToolPolicyConfig{Preset: FacadeSurfaceVersion, Mode: toolPolicyModeHide}, s.logger)
+	}
 	if !isKnownAgentClient(client) {
 		return nil
 	}

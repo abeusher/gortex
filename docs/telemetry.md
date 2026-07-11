@@ -31,19 +31,30 @@ An unrecognised or empty value at a rung falls through to the next rung rather t
 
 ## What is collected
 
-Exactly **four** metric keys can ever be recorded — a hard allow-list; the aggregator physically cannot record anything else:
+Only the following metric keys can ever be recorded — a hard allow-list; the aggregator physically cannot record anything else:
 
 | Key | Meaning | Dimension |
 | --- | --- | --- |
 | `mcp_tool_call` | an MCP tool was invoked | tool name (e.g. `search_symbols`) |
+| `mcp_facade_call` | a facade-v1 operation was attempted | registered `facade.operation` or a fixed `unknown` sentinel |
+| `mcp_facade_status` | coarse facade result status | registered `facade.operation.ok|error` |
+| `mcp_facade_outcome` | bounded facade result class | registered `facade.operation` plus `success`, `invalid_operation`, `invalid_argument`, `blocked`, `unavailable`, `tool_error`, `handler_error`, or `empty_result` |
+| `mcp_facade_invalid` | facade validation failed | registered `facade.operation.invalid_argument` |
+| `mcp_facade_latency` | facade end-to-end latency | registered `facade.operation` plus a duration bucket |
 | `cli_command` | a CLI subcommand ran | dotted command path (e.g. `daemon.start`, `review`) |
 | `index` | an index pass completed | file-count bucket |
+| `index_lang` | a language occurred in an index pass | language name from the fixed parser registry |
 | `daemon_session` | a daemon session started | backend kind (e.g. `sqlite`) |
+| `install` | an agent integration was installed | fixed agent target/scope |
+| `uninstall` | an agent integration was removed | fixed agent target/scope |
+| `client` | an MCP client connected | bounded client family |
 
 A recorded counter is `key` or `key:dimension` (e.g. `mcp_tool_call:search_symbols`, `index:1k-10k`). Values are **bucketed**, never exact — exact counts can narrow identification:
 
 - File counts → `<100`, `100-1k`, `1k-10k`, `10k+`
-- Durations → `<10s`, `10-60s`, `1-5m`, `5m+`
+- Facade latencies → `<1ms`, `1-10ms`, `10-100ms`, `100ms-1s`, `1-10s`, `10s+`
+
+Facade dimensions are admitted only from the canonical operation registry (or fixed sentinels). Caller-provided operation/domain values never become a metric dimension, even in hashed form.
 
 A dimension guard (`^[A-Za-z0-9_.<>+-]{1,32}$`) drops any token containing a path separator, whitespace, or over 32 characters, so even a caller that mistakenly passed a path or symbol name as a dimension cannot leak it — only the bare metric key is recorded.
 
