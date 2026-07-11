@@ -1070,6 +1070,23 @@ type LightNodeReader interface {
 	GetRepoNodesLight(repoPrefix string) []*Node
 }
 
+// FnValuePlaceholderScanner is an optional store capability: a scan restricted
+// to the fn-value gate's placeholder namespace (FnValuePlaceholderMarker, both
+// the bare `unresolved::fnvalue::<name>` and the multi-repo
+// `<repoPrefix>::unresolved::fnvalue::<name>` COPY-rewrite forms). The gate
+// (resolver.ResolveFnValueCallbacks) is the sole consumer and needs only these
+// placeholders, but its generic path scans the entire EdgeReferences kind —
+// placeholders plus every real reference edge — and Go-filters by Meta["via"].
+// On a large multi-repo graph that materialises millions of reference edges on
+// every whole-graph synthesizer pass just to keep a handful of placeholders.
+// Backends that can range-scan the namespace on a to-keyed index implement
+// this; others are served by the gate's EdgesByKind(references) fallback. Meta
+// IS populated — the gate reads Meta["via"] and the captured fn_value_name off
+// each placeholder.
+type FnValuePlaceholderScanner interface {
+	FnValuePlaceholderEdges() iter.Seq[*Edge]
+}
+
 // EdgePersister is an optional capability backends MAY implement to
 // durably rewrite the mutable attribute columns (Confidence,
 // ConfidenceLabel, Origin, Tier, Meta) of an edge already present in the

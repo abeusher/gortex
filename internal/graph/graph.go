@@ -1178,6 +1178,24 @@ func (g *Graph) EdgesWithUnresolvedTarget() iter.Seq[*Edge] {
 	}
 }
 
+// FnValuePlaceholderEdges implements graph.FnValuePlaceholderScanner: it yields
+// every edge whose To is a fn-value gate placeholder (both the bare and the
+// multi-repo COPY-rewrite forms) — the exact inverse of the exclusion
+// EdgesWithUnresolvedTarget applies. Full edges with Meta intact, since the gate
+// reads Meta["via"] and the captured fn_value_name off each one.
+func (g *Graph) FnValuePlaceholderEdges() iter.Seq[*Edge] {
+	return func(yield func(*Edge) bool) {
+		for _, e := range g.AllEdges() {
+			if e == nil || !IsFnValuePlaceholder(e.To) {
+				continue
+			}
+			if !yield(e) {
+				return
+			}
+		}
+	}
+}
+
 // DeadCodeCandidates is the in-memory reference implementation of
 // DeadCodeCandidator. Iterates the requested node kinds and filters
 // out anything whose incoming-edge bucket contains an allowlist match

@@ -63,12 +63,20 @@ func ResolveFnValueCallbacks(g graph.Store) int {
 		fileNodes[filePath] = ns
 		return ns
 	}
-	// Every callback-candidate placeholder EmitFnValueCandidates emits is a
-	// graph.EdgeReferences edge (see languages.EmitFnValueCandidates), so a
-	// kind-scoped scan sees the same candidates as AllEdges() without paying
-	// to decode the graph's other edge kinds (calls, arg_of, member_of, ...) —
-	// several times the size of references alone on a large multi-repo graph.
-	for e := range g.EdgesByKind(graph.EdgeReferences) {
+	// The gate needs only the placeholders parked in the fn-value namespace,
+	// not every reference edge. When the backend can range-scan that namespace
+	// (FnValuePlaceholderScanner) use it: the generic EdgesByKind(references)
+	// path materialises the whole placeholders-plus-real-references set on every
+	// whole-graph synthesizer pass — several times the size of the placeholder
+	// slice on a large multi-repo graph. Both iterators are iter.Seq[*Edge], so
+	// the loop body is identical; the Meta["via"] == callback_candidate filter
+	// below STAYS on both paths — a non-candidate edge can be parked in the
+	// namespace (e.g. an already-bound registration) and must never be gated.
+	edges := g.EdgesByKind(graph.EdgeReferences)
+	if fp, ok := g.(graph.FnValuePlaceholderScanner); ok {
+		edges = fp.FnValuePlaceholderEdges()
+	}
+	for e := range edges {
 		if e == nil || e.Meta == nil {
 			continue
 		}

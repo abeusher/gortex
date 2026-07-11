@@ -67,6 +67,7 @@ func RunConformance(t *testing.T, factory Factory) {
 	t.Run("EdgesByKind", func(t *testing.T) { testEdgesByKind(t, factory) })
 	t.Run("NodesByKind", func(t *testing.T) { testNodesByKind(t, factory) })
 	t.Run("EdgesWithUnresolvedTarget", func(t *testing.T) { testEdgesWithUnresolvedTarget(t, factory) })
+	t.Run("FnValuePlaceholderEdges", func(t *testing.T) { testFnValuePlaceholderEdges(t, factory) })
 	t.Run("GetNodesByIDs", func(t *testing.T) { testGetNodesByIDs(t, factory) })
 	t.Run("FindNodesByNames", func(t *testing.T) { testFindNodesByNames(t, factory) })
 	t.Run("GetEdgesByNodeIDs", func(t *testing.T) { testGetEdgesByNodeIDs(t, factory) })
@@ -983,6 +984,47 @@ func testEdgesWithUnresolvedTarget(t *testing.T, factory Factory) {
 	}
 	if !gotPrefixed {
 		t.Fatalf("EdgesWithUnresolvedTarget did not yield the multi-repo prefixed stub gortex::unresolved::Baz")
+	}
+}
+
+// testFnValuePlaceholderEdges pins graph.FnValuePlaceholderScanner: the scan
+// must return EXACTLY the fn-value gate placeholders (both the bare and the
+// multi-repo COPY-rewrite forms) and nothing else — not real references, not
+// non-fnvalue unresolved stubs, not resolved edges. It is the mirror image of
+// testEdgesWithUnresolvedTarget's exclusion.
+func testFnValuePlaceholderEdges(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	sc, ok := s.(graph.FnValuePlaceholderScanner)
+	if !ok {
+		t.Skip("backend does not implement FnValuePlaceholderScanner")
+	}
+	s.AddNode(mkNode("a", "A", "x.go", graph.KindFunction))
+	s.AddEdge(mkEdge("a", "b", graph.EdgeReferences))          // real reference — not a placeholder
+	s.AddEdge(mkEdge("a", "unresolved::Foo", graph.EdgeCalls)) // unresolved, but not fn-value
+	s.AddEdge(mkEdge("a", "resolved", graph.EdgeReferences))   // resolved
+	ph1 := mkEdge("a", "unresolved::fnvalue::handler", graph.EdgeReferences)
+	ph1.Line = 6
+	ph2 := mkEdge("a", "gortex::unresolved::fnvalue::handler", graph.EdgeReferences)
+	ph2.Line = 7
+	s.AddEdge(ph1)
+	s.AddEdge(ph2)
+
+	seen := map[string]bool{}
+	for e := range sc.FnValuePlaceholderEdges() {
+		if !graph.IsFnValuePlaceholder(e.To) {
+			t.Fatalf("FnValuePlaceholderEdges yielded a non-placeholder To: %s", e.To)
+		}
+		seen[e.To] = true
+	}
+	if len(seen) != 2 {
+		t.Fatalf("FnValuePlaceholderEdges yielded %d distinct placeholders, want 2 (bare + multi-repo forms only); got %v", len(seen), seen)
+	}
+	if !seen["unresolved::fnvalue::handler"] {
+		t.Fatalf("FnValuePlaceholderEdges missed the bare form; got %v", seen)
+	}
+	if !seen["gortex::unresolved::fnvalue::handler"] {
+		t.Fatalf("FnValuePlaceholderEdges missed the multi-repo COPY-rewrite form; got %v", seen)
 	}
 }
 
