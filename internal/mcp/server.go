@@ -2199,6 +2199,16 @@ func (s *Server) RunAnalysis() {
 	s.hotspots = analysis.FindHotspots(s.graph, communities, 0)
 	s.analysisMu.Unlock()
 
+	// The graph was just rebuilt, so the lazy-enrichment ledger — symbol
+	// IDs whose incoming refs were confirmed against the *previous* graph
+	// — is both potentially stale (a reindex can re-mint those IDs) and
+	// unbounded across a long daemon session. Reset it so re-confirmation
+	// runs against the new graph and the ledger stays scoped to one
+	// analysis epoch. Kept outside analysisMu: refsConfirmed carries its
+	// own synchronisation and a racing reader just re-confirms, which is
+	// idempotent.
+	s.resetConfirmedRefs()
+
 	// Bootstrap-resource payloads (graph_stats, index_health, etc.)
 	// can change after re-warm even when the analysis itself didn't
 	// — node counts move on every reindex. Fire updates regardless.
@@ -2209,6 +2219,18 @@ func (s *Server) RunAnalysis() {
 	if s.graphInvalidatedBroadcaster != nil && s.graph != nil {
 		s.graphInvalidatedBroadcaster.broadcast(s.graph.NodeCount(), s.graph.EdgeCount(), "reanalysis")
 	}
+}
+
+// resetConfirmedRefs clears the lazy-enrichment ledger (see the
+// refsConfirmed field). sync.Map has no clear-all, so this ranges and
+// deletes; it is safe against concurrent confirmSymbolRefsOnDemand
+// readers because a racing miss just re-confirms the symbol, which is
+// idempotent — it re-lands the same lsp_resolved edges.
+func (s *Server) resetConfirmedRefs() {
+	s.refsConfirmed.Range(func(k, _ any) bool {
+		s.refsConfirmed.Delete(k)
+		return true
+	})
 }
 
 func (s *Server) getCommunities() *analysis.CommunityResult {
