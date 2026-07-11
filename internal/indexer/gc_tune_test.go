@@ -538,8 +538,10 @@ func TestFreeOSMemoryAfterColdIndex(t *testing.T) {
 	for i := range sink {
 		sink[i] = byte(i)
 	}
-	_ = sink
-	sink = nil
+	// Force the writes to land (so the allocation is not elided), then let the
+	// reference drop here: sink is dead past this point, so the scavenge below
+	// has heap to return.
+	runtime.KeepAlive(sink)
 
 	var before, after runtime.MemStats
 	runtime.ReadMemStats(&before)

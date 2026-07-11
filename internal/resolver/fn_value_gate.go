@@ -236,7 +236,7 @@ func resolveFnValueName(fileNodes []*graph.Node, name string) string {
 // the repo, or "" when none or more than one exists (unique-or-drop). The
 // shared repo-wide resolution rule for qualified-path and gate-skipping
 // (curated-HOF string) function values. Prototype declarations of the name
-// never make it ambiguous — see uniqueFnValueMatch.
+// never make it ambiguous — see uniqueFnValueMatchMemo.
 func resolveUniqueFnValue(g graph.Store, name string) string {
 	return resolveUniqueFnValueMemo(g, name, nil)
 }
@@ -247,19 +247,14 @@ func resolveUniqueFnValueMemo(g graph.Store, name string, memo map[string][]*gra
 	return uniqueFnValueMatchMemo(g, name, nil, memo)
 }
 
-// resolveFnValueCrossModule binds a function value to a uniquely-named
+// resolveFnValueCrossModuleMemo binds a function value to a uniquely-named
 // function/method anywhere in the repo, skipping any candidate with file-local
 // linkage (a C/C++ `static` function, stamped scope_static): such a definition
 // is invisible outside its translation unit, so a cross-module reference can
 // never target it, and a same-named static in an unrelated file must not make
 // the name look ambiguous. The same-file path is preferred by the caller; this
-// is the cross-module fallback.
-func resolveFnValueCrossModule(g graph.Store, name string) string {
-	return resolveFnValueCrossModuleMemo(g, name, nil)
-}
-
-// resolveFnValueCrossModuleMemo is resolveFnValueCrossModule with a shared
-// per-pass FindNodesByName memo (nil disables memoization).
+// is the cross-module fallback. A shared per-pass FindNodesByName memo collapses
+// repeated lookups of the same name (nil disables memoization).
 func resolveFnValueCrossModuleMemo(g graph.Store, name string, memo map[string][]*graph.Node) string {
 	return uniqueFnValueMatchMemo(g, name, isFileLocalLinkage, memo)
 }
@@ -281,8 +276,9 @@ func findNodesByNameMemo(g graph.Store, name string, memo map[string][]*graph.No
 	return ns
 }
 
-// uniqueFnValueMatch is the shared unique-or-drop scan over every
-// function/method named name, with an optional per-node exclusion.
+// uniqueFnValueMatchMemo is the shared unique-or-drop scan over every
+// function/method named name, with an optional per-node exclusion and a shared
+// per-pass FindNodesByName memo (nil disables memoization).
 //
 // A C-family forward declaration (`void strlenCommand(client *c);` in a
 // header, stamped Meta["prototype"]) names the SAME extern symbol as its
@@ -295,12 +291,6 @@ func findNodesByNameMemo(g graph.Store, name string, memo map[string][]*graph.No
 // prototypes are consulted only when no definition matches at all (the
 // definition's translation unit isn't indexed), and then under the same
 // unique-or-drop rule.
-func uniqueFnValueMatch(g graph.Store, name string, exclude func(*graph.Node) bool) string {
-	return uniqueFnValueMatchMemo(g, name, exclude, nil)
-}
-
-// uniqueFnValueMatchMemo is uniqueFnValueMatch with a shared per-pass
-// FindNodesByName memo (nil disables memoization).
 func uniqueFnValueMatchMemo(g graph.Store, name string, exclude func(*graph.Node) bool, memo map[string][]*graph.Node) string {
 	def, proto := "", ""
 	for _, n := range findNodesByNameMemo(g, name, memo) {
@@ -390,15 +380,10 @@ func resolveMemberByTypeMemo(g graph.Store, typeName, member string, memo map[st
 	return match
 }
 
-// resolveFnValueSelfMember binds a `this.m` / `self.m` member reference against
-// the methods of the registration site's enclosing type, so it can never bind
-// a coincidentally-named top-level function.
-func resolveFnValueSelfMember(g graph.Store, fromID, member string) string {
-	return resolveFnValueSelfMemberMemo(g, fromID, member, nil)
-}
-
-// resolveFnValueSelfMemberMemo is resolveFnValueSelfMember with a shared
-// per-pass FindNodesByName memo (nil disables memoization).
+// resolveFnValueSelfMemberMemo binds a `this.m` / `self.m` member reference
+// against the methods of the registration site's enclosing type, so it can
+// never bind a coincidentally-named top-level function. A shared per-pass
+// FindNodesByName memo collapses repeated lookups (nil disables memoization).
 func resolveFnValueSelfMemberMemo(g graph.Store, fromID, member string, memo map[string][]*graph.Node) string {
 	from := g.GetNode(fromID)
 	if from == nil || from.Meta == nil {
