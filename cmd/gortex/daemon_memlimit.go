@@ -260,11 +260,19 @@ func releaseMemoryToOS(logger *zap.Logger, reason string) {
 	debug.FreeOSMemory()
 	elapsed := time.Since(start)
 	runtime.ReadMemStats(&after)
+	// Concurrent allocation between the two reads can re-acquire released
+	// pages faster than this call released them, making the raw delta
+	// negative; report that as zero net release rather than a nonsense
+	// negative byte count.
+	freed := int64(after.HeapReleased) - int64(before.HeapReleased)
+	if freed < 0 {
+		freed = 0
+	}
 	if logger != nil {
 		logger.Info("daemon: released heap to OS",
 			zap.String("reason", reason),
 			zap.Duration("elapsed", elapsed),
-			zap.Int64("freed_bytes", int64(after.HeapReleased-before.HeapReleased)),
+			zap.Int64("freed_bytes", freed),
 			zap.Uint64("heap_sys_bytes", after.HeapSys),
 			zap.Uint64("heap_released_bytes", after.HeapReleased))
 	}
