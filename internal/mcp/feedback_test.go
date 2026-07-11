@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -152,4 +153,25 @@ func TestFeedbackManager_FilterByToolSource(t *testing.T) {
 	// All sources.
 	stats = fm.AggregatedStats("all", 10)
 	assert.Equal(t, 2, stats["total_entries"])
+}
+
+func TestFeedbackManager_EntriesBounded(t *testing.T) {
+	fm := &feedbackManager{} // dir="" — no disk trim, exercises the in-memory cap
+
+	total := feedbackMaxEntries + 128
+	for i := 0; i < total; i++ {
+		require.NoError(t, fm.Record(persistence.FeedbackEntry{
+			Task:   "task",
+			Useful: []string{fmt.Sprintf("sym-%d", i)},
+			Source: "smart_context",
+		}))
+	}
+
+	require.Len(t, fm.store.Entries, feedbackMaxEntries, "in-memory log capped")
+
+	// Newest retained, oldest aged out.
+	last := fm.store.Entries[len(fm.store.Entries)-1]
+	assert.Equal(t, []string{fmt.Sprintf("sym-%d", total-1)}, last.Useful, "newest entry retained")
+	first := fm.store.Entries[0]
+	assert.Equal(t, []string{fmt.Sprintf("sym-%d", total-feedbackMaxEntries)}, first.Useful, "oldest surviving entry")
 }
