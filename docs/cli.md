@@ -173,6 +173,7 @@ The generic relay: invoke any tool the daemon's MCP surface registers, even one 
 | `--quiet` | suppress the mutating-tool stderr note |
 
 ```bash
+gortex call explore --arg task="login handler 500s when the session cookie is expired"
 gortex call smart_context --arg task="add rate limiting to the login handler"
 gortex call find_usages --arg id="internal/auth/login.go::Login" --format gcx
 gortex call overlay_push --json-file ./buffer.json          # reach a deferred tool by name
@@ -235,6 +236,25 @@ gortex memory surface --task "fix the auth bug" --symbols internal/auth/login.go
 gortex memory store --kind invariant --importance 5 --symbols pkg/foo.go::Bar \
   --body "Bar must hold the lock before mutating the cache"
 gortex memory note --tags decision --body "chose token bucket over leaky bucket because of burst tolerance"
+```
+
+### `gortex instructions …` — instruction profiles
+
+An **instruction profile** bundles four agent-facing surfaces, generated from one table so they cannot drift: the instructions body (`~/.gortex/instructions/<name>.md`, @-included into `~/.claude/CLAUDE.md` through an `active.md` byte copy), the MCP tool preset sessions default to, the installed skills subset, and the hook-verbosity tier. Three profiles ship: `core` (balanced default), `localization` (lean code-finding surface: ~2 KB body, ~10 read-only tools, 3 skills, lean hooks), `full` (maximum guidance: the ~34-tool dev-cycle preset eager).
+
+| Verb | Effect |
+|---|---|
+| `instructions list` | profiles with the active marker, body bytes, preset, skills count, hook tier |
+| `instructions show <name>` | print one profile's instructions body |
+| `instructions switch <name>` | atomically repoint `active.md`, record the state, reconcile installed skills |
+| `instructions regen` | re-derive the profile files from the running binary (selection unchanged) |
+
+Switching applies to **new sessions only** — the @-include, `tools/list`, and skills all load at session start. A forwarded `GORTEX_TOOLS` or an operator-pinned `mcp.tools` config always beats the profile's preset (see [`mcp.md`](mcp.md#restricting-the-tool-surface-presets)); `GORTEX_INSTRUCTIONS_PROFILE=<name>` pins the profile per process tree (benchmarks, CI).
+
+```bash
+gortex instructions list
+gortex instructions switch localization   # lean machine: diet body + 10-tool surface + lean hooks
+gortex instructions switch core           # back to the balanced default
 ```
 
 ### `gortex analyze` — unified analysis dispatcher

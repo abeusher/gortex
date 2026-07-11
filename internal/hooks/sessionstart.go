@@ -11,6 +11,7 @@ import (
 
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/pathkey"
+	"github.com/zzet/gortex/internal/profiles"
 	"github.com/zzet/gortex/internal/toolref"
 )
 
@@ -121,12 +122,56 @@ func buildSessionStartBriefing(cwd string) string {
 		return sb.String()
 	}
 
-	// Happy path: daemon is reachable.
-	sb.WriteString(renderDaemonReadiness(status))
-	sb.WriteString(renderCwdCoverage(cwd, status))
+	// Happy path: daemon is reachable. The lean hook tier (set by the
+	// active instruction profile) compresses the status prose to one
+	// line; the rule preamble — the positioning cues — survives every
+	// tier, and so does the actionable not-covered warning.
+	if activeHookTier() == profiles.HookTierLean {
+		sb.WriteString(renderLeanReadiness(cwd, status))
+	} else {
+		sb.WriteString(renderDaemonReadiness(status))
+		sb.WriteString(renderCwdCoverage(cwd, status))
+	}
 	sb.WriteString("\n")
 	sb.WriteString(rulePreamble())
 	return sb.String()
+}
+
+// activeHookTier reads the machine's hook-verbosity tier from the
+// active instruction profile. Package var so tests pin a tier without
+// touching machine state.
+var activeHookTier = profiles.ActiveHookTier
+
+// renderLeanReadiness is the one-line status the lean tier emits when
+// the cwd is a tracked repo. The workspace-root and not-covered cases
+// keep their full explanations in every tier — those are actionable
+// warnings, not status prose.
+func renderLeanReadiness(cwd string, s *daemon.StatusResponse) string {
+	var totalNodes int
+	for _, r := range s.TrackedRepos {
+		totalNodes += r.Nodes
+	}
+	state := "ready"
+	if !s.Ready {
+		state = "warming up — enforcement partial"
+	}
+	line := fmt.Sprintf("✓ Gortex %s (v%s): %d repo(s), %d nodes.",
+		state, strings.TrimPrefix(s.Version, "v"), len(s.TrackedRepos), totalNodes)
+
+	abs := cwd
+	if cwd != "" {
+		if a, err := filepath.Abs(cwd); err == nil {
+			abs = a
+		}
+	}
+	if abs != "" {
+		if exact, _ := classifyCwd(abs, s.TrackedRepos); exact != nil {
+			return fmt.Sprintf("%s cwd tracked as `%s` — enforcement active.\n", line, exact.Name)
+		}
+		// Workspace-root and not-covered explanations stay verbatim.
+		return line + "\n\n" + renderCwdCoverage(cwd, s)
+	}
+	return line + "\n"
 }
 
 // renderDaemonReadiness summarises the daemon's overall state in one
@@ -240,9 +285,9 @@ func hasPathPrefix(path, prefix string) bool {
 // to reach for graph tools first.
 func rulePreamble() string {
 	return "**Rule:** Use Gortex MCP tools for code operations in this repo. Prefer:\n" +
+		"- **`explore` first for any task or bug report** — one call returns the ranked neighborhood (likely symbols + their source + call paths + the files to change); answer or start editing from it\n" +
 		"- `search_symbols` / `find_usages` / `get_callers` over `grep` / `Grep`\n" +
-		"- `get_symbol_source` / `get_file_summary` / `get_editing_context` over `Read`\n" +
-		"- `smart_context` over multiple Read/Grep calls when starting a task\n" +
+		"- `get_symbol_source` / `batch_symbols` / `get_file_summary` over `Read`\n" +
 		"- `edit_symbol` / `edit_file` / `rename_symbol` over `Edit` / `Write` for indexed source\n\n" +
 		"Pre-tool hooks will deny attempts to Read/Grep/Glob indexed source files; the deny message names the right tool.\n" +
 		"Shell only (no MCP tools)? Reach any tool with `gortex call <tool> --arg k=v` (e.g. `" + toolref.CLIFallback("get_symbol_source") + "`) — there is no bare `gortex <tool>` verb.\n"

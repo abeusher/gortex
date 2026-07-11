@@ -47,7 +47,7 @@ func TestInitialize_ReturnsInstructions(t *testing.T) {
 	if strings.TrimSpace(parsed.Result.Instructions) == "" {
 		t.Fatalf("initialize response carried no instructions field; got: %s", out)
 	}
-	for _, want := range []string{"smart_context", "search_symbols", "tools_search"} {
+	for _, want := range []string{"explore", "search_symbols", "tools_search"} {
 		if !strings.Contains(parsed.Result.Instructions, want) {
 			t.Errorf("instructions should mention %q; got: %q", want, parsed.Result.Instructions)
 		}
@@ -131,7 +131,7 @@ func TestStateAwareInstructionsVariants(t *testing.T) {
 
 	t.Run("covered_cwd_appends_live_facts", func(t *testing.T) {
 		got := srv.stateAwareInstructions(repoA)
-		require.Contains(t, got, "smart_context", "base guidance must still lead")
+		require.Contains(t, got, "explore", "base guidance must still lead")
 		require.Contains(t, got, "Tracked repositories", "live workspace facts must be appended")
 		require.Contains(t, got, "repo-a")
 		require.Contains(t, got, "Index status: ready", "warmup readiness must be surfaced")

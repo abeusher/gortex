@@ -241,9 +241,9 @@ type Server struct {
 	// instead of re-spawning the language server. An entry is recorded after
 	// the first attempt (success or empty) to bound per-query LSP work.
 	refsConfirmed sync.Map // symbolID → struct{}
-	feedback         *feedbackManager
-	notes            *notesManager
-	memories         *memoryManager
+	feedback      *feedbackManager
+	notes         *notesManager
+	memories      *memoryManager
 	// promotedTools is the per-workspace learned tool surface: deferred
 	// tools promoted into the eager surface after use, persisted so the
 	// learning survives daemon restarts (with demotion after disuse). Nil
@@ -428,6 +428,11 @@ type Server struct {
 	// toolSurfaceFilter + checkToolGate and in defer mode by the lazy
 	// registry's eager predicate.
 	toolPolicy *toolPolicy
+	// toolPolicyOperatorPinned records whether the global policy came
+	// from a deliberate operator configuration (mcp.tools beyond the
+	// shipped default, or GORTEX_TOOLS) — when true, the active
+	// instruction profile does not adjust session tool surfaces.
+	toolPolicyOperatorPinned bool
 
 	// toolBudgetOnce / toolBudgetCached memoise the project-size-scaled
 	// exploration-call budget appended to navigation tools' descriptions
@@ -559,6 +564,19 @@ type sessionState struct {
 	// for the post-filter tools (ctx_grep / ctx_slice / …). Allocated
 	// lazily on first capture.
 	responses *responseBuffer
+
+	// momentumReads counts this session's read/navigate tool calls;
+	// momentumNudged latches the one-shot momentum note (momentum.go).
+	// momentumStreak counts CONSECUTIVE granular reads (broken by
+	// explore / smart_context and by any non-read call);
+	// momentumEscalated latches the one-shot escalation note and
+	// momentumExploreUsed records whether explore ran this session
+	// (it drives the escalation's wording).
+	momentumReads       int
+	momentumNudged      bool
+	momentumStreak      int
+	momentumEscalated   bool
+	momentumExploreUsed bool
 
 	// cursor is the per-session stateful navigation cursor used by the
 	// nav tool — a current symbol plus a back-history. Allocated lazily
@@ -794,7 +812,6 @@ func (ss *sessionState) recordToolPolicy(spec, mode string) {
 	ss.resolvedToolPolicy = nil
 	ss.toolPolicyResolved = false
 }
-
 
 // snapshotClientName returns the captured client name under the
 // session lock. Returns empty when the `initialize` frame hasn't
@@ -1100,8 +1117,8 @@ type MultiRepoOptions struct {
 // the graph tools over raw file reads, and where to start."
 const serverInstructions = `Gortex is a code-intelligence graph server — it indexes repositories into a queryable knowledge graph. Prefer its graph tools over raw file reads and text search:
 
-- Start any task with smart_context: it assembles the minimal relevant working set (symbols, sources, edit plan) in one call.
-- Use search_symbols (BM25, camelCase-aware) instead of grep; find_usages / get_callers for references and callers; get_symbol_source to read one symbol without its whole file.
+- START WITH explore FOR EVERY TASK-SHAPED REQUEST (a bug report, a feature, "where is / how does X work"): one call returns the ranked neighborhood — the likely symbols with their source, call paths, and the files to change. Answer or start editing directly from its output instead of chaining search/read/callers calls; its locations are graph-verified, so no re-checking with file reads is needed.
+- For one known symbol: search_symbols (BM25, camelCase-aware) to find it, get_symbol_source to read it, batch_symbols for several bodies in one call; find_usages / get_callers for references and callers.
 - Before editing, call get_editing_context on the file; for refactors use edit_symbol / rename_symbol / batch_edit.
 - The cold tools/list shows a core set — call tools_search to discover the rest of the catalogue on demand.
 - Pass format:"gcx" to list-shaped tools for a compact, round-trippable wire format (~27% fewer tokens).
@@ -1366,7 +1383,9 @@ func NewServer(engine *query.Engine, g graph.Store, idx *indexer.Indexer, watche
 	// eager surface; hide mode is enforced later by toolSurfaceFilter /
 	// checkToolGate. Resolved before the register sweep so every
 	// addTool sees the policy.
-	s.toolPolicy = resolveToolPolicy(toolPolicyBaseFromOptions(opts), logger)
+	toolPolicyBase := toolPolicyBaseFromOptions(opts)
+	s.toolPolicyOperatorPinned = operatorPinnedToolPolicy(toolPolicyBase)
+	s.toolPolicy = resolveToolPolicy(toolPolicyBase, logger)
 	s.lazy = newLazyToolRegistry(lazyEnabledFromEnv() || s.toolPolicy.deferMode())
 	if s.toolPolicy.deferMode() {
 		s.lazy.SetEagerPredicate(s.toolPolicy.allows)
@@ -1375,6 +1394,7 @@ func NewServer(engine *query.Engine, g graph.Store, idx *indexer.Indexer, watche
 	s.registerToolsSearch()
 
 	s.registerCoreTools()
+	s.registerExploreTool()
 	s.registerFindFilesTool()
 	s.registerCodingTools()
 	s.registerMoveInlineTools()

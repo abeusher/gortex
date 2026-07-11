@@ -30,6 +30,7 @@ var exampleArg = map[string]string{
 	"find_usages":         "symbol=<file>::<Name|Recv.Name>",
 	"get_callers":         "symbol=<file>::<Name|Recv.Name>",
 	"smart_context":       "task=<what you want to do>",
+	"explore":             "task=<the request / bug report text>",
 	"get_repo_outline":    "path_prefix=<dir>/",
 	"edit_file":           "path=<file>",
 	"edit_symbol":         "id=<file>::<Name|Recv.Name>",
