@@ -65,14 +65,42 @@ func TestRenderExploreShape(t *testing.T) {
 		"^ callers: Fetch (client.go:4-6)",
 		"v calls:   Backoff (retry.go:6-8)",
 		"func DoWithRetry(max int) error", // full body for hot target
+		"ANSWER-READY:",
 		"## Files to change",
 		"- retry.go  ·  Backoff, DoWithRetry",
-		"— Completeness: 2 candidate symbol(s) across 1 file(s)",
-		"FILES / SYMBOLS / EVIDENCE",
+		"— Coverage: 2 ranked candidate symbol(s) across 1 file(s)",
+		"NEXT ACTION (required): answer now with FILES / SYMBOLS / EVIDENCE",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("render missing %q\n--- got ---\n%s", want, out)
 		}
+	}
+}
+
+func TestRenderExploreBroadWeakNeighborhoodRequestsOneRefinement(t *testing.T) {
+	targets := []exploreTarget{
+		{node: &graph.Node{Name: "current", Kind: graph.KindVariable, FilePath: "internal/embedding/onnx.go"}, score: 0.9},
+		{node: &graph.Node{Name: "dirty", Kind: graph.KindVariable, FilePath: "internal/analyzer/state.go"}, score: 0.8},
+	}
+	task := "review release blockers across impact reach sqlite races mcp facade routing codex claude guidance explore ranking token cost"
+	out := (&Server{}).renderExplore(task, targets, 1600)
+	if !strings.Contains(out, "REFINEMENT NEEDED:") || !strings.Contains(out, "make one focused refinement before answering") {
+		t.Fatalf("broad weak neighborhood must request one refinement:\n%s", out)
+	}
+	if strings.Contains(out, "ANSWER-READY:") || strings.Contains(out, "answer now with FILES") {
+		t.Fatalf("broad weak neighborhood must not force a final answer:\n%s", out)
+	}
+}
+
+func TestRenderExploreBroadWellAlignedNeighborhoodRemainsAnswerReady(t *testing.T) {
+	targets := []exploreTarget{{
+		node:  &graph.Node{Name: "registerFacadeTools", Kind: graph.KindMethod, FilePath: "internal/mcp/facade_tools.go"},
+		score: 1.2,
+	}}
+	task := "investigate mcp facade tool routing schema registration operation dispatch surface architecture integration behavior"
+	out := (&Server{}).renderExplore(task, targets, 1600)
+	if !strings.Contains(out, "ANSWER-READY:") || !strings.Contains(out, "answer now with FILES") {
+		t.Fatalf("well-aligned ranked head must preserve strong terminality:\n%s", out)
 	}
 }
 
@@ -84,11 +112,29 @@ func TestRenderExploreBudgetTruncation(t *testing.T) {
 	for _, want := range []string{
 		"1. DoWithRetry  function  ·  retry.go:11-20",
 		"2. Backoff  function  ·  retry.go:6-8",
-		"— Completeness:",
+		"— Coverage:",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("truncated render missing %q", want)
 		}
+	}
+}
+
+func TestRenderExploreLimitsFullBodiesToTopTargets(t *testing.T) {
+	targets := exploreTestTargets()
+	targets = append(targets, exploreTarget{
+		node:   &graph.Node{Name: "Third", Kind: graph.KindFunction, FilePath: "third.go", StartLine: 1, EndLine: 4, Language: "go"},
+		source: "func Third() int {\n\treturn 3\n}",
+	})
+	out := (&Server{}).renderExplore("task", targets, exploreDefaultBudgetTokens)
+	if exploreDefaultBudgetTokens != 1600 {
+		t.Fatalf("default explore budget=%d want 1600", exploreDefaultBudgetTokens)
+	}
+	if !strings.Contains(out, "3. Third  function") {
+		t.Fatal("third candidate header was dropped")
+	}
+	if strings.Contains(out, "return 3") {
+		t.Fatal("third candidate unexpectedly retained a full body")
 	}
 }
 
@@ -216,23 +262,45 @@ func TestFacadeExploreDemotesRepeatedDataLeafNames(t *testing.T) {
 	}
 }
 
-func TestDemoteRepeatedExploreDataNamesIsConceptOnlyAndStable(t *testing.T) {
+func TestDiversifyRepeatedExploreNamesIsConceptOnlyAndStable(t *testing.T) {
 	leaf1 := &rerank.Candidate{Node: &graph.Node{ID: "a", Name: "client", Kind: graph.KindVariable}}
 	leaf2 := &rerank.Candidate{Node: &graph.Node{ID: "b", Name: "client", Kind: graph.KindField}}
-	callable := &rerank.Candidate{Node: &graph.Node{ID: "c", Name: "ClientCoordinator", Kind: graph.KindFunction}}
+	validate1 := &rerank.Candidate{Node: &graph.Node{ID: "v1", Name: "Validate", Kind: graph.KindMethod}}
+	validate2 := &rerank.Candidate{Node: &graph.Node{ID: "v2", Name: "Validate", Kind: graph.KindMethod}}
+	validate3 := &rerank.Candidate{Node: &graph.Node{ID: "v3", Name: "Validate", Kind: graph.KindFunction}}
+	callable := &rerank.Candidate{Node: &graph.Node{ID: "c", Name: "FacadeRegistry", Kind: graph.KindFunction}}
+	input := []*rerank.Candidate{leaf1, leaf2, validate1, validate2, validate3, callable}
 
-	concept := demoteRepeatedExploreDataNames([]*rerank.Candidate{leaf1, leaf2, callable}, rerank.QueryClassConcept)
-	if concept[0] != leaf1 || concept[1] != callable || concept[2] != leaf2 {
-		t.Fatalf("concept diversification is not stable/bounded: %#v", concept)
+	concept := diversifyRepeatedExploreNames(append([]*rerank.Candidate(nil), input...), rerank.QueryClassConcept)
+	want := []*rerank.Candidate{leaf1, validate1, validate2, callable, leaf2, validate3}
+	for i := range want {
+		if concept[i] != want[i] {
+			t.Fatalf("concept diversification[%d]=%s want %s", i, concept[i].Node.ID, want[i].Node.ID)
+		}
 	}
-	symbol := demoteRepeatedExploreDataNames([]*rerank.Candidate{leaf1, leaf2, callable}, rerank.QueryClassSymbol)
-	if symbol[0] != leaf1 || symbol[1] != leaf2 || symbol[2] != callable {
-		t.Fatalf("identifier lookup order changed: %#v", symbol)
+	symbol := diversifyRepeatedExploreNames(append([]*rerank.Candidate(nil), input...), rerank.QueryClassSymbol)
+	for i := range input {
+		if symbol[i] != input[i] {
+			t.Fatalf("identifier lookup order changed at %d", i)
+		}
 	}
 	if got := exploreCandidateFetchLimit(6, rerank.QueryClassConcept); got != 48 {
 		t.Fatalf("concept fetch limit=%d want 48", got)
 	}
 	if got := exploreCandidateFetchLimit(6, rerank.QueryClassSymbol); got != 24 {
 		t.Fatalf("symbol fetch limit=%d want 24", got)
+	}
+}
+
+func TestStripLeadingExploreDirective(t *testing.T) {
+	for input, want := range map[string]string{
+		"Audit and fix MCP facade impact handling":         "MCP facade impact handling",
+		"Please validate operation schema discoverability": "operation schema discoverability",
+		"How does Validate work":                           "How does Validate work",
+		"fix impact":                                       "fix impact",
+	} {
+		if got := stripLeadingExploreDirective(input); got != want {
+			t.Errorf("stripLeadingExploreDirective(%q)=%q want %q", input, got, want)
+		}
 	}
 }

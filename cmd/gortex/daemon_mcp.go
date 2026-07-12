@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -95,7 +96,7 @@ func (d *mcpDispatcher) Dispatch(ctx context.Context, sess *daemon.Session, fram
 	if untracked {
 		d.logUncoveredCWDOnce(sess)
 	}
-	if untracked && peekFrameMethod(frame) == "tools/call" {
+	if untracked && peekFrameMethod(frame) == "tools/call" && !untrackedBootstrapCall(frame) {
 		return d.notTrackedError(sess, frame), nil
 	}
 
@@ -202,12 +203,29 @@ func peekFrameToolName(frame []byte) string {
 	return peek.Params.Name
 }
 
-// rewriteUntrackedResponse swaps a successful initialize / tools/list response
-// for its untracked-cwd variant: initialize carries the inactive instructions
-// (with the cwd-specific `gortex track` affordance) and tools/list is emptied,
-// so the handshake completes gracefully instead of erroring. Non-initialize /
-// non-tools/list frames, error responses, and unparseable bodies pass through
-// unchanged.
+// untrackedBootstrapCall permits only the two facade calls that can explain or
+// repair an uncovered cwd. Every graph-backed call remains fail-closed.
+func untrackedBootstrapCall(frame []byte) bool {
+	var peek struct {
+		Method string `json:"method"`
+		Params struct {
+			Name      string         `json:"name"`
+			Arguments map[string]any `json:"arguments"`
+		} `json:"params"`
+	}
+	if json.Unmarshal(frame, &peek) != nil || peek.Method != "tools/call" {
+		return false
+	}
+	if peek.Params.Name == "capabilities" {
+		return true
+	}
+	return peek.Params.Name == "workspace_admin" && strings.EqualFold(strings.TrimSpace(fmt.Sprint(peek.Params.Arguments["operation"])), "track")
+}
+
+// rewriteUntrackedResponse swaps a successful initialize response for its
+// untracked-cwd variant. tools/list is deliberately preserved so facade clients
+// can discover capabilities and workspace_admin.track without reconnecting;
+// every other tools/call remains blocked by Dispatch until tracking succeeds.
 func rewriteUntrackedResponse(method string, out []byte, cwd string, roots []string) []byte {
 	if len(out) == 0 {
 		return out
@@ -220,14 +238,10 @@ func rewriteUntrackedResponse(method string, out []byte, cwd string, roots []str
 	if !ok {
 		return out // an error response or non-object result — leave it
 	}
-	switch method {
-	case "initialize":
-		result["instructions"] = gortexmcp.ServerInstructionsUntracked(cwd, roots...)
-	case "tools/list":
-		result["tools"] = []any{}
-	default:
+	if method != "initialize" {
 		return out
 	}
+	result["instructions"] = gortexmcp.ServerInstructionsUntracked(cwd, roots...)
 	resp["result"] = result
 	if rewritten, mErr := json.Marshal(resp); mErr == nil {
 		return rewritten

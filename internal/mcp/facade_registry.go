@@ -115,6 +115,26 @@ func (r *facadeRegistry) operations(facade string) []facadeOperationSpec {
 	return out
 }
 
+// availableOperations is the public runtime catalogue. The migration table is
+// intentionally broader than any one server configuration, so only operations
+// whose implementation handler was actually captured may be advertised.
+func (r *facadeRegistry) availableOperations(facade string) []facadeOperationSpec {
+	if r == nil {
+		return nil
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	ops := r.byFacade[facade]
+	out := make([]facadeOperationSpec, 0, len(ops))
+	for _, spec := range ops {
+		if _, available := r.captured[spec.Legacy]; available {
+			out = append(out, spec)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Operation < out[j].Operation })
+	return out
+}
+
 func (r *facadeRegistry) mapsLegacy(name string) bool {
 	return r != nil && len(r.byLegacy[name]) > 0
 }

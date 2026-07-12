@@ -66,11 +66,10 @@ func (s *Server) ensureFresh(filePaths []string) []string {
 		if !idx.IsTrackedStale(rel) {
 			continue
 		}
-		if err := idx.IndexFile(absPath); err != nil {
+		if !s.reindexFile(absPath) {
 			s.logger.Warn("auto re-index failed",
 				zap.String("file", fp),
-				zap.String("resolved", absPath),
-				zap.Error(err))
+				zap.String("resolved", absPath))
 			continue
 		}
 		// Advance the recorded mtime so a follow-up read in the same window
@@ -290,7 +289,7 @@ func (s *Server) registerEnhancementTools() {
 	// batch_edit
 	s.addTool(
 		mcp.NewTool("batch_edit",
-			mcp.WithDescription("Applies multiple edits in one atomic, dependency-ordered batch. Symbol edits are ordered definitions→callers; the graph re-indexes after each edit; the batch stops on the first failure and skips the rest. Each edit is one of two operations selected by `op`:\n  • edit_symbol (default): {id, old_source, new_source} — replace a fragment inside a symbol's body.\n  • edit_file: {op:\"edit_file\", path, old_string, new_string, replace_all?} — replace a string in any file (imports, config, comments).\nPass `edits` as a JSON array of objects (a JSON-encoded string of the same array is also accepted for backward compatibility)."),
+			mcp.WithDescription("Preflights every edit, then applies the dependency-ordered batch. Validation failures and no-op edits are reported before any file is written. Symbol edits are ordered definitions→callers; the graph re-indexes after each edit. A filesystem write failure can still leave earlier writes applied, so the batch stops immediately and reports the remainder skipped. Each edit is one of two operations selected by `op`:\n  • edit_symbol (default): {id, old_source, new_source} — replace a fragment inside a symbol's body.\n  • edit_file: {op:\"edit_file\", path, old_string, new_string, replace_all?} — replace a string in any file (imports, config, comments).\nPass `edits` as a JSON array of objects (a JSON-encoded string of the same array is also accepted for backward compatibility)."),
 			mcp.WithArray("edits", mcp.Required(),
 				mcp.Description("Edit operations. Each item is an edit_symbol or edit_file object selected by the `op` discriminator."),
 				mcp.Items(batchEditItemsSchema()),
@@ -3495,31 +3494,62 @@ func (s *Server) handleBatchEdit(ctx context.Context, req mcp.CallToolRequest) (
 		})
 	}
 
-	// Apply edits sequentially, dispatching per operation kind. Stop on the
-	// first failure and mark the remainder skipped.
+	// Preflight the same validation and replacement computation used by the
+	// write path. A malformed, stale, ambiguous, or no-op item therefore fails
+	// before the first file is changed. This is validation atomicity, not a
+	// filesystem transaction: a later write error can still leave prior writes.
 	var results []batchEditResult
-	failed := false
-
-	for _, o := range ordered {
-		if failed {
+	failedAt := -1
+	for i, o := range ordered {
+		var r batchEditResult
+		switch o.op {
+		case "edit_file":
+			r = s.applyBatchFileEdit(o.edit, false)
+		default:
+			r = s.applyBatchSymbolEdit(ctx, o.edit, false)
+		}
+		results = append(results, r)
+		if r.Status == "failed" {
+			failedAt = i
+			break
+		}
+	}
+	if failedAt >= 0 {
+		for i := 0; i < failedAt; i++ {
+			results[i].Status = "skipped"
+		}
+		for _, o := range ordered[failedAt+1:] {
 			results = append(results, batchEditResult{
 				Op:       o.op,
 				SymbolID: o.edit.SymbolID,
 				FilePath: o.file,
 				Status:   "skipped",
 			})
-			continue
 		}
-		var r batchEditResult
-		switch o.op {
-		case "edit_file":
-			r = s.applyBatchFileEdit(o.edit)
-		default:
-			r = s.applyBatchSymbolEdit(ctx, o.edit)
-		}
-		results = append(results, r)
-		if r.Status == "failed" {
-			failed = true
+	} else {
+		results = results[:0]
+		failed := false
+		for _, o := range ordered {
+			if failed {
+				results = append(results, batchEditResult{
+					Op:       o.op,
+					SymbolID: o.edit.SymbolID,
+					FilePath: o.file,
+					Status:   "skipped",
+				})
+				continue
+			}
+			var r batchEditResult
+			switch o.op {
+			case "edit_file":
+				r = s.applyBatchFileEdit(o.edit, true)
+			default:
+				r = s.applyBatchSymbolEdit(ctx, o.edit, true)
+			}
+			results = append(results, r)
+			if r.Status == "failed" {
+				failed = true
+			}
 		}
 	}
 
@@ -3562,7 +3592,7 @@ func (s *Server) handleBatchEdit(ctx context.Context, req mcp.CallToolRequest) (
 // applyBatchSymbolEdit applies one edit_symbol operation: it locates the
 // symbol's source range, replaces old_source with new_source inside it, writes
 // the file, and re-indexes. Semantics match the legacy single-op batch_edit.
-func (s *Server) applyBatchSymbolEdit(ctx context.Context, edit batchEditItem) batchEditResult {
+func (s *Server) applyBatchSymbolEdit(ctx context.Context, edit batchEditItem, write bool) batchEditResult {
 	res := batchEditResult{Op: "edit_symbol", SymbolID: edit.SymbolID}
 	if edit.OldSource == edit.NewSource {
 		res.Status, res.Error = "failed", "old_source and new_source are identical"
@@ -3650,13 +3680,15 @@ func (s *Server) applyBatchSymbolEdit(ctx context.Context, edit batchEditItem) b
 		res.Status, res.Error = "failed", "old_source and new_source are identical after line-ending normalization"
 		return res
 	}
+	if !write {
+		res.Status = "validated"
+		return res
+	}
 	if writeErr := os.WriteFile(absPath, []byte(newContent), 0o644); writeErr != nil {
 		res.Status, res.Error = "failed", fmt.Sprintf("could not write file: %v", writeErr)
 		return res
 	}
-	if s.indexer != nil {
-		_ = s.indexer.IndexFile(absPath)
-	}
+	_ = s.reindexFile(absPath)
 	res.Status = "applied"
 	return res
 }
@@ -3664,7 +3696,7 @@ func (s *Server) applyBatchSymbolEdit(ctx context.Context, edit batchEditItem) b
 // applyBatchFileEdit applies one edit_file operation: it replaces old_string
 // with new_string in the file at path, mirroring edit_file's uniqueness and
 // replace_all semantics, then re-indexes.
-func (s *Server) applyBatchFileEdit(edit batchEditItem) batchEditResult {
+func (s *Server) applyBatchFileEdit(edit batchEditItem, write bool) batchEditResult {
 	res := batchEditResult{Op: "edit_file", FilePath: edit.Path}
 	if edit.Path == "" {
 		res.Status, res.Error = "failed", "edit_file op requires path"
@@ -3718,6 +3750,10 @@ func (s *Server) applyBatchFileEdit(edit batchEditItem) batchEditResult {
 		newContent = strings.ReplaceAll(fileStr, edit.OldString, edit.NewString)
 	default:
 		newContent = strings.Replace(fileStr, edit.OldString, edit.NewString, 1)
+	}
+	if !write {
+		res.Status = "validated"
+		return res
 	}
 	perm := os.FileMode(0o644)
 	if info, e := os.Stat(absPath); e == nil {

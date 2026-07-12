@@ -114,6 +114,7 @@ func facadePublicCapabilitySchema(
 		if field == "operation" {
 			schema := facadePublicValueSchema(value, staticProperties[field])
 			schema["const"] = spec.Operation
+			schema["enum"] = []string{spec.Operation}
 			properties[field] = schema
 			requiredTop[field] = struct{}{}
 			continue

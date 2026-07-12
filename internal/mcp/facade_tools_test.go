@@ -15,7 +15,11 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/zzet/gortex/internal/daemon"
+	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/query"
+	"github.com/zzet/gortex/internal/search"
 	"github.com/zzet/gortex/internal/telemetry"
+	"go.uber.org/zap"
 )
 
 func TestFacadeRegistryCoversRegisteredLegacyCatalog(t *testing.T) {
@@ -104,6 +108,7 @@ func TestCompactToolsListIsStaticAndBudgeted(t *testing.T) {
 	require.NotNil(t, reply)
 	raw, err := json.Marshal(reply)
 	require.NoError(t, err)
+	t.Logf("compact tools/list: %d bytes", len(raw))
 	serialized := strings.ToLower(string(raw))
 	require.NotContains(t, serialized, "facade-v1")
 	require.NotContains(t, serialized, "facade")
@@ -1415,4 +1420,148 @@ func TestFacadeTelemetryRespectsDisabledConsent(t *testing.T) {
 	days, err := store.Days()
 	require.NoError(t, err)
 	require.Empty(t, days)
+}
+
+func TestFacadeReadSelectorCardinalityDefaultsAndAliases(t *testing.T) {
+	srv := &Server{facades: newFacadeRegistry()}
+	capture := func(_ context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+		return mcpgo.NewToolResultJSON(req.GetArguments())
+	}
+	srv.facades.capture(mcpgo.NewTool("read_file"), capture)
+	srv.facades.capture(mcpgo.NewTool("get_symbol_source"), capture)
+	srv.facades.capture(mcpgo.NewTool("batch_symbols"), capture)
+
+	call := func(arguments map[string]any) map[string]any {
+		t.Helper()
+		req := mcpgo.CallToolRequest{}
+		req.Params.Arguments = arguments
+		result, err := srv.handleFacade(context.Background(), "read", req)
+		require.NoError(t, err)
+		return unmarshalResult(t, result)
+	}
+
+	batch := call(map[string]any{
+		"operation": "source",
+		"target":    map[string]any{"symbols": []any{"a.go::A", "b.go::B"}},
+	})
+	require.Equal(t, "a.go::A,b.go::B", batch["ids"])
+	require.Equal(t, true, batch["include_source"])
+
+	metadataOnly := call(map[string]any{
+		"operation": "symbols",
+		"target":    map[string]any{"symbols": []any{"a.go::A"}},
+		"options":   map[string]any{"include_source": false},
+	})
+	require.Equal(t, false, metadataOnly["include_source"])
+
+	single := call(map[string]any{
+		"operation": "symbols",
+		"target":    map[string]any{"symbol": "a.go::A"},
+	})
+	require.Equal(t, "a.go::A", single["id"])
+	require.NotContains(t, single, "ids")
+
+	line := call(map[string]any{
+		"operation": "source",
+		"target":    map[string]any{"file": "a.go"},
+		"options":   map[string]any{"line": 42},
+	})
+	require.Equal(t, "a.go", line["path"])
+	require.Equal(t, float64(42), line["offset"])
+	require.Equal(t, float64(1), line["limit"])
+
+	window := call(map[string]any{
+		"operation": "source",
+		"target":    map[string]any{"file": "a.go"},
+		"options":   map[string]any{"window": map[string]any{"offset": 20, "limit": 7}},
+	})
+	require.Equal(t, float64(20), window["offset"])
+	require.Equal(t, float64(7), window["limit"])
+}
+
+func TestFacadeSchemasEnumerateOnlyAvailableOperations(t *testing.T) {
+	srv := &Server{facades: newFacadeRegistry()}
+	capture := func(_ context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+		return mcpgo.NewToolResultJSON(req.GetArguments())
+	}
+	srv.facades.capture(mcpgo.NewTool("read_file", mcpgo.WithString("path", mcpgo.Required())), capture)
+
+	runtime := srv.facadeToolDefinition("read")
+	operation := runtime.InputSchema.Properties["operation"].(map[string]any)
+	require.Equal(t, []string{"file"}, operation["enum"])
+
+	canonical := facadeToolDefinition("read")
+	canonicalOperation := canonical.InputSchema.Properties["operation"].(map[string]any)
+	require.Contains(t, canonicalOperation["enum"], "source")
+	require.Contains(t, canonicalOperation["enum"], "symbols")
+	analyzeKind := facadeToolDefinition("analyze").InputSchema.Properties["kind"].(map[string]any)
+	require.Contains(t, analyzeKind["enum"], "todos")
+
+	srv.facades.capture(mcpgo.NewTool("batch_symbols",
+		mcpgo.WithString("ids", mcpgo.Required()),
+		mcpgo.WithBoolean("include_source"),
+	), capture)
+	spec, ok := srv.capabilityOperation("read", "symbols")
+	require.True(t, ok)
+	capability := srv.facadeCapability(spec, true)
+	schema := capability["input_schema"].(map[string]any)
+	properties := schema["properties"].(map[string]any)
+	exactOperation := properties["operation"].(map[string]any)
+	require.Equal(t, []string{"symbols"}, exactOperation["enum"])
+	options := properties["options"].(map[string]any)["properties"].(map[string]any)
+	includeSource := options["include_source"].(map[string]any)
+	require.Equal(t, true, includeSource["default"])
+	require.Contains(t, includeSource["description"], "default: true")
+}
+
+func TestBatchEditPreflightsAllItemsBeforeFirstWrite(t *testing.T) {
+	srv, root := setupTestServer(t)
+	path := filepath.Join(root, "batch-preflight.txt")
+	require.NoError(t, os.WriteFile(path, []byte("alpha beta\n"), 0o644))
+
+	req := mcpgo.CallToolRequest{}
+	req.Params.Arguments = map[string]any{
+		"edits": []any{
+			map[string]any{
+				"op": "edit_file", "path": path,
+				"old_string": "alpha", "new_string": "ALPHA",
+			},
+			map[string]any{
+				"op": "edit_file", "path": path,
+				"old_string": "beta", "new_string": "beta",
+			},
+		},
+	}
+	result, err := srv.handleBatchEdit(context.Background(), req)
+	require.NoError(t, err)
+	out := unmarshalResult(t, result)
+	summary := out["summary"].(map[string]any)
+	require.Equal(t, float64(0), summary["applied"])
+	require.Equal(t, float64(1), summary["failed"])
+	require.Equal(t, float64(1), summary["skipped"])
+	content, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, "alpha beta\n", string(content), "a later no-op must fail before the first edit writes")
+}
+
+func TestFacadeReadResolvesOnlyUniqueSymbolShorthand(t *testing.T) {
+	g := graph.New()
+	bm := search.NewBM25()
+	first := &graph.Node{ID: "pkg/a.go::UniqueReadTarget", Name: "UniqueReadTarget", Kind: graph.KindFunction, FilePath: "pkg/a.go"}
+	g.AddNode(first)
+	bm.Add(first.ID, first.Name, first.FilePath, first.Name)
+	eng := query.NewEngine(g)
+	eng.SetSearch(bm)
+	srv := NewServer(eng, g, nil, nil, zap.NewNop(), nil)
+
+	resolved, ambiguous := srv.resolveFacadeSymbolShorthand(context.Background(), "UniqueReadTarget")
+	require.Equal(t, first.ID, resolved)
+	require.Empty(t, ambiguous)
+
+	second := &graph.Node{ID: "pkg/b.go::UniqueReadTarget", Name: "UniqueReadTarget", Kind: graph.KindFunction, FilePath: "pkg/b.go"}
+	g.AddNode(second)
+	bm.Add(second.ID, second.Name, second.FilePath, second.Name)
+	resolved, ambiguous = srv.resolveFacadeSymbolShorthand(context.Background(), "UniqueReadTarget")
+	require.Equal(t, "UniqueReadTarget", resolved)
+	require.ElementsMatch(t, []string{first.ID, second.ID}, ambiguous)
 }

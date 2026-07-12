@@ -172,7 +172,7 @@ func (s *Server) registerCodingTools() {
 
 	s.addTool(
 		mcp.NewTool("rename_symbol",
-			mcp.WithDescription("Plans a coordinated multi-file rename for a symbol. Plan-only — this call never writes to disk. Returns {file, line, old_text, new_text, confidence, reason} for the definition, every graph usage (calls / references / instantiates), receiver-line edits when renaming a type, and test-function names that embed the old identifier. Apply the returned edits with batch_edit (preferred — dependency-ordered, atomic), edit_file, or edit_symbol."),
+			mcp.WithDescription("Plans a coordinated multi-file rename for a symbol. Plan-only — this call never writes to disk. Returns {file, line, old_text, new_text, confidence, reason} for the definition, every graph usage (calls / references / instantiates), receiver-line edits when renaming a type, and test-function names that embed the old identifier. Apply the returned edits with batch_edit (preferred — preflighted and dependency-ordered), edit_file, or edit_symbol."),
 			mcp.WithString("id", mcp.Required(), mcp.Description("Symbol ID to rename (e.g. auth/token.go::validateToken)")),
 			mcp.WithString("new_name", mcp.Required(), mcp.Description("New name for the symbol")),
 		),

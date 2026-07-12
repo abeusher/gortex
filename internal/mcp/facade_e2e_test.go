@@ -59,6 +59,44 @@ func TestFacadeProtocolReadAndGuardedEdit(t *testing.T) {
 		"an explicit uncompressed facade read must preserve function bodies")
 	require.NotContains(t, toolResultText(readResult), "lines elided")
 
+	var helperID string
+	for _, node := range srv.engineFor(ctx).FindSymbols("helper") {
+		if node != nil && node.Name == "helper" {
+			helperID = node.ID
+			break
+		}
+	}
+	require.NotEmpty(t, helperID, "fixture must index main.go::helper")
+	for i, operation := range []string{"source", "symbols"} {
+		t.Run("batch_"+operation+"_defaults_source", func(t *testing.T) {
+			result := call(10+i, "read", map[string]any{
+				"operation": operation,
+				"target":    map[string]any{"symbols": []string{helperID}},
+				"output":    map[string]any{"format": "json"},
+			})
+			require.False(t, result.IsError, toolResultText(result))
+			require.Contains(t, toolResultText(result), "func helper() {}")
+			require.NotNil(t, result.Meta)
+			facadeMeta, ok := result.Meta.AdditionalFields["gortex_facade"].(map[string]any)
+			require.True(t, ok)
+			require.Equal(t, "batch_symbols", facadeMeta["canonical_tool"])
+		})
+		t.Run("batch_"+operation+"_source_opt_out", func(t *testing.T) {
+			result := call(20+i, "read", map[string]any{
+				"operation": operation,
+				"target":    map[string]any{"symbols": []string{helperID}},
+				"options":   map[string]any{"include_source": false},
+				"output":    map[string]any{"format": "json"},
+			})
+			require.False(t, result.IsError, toolResultText(result))
+			require.NotContains(t, toolResultText(result), "func helper() {}")
+			require.NotNil(t, result.Meta)
+			facadeMeta, ok := result.Meta.AdditionalFields["gortex_facade"].(map[string]any)
+			require.True(t, ok)
+			require.Equal(t, "batch_symbols", facadeMeta["canonical_tool"])
+		})
+	}
+
 	path := filepath.Join(root, "main.go")
 	before, err := os.ReadFile(path)
 	require.NoError(t, err)

@@ -33,13 +33,18 @@ const exploreToolDescription = "Start here for any task, bug report, or " +
 // corpus, query vocabulary, or benchmark. The verb takes arbitrary free
 // text; nothing here is derived from a fixed task set.
 const (
-	exploreDefaultBudgetTokens = 9000
-	exploreMinBudgetTokens     = 2000
+	exploreDefaultBudgetTokens = 1600
+	exploreMinBudgetTokens     = 1000
 	exploreMaxBudgetTokens     = 24000
 	exploreDefaultMaxSymbols   = 10
 	exploreMaxMaxSymbols       = 30
 	exploreRingCap             = 5 // callers / callees shown per target
 	exploreCharsPerToken       = 4 // coarse token estimate for budgeting
+	// Full bodies are the largest repeated-context cost. Candidate headers,
+	// locations, signatures, and graph rings preserve recall for the whole
+	// neighborhood; only the top targets need full source to make the first
+	// response answer-ready.
+	exploreFullBodyLimit = 2
 	// exploreBodyBudgetShare caps any single full body at this fraction of
 	// the total budget, so one huge top-ranked symbol cannot starve the
 	// rest of the neighborhood of their bodies.
@@ -56,7 +61,7 @@ func (s *Server) registerExploreTool() {
 			mcp.WithDescription(exploreToolDescription),
 			mcp.WithString("task", mcp.Required(), mcp.Description("Natural-language description of the task, bug report, or question to localize (e.g. paste an issue body, or 'the retry backoff never triggers on a 429').")),
 			mcp.WithNumber("max_symbols", mcp.Description("Max ranked candidate symbols (default 10).")),
-			mcp.WithNumber("token_budget", mcp.Description("Response token ceiling (default 9000). Bodies pack until it fills, then demote to signatures; every candidate location is always listed.")),
+			mcp.WithNumber("token_budget", mcp.Description("Approximate source-packing budget in tokens (default 1600). Candidate locations and signatures are always listed and may exceed it; full source is reserved for the highest-ranked targets.")),
 			mcp.WithString("repo", mcp.Description("Filter results to a specific repository prefix")),
 			mcp.WithString("path", mcp.Description("Restrict the neighborhood to one or more sub-paths (comma-separated), anchored at the repo root — a monorepo-service slice.")),
 		),
@@ -72,6 +77,121 @@ type exploreTarget struct {
 	callers []*graph.Node
 	callees []*graph.Node
 	source  string // full body (may be empty for non-source kinds)
+}
+
+// exploreAnswerReady decides whether the ranked head is strong enough to end
+// localization. A result is terminal only when its symbols visibly align with
+// the shaped query; rank alone is not enough because broad review/audit prompts
+// can otherwise elevate common identifiers such as current, change, or client.
+func exploreAnswerReady(task string, targets []exploreTarget) bool {
+	if len(targets) == 0 || targets[0].node == nil {
+		return false
+	}
+	query := shapeExploreQuery(task)
+	class := rerank.ClassifyQuery(query)
+	if class == rerank.QueryClassConcept {
+		query = stripLeadingExploreDirective(query)
+	}
+	queryTerms := exploreTerminalTerms(query)
+	if len(queryTerms) == 0 {
+		return false
+	}
+
+	matched := func(target exploreTarget) int {
+		if target.node == nil {
+			return 0
+		}
+		n := target.node
+		text := n.Name + " " + n.QualName + " " + n.FilePath
+		if sig, _ := n.Meta["signature"].(string); sig != "" {
+			text += " " + sig
+		}
+		candidateTerms := exploreTerminalTerms(text)
+		count := 0
+		for term := range queryTerms {
+			if _, ok := candidateTerms[term]; ok {
+				count++
+			}
+		}
+		return count
+	}
+
+	headMatches := matched(targets[0])
+	union := make(map[string]struct{})
+	for i := 0; i < len(targets) && i < 3; i++ {
+		if targets[i].node == nil {
+			continue
+		}
+		n := targets[i].node
+		text := n.Name + " " + n.QualName + " " + n.FilePath
+		if sig, _ := n.Meta["signature"].(string); sig != "" {
+			text += " " + sig
+		}
+		for term := range exploreTerminalTerms(text) {
+			if _, relevant := queryTerms[term]; relevant {
+				union[term] = struct{}{}
+			}
+		}
+	}
+
+	// Paths, signatures, and identifier-shaped queries carry explicit anchors.
+	if class == rerank.QueryClassPath || class == rerank.QueryClassSymbol || class == rerank.QueryClassSignature {
+		return headMatches > 0
+	}
+	// Broad prompts need several independent anchors in the top result. This
+	// keeps a multi-area audit from becoming terminal merely because one generic
+	// word matched somewhere in the neighborhood.
+	if len(queryTerms) > 10 {
+		return headMatches >= 3 && len(union) >= 3
+	}
+	if len(queryTerms) == 1 {
+		return headMatches == 1
+	}
+	if headMatches >= 1 && len(union) >= 2 {
+		return true
+	}
+	// A sharply separated ranked head is useful supporting evidence, but only
+	// when it also has a visible lexical anchor to the request.
+	if headMatches > 0 && targets[0].score > 0 {
+		if len(targets) == 1 || targets[1].score <= 0 || targets[0].score/targets[1].score >= 1.5 {
+			return true
+		}
+	}
+	return false
+}
+
+var exploreTerminalGenericTerms = map[string]struct{}{
+	"audit": {}, "behavior": {}, "blocker": {}, "branch": {}, "change": {},
+	"check": {}, "code": {}, "correctness": {}, "current": {}, "file": {},
+	"find": {}, "fix": {}, "identify": {}, "implement": {}, "investigate": {},
+	"issue": {}, "problem": {}, "quality": {}, "release": {}, "review": {},
+	"source": {}, "symbol": {}, "task": {}, "validate": {},
+}
+
+func exploreTerminalTerms(text string) map[string]struct{} {
+	terms := make(map[string]struct{})
+	for _, raw := range rerank.Tokenize(text) {
+		term := strings.ToLower(strings.TrimSpace(raw))
+		if len(term) < 3 {
+			continue
+		}
+		if _, stop := assistStopWords[term]; stop {
+			continue
+		}
+		term = exploreTerminalTermRoot(term)
+		if _, generic := exploreTerminalGenericTerms[term]; generic {
+			continue
+		}
+		terms[term] = struct{}{}
+	}
+	return terms
+}
+
+func exploreTerminalTermRoot(term string) string {
+	if len(term) > 4 && strings.HasSuffix(term, "s") && !strings.HasSuffix(term, "ss") {
+		return strings.TrimSuffix(term, "s")
+	}
+	return term
 }
 
 // handleExplore is the one-shot localization verb: free text in, a ranked
@@ -110,6 +230,9 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	// sees what it asked.
 	searchQuery := shapeExploreQuery(task)
 	queryClass := rerank.ClassifyQuery(searchQuery)
+	if queryClass == rerank.QueryClassConcept {
+		searchQuery = stripLeadingExploreDirective(searchQuery)
+	}
 	rctx := s.buildRerankContext(ctx, searchQuery)
 	// Over-fetch, then keep the top maxSymbols that are real localization
 	// targets — params / locals / closures / imports are never a place a
@@ -163,14 +286,13 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 			prod = append(prod, c)
 		}
 	}
-	// Natural-language localization can retrieve a large cross-file collision
-	// set for a generic data-leaf name (for example, one `client` variable per
-	// package). BM25 legitimately ranks those short exact-name documents highly,
-	// but returning every collision crowds callable/type targets out of the
-	// neighborhood. Keep the best leaf for evidence and move only repeated
-	// same-name leaves behind other production definitions. Identifier/path
-	// lookups retain their literal ordering.
-	prod = demoteRepeatedExploreDataNames(prod, queryClass)
+	// Natural-language localization can retrieve large exact-name collision
+	// sets (`client` fields, `Validate` methods, generated accessors). BM25 is
+	// right that each item matches, but a useful neighborhood needs distinct
+	// concepts. Keep one data declaration and at most two callable/type members
+	// per repeated name, moving the remaining collisions behind distinct
+	// definitions. Identifier/path lookups retain literal ordering.
+	prod = diversifyRepeatedExploreNames(prod, queryClass)
 	// Bounded per-file diversification (the same demote-only mechanism the
 	// ranked search head uses): a localization neighborhood that spans
 	// files beats one file's cluster of sibling shims crowding out every
@@ -235,7 +357,13 @@ func (s *Server) renderExplore(task string, targets []exploreTarget, budget int)
 	}
 
 	fmt.Fprintf(&b, "EXPLORE — %s\n\n", truncateOneLine(task, 200))
-	b.WriteString("Ranked localization neighborhood (graph-verified). Likely targets first; each carries its call paths and source.\n\n")
+	answerReady := exploreAnswerReady(task, targets)
+	if answerReady {
+		b.WriteString("ANSWER-READY: return FILES / SYMBOLS / EVIDENCE from this ranked neighborhood now. Do not make another tool call when a plausible target is listed; if one decisive fact is missing, make at most one exact-id read, then answer.\n\n")
+	} else {
+		b.WriteString("REFINEMENT NEEDED: this broad or weakly aligned neighborhood is a starting point, not sufficient evidence for a final answer. Make exactly one focused refinement: rerun explore for one subsystem/symptom, or read one exact symbol ID below.\n\n")
+	}
+	b.WriteString("Ranked localization neighborhood (graph-verified). Likely targets first; all locations and signatures are retained, with full source for the highest-ranked targets.\n\n")
 	b.WriteString("## Likely targets (most-relevant first)\n")
 
 	used := estimateTokens(b.String())
@@ -256,15 +384,15 @@ func (s *Server) renderExplore(task string, targets []exploreTarget, budget int)
 		b.WriteString(head.String())
 		used += estimateTokens(head.String())
 
-		// Source body: full while the budget holds (rank decides order, the
-		// budget decides where full source stops; no single body may take
-		// more than 1/exploreBodyBudgetShare of the whole budget), signature
-		// stub otherwise. The header/locations above are always emitted so
+		// Source body: full for the highest-ranked targets while the budget
+		// holds (no single body may take more than 1/exploreBodyBudgetShare
+		// of the whole budget), signature stub otherwise. The header/locations
+		// above are always emitted so
 		// file-hit / symbol-hit never depend on budget.
 		body := ""
 		if t.source != "" {
 			cost := estimateTokens(t.source)
-			if used+cost <= budget && cost <= budget/exploreBodyBudgetShare {
+			if i < exploreFullBodyLimit && used+cost <= budget && cost <= budget/exploreBodyBudgetShare {
 				body = t.source
 			} else {
 				if sig, err := elide.CompressString(t.source, n.Language); err == nil && sig != "" {
@@ -289,15 +417,15 @@ func (s *Server) renderExplore(task string, targets []exploreTarget, budget int)
 		fmt.Fprintf(&b, "- %s  ·  %s\n", f, strings.Join(dedupStrings(files[f]), ", "))
 	}
 
-	fmt.Fprintf(&b, "\n— Completeness: %d candidate symbol(s) across %d file(s); callers/callees resolved server-side from the graph. This is the ranked neighborhood for the request — a location not listed here is not on the ranked path. Answer (FILES / SYMBOLS / EVIDENCE) or start editing directly from this; the paths and line numbers above are real and citeable.\n",
+	fmt.Fprintf(&b, "\n— Coverage: %d ranked candidate symbol(s) across %d file(s); callers/callees resolved server-side. Locations and IDs above are citeable.\n",
 		len(targets), len(fileOrder))
-	// Terminality affordance: the source for each listed symbol is already in
-	// this response. Re-opening these files with Read / Glob is the measured
-	// wasted-turn trap (the indexed-source deny-hook rejects it); any follow-up
-	// uses the public read facade and the exact `id:` shown above.
-	b.WriteString("  The source for each symbol is included above — do not re-open these files with Read/Glob; read more of one listed symbol with read(operation:\"source\", target:{symbol:\"<id>\"}), or several with read(operation:\"symbols\", target:{symbols:[\"<id>\", ...]}).\n")
+	if answerReady {
+		b.WriteString("NEXT ACTION (required): answer now with FILES / SYMBOLS / EVIDENCE. Do not continue exploring when a plausible target is present. If one decisive fact is absent, make at most one read(operation:\"source\", target:{symbol:\"<exact id above>\"}), then answer.\n")
+	} else {
+		b.WriteString("NEXT ACTION (required): make one focused refinement before answering — rerun explore for one subsystem/symptom or read one exact symbol ID above. Do not fan out into broad file or shell searches.\n")
+	}
 	if truncated {
-		fmt.Fprintf(&b, "  (Some bodies are elided under the %d-token budget; every candidate's location is still listed above — fetch elided bodies through read with the exact `id:` shown on each line.)\n", budget)
+		fmt.Fprintf(&b, "Some bodies are signature-only under the %d-token budget; every candidate location remains listed.\n", budget)
 	}
 	return b.String()
 }
@@ -343,19 +471,21 @@ func exploreCandidateFetchLimit(maxSymbols int, class rerank.QueryClass) int {
 	return clampInt(maxSymbols*factor, maxSymbols, 80)
 }
 
-// demoteRepeatedExploreDataNames performs bounded name diversification for
-// concept queries. It is stable within both groups and never drops a candidate.
-// Callable/type overloads are intentionally untouched: same-named methods on
-// different receivers are often the exact polymorphic family being localized.
-func demoteRepeatedExploreDataNames(cands []*rerank.Candidate, class rerank.QueryClass) []*rerank.Candidate {
+// diversifyRepeatedExploreNames performs stable, bounded name diversification
+// for concept queries. One data declaration and two callable/type definitions
+// per normalized name remain in the head; every overflow candidate is retained
+// behind distinct concepts. Keeping two callables preserves useful overload or
+// receiver families without letting a common method such as Validate consume
+// the whole neighborhood.
+func diversifyRepeatedExploreNames(cands []*rerank.Candidate, class rerank.QueryClass) []*rerank.Candidate {
 	if class != rerank.QueryClassConcept || len(cands) < 2 {
 		return cands
 	}
-	seen := make(map[string]struct{}, len(cands))
+	seen := make(map[string]int, len(cands))
 	duplicates := make([]*rerank.Candidate, 0)
 	head := cands[:0]
 	for _, cand := range cands {
-		if cand == nil || cand.Node == nil || !exploreDataDefinitionKind(cand.Node.Kind) {
+		if cand == nil || cand.Node == nil {
 			head = append(head, cand)
 			continue
 		}
@@ -364,11 +494,15 @@ func demoteRepeatedExploreDataNames(cands []*rerank.Candidate, class rerank.Quer
 			head = append(head, cand)
 			continue
 		}
-		if _, exists := seen[name]; exists {
+		limit := 2
+		if exploreDataDefinitionKind(cand.Node.Kind) {
+			limit = 1
+		}
+		if seen[name] >= limit {
 			duplicates = append(duplicates, cand)
 			continue
 		}
-		seen[name] = struct{}{}
+		seen[name]++
 		head = append(head, cand)
 	}
 	return append(head, duplicates...)
@@ -443,8 +577,57 @@ func fenceLang(lang string) string {
 	return lang
 }
 
-// Query-shaping tuning. Generic structural thresholds — no vocabulary, no
-// dependence on any corpus or task set.
+// stripLeadingExploreDirective removes generic agent-task verbs from the start
+// of a multi-word concept query. These verbs describe what the agent should do,
+// not the subsystem being localized; letting an exact symbol named Audit or
+// Validate own that token can otherwise dominate every domain term. Identifier
+// and short queries are left untouched by the caller/query-length guard.
+func stripLeadingExploreDirective(query string) string {
+	fields := strings.Fields(query)
+	if len(fields) < 4 {
+		return query
+	}
+	word := func(s string) string {
+		return strings.ToLower(strings.Trim(s, "\"'`.,;:()[]{}<>!?—-"))
+	}
+	fillers := map[string]struct{}{
+		"please": {}, "can": {}, "could": {}, "would": {}, "you": {}, "help": {}, "me": {}, "to": {},
+	}
+	directives := map[string]struct{}{
+		"audit": {}, "check": {}, "diagnose": {}, "explain": {}, "find": {}, "fix": {},
+		"implement": {}, "improve": {}, "investigate": {}, "review": {}, "trace": {},
+		"understand": {}, "update": {}, "validate": {},
+	}
+	i := 0
+	for i < len(fields) && i < 4 {
+		if _, ok := fillers[word(fields[i])]; !ok {
+			break
+		}
+		i++
+	}
+	if i >= len(fields) {
+		return query
+	}
+	if _, ok := directives[word(fields[i])]; !ok {
+		return query
+	}
+	i++
+	if i < len(fields) && (word(fields[i]) == "and" || word(fields[i]) == "then") {
+		i++
+		if i < len(fields) {
+			if _, ok := directives[word(fields[i])]; ok {
+				i++
+			}
+		}
+	}
+	if len(fields)-i < 2 {
+		return query
+	}
+	return strings.Join(fields[i:], " ")
+}
+
+// Query-shaping tuning. Generic structural thresholds — no corpus-specific
+// vocabulary or benchmark-derived terms.
 const (
 	// shapeMinReportChars is the size above which a multi-line task is
 	// treated as a pasted report worth distilling. Below it (or single-line)

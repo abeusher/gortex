@@ -350,10 +350,11 @@ func TestDispatcher_UnreachableCWD_StillRejected(t *testing.T) {
 // F4 contract: an MCP session opened in a cwd that no tracked repo covers must
 // still complete its handshake. initialize flows through and the response
 // carries the inactive-instructions variant (telling the agent to run `gortex
-// track <cwd>`); tools/list answers an empty track-only list; only tools/call
-// is refused with the structured repo_not_tracked error. This beats
-// codegraph's silent empty-list — the agent gets an actionable affordance, not
-// a dead connection.
+// track <cwd>`); tools/list preserves the stable facade so clients can discover
+// capabilities and the track operation before a graph exists. Graph-dependent
+// tools/call requests are still refused with the structured repo_not_tracked
+// error. This beats a silent empty-list — the agent gets an actionable
+// affordance, not a dead connection.
 func TestDispatcher_UntrackedHandshake_SurvivesWithInactiveVariant(t *testing.T) {
 	tracked := t.TempDir()
 	untracked := t.TempDir() // a sibling the dispatcher does not cover
@@ -388,18 +389,28 @@ func TestDispatcher_UntrackedHandshake_SurvivesWithInactiveVariant(t *testing.T)
 			"instructions must carry the cwd-specific track affordance")
 	})
 
-	t.Run("tools_list_returns_empty_track_only", func(t *testing.T) {
+	t.Run("tools_list_preserves_facade_surface", func(t *testing.T) {
 		parsed := dispatch(t, `{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`)
 
 		result, ok := parsed["result"].(map[string]any)
 		require.True(t, ok, "tools/list must return a result object: %v", parsed)
 		tools, ok := result["tools"].([]any)
 		require.True(t, ok, "tools/list result must carry a tools array")
-		assert.Empty(t, tools, "untracked tools/list must be an empty track-only list")
+		names := make(map[string]bool, len(tools))
+		for _, raw := range tools {
+			tool, ok := raw.(map[string]any)
+			require.True(t, ok, "tool entry must be an object: %v", raw)
+			name, _ := tool["name"].(string)
+			names[name] = true
+		}
+		assert.True(t, names["capabilities"], "bootstrap discovery must remain visible")
+		assert.True(t, names["workspace_admin"], "workspace_admin.track must remain discoverable")
+		assert.True(t, names["explore"], "the stable facade must not drift when the cwd is untracked")
+		assert.False(t, names["graph_stats"], "legacy tools must remain hidden")
 	})
 
 	t.Run("tools_call_still_refused", func(t *testing.T) {
-		parsed := dispatch(t, `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"graph_stats","arguments":{}}}`)
+		parsed := dispatch(t, `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"explore","arguments":{"task":"locate startup"}}}`)
 
 		errObj, ok := parsed["error"].(map[string]any)
 		require.True(t, ok, "untracked tools/call must still be refused: %v", parsed)

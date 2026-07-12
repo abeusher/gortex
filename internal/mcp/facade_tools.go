@@ -17,27 +17,27 @@ import (
 )
 
 var facadeDescriptions = map[string]string{
-	"explore":         "Localize a task and return the most relevant code neighborhood.",
-	"search":          "Search symbols, text, files, AST, or artifacts. Choose with operation.",
-	"read":            "Read a file, symbol, symbol batch, summary, history, or editing context.",
-	"relations":       "Query usages, callers, dependencies, implementations, or other symbol relations.",
-	"trace":           "Trace call chains, graph paths, data flow, taint, CFG, or an expert graph query.",
-	"analyze":         "Run deterministic graph analysis selected by kind.",
-	"ask":             "Ask the configured research agent an open-ended codebase question.",
-	"change":          "Assess a proposed or existing change without modifying source.",
-	"edit":            "Apply a guarded source or file mutation. This tool writes to disk.",
-	"refactor":        "Apply a semantic refactor such as rename, move, inline, delete, or code action.",
-	"review":          "Build or critique a read-only code review selected by operation.",
-	"publish_review":  "Publish a review to an external forge. This tool has external side effects.",
-	"pr":              "Inspect pull requests, risk, impact, reviewers, triage, or conflicts.",
-	"recall":          "Read session notes, durable memories, or repository notebooks.",
-	"remember":        "Persist notes, memories, notebook entries, or review suppressions.",
-	"workspace":       "Inspect repository, project, scope, index, graph, or proxy state.",
-	"workspace_admin": "Change repository, project, index, scope, workflow, or daemon control state.",
-	"session":         "Change volatile agent, planning, workflow, or proxy state for this session.",
-	"overlay":         "Change only the current session's speculative overlay state.",
-	"response":        "Inspect, slice, grep, or export a buffered Gortex response.",
-	"capabilities":    "List public tool operations or return the exact schema for one operation.",
+	"explore":         "Localize a task in indexed code.",
+	"search":          "Search indexed code and artifacts by operation.",
+	"read":            "Read files, symbols, or context by operation.",
+	"relations":       "Query symbol relationships by operation.",
+	"trace":           "Trace graph or data flow by operation.",
+	"analyze":         "Run graph analysis by kind.",
+	"ask":             "Ask the configured research agent.",
+	"change":          "Assess a proposed or existing change.",
+	"edit":            "Apply guarded source or file changes.",
+	"refactor":        "Apply a semantic refactor.",
+	"review":          "Build or critique a code review.",
+	"publish_review":  "Publish a review to a forge.",
+	"pr":              "Inspect pull requests.",
+	"recall":          "Read notes, memories, or notebooks.",
+	"remember":        "Persist notes, memories, or suppressions.",
+	"workspace":       "Inspect workspace and index state.",
+	"workspace_admin": "Change workspace or daemon state.",
+	"session":         "Change volatile session state.",
+	"overlay":         "Change speculative overlay state.",
+	"response":        "Inspect a buffered response.",
+	"capabilities":    "List operations or return an exact schema.",
 }
 
 func boolPointer(v bool) *bool { return &v }
@@ -85,15 +85,19 @@ func facadeTargetProperty() mcpgo.PropertyOption {
 }
 
 func facadeToolDefinition(name string) mcpgo.Tool {
+	return facadeToolDefinitionWithOperations(name, facadeCanonicalOperationNames(name))
+}
+
+func facadeToolDefinitionWithOperations(name string, operations []string) mcpgo.Tool {
 	desc := facadeDescriptions[name]
 	annotation := mcpgo.WithToolAnnotation(facadeAnnotation(name))
-	freeObject := func(field, description string) mcpgo.ToolOption {
-		return mcpgo.WithObject(field, mcpgo.Description(description), mcpgo.AdditionalProperties(true))
+	freeObject := func(field, _ string) mcpgo.ToolOption {
+		return mcpgo.WithObject(field, mcpgo.AdditionalProperties(true))
 	}
-	operation := mcpgo.WithString("operation", mcpgo.Description("Operation; omit for a selector default."))
-	options := freeObject("options", "Operation-specific options validated by Gortex.")
-	output := freeObject("output", "Response shaping.")
-	target := mcpgo.WithObject("target", mcpgo.Description("Exactly one primary target selector."), facadeTargetProperty(), mcpgo.AdditionalProperties(false))
+	operation := mcpgo.WithString("operation")
+	options := freeObject("options", "")
+	output := freeObject("output", "")
+	target := mcpgo.WithObject("target", facadeTargetProperty(), mcpgo.AdditionalProperties(false))
 
 	var opts []mcpgo.ToolOption
 	switch name {
@@ -161,7 +165,55 @@ func facadeToolDefinition(name string) mcpgo.Tool {
 	// already include output above; reapplying the same property is idempotent.
 	opts = append(opts, output)
 	opts = append([]mcpgo.ToolOption{mcpgo.WithDescription(desc), annotation}, opts...)
-	return mcpgo.NewTool(name, opts...)
+	tool := mcpgo.NewTool(name, opts...)
+	discriminator := "operation"
+	if name == "analyze" {
+		discriminator = "kind"
+	}
+	if property, ok := tool.InputSchema.Properties[discriminator].(map[string]any); ok && len(operations) > 0 {
+		property["enum"] = append([]string(nil), operations...)
+	}
+	return tool
+}
+
+func facadeCanonicalOperationNames(name string) []string {
+	seen := make(map[string]bool)
+	for _, spec := range facadeOperationSpecs() {
+		if spec.Facade == name && !spec.Hidden {
+			seen[spec.Operation] = true
+		}
+	}
+	if name == "analyze" {
+		for _, kind := range AnalyzeKinds() {
+			if !analyzeKindRequiresAdmin(kind) {
+				seen[kind] = true
+			}
+		}
+	}
+	if name == "session" {
+		for operation := range seen {
+			if strings.HasPrefix(operation, "subscribe_") || strings.HasPrefix(operation, "unsubscribe_") {
+				delete(seen, operation)
+			}
+		}
+		seen["subscribe"] = true
+		seen["unsubscribe"] = true
+	}
+	operations := make([]string, 0, len(seen))
+	for operation := range seen {
+		operations = append(operations, operation)
+	}
+	sort.Strings(operations)
+	return operations
+}
+
+func (s *Server) facadeToolDefinition(name string) mcpgo.Tool {
+	specs := s.capabilityOperations(name)
+	operations := make([]string, 0, len(specs))
+	for _, spec := range specs {
+		operations = append(operations, spec.Operation)
+	}
+	return facadeToolDefinitionWithOperations(name, operations)
 }
 
 // registerFacadeTools installs every facade name directly into the live MCP
@@ -174,7 +226,7 @@ func (s *Server) registerFacadeTools() {
 			continue // explore/analyze/review (and ask when configured)
 		}
 		facade := name
-		tool := facadeToolDefinition(facade)
+		tool := s.facadeToolDefinition(facade)
 		var handler server.ToolHandlerFunc
 		if facade == "capabilities" {
 			handler = s.handleCapabilities
@@ -246,6 +298,9 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 	if operation == "" {
 		operation = defaultFacadeOperation(facade)
 	}
+	if facade == "read" {
+		operation = normalizeFacadeReadOperation(operation, req.GetArguments())
+	}
 	var spec facadeOperationSpec
 	var ok bool
 	if facade == "analyze" {
@@ -299,6 +354,33 @@ func inferFacadeOperation(facade string, input map[string]any) string {
 		}
 	}
 	return ""
+}
+
+// normalizeFacadeReadOperation makes the selector cardinality authoritative.
+// This accepts harmless migration aliases without forwarding an impossible
+// request to a single-symbol or batch legacy handler.
+func normalizeFacadeReadOperation(operation string, input map[string]any) string {
+	target, _ := input["target"].(map[string]any)
+	hasFile := facadeSelectorPresent(target["file"])
+	hasSymbol := facadeSelectorPresent(target["symbol"])
+	hasSymbols := facadeSelectorPresent(target["symbols"])
+	switch operation {
+	case "source":
+		if hasSymbols {
+			return "symbols"
+		}
+		if hasFile && !hasSymbol {
+			return "file"
+		}
+	case "symbols":
+		if hasSymbol && !hasSymbols {
+			return "source"
+		}
+		if hasFile && !hasSymbols {
+			return "file"
+		}
+	}
+	return operation
 }
 
 var facadeSessionChannels = []string{
@@ -373,6 +455,34 @@ func (s *Server) invokeFacadeSpec(ctx context.Context, req mcpgo.CallToolRequest
 		return invalid, nil
 	}
 	normalized := normalizeFacadeArguments(spec, req.GetArguments())
+	if spec.Facade == "read" && (spec.Operation == "source" || spec.Operation == "symbols") {
+		ids := []string{strings.TrimSpace(fmt.Sprint(normalized["id"]))}
+		field := "id"
+		if spec.Operation == "symbols" {
+			ids = strings.Split(fmt.Sprint(normalized["ids"]), ",")
+			field = "ids"
+		}
+		resolved := make([]string, 0, len(ids))
+		for _, id := range ids {
+			id = strings.TrimSpace(id)
+			if id == "" {
+				continue
+			}
+			canonical, ambiguous := s.resolveFacadeSymbolShorthand(ctx, id)
+			if len(ambiguous) > 0 {
+				outcome = facadeOutcomeInvalidArgument
+				return NewStructuredErrorResult(StructuredError{
+					ErrorCode: ErrCodeInvalidArgument,
+					Message:   fmt.Sprintf("symbol shorthand %q is ambiguous", id),
+					Data:      map[string]any{"symbol": id, "candidates": ambiguous},
+				}), nil
+			}
+			resolved = append(resolved, canonical)
+		}
+		if len(resolved) > 0 {
+			normalized[field] = strings.Join(resolved, ",")
+		}
+	}
 	if spec.Facade == "analyze" && analyzeKindRequiresAdmin(normalizeFacadeOperation(fmt.Sprint(normalized["kind"]))) {
 		kind := normalizeFacadeOperation(fmt.Sprint(normalized["kind"]))
 		outcome = facadeOutcomeBlocked
@@ -411,6 +521,41 @@ func (s *Server) invokeFacadeSpec(ctx context.Context, req mcpgo.CallToolRequest
 		}
 	}
 	return result, err
+}
+
+func (s *Server) resolveFacadeSymbolShorthand(ctx context.Context, id string) (string, []string) {
+	resolved := s.resolveSymbolID(ctx, id)
+	if s.graph == nil || s.graph.GetNode(resolved) != nil || strings.Contains(id, "::") {
+		return resolved, nil
+	}
+	eng := s.engineFor(ctx)
+	if eng == nil {
+		return resolved, nil
+	}
+	seen := make(map[string]bool)
+	candidates := make([]string, 0, 2)
+	for _, node := range eng.FindSymbols(id) {
+		if node == nil || seen[node.ID] || !s.nodeInSessionScope(ctx, node) {
+			continue
+		}
+		storedName := node.Name
+		if parts := strings.SplitN(node.ID, "::", 2); len(parts) == 2 && parts[1] == id {
+			storedName = id
+		}
+		if storedName != id {
+			continue
+		}
+		seen[node.ID] = true
+		candidates = append(candidates, node.ID)
+	}
+	sort.Strings(candidates)
+	if len(candidates) == 1 {
+		return candidates[0], nil
+	}
+	if len(candidates) > 1 {
+		return id, candidates
+	}
+	return resolved, nil
 }
 
 // requestedAnalyzeKind applies the same argument-container precedence as the
@@ -642,7 +787,13 @@ func (s *Server) facadeTelemetryIdentity(facade, operation string) (string, stri
 	if operation == "unknown" {
 		return facade, operation
 	}
-	if _, ok := s.capabilityOperation(facade, operation); ok {
+	if _, ok := s.facades.operation(facade, operation); ok {
+		return facade, operation
+	}
+	if facade == "analyze" && AnalyzeKindDescription(operation) != "" {
+		return facade, operation
+	}
+	if facade == "session" && (operation == "subscribe" || operation == "unsubscribe") {
 		return facade, operation
 	}
 	// Admin-only analyze kinds are rejected before capability dispatch, but
@@ -773,6 +924,12 @@ func normalizeFacadeAliases(spec facadeOperationSpec, input, out map[string]any)
 		delete(out, "range")
 	}
 	switch spec.Facade + "." + spec.Operation {
+	case "read.file":
+		normalizeFacadeReadWindow(out)
+	case "read.symbols":
+		if _, explicit := out["include_source"]; !explicit {
+			out["include_source"] = true
+		}
 	case "search.ast":
 		alias("query", "pattern")
 	case "search.winnow":
@@ -849,6 +1006,50 @@ func normalizeFacadeAliases(spec facadeOperationSpec, input, out map[string]any)
 			out["sink_pattern"] = sink
 		}
 		delete(out, "id")
+	}
+}
+
+func normalizeFacadeReadWindow(out map[string]any) {
+	if window, ok := out["window"].(map[string]any); ok {
+		for _, key := range []string{"offset", "limit", "line"} {
+			if _, exists := out[key]; !exists {
+				if value, present := window[key]; present {
+					out[key] = value
+				}
+			}
+		}
+	}
+	delete(out, "window")
+	if line, ok := facadePositiveInt(out["line"]); ok {
+		if _, exists := out["offset"]; !exists {
+			out["offset"] = line
+		}
+		if _, exists := out["limit"]; !exists {
+			out["limit"] = 1
+		}
+	}
+	delete(out, "line")
+}
+
+func facadePositiveInt(value any) (int, bool) {
+	switch value := value.(type) {
+	case int:
+		return value, value > 0
+	case int32:
+		return int(value), value > 0
+	case int64:
+		return int(value), value > 0
+	case float32:
+		integer := int(value)
+		return integer, value > 0 && float32(integer) == value
+	case float64:
+		integer := int(value)
+		return integer, value > 0 && float64(integer) == value
+	case json.Number:
+		integer, err := value.Int64()
+		return int(integer), err == nil && integer > 0
+	default:
+		return 0, false
 	}
 }
 
@@ -984,28 +1185,34 @@ func (s *Server) capabilityOperation(domain, operation string) (facadeOperationS
 	if domain == "session" {
 		switch operation {
 		case "subscribe":
-			return facadeOperationSpec{Facade: "session", Operation: operation, Legacy: "subscribe_diagnostics", Effect: facadeEffectSessionWrite}, true
+			_, available := s.facades.legacy("subscribe_diagnostics")
+			return facadeOperationSpec{Facade: "session", Operation: operation, Legacy: "subscribe_diagnostics", Effect: facadeEffectSessionWrite}, available
 		case "unsubscribe":
-			return facadeOperationSpec{Facade: "session", Operation: operation, Legacy: "unsubscribe_diagnostics", Effect: facadeEffectSessionWrite}, true
+			_, available := s.facades.legacy("unsubscribe_diagnostics")
+			return facadeOperationSpec{Facade: "session", Operation: operation, Legacy: "unsubscribe_diagnostics", Effect: facadeEffectSessionWrite}, available
 		}
 		if strings.HasPrefix(operation, "subscribe_") || strings.HasPrefix(operation, "unsubscribe_") {
 			return facadeOperationSpec{}, false
 		}
 	}
 	if spec, ok := s.facades.operation(domain, operation); ok {
-		return spec, true
+		if _, available := s.facades.legacy(spec.Legacy); available {
+			return spec, true
+		}
 	}
 	if domain == "analyze" && !analyzeKindRequiresAdmin(operation) && AnalyzeKindDescription(operation) != "" {
-		return facadeOperationSpec{
-			Facade: "analyze", Operation: operation, Legacy: "analyze", Effect: facadeEffectRead,
-			Fixed: publicAnalyzeFixedArguments(operation),
-		}, true
+		if _, available := s.facades.legacy("analyze"); available {
+			return facadeOperationSpec{
+				Facade: "analyze", Operation: operation, Legacy: "analyze", Effect: facadeEffectRead,
+				Fixed: publicAnalyzeFixedArguments(operation),
+			}, true
+		}
 	}
 	return facadeOperationSpec{}, false
 }
 
 func (s *Server) capabilityOperations(domain string) []facadeOperationSpec {
-	ops := s.facades.operations(domain)
+	ops := s.facades.availableOperations(domain)
 	if domain == "session" {
 		public := make([]facadeOperationSpec, 0, len(ops)+2)
 		for _, spec := range ops {
@@ -1077,6 +1284,13 @@ func (s *Server) facadeCapability(spec facadeOperationSpec, includeSchema bool) 
 		if includeSchema {
 			inputSchema := any(legacy.tool.InputSchema)
 			properties := legacy.tool.InputSchema.Properties
+			if spec.Facade == "read" && spec.Operation == "symbols" {
+				properties = cloneFacadeSchemaMap(properties)
+				if includeSource, ok := properties["include_source"].(map[string]any); ok {
+					includeSource["default"] = true
+					includeSource["description"] = "Include source code for each symbol (default: true; pass false for metadata only)."
+				}
+			}
 			required := legacy.tool.InputSchema.Required
 			if spec.Facade == "analyze" || (spec.Facade == "workspace_admin" && spec.Legacy == "analyze") {
 				inputSchema, properties, required = analyzeFacadeCapabilitySchema(spec, properties, required)
@@ -1095,6 +1309,24 @@ func (s *Server) facadeCapability(spec facadeOperationSpec, includeSchema bool) 
 			requestShape := facadeRequestShape(spec, properties, required)
 			if spec.Facade != "analyze" && spec.Facade != "session" && (spec.Facade != "workspace_admin" || spec.Legacy != "analyze") {
 				inputSchema = facadePublicCapabilitySchema(spec, properties, required, requestShape)
+			}
+			if spec.Facade == "read" && spec.Operation == "symbols" {
+				if schema, ok := inputSchema.(map[string]any); ok {
+					schemaProperties, _ := schema["properties"].(map[string]any)
+					options, _ := schemaProperties["options"].(map[string]any)
+					optionProperties, _ := options["properties"].(map[string]any)
+					if optionProperties == nil {
+						optionProperties = make(map[string]any)
+						options["properties"] = optionProperties
+					}
+					includeSource, _ := optionProperties["include_source"].(map[string]any)
+					if includeSource == nil {
+						includeSource = map[string]any{"type": "boolean"}
+						optionProperties["include_source"] = includeSource
+					}
+					includeSource["default"] = true
+					includeSource["description"] = "Include source code for each symbol (default: true; pass false for metadata only)."
+				}
 			}
 			out["input_schema"] = inputSchema
 			out["request_shape"] = requestShape
@@ -1491,7 +1723,7 @@ func (s *Server) applyFacadeSurface(ctx context.Context, tools []mcpgo.Tool) []m
 	byName := make(map[string]mcpgo.Tool, len(facadeToolNames()))
 	for _, tool := range tools {
 		if isFacadeToolName(tool.Name) {
-			byName[tool.Name] = facadeToolDefinition(tool.Name)
+			byName[tool.Name] = s.facadeToolDefinition(tool.Name)
 		}
 	}
 	out := make([]mcpgo.Tool, 0, len(facadeToolNames()))
