@@ -79,6 +79,183 @@ type exploreTarget struct {
 	source  string // full body (may be empty for non-source kinds)
 }
 
+const (
+	exploreDraftPrimaryLimit = 3
+	exploreDraftTotalLimit   = 5
+)
+
+type exploreDraftEntry struct {
+	node       *graph.Node
+	evidence   string
+	exact      bool
+	overlap    int
+	direct     bool
+	parentRank int
+}
+
+// exploreAnswerDraft puts a small, ready-to-use evidence set before the full
+// neighborhood. The ranked head always leads; the remaining slots promote
+// query-aligned deeper targets or graph neighbors without hiding any detailed
+// candidate below.
+func exploreAnswerDraft(task string, targets []exploreTarget) []exploreDraftEntry {
+	entries := make([]exploreDraftEntry, 0, exploreDraftTotalLimit)
+	seen := make(map[string]struct{}, exploreDraftTotalLimit)
+	appendEntry := func(entry exploreDraftEntry) bool {
+		if entry.node == nil {
+			return false
+		}
+		key := exploreDraftNodeKey(entry.node)
+		if _, ok := seen[key]; ok {
+			return false
+		}
+		seen[key] = struct{}{}
+		entries = append(entries, entry)
+		return true
+	}
+
+	for i := 0; i < len(targets) && i < exploreDraftPrimaryLimit; i++ {
+		if targets[i].node != nil {
+			appendEntry(exploreDraftEntry{
+				node:       targets[i].node,
+				evidence:   fmt.Sprintf("ranked #%d", i+1),
+				direct:     true,
+				parentRank: i,
+			})
+		}
+	}
+
+	query := shapeExploreQuery(task)
+	if rerank.ClassifyQuery(query) == rerank.QueryClassConcept {
+		query = stripLeadingExploreDirective(query)
+	}
+	queryTerms := exploreTerminalTerms(query)
+	var aligned []exploreDraftEntry
+	consider := func(n *graph.Node, evidence string, direct bool, parentRank int) {
+		if n == nil {
+			return
+		}
+		overlap, longest := exploreDraftTermOverlap(queryTerms, n)
+		exact := exploreDraftExactAnchor(query, n)
+		// One long discriminative term is useful for graph neighbors; short
+		// generic collisions need either an exact anchor or two query terms.
+		if !exact && overlap < 2 && !(overlap == 1 && longest >= 5) {
+			return
+		}
+		aligned = append(aligned, exploreDraftEntry{
+			node:       n,
+			evidence:   evidence,
+			exact:      exact,
+			overlap:    overlap,
+			direct:     direct,
+			parentRank: parentRank,
+		})
+	}
+	for i, target := range targets {
+		if i >= exploreDraftPrimaryLimit {
+			consider(target.node, fmt.Sprintf("ranked #%d", i+1), true, i)
+		}
+		for _, n := range target.callers {
+			consider(n, fmt.Sprintf("caller of ranked #%d", i+1), false, i)
+		}
+		for _, n := range target.callees {
+			consider(n, fmt.Sprintf("callee of ranked #%d", i+1), false, i)
+		}
+	}
+	sort.SliceStable(aligned, func(i, j int) bool {
+		a, b := aligned[i], aligned[j]
+		if a.exact != b.exact {
+			return a.exact
+		}
+		if a.overlap != b.overlap {
+			return a.overlap > b.overlap
+		}
+		if a.direct != b.direct {
+			return a.direct
+		}
+		if a.parentRank != b.parentRank {
+			return a.parentRank < b.parentRank
+		}
+		return exploreDraftNodeKey(a.node) < exploreDraftNodeKey(b.node)
+	})
+	for _, entry := range aligned {
+		if len(entries) >= exploreDraftTotalLimit {
+			break
+		}
+		appendEntry(entry)
+	}
+	// Weakly aligned neighborhoods still provide a compact best-supported
+	// answer: fill unused slots from the original ranking, never by broadening
+	// retrieval or inventing another search step.
+	for i := exploreDraftPrimaryLimit; i < len(targets) && len(entries) < exploreDraftTotalLimit; i++ {
+		appendEntry(exploreDraftEntry{
+			node:       targets[i].node,
+			evidence:   fmt.Sprintf("ranked #%d", i+1),
+			direct:     true,
+			parentRank: i,
+		})
+	}
+	return entries
+}
+
+func exploreDraftTermOverlap(queryTerms map[string]struct{}, n *graph.Node) (count, longest int) {
+	if n == nil || len(queryTerms) == 0 {
+		return 0, 0
+	}
+	text := n.Name + " " + n.QualName + " " + nodeDisplayPath(n)
+	if sig, _ := n.Meta["signature"].(string); sig != "" {
+		text += " " + sig
+	}
+	for term := range exploreTerminalTerms(text) {
+		if _, ok := queryTerms[term]; !ok {
+			continue
+		}
+		count++
+		if len(term) > longest {
+			longest = len(term)
+		}
+	}
+	return count, longest
+}
+
+func exploreDraftExactAnchor(query string, n *graph.Node) bool {
+	if n == nil {
+		return false
+	}
+	normalize := func(text string) string {
+		return strings.ToLower(strings.Join(rerank.Tokenize(text), " "))
+	}
+	query = " " + normalize(query) + " "
+	for _, anchor := range []string{n.Name, n.QualName} {
+		anchor = normalize(anchor)
+		if len(anchor) >= 3 && strings.Contains(query, " "+anchor+" ") {
+			return true
+		}
+	}
+	path := nodeDisplayPath(n)
+	if slash := strings.LastIndex(path, "/"); slash >= 0 {
+		path = path[slash+1:]
+	}
+	path = normalize(path)
+	return len(path) >= 3 && strings.Contains(query, " "+path+" ")
+}
+
+func exploreDraftNodeKey(n *graph.Node) string {
+	if n == nil {
+		return ""
+	}
+	if n.ID != "" {
+		return n.ID
+	}
+	return fmt.Sprintf("%s|%s|%s|%d", nodeDisplayPath(n), n.Kind, n.Name, n.StartLine)
+}
+
+func exploreDraftSymbol(n *graph.Node) string {
+	if n.QualName != "" {
+		return n.QualName
+	}
+	return n.Name
+}
+
 // exploreAnswerReady decides whether the ranked head is strong enough to end
 // localization. A result is terminal only when its symbols visibly align with
 // the shaped query; rank alone is not enough because broad review/audit prompts
@@ -359,12 +536,17 @@ func (s *Server) renderExplore(task string, targets []exploreTarget, budget int)
 	fmt.Fprintf(&b, "EXPLORE — %s\n\n", truncateOneLine(task, 200))
 	answerReady := exploreAnswerReady(task, targets)
 	if answerReady {
-		b.WriteString("ANSWER-READY: return FILES / SYMBOLS / EVIDENCE from this ranked neighborhood now. Do not make another tool call when a plausible target is listed; if one decisive fact is missing, make at most one exact-id read, then answer.\n\n")
+		b.WriteString("LOCALIZATION COMPLETE: use the strongest supported rows below now. For a location or explanation request, answer. For a requested change, proceed directly to impact, edit, and test. Do not make another localization, search, or read call.\n\n")
 	} else {
-		b.WriteString("REFINEMENT NEEDED: this broad or weakly aligned neighborhood is a starting point, not sufficient evidence for a final answer. Make exactly one focused refinement: rerun explore for one subsystem/symptom, or read one exact symbol ID below.\n\n")
+		b.WriteString("BEST-SUPPORTED LOCALIZATION: use the evidence below with stated uncertainty. If one decisive target is absent, make at most one focused exact-ID read or exact literal/path/symbol search, then stop localization. Do not fan out or rerun broad exploration.\n\n")
 	}
-	b.WriteString("Ranked localization neighborhood (graph-verified). Likely targets first; all locations and signatures are retained, with full source for the highest-ranked targets.\n\n")
-	b.WriteString("## Likely targets (most-relevant first)\n")
+	b.WriteString("## Answer draft\n")
+	for _, entry := range exploreAnswerDraft(task, targets) {
+		fmt.Fprintf(&b, "- FILE: %s  ·  SYMBOL: %s  ·  EVIDENCE: %s\n",
+			nodeLoc(entry.node), exploreDraftSymbol(entry.node), entry.evidence)
+	}
+	b.WriteString("\n## Likely targets (most-relevant first)\n")
+	b.WriteString("Graph-verified details follow; all candidate locations and signatures are retained, with full source for the highest-ranked targets.\n")
 
 	used := estimateTokens(b.String())
 	truncated := false
@@ -412,18 +594,14 @@ func (s *Server) renderExplore(task string, targets []exploreTarget, budget int)
 		}
 	}
 
-	b.WriteString("\n## Files to change\n")
+	b.WriteString("\n## Candidate files\n")
 	for _, f := range fileOrder {
 		fmt.Fprintf(&b, "- %s  ·  %s\n", f, strings.Join(dedupStrings(files[f]), ", "))
 	}
 
 	fmt.Fprintf(&b, "\n— Coverage: %d ranked candidate symbol(s) across %d file(s); callers/callees resolved server-side. Locations and IDs above are citeable.\n",
 		len(targets), len(fileOrder))
-	if answerReady {
-		b.WriteString("NEXT ACTION (required): answer now with FILES / SYMBOLS / EVIDENCE. Do not continue exploring when a plausible target is present. If one decisive fact is absent, make at most one read(operation:\"source\", target:{symbol:\"<exact id above>\"}), then answer.\n")
-	} else {
-		b.WriteString("NEXT ACTION (required): make one focused refinement before answering — rerun explore for one subsystem/symptom or read one exact symbol ID above. Do not fan out into broad file or shell searches.\n")
-	}
+	b.WriteString("END OF LOCALIZATION — answer from this evidence or proceed with the requested change; do not continue searching.\n")
 	if truncated {
 		fmt.Fprintf(&b, "Some bodies are signature-only under the %d-token budget; every candidate location remains listed.\n", budget)
 	}
