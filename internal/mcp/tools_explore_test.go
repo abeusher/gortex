@@ -121,7 +121,7 @@ func TestExploreHelpers(t *testing.T) {
 func TestFacadeExploreDemotesRepeatedDataLeafNames(t *testing.T) {
 	g := graph.New()
 	bm := search.NewBM25()
-	for i := 0; i < 12; i++ {
+	for i := 0; i < 30; i++ {
 		id := fmt.Sprintf("pkg/service%d.go::client", i)
 		n := &graph.Node{
 			ID: id, Name: "client", Kind: graph.KindVariable,
@@ -130,17 +130,6 @@ func TestFacadeExploreDemotesRepeatedDataLeafNames(t *testing.T) {
 		}
 		g.AddNode(n)
 		bm.Add(id, n.Name, n.FilePath, "trace client coordinated transport")
-
-		// Common prose-only matches make `trace` non-discriminative in
-		// the lexical corpus. They are deliberately non-localizable and
-		// filtered by explore after retrieval.
-		traceID := fmt.Sprintf("pkg/service%d.go::traceMarker", i)
-		trace := &graph.Node{
-			ID: traceID, Name: "traceMarker", Kind: graph.KindParam,
-			FilePath: fmt.Sprintf("pkg/service%d.go", i), Language: "go",
-		}
-		g.AddNode(trace)
-		bm.Add(traceID, trace.Name, trace.FilePath, "trace")
 	}
 	relevant := &graph.Node{
 		ID: "pkg/coordinator.go::TransportCoordinator", Name: "TransportCoordinator",
@@ -148,26 +137,45 @@ func TestFacadeExploreDemotesRepeatedDataLeafNames(t *testing.T) {
 		Meta: map[string]any{"signature": "func TransportCoordinator()"},
 	}
 	g.AddNode(relevant)
-	bm.Add(relevant.ID, relevant.Name, relevant.FilePath, "coordinated")
+	// It matches the whole task, but its longer prose and non-literal symbol
+	// name rank below the short exact-name `client` declarations. The concept
+	// over-fetch window must retain it so name diversification can promote it.
+	relevantText := strings.Repeat("architecture routing plumbing lifecycle ", 40) + "trace client coordinated transport coordinator"
+	bm.Add(relevant.ID, relevant.Name, relevant.FilePath, relevantText)
 
 	eng := query.NewEngine(g)
 	eng.SetSearch(bm)
 	srv := NewServer(eng, g, nil, nil, zap.NewNop(), nil)
 	task := "trace how the client is coordinated"
 	searchQuery := shapeExploreQuery(task)
-	raw := eng.SearchSymbolsRanked(searchQuery, 24, query.QueryOptions{}, srv.buildRerankContext(context.Background(), searchQuery))
+	const maxSymbols = 6
+	queryClass := rerank.ClassifyQuery(searchQuery)
+	raw := eng.SearchSymbolsRanked(searchQuery, exploreCandidateFetchLimit(maxSymbols, queryClass), query.QueryOptions{}, srv.buildRerankContext(context.Background(), searchQuery))
 	rawHead := make([]string, 0, 6)
+	relevantRetrieved := false
 	for _, candidate := range raw {
+		if candidate != nil && candidate.Node != nil && candidate.Node.ID == relevant.ID {
+			relevantRetrieved = true
+		}
+		if len(rawHead) == 6 {
+			continue
+		}
 		if candidate == nil || candidate.Node == nil || !exploreLocalizableKind(candidate.Node.Kind) || !exploreCodeDefinitionKind(candidate.Node.Kind) {
 			continue
 		}
 		rawHead = append(rawHead, candidate.Node.ID)
-		if len(rawHead) == 6 {
-			break
-		}
 	}
 	if len(rawHead) != 6 {
 		t.Fatalf("fixture produced only %d raw localization candidates: %v", len(rawHead), rawHead)
+	}
+	if !relevantRetrieved {
+		rawIDs := make([]string, 0, len(raw))
+		for _, candidate := range raw {
+			if candidate != nil && candidate.Node != nil {
+				rawIDs = append(rawIDs, candidate.Node.ID)
+			}
+		}
+		t.Fatalf("fixture's relevant callable fell outside the concept-query over-fetch window: query=%q raw=%v", searchQuery, rawIDs)
 	}
 	for _, id := range rawHead {
 		if id == relevant.ID {
@@ -177,7 +185,7 @@ func TestFacadeExploreDemotesRepeatedDataLeafNames(t *testing.T) {
 	req := mcpgo.CallToolRequest{}
 	// Omit operation deliberately: the facade default must route to task.
 	req.Params.Arguments = map[string]any{
-		"task": task, "options": map[string]any{"max_symbols": 6},
+		"task": task, "options": map[string]any{"max_symbols": maxSymbols},
 	}
 	result, err := srv.handleFacade(context.Background(), "explore", req)
 	if err != nil {
@@ -220,5 +228,11 @@ func TestDemoteRepeatedExploreDataNamesIsConceptOnlyAndStable(t *testing.T) {
 	symbol := demoteRepeatedExploreDataNames([]*rerank.Candidate{leaf1, leaf2, callable}, rerank.QueryClassSymbol)
 	if symbol[0] != leaf1 || symbol[1] != leaf2 || symbol[2] != callable {
 		t.Fatalf("identifier lookup order changed: %#v", symbol)
+	}
+	if got := exploreCandidateFetchLimit(6, rerank.QueryClassConcept); got != 48 {
+		t.Fatalf("concept fetch limit=%d want 48", got)
+	}
+	if got := exploreCandidateFetchLimit(6, rerank.QueryClassSymbol); got != 24 {
+		t.Fatalf("symbol fetch limit=%d want 24", got)
 	}
 }

@@ -109,6 +109,7 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	// untouched. The original task is still shown in the header so the agent
 	// sees what it asked.
 	searchQuery := shapeExploreQuery(task)
+	queryClass := rerank.ClassifyQuery(searchQuery)
 	rctx := s.buildRerankContext(ctx, searchQuery)
 	// Over-fetch, then keep the top maxSymbols that are real localization
 	// targets — params / locals / closures / imports are never a place a
@@ -116,7 +117,7 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	// slots and clutter the file map. Test-source symbols are demoted, not
 	// dropped: production code is where a report is resolved, but a task
 	// genuinely about tests still gets them when production hits run out.
-	fetch := clampInt(maxSymbols*4, maxSymbols, 80)
+	fetch := exploreCandidateFetchLimit(maxSymbols, queryClass)
 	ranked := eng.SearchSymbolsRanked(searchQuery, fetch, opts, rctx)
 	// Resilience ladder: a warm-restarted daemon can transiently return an
 	// empty scoped ranked result (workspace stamps not yet backfilled, or
@@ -169,7 +170,7 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	// neighborhood. Keep the best leaf for evidence and move only repeated
 	// same-name leaves behind other production definitions. Identifier/path
 	// lookups retain their literal ordering.
-	prod = demoteRepeatedExploreDataNames(prod, rerank.ClassifyQuery(searchQuery))
+	prod = demoteRepeatedExploreDataNames(prod, queryClass)
 	// Bounded per-file diversification (the same demote-only mechanism the
 	// ranked search head uses): a localization neighborhood that spans
 	// files beats one file's cluster of sibling shims crowding out every
@@ -328,6 +329,18 @@ func exploreDataDefinitionKind(k graph.NodeKind) bool {
 	default:
 		return false
 	}
+}
+
+// exploreCandidateFetchLimit leaves enough headroom for concept localization
+// to survive generic exact-name collisions and non-localizable graph nodes
+// before filtering and diversification. Literal identifier/path queries keep
+// the tighter historical window because their exact ordering is the intent.
+func exploreCandidateFetchLimit(maxSymbols int, class rerank.QueryClass) int {
+	factor := 4
+	if class == rerank.QueryClassConcept {
+		factor = 8
+	}
+	return clampInt(maxSymbols*factor, maxSymbols, 80)
 }
 
 // demoteRepeatedExploreDataNames performs bounded name diversification for
