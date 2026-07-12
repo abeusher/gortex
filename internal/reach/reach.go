@@ -13,6 +13,7 @@ package reach
 import (
 	"context"
 	"sort"
+	"sync"
 	"sync/atomic"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -42,14 +43,33 @@ const (
 	MetaReachD1Label = "reach_d1_label"
 	MetaReachD2Label = "reach_d2_label"
 	MetaReachD3Label = "reach_d3_label"
+	// MetaReachComplete is the publication marker for a reach record.
+	// A matching generation is not sufficient on its own: older code
+	// stamped MetaReachBuild before it finished writing the tier keys, so
+	// a concurrent lookup could observe a matching stamp with empty tiers
+	// and return a false-safe zero-impact result. New records are assembled
+	// on a copy of the node and published only after this marker is set.
+	MetaReachComplete = "reach_complete"
 
 	// MetaReachBuild is a monotonic build-generation counter stamped
 	// on every node the indexer touched in the most recent reach pass.
-	// Consumers compare it against the graph-level counter on
-	// AnalyzeImpact entry to decide whether to trust the precomputed
-	// sets or fall back to a live walk. The Meta value is a uint64.
+	// Consumers require both a counter match and MetaReachComplete before
+	// trusting the precomputed sets. The Meta value is a uint64.
 	MetaReachBuild = "reach_build"
+
+	// reachPublishBatchSize bounds the temporary copy-on-write node set
+	// retained by eager builds and clears. A few thousand rows keeps SQLite
+	// transaction amortisation while avoiding a full-graph duplicate of every
+	// Node and Meta map at peak.
+	reachPublishBatchSize = 4096
 )
+
+var reachMetaKeys = [...]string{
+	MetaReachD1, MetaReachD2, MetaReachD3,
+	MetaReachD1Conf, MetaReachD2Conf, MetaReachD3Conf,
+	MetaReachD1Label, MetaReachD2Label, MetaReachD3Label,
+	MetaReachBuild, MetaReachComplete,
+}
 
 // ReachableEdge returns true when an edge participates in the impact
 // graph. Mirrors AnalyzeImpact's filter exactly so the precomputed
@@ -89,6 +109,85 @@ type Stats struct {
 // incremental rebuilds. Bumped on every BuildIndex / ClearIndex call.
 var buildCounter uint64
 
+// topologyGate serialises impact readers/eager reach maintenance with a
+// watcher topology transaction. It is separate from Store.ResolveMutex:
+// watcher indexing calls resolver methods that acquire ResolveMutex
+// internally, so holding that non-reentrant mutex around the whole patch would
+// deadlock. Readers always acquire this gate before ResolveMutex; a watcher
+// holds the writer side while its nested resolver calls take ResolveMutex.
+type topologyGate struct {
+	mu             sync.Mutex
+	cond           *sync.Cond
+	readers        int
+	writer         bool
+	writersWaiting int
+}
+
+// buildCounter is already process-global, so topology publication uses one
+// process-global gate as well. This avoids retaining one registry entry per
+// short-lived Store forever (notably across tests and workspace reloads).
+// Production multi-repo indexers share one Store; independent-store watcher
+// transactions are rare enough that the conservative cross-store serialization
+// is preferable to an unbounded coordination registry.
+var globalTopologyGate = func() *topologyGate {
+	gate := &topologyGate{}
+	gate.cond = sync.NewCond(&gate.mu)
+	return gate
+}()
+
+func beginTopologyRead(_ graph.Store) func() {
+	gate := globalTopologyGate
+	gate.mu.Lock()
+	for gate.writer || gate.writersWaiting > 0 {
+		gate.cond.Wait()
+	}
+	gate.readers++
+	gate.mu.Unlock()
+
+	return func() {
+		gate.mu.Lock()
+		gate.readers--
+		if gate.readers == 0 {
+			gate.cond.Broadcast()
+		}
+		gate.mu.Unlock()
+	}
+}
+
+// BeginTopologyMutation prevents reach lookups/builds from observing a
+// watcher's parse-then-swap and resolver work half-applied. The returned
+// function must be called exactly once; changed=true invalidates every cached
+// generation before waiting readers are released. A separate gate is required
+// because the mutation body itself invokes resolver methods that acquire the
+// store's non-reentrant ResolveMutex.
+func BeginTopologyMutation(g graph.Store) func(changed bool) {
+	if g == nil {
+		return func(bool) {}
+	}
+	gate := globalTopologyGate
+	gate.mu.Lock()
+	gate.writersWaiting++
+	for gate.writer || gate.readers > 0 {
+		gate.cond.Wait()
+	}
+	gate.writersWaiting--
+	gate.writer = true
+	gate.mu.Unlock()
+
+	var once sync.Once
+	return func(changed bool) {
+		once.Do(func() {
+			if changed {
+				InvalidateIndex()
+			}
+			gate.mu.Lock()
+			gate.writer = false
+			gate.cond.Broadcast()
+			gate.mu.Unlock()
+		})
+	}
+}
+
 // BuildIndex precomputes per-depth incoming reachability sets for
 // every impact-seed node in g and stores them under Node.Meta as
 // []string slices keyed reach_d1 / reach_d2 / reach_d3. Tiers are
@@ -121,6 +220,8 @@ func BuildIndexCtx(ctx context.Context, g graph.Store) *Stats {
 		return &Stats{}
 	}
 	reporter := progress.FromContext(ctx)
+	releaseTopology := beginTopologyRead(g)
+	defer releaseTopology()
 	mu := g.ResolveMutex()
 	mu.Lock()
 	defer mu.Unlock()
@@ -146,37 +247,29 @@ func BuildIndexCtx(ctx context.Context, g graph.Store) *Stats {
 
 	const reachProgressEvery = 1000
 	seedsDone := 0
-	// Collect the seed nodes we stamp so we can persist the Meta back
-	// through the store in one batch at the end. On the in-memory
-	// backend the in-place stamp already persists (n is canonical); on
-	// disk backends n is a GetNode reconstruction, so without
-	// the write-back the whole reach index would be computed and then
-	// thrown away. Mirrors the per-seed AddNode in Lookup's slow path.
-	stamped := make([]*graph.Node, 0, seedTotal)
+	// Persist complete copy-on-write records in bounded batches. Keeping
+	// every clone until the end doubled the full graph's Node + Meta memory
+	// at eager-build scale; chunking preserves atomic per-node publication
+	// and disk transaction amortisation without that peak.
+	batchCap := min(seedTotal, reachPublishBatchSize)
+	stamped := make([]*graph.Node, 0, batchCap)
 	for _, n := range nodes {
 		if n == nil || !ImpactSeedKind(n.Kind) {
 			continue
 		}
 		tiers := compute(g, n.ID)
-		if n.Meta == nil {
-			n.Meta = make(map[string]any, 10)
-		}
-		// Always stamp the build counter so a node with no reach
-		// (sink with zero callers) still proves "we tried" — without
-		// this, lookups for sink nodes would fall back to a live walk
-		// on every call.
-		n.Meta[MetaReachBuild] = build
-		setOrDeleteStrings(n.Meta, MetaReachD1, tiers[0].IDs)
-		setOrDeleteStrings(n.Meta, MetaReachD2, tiers[1].IDs)
-		setOrDeleteStrings(n.Meta, MetaReachD3, tiers[2].IDs)
-		setOrDeleteFloats(n.Meta, MetaReachD1Conf, tiers[0].Conf)
-		setOrDeleteFloats(n.Meta, MetaReachD2Conf, tiers[1].Conf)
-		setOrDeleteFloats(n.Meta, MetaReachD3Conf, tiers[2].Conf)
-		setOrDeleteStrings(n.Meta, MetaReachD1Label, tiers[0].Labels)
-		setOrDeleteStrings(n.Meta, MetaReachD2Label, tiers[1].Labels)
-		setOrDeleteStrings(n.Meta, MetaReachD3Label, tiers[2].Labels)
+		// Build the complete record off to the side, then replace the
+		// canonical node through Store.AddBatch below. Mutating n.Meta in
+		// place made MetaReachBuild visible before the tier slices and also
+		// raced lock-free readers of the map.
+		published := cloneNodeWithMeta(n)
+		writeRecord(published.Meta, build, tiers)
 
-		stamped = append(stamped, n)
+		stamped = append(stamped, published)
+		if len(stamped) == reachPublishBatchSize {
+			g.AddBatch(stamped, nil)
+			stamped = stamped[:0]
+		}
 		stats.NodesIndexed++
 		stats.EntriesD1 += len(tiers[0].IDs)
 		stats.EntriesD2 += len(tiers[1].IDs)
@@ -187,9 +280,8 @@ func BuildIndexCtx(ctx context.Context, g graph.Store) *Stats {
 			reporter.Report("reachability index", seedsDone, seedTotal)
 		}
 	}
-	// Persist every stamped node's Meta back through the store in one
-	// batch (no-op-ish on the in-memory backend, the durable write on
-	// disk backends). AddBatch with no edges only upserts the nodes.
+	// Flush the final partial batch. AddBatch with no edges only upserts
+	// the nodes.
 	if len(stamped) > 0 {
 		g.AddBatch(stamped, nil)
 	}
@@ -226,6 +318,40 @@ func setOrDeleteFloats(m map[string]any, key string, value []float64) {
 		return
 	}
 	m[key] = value
+}
+
+// cloneNodeWithMeta makes a copy-on-write carrier for a reach record.
+// Node.Meta is otherwise a regular Go map: editing the canonical map in
+// place while Lookup reads it is both a data race and a partial-publication
+// hazard. Values are shallow-copied because reach only replaces its own
+// immutable slices and never mutates metadata owned by another subsystem.
+func cloneNodeWithMeta(n *graph.Node) *graph.Node {
+	clone := *n
+	clone.Meta = make(map[string]any, len(n.Meta)+11)
+	for key, value := range n.Meta {
+		clone.Meta[key] = value
+	}
+	return &clone
+}
+
+// writeRecord writes every tier onto a private metadata map and sets the
+// completeness marker last. The containing node must not be published to the
+// Store until this function returns.
+func writeRecord(meta map[string]any, build uint64, tiers [3]tier) {
+	delete(meta, MetaReachComplete)
+	setOrDeleteStrings(meta, MetaReachD1, tiers[0].IDs)
+	setOrDeleteStrings(meta, MetaReachD2, tiers[1].IDs)
+	setOrDeleteStrings(meta, MetaReachD3, tiers[2].IDs)
+	setOrDeleteFloats(meta, MetaReachD1Conf, tiers[0].Conf)
+	setOrDeleteFloats(meta, MetaReachD2Conf, tiers[1].Conf)
+	setOrDeleteFloats(meta, MetaReachD3Conf, tiers[2].Conf)
+	setOrDeleteStrings(meta, MetaReachD1Label, tiers[0].Labels)
+	setOrDeleteStrings(meta, MetaReachD2Label, tiers[1].Labels)
+	setOrDeleteStrings(meta, MetaReachD3Label, tiers[2].Labels)
+	// A node with no callers deliberately has no tier keys. These two
+	// fields distinguish that valid empty record from an interrupted write.
+	meta[MetaReachBuild] = build
+	meta[MetaReachComplete] = true
 }
 
 // compute walks incoming edges from seed up to depth 3 and returns
@@ -335,23 +461,39 @@ func ClearIndex(g graph.Store) {
 	if g == nil {
 		return
 	}
+	releaseTopology := beginTopologyRead(g)
+	defer releaseTopology()
 	mu := g.ResolveMutex()
 	mu.Lock()
 	defer mu.Unlock()
 	atomic.AddUint64(&buildCounter, 1)
+	cleared := make([]*graph.Node, 0, reachPublishBatchSize)
 	for _, n := range g.AllNodes() {
-		if n == nil || n.Meta == nil {
+		if n == nil || !hasReachMeta(n.Meta) {
 			continue
 		}
-		for _, k := range []string{
-			MetaReachD1, MetaReachD2, MetaReachD3,
-			MetaReachD1Conf, MetaReachD2Conf, MetaReachD3Conf,
-			MetaReachD1Label, MetaReachD2Label, MetaReachD3Label,
-			MetaReachBuild,
-		} {
-			delete(n.Meta, k)
+		clone := cloneNodeWithMeta(n)
+		for _, k := range reachMetaKeys {
+			delete(clone.Meta, k)
+		}
+		cleared = append(cleared, clone)
+		if len(cleared) == reachPublishBatchSize {
+			g.AddBatch(cleared, nil)
+			cleared = cleared[:0]
 		}
 	}
+	if len(cleared) > 0 {
+		g.AddBatch(cleared, nil)
+	}
+}
+
+func hasReachMeta(meta map[string]any) bool {
+	for _, key := range reachMetaKeys {
+		if _, ok := meta[key]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // Entry is one precomputed reach record: a node ID and the
@@ -365,8 +507,9 @@ type Entry struct {
 }
 
 // Lookup returns the per-depth reach for seedID. On a fresh cache hit
-// (build counter matches current generation) it returns the cached
-// tiers in sub-millisecond. On a miss — first call for this seed, or
+// (build counter matches current generation and the completion marker
+// is present) it returns the cached tiers in sub-millisecond. On a miss —
+// first call for this seed, an interrupted/legacy record, or
 // the global build counter has advanced past the stamped value
 // because the graph mutated — it runs the BFS on demand under
 // g.ResolveMutex(), caches the result onto n.Meta, and returns the
@@ -383,74 +526,68 @@ type Entry struct {
 // given seed, then caches forever. BuildIndex remains available for
 // `gortex enrich reach` (explicit prebuild) and for callers that
 // want to pay the cost up front under controlled conditions.
+//
+// Callers must not already hold g.ResolveMutex(): Lookup acquires that
+// non-reentrant mutex to serialize every Node.Meta read with graph-wide
+// metadata writers. Current production callers enter from analysis/MCP paths,
+// outside resolver critical sections.
 func Lookup(g graph.Store, seedID string) (d1, d2, d3 []Entry, hit bool) {
 	if g == nil {
 		return nil, nil, nil, false
 	}
+	for {
+		// The topology read gate keeps watcher parse-then-swap transactions
+		// outside this operation. ResolveMutex additionally serialises every
+		// Meta read with unrelated in-place metadata writers.
+		releaseTopology := beginTopologyRead(g)
+		mu := g.ResolveMutex()
+		mu.Lock()
+		currentBuild := atomic.LoadUint64(&buildCounter)
+		d1, d2, d3, hit = lookupLocked(g, seedID, currentBuild)
+		generationStable := currentBuild == atomic.LoadUint64(&buildCounter)
+		mu.Unlock()
+		releaseTopology()
+		if generationStable {
+			return d1, d2, d3, hit
+		}
+		// A non-watcher invalidation raced this lookup. Its result is not
+		// allowed to escape; retry against the new generation.
+	}
+}
+
+// lookupLocked returns or creates one complete reach record. The caller holds
+// both the topology read gate and g.ResolveMutex().
+func lookupLocked(g graph.Store, seedID string, currentBuild uint64) (d1, d2, d3 []Entry, hit bool) {
 	n := g.GetNode(seedID)
-	if n == nil {
+	if n == nil || !ImpactSeedKind(n.Kind) {
 		return nil, nil, nil, false
 	}
-	if !ImpactSeedKind(n.Kind) {
-		return nil, nil, nil, false
-	}
-
-	currentBuild := atomic.LoadUint64(&buildCounter)
-	// Fast path: existing stamp matches the current build generation.
-	if d1, d2, d3, ok := readCached(n, currentBuild); ok {
-		return d1, d2, d3, true
-	}
-
-	// Slow path: compute the tiers and cache them. Acquire the resolve
-	// mutex so the Meta writes don't race other graph-wide passes that
-	// already serialise on it (markTestSymbolsAndEmitEdges, clone
-	// detection, ResolveTemporalCalls).
-	mu := g.ResolveMutex()
-	mu.Lock()
-	defer mu.Unlock()
-
-	// Re-check after acquiring the lock: another goroutine may have
-	// computed and cached this seed while we were waiting.
 	if d1, d2, d3, ok := readCached(n, currentBuild); ok {
 		return d1, d2, d3, true
 	}
 
 	tiers := compute(g, seedID)
-	if n.Meta == nil {
-		n.Meta = make(map[string]any, 10)
-	}
-	n.Meta[MetaReachBuild] = currentBuild
-	setOrDeleteStrings(n.Meta, MetaReachD1, tiers[0].IDs)
-	setOrDeleteStrings(n.Meta, MetaReachD2, tiers[1].IDs)
-	setOrDeleteStrings(n.Meta, MetaReachD3, tiers[2].IDs)
-	setOrDeleteFloats(n.Meta, MetaReachD1Conf, tiers[0].Conf)
-	setOrDeleteFloats(n.Meta, MetaReachD2Conf, tiers[1].Conf)
-	setOrDeleteFloats(n.Meta, MetaReachD3Conf, tiers[2].Conf)
-	setOrDeleteStrings(n.Meta, MetaReachD1Label, tiers[0].Labels)
-	setOrDeleteStrings(n.Meta, MetaReachD2Label, tiers[1].Labels)
-	setOrDeleteStrings(n.Meta, MetaReachD3Label, tiers[2].Labels)
+	published := cloneNodeWithMeta(n)
+	writeRecord(published.Meta, currentBuild, tiers)
 
-	// Persist the freshly-stamped Meta through the store. On the
-	// in-memory backend n is the canonical node, so the mutations above
-	// already stuck — AddNode re-inserts the same pointer idempotently.
-	// On disk backends n is a per-call reconstruction returned
-	// by GetNode, so the in-place stamp would otherwise be discarded the
-	// moment this function returns: the lazy reach cache would never
-	// survive a single query, forcing a full recompute on every
-	// AnalyzeImpact / explain_change_impact / get_callers call. AddNode
-	// upserts the Meta column so the cache actually sticks.
-	g.AddNode(n)
+	// Publish the fully assembled node through the store. The in-memory
+	// backend swaps the canonical pointer under its shard lock; disk
+	// backends persist the copied Meta column. In both cases readers see
+	// either the previous complete record or this complete record, never
+	// intermediate map writes.
+	g.AddNode(published)
 
-	d1 = readTier(n.Meta, MetaReachD1, MetaReachD1Conf, MetaReachD1Label)
-	d2 = readTier(n.Meta, MetaReachD2, MetaReachD2Conf, MetaReachD2Label)
-	d3 = readTier(n.Meta, MetaReachD3, MetaReachD3Conf, MetaReachD3Label)
+	d1 = readTier(published.Meta, MetaReachD1, MetaReachD1Conf, MetaReachD1Label)
+	d2 = readTier(published.Meta, MetaReachD2, MetaReachD2Conf, MetaReachD2Label)
+	d3 = readTier(published.Meta, MetaReachD3, MetaReachD3Conf, MetaReachD3Label)
 	return d1, d2, d3, true
 }
 
 // readCached reads the stamped reach tiers off n.Meta when the stamp
-// matches currentBuild. Returns ok=false when the stamp is missing
-// (never built), stale (graph has changed since), or has the wrong
-// Go type (snapshot from an older format).
+// matches currentBuild and the record carries a completion marker.
+// Returns ok=false when either marker is missing (never built, legacy,
+// or interrupted), stale (graph has changed since), or has the wrong
+// Go type.
 func readCached(n *graph.Node, currentBuild uint64) (d1, d2, d3 []Entry, ok bool) {
 	if n.Meta == nil {
 		return nil, nil, nil, false
@@ -473,6 +610,14 @@ func readCached(n *graph.Node, currentBuild uint64) (d1, d2, d3 []Entry, ok bool
 		return nil, nil, nil, false
 	}
 	if stamped != currentBuild {
+		return nil, nil, nil, false
+	}
+	complete, _ := n.Meta[MetaReachComplete].(bool)
+	if !complete {
+		// A generation stamp without an explicit completion marker is an
+		// interrupted/legacy publication. Treat it as a miss so Lookup
+		// recomputes instead of silently interpreting missing tiers as an
+		// intentionally empty blast radius.
 		return nil, nil, nil, false
 	}
 	d1 = readTier(n.Meta, MetaReachD1, MetaReachD1Conf, MetaReachD1Label)

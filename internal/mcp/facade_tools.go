@@ -69,15 +69,19 @@ func facadeAnnotation(name string) mcpgo.ToolAnnotation {
 	}
 }
 
-func facadeTargetProperty() mcpgo.PropertyOption {
-	return mcpgo.Properties(map[string]any{
+func facadeTargetProperties() map[string]any {
+	return map[string]any{
 		"file":     map[string]any{"type": "string"},
 		"symbol":   map[string]any{"type": "string"},
 		"symbols":  map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
 		"query":    map[string]any{"type": "string"},
 		"artifact": map[string]any{"type": "string"},
 		"repo":     map[string]any{"type": "string"},
-	})
+	}
+}
+
+func facadeTargetProperty() mcpgo.PropertyOption {
+	return mcpgo.Properties(facadeTargetProperties())
 }
 
 func facadeToolDefinition(name string) mcpgo.Tool {
@@ -112,7 +116,13 @@ func facadeToolDefinition(name string) mcpgo.Tool {
 		}
 	case "ask":
 		opts = []mcpgo.ToolOption{mcpgo.WithString("question", mcpgo.Required()), options, output}
-	case "change", "review":
+	case "change":
+		opts = []mcpgo.ToolOption{
+			operation, target,
+			freeObject("source", "Diff, working tree, ranges, symbols, or other change source."),
+			options, output,
+		}
+	case "review":
 		opts = []mcpgo.ToolOption{operation, freeObject("source", "Diff, working tree, ranges, symbols, or review source."), options, output}
 	case "edit":
 		opts = []mcpgo.ToolOption{
@@ -773,7 +783,20 @@ func normalizeFacadeAliases(spec facadeOperationSpec, input, out map[string]any)
 		alias("changes", "edits")
 	case "refactor.move":
 		alias("destination", "target_file")
-	case "change.impact", "change.edit_plan", "change.guards", "change.tests":
+	case "change.impact":
+		// Compatibility source fields are lowered first. An explicit target
+		// is the canonical selector and therefore wins deterministically when
+		// a caller supplies both forms during migration.
+		commaString("symbols", "ids")
+		if symbol := facadeSelector(input["target"], "symbol"); symbol != nil {
+			out["ids"] = symbol
+		}
+		if symbols := facadeSelector(input["target"], "symbols"); symbols != nil {
+			out["symbols"] = symbols
+			commaString("symbols", "ids")
+		}
+		delete(out, "id")
+	case "change.edit_plan", "change.guards", "change.tests":
 		commaString("symbols", "ids")
 	case "change.pattern":
 		// suggest_pattern accepts one anchor. Preserve an explicit id; when the
@@ -1069,8 +1092,12 @@ func (s *Server) facadeCapability(spec facadeOperationSpec, includeSchema bool) 
 				properties = map[string]any{"channel": map[string]any{"type": "string"}}
 				required = []string{"channel"}
 			}
+			requestShape := facadeRequestShape(spec, properties, required)
+			if spec.Facade != "analyze" && spec.Facade != "session" && (spec.Facade != "workspace_admin" || spec.Legacy != "analyze") {
+				inputSchema = facadePublicCapabilitySchema(spec, properties, required, requestShape)
+			}
 			out["input_schema"] = inputSchema
-			out["request_shape"] = facadeRequestShape(spec, properties, required)
+			out["request_shape"] = requestShape
 			if raw, err := json.Marshal(inputSchema); err == nil {
 				sum := sha256.Sum256(raw)
 				out["schema_hash"] = hex.EncodeToString(sum[:])
@@ -1320,7 +1347,9 @@ func facadeRequestShape(spec facadeOperationSpec, properties map[string]any, req
 		switch spec.Operation {
 		case "api_impact":
 			source["file"] = "<file>"
-		case "impact", "edit_plan", "guards", "pattern", "tests":
+		case "impact":
+			args["target"] = placeholder("symbol")
+		case "edit_plan", "guards", "pattern", "tests":
 			source["symbols"] = []string{"<symbol>"}
 		case "verify":
 			source["changes"] = []map[string]any{{"symbol_id": "<symbol>", "new_signature": "<signature>"}}
@@ -1339,7 +1368,9 @@ func facadeRequestShape(spec facadeOperationSpec, properties map[string]any, req
 			source["source"] = "symbols"
 			source["symbols"] = []string{"<symbol>"}
 		}
-		args["source"] = source
+		if len(source) > 0 {
+			args["source"] = source
+		}
 	case "review":
 		args["source"] = map[string]any{}
 	case "edit":
@@ -1405,6 +1436,9 @@ func facadeRequestShape(spec facadeOperationSpec, properties map[string]any, req
 	if spec.Facade == "workspace_admin" && spec.Operation == "coverage" {
 		args["arguments"] = map[string]any{"profile": "<cover profile>"}
 	}
+	if spec.Facade != "analyze" && spec.Facade != "session" {
+		facadeCompleteRequiredSelectors(spec, args, required)
+	}
 
 	// Manual aliases above cover common intent-oriented and conditional fields;
 	// remaining schema-required legacy fields stay operation-specific under
@@ -1431,25 +1465,6 @@ func facadeRequestShape(spec facadeOperationSpec, properties map[string]any, req
 		extras[field] = facadeSchemaPlaceholder(field, properties[field])
 	}
 	return map[string]any{"tool": spec.Facade, "arguments": args}
-}
-
-func facadeSchemaPlaceholder(field string, raw any) any {
-	property, _ := raw.(map[string]any)
-	switch property["type"] {
-	case "boolean":
-		return false
-	case "integer", "number":
-		return 1
-	case "array":
-		if item, ok := property["items"]; ok {
-			return []any{facadeSchemaPlaceholder(field, item)}
-		}
-		return []any{"<" + field + ">"}
-	case "object":
-		return map[string]any{}
-	default:
-		return "<" + field + ">"
-	}
 }
 
 // applyFacadeSurface provides session-level surface negotiation. Legacy

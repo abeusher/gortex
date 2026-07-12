@@ -116,7 +116,7 @@ func mergeReadControls(values ...any) map[string]any {
 
 // gortexReadAdvisory builds the reminder shown when a Gortex read tool is
 // about to pull full bodies. It names only compact public operations and gives
-// the direct Bash mirror for a harness without native MCP tools.
+// the mandatory native-MCP transport rule for this configured profile.
 func gortexReadAdvisory(toolName, path string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "[Gortex] %s on %s without compress_bodies — a full-body read can dominate context.\n",
@@ -124,7 +124,7 @@ func gortexReadAdvisory(toolName, path string) string {
 	b.WriteString("  - Locate sites with `search(operation:\"text\", query:\"<literal>\")`; it reads no bodies.\n")
 	b.WriteString("  - Read with `read(target:{file:\"<path>\"}, options:{compress_bodies:true})` when full bodies are unnecessary.\n")
 	b.WriteString("  - Add `options:{keep:\"Name1,Name2\"}` when selected bodies must stay complete.\n")
-	b.WriteString(toolref.FallbackLine("search_text"))
+	b.WriteString(toolref.MCPRequiredLine())
 	return b.String()
 }
 

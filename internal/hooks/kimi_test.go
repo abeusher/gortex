@@ -88,10 +88,13 @@ func TestRunKimiPreToolUseGortexReadPlainStdout(t *testing.T) {
 			if out == "" {
 				t.Fatal("expected Kimi MCP read PreToolUse guidance, got empty output")
 			}
-			for _, want := range []string{"compress_bodies", `search(operation:"text", query:`, "keep", "gortex call search"} {
+			for _, want := range []string{"compress_bodies", `search(operation:"text", query:`, "keep", "Native Gortex MCP is mandatory"} {
 				if !strings.Contains(out, want) {
 					t.Fatalf("stdout guidance missing %q: %q", want, out)
 				}
+			}
+			if strings.Contains(out, "gortex call ") {
+				t.Fatalf("Kimi MCP read guidance advertised CLI fallback: %q", out)
 			}
 			for _, notWant := range []string{"hookSpecificOutput", "additionalContext", "permissionDecision"} {
 				if strings.Contains(out, notWant) {

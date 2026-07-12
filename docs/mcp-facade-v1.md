@@ -4,7 +4,7 @@
 | --- | --- |
 | Status | Implemented |
 | Surface/config identifier | `facade-v1` |
-| Specification version | `1.0.0` |
+| Specification version | `1.0.1` |
 | Last updated | 2026-07-12 |
 | Replaces | No existing API; this is an additive facade over the legacy MCP tools |
 
@@ -315,6 +315,20 @@ Detect a working-tree change independently of how it was applied:
 }
 ```
 
+Ask for the impact of one known symbol with the same selector shape used by
+`read` and `relations`:
+
+```json
+{
+  "operation": "impact",
+  "target": {"symbol": "Server.addTool"}
+}
+```
+
+`target.symbols` is the batch form. `change` translates both forms to the
+captured impact handler's identifier list; callers do not need to know its
+legacy `options.ids` spelling.
+
 The `change` facade applies equally to mutations made through `edit`, `refactor`, `apply_patch`, an IDE, or another tool. After mutation, run `detect` and use its symbol IDs with `tests`, `guards`, and `contract`. Run `verify` before a signature mutation with the proposed signature. Use `capabilities` when an exact operation schema is needed.
 
 ## 9. Capability discovery
@@ -359,7 +373,7 @@ The registry:
 
 1. Facade MCP registration and dispatch.
 2. Captures the existing legacy tool definition and handler when it is registered.
-3. Supplies operation availability, summaries, and exact captured input schemas to `capabilities`.
+3. Supplies operation availability and summaries, then projects captured handler fields into the stable public facade envelope returned by `capabilities`; captured implementation schemas are never returned as the public contract.
 4. Supplies facade/operation/canonical-tool metadata and privacy-safe telemetry dimensions.
 5. Provides the complete mapping used by coverage, effect-parity, schema-budget, and dispatch tests.
 
@@ -439,6 +453,20 @@ Requirements:
 7. The ordinary coding loop MUST work when the client ignores `notifications/tools/list_changed`.
 8. Each MCP-capable integration harness SHOULD compare the raw MCP roster with the functions exposed by its client bridge. If the bridge drops a tool, telemetry and diagnostics MUST identify the missing facade rather than recommend an uncallable name.
 9. A Bash-only harness with no native MCP function exposure MUST be able to invoke the same compact names and argument objects through `gortex call`; this CLI path is a direct mirror, not a translation to legacy tool names.
+10. An agent adapter MUST use the host's supported eager/direct namespace control when the host otherwise defers MCP tools. Discovery in a settings screen or a successful raw `tools/list` is not sufficient: the facade functions MUST be present in the model-visible callable registry on the first turn.
+11. An agent adapter SHOULD mark Gortex as required when the host supports required MCP servers. Startup or discovery failure must fail visibly instead of silently leaving the agent with source-access guidance that it cannot follow.
+12. Guidance installed for an MCP-capable host MUST NOT recommend daemon startup or the Bash mirror when a Gortex callable handle is missing. That state is a host integration failure and MUST be surfaced. `gortex call` remains the mirror only for a harness that genuinely has no MCP transport.
+
+For Codex 0.142.0 and newer, `gortex init` adds the current `mcp__gortex`
+namespace and its non-prefixed `gortex` form to
+`features.code_mode.direct_only_tool_namespaces` without removing
+user-configured namespaces. This is the host-supported bypass for deferral: the
+active Gortex namespace remains a direct model tool even when other MCP
+namespaces are available only through tool search. The adapter also writes
+`required = true` and a startup timeout long enough for Gortex's bounded daemon
+autostart. Older Codex releases reject that field, so the adapter version-gates
+it rather than invalidating their config. These are transport/host settings,
+not agent instructions and not part of the facade request schema.
 
 ## 13. Telemetry and privacy
 
@@ -546,6 +574,7 @@ Success and regression dashboards SHOULD track:
 - A known file is readable with `read(target={file:"..."})`; known symbol source is readable with `read(target={symbol:"..."})`. Explicit operations remain valid.
 - Target validation accepts exactly one of `file`, `symbol`, `symbols`, `query`, `artifact`, or `repo` and rejects ambiguous/unknown selectors.
 - A guarded edit, semantic refactor preview, and post-mutation verification complete without legacy-tool discovery.
+- A natural-language localization query cannot have its complete result head monopolized by repeated, same-named data leaves; the highest-ranked leaf remains, while callable/type targets remain discoverable. Literal symbol queries retain their exact-name ordering.
 - Invalid-argument and raw-file fallback rates are no worse than the legacy baseline and trend downward during canarying.
 
 ### 15.4 Named-client and harness correctness
@@ -554,11 +583,14 @@ Success and regression dashboards SHOULD track:
 - An empty or pre-initialize session retains the server default unless an explicit policy selects the compact surface.
 - Wire-format negotiation remains independent: an unknown named client remains on JSON unless it is separately GCX-capable.
 - `read` is present, directly callable, and can return uncompressed source.
-- `capabilities(domain="read", operation="file", detail="schema")` returns an available operation, its exact captured `input_schema`, and `schema_hash` without promotion.
+- `capabilities(domain="read", operation="file", detail="schema")` returns an available operation, its operation-specific public `input_schema`, canonical `request_shape`, and `schema_hash`; the shape validates against both that schema and the static `read` facade schema, while captured selector names and fixed server arguments stay out of caller input.
 - Direct calls to hidden legacy tools are blocked in the same session.
 - The integration passes when `tools/list_changed` is ignored.
 - A bridge-exposure regression fails loudly instead of silently recommending a missing tool.
 - A Bash-only harness can call the same compact tool names with the same argument objects through `gortex call`, without legacy-name translation.
+- Host integrations that support namespace deferral controls expose Gortex directly on the first model turn; an MCP settings screen and raw `tools/list` alone do not satisfy this criterion.
+- Host integrations that support required MCP servers fail startup visibly when Gortex cannot initialize or enumerate tools.
+- MCP-profile hook guidance reports a missing callable handle as an integration failure and never tells the agent to start a daemon or switch to `gortex call`; Bash-only generated guidance continues to document the CLI mirror.
 
 ### 15.5 Safety
 
@@ -568,6 +600,8 @@ Success and regression dashboards SHOULD track:
 - `publish_review` is the only facade that writes to a forge.
 - `edit` and `refactor` retain stale-write guards and dry-run behavior where supported.
 - Applying external mutations follows the same `change` pipeline: `detect`, then `tests`, `guards`, and `contract` using the detected symbol IDs. The Codex `apply_patch` PostToolUse adapter runs this pipeline automatically; other harnesses can call the public operations directly.
+- `change(operation="impact", target={symbol:...})` and its `target.symbols` batch form produce the same result as the canonical impact handler selector.
+- A reach-index entry is usable only after its generation and completeness marker are published with all distance tiers. An incomplete or concurrently replaced entry MUST fall back to a live graph walk; repeated identical impact queries MUST NOT decrease to a false-safe zero result while the graph is unchanged.
 
 ### 15.6 Observability
 
@@ -612,6 +646,7 @@ Any registered legacy name absent from this table is a specification defect unle
 
 | Version | Date | Change |
 | --- | --- | --- |
+| `1.0.1` | 2026-07-12 | Required direct host exposure where supported; projected every capability schema into the public envelope; normalized `change.impact` selectors; made repeated impact results safe against incomplete reach publication; kept natural-language explore results diverse; and made missing MCP handles fail visibly instead of triggering a CLI fallback |
 | `1.0.0` | 2026-07-12 | Generalized the default across named MCP clients and Bash-only harnesses; added selector defaults, exact CLI mirroring, per-operation schemas, and audited effect splits |
 | `1.0.0-draft.3` | 2026-07-11 | Replaced the notification-only facade with the broader session-only `session` facade and kept durable mutation under `workspace_admin` |
 | `1.0.0-draft.2` | 2026-07-11 | Aligned selectors, operation calls, capability discovery, response metadata, and hide-mode behavior with the implementation |

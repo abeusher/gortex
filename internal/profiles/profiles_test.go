@@ -42,7 +42,7 @@ func TestProfileBodyByteCeilings(t *testing.T) {
 // positioningCues are the load-bearing fragments EVERY profile must
 // keep, lean ones included: the mandatory-rule sentinel, the deny-hook
 // warning, the one-shot opener, the memory triggers, the discovery
-// path, the CLI fallback, and the switch-back line. Trimming any of
+// path, the native-MCP failure posture, and the switch-back line. Trimming any of
 // these is what costs tool adoption — the diet only ever removes
 // elaboration around them.
 var positioningCues = []string{
@@ -50,7 +50,8 @@ var positioningCues = []string{
 	"MUST prefer graph queries",
 	"deny",
 	"explore",
-	"gortex call",
+	"Gortex MCP integration failure",
+	"Do not start a daemon",
 	"gortex instructions switch",
 	"NEW sessions only",
 }
@@ -228,13 +229,13 @@ var relocatedContentMarkers = []string{
 // carry — the machine-level single home for the full memory-workflow
 // triggers. The localization profile intentionally keeps only the
 // positioning cues (TestEveryProfileKeepsPositioningCues).
-var legacyFullPolicyTokens = []string{
+var preCompactFullPolicyTokens = []string{
 	"search_symbols", "find_usages", "get_callers", "get_call_chain",
 	"get_symbol_source", "get_editing_context", "read_file",
 	"smart_context", "edit_file", "rename_symbol", "compress_bodies",
 	"distill_session", "surface_memories", "save_note", "store_memory",
 	"query_notes", "query_memories",
-	"tools_search", "gortex://guide", "gortex daemon start",
+	"tools_search", "gortex://guide", "MCP startup manages daemon availability",
 }
 
 func TestBodies_PolicyCoreAndSingleHome(t *testing.T) {
@@ -242,9 +243,9 @@ func TestBodies_PolicyCoreAndSingleHome(t *testing.T) {
 	if !ok {
 		t.Fatal("full profile missing")
 	}
-	for _, token := range legacyFullPolicyTokens {
+	for _, token := range preCompactFullPolicyTokens {
 		if !strings.Contains(full.Body(), token) {
-			t.Errorf("full body no longer mentions %q — legacy opt-in policy regression", token)
+			t.Errorf("full body no longer mentions %q — pre-compact opt-in policy regression", token)
 		}
 	}
 
@@ -258,7 +259,7 @@ func TestBodies_PolicyCoreAndSingleHome(t *testing.T) {
 				t.Errorf("%s body no longer mentions compact tool %q", name, token)
 			}
 		}
-		for _, banned := range []string{"facade-v1", "search_symbols", "get_symbol_source", "tools_search"} {
+		for _, banned := range []string{"facade-v1", "search_symbols", "get_symbol_source", "tools_search", "while these tools are available"} {
 			if strings.Contains(p.Body(), banned) {
 				t.Errorf("%s body exposes implementation detail %q", name, banned)
 			}

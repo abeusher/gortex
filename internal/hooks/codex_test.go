@@ -133,10 +133,13 @@ func TestRunCodexPreToolUseGortexMCPReadSoftAdditionalContext(t *testing.T) {
 			if hso.HookEventName != "PreToolUse" {
 				t.Fatalf("hookEventName=%q want PreToolUse", hso.HookEventName)
 			}
-			for _, want := range []string{"compress_bodies", `search(operation:"text", query:`, "keep", "gortex call search"} {
+			for _, want := range []string{"compress_bodies", `search(operation:"text", query:`, "keep", "Native Gortex MCP is mandatory"} {
 				if !strings.Contains(hso.AdditionalContext, want) {
 					t.Fatalf("additionalContext missing %q: %q", want, hso.AdditionalContext)
 				}
+			}
+			if strings.Contains(hso.AdditionalContext, "gortex call ") {
+				t.Fatalf("MCP read advisory must not advertise CLI fallback: %q", hso.AdditionalContext)
 			}
 			if hso.PermissionDecision != "" || hso.PermissionDecisionReason != "" {
 				t.Fatalf("Codex MCP read nudge must not deny: %#v", hso)

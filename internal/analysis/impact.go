@@ -53,15 +53,18 @@ type ImpactResult struct {
 
 // AnalyzeImpact performs depth-tiered blast radius analysis on a set of symbols.
 //
-// Fast path: when every seed has a precomputed reach index
-// (`Node.Meta["reach_d1/d2/d3"]` stamped by BuildReachIndex), the
+// Fast path: when every seed has a complete reach index record
+// (`Node.Meta["reach_d1/d2/d3"]` with matching build and completion
+// markers), the
 // depth-1/2/3 ByDepth tiers are constructed from those sets without
 // a live BFS — turning the dominant cost from O(reach) edge walks
 // into O(reach) map lookups. The representative in-edge per tier
 // entry is recovered with a linear scan of the entry's incoming
 // edges, matching the live walk's behavior. Fall back to live BFS
-// when any seed lacks the index — the slow path is identical to the
-// pre-index implementation so consumer semantics never diverge.
+// when a seed cannot be indexed (for example, a non-symbol node) — the
+// slow path is identical to the pre-index implementation so consumer
+// semantics never diverge. Missing or interrupted symbol records are
+// recomputed and atomically published by reach.Lookup.
 func AnalyzeImpact(g graph.Store, symbolIDs []string, communities *CommunityResult, processes *ProcessResult) *ImpactResult {
 	result := &ImpactResult{
 		ByDepth: make(map[int][]ImpactEntry),
@@ -236,9 +239,10 @@ func fillImpactLive(g graph.Store, result *ImpactResult, symbolIDs []string) {
 	}
 }
 
-// fillImpactFromReach is the precomputed fast path. Returns false if
-// any seed lacks a reach build stamp — the caller must then run
-// fillImpactLive. The union of per-seed reach_d1 sets becomes the
+// fillImpactFromReach is the indexed fast path. Returns false if any seed
+// cannot produce a complete reach record — the caller must then run
+// fillImpactLive. A merely stamped but incomplete record is never a hit.
+// The union of per-seed reach_d1 sets becomes the
 // depth-1 tier; depth-2 is the union of per-seed reach_d2 minus
 // seeds and minus the depth-1 set; depth-3 is built the same way
 // against (seeds ∪ d1 ∪ d2). For each tier-N entry we look up the

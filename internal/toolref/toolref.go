@@ -1,14 +1,9 @@
-// Package toolref renders references to Gortex MCP tools for guidance text so
-// every hook, adapter, and CLI message names a tool the SAME way — and never
-// mints the invalid bare `gortex <tool>` shell shape that led agents astray
-// (an agent that sees a bare tool name in a shell context invents
-// `gortex read_file <path>`, which is not a real verb). MCP-directed guidance
-// says "call the `<tool>` MCP tool"; a shell fallback renders the real
-// `gortex call <tool> --arg k=v` invocation, which is the ONE correct way to
-// reach a tool that has no dedicated CLI verb.
+// Package toolref renders references to Gortex tools for agent guidance.
+// MCP-capable profiles get an explicit native-MCP requirement and must surface
+// a missing callable handle as an integration failure. Bash-only profiles and
+// CLI diagnostics can separately render the real `gortex call <tool> --arg
+// k=v` shape, never the invalid bare `gortex <tool>` form.
 package toolref
-
-import "strings"
 
 // cliExample maps internal/compatibility tool names used by hooks to the
 // compact public call an agent should execute from Bash. Hooks may still use
@@ -64,19 +59,10 @@ func ConcreteCLIFallback(tool string) (string, bool) {
 	return example, ok
 }
 
-// FallbackLine is the standard one-line advisory appended to graph-tool
-// guidance. It teaches the `gortex call <tool> --arg …` shape (with a realistic
-// example for the primary tool) so an agent in a shell context — MCP unmounted
-// or degraded, or one that chose Bash — never invents the invalid
-// `gortex <tool>` verb. primary names the most relevant tool for the worked
-// example; pass "" to emit only the generic form. The returned string ends in a
-// newline so it drops straight into a bulleted guidance block.
-func FallbackLine(primary string) string {
-	var b strings.Builder
-	b.WriteString("  - Shell only (no MCP tools)? Reach any tool above with `gortex call <tool> --arg k=v`")
-	if primary != "" {
-		b.WriteString(" — e.g. `" + CLIFallback(primary) + "`")
-	}
-	b.WriteString(". There is no bare `gortex <tool>` verb.\n")
-	return b.String()
+// MCPRequiredLine is the standard transport rule appended to guidance emitted
+// by hooks installed for an MCP-capable profile. A configured server whose
+// tools are absent from the model's callable manifest is a host integration
+// failure, not permission to launch infrastructure or switch transports.
+func MCPRequiredLine() string {
+	return "  - Native Gortex MCP is mandatory for this profile. If a referenced Gortex tool is missing from the callable MCP tools despite the server being configured, surface a Gortex MCP integration failure to the user and stop. Do not start a daemon or use any CLI/shell fallback.\n"
 }

@@ -1,10 +1,18 @@
 package mcp
 
 import (
+	"context"
+	"fmt"
 	"strings"
 	"testing"
 
+	mcpgo "github.com/mark3labs/mcp-go/mcp"
+	"go.uber.org/zap"
+
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/query"
+	"github.com/zzet/gortex/internal/search"
+	"github.com/zzet/gortex/internal/search/rerank"
 )
 
 func TestExploreLocalizableKind(t *testing.T) {
@@ -102,5 +110,115 @@ func TestExploreHelpers(t *testing.T) {
 	}
 	if got := dedupStrings([]string{"b", "a", "b"}); strings.Join(got, ",") != "a,b" {
 		t.Errorf("dedupStrings: %v", got)
+	}
+}
+
+// TestFacadeExploreDemotesRepeatedDataLeafNames reproduces the reported
+// localization failure through the public facade: many unrelated declarations
+// named `client` used to consume the whole result head, excluding the callable
+// definition that explains the area. One best data-leaf match may remain, but
+// repeated same-name leaves must not crowd out a differently-named code target.
+func TestFacadeExploreDemotesRepeatedDataLeafNames(t *testing.T) {
+	g := graph.New()
+	bm := search.NewBM25()
+	for i := 0; i < 12; i++ {
+		id := fmt.Sprintf("pkg/service%d.go::client", i)
+		n := &graph.Node{
+			ID: id, Name: "client", Kind: graph.KindVariable,
+			FilePath: fmt.Sprintf("pkg/service%d.go", i), Language: "go",
+			Meta: map[string]any{"signature": "var client *Transport"},
+		}
+		g.AddNode(n)
+		bm.Add(id, n.Name, n.FilePath, "trace client coordinated transport")
+
+		// Common prose-only matches make `trace` non-discriminative in
+		// the lexical corpus. They are deliberately non-localizable and
+		// filtered by explore after retrieval.
+		traceID := fmt.Sprintf("pkg/service%d.go::traceMarker", i)
+		trace := &graph.Node{
+			ID: traceID, Name: "traceMarker", Kind: graph.KindParam,
+			FilePath: fmt.Sprintf("pkg/service%d.go", i), Language: "go",
+		}
+		g.AddNode(trace)
+		bm.Add(traceID, trace.Name, trace.FilePath, "trace")
+	}
+	relevant := &graph.Node{
+		ID: "pkg/coordinator.go::TransportCoordinator", Name: "TransportCoordinator",
+		Kind: graph.KindFunction, FilePath: "pkg/coordinator.go", Language: "go",
+		Meta: map[string]any{"signature": "func TransportCoordinator()"},
+	}
+	g.AddNode(relevant)
+	bm.Add(relevant.ID, relevant.Name, relevant.FilePath, "coordinated")
+
+	eng := query.NewEngine(g)
+	eng.SetSearch(bm)
+	srv := NewServer(eng, g, nil, nil, zap.NewNop(), nil)
+	task := "trace how the client is coordinated"
+	searchQuery := shapeExploreQuery(task)
+	raw := eng.SearchSymbolsRanked(searchQuery, 24, query.QueryOptions{}, srv.buildRerankContext(context.Background(), searchQuery))
+	rawHead := make([]string, 0, 6)
+	for _, candidate := range raw {
+		if candidate == nil || candidate.Node == nil || !exploreLocalizableKind(candidate.Node.Kind) || !exploreCodeDefinitionKind(candidate.Node.Kind) {
+			continue
+		}
+		rawHead = append(rawHead, candidate.Node.ID)
+		if len(rawHead) == 6 {
+			break
+		}
+	}
+	if len(rawHead) != 6 {
+		t.Fatalf("fixture produced only %d raw localization candidates: %v", len(rawHead), rawHead)
+	}
+	for _, id := range rawHead {
+		if id == relevant.ID {
+			t.Fatalf("fixture no longer reproduces crowd-out before explore diversification: %v", rawHead)
+		}
+	}
+	req := mcpgo.CallToolRequest{}
+	// Omit operation deliberately: the facade default must route to task.
+	req.Params.Arguments = map[string]any{
+		"task": task, "options": map[string]any{"max_symbols": 6},
+	}
+	result, err := srv.handleFacade(context.Background(), "explore", req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result == nil || result.IsError || len(result.Content) == 0 {
+		t.Fatalf("explore failed: %#v", result)
+	}
+	text, ok := result.Content[0].(mcpgo.TextContent)
+	if !ok {
+		t.Fatalf("unexpected explore result content: %#v", result.Content[0])
+	}
+	out := text.Text
+	if strings.Contains(out, "get_symbol_source") || strings.Contains(out, "batch_symbols") || strings.Contains(out, "search_text") || strings.Contains(out, "find_files") {
+		t.Fatalf("explore emitted unavailable legacy follow-up guidance:\n%s", out)
+	}
+	relevantAt := strings.Index(out, "TransportCoordinator")
+	if relevantAt < 0 {
+		t.Fatalf("callable target was crowded out by repeated data leaves:\n%s", out)
+	}
+	firstClient := strings.Index(out, ". client  variable")
+	if firstClient < 0 {
+		t.Fatalf("fixture did not surface its best literal data-leaf match:\n%s", out)
+	}
+	secondClient := strings.Index(out[firstClient+1:], ". client  variable")
+	if secondClient >= 0 && firstClient+1+secondClient < relevantAt {
+		t.Fatalf("repeated generic data leaves still rank ahead of the callable target:\n%s", out)
+	}
+}
+
+func TestDemoteRepeatedExploreDataNamesIsConceptOnlyAndStable(t *testing.T) {
+	leaf1 := &rerank.Candidate{Node: &graph.Node{ID: "a", Name: "client", Kind: graph.KindVariable}}
+	leaf2 := &rerank.Candidate{Node: &graph.Node{ID: "b", Name: "client", Kind: graph.KindField}}
+	callable := &rerank.Candidate{Node: &graph.Node{ID: "c", Name: "ClientCoordinator", Kind: graph.KindFunction}}
+
+	concept := demoteRepeatedExploreDataNames([]*rerank.Candidate{leaf1, leaf2, callable}, rerank.QueryClassConcept)
+	if concept[0] != leaf1 || concept[1] != callable || concept[2] != leaf2 {
+		t.Fatalf("concept diversification is not stable/bounded: %#v", concept)
+	}
+	symbol := demoteRepeatedExploreDataNames([]*rerank.Candidate{leaf1, leaf2, callable}, rerank.QueryClassSymbol)
+	if symbol[0] != leaf1 || symbol[1] != leaf2 || symbol[2] != callable {
+		t.Fatalf("identifier lookup order changed: %#v", symbol)
 	}
 }

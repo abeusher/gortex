@@ -87,18 +87,18 @@ func (a *Adapter) Apply(env agents.Env, opts agents.ApplyOpts) (*agents.Result, 
 	res.Files = append(res.Files, hooksAction)
 
 	// 2. Knowledge Item — kept as a secondary artifact. It makes the native
-	//    MCP-first public workflow mandatory and documents gortex call only as
-	//    the Bash fallback. Exact shipped legacy content is migrated in place;
+	//    MCP public workflow mandatory and treats absent callable handles as an
+	//    integration failure. Exact shipped v0.60.0 content is migrated in place;
 	//    any customized KI is preserved.
 	kiDir := filepath.Join(env.Home, ".gemini", "antigravity", "knowledge", "gortex-workflow")
 
-	metaAction, err := writeKnowledgeItem(env.Stderr, filepath.Join(kiDir, "metadata.json"), Metadata, legacyMetadata, opts)
+	metaAction, err := writeKnowledgeItem(env.Stderr, filepath.Join(kiDir, "metadata.json"), Metadata, v060Metadata, opts)
 	if err != nil {
 		return res, err
 	}
 	res.Files = append(res.Files, metaAction)
 
-	instrAction, err := writeKnowledgeItem(env.Stderr, filepath.Join(kiDir, "artifacts", "gortex-instructions.md"), Instructions, legacyInstructions, opts)
+	instrAction, err := writeKnowledgeItem(env.Stderr, filepath.Join(kiDir, "artifacts", "gortex-instructions.md"), Instructions, v060Instructions, opts)
 	if err != nil {
 		return res, err
 	}
@@ -109,9 +109,9 @@ func (a *Adapter) Apply(env agents.Env, opts agents.ApplyOpts) (*agents.Result, 
 }
 
 // writeKnowledgeItem creates a missing artifact or replaces it only when its
-// bytes match a Gortex-shipped legacy version. A different existing file is
+// bytes match a Gortex-shipped migration fingerprint. A different existing file is
 // user-authored policy and is never overwritten, including under --force.
-func writeKnowledgeItem(w io.Writer, path, current, legacy string, opts agents.ApplyOpts) (agents.FileAction, error) {
+func writeKnowledgeItem(w io.Writer, path, current, migration string, opts agents.ApplyOpts) (agents.FileAction, error) {
 	existing, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return agents.WriteIfNotExists(w, path, current, opts)
@@ -123,7 +123,7 @@ func writeKnowledgeItem(w io.Writer, path, current, legacy string, opts agents.A
 	switch string(existing) {
 	case current:
 		return agents.FileAction{Path: path, Action: agents.ActionSkip, Reason: "unchanged"}, nil
-	case legacy:
+	case migration:
 		return agents.WriteOwnedFile(w, path, current, opts)
 	default:
 		internalutil.Logf(w, "[gortex init] skip %s (customized Knowledge Item)", path)

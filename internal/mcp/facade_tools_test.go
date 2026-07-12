@@ -135,6 +135,19 @@ func TestFacadeSchemasAcceptUniversalCLIOutput(t *testing.T) {
 	}
 }
 
+func TestFacadeChangeSchemaAdvertisesSymbolTargets(t *testing.T) {
+	tool := facadeToolDefinition("change")
+	raw, err := json.Marshal(tool.InputSchema)
+	require.NoError(t, err)
+	var schema map[string]any
+	require.NoError(t, json.Unmarshal(raw, &schema))
+	properties := schema["properties"].(map[string]any)
+	target := properties["target"].(map[string]any)
+	targetProperties := target["properties"].(map[string]any)
+	require.Contains(t, targetProperties, "symbol")
+	require.Contains(t, targetProperties, "symbols")
+}
+
 func TestIdentifiedClientsShareDefaultSurface(t *testing.T) {
 	clients := make([]string, 0, len(knownAgentClients)+3)
 	for client := range knownAgentClients {
@@ -688,6 +701,10 @@ func TestFacadeOperationAliasesMatchLegacyContracts(t *testing.T) {
 		{"refactor", map[string]any{"operation": "move", "target": map[string]any{"symbol": "pkg/a.go::A"}, "destination": "pkg/b.go"}, map[string]any{"id": "pkg/a.go::A", "target_file": "pkg/b.go"}},
 		{"edit", map[string]any{"operation": "batch", "changes": []any{map[string]any{"op": "edit_file"}}}, map[string]any{"edits": []any{map[string]any{"op": "edit_file"}}}},
 		{"change", map[string]any{"operation": "impact", "source": map[string]any{"symbols": []any{"a", "b"}}}, map[string]any{"ids": "a,b"}},
+		{"change", map[string]any{"operation": "impact", "target": map[string]any{"symbol": "a"}}, map[string]any{"ids": "a"}},
+		{"change", map[string]any{"operation": "impact", "target": map[string]any{"symbols": []any{"a", "b"}}}, map[string]any{"ids": "a,b"}},
+		{"change", map[string]any{"operation": "impact", "source": map[string]any{"symbols": []any{"source"}}, "target": map[string]any{"symbol": "target"}}, map[string]any{"ids": "target"}},
+		{"change", map[string]any{"operation": "impact", "source": map[string]any{"symbols": []any{"source"}}, "target": map[string]any{"symbols": []any{"target-a", "target-b"}}}, map[string]any{"ids": "target-a,target-b"}},
 		{"change", map[string]any{"operation": "tests", "source": map[string]any{"symbols": []any{"a", "b"}}}, map[string]any{"ids": "a,b"}},
 		{"change", map[string]any{"operation": "guards", "source": map[string]any{"symbols": []any{"a", "b"}}}, map[string]any{"ids": "a,b"}},
 		{"change", map[string]any{"operation": "edit_plan", "source": map[string]any{"symbols": []any{"a", "b"}}}, map[string]any{"ids": "a,b"}},
@@ -996,6 +1013,47 @@ func TestFacadeCapabilitiesReturnsOperationSchema(t *testing.T) {
 	require.Equal(t, map[string]any{"file": "<file>"}, arguments["target"])
 }
 
+func TestFacadeCapabilitiesChangeImpactUsesPublicTargetSchema(t *testing.T) {
+	srv := &Server{facades: newFacadeRegistry()}
+	legacy := mcpgo.NewTool("explain_change_impact",
+		mcpgo.WithString("ids", mcpgo.Required()),
+		mcpgo.WithBoolean("summary_only"),
+		mcpgo.WithNumber("offset"),
+		mcpgo.WithNumber("limit"),
+		mcpgo.WithString("format"),
+		mcpgo.WithNumber("max_bytes"),
+	)
+	srv.facades.capture(legacy, func(context.Context, mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+		return mcpgo.NewToolResultText("ok"), nil
+	})
+	req := mcpgo.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"domain": "change", "operation": "impact", "detail": "schema"}
+	result, err := srv.handleCapabilities(context.Background(), req)
+	require.NoError(t, err)
+	out := unmarshalResult(t, result)
+
+	schema := out["input_schema"].(map[string]any)
+	properties := schema["properties"].(map[string]any)
+	require.NotContains(t, properties, "ids")
+	require.Equal(t, "impact", properties["operation"].(map[string]any)["const"])
+	require.ElementsMatch(t, []any{"operation", "target"}, schema["required"].([]any))
+
+	target := properties["target"].(map[string]any)
+	targetProperties := target["properties"].(map[string]any)
+	require.Contains(t, targetProperties, "symbol")
+	require.Contains(t, targetProperties, "symbols")
+	require.Equal(t, float64(1), target["minProperties"])
+	require.Equal(t, float64(1), target["maxProperties"])
+	require.Equal(t, false, target["additionalProperties"])
+
+	outputProperties := properties["output"].(map[string]any)["properties"].(map[string]any)
+	for _, field := range []string{"summary_only", "offset", "limit", "format", "max_bytes"} {
+		require.Contains(t, outputProperties, field)
+	}
+	shape := out["request_shape"].(map[string]any)["arguments"].(map[string]any)
+	require.Equal(t, map[string]any{"symbol": "<symbol>"}, shape["target"])
+}
+
 func TestFacadeCapabilitiesRequestShapesUsePublicMutationFields(t *testing.T) {
 	srv := &Server{facades: newFacadeRegistry()}
 	handler := func(context.Context, mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
@@ -1014,6 +1072,9 @@ func TestFacadeCapabilitiesRequestShapesUsePublicMutationFields(t *testing.T) {
 	), handler)
 	srv.facades.capture(mcpgo.NewTool("find_files"), handler)
 	srv.facades.capture(mcpgo.NewTool("api_impact"), handler)
+	srv.facades.capture(mcpgo.NewTool("explain_change_impact",
+		mcpgo.WithString("ids", mcpgo.Required()),
+	), handler)
 	srv.facades.capture(mcpgo.NewTool("symbols_for_ranges"), handler)
 	srv.facades.capture(mcpgo.NewTool("batch_edit",
 		mcpgo.WithArray("edits", mcpgo.Required()),
@@ -1054,6 +1115,9 @@ func TestFacadeCapabilitiesRequestShapesUsePublicMutationFields(t *testing.T) {
 	require.Equal(t, "<query>", files["query"])
 	apiImpact := requestShape("change", "api_impact")
 	require.Equal(t, "<file>", apiImpact["source"].(map[string]any)["file"])
+	impact := requestShape("change", "impact")
+	require.Equal(t, map[string]any{"symbol": "<symbol>"}, impact["target"])
+	require.NotContains(t, impact, "source")
 	ranges := requestShape("change", "ranges")
 	require.NotEmpty(t, ranges["source"].(map[string]any)["ranges"])
 	batch := requestShape("edit", "batch")

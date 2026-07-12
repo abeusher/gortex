@@ -32,18 +32,21 @@ func TestCLIFallbackUsesCompactPublicSurface(t *testing.T) {
 	}
 }
 
-func TestFallbackLineIsConcreteAndRejectsBareVerbShape(t *testing.T) {
+func TestMCPRequiredLineRejectsTransportFallback(t *testing.T) {
 	t.Parallel()
 
-	got := FallbackLine("get_repo_outline")
+	got := MCPRequiredLine()
 	for _, want := range []string{
-		"gortex call explore --arg operation=outline",
-		`--arg options='{"path_prefix":"<dir>/"}'`,
-		"There is no bare `gortex <tool>` verb",
+		"Native Gortex MCP is mandatory",
+		"surface a Gortex MCP integration failure",
+		"Do not start a daemon",
 	} {
 		if !strings.Contains(got, want) {
-			t.Fatalf("FallbackLine() = %q, want %q", got, want)
+			t.Fatalf("MCPRequiredLine() = %q, want %q", got, want)
 		}
+	}
+	if strings.Contains(got, "gortex call ") {
+		t.Fatalf("MCP-required guidance advertised a CLI fallback: %q", got)
 	}
 }
 

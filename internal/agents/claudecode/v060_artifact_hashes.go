@@ -10,10 +10,11 @@ import (
 	"github.com/zzet/gortex/internal/agents"
 )
 
-// These hashes are byte-for-byte fingerprints of the last legacy-vocabulary
-// artifacts shipped before the compact public surface. They let upgrades
-// replace only untouched Gortex files while preserving every customized copy.
-var legacyGlobalSkillHashes = map[string]string{
+// These hashes are byte-for-byte fingerprints of the artifacts shipped by
+// gortex v0.60.0 before the compact public surface. They let upgrades replace
+// only untouched Gortex files while preserving every customized copy. The
+// concrete retirement gate is documented in docs/versioning.md.
+var v060GlobalSkillHashes = map[string]string{
 	"gortex-add-test":               "ac7088f6146395d15e70b011e4150a1708614e03763618202cb65367f807018c",
 	"gortex-architecture-review":    "01594df88d730aab382dd3b2ef5d99c4cb03ce62ed1e04e56ef02049325efdcd",
 	"gortex-cli":                    "8c71c2290a1695fc2c2461575ff949f0d33a659fff2d291e728c8109fb81d16b",
@@ -37,7 +38,7 @@ var legacyGlobalSkillHashes = map[string]string{
 	"gortex-safe-edit":              "ccfc21a7ffc81ef8407b97cd54509f18226a09ee46a0d8fa3acc4265422f935e",
 }
 
-var legacySlashCommandHashes = map[string]string{
+var v060SlashCommandHashes = map[string]string{
 	"gortex-add-test.md":               "5dc170d682bfd0e9023b1d4f906378aa9bd017d11d1891e12166bc39f231a6d8",
 	"gortex-architecture-review.md":    "79e168a3bf9a7cc015a565b33b9e78befc96fc3ddf57f2de716caa5490154f6c",
 	"gortex-co-change.md":              "95a0176b2d231295d0936aa7e2334ee55ffa6aeddbd728f920732145cda3b784",
@@ -60,7 +61,7 @@ var legacySlashCommandHashes = map[string]string{
 	"gortex-safe-edit.md":              "5e487527a55816d64c23cc0fa080e024af3a771ed68e96c28a16940693f0b91d",
 }
 
-var legacySubAgentHashes = map[string]string{
+var v060SubAgentHashes = map[string]string{
 	"gortex-impact.md": "bcf2bebeee1a932d1896e14a8de8ae8892191aed8683e233ca1d8ffa5276dae5",
 	"gortex-search.md": "40cb39e36419993b2d75a9a13f363542bf392168e2d299e201165da7459f715b",
 }
@@ -69,11 +70,11 @@ func artifactHash(content []byte) string {
 	return fmt.Sprintf("%x", sha256.Sum256(content))
 }
 
-func isShippedAgentArtifact(existing []byte, current, legacyHash string) bool {
-	return string(existing) == current || (legacyHash != "" && artifactHash(existing) == legacyHash)
+func isShippedAgentArtifact(existing []byte, current, migrationHash string) bool {
+	return string(existing) == current || (migrationHash != "" && artifactHash(existing) == migrationHash)
 }
 
-func writeAgentArtifact(w io.Writer, path, current, legacyHash string, opts agents.ApplyOpts) (agents.FileAction, error) {
+func writeAgentArtifact(w io.Writer, path, current, migrationHash string, opts agents.ApplyOpts) (agents.FileAction, error) {
 	existing, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return agents.WriteIfNotExists(w, path, current, opts)
@@ -84,7 +85,7 @@ func writeAgentArtifact(w io.Writer, path, current, legacyHash string, opts agen
 	if string(existing) == current {
 		return agents.FileAction{Path: path, Action: agents.ActionSkip, Reason: "unchanged"}, nil
 	}
-	if legacyHash != "" && artifactHash(existing) == legacyHash {
+	if migrationHash != "" && artifactHash(existing) == migrationHash {
 		return agents.WriteOwnedFile(w, path, current, opts)
 	}
 	logWarn(w, "keeping customised agent artifact %s", path)

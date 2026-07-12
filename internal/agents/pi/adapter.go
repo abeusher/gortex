@@ -157,7 +157,7 @@ func renderExtension(env agents.Env) string {
 	src = substituteSentinel(src, sentinelBin, jsonString(bin))
 	src = substituteSentinel(src, sentinelArgv, jsonValue(argv))
 	src = substituteSentinel(src, sentinelEnforce, jsonValue(env.InstallHooks))
-	src = substituteSentinel(src, sentinelInstructions, jsonString(agents.InstructionsBody))
+	src = substituteSentinel(src, sentinelInstructions, jsonString(agents.BashInstructionsBody))
 	return src
 }
 

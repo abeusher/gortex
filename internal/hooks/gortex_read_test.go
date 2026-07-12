@@ -31,10 +31,13 @@ func TestGortexReadNudge_CompactReadShape(t *testing.T) {
 		"target":    map[string]any{"file": "internal/resolver/resolver.go"},
 	}
 	msg := gortexReadNudge(gortexCompactReadTool, input)
-	for _, want := range []string{"compress_bodies", `search(operation:"text", query:`, `read(target:{file:`, "gortex call search"} {
+	for _, want := range []string{"compress_bodies", `search(operation:"text", query:`, `read(target:{file:`, "Native Gortex MCP is mandatory"} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("compact read nudge missing %q:\n%s", want, msg)
 		}
+	}
+	if strings.Contains(msg, "gortex call ") {
+		t.Errorf("compact read nudge advertised CLI fallback:\n%s", msg)
 	}
 	for _, legacy := range []string{"search_text", "read_file", "get_editing_context"} {
 		if strings.Contains(msg, legacy) {

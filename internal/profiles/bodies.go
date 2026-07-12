@@ -49,13 +49,13 @@ var sectionExploreOpener = bt(`**Start every task with §explore§.** Describe t
 var sectionCompactWorkflow = bt(`For every coding task:
 
 1. Call §explore§ first with the complete task. Work from its returned source and call paths; do not reopen them with file or shell tools.
-2. Inspect indexed code only with §search§, §read§, §relations§, and §trace§. Do not use Read/Grep/Glob or shell equivalents while these tools are available.
+2. Inspect indexed code only with §search§, §read§, §relations§, and §trace§. Never use Read/Grep/Glob or shell equivalents for indexed source.
 3. Before mutation, call §change(operation:"impact")§; for a signature change, also call §change(operation:"verify")§ with the proposed signature. Mutate only with §edit§ or §refactor§. After mutation, call §change(operation:"detect")§, then use its symbol IDs with §change(operation:"tests")§, §change(operation:"guards")§, and §change(operation:"contract")§.
 4. Call §capabilities§ only when you need the exact fields for an operation.
 
 Common calls: §search(operation:"symbols", query:"<name>")§ · §read(target:{symbol:"<id>"})§ · §relations(operation:"usages", target:{symbol:"<id>"})§.
 
-**Bash only:** mirror the same tool and arguments with §gortex call <tool> --arg k=v§. Examples: §gortex call explore --arg task="<task>"§ and §gortex call read --arg target='{"symbol":"<id>"}'§.
+If the Gortex server is configured but these tools are missing from the callable MCP tools, report a Gortex MCP integration failure and stop. Do not start a daemon or switch to a CLI/shell fallback.
 
 `)
 
@@ -79,9 +79,9 @@ var sectionFullRuleTable = bt(`| Instead of...                       | Use...   
 
 `)
 
-// sectionCLIFallback is the shell fallback line. Load-bearing for
-// harnesses that mount no MCP tools — present in every profile.
-var sectionCLIFallback = bt(`**CLI fallback (no MCP):** every tool above is reachable from a shell as §gortex call <tool> --arg k=v§ (e.g. §gortex call read_file --arg path=<file>§) — there is no bare §gortex <tool>§ verb.
+// sectionMCPRequired keeps the legacy/full MCP profile from silently changing
+// transports when a host bridge fails to expose a configured tool.
+var sectionMCPRequired = bt(`**Native MCP required:** if a configured Gortex tool is missing from the callable MCP tools, report a Gortex MCP integration failure and stop. Do not start a daemon or use a CLI/shell fallback.
 
 `)
 
@@ -124,7 +124,7 @@ func sectionDiscovery(active, surfaceLine string) string {
 	return bt(`## Reference and discovery
 
 - **§gortex://guide§ resource** (or the §gortex guide [topic]§ CLI) is the full reference: LLM-provider matrix, capabilities catalog, analyze / search_ast catalogs, token-economy detail, MCP resources, session-start checklist. Read it on demand — it is not pre-paid here.
-- `) + surfaceLine + bt(`- The SessionStart hook injects daemon status. "daemon is not running" → run §gortex daemon start --detach§; "cwd is not covered by any tracked repo" → graph tools are unavailable there.
+- `) + surfaceLine + bt(`- MCP startup manages daemon availability. If the configured server or its tools are unavailable, report a Gortex MCP integration failure; do not start a daemon manually. "cwd is not covered by any tracked repo" means graph tools are unavailable there.
 `) + switchBullet(active, false)
 }
 
@@ -150,7 +150,7 @@ func fullBody() string {
 	return sectionHeader(false) +
 		sectionExploreOpener +
 		sectionFullRuleTable +
-		sectionCLIFallback +
+		sectionMCPRequired +
 		sectionReadDiscipline +
 		sectionMemoryFull +
 		sectionDiscovery("full", fullSurfaceLine)

@@ -573,21 +573,21 @@ func installPermissions(w io.Writer, settingsPath string, opts agents.ApplyOpts)
 		}
 		allow := perms["allow"].([]any)
 		hasGortexRule := false
-		hasLegacyWildcard := false
+		hasPreCompactWildcard := false
 		for _, entry := range allow {
 			s, ok := entry.(string)
 			if !ok || !strings.HasPrefix(s, "mcp__gortex__") {
 				continue
 			}
 			hasGortexRule = true
-			hasLegacyWildcard = hasLegacyWildcard || s == "mcp__gortex__*"
+			hasPreCompactWildcard = hasPreCompactWildcard || s == "mcp__gortex__*"
 		}
 		// Exact existing entries are user policy. Do not widen them. The one
 		// legacy wildcard is Gortex's old shipped rule and is safe to migrate.
-		if hasGortexRule && !hasLegacyWildcard {
+		if hasGortexRule && !hasPreCompactWildcard {
 			return false, nil
 		}
-		if hasLegacyWildcard {
+		if hasPreCompactWildcard {
 			filtered := allow[:0]
 			for _, entry := range allow {
 				if entry != "mcp__gortex__*" {
@@ -655,7 +655,7 @@ func SyncGlobalSkills(w io.Writer, home string, allowed []string, opts agents.Ap
 				out = append(out, agents.FileAction{Path: path, Action: agents.ActionSkip, Reason: "outside-profile"})
 				continue
 			}
-			if !isShippedAgentArtifact(existing, content, legacyGlobalSkillHashes[name]) {
+			if !isShippedAgentArtifact(existing, content, v060GlobalSkillHashes[name]) {
 				logWarn(w, "keeping customised skill %s (outside the active profile)", path)
 				out = append(out, agents.FileAction{Path: path, Action: agents.ActionSkip, Reason: "customised"})
 				continue
@@ -671,7 +671,7 @@ func SyncGlobalSkills(w io.Writer, home string, allowed []string, opts agents.Ap
 			out = append(out, agents.FileAction{Path: path, Action: agents.ActionDelete, Keys: []string{"skill"}})
 			continue
 		}
-		action, err := writeAgentArtifact(w, path, content, legacyGlobalSkillHashes[name], opts)
+		action, err := writeAgentArtifact(w, path, content, v060GlobalSkillHashes[name], opts)
 		if err != nil {
 			return out, err
 		}
@@ -690,7 +690,7 @@ func installGlobalSlashCommands(w io.Writer, home string, opts agents.ApplyOpts)
 	dir := filepath.Join(userClaudeConfigDir(home), "commands")
 	for name, content := range SlashCommands {
 		path := filepath.Join(dir, name)
-		action, err := writeAgentArtifact(w, path, content, legacySlashCommandHashes[name], opts)
+		action, err := writeAgentArtifact(w, path, content, v060SlashCommandHashes[name], opts)
 		if err != nil {
 			return out, err
 		}
@@ -708,7 +708,7 @@ func installGlobalSubAgents(w io.Writer, home string, opts agents.ApplyOpts) ([]
 	dir := filepath.Join(userClaudeConfigDir(home), "agents")
 	for name, content := range SubAgents {
 		path := filepath.Join(dir, name)
-		action, err := writeAgentArtifact(w, path, content, legacySubAgentHashes[name], opts)
+		action, err := writeAgentArtifact(w, path, content, v060SubAgentHashes[name], opts)
 		if err != nil {
 			return out, err
 		}

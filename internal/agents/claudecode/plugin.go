@@ -188,7 +188,7 @@ installs to ` + "`~/.local/bin`" + ` (or ` + "`/usr/local/bin`" + `), and runs `
 |---------|--------------|
 | **MCP server** | 21 tools over stdio via ` + "`gortex mcp`" + `: begin with ` + "`explore`" + `, inspect with ` + "`search`" + ` / ` + "`read`" + ` / ` + "`relations`" + ` / ` + "`trace`" + `, assess with ` + "`analyze`" + ` / ` + "`change`" + ` / ` + "`review`" + `, and mutate with ` + "`edit`" + ` / ` + "`refactor`" + `. ` + "`capabilities`" + ` returns an operation's exact schema on demand. |
 | **Slash commands** | Discovery: ` + "`/gortex-guide`" + `, ` + "`/gortex-explore`" + `, ` + "`/gortex-debug`" + `, ` + "`/gortex-impact`" + `, ` + "`/gortex-dataflow-trace`" + `, ` + "`/gortex-cross-repo-usage`" + `, ` + "`/gortex-co-change`" + `, ` + "`/gortex-onboarding`" + ` · Edit & refactor: ` + "`/gortex-refactor`" + `, ` + "`/gortex-safe-edit`" + `, ` + "`/gortex-rename`" + `, ` + "`/gortex-extract-function`" + `, ` + "`/gortex-fix-all`" + `, ` + "`/gortex-add-test`" + ` · Review & operate: ` + "`/gortex-pr-review`" + `, ` + "`/gortex-pr-review-agent`" + `, ` + "`/gortex-architecture-review`" + `, ` + "`/gortex-quality-audit`" + `, ` + "`/gortex-incident-investigation`" + `, ` + "`/gortex-episode-replay`" + ` |
-| **Skills** | Twenty model-invoked, task-shaped workflows. Each requires native MCP when available, starts task work with ` + "`explore`" + `, gates mutations with ` + "`change`" + `, writes through ` + "`edit`" + ` / ` + "`refactor`" + `, and verifies the result. The Bash-only CLI skill mirrors those same tool names through ` + "`gortex call`" + `. |
+| **Skills** | Twenty model-invoked, task-shaped workflows require callable native MCP, start with ` + "`explore`" + `, gate mutations with ` + "`change`" + `, write through ` + "`edit`" + ` / ` + "`refactor`" + `, and verify the result. The separate CLI skill mirrors those names through ` + "`gortex call`" + ` only for a harness with no MCP transport by design. |
 | **Hooks** | PreToolUse graph routing, PreCompact orientation, Stop post-task diagnostics, and SessionStart briefing. Hook guidance uses the same public MCP tool names. |
 
 ## First run
@@ -198,9 +198,9 @@ involves understanding code structure ("how does authentication work?",
 "what breaks if I rename ` + "`UserStore`" + `?"). Begin with ` + "`explore`" + `; the
 slash commands provide short, ordered workflows for common tasks.
 
-If ` + "`gortex daemon`" + ` is running (` + "`gortex daemon start --detach`" + ` to start it),
-all your editor sessions share one in-memory graph. Otherwise this plugin
-spawns a one-shot MCP server per session — same tools, slower cold start.
+The MCP server owns graph startup and should expose the tools without a manual
+daemon step. If configured tools are missing or unreachable, report an MCP
+integration failure; do not start a daemon manually or switch to a CLI fallback.
 
 ## Links
 

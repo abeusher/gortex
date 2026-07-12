@@ -87,7 +87,7 @@ func (a *Adapter) Apply(env agents.Env, opts agents.ApplyOpts) (*agents.Result, 
 		entry := agents.DefaultGortexMCPEntry()
 		entry["disabled"] = false
 		entry["autoApprove"] = AutoApproveTools
-		return agents.UpsertMCPServerApprovalList(root, "gortex", "autoApprove", AutoApproveTools, entry, opts, legacyAutoApproveTools), nil
+		return agents.UpsertMCPServerApprovalList(root, "gortex", "autoApprove", AutoApproveTools, entry, opts, v060AutoApproveTools), nil
 	}, opts)
 	if err != nil {
 		return res, fmt.Errorf("kiro mcp.json: %w", err)

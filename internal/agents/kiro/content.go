@@ -34,13 +34,7 @@ Use Gortex MCP tools for indexed code. This is mandatory.
 5. Mutate only with ` + "`edit`" + ` or ` + "`refactor`" + `. After mutation, call ` + "`change`" + ` operations ` + "`detect`" + `, ` + "`tests`" + `, ` + "`guards`" + `, and ` + "`contract`" + `.
 6. Call ` + "`capabilities`" + ` with ` + "`domain`" + `, ` + "`operation`" + `, and ` + "`detail: \"schema\"`" + ` when exact arguments are not already visible.
 
-Do not replace graph reads or searches with shell commands when MCP is available.
-
-If only a shell is available, use the same public tools through ` + "`gortex call <tool>`" + `. Examples:
-
-- ` + "`gortex call explore --arg operation=task --arg task=\"fix startup race\"`" + `
-- ` + "`gortex call search --arg operation=symbols --arg query=Server`" + `
-- ` + "`gortex call read --arg target='{\"symbol\":\"pkg/server.go::Server\"}'`" + `
+Do not replace graph reads or searches with shell commands. If the configured Gortex tools are missing from the callable MCP tools, report a Gortex MCP integration failure and stop; do not start a daemon or use a CLI/shell fallback.
 
 For durable context, use ` + "`recall`" + ` (` + "`surface`" + `/` + "`notes`" + `/` + "`memories`" + `) before editing known code and ` + "`remember`" + ` (` + "`note`" + `/` + "`memory`" + `) for decisions and invariants.
 `
@@ -140,9 +134,10 @@ const hookPreRead = `{
 // publishing remains approval-gated by the shared policy.
 var AutoApproveTools = agents.CompactMCPAutoApproveTools()
 
-// legacyAutoApproveTools is the exact pre-compact shipped policy and serves
-// only as a safe migration fingerprint.
-var legacyAutoApproveTools = []string{
+// v060AutoApproveTools is the exact approval policy shipped by gortex
+// v0.60.0. It is only a safe migration fingerprint. The concrete retirement
+// gate is documented in docs/versioning.md.
+var v060AutoApproveTools = []string{
 	"graph_stats", "search_symbols", "winnow_symbols", "get_symbol", "get_file_summary",
 	"get_editing_context", "get_dependencies", "get_dependents", "get_call_chain", "get_callers",
 	"find_implementations", "find_usages", "get_cluster", "get_symbol_source", "batch_symbols",

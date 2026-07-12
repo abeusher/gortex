@@ -186,7 +186,7 @@ func kimiSubagentFallbackBriefing() string {
 	sb.WriteString("[Gortex] Subagent briefing — this repo has a Gortex MCP server.\n")
 	sb.WriteString("Subagents don't inherit project instructions, so the rules below are restated inline:\n\n")
 	sb.WriteString(gortexToolGuidance)
-	sb.WriteString(toolref.FallbackLine("smart_context"))
+	sb.WriteString(toolref.MCPRequiredLine())
 	sb.WriteString("\n_First call: `explore` with the task. Before mutation, call `change(operation:\"impact\")`; inspect with `read`; mutate only with `edit` or `refactor`. After mutation, call `change(operation:\"detect\")`, then use its symbol IDs with `change` operations `tests`, `guards`, and `contract`. Never Read/Grep indexed source._\n")
 	return sb.String()
 }

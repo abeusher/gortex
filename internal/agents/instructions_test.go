@@ -139,13 +139,13 @@ const (
 )
 
 // TestInstructionsBody_PolicyCoreAndSingleHome locks the compact public
-// workflow and its Bash mirror. Agent-facing rules must not leak transport
+// workflow and its native-MCP failure posture. Agent-facing rules must not leak transport
 // versions, legacy implementation aliases, or the relocated long reference.
 func TestInstructionsBody_PolicyCoreAndSingleHome(t *testing.T) {
 	for _, token := range []string{
 		"explore", "search", "read", "relations", "trace", "change",
 		"edit", "refactor", "capabilities", "recall", "remember",
-		"gortex call read", `operation:"verify"`,
+		"Gortex MCP integration failure", `operation:"verify"`,
 	} {
 		if !strings.Contains(InstructionsBody, token) {
 			t.Errorf("InstructionsBody no longer mentions %q — policy core regression", token)
@@ -154,6 +154,7 @@ func TestInstructionsBody_PolicyCoreAndSingleHome(t *testing.T) {
 	for _, banned := range []string{
 		providerMatrixMarker, analyzeCatalogMarker, formatDeepDiveMarker,
 		"facade-v1", "search_symbols", "get_symbol_source", "tools_search",
+		"gortex call", "daemon start", "while these tools are available",
 	} {
 		if strings.Contains(InstructionsBody, banned) {
 			t.Errorf("InstructionsBody re-carries relocated content %q — single-home violation", banned)
@@ -161,6 +162,17 @@ func TestInstructionsBody_PolicyCoreAndSingleHome(t *testing.T) {
 	}
 	if len(InstructionsBody) > 2_500 {
 		t.Fatalf("InstructionsBody grew to %d bytes; keep ambient agent guidance lean", len(InstructionsBody))
+	}
+}
+
+func TestBashInstructionsBodyUsesOnlyExplicitCLIMirror(t *testing.T) {
+	for _, want := range []string{"no native MCP transport", "gortex call <tool>", "gortex call explore", "gortex call change"} {
+		if !strings.Contains(BashInstructionsBody, want) {
+			t.Errorf("BashInstructionsBody missing %q", want)
+		}
+	}
+	if strings.Contains(BashInstructionsBody, "Native Gortex MCP is mandatory") {
+		t.Error("Bash-only instructions must not claim a native MCP transport")
 	}
 }
 

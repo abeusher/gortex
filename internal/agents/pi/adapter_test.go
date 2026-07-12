@@ -284,8 +284,8 @@ func TestPiRendersCompactPublicTools(t *testing.T) {
 	if !slices.Equal(got, want) {
 		t.Fatalf("public Pi tools = %v, want %v", got, want)
 	}
-	if !strings.Contains(src, agents.InstructionsSentinel) {
-		t.Error("rendered Pi extension must carry the shared mandatory public workflow")
+	if !strings.Contains(src, agents.BashInstructionsSentinel) {
+		t.Error("rendered Pi extension must carry the mandatory Bash-only public workflow")
 	}
 }
 

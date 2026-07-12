@@ -33,9 +33,10 @@ func (a *Adapter) DocsURL() string { return DocsURL }
 // Cline fork and uses the same field and compact-tool policy.
 var alwaysAllow = agents.CompactMCPAutoApproveTools()
 
-// legacyAlwaysAllow fingerprints the exact pre-compact shipped list. User
-// customizations, including deliberately narrower lists, are never widened.
-var legacyAlwaysAllow = []string{
+// v060AlwaysAllow fingerprints the exact approval list shipped by gortex
+// v0.60.0. User customizations, including deliberately narrower lists, are
+// never widened. The concrete retirement gate is in docs/versioning.md.
+var v060AlwaysAllow = []string{
 	"graph_stats", "search_symbols", "winnow_symbols", "get_symbol", "get_file_summary",
 	"get_editing_context", "get_dependencies", "get_dependents", "get_call_chain", "get_callers",
 	"find_implementations", "find_usages", "get_cluster", "get_symbol_source", "batch_symbols",
@@ -124,7 +125,7 @@ func (a *Adapter) Apply(env agents.Env, opts agents.ApplyOpts) (*agents.Result, 
 	entry["alwaysAllow"] = alwaysAllow
 
 	merge := func(root map[string]any, _ bool) (bool, error) {
-		return agents.UpsertMCPServerApprovalList(root, "gortex", "alwaysAllow", alwaysAllow, entry, opts, legacyAlwaysAllow), nil
+		return agents.UpsertMCPServerApprovalList(root, "gortex", "alwaysAllow", alwaysAllow, entry, opts, v060AlwaysAllow), nil
 	}
 
 	// Project-level first, if a .kilocode/ dir already exists.

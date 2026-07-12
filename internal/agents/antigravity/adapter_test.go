@@ -60,32 +60,28 @@ func TestAntigravityRegistersMCPAndWritesKI(t *testing.T) {
 		agents.InstructionsSentinel,
 		"Call `explore` first",
 		"change(operation:\"impact\")",
-		"gortex call explore",
+		"Gortex MCP integration failure",
 	} {
 		if !strings.Contains(text, want) {
 			t.Errorf("Antigravity instructions missing %q", want)
 		}
 	}
-	for _, forbidden := range []string{"./gortex query", "facade-v1", "tools_search"} {
+	for _, forbidden := range []string{"./gortex query", "facade-v1", "tools_search", "gortex call", "daemon start"} {
 		if strings.Contains(text, forbidden) {
 			t.Errorf("Antigravity instructions contain obsolete agent vocabulary %q", forbidden)
 		}
 	}
-	if strings.Index(text, agents.InstructionsSentinel) > strings.Index(text, "gortex call explore") {
-		t.Error("native MCP workflow must precede the Bash fallback")
-	}
-
 	agentstest.AssertIdempotent(t, a, env)
 }
 
-func TestAntigravityMigratesExactLegacyKI(t *testing.T) {
+func TestAntigravityMigratesExactV060KI(t *testing.T) {
 	env, _ := agentstest.NewEnv(t)
 	kiBase := filepath.Join(env.Home, ".gemini", "antigravity", "knowledge", "gortex-workflow")
 	metadataPath := filepath.Join(kiBase, "metadata.json")
 	instructionsPath := filepath.Join(kiBase, "artifacts", "gortex-instructions.md")
 	for path, content := range map[string]string{
-		metadataPath:     legacyMetadata,
-		instructionsPath: legacyInstructions,
+		metadataPath:     v060Metadata,
+		instructionsPath: v060Instructions,
 	} {
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			t.Fatal(err)
@@ -107,7 +103,7 @@ func TestAntigravityMigratesExactLegacyKI(t *testing.T) {
 			t.Fatal(err)
 		}
 		if string(got) != want {
-			t.Errorf("legacy artifact %s was not migrated", path)
+			t.Errorf("v0.60.0 artifact %s was not migrated", path)
 		}
 	}
 }

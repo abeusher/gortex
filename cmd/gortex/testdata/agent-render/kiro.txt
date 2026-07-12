@@ -126,12 +126,6 @@ Use Gortex MCP tools for indexed code. This is mandatory.
 5. Mutate only with `edit` or `refactor`. After mutation, call `change` operations `detect`, `tests`, `guards`, and `contract`.
 6. Call `capabilities` with `domain`, `operation`, and `detail: "schema"` when exact arguments are not already visible.
 
-Do not replace graph reads or searches with shell commands when MCP is available.
-
-If only a shell is available, use the same public tools through `gortex call <tool>`. Examples:
-
-- `gortex call explore --arg operation=task --arg task="fix startup race"`
-- `gortex call search --arg operation=symbols --arg query=Server`
-- `gortex call read --arg target='{"symbol":"pkg/server.go::Server"}'`
+Do not replace graph reads or searches with shell commands. If the configured Gortex tools are missing from the callable MCP tools, report a Gortex MCP integration failure and stop; do not start a daemon or use a CLI/shell fallback.
 
 For durable context, use `recall` (`surface`/`notes`/`memories`) before editing known code and `remember` (`note`/`memory`) for decisions and invariants.

@@ -29,6 +29,10 @@ import (
 // like AGENTS.md) we skip to stay idempotent.
 const InstructionsSentinel = "## MANDATORY: Use Gortex MCP tools"
 
+// BashInstructionsSentinel identifies the separate policy installed only by
+// harness adapters that have no native MCP transport.
+const BashInstructionsSentinel = "## MANDATORY: Use the Gortex public CLI mirror"
+
 // CommunitiesStartMarker / CommunitiesEndMarker fence the generated
 // community-routing block that `gortex init` writes into per-repo
 // instructions files. Fenced (not just start-only) because this block
@@ -67,15 +71,16 @@ func GlobalPointerBody(instructionsDir string) string {
 }
 
 // InstructionsBody is the shared, agent-neutral rule block every doc-aware
-// adapter writes. It names only the compact public tools and gives the exact
-// Bash mirror; transport versions and implementation aliases do not belong in
-// an agent's working context.
+// adapter writes. It names only the compact public tools and treats a missing
+// callable handle as an integration failure; transport versions,
+// implementation aliases, and cross-transport fallbacks do not belong in an
+// MCP-capable agent's working context.
 const InstructionsBody = `## MANDATORY: Use Gortex MCP tools instead of Read/Grep
 
 For every coding task:
 
 1. Call ` + "`" + `explore` + "`" + ` first with the complete task. Work from the returned source and call paths; do not reopen them with file or shell tools.
-2. Inspect indexed code only with ` + "`" + `search` + "`" + `, ` + "`" + `read` + "`" + `, ` + "`" + `relations` + "`" + `, and ` + "`" + `trace` + "`" + `. Do not use Read/Grep/Glob or shell equivalents while these tools are available.
+2. Inspect indexed code only with ` + "`" + `search` + "`" + `, ` + "`" + `read` + "`" + `, ` + "`" + `relations` + "`" + `, and ` + "`" + `trace` + "`" + `. Never use Read/Grep/Glob or shell equivalents for indexed source.
 3. Before mutation, call ` + "`" + `change(operation:"impact")` + "`" + `; for a signature change, also call ` + "`" + `change(operation:"verify")` + "`" + ` with the proposed signature. Mutate only with ` + "`" + `edit` + "`" + ` or ` + "`" + `refactor` + "`" + `. After mutation, call ` + "`" + `change(operation:"detect")` + "`" + `, then use its symbol IDs with ` + "`" + `change(operation:"tests")` + "`" + `, ` + "`" + `change(operation:"guards")` + "`" + `, and ` + "`" + `change(operation:"contract")` + "`" + `.
 4. Call ` + "`" + `capabilities` + "`" + ` only when you need the exact fields for an operation.
 
@@ -86,14 +91,22 @@ Common calls:
 - ` + "`" + `relations({operation:"usages", target:{symbol:"<id>"}})` + "`" + `
 - ` + "`" + `edit({target:{file:"<path>"}, match:"<old>", replacement:"<new>"})` + "`" + `
 
-If MCP tools are unavailable but Bash is available, use the same tool names and arguments through ` + "`" + `gortex call` + "`" + `:
-
-- ` + "`" + `gortex call explore --arg task="<task>"` + "`" + `
-- ` + "`" + `gortex call search --arg operation=symbols --arg query="<name>"` + "`" + `
-- ` + "`" + `gortex call read --arg target='{"symbol":"<file>::<Name|Recv.Name>"}'` + "`" + `
-- ` + "`" + `gortex call capabilities --arg domain=read --arg operation=source --arg detail=schema` + "`" + `
+If the Gortex server is configured but these tools are missing from the callable MCP tools, report a Gortex MCP integration failure and stop. Do not start a daemon or switch to a CLI/shell fallback.
 
 Use ` + "`" + `recall` + "`" + ` before revisiting prior work and ` + "`" + `remember` + "`" + ` immediately for durable decisions, invariants, or gotchas.
+`
+
+// BashInstructionsBody is used only by harnesses that genuinely have no MCP
+// transport. It mirrors the same compact public surface through the CLI rather
+// than teaching MCP-capable agents to silently change transports.
+const BashInstructionsBody = BashInstructionsSentinel + ` instead of raw source reads/searches
+
+This harness has no native MCP transport. Invoke public Gortex tools only as ` + "`" + `gortex call <tool>` + "`" + `; never invent a bare ` + "`" + `gortex <tool>` + "`" + ` command.
+
+1. Start every coding task with ` + "`" + `gortex call explore --arg task="<task>"` + "`" + `.
+2. Inspect with ` + "`" + `gortex call search` + "`" + `, ` + "`" + `gortex call read` + "`" + `, ` + "`" + `gortex call relations` + "`" + `, or ` + "`" + `gortex call trace` + "`" + ` instead of Read/Grep/Glob or shell equivalents.
+3. Before mutation call ` + "`" + `gortex call change --arg operation=impact` + "`" + `. Mutate only through ` + "`" + `gortex call edit` + "`" + ` or ` + "`" + `gortex call refactor` + "`" + `; afterward run change operations ` + "`" + `detect` + "`" + `, ` + "`" + `tests` + "`" + `, ` + "`" + `guards` + "`" + `, and ` + "`" + `contract` + "`" + `.
+4. Use ` + "`" + `gortex call capabilities` + "`" + ` only when exact operation fields are unknown.
 `
 
 // AppendInstructions appends body to path, creating the file if

@@ -7,13 +7,17 @@ import (
 )
 
 // TestCommandPRReviewAgent_ShellsTheReviewVerb asserts the agent-review skill
-// retains the dedicated CLI path for Bash-only harnesses while requiring MCP
-// whenever native tools are present.
+// retains the dedicated CLI path only for a harness with no MCP transport by
+// design. A missing configured handle remains an integration failure.
 func TestCommandPRReviewAgent_ShellsTheReviewVerb(t *testing.T) {
 	for _, want := range []string{
-		"native Gortex MCP is available, it is mandatory",
+		"Native Gortex MCP is mandatory",
 		"review({operation: \"run\"",
-		"## Bash-only fallback",
+		"configured callable tools are missing",
+		"Gortex MCP integration failure",
+		"do not start a daemon or use the Bash path below",
+		"## Bash-only harness",
+		"no MCP transport by design",
 		"gortex review --audience agent",
 		"--format json",
 		"VERDICT:",
@@ -22,6 +26,9 @@ func TestCommandPRReviewAgent_ShellsTheReviewVerb(t *testing.T) {
 		if !strings.Contains(commandPRReviewAgent, want) {
 			t.Errorf("commandPRReviewAgent must reference %q so the agent shells the verb and parses its output", want)
 		}
+	}
+	if strings.Contains(commandPRReviewAgent, "when native Gortex MCP is available") {
+		t.Error("commandPRReviewAgent must not reinterpret a missing MCP bridge as transport unavailability")
 	}
 }
 

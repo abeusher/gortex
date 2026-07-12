@@ -319,7 +319,7 @@ func nudgeReason(guidance string) string {
 	var b strings.Builder
 	b.WriteString("[Gortex] You've made several raw file-search calls in a row. ")
 	b.WriteString("Call `explore` for the task, then use `search`, `read`, or `relations`; do not continue the raw search/read loop.\n")
-	b.WriteString(toolref.FallbackLine("search_symbols"))
+	b.WriteString(toolref.MCPRequiredLine())
 	if guidance != "" {
 		b.WriteString(guidance)
 		if !strings.HasSuffix(guidance, "\n") {
@@ -382,7 +382,7 @@ func enrichRead(toolInput map[string]any, cwd string) enrichResult {
 		reason.WriteString("  - `read(target:{symbols:[\"<id>\"]})` — several symbols\n")
 		reason.WriteString("  - `read(operation:\"editing_context\", target:{file:\"<path>\"})` — full editing context\n")
 		reason.WriteString(gcxTip)
-		reason.WriteString(toolref.FallbackLine("get_symbol_source"))
+		reason.WriteString(toolref.MCPRequiredLine())
 
 		return enrichResult{
 			deny:   true,
@@ -397,7 +397,7 @@ func enrichRead(toolInput map[string]any, cwd string) enrichResult {
 	guidance.WriteString("  - before editing: `read(operation:\"editing_context\", target:{file:\"<path>\"})`\n")
 	guidance.WriteString("  - file overview: `read(operation:\"summary\", target:{file:\"<path>\"})`\n")
 	guidance.WriteString(gcxTip)
-	guidance.WriteString(toolref.FallbackLine("get_symbol_source"))
+	guidance.WriteString(toolref.MCPRequiredLine())
 
 	return enrichResult{context: guidance.String()}
 }
@@ -651,7 +651,7 @@ func defaultGrepGuidance() string {
 	b.WriteString("  - references: `relations(operation:\"usages\", target:{symbol:\"<id>\"})`; choose `callers` or `implementations` when that is the required relation\n")
 	b.WriteString("  - TODOs or contracts: `analyze(kind:\"todos\")` or `analyze(kind:\"contracts\")`\n")
 	b.WriteString(gcxTip)
-	b.WriteString(toolref.FallbackLine("search_symbols"))
+	b.WriteString(toolref.MCPRequiredLine())
 	return b.String()
 }
 
@@ -674,7 +674,7 @@ func formatGrepDeny(pattern string, hits []grepSymbolHit) string {
 	b.WriteString("\n")
 	b.WriteString("Localizing a task rather than one symbol? `explore` returns the ranked neighborhood (symbols + source + call paths) in one call.\n")
 	b.WriteString(gcxTip)
-	b.WriteString(toolref.FallbackLine("search_symbols"))
+	b.WriteString(toolref.MCPRequiredLine())
 	b.WriteString("To force text search, add a regex metachar (e.g. \\b) or quote the pattern.")
 	return b.String()
 }
@@ -907,7 +907,7 @@ func enrichBash(toolInput map[string]any, cwd string) enrichResult {
 			reason.WriteString("  - file overview: `read(operation:\"summary\", target:{file:\"<path>\"})`\n")
 			reason.WriteString("  - before editing: `read(operation:\"editing_context\", target:{file:\"<path>\"})`\n")
 			reason.WriteString(gcxTip)
-			reason.WriteString(toolref.FallbackLine("get_symbol_source"))
+			reason.WriteString(toolref.MCPRequiredLine())
 			return enrichResult{deny: true, reason: reason.String()}
 		}
 		// Not indexed — soft guidance so Bash proceeds.
@@ -915,7 +915,7 @@ func enrichBash(toolInput map[string]any, cwd string) enrichResult {
 		g.WriteString("[Gortex] Use `read` instead of Bash cat/head/tail for indexed source:\n")
 		g.WriteString("  - `read(target:{symbol:\"<id>\"})` for one symbol; use operation `summary` for an overview or `editing_context` before editing\n")
 		g.WriteString(gcxTip)
-		g.WriteString(toolref.FallbackLine("get_symbol_source"))
+		g.WriteString(toolref.MCPRequiredLine())
 		return enrichResult{context: g.String()}
 	}
 
@@ -955,7 +955,7 @@ func enrichGlob(toolInput map[string]any) enrichResult {
 		b.WriteString("  - `search(operation:\"symbols\")` — name-based lookup with file paths\n")
 		b.WriteString("  - `read(operation:\"summary\", target:{file:\"<path>\"})` — a specific file overview\n")
 		b.WriteString(gcxTip)
-		b.WriteString(toolref.FallbackLine("get_repo_outline"))
+		b.WriteString(toolref.MCPRequiredLine())
 		b.WriteString("If you genuinely need a file-system listing, run `find` or `ls` via Bash with a specific filename component — Glob deny only triggers on bare extension wildcards.")
 		return enrichResult{deny: true, reason: b.String()}
 	}
@@ -973,7 +973,7 @@ func defaultGlobGuidance() string {
 		"  - task-level discovery: `explore`\n" +
 		"  - For migration / SQL globs (`db/migrations/*.sql`, `**/*.sql`): use `analyze kind=orphan_tables` and `kind=unreferenced_tables` to find queried-but-undeclared and provided-but-unused tables\n" +
 		gcxTip +
-		toolref.FallbackLine("search_symbols")
+		toolref.MCPRequiredLine()
 }
 
 // isGreedySourceGlob returns true when the pattern is a bare
@@ -1049,7 +1049,7 @@ func enrichEdit(toolInput map[string]any, cwd string) enrichResult {
 	fmt.Fprintf(&b, "[Gortex] BLOCKED: Edit of %s (indexed source). Use Gortex MCP edit tools — they don't require a prior Read and update the graph atomically:\n", filePath)
 	b.WriteString("  - choose `edit` operation `symbol`, `file`, or `batch`; for example `edit(operation:\"file\", target:{file:\"<path>\"})`\n")
 	b.WriteString("  - `refactor(operation:\"rename\")` for a coordinated rename\n\n")
-	b.WriteString(toolref.FallbackLine("edit_file"))
+	b.WriteString(toolref.MCPRequiredLine())
 	b.WriteString("To bypass this redirect: unset GORTEX_HOOK_BLOCK_EDIT, or target a file outside the tracked repos.\n")
 	return enrichResult{deny: true, reason: b.String()}
 }
@@ -1077,7 +1077,7 @@ func enrichWrite(toolInput map[string]any, cwd string) enrichResult {
 	fmt.Fprintf(&b, "[Gortex] BLOCKED: Write of %s (indexed source — would overwrite existing tracked file). Use:\n", filePath)
 	b.WriteString("  - `edit(operation:\"write\")` for a whole-file write\n")
 	b.WriteString("  - `edit(operation:\"file\")` for a guarded replacement\n\n")
-	b.WriteString(toolref.FallbackLine("edit_file"))
+	b.WriteString(toolref.MCPRequiredLine())
 	b.WriteString("To bypass: unset GORTEX_HOOK_BLOCK_EDIT, or target a path outside tracked repos.\n")
 	return enrichResult{deny: true, reason: b.String()}
 }

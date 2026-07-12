@@ -909,11 +909,22 @@ func (w *Watcher) drainStorm() {
 	}
 	start := time.Now()
 	w.logger.Info("watcher: storm drain starting", zap.Int("paths", len(batch)))
+	finishTopologyMutation := reach.BeginTopologyMutation(w.indexer.graph)
+	mutationFinished := false
+	defer func() {
+		if !mutationFinished {
+			// The batch is non-empty and may have partially applied before a
+			// panic. Invalidate conservatively before unblocking readers.
+			finishTopologyMutation(true)
+		}
+	}()
 
 	for path, kind := range batch {
 		w.patchGraphNoResolve(path, kind)
 	}
 	w.indexer.ResolveAll()
+	finishTopologyMutation(true)
+	mutationFinished = true
 
 	w.logger.Info("watcher: storm drain complete",
 		zap.Int("paths", len(batch)),
@@ -1005,6 +1016,30 @@ func (w *Watcher) patchGraph(path string, kind ChangeKind) {
 	kind = w.reconcileKindWithDisk(path, kind)
 	start := time.Now()
 	var nodesAdded, nodesRemoved, edgesAdded, edgesRemoved int
+	var finishTopologyMutation func(bool)
+	topologyChanged := false
+	// Keep a panic/error-safe release so no lookup can remain parked behind the
+	// reach topology gate if an incremental path exits early.
+	defer func() {
+		if finishTopologyMutation != nil {
+			finishTopologyMutation(topologyChanged)
+		}
+	}()
+	beginTopologyMutation := func() {
+		finishTopologyMutation = reach.BeginTopologyMutation(w.indexer.graph)
+		// Conservatively invalidate after every structural reindex attempt. Most
+		// parse failures leave the old graph untouched, but treating that as a
+		// cache miss is safer than trusting count-based telemetry to prove no
+		// resolver edge was retargeted.
+		topologyChanged = true
+	}
+	endTopologyMutation := func() {
+		if finishTopologyMutation == nil {
+			return
+		}
+		finishTopologyMutation(topologyChanged)
+		finishTopologyMutation = nil
+	}
 
 	// Two keys for this file. relPath (RelKey: slash form + NFC) is the
 	// mtime-forget / change-callback key. graphKey (graphRelKey:
@@ -1024,6 +1059,7 @@ func (w *Watcher) patchGraph(path string, kind ChangeKind) {
 
 	switch kind {
 	case ChangeCreated:
+		beginTopologyMutation()
 		if err := w.indexer.IndexFile(path); err != nil {
 			w.logger.Warn("index file failed", zap.String("path", path), zap.Error(err))
 			return
@@ -1031,6 +1067,7 @@ func (w *Watcher) patchGraph(path string, kind ChangeKind) {
 		newSymbols := w.indexer.graph.GetFileNodes(graphKey)
 		nodesAdded = len(newSymbols)
 		edgesAdded = w.countFileEdges(newSymbols)
+		endTopologyMutation()
 
 		// Notify callback: no old symbols, only new symbols.
 		w.symbolChangeCbMu.RLock()
@@ -1074,6 +1111,7 @@ func (w *Watcher) patchGraph(path string, kind ChangeKind) {
 		fileEdgesBefore := w.countFileEdges(priorNodes)
 		resolvedBefore := w.countResolvedFileEdges(priorNodes)
 		incomingBeforeByID := w.resolvedIncomingByNode(priorNodes)
+		beginTopologyMutation()
 		if err := w.indexer.IndexFile(path); err != nil {
 			w.logger.Warn("reindex file failed", zap.String("path", path), zap.Error(err))
 			return
@@ -1097,6 +1135,7 @@ func (w *Watcher) patchGraph(path string, kind ChangeKind) {
 		// self-heals instead of persisting the degraded shape.
 		incomingBefore, incomingAfter := w.incomingRegressionForSurvivors(incomingBeforeByID, newSymbols)
 		w.guardResolvedEdgeRegression(path, len(priorNodes), len(newSymbols), resolvedBefore, w.countResolvedFileEdges(newSymbols), incomingBefore, incomingAfter)
+		endTopologyMutation()
 
 		// Notify callback with old and new symbols.
 		w.symbolChangeCbMu.RLock()
@@ -1110,9 +1149,11 @@ func (w *Watcher) patchGraph(path string, kind ChangeKind) {
 		// Snapshot old symbols before eviction.
 		oldSymbols := w.snapshotSymbols(graphKey)
 
+		beginTopologyMutation()
 		nr, er := w.indexer.EvictFile(path)
 		nodesRemoved = nr
 		edgesRemoved = er
+		endTopologyMutation()
 
 		// The file is genuinely gone from disk here — reconcileKindWithDisk
 		// already downgraded a replace/revert (path still present) to
@@ -1141,19 +1182,11 @@ func (w *Watcher) patchGraph(path string, kind ChangeKind) {
 		DurationMs:   time.Since(start).Milliseconds(),
 	}
 
-	// Rebuild the reachability index so AnalyzeImpact /
-	// explain_change_impact stay correct against the patched topology.
-	// Lazy reach: instead of eagerly recomputing every seed's reach
-	// after a watcher-driven patch (the old reach.BuildIndex call
-	// here paid the full O(seeds) cost on every file edit), we just
-	// invalidate the build counter so subsequent AnalyzeImpact calls
-	// recompute on demand against the fresh graph. No-op patches
-	// (nodesAdded == 0 && nodesRemoved == 0 && edgesAdded == 0 &&
-	// edgesRemoved == 0) leave the counter alone so existing caches
-	// stay valid.
-	if nodesAdded+nodesRemoved+edgesAdded+edgesRemoved > 0 {
-		reach.InvalidateIndex()
-	}
+	// Reach invalidation is published by endTopologyMutation before any
+	// callbacks or events can observe the new graph. The topology gate spans
+	// IndexFile's parse-then-swap and nested resolver work without taking the
+	// resolver's non-reentrant mutex twice; impact readers therefore see the
+	// complete old graph or the complete new graph, never the eviction gap.
 
 	w.historyMu.Lock()
 	w.history = append(w.history, ev)

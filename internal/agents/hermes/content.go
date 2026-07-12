@@ -99,13 +99,7 @@ Use Gortex MCP tools for indexed code. This is mandatory.
 5. Mutate only with ` + "`edit`" + ` or ` + "`refactor`" + `. After mutation, call ` + "`change`" + ` operations ` + "`detect`" + `, ` + "`tests`" + `, ` + "`guards`" + `, and ` + "`contract`" + `.
 6. Call ` + "`capabilities`" + ` with ` + "`domain`" + `, ` + "`operation`" + `, and ` + "`detail: \"schema\"`" + ` when exact arguments are not visible.
 
-Do not replace graph reads or searches with terminal commands when MCP is available.
-
-If only the terminal is available, call the same public tools through ` + "`gortex call <tool>`" + `:
-
-- ` + "`gortex call explore --arg operation=task --arg task=\"fix startup race\"`" + `
-- ` + "`gortex call search --arg operation=symbols --arg query=Server`" + `
-- ` + "`gortex call read --arg target='{\"symbol\":\"pkg/server.go::Server\"}'`" + `
+Do not replace graph reads or searches with terminal commands. If the configured Gortex tools are missing from the callable MCP tools, report a Gortex MCP integration failure and stop; do not start a daemon or use a CLI/shell fallback.
 
 Use ` + "`workspace`" + ` for local index, repository, and project state. Use ` + "`workspace_admin`" + ` only when the user asks to change that state. Use ` + "`recall`" + ` before editing known code and ` + "`remember`" + ` for durable decisions or invariants.
 `

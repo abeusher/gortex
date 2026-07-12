@@ -227,7 +227,8 @@ description: "Coding-agent review verdict via the gortex review verb."
 const nativeMCPRules = `
 ## Required behavior
 
-- Use native Gortex MCP tools when they are available. Do not substitute shell reads, file search, or Git plumbing.
+- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
+- Do not substitute shell reads, file search, or Git plumbing.
 - Start task-shaped work with ` + "`explore`" + `. For one already-known symbol, start with ` + "`search`" + `.
 - Use ` + "`change`" + ` before a mutation and again after it. Write only through ` + "`edit`" + ` or ` + "`refactor`" + `.
 - Call ` + "`capabilities({domain: \"<tool>\", operation: \"<operation>\", detail: \"schema\"})`" + ` only when an operation's exact arguments are unclear.
@@ -402,18 +403,20 @@ const commandPRReview = `# Review a Change with Gortex
 
 const commandPRReviewAgent = `# Review a Change as a Sub-Agent
 
-When native Gortex MCP is available, it is mandatory: call ` + "`review({operation: \"run\", source: {scope: \"<scope>\"}})`" + `, then use ` + "`change`" + ` operations ` + "`guards`" + `, ` + "`tests`" + `, and ` + "`contract`" + `. When the proposed signature is known, run operation ` + "`verify`" + ` before mutation. Return ` + "`VERDICT:`" + ` plus actionable findings with severity and ` + "`file:line`" + `.
+## MCP-capable harness
 
-## Bash-only fallback
+Native Gortex MCP is mandatory. Call ` + "`review({operation: \"run\", source: {scope: \"<scope>\"}})`" + `, then use ` + "`change`" + ` operations ` + "`guards`" + `, ` + "`tests`" + `, and ` + "`contract`" + `. When the proposed signature is known, run operation ` + "`verify`" + ` before mutation. If the configured callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or use the Bash path below.
 
-Use this only when the harness exposes Bash but no MCP tools:
+## Bash-only harness
+
+Use this path only when the harness has no MCP transport by design:
 
 ` + "```bash" + `
 gortex review --audience agent --format json
 ` + "```" + `
 
-Parse the JSON; do not replace it with ad-hoc ` + "`git diff`" + ` inspection. Return ` + "`VERDICT: clean`" + ` or ` + "`VERDICT: findings`" + ` followed by the tool's evidence-backed ` + "`file:line`" + ` items.
-` + nativeMCPRules
+In either mode, return ` + "`VERDICT: clean`" + ` or ` + "`VERDICT: findings`" + ` followed by actionable findings with severity and ` + "`file:line`" + `. Do not replace graph-backed review with ad-hoc ` + "`git diff`" + ` inspection.
+`
 
 const skillGortexCLI = `---
 name: gortex-cli
@@ -421,7 +424,7 @@ description: "Bash-only mirror of Gortex MCP tools for harnesses without MCP sup
 ---
 # Gortex from a Bash-Only Harness
 
-Use this skill only when native Gortex MCP tools are unavailable. If MCP is present, the MCP path is mandatory.
+Use this skill only in a harness that has no MCP transport by design. If a Gortex MCP server is configured but its callable tools are missing, report an integration failure; do not use this skill as a fallback.
 
 Every public MCP tool has the same name through ` + "`gortex call`" + `:
 
@@ -430,7 +433,7 @@ gortex call explore --arg task='locate the authentication flow'
 gortex call search --arg operation=symbols --arg query=UserStore
 gortex call read --arg target='{"symbol":"internal/store.go::UserStore"}'
 gortex call relations --arg operation=usages --arg target='{"symbol":"internal/store.go::UserStore"}'
-gortex call change --arg operation=impact --arg source='{"symbols":["internal/store.go::UserStore"]}'
+gortex call change --arg operation=impact --arg target='{"symbol":"internal/store.go::UserStore"}'
 gortex call edit --arg target='{"file":"internal/store.go"}' --arg match='old text' --arg replacement='new text'
 gortex call change --arg operation=detect --arg source='{"scope":"all"}'
 ` + "```" + `

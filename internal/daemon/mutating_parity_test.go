@@ -2,11 +2,11 @@ package daemon
 
 import "testing"
 
-// legacyEditingToolNames mirrors the planning-mode editing set that used
-// to live in internal/mcp (tools_mode.go::editingToolNames) before the
-// consolidation. Duplicated here as a fixture so the parity test fails
-// closed if the canonical set ever drops one of them.
-var legacyEditingToolNames = []string{
+// preConsolidationEditingToolNames mirrors the planning-mode editing set that
+// lived in internal/mcp (tools_mode.go::editingToolNames) before the effect
+// registry became canonical. The fixture makes parity fail closed if the
+// canonical set ever drops one of them.
+var preConsolidationEditingToolNames = []string{
 	"edit_file", "edit_symbol", "write_file", "rename_symbol",
 }
 
@@ -23,7 +23,7 @@ var cloudMutatingDenied = []string{
 // superset of both legacy write-tool lists — the single source of truth
 // the planning-mode gate and the federation write-gate both consult.
 func TestMutatingTools_Superset(t *testing.T) {
-	for _, name := range legacyEditingToolNames {
+	for _, name := range preConsolidationEditingToolNames {
 		if !MutatingTools[name] {
 			t.Errorf("MutatingTools is missing legacy editing tool %q", name)
 		}

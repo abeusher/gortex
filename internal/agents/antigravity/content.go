@@ -8,16 +8,17 @@ import "github.com/zzet/gortex/internal/agents"
 
 // Metadata is the KI manifest. Antigravity reads it to show the KI in its UI
 // and locate the public-tool workflow. The summary is deliberately transport
-// specific: native MCP first, with Bash only as an availability fallback.
+// specific: this adapter registers native MCP, so missing handles are an
+// integration failure rather than permission to change transports.
 const Metadata = `{
-  "summary": "MANDATORY: Use Gortex MCP tools first for indexed code. Use gortex call only when MCP is unavailable and Bash is the only transport.",
+  "summary": "MANDATORY: Use native Gortex MCP tools for indexed code. If configured tools are missing, report an MCP integration failure; do not start a daemon or use a CLI fallback.",
   "references": ["artifacts/gortex-instructions.md"]
 }
 `
 
 // Instructions reuses the same compact, agent-neutral workflow installed by
-// every other adapter. Antigravity's native MCP registration makes the direct
-// tool calls primary; the shared body names gortex call only as a Bash fallback.
+// every other MCP adapter. Antigravity's native MCP registration makes direct
+// tool calls mandatory.
 const Instructions = `---
 type: "Knowledge Item"
 description: "Mandatory Gortex public-tool workflow"
@@ -25,17 +26,17 @@ description: "Mandatory Gortex public-tool workflow"
 
 ` + agents.InstructionsBody
 
-// These exact artifacts shipped before the compact public-tool surface. They
-// remain here solely as byte-for-byte migration fingerprints; customized KI
-// files never match them and are therefore preserved.
-const legacyMetadata = `{
+// These exact artifacts shipped in gortex v0.60.0. They remain solely as
+// byte-for-byte migration fingerprints; customized KI files never match them
+// and are therefore preserved. The retirement gate is in docs/versioning.md.
+const v060Metadata = `{
   "summary": "MANDATORY: Instructions on how to use the local gortex engine CLI to significantly improve codebase intelligence. Antigravity must use run_command with gortex query over standard file read commands.",
   "references": ["artifacts/gortex-instructions.md"]
 }
 `
 
-// legacyInstructions is the former CLI-first KI body.
-const legacyInstructions = `---
+// v060Instructions is the v0.60.0 CLI-first KI body.
+const v060Instructions = `---
 type: "Knowledge Item"
 description: "Gortex Workflow and Tools for Antigravity"
 ---

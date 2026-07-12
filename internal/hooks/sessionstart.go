@@ -117,8 +117,7 @@ func buildSessionStartBriefing(cwd string) string {
 	status, err := sessionStartStatusFn()
 	switch {
 	case errors.Is(err, errDaemonUnreachable):
-		sb.WriteString("⚠️  **Gortex daemon is not running.** Code-operation enforcement is disabled for this session: Read/Grep/Glob/Bash on indexed source files will not be redirected to graph tools.\n\n")
-		sb.WriteString("Start it with: `gortex daemon start --detach`\n\n")
+		sb.WriteString("⚠️  **Gortex graph transport is unreachable.** Required native MCP tools and code-operation enforcement cannot be assumed healthy. Treat this as an MCP integration failure: stop indexed code operations and report it; do not start a daemon manually or switch to a CLI fallback.\n\n")
 		sb.WriteString(rulePreamble())
 		return sb.String()
 	case err != nil:
@@ -293,7 +292,7 @@ func rulePreamble() string {
 	return "**Rule:** Call `explore` first for every code task. Inspect indexed code with `search`, `read`, `relations`, or `trace`; never Read/Grep/Glob it. " +
 		"Before mutation call `change(operation:\"impact\")`; for a signature change also call `change(operation:\"verify\")` with the proposed signature. Mutate only with `edit` or `refactor`. After mutation call `change(operation:\"detect\")`; use the returned symbol IDs with `change` operations `tests`, `guards`, and `contract`. " +
 		"Call `capabilities` only when exact operation fields are unknown.\n" +
-		"Shell only (no MCP tools)? Reach any tool with `gortex call <tool> --arg k=v` (e.g. `" + toolref.CLIFallback("get_symbol_source") + "`) — there is no bare `gortex <tool>` verb.\n"
+		toolref.MCPRequiredLine()
 }
 
 // formatDuration renders a number of seconds as "1h7m" or "45s".

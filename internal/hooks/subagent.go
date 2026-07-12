@@ -44,7 +44,7 @@ func enrichTask(toolInput map[string]any, port int) enrichResult {
 	sb.WriteString("Subagents don't inherit CLAUDE.md, so the rules below are restated inline:\n\n")
 
 	sb.WriteString(gortexToolGuidance)
-	sb.WriteString(toolref.FallbackLine("smart_context"))
+	sb.WriteString(toolref.MCPRequiredLine())
 	sb.WriteString("\n")
 
 	if summary := renderStatsSummary(stats); summary != "" {

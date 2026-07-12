@@ -162,6 +162,14 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 			prod = append(prod, c)
 		}
 	}
+	// Natural-language localization can retrieve a large cross-file collision
+	// set for a generic data-leaf name (for example, one `client` variable per
+	// package). BM25 legitimately ranks those short exact-name documents highly,
+	// but returning every collision crowds callable/type targets out of the
+	// neighborhood. Keep the best leaf for evidence and move only repeated
+	// same-name leaves behind other production definitions. Identifier/path
+	// lookups retain their literal ordering.
+	prod = demoteRepeatedExploreDataNames(prod, rerank.ClassifyQuery(searchQuery))
 	// Bounded per-file diversification (the same demote-only mechanism the
 	// ranked search head uses): a localization neighborhood that spans
 	// files beats one file's cluster of sibling shims crowding out every
@@ -184,7 +192,7 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	}
 	if len(cands) == 0 {
 		return mcp.NewToolResultText(fmt.Sprintf(
-			"EXPLORE — %s\n\nNo ranked symbols matched this request. The graph found nothing on the ranked path — widen the wording, or drop to search_text / find_files for a literal or filename lead.",
+			"EXPLORE — %s\n\nNo ranked symbols matched this request. Widen the wording, use search(operation:\"text\", query:\"<literal>\") for a literal lead, or search(operation:\"files\", query:\"<filename>\") for a path lead.",
 			truncateOneLine(task, 200))), nil
 	}
 
@@ -284,11 +292,11 @@ func (s *Server) renderExplore(task string, targets []exploreTarget, budget int)
 		len(targets), len(fileOrder))
 	// Terminality affordance: the source for each listed symbol is already in
 	// this response. Re-opening these files with Read / Glob is the measured
-	// wasted-turn trap (the indexed-source deny-hook rejects it); the follow-up
-	// reader is get_symbol_source / batch_symbols on the `id:` shown above.
-	b.WriteString("  The source for each symbol is included above — do not re-open these files with Read/Glob; read more of any listed symbol with get_symbol_source / batch_symbols using its exact `id:`.\n")
+	// wasted-turn trap (the indexed-source deny-hook rejects it); any follow-up
+	// uses the public read facade and the exact `id:` shown above.
+	b.WriteString("  The source for each symbol is included above — do not re-open these files with Read/Glob; read more of one listed symbol with read(operation:\"source\", target:{symbol:\"<id>\"}), or several with read(operation:\"symbols\", target:{symbols:[\"<id>\", ...]}).\n")
 	if truncated {
-		fmt.Fprintf(&b, "  (Some bodies are elided under the %d-token budget; every candidate's location is still listed above — fetch an elided body with get_symbol_source / batch_symbols using the exact `id:` shown on its line.)\n", budget)
+		fmt.Fprintf(&b, "  (Some bodies are elided under the %d-token budget; every candidate's location is still listed above — fetch elided bodies through read with the exact `id:` shown on each line.)\n", budget)
 	}
 	return b.String()
 }
@@ -307,6 +315,50 @@ func exploreCodeDefinitionKind(k graph.NodeKind) bool {
 	default:
 		return false
 	}
+}
+
+// exploreDataDefinitionKind identifies leaf declarations whose repeated
+// generic names carry little extra localization information. These remain real
+// edit targets: the first/highest-ranked occurrence stays in place, and every
+// occurrence stays available below the diversified head.
+func exploreDataDefinitionKind(k graph.NodeKind) bool {
+	switch k {
+	case graph.KindField, graph.KindConstant, graph.KindVariable, graph.KindEnumMember:
+		return true
+	default:
+		return false
+	}
+}
+
+// demoteRepeatedExploreDataNames performs bounded name diversification for
+// concept queries. It is stable within both groups and never drops a candidate.
+// Callable/type overloads are intentionally untouched: same-named methods on
+// different receivers are often the exact polymorphic family being localized.
+func demoteRepeatedExploreDataNames(cands []*rerank.Candidate, class rerank.QueryClass) []*rerank.Candidate {
+	if class != rerank.QueryClassConcept || len(cands) < 2 {
+		return cands
+	}
+	seen := make(map[string]struct{}, len(cands))
+	duplicates := make([]*rerank.Candidate, 0)
+	head := cands[:0]
+	for _, cand := range cands {
+		if cand == nil || cand.Node == nil || !exploreDataDefinitionKind(cand.Node.Kind) {
+			head = append(head, cand)
+			continue
+		}
+		name := strings.ToLower(strings.TrimSpace(cand.Node.Name))
+		if name == "" {
+			head = append(head, cand)
+			continue
+		}
+		if _, exists := seen[name]; exists {
+			duplicates = append(duplicates, cand)
+			continue
+		}
+		seen[name] = struct{}{}
+		head = append(head, cand)
+	}
+	return append(head, duplicates...)
 }
 
 // exploreLocalizableKind reports whether a node kind is a place a

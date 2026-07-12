@@ -145,6 +145,7 @@ func TestPluginReadme_DescribesPublicAgentSurface(t *testing.T) {
 	for _, forbidden := range []string{
 		"52 tools", "search_symbols", "find_usages", "get_call_chain",
 		"rename_symbol", "preview_edit", "simulate_chain", "facade-v1",
+		"gortex daemon start",
 	} {
 		if strings.Contains(pluginReadmeBody, forbidden) {
 			t.Errorf("plugin README must not expose %q", forbidden)

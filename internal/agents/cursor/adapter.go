@@ -126,7 +126,7 @@ Use Gortex MCP tools for indexed code. This is mandatory.
 4. Mutate only with **edit** or **refactor**. After mutation, call **change** operations ` + "`detect`" + `, ` + "`tests`" + `, ` + "`guards`" + `, and ` + "`contract`" + `.
 5. Call **capabilities** with ` + "`domain`" + `, ` + "`operation`" + `, and ` + "`detail: \"schema\"`" + ` when exact arguments are not visible.
 
-If MCP is unavailable, use the same public tools through ` + "`gortex call <tool>`" + `; for example, ` + "`gortex call search --arg operation=symbols --arg query=Server`" + `.
+If the configured Gortex tools are missing from the callable MCP tools, report a Gortex MCP integration failure and stop. Do not start a daemon or use a CLI/shell fallback.
 
 Use **recall** before editing known code and **remember** for durable decisions or invariants.
 `

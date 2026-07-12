@@ -142,8 +142,8 @@ func buildPromptInjection(hits []grepSymbolHit) string {
 		sb.WriteString("\nThese are leads, not the full picture — call `explore` with the request text to get the ranked " +
 			"neighborhood (these symbols and their siblings, WITH source + call paths + the files to change) in one call, " +
 			"then answer or edit directly from it. Use `read(operation:\"source\")` for one symbol or operation `symbols` for a batch; " +
-			"use `relations(operation:\"usages\")` for references or operation `callers` for callers. Prefer these graph facts over grep/Read. " +
-			"Shell only (no MCP tools)? Reach any with `gortex call <tool> --arg k=v` (e.g. `" + toolref.CLIFallback("explore") + "`).\n")
+			"use `relations(operation:\"usages\")` for references or operation `callers` for callers. Prefer these graph facts over grep/Read.\n")
 	}
+	sb.WriteString(toolref.MCPRequiredLine())
 	return sb.String()
 }

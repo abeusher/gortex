@@ -24,7 +24,9 @@ import (
 // hook can also enforce read shaping after the client has entered Gortex.
 const CurrentPreToolUseMatcher = "Read|Grep|Glob|Task|Bash|Edit|Write|mcp__gortex__read"
 
-const previousPreToolUseMatcher = "Read|Grep|Glob|Task|Bash|Edit|Write|mcp__gortex__read_file|mcp__gortex__get_editing_context"
+// v060PreToolUseMatcher fingerprints the exact matcher shipped by gortex
+// v0.60.0. The concrete retirement gate is documented in docs/versioning.md.
+const v060PreToolUseMatcher = "Read|Grep|Glob|Task|Bash|Edit|Write|mcp__gortex__read_file|mcp__gortex__get_editing_context"
 
 // CurrentPostToolUseMatcher names the tools whose response the
 // PostToolUse hook augments. Only the read-shaped tools have an obvious
@@ -201,13 +203,13 @@ func upgradeGortexMatcher(hooks map[string]any) bool {
 	if !ok {
 		return false
 	}
-	legacyMatchers := map[string]bool{
+	supersededMatchers := map[string]bool{
 		"Read|Grep":                           true,
 		"Read|Grep|Glob":                      true,
 		"Read|Grep|Glob|Task":                 true,
 		"Read|Grep|Glob|Task|Bash":            true,
 		"Read|Grep|Glob|Task|Bash|Edit|Write": true,
-		previousPreToolUseMatcher:             true,
+		v060PreToolUseMatcher:                 true,
 	}
 	upgraded := false
 	for _, h := range pre {
@@ -216,7 +218,7 @@ func upgradeGortexMatcher(hooks map[string]any) bool {
 			continue
 		}
 		matcher, _ := hm["matcher"].(string)
-		if !legacyMatchers[matcher] {
+		if !supersededMatchers[matcher] {
 			continue
 		}
 		if !entryInvokesGortexHook(hm) {
