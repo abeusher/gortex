@@ -61,8 +61,8 @@ func TestRenderExploreShape(t *testing.T) {
 	for _, want := range []string{
 		"EXPLORE — the retry backoff never fires on 429",
 		"LOCALIZATION COMPLETE:",
-		"For a location or explanation request, answer",
-		"For a requested change, proceed directly to impact, edit, and test",
+		"A files/symbols/evidence/where request is localization-only even when it describes a bug: answer now",
+		"For a requested implementation change, proceed directly to impact, edit, and test",
 		"Do not make another localization, search, or read call",
 		"## Answer draft",
 		"FILE: retry.go:11-20  ·  SYMBOL: DoWithRetry  ·  EVIDENCE: ranked #1",

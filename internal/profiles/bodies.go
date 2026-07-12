@@ -39,7 +39,7 @@ A Gortex daemon is configured machine-wide via the §gortex§ MCP server. Whenev
 // sectionExploreOpener positions the one-shot localization verb as
 // the opening move (standard rendering; the lean profile carries its
 // own condensed line).
-var sectionExploreOpener = bt(`**Start every task with §explore§.** Describe the request in plain words (paste the issue, name the area) and it returns the ranked localization neighborhood — likely symbols, source, call paths, and files — in ONE call. For localization-only requests, stop after §explore§ and answer from its evidence; do not cross-check with search or read. For requested changes, proceed directly from §explore§ to impact, edit, and test.
+var sectionExploreOpener = bt(`**Start every task with §explore§.** Describe the request in plain words (paste the issue, name the area) and it returns the ranked localization neighborhood — likely symbols, source, call paths, and files — in ONE call. Files/symbols/evidence/"where" requests are localization-only even when they describe a bug: stop after §explore§ and answer from its evidence. For requested changes, make at most one focused follow-up call, then proceed to impact, edit, and test.
 
 `)
 
@@ -48,8 +48,8 @@ var sectionExploreOpener = bt(`**Start every task with §explore§.** Describe t
 // can actually call; exact operation schemas remain on demand.
 var sectionCompactWorkflow = bt(`For every coding task:
 
-1. Call §explore§ first with the complete task. For localization-only requests, answer immediately from its evidence; do not cross-check. For requested changes, work from its returned source and call paths.
-2. Only if one change target remains unresolved, inspect that specific symbol with §search§, §read§, §relations§, or §trace§. Never reopen indexed source with Read/Grep/Glob or shell equivalents.
+1. Call §explore§ first with the complete task. Files/symbols/evidence/"where" requests are localization-only even when they describe a bug: answer immediately from §explore§; do not cross-check.
+2. For requested changes, make at most one follow-up call on one unresolved symbol with §search§, §read§, §relations§, or §trace§, then continue to step 3. Never reopen indexed source with Read/Grep/Glob or shell equivalents.
 3. Before mutation, call §change(operation:"impact")§; for a signature change, also call §change(operation:"verify")§ with the proposed signature. Mutate only with §edit§ or §refactor§. After mutation, call §change(operation:"detect")§, then use its symbol IDs with §change(operation:"tests")§, §change(operation:"guards")§, and §change(operation:"contract")§.
 4. Call §capabilities§ only when you need the exact fields for an operation.
 

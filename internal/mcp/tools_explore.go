@@ -536,7 +536,7 @@ func (s *Server) renderExplore(task string, targets []exploreTarget, budget int)
 	fmt.Fprintf(&b, "EXPLORE — %s\n\n", truncateOneLine(task, 200))
 	answerReady := exploreAnswerReady(task, targets)
 	if answerReady {
-		b.WriteString("LOCALIZATION COMPLETE: use the strongest supported rows below now. For a location or explanation request, answer. For a requested change, proceed directly to impact, edit, and test. Do not make another localization, search, or read call.\n\n")
+		b.WriteString("LOCALIZATION COMPLETE: use the strongest supported rows below now. A files/symbols/evidence/where request is localization-only even when it describes a bug: answer now. For a requested implementation change, proceed directly to impact, edit, and test. Do not make another localization, search, or read call.\n\n")
 	} else {
 		b.WriteString("BEST-SUPPORTED LOCALIZATION: use the evidence below with stated uncertainty. If one decisive target is absent, make at most one focused exact-ID read or exact literal/path/symbol search, then stop localization. Do not fan out or rerun broad exploration.\n\n")
 	}
