@@ -98,6 +98,23 @@ type exploreDraftEntry struct {
 // query-aligned deeper targets or graph neighbors without hiding any detailed
 // candidate below.
 func exploreAnswerDraft(task string, targets []exploreTarget) []exploreDraftEntry {
+	query := shapeExploreQuery(task)
+	if rerank.ClassifyQuery(query) == rerank.QueryClassConcept {
+		query = stripLeadingExploreDirective(query)
+	}
+	queryTerms := exploreTerminalTerms(query)
+	makeEntry := func(n *graph.Node, evidence string, direct bool, parentRank int) (exploreDraftEntry, int) {
+		overlap, longest := exploreDraftTermOverlap(queryTerms, n)
+		return exploreDraftEntry{
+			node:       n,
+			evidence:   evidence,
+			exact:      exploreDraftExactAnchor(query, n),
+			overlap:    overlap,
+			direct:     direct,
+			parentRank: parentRank,
+		}, longest
+	}
+
 	entries := make([]exploreDraftEntry, 0, exploreDraftTotalLimit)
 	seen := make(map[string]struct{}, exploreDraftTotalLimit)
 	appendEntry := func(entry exploreDraftEntry) bool {
@@ -113,42 +130,25 @@ func exploreAnswerDraft(task string, targets []exploreTarget) []exploreDraftEntr
 		return true
 	}
 
+	// Preserve recall by reserving the retrieval head in the five-row draft;
+	// the final sort below orders those rows by visible query alignment.
 	for i := 0; i < len(targets) && i < exploreDraftPrimaryLimit; i++ {
-		if targets[i].node != nil {
-			appendEntry(exploreDraftEntry{
-				node:       targets[i].node,
-				evidence:   fmt.Sprintf("ranked #%d", i+1),
-				direct:     true,
-				parentRank: i,
-			})
-		}
+		entry, _ := makeEntry(targets[i].node, fmt.Sprintf("ranked #%d", i+1), true, i)
+		appendEntry(entry)
 	}
 
-	query := shapeExploreQuery(task)
-	if rerank.ClassifyQuery(query) == rerank.QueryClassConcept {
-		query = stripLeadingExploreDirective(query)
-	}
-	queryTerms := exploreTerminalTerms(query)
 	var aligned []exploreDraftEntry
 	consider := func(n *graph.Node, evidence string, direct bool, parentRank int) {
 		if n == nil {
 			return
 		}
-		overlap, longest := exploreDraftTermOverlap(queryTerms, n)
-		exact := exploreDraftExactAnchor(query, n)
+		entry, longest := makeEntry(n, evidence, direct, parentRank)
 		// One long discriminative term is useful for graph neighbors; short
 		// generic collisions need either an exact anchor or two query terms.
-		if !exact && overlap < 2 && !(overlap == 1 && longest >= 5) {
+		if !entry.exact && entry.overlap < 2 && !(entry.overlap == 1 && longest >= 5) {
 			return
 		}
-		aligned = append(aligned, exploreDraftEntry{
-			node:       n,
-			evidence:   evidence,
-			exact:      exact,
-			overlap:    overlap,
-			direct:     direct,
-			parentRank: parentRank,
-		})
+		aligned = append(aligned, entry)
 	}
 	for i, target := range targets {
 		if i >= exploreDraftPrimaryLimit {
@@ -162,20 +162,7 @@ func exploreAnswerDraft(task string, targets []exploreTarget) []exploreDraftEntr
 		}
 	}
 	sort.SliceStable(aligned, func(i, j int) bool {
-		a, b := aligned[i], aligned[j]
-		if a.exact != b.exact {
-			return a.exact
-		}
-		if a.overlap != b.overlap {
-			return a.overlap > b.overlap
-		}
-		if a.direct != b.direct {
-			return a.direct
-		}
-		if a.parentRank != b.parentRank {
-			return a.parentRank < b.parentRank
-		}
-		return exploreDraftNodeKey(a.node) < exploreDraftNodeKey(b.node)
+		return exploreDraftEntryLess(aligned[i], aligned[j])
 	})
 	for _, entry := range aligned {
 		if len(entries) >= exploreDraftTotalLimit {
@@ -187,14 +174,29 @@ func exploreAnswerDraft(task string, targets []exploreTarget) []exploreDraftEntr
 	// answer: fill unused slots from the original ranking, never by broadening
 	// retrieval or inventing another search step.
 	for i := exploreDraftPrimaryLimit; i < len(targets) && len(entries) < exploreDraftTotalLimit; i++ {
-		appendEntry(exploreDraftEntry{
-			node:       targets[i].node,
-			evidence:   fmt.Sprintf("ranked #%d", i+1),
-			direct:     true,
-			parentRank: i,
-		})
+		entry, _ := makeEntry(targets[i].node, fmt.Sprintf("ranked #%d", i+1), true, i)
+		appendEntry(entry)
 	}
+	sort.SliceStable(entries, func(i, j int) bool {
+		return exploreDraftEntryLess(entries[i], entries[j])
+	})
 	return entries
+}
+
+func exploreDraftEntryLess(a, b exploreDraftEntry) bool {
+	if a.exact != b.exact {
+		return a.exact
+	}
+	if a.overlap != b.overlap {
+		return a.overlap > b.overlap
+	}
+	if a.direct != b.direct {
+		return a.direct
+	}
+	if a.parentRank != b.parentRank {
+		return a.parentRank < b.parentRank
+	}
+	return exploreDraftNodeKey(a.node) < exploreDraftNodeKey(b.node)
 }
 
 func exploreDraftTermOverlap(queryTerms map[string]struct{}, n *graph.Node) (count, longest int) {
@@ -540,13 +542,21 @@ func (s *Server) renderExplore(task string, targets []exploreTarget, budget int)
 	} else {
 		b.WriteString("BEST-SUPPORTED LOCALIZATION: use the evidence below with stated uncertainty. If one decisive target is absent, make at most one focused exact-ID read or exact literal/path/symbol search, then stop localization. Do not fan out or rerun broad exploration.\n\n")
 	}
+	draft := exploreAnswerDraft(task, targets)
 	b.WriteString("## Answer draft\n")
-	for _, entry := range exploreAnswerDraft(task, targets) {
+	for _, entry := range draft {
 		fmt.Fprintf(&b, "- FILE: %s  ·  SYMBOL: %s  ·  EVIDENCE: %s\n",
 			nodeLoc(entry.node), exploreDraftSymbol(entry.node), entry.evidence)
 	}
+	fullBodyIDs := make(map[string]struct{}, exploreFullBodyLimit)
+	for _, entry := range draft {
+		if !entry.direct || len(fullBodyIDs) >= exploreFullBodyLimit {
+			continue
+		}
+		fullBodyIDs[exploreDraftNodeKey(entry.node)] = struct{}{}
+	}
 	b.WriteString("\n## Likely targets (most-relevant first)\n")
-	b.WriteString("Graph-verified details follow; all candidate locations and signatures are retained, with full source for the highest-ranked targets.\n")
+	b.WriteString("Graph-verified details follow; all candidate locations and signatures are retained, with full source for the strongest direct draft targets.\n")
 
 	used := estimateTokens(b.String())
 	truncated := false
@@ -566,15 +576,16 @@ func (s *Server) renderExplore(task string, targets []exploreTarget, budget int)
 		b.WriteString(head.String())
 		used += estimateTokens(head.String())
 
-		// Source body: full for the highest-ranked targets while the budget
-		// holds (no single body may take more than 1/exploreBodyBudgetShare
+		// Source body: full for the strongest direct draft targets while the
+		// budget holds (no single body may take more than 1/exploreBodyBudgetShare
 		// of the whole budget), signature stub otherwise. The header/locations
 		// above are always emitted so
 		// file-hit / symbol-hit never depend on budget.
 		body := ""
 		if t.source != "" {
 			cost := estimateTokens(t.source)
-			if i < exploreFullBodyLimit && used+cost <= budget && cost <= budget/exploreBodyBudgetShare {
+			_, preferred := fullBodyIDs[exploreDraftNodeKey(n)]
+			if preferred && used+cost <= budget && cost <= budget/exploreBodyBudgetShare {
 				body = t.source
 			} else {
 				if sig, err := elide.CompressString(t.source, n.Language); err == nil && sig != "" {

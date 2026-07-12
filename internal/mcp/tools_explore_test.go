@@ -155,6 +155,9 @@ func TestExploreAnswerDraftCapsAndDeduplicates(t *testing.T) {
 	if len(entries) != exploreDraftTotalLimit {
 		t.Fatalf("draft size = %d, want %d: %#v", len(entries), exploreDraftTotalLimit, entries)
 	}
+	if entries[0].node.ID != "deep" {
+		t.Fatalf("exact query-aligned target must lead the draft, got %q", entries[0].node.ID)
+	}
 	seen := map[string]int{}
 	for _, entry := range entries {
 		seen[exploreDraftNodeKey(entry.node)]++
@@ -196,6 +199,25 @@ func TestRenderExploreBroadWellAlignedNeighborhoodRemainsAnswerReady(t *testing.
 		if strings.Contains(out, forbidden) {
 			t.Fatalf("well-aligned neighborhood must not invite another call via %q:\n%s", forbidden, out)
 		}
+	}
+}
+
+func TestRenderExplorePacksStrongestDraftBody(t *testing.T) {
+	targets := []exploreTarget{
+		{node: &graph.Node{ID: "generic.go::Current", Name: "Current", Kind: graph.KindFunction, FilePath: "generic.go", StartLine: 1}, source: "func Current() {\n\tgenericOne()\n}"},
+		{node: &graph.Node{ID: "generic.go::State", Name: "State", Kind: graph.KindFunction, FilePath: "generic.go", StartLine: 10}, source: "func State() {\n\tgenericTwo()\n}"},
+		{node: &graph.Node{ID: "retry.go::DeepTarget", Name: "DeepTarget", Kind: graph.KindFunction, FilePath: "retry.go", StartLine: 20}, source: "func DeepTarget() {\n\tdecisiveBody()\n}"},
+	}
+	out := (&Server{}).renderExplore("locate DeepTarget implementation", targets, 9000)
+	draftStart := strings.Index(out, "## Answer draft")
+	if draftStart < 0 {
+		t.Fatalf("missing answer draft:\n%s", out)
+	}
+	if first := strings.Index(out[draftStart:], "SYMBOL:"); first < 0 || !strings.HasPrefix(out[draftStart+first:], "SYMBOL: DeepTarget") {
+		t.Fatalf("query-aligned target must lead the answer draft:\n%s", out)
+	}
+	if !strings.Contains(out, "decisiveBody()") {
+		t.Fatalf("query-aligned direct target must receive a full source body:\n%s", out)
 	}
 }
 
