@@ -420,7 +420,27 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	// dropped: production code is where a report is resolved, but a task
 	// genuinely about tests still gets them when production hits run out.
 	fetch := exploreCandidateFetchLimit(maxSymbols, queryClass)
-	ranked := eng.SearchSymbolsRanked(searchQuery, fetch, opts, rctx)
+	var ranked []*rerank.Candidate
+	if queryClass == rerank.QueryClassConcept {
+		// Whole-query retrieval can let one repeated phrase own the candidate
+		// pool. Fetch the primary query and a stopword-filtered concept bag with
+		// inner reranking disabled, then run the session-aware reranker exactly
+		// once over their union. This adds one bounded backend recall call, not a
+		// duplicate full ranked search, and uses no corpus-specific vocabulary.
+		nodes, _ := fetchAndMergeBM25Timed(eng, searchQuery, exploreConceptRecallTerms(searchQuery), fetch, opts, nil)
+		scoped := opts.WorkspaceID != "" || opts.ProjectID != "" || len(opts.RepoAllow) > 0
+		for i, n := range nodes {
+			if n == nil || (scoped && !opts.ScopeAllows(n)) {
+				continue
+			}
+			ranked = append(ranked, &rerank.Candidate{Node: n, TextRank: i, VectorRank: -1})
+		}
+		if pipeline := eng.Rerank(); pipeline != nil {
+			ranked = pipeline.Rerank(searchQuery, ranked, rctx)
+		}
+	} else {
+		ranked = eng.SearchSymbolsRanked(searchQuery, fetch, opts, rctx)
+	}
 	// Resilience ladder: a warm-restarted daemon can transiently return an
 	// empty scoped ranked result (workspace stamps not yet backfilled, or
 	// search bundles served before their node payloads re-materialise)
@@ -1107,6 +1127,32 @@ func inlineLeadClause(task string) string {
 		return ""
 	}
 	return lead
+}
+
+// exploreConceptRecallTerms preserves the query's discriminative concepts in
+// first-seen order for the ordinary concept recall channel. The same generic
+// and stopword filter used by answer-readiness keeps agent verbs and task
+// boilerplate from consuming the bounded expansion bag.
+func exploreConceptRecallTerms(text string) []string {
+	const maxTerms = 12
+	allowed := exploreTerminalTerms(text)
+	seen := make(map[string]struct{}, len(allowed))
+	out := make([]string, 0, min(len(allowed), maxTerms))
+	for _, raw := range rerank.Tokenize(text) {
+		term := exploreTerminalTermRoot(strings.ToLower(strings.TrimSpace(raw)))
+		if _, ok := allowed[term]; !ok {
+			continue
+		}
+		if _, ok := seen[term]; ok {
+			continue
+		}
+		seen[term] = struct{}{}
+		out = append(out, term)
+		if len(out) >= maxTerms {
+			break
+		}
+	}
+	return out
 }
 
 // exploreLexicalTerms splits free task text into the distinct word/identifier

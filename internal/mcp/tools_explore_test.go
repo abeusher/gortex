@@ -299,6 +299,18 @@ func TestExploreHelpers(t *testing.T) {
 	if got := dedupStrings([]string{"b", "a", "b"}); strings.Join(got, ",") != "a,b" {
 		t.Errorf("dedupStrings: %v", got)
 	}
+	got := exploreConceptRecallTerms("Find the code responsible for case insensitive alternation literal prefixes")
+	joined := strings.Join(got, ",")
+	for _, want := range []string{"case", "insensitive", "alternation", "literal", "prefix"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("concept recall terms missing %q: %v", want, got)
+		}
+	}
+	for _, noise := range []string{"find", "code"} {
+		if strings.Contains(joined, noise) {
+			t.Errorf("concept recall terms retained generic %q: %v", noise, got)
+		}
+	}
 }
 
 // TestFacadeExploreDemotesRepeatedDataLeafNames reproduces the reported
