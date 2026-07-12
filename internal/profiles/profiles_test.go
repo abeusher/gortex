@@ -40,15 +40,15 @@ func TestProfileBodyByteCeilings(t *testing.T) {
 }
 
 // positioningCues are the load-bearing fragments EVERY profile must
-// keep, lean ones included: the mandatory-rule sentinel, the deny-hook
+// keep, lean ones included: the mandatory-rule sentinel, the hook-posture
 // warning, the one-shot opener, the memory triggers, the discovery
-// path, the native-MCP failure posture, and the switch-back line. Trimming any of
+// path, the configurable hook posture, and the switch-back line. Trimming any of
 // these is what costs tool adoption — the diet only ever removes
 // elaboration around them.
 var positioningCues = []string{
 	"## MANDATORY: Use Gortex MCP tools", // idempotency sentinel + the rule itself
 	"MUST prefer graph queries",
-	"deny",
+	"Hook posture is configurable",
 	"explore",
 	"Gortex MCP integration failure",
 	"Do not start a daemon",

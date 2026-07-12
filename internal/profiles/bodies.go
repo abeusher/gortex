@@ -23,13 +23,13 @@ func sectionHeader(lean bool) string {
 	if lean {
 		return bt(`## MANDATORY: Use Gortex MCP tools instead of Read/Grep/Glob
 
-A machine-wide §gortex§ MCP server indexes this code. You MUST prefer graph queries over file reads — PreToolUse hooks deny §Read§ / §Grep§ / §Glob§ on indexed source, and the deny message names the right tool.
+A machine-wide §gortex§ MCP server indexes this code. You MUST prefer graph queries over file reads. Hook posture is configurable; follow every Gortex hook instruction even when raw file tools remain callable.
 
 `)
 	}
 	return bt(`## MANDATORY: Use Gortex MCP tools instead of Read/Grep/Glob
 
-A Gortex daemon is configured machine-wide via the §gortex§ MCP server. Whenever you operate on indexed source (any repo the daemon tracks — check §gortex daemon status§), you MUST prefer graph queries over file reads. PreToolUse hooks deny §Read§ / §Grep§ / §Glob§ against indexed source — the deny message names the right tool.
+A Gortex daemon is configured machine-wide via the §gortex§ MCP server. Whenever you operate on indexed source (any repo the daemon tracks — check §gortex daemon status§), you MUST prefer graph queries over file reads. Hook posture is configurable; follow every Gortex hook instruction even when raw file tools remain callable.
 
 `)
 }

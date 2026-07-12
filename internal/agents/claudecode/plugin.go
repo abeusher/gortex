@@ -94,7 +94,7 @@ const pluginHooksJSON = `{
             "type": "command",
             "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks-handlers/gortex-hook.sh\"",
             "timeout": 3000,
-            "statusMessage": "Enriching with Gortex graph context..."
+            "statusMessage": "Enforcing Gortex graph access policy..."
           }
         ]
       }

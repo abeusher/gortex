@@ -18,34 +18,43 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
 
 	"github.com/zzet/gortex/internal/agents"
 	"github.com/zzet/gortex/internal/agents/internalutil"
+	"github.com/zzet/gortex/internal/mcp"
 	"github.com/zzet/gortex/internal/version"
 )
 
-const Name = "codex"
-const DocsURL = "https://developers.openai.com/codex/mcp"
+const (
+	Name    = "codex"
+	DocsURL = "https://developers.openai.com/codex/mcp"
+)
 
-const codexGortexToolNamespace = "mcp__gortex"
-const codexGortexNonPrefixedToolNamespace = "gortex"
-const codexMCPStartupTimeoutSeconds = 90
-const codexDirectToolNamespacesMinMinor = 142
+const (
+	codexGortexToolNamespace            = "mcp__gortex"
+	codexGortexNonPrefixedToolNamespace = "gortex"
+	codexMCPStartupTimeoutSeconds       = 90
+	codexDirectToolNamespacesMinMinor   = 142
+)
 
 const codexSessionStartMatcher = "startup|resume|clear|compact"
 
 // v060CodexSessionStart* fingerprints the static hook shipped by gortex
 // v0.60.0 so an upgrade replaces it instead of installing a duplicate. The
 // concrete retirement gate is documented in docs/versioning.md.
-const v060CodexSessionStartMessage = "IMPORTANT: Prefer Gortex MCP tools (search_symbols, get_callers, get_file_summary, edit_file) over Read/Grep/Glob/Edit."
-const v060CodexSessionStartCommand = "printf '%s\\n' '" + v060CodexSessionStartMessage + "'"
-const v060CodexSessionStartWindowsCommand = "powershell -NoProfile -Command \"Write-Output '" + v060CodexSessionStartMessage + "'\""
-const codexPreToolUseMatcher = "^Bash$"
-const codexMCPReadPreToolUseMatcher = "^mcp__gortex__read$"
-const codexPostToolUseMatcher = "^(Bash|apply_patch)$"
-const codexHookTimeoutSeconds = 5
-const codexHookModeEnvVar = "GORTEX_CODEX_HOOK_MODE"
+const (
+	v060CodexSessionStartMessage        = "IMPORTANT: Prefer Gortex MCP tools (search_symbols, get_callers, get_file_summary, edit_file) over Read/Grep/Glob/Edit."
+	v060CodexSessionStartCommand        = "printf '%s\\n' '" + v060CodexSessionStartMessage + "'"
+	v060CodexSessionStartWindowsCommand = "powershell -NoProfile -Command \"Write-Output '" + v060CodexSessionStartMessage + "'\""
+	codexPreToolUseMatcher              = "^Bash$"
+	codexMCPReadPreToolUseMatcher       = "^mcp__gortex__read$"
+	codexPostToolUseMatcher             = "^(Bash|apply_patch)$"
+	codexHookTimeoutSeconds             = 5
+	codexHookModeEnvVar                 = "GORTEX_CODEX_HOOK_MODE"
+)
 
 type Adapter struct{}
 
@@ -188,7 +197,7 @@ func upsertCodexMCPServer(root map[string]any, opts agents.ApplyOpts) bool {
 	if !ok {
 		return false
 	}
-	changed := false
+	changed := migrateCodexFacadeToolApprovals(entry)
 	if required, _ := entry["required"].(bool); !required {
 		entry["required"] = true
 		changed = true
@@ -202,6 +211,83 @@ func upsertCodexMCPServer(root map[string]any, opts agents.ApplyOpts) bool {
 		root["mcp_servers"] = servers
 	}
 	return changed
+}
+
+// migrateCodexFacadeToolApprovals upgrades per-tool approval entries from the
+// legacy one-tool-per-operation surface to the compact public facade. Entries
+// for current facade tools, unknown extension tools, and user-defined fields
+// are preserved. Several legacy tools can collapse into one facade tool; when
+// their approval modes disagree, prompt is the conservative merged posture.
+func migrateCodexFacadeToolApprovals(entry map[string]any) bool {
+	tools, ok := entry["tools"].(map[string]any)
+	if !ok || len(tools) == 0 {
+		return false
+	}
+
+	legacyNames := make([]string, 0, len(tools))
+	for name := range tools {
+		facade, _, recognized := mcp.PublicOperationForLegacy(name)
+		if recognized && facade != name {
+			legacyNames = append(legacyNames, name)
+		}
+	}
+	if len(legacyNames) == 0 {
+		return false
+	}
+	slices.Sort(legacyNames)
+
+	changed := false
+	for _, legacyName := range legacyNames {
+		facade, _, _ := mcp.PublicOperationForLegacy(legacyName)
+		legacyValue := tools[legacyName]
+		legacyTable, validTable := legacyValue.(map[string]any)
+		if !validTable {
+			// Do not delete malformed or future config shapes that we cannot
+			// migrate without losing user intent.
+			continue
+		}
+
+		if currentValue, exists := tools[facade]; !exists {
+			tools[facade] = cloneCodexToolApproval(legacyTable)
+		} else if currentTable, ok := currentValue.(map[string]any); ok {
+			mergeCodexToolApproval(currentTable, legacyTable)
+		} else {
+			// A non-table public entry is not a documented Codex shape. Keep it
+			// and the legacy entry rather than guessing which one the user owns.
+			continue
+		}
+		delete(tools, legacyName)
+		changed = true
+	}
+	return changed
+}
+
+func cloneCodexToolApproval(source map[string]any) map[string]any {
+	clone := make(map[string]any, len(source))
+	for key, value := range source {
+		clone[key] = value
+	}
+	return clone
+}
+
+func mergeCodexToolApproval(current, incoming map[string]any) {
+	for key, value := range incoming {
+		if key == "approval_mode" {
+			continue
+		}
+		if _, exists := current[key]; !exists {
+			current[key] = value
+		}
+	}
+
+	incomingMode, incomingHasMode := incoming["approval_mode"]
+	currentMode, currentHasMode := current["approval_mode"]
+	switch {
+	case !currentHasMode && incomingHasMode:
+		current["approval_mode"] = incomingMode
+	case currentHasMode && incomingHasMode && !reflect.DeepEqual(currentMode, incomingMode):
+		current["approval_mode"] = "prompt"
+	}
 }
 
 func codexStartupTimeoutAtLeast(value any, minimum int) bool {
