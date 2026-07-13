@@ -323,7 +323,47 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 		s.recordFacadeTelemetry(facade, "unknown", facadeOutcomeInvalidOperation, time.Since(started))
 		return result, nil
 	}
-	return s.invokeFacadeSpec(ctx, req, spec)
+	input, _ := req.Params.Arguments.(map[string]any)
+	if invalid := validateFacadeInput(spec, input); invalid != nil {
+		s.recordFacadeTelemetry(facade, operation, facadeOutcomeInvalidArgument, time.Since(started))
+		return invalid, nil
+	}
+	terminal := s.localizationFor(ctx)
+	// An explicit explore operation marks a new request boundary. Diagnosis and
+	// change flows stay non-terminal; localization-only flows replace any prior
+	// completion contract. Ordinary navigation cannot clear terminal state.
+	freshTaskFlow := facade == "explore" && operation == "task"
+	freshLocalizeFlow := facade == "explore" && operation == "localize"
+	if freshLocalizeFlow {
+		if blocked := terminal.beginLocalize(req.GetString("task", "")); blocked != nil {
+			s.recordFacadeTelemetry(facade, operation, facadeOutcomeBlocked, time.Since(started))
+			return blocked, nil
+		}
+	}
+	exactReadReserved := false
+	exactReadSucceeded := false
+	defer func() {
+		if exactReadReserved {
+			terminal.finishExactRead(exactReadSucceeded)
+		}
+	}()
+	if !freshTaskFlow && !freshLocalizeFlow {
+		blocked, reserved := terminal.authorize(facade, operation, req.GetArguments())
+		if blocked != nil {
+			s.recordFacadeTelemetry(facade, operation, facadeOutcomeBlocked, time.Since(started))
+			return blocked, nil
+		}
+		exactReadReserved = reserved
+	}
+	result, err := s.invokeFacadeSpec(ctx, req, spec)
+	succeeded := err == nil && result != nil && !result.IsError
+	if exactReadReserved {
+		exactReadSucceeded = succeeded
+	}
+	if freshTaskFlow && succeeded {
+		terminal.reset()
+	}
+	return result, err
 }
 
 func inferFacadeOperation(facade string, input map[string]any) string {
@@ -642,10 +682,19 @@ func validateFacadeInput(spec facadeOperationSpec, input map[string]any) *mcpgo.
 			}
 		}
 	}
+	if spec.Facade == "explore" && spec.Operation == "task" {
+		normalized := normalizeFacadeArguments(spec, input)
+		if localize, _ := normalized["localize"].(bool); localize {
+			return NewStructuredErrorResult(StructuredError{
+				ErrorCode: ErrCodeInvalidArgument, Message: "explore.task does not accept localize=true",
+				Data: map[string]any{"field": "localize", "operation": spec.Operation},
+			})
+		}
+	}
 	task, _ := input["task"].(string)
-	if spec.Facade == "explore" && spec.Operation == "task" && strings.TrimSpace(task) == "" {
+	if spec.Facade == "explore" && (spec.Operation == "task" || spec.Operation == "localize") && strings.TrimSpace(task) == "" {
 		return NewStructuredErrorResult(StructuredError{
-			ErrorCode: ErrCodeInvalidArgument, Message: "explore.task requires task",
+			ErrorCode: ErrCodeInvalidArgument, Message: fmt.Sprintf("explore.%s requires task", spec.Operation),
 			Data: map[string]any{"field": "task", "operation": spec.Operation},
 		})
 	}

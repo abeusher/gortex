@@ -208,9 +208,10 @@ type Server struct {
 	// state for the embedded stdio path (one implicit client per process).
 	// Tool handlers reach per-session activity via sessionFor(ctx); that
 	// helper returns this default when ctx carries no session ID.
-	session    *sessionState
-	symHistory *symbolHistory
-	tokenStats *tokenStats
+	session      *sessionState
+	symHistory   *symbolHistory
+	tokenStats   *tokenStats
+	localization *localizationTerminalState
 
 	// sessions multiplexes per-client sessionLocal for the daemon
 	// transport. When ctx carries a session ID (WithSessionID), handlers
@@ -1136,7 +1137,7 @@ type MultiRepoOptions struct {
 // the graph tools over raw file reads, and where to start."
 const serverInstructions = `Gortex is a code-intelligence graph server — it indexes repositories into a queryable knowledge graph. Prefer its graph tools over raw file reads and text search:
 
-- START WITH explore FOR EVERY TASK-SHAPED REQUEST (a bug report, a feature, "where is / how does X work"): one call returns the ranked neighborhood — the likely symbols with their source, call paths, and the files to change. Answer or start editing directly from its output instead of chaining search/read/callers calls; its locations are graph-verified, so no re-checking with file reads is needed.
+- For a request whose deliverable is only files, symbols, evidence, or a location, call explore(operation:"localize"). Follow completion.required_action: answer immediately when state is answer_ready; when state is needs_exact_read, make only the named exact read. For diagnosis or modification, call explore(operation:"task") and continue from its evidence.
 - For one known symbol: search_symbols (BM25, camelCase-aware) to find it, get_symbol_source to read it, batch_symbols for several bodies in one call; find_usages / get_callers for references and callers.
 - Before editing, call get_editing_context on the file; for refactors use edit_symbol / rename_symbol / batch_edit.
 - The cold tools/list shows a core set — call tools_search to discover the rest of the catalogue on demand.
@@ -1147,7 +1148,7 @@ const serverInstructions = `Gortex is a code-intelligence graph server — it in
 // codingAgentInstructions is intentionally terse because some MCP hosts repeat
 // initialize instructions beside every rendered tool. It describes what to do,
 // not how the server versions or implements its tool surface.
-const codingAgentInstructions = `MUST use Gortex MCP. Start every task with explore. Files/symbols/evidence/where—even bugs—are localization-only: answer from explore; no cross-check. For changes, at most one follow-up call on one unresolved symbol via search/read/relations/trace. Before edit: change(operation:"impact"); signature: change(operation:"verify"). Mutate only with edit or refactor. After: change(operation:"detect"), then tests/guards/contract with its IDs. Call capabilities only for unknown fields.`
+const codingAgentInstructions = `MUST use Gortex MCP. For files/symbols/evidence/where, call explore(operation:"localize"); obey completion.required_action and make no calls after answer_ready. For diagnosis/change, call explore(operation:"task"), then at most one focused follow-up. Before edit: change(operation:"impact"); signature: change(operation:"verify"). Mutate only with edit or refactor. After: change(operation:"detect"), then tests/guards/contract with its IDs. Call capabilities only for unknown fields.`
 
 // ServerInstructionsUntracked is the inactive-state `instructions` variant
 // returned when a session's cwd is not covered by any tracked repo. Rather than
@@ -1335,6 +1336,7 @@ func NewServer(engine *query.Engine, g graph.Store, idx *indexer.Indexer, watche
 		indexer:             idx,
 		logger:              logger,
 		session:             newSessionState(),
+		localization:        newLocalizationTerminalState(),
 		scopeIntentDefaults: true,
 		tokenStats:          &tokenStats{},
 		symHistory: &symbolHistory{

@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"sort"
@@ -445,10 +446,7 @@ func exploreAnswerReady(task string, targets []exploreTarget) bool {
 			return 0
 		}
 		n := target.node
-		text := n.Name + " " + n.QualName + " " + n.FilePath
-		if sig, _ := n.Meta["signature"].(string); sig != "" {
-			text += " " + sig
-		}
+		text := exploreTerminalNodeText(n)
 		candidateTerms := exploreTerminalTerms(text)
 		count := 0
 		for term := range queryTerms {
@@ -466,10 +464,7 @@ func exploreAnswerReady(task string, targets []exploreTarget) bool {
 			continue
 		}
 		n := targets[i].node
-		text := n.Name + " " + n.QualName + " " + n.FilePath
-		if sig, _ := n.Meta["signature"].(string); sig != "" {
-			text += " " + sig
-		}
+		text := exploreTerminalNodeText(n)
 		for term := range exploreTerminalTerms(text) {
 			if _, relevant := queryTerms[term]; relevant {
 				union[term] = struct{}{}
@@ -501,6 +496,14 @@ func exploreAnswerReady(task string, targets []exploreTarget) bool {
 		}
 	}
 	return false
+}
+
+func exploreTerminalNodeText(n *graph.Node) string {
+	if n == nil {
+		return ""
+	}
+	retrieval := n.RetrievalMetadata()
+	return strings.TrimSpace(strings.Join([]string{n.Name, retrieval.QualName, n.FilePath, retrieval.Signature}, " "))
 }
 
 var exploreTerminalGenericTerms = map[string]struct{}{
@@ -685,6 +688,9 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		cands = append(cands, test[:room]...)
 	}
 	if len(cands) == 0 {
+		if req.GetBool("localize", false) {
+			return s.completeEmptyLocalization(ctx, task, budget), nil
+		}
 		return mcp.NewToolResultText(fmt.Sprintf(
 			"EXPLORE — %s\n\nNo ranked symbols matched this request. Widen the wording, use search(operation:\"text\", query:\"<literal>\") for a literal lead, or search(operation:\"files\", query:\"<filename>\") for a path lead.",
 			truncateOneLine(task, 200))), nil
@@ -708,7 +714,98 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		targets = append(targets, t)
 	}
 
-	return mcp.NewToolResultText(s.renderExplore(task, targets, budget)), nil
+	if !req.GetBool("localize", false) {
+		return mcp.NewToolResultText(s.renderExplore(task, targets, budget)), nil
+	}
+	completion := newLocalizationCompletion(exploreAnswerReady(task, targets), targets[0].node.ID)
+	s.localizationFor(ctx).armForTask(completion, task)
+	return newLocalizationExploreResult(completion, targets, budget), nil
+}
+
+// localizationExploreEnvelope is the compact, machine-readable result for an
+// explicit localization-only request. Ordinary explore(task) retains the
+// human-oriented legacy rendering; localize does not duplicate it.
+type localizationExploreEnvelope struct {
+	Completion localizationCompletion `json:"completion"`
+	Files      []string               `json:"files"`
+	Symbols    []string               `json:"symbols"`
+	Evidence   []localizationEvidence `json:"evidence"`
+}
+
+type localizationEvidence struct {
+	Rank      int      `json:"rank"`
+	ID        string   `json:"id"`
+	Name      string   `json:"name"`
+	QualName  string   `json:"qual_name,omitempty"`
+	Kind      string   `json:"kind"`
+	File      string   `json:"file"`
+	Line      int      `json:"line"`
+	EndLine   int      `json:"end_line,omitempty"`
+	Signature string   `json:"signature,omitempty"`
+	Callers   []string `json:"callers,omitempty"`
+	Callees   []string `json:"callees,omitempty"`
+	Source    string   `json:"source,omitempty"`
+}
+
+func (s *Server) completeEmptyLocalization(ctx context.Context, task string, budget int) *mcp.CallToolResult {
+	completion := newLocalizationCompletion(true, "")
+	s.localizationFor(ctx).armForTask(completion, task)
+	return newLocalizationExploreResult(completion, []exploreTarget{}, budget)
+}
+
+func newLocalizationExploreResult(completion localizationCompletion, targets []exploreTarget, budget int) *mcp.CallToolResult {
+	envelope := localizationExploreEnvelope{
+		Completion: completion,
+		Files:      make([]string, 0),
+		Symbols:    make([]string, 0),
+		Evidence:   make([]localizationEvidence, 0),
+	}
+	seenFiles := make(map[string]struct{})
+	sourceBudget := budget / 2
+	for rank, target := range targets {
+		if target.node == nil {
+			continue
+		}
+		n := target.node
+		path := nodeDisplayPath(n)
+		if _, seen := seenFiles[path]; !seen {
+			seenFiles[path] = struct{}{}
+			envelope.Files = append(envelope.Files, path)
+		}
+		envelope.Symbols = append(envelope.Symbols, n.ID)
+		retrieval := n.RetrievalMetadata()
+		evidence := localizationEvidence{
+			Rank: rank + 1, ID: n.ID, Name: n.Name, Kind: string(n.Kind), File: path,
+			Line: n.StartLine, EndLine: n.EndLine,
+			QualName:  retrieval.QualName,
+			Signature: retrieval.Signature,
+			Callers:   localizationNeighborIDs(target.callers),
+			Callees:   localizationNeighborIDs(target.callees),
+		}
+		if rank < exploreFullBodyLimit && target.source != "" {
+			cost := estimateTokens(target.source)
+			if cost <= budget/exploreBodyBudgetShare && cost <= sourceBudget {
+				evidence.Source = target.source
+				sourceBudget -= cost
+			}
+		}
+		envelope.Evidence = append(envelope.Evidence, evidence)
+	}
+	body, err := json.Marshal(envelope)
+	if err != nil {
+		return mcp.NewToolResultError("encode localization result: " + err.Error())
+	}
+	return mcp.NewToolResultText(string(body))
+}
+
+func localizationNeighborIDs(nodes []*graph.Node) []string {
+	ids := make([]string, 0, len(nodes))
+	for _, node := range nodes {
+		if node != nil && node.ID != "" {
+			ids = append(ids, node.ID)
+		}
+	}
+	return ids
 }
 
 // renderExplore lays out the ranked neighborhood as a compact, agent-facing
@@ -728,12 +825,7 @@ func (s *Server) renderExplore(task string, targets []exploreTarget, budget int)
 	}
 
 	fmt.Fprintf(&b, "EXPLORE — %s\n\n", truncateOneLine(task, 200))
-	answerReady := exploreAnswerReady(task, targets)
-	if answerReady {
-		b.WriteString("LOCALIZATION COMPLETE: use the strongest supported rows below now. A files/symbols/evidence/where request is localization-only even when it describes a bug: answer now. For a requested implementation change, proceed directly to impact, edit, and test. Do not make another localization, search, or read call.\n\n")
-	} else {
-		b.WriteString("BEST-SUPPORTED LOCALIZATION: use the evidence below with stated uncertainty. If one decisive target is absent, make at most one focused exact-ID read or exact literal/path/symbol search, then stop localization. Do not fan out or rerun broad exploration.\n\n")
-	}
+	b.WriteString("RANKED LOCALIZATION: use the evidence below with stated uncertainty. Do not fan out or rerun broad exploration. Localization-only callers receive a separate completion contract; diagnosis and change callers continue from this evidence.\n\n")
 	draft := exploreAnswerDraft(task, targets)
 	b.WriteString("## Answer draft\n")
 	for _, entry := range draft {
@@ -809,7 +901,7 @@ func (s *Server) renderExplore(task string, targets []exploreTarget, budget int)
 
 	fmt.Fprintf(&b, "\n— Coverage: %d ranked candidate symbol(s) across %d file(s); callers/callees resolved server-side. Locations and IDs above are citeable.\n",
 		len(targets), len(fileOrder))
-	b.WriteString("END OF LOCALIZATION — answer from this evidence or proceed with the requested change; do not continue searching.\n")
+	b.WriteString("END OF LOCALIZATION — localization-only callers answer from this evidence; diagnosis and change callers proceed from it.\n")
 	if truncated {
 		fmt.Fprintf(&b, "Some bodies are signature-only under the %d-token budget; every candidate location remains listed.\n", budget)
 	}

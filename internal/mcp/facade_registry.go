@@ -238,6 +238,13 @@ func facadeOperationSpecs() []facadeOperationSpec {
 		"plan": "plan_turn", "prefetch": "prefetch_context", "suggest": "suggest_queries",
 		"task": "explore", "wakeup": "gortex_wakeup",
 	})
+	// Localization-only requests use the same retrieval implementation but add
+	// an explicit terminality contract. Keeping this opt-in prevents diagnostic
+	// and implementation requests from being terminated by a ranking heuristic.
+	specs = append(specs, facadeOperationSpec{
+		Facade: "explore", Operation: "localize", Legacy: "explore",
+		Effect: facadeEffectRead, Fixed: map[string]any{"localize": true},
+	})
 	addFacadeGroup(&specs, "search", facadeEffectRead, map[string]string{
 		"artifacts": "search_artifacts", "ast": "search_ast", "completion": "graph_completion_search",
 		"files": "find_files", "symbols": "search_symbols", "text": "search_text", "winnow": "winnow_symbols",

@@ -53,17 +53,16 @@ func exploreTestTargets() []exploreTarget {
 	}
 }
 
-func TestRenderExploreShape(t *testing.T) {
+func TestRenderExploreShapeIsNonTerminal(t *testing.T) {
 	out := (&Server{}).renderExplore("the retry backoff never fires on 429", exploreTestTargets(), 9000)
 
 	// Ranked targets, with citeable path:line locations and an answer draft
 	// before the detailed payload.
 	for _, want := range []string{
 		"EXPLORE — the retry backoff never fires on 429",
-		"LOCALIZATION COMPLETE:",
-		"A files/symbols/evidence/where request is localization-only even when it describes a bug: answer now",
-		"For a requested implementation change, proceed directly to impact, edit, and test",
-		"Do not make another localization, search, or read call",
+		"RANKED LOCALIZATION:",
+		"Localization-only callers receive a separate completion contract",
+		"diagnosis and change callers continue from this evidence",
 		"## Answer draft",
 		"FILE: retry.go:11-20  ·  SYMBOL: DoWithRetry  ·  EVIDENCE: ranked #1",
 		"## Likely targets",
@@ -75,7 +74,7 @@ func TestRenderExploreShape(t *testing.T) {
 		"## Candidate files",
 		"- retry.go  ·  Backoff, DoWithRetry",
 		"— Coverage: 2 ranked candidate symbol(s) across 1 file(s)",
-		"END OF LOCALIZATION — answer from this evidence or proceed with the requested change",
+		"END OF LOCALIZATION — localization-only callers answer from this evidence; diagnosis and change callers proceed from it",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("render missing %q\n--- got ---\n%s", want, out)
@@ -84,9 +83,9 @@ func TestRenderExploreShape(t *testing.T) {
 	if strings.Index(out, "## Answer draft") >= strings.Index(out, "## Likely targets") {
 		t.Fatalf("answer draft must precede detailed targets:\n%s", out)
 	}
-	for _, forbidden := range []string{"REFINEMENT NEEDED", "make at most one", "rerun explore", "read(operation:", "Do not call another tool"} {
+	for _, forbidden := range []string{"LOCALIZATION COMPLETE:", "answer now", "Do not make another localization", "REFINEMENT NEEDED", "read(operation:", "Do not call another tool"} {
 		if strings.Contains(out, forbidden) {
-			t.Fatalf("answer-ready output must not invite another call via %q:\n%s", forbidden, out)
+			t.Fatalf("ordinary explore(task) must not claim terminality via %q:\n%s", forbidden, out)
 		}
 	}
 }
@@ -98,18 +97,15 @@ func TestRenderExploreBroadWeakNeighborhoodReturnsBestSupportedDraft(t *testing.
 	}
 	task := "review release blockers across impact reach sqlite races mcp facade routing codex claude guidance explore ranking token cost"
 	out := (&Server{}).renderExplore(task, targets, 1600)
-	for _, want := range []string{"BEST-SUPPORTED LOCALIZATION:", "with stated uncertainty", "## Answer draft", "at most one focused exact-ID read or exact literal/path/symbol search", "then stop localization", "Do not fan out or rerun broad exploration"} {
+	for _, want := range []string{"RANKED LOCALIZATION:", "with stated uncertainty", "## Answer draft", "Do not fan out or rerun broad exploration", "diagnosis and change callers continue from this evidence"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("weak neighborhood missing %q:\n%s", want, out)
 		}
 	}
-	for _, forbidden := range []string{"REFINEMENT NEEDED", "make one focused refinement", "rerun explore for", "search(operation:"} {
+	for _, forbidden := range []string{"LOCALIZATION COMPLETE:", "REFINEMENT NEEDED", "make one focused refinement", "rerun explore for", "search(operation:"} {
 		if strings.Contains(out, forbidden) {
 			t.Fatalf("weak neighborhood must not invite broad refinement via %q:\n%s", forbidden, out)
 		}
-	}
-	if strings.Contains(out, "LOCALIZATION COMPLETE:") {
-		t.Fatalf("weak neighborhood must not overstate confidence:\n%s", out)
 	}
 }
 
@@ -267,15 +263,18 @@ func TestExploreDraftExactAnchorUsesTokenBoundaries(t *testing.T) {
 	}
 }
 
-func TestRenderExploreBroadWellAlignedNeighborhoodRemainsAnswerReady(t *testing.T) {
+func TestExploreBroadWellAlignedNeighborhoodGetsExplicitAnswerReadyContract(t *testing.T) {
 	targets := []exploreTarget{{
 		node:  &graph.Node{ID: "internal/mcp/facade_tools.go::registerFacadeTools", Name: "registerFacadeTools", Kind: graph.KindMethod, FilePath: "internal/mcp/facade_tools.go"},
 		score: 1.2,
 	}}
 	task := "investigate mcp facade tool routing schema registration operation dispatch surface architecture integration behavior"
+	if !exploreAnswerReady(task, targets) {
+		t.Fatal("well-aligned ranked head should produce answer_ready for explore(localize)")
+	}
 	out := (&Server{}).renderExplore(task, targets, 1600)
-	if !strings.Contains(out, "LOCALIZATION COMPLETE:") || !strings.Contains(out, "use the strongest supported rows") || !strings.Contains(out, "proceed directly to impact, edit, and test") {
-		t.Fatalf("well-aligned ranked head must preserve strong terminality:\n%s", out)
+	if !strings.Contains(out, "RANKED LOCALIZATION:") || strings.Contains(out, "LOCALIZATION COMPLETE:") {
+		t.Fatalf("ordinary explore(task) rendering must stay non-terminal:\n%s", out)
 	}
 	for _, forbidden := range []string{"exact-ID source read", "REFINEMENT", "rerun explore", "read(operation:"} {
 		if strings.Contains(out, forbidden) {
