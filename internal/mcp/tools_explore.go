@@ -150,7 +150,7 @@ func exploreAnswerDraft(task string, targets []exploreTarget) []exploreDraftEntr
 			return
 		}
 		entry, longest := makeEntry(n, evidence, direct, parentRank)
-		if !entry.exact && entry.overlap < 2 && !(entry.overlap == 1 && longest >= 5) {
+		if !entry.exact && entry.overlap < 2 && (entry.overlap != 1 || longest < 5) {
 			return
 		}
 		aligned = append(aligned, entry)
