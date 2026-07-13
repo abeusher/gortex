@@ -81,11 +81,14 @@ func AnalyzeImpact(g graph.Store, symbolIDs []string, communities *CommunityResu
 // The compatibility wrapper above supplies a strict deadline so even callers
 // that have not yet propagated their request context cannot hang on a hub.
 func AnalyzeImpactContext(ctx context.Context, g graph.Store, symbolIDs []string, communities *CommunityResult, processes *ProcessResult) *ImpactResult {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	result := &ImpactResult{
 		ByDepth: make(map[int][]ImpactEntry),
 	}
 	if !fillImpactFromReach(ctx, g, result, symbolIDs) {
-		fillImpactLive(g, result, symbolIDs)
+		fillImpactLive(ctx, g, result, symbolIDs)
 	}
 
 	// Trim noise from the transitive tiers: a resolution edge with
@@ -103,11 +106,10 @@ func AnalyzeImpactContext(ctx context.Context, g graph.Store, symbolIDs []string
 	// Hard fan-out cap per tier so a pathological hub doesn't blow up
 	// the response. Sorted ID order is already deterministic from the
 	// reach index, so the cap is stable.
-	const maxPerTier = 50
 	for depth := 1; depth <= 3; depth++ {
-		if len(result.ByDepth[depth]) > maxPerTier {
+		if len(result.ByDepth[depth]) > maxImpactEntriesPerTier {
 			result.Truncated = true
-			result.ByDepth[depth] = result.ByDepth[depth][:maxPerTier]
+			result.ByDepth[depth] = result.ByDepth[depth][:maxImpactEntriesPerTier]
 		}
 	}
 
@@ -166,10 +168,17 @@ func AnalyzeImpactContext(ctx context.Context, g graph.Store, symbolIDs []string
 		sort.Strings(result.AffectedCommunities)
 	}
 
+	seedNodes, seedNodeErr := getImpactNodesContext(ctx, g, symbolIDs)
+	if seedNodeErr != nil {
+		result.Truncated = true
+	}
+
 	// Epistemic lower bound: blast radius is a count of *callers*, so a seed
 	// that implements/overrides an interface may be reached through dynamic
 	// dispatch the resolver could not attribute — the count is then a floor.
-	result.Boundaries = graph.CallerBoundaries(g, symbolIDs, 0)
+	boundaries, boundaryTruncated := graph.CallerBoundariesContext(ctx, g, symbolIDs, 0)
+	result.Boundaries = boundaries
+	result.Truncated = result.Truncated || boundaryTruncated
 	result.LowerBound = result.Truncated || graph.LowerBoundCaveat(result.Boundaries)
 	// A partial traversal is never a LOW-risk verdict. MEDIUM is the minimum
 	// conservative posture; observed direct/transitive fan-out can still raise
@@ -197,7 +206,7 @@ func AnalyzeImpactContext(ctx context.Context, g graph.Store, symbolIDs []string
 	repoSet := make(map[string]bool)
 	byRepo := make(map[string][]ImpactEntry)
 	for _, id := range symbolIDs {
-		if n := g.GetNode(id); n != nil && n.RepoPrefix != "" {
+		if n := seedNodes[id]; n != nil && n.RepoPrefix != "" {
 			repoSet[n.RepoPrefix] = true
 		}
 	}
@@ -222,45 +231,127 @@ func AnalyzeImpactContext(ctx context.Context, g graph.Store, symbolIDs []string
 // per discovered node, attributing the in-edge that introduced it to
 // EdgeConfidence / ConfidenceLabel. Kept as the always-correct
 // fallback for fillImpactFromReach.
-func fillImpactLive(g graph.Store, result *ImpactResult, symbolIDs []string) {
+const maxImpactEntriesPerTier = 50
+
+type impactNodesContextGetter interface {
+	GetNodesByIDsContext(context.Context, []string) (map[string]*graph.Node, error)
+}
+
+func getImpactNodesContext(ctx context.Context, g graph.Store, ids []string) (map[string]*graph.Node, error) {
+	if getter, ok := g.(impactNodesContextGetter); ok {
+		return getter.GetNodesByIDsContext(ctx, ids)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return g.GetNodesByIDs(ids), nil
+}
+
+func fillImpactLive(ctx context.Context, g graph.Store, result *ImpactResult, symbolIDs []string) {
+	const maxLiveImpactEdges = maxImpactEntriesPerTier + 1
+
+	type boundedIncomingEdgeReader interface {
+		GetInEdgesByNodeIDsContext(context.Context, []string, int) (map[string][]*graph.Edge, bool, error)
+	}
+	readIncoming := func(ids []string, limit int) (map[string][]*graph.Edge, bool, error) {
+		if reader, ok := g.(boundedIncomingEdgeReader); ok {
+			return reader.GetInEdgesByNodeIDsContext(ctx, ids, limit)
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, true, err
+		}
+		all := g.GetInEdgesByNodeIDs(ids)
+		out := make(map[string][]*graph.Edge, len(all))
+		count := 0
+		for _, id := range ids {
+			for _, edge := range all[id] {
+				if count >= limit {
+					return out, true, nil
+				}
+				out[id] = append(out[id], edge)
+				count++
+			}
+		}
+		return out, false, nil
+	}
+
 	visited := make(map[string]bool)
 	for _, id := range symbolIDs {
 		visited[id] = true
 	}
-	current := symbolIDs
-	for depth := 1; depth <= 3; depth++ {
-		var next []string
-		for _, id := range current {
-			for _, e := range g.GetInEdges(id) {
-				if visited[e.From] {
-					continue
-				}
-				if e.Kind == graph.EdgeDefines || e.Kind == graph.EdgeMemberOf {
-					continue
-				}
-				visited[e.From] = true
-				next = append(next, e.From)
+	current := append([]string(nil), symbolIDs...)
+	edgesRemaining := maxLiveImpactEdges
+	for depth := 1; depth <= 3 && len(current) > 0; depth++ {
+		if ctx.Err() != nil || edgesRemaining <= 0 {
+			result.Truncated = true
+			break
+		}
+		inEdges, limited, err := readIncoming(current, edgesRemaining)
+		if err != nil {
+			result.Truncated = true
+			break
+		}
 
-				n := g.GetNode(e.From)
-				if n == nil || n.Kind == graph.KindFile || n.Kind == graph.KindImport {
+		type candidate struct {
+			id   string
+			edge *graph.Edge
+		}
+		next := make([]string, 0)
+		candidates := make([]candidate, 0)
+		for _, id := range current {
+			for _, edge := range inEdges[id] {
+				edgesRemaining--
+				if edge == nil || visited[edge.From] {
 					continue
 				}
-				result.ByDepth[depth] = append(result.ByDepth[depth], ImpactEntry{
-					ID:              n.ID,
-					Name:            n.Name,
-					Kind:            string(n.Kind),
-					FilePath:        n.FilePath,
-					Line:            n.StartLine,
-					RepoPrefix:      n.RepoPrefix,
-					EdgeConfidence:  e.Confidence,
-					ConfidenceLabel: graph.ConfidenceLabelFor(e.Kind, e.Confidence),
-				})
-				if isTestFile(n.FilePath) {
-					result.TestFiles = append(result.TestFiles, n.FilePath)
+				if edge.Kind == graph.EdgeDefines || edge.Kind == graph.EdgeMemberOf {
+					continue
 				}
+				visited[edge.From] = true
+				next = append(next, edge.From)
+				candidates = append(candidates, candidate{id: edge.From, edge: edge})
+			}
+		}
+
+		nodes, err := getImpactNodesContext(ctx, g, next)
+		if err != nil {
+			result.Truncated = true
+			return
+		}
+		emitted := 0
+		for _, candidate := range candidates {
+			if ctx.Err() != nil {
+				result.Truncated = true
+				break
+			}
+			n := nodes[candidate.id]
+			if n == nil || n.Kind == graph.KindFile || n.Kind == graph.KindImport {
+				continue
+			}
+			if emitted >= maxImpactEntriesPerTier {
+				result.Truncated = true
+				continue
+			}
+			result.ByDepth[depth] = append(result.ByDepth[depth], ImpactEntry{
+				ID:              n.ID,
+				Name:            n.Name,
+				Kind:            string(n.Kind),
+				FilePath:        n.FilePath,
+				Line:            n.StartLine,
+				RepoPrefix:      n.RepoPrefix,
+				EdgeConfidence:  candidate.edge.Confidence,
+				ConfidenceLabel: graph.ConfidenceLabelFor(candidate.edge.Kind, candidate.edge.Confidence),
+			})
+			emitted++
+			if isTestFile(n.FilePath) {
+				result.TestFiles = append(result.TestFiles, n.FilePath)
 			}
 		}
 		current = next
+		if limited {
+			result.Truncated = true
+			break
+		}
 	}
 }
 
@@ -304,12 +395,33 @@ func fillImpactFromReach(ctx context.Context, g graph.Store, result *ImpactResul
 			if len(tier) == 0 {
 				continue
 			}
-			out := make([]ImpactEntry, 0, len(tier))
-			for _, e := range tier {
-				if e.ID == seedID {
+			selected := make([]reach.Entry, 0, min(len(tier), maxImpactEntriesPerTier))
+			for _, entry := range tier {
+				if entry.ID == seedID {
 					continue
 				}
-				n := g.GetNode(e.ID)
+				if len(selected) == maxImpactEntriesPerTier {
+					result.Truncated = true
+					break
+				}
+				selected = append(selected, entry)
+			}
+			ids := make([]string, len(selected))
+			for i := range selected {
+				ids[i] = selected[i].ID
+			}
+			nodes, err := getImpactNodesContext(ctx, g, ids)
+			if err != nil {
+				result.Truncated = true
+				return true
+			}
+			out := make([]ImpactEntry, 0, len(selected))
+			for _, entry := range selected {
+				if ctx.Err() != nil {
+					result.Truncated = true
+					break
+				}
+				n := nodes[entry.ID]
 				if n == nil || n.Kind == graph.KindFile || n.Kind == graph.KindImport {
 					continue
 				}
@@ -320,8 +432,8 @@ func fillImpactFromReach(ctx context.Context, g graph.Store, result *ImpactResul
 					FilePath:        n.FilePath,
 					Line:            n.StartLine,
 					RepoPrefix:      n.RepoPrefix,
-					EdgeConfidence:  e.Conf,
-					ConfidenceLabel: e.Label,
+					EdgeConfidence:  entry.Conf,
+					ConfidenceLabel: entry.Label,
 				})
 				if isTestFile(n.FilePath) {
 					result.TestFiles = append(result.TestFiles, n.FilePath)
@@ -368,8 +480,25 @@ func fillImpactFromReach(ctx context.Context, g graph.Store, result *ImpactResul
 		// Deterministic emission — matches each per-seed slice's
 		// build-time sort + makes the JSON payload diff-stable.
 		sort.Slice(tier, func(i, j int) bool { return tier[i].ID < tier[j].ID })
-		for _, e := range tier {
-			n := g.GetNode(e.ID)
+		if len(tier) > maxImpactEntriesPerTier {
+			result.Truncated = true
+			tier = tier[:maxImpactEntriesPerTier]
+		}
+		ids := make([]string, len(tier))
+		for i := range tier {
+			ids[i] = tier[i].ID
+		}
+		nodes, err := getImpactNodesContext(ctx, g, ids)
+		if err != nil {
+			result.Truncated = true
+			return true
+		}
+		for _, entry := range tier {
+			if ctx.Err() != nil {
+				result.Truncated = true
+				break
+			}
+			n := nodes[entry.ID]
 			if n == nil || n.Kind == graph.KindFile || n.Kind == graph.KindImport {
 				continue
 			}
@@ -380,8 +509,8 @@ func fillImpactFromReach(ctx context.Context, g graph.Store, result *ImpactResul
 				FilePath:        n.FilePath,
 				Line:            n.StartLine,
 				RepoPrefix:      n.RepoPrefix,
-				EdgeConfidence:  e.Conf,
-				ConfidenceLabel: e.Label,
+				EdgeConfidence:  entry.Conf,
+				ConfidenceLabel: entry.Label,
 			})
 			if isTestFile(n.FilePath) {
 				result.TestFiles = append(result.TestFiles, n.FilePath)

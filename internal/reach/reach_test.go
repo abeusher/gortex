@@ -190,13 +190,15 @@ func TestLookup_LazyComputesOnFirstMiss(t *testing.T) {
 	if len(d3) != 0 {
 		t.Errorf("expected d3=[], got %#v", d3)
 	}
-	// The lazy compute should have stamped the result for next time.
+	// Lazy lookup is intentionally read-only. Persisting this result would
+	// turn a safety check into an uncancellable store write; eager BuildIndex
+	// remains the only reach-cache publication path.
 	n := g.GetNode(seed)
-	if n == nil || n.Meta == nil {
-		t.Fatalf("lazy Lookup should have stamped result on %s", seed)
+	if n == nil {
+		t.Fatalf("seed %s disappeared after lazy lookup", seed)
 	}
-	if _, ok := n.Meta[MetaReachBuild]; !ok {
-		t.Errorf("lazy Lookup should have stamped MetaReachBuild on %s", seed)
+	if _, ok := n.Meta[MetaReachBuild]; ok {
+		t.Errorf("lazy Lookup must not stamp MetaReachBuild on %s", seed)
 	}
 }
 

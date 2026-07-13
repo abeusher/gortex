@@ -45,17 +45,19 @@ func TestLookupSQLiteRepeatedAndReloadedPreservesTopology(t *testing.T) {
 		}
 	}
 
-	assertLookup(s) // computes and persists the cache
-	assertLookup(s) // reads the persisted cache
+	assertLookup(s) // computes an exact, read-only result
+	assertLookup(s) // repeated lazy lookup remains exact without writing
 	if got := s.EdgeCount(); got != len(edges) {
 		t.Fatalf("edge count after repeated lookup = %d, want %d", got, len(edges))
 	}
 	seed := s.GetNode("seed")
-	if _, ok := seed.Meta[MetaReachBuild].(uint64); !ok {
-		t.Fatalf("persisted reach build type = %T, want uint64", seed.Meta[MetaReachBuild])
-	}
-	if _, ok := seed.Meta[MetaReachD1Conf].([]float64); !ok {
-		t.Fatalf("persisted confidence type = %T, want []float64", seed.Meta[MetaReachD1Conf])
+	if seed.Meta != nil {
+		if _, ok := seed.Meta[MetaReachBuild]; ok {
+			t.Fatal("lazy lookup must not persist a reach build")
+		}
+		if _, ok := seed.Meta[MetaReachD1Conf]; ok {
+			t.Fatal("lazy lookup must not persist reach confidence")
+		}
 	}
 
 	if err := s.Close(); err != nil {

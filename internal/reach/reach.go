@@ -726,6 +726,20 @@ func LookupCached(g graph.Store, seedID string) (d1, d2, d3 []Entry, hit, trunca
 // resolver locks. Publication re-enters both locks, verifies the generation,
 // and retries if a mutation crossed the optimistic compute window. This keeps
 // synchronous edits from waiting behind breadth-first graph traversal.
+type contextNodeGetter interface {
+	GetNodeContext(context.Context, string) (*graph.Node, error)
+}
+
+func getNodeContext(ctx context.Context, g graph.Store, id string) (*graph.Node, error) {
+	if getter, ok := g.(contextNodeGetter); ok {
+		return getter.GetNodeContext(ctx, id)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return g.GetNode(id), nil
+}
+
 func LookupContext(parent context.Context, g graph.Store, seedID string) (d1, d2, d3 []Entry, hit, truncated bool) {
 	if g == nil {
 		return nil, nil, nil, false, false
@@ -747,7 +761,12 @@ func LookupContext(parent context.Context, g graph.Store, seedID string) (d1, d2
 			return nil, nil, nil, false, true
 		}
 		currentBuild := atomic.LoadUint64(&buildCounter)
-		n := g.GetNode(seedID)
+		n, nodeErr := getNodeContext(ctx, g, seedID)
+		if nodeErr != nil {
+			mu.Unlock()
+			releaseTopology()
+			return nil, nil, nil, true, true
+		}
 		if n == nil || !ImpactSeedKind(n.Kind) {
 			mu.Unlock()
 			releaseTopology()
@@ -766,50 +785,21 @@ func LookupContext(parent context.Context, g graph.Store, seedID string) (d1, d2
 		releaseTopology()
 
 		// The expensive portion is optimistic and lock-free with respect to
-		// indexing. A concurrent topology writer invalidates currentBuild;
-		// the publication gate below then discards this snapshot and retries.
+		// indexing. Lazy lookups are deliberately read-only: publishing the
+		// result through graph.Store.AddNode turns an interactive safety check
+		// into an uncancellable SQLite write. Under concurrent indexing that
+		// write can wait on the store write mutex long after ctx expires while
+		// also retaining topology/resolve coordination, starving the daemon.
+		//
+		// BuildIndexCtx is the sole persistent reach-cache writer. A lazy miss
+		// returns its bounded lower-bound evidence directly; a concurrent graph
+		// generation change marks that evidence truncated rather than retrying
+		// or publishing a mixed snapshot.
 		tiers, traversalTruncated := compute(ctx, g, seedID)
 		if ctx.Err() != nil {
-			traversalTruncated = true
-		}
-
-		releaseTopology, ok = beginTopologyReadContext(ctx)
-		if !ok {
-			return entriesForTier(tiers[0]), entriesForTier(tiers[1]), entriesForTier(tiers[2]), true, true
-		}
-		if !lockContext(ctx, mu) {
-			releaseTopology()
 			return entriesForTier(tiers[0]), entriesForTier(tiers[1]), entriesForTier(tiers[2]), true, true
 		}
 		if currentBuild != atomic.LoadUint64(&buildCounter) {
-			mu.Unlock()
-			releaseTopology()
-			if ctx.Err() != nil {
-				return entriesForTier(tiers[0]), entriesForTier(tiers[1]), entriesForTier(tiers[2]), true, true
-			}
-			continue
-		}
-		n = g.GetNode(seedID)
-		if n == nil || !ImpactSeedKind(n.Kind) {
-			mu.Unlock()
-			releaseTopology()
-			return nil, nil, nil, false, false
-		}
-		if d1, d2, d3, cachedTruncated, cached := readCached(n, currentBuild); cached {
-			mu.Unlock()
-			releaseTopology()
-			return d1, d2, d3, true, cachedTruncated
-		}
-		published := cloneNodeWithMeta(n)
-		writeRecord(published.Meta, currentBuild, tiers, traversalTruncated)
-		g.AddNode(published)
-		stable := currentBuild == atomic.LoadUint64(&buildCounter)
-		mu.Unlock()
-		releaseTopology()
-		if !stable {
-			if ctx.Err() != nil {
-				return entriesForTier(tiers[0]), entriesForTier(tiers[1]), entriesForTier(tiers[2]), true, true
-			}
 			continue
 		}
 		return entriesForTier(tiers[0]), entriesForTier(tiers[1]), entriesForTier(tiers[2]), true, traversalTruncated
