@@ -54,6 +54,17 @@ type localizationTerminalState struct {
 	state           string
 	exactSymbol     string
 	taskFingerprint string
+	generation      uint64
+	nextReservation uint64
+	reservation     *localizationReservation
+}
+
+type localizationReservation struct {
+	token                  uint64
+	generation             uint64
+	pendingCompletion      localizationCompletion
+	pendingTaskFingerprint string
+	staged                 bool
 }
 
 func newLocalizationTerminalState() *localizationTerminalState {
@@ -65,9 +76,13 @@ func (s *localizationTerminalState) reset() {
 		return
 	}
 	s.mu.Lock()
+	s.generation++
 	s.state = localizationStateInactive
 	s.exactSymbol = ""
 	s.taskFingerprint = ""
+	// Keep an in-flight reservation until its owner finishes. Its captured
+	// generation is now stale, so finishLocalize cannot commit it, while a
+	// second localization cannot race ahead of the still-running handler.
 	s.mu.Unlock()
 }
 
@@ -80,34 +95,47 @@ func (s *localizationTerminalState) armForTask(completion localizationCompletion
 		return
 	}
 	s.mu.Lock()
-	s.state = completion.State
-	s.exactSymbol = completion.ExactSymbol
-	s.taskFingerprint = localizationTaskFingerprint(task)
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+	fingerprint := localizationTaskFingerprint(task)
+	if s.reservation != nil {
+		s.reservation.pendingCompletion = completion
+		s.reservation.pendingTaskFingerprint = fingerprint
+		s.reservation.staged = true
+		return
+	}
+	s.commitLocalizationLocked(completion, fingerprint)
 }
 
-// beginLocalize admits a new explicit localization request without mutating the
-// prior completion contract. Repeating the same normalized task is a navigation
-// loop; a successful different task atomically replaces the contract in armForTask.
-func (s *localizationTerminalState) beginLocalize(task string) *mcpgo.CallToolResult {
+func (s *localizationTerminalState) commitLocalizationLocked(completion localizationCompletion, fingerprint string) {
+	s.generation++
+	s.state = completion.State
+	s.exactSymbol = completion.ExactSymbol
+	s.taskFingerprint = fingerprint
+}
+
+// beginLocalize reserves the only localization handler slot for this session.
+// An inactive session admits its first localization without a boundary flag.
+// Once a contract exists, only the first localize call for a genuinely new user
+// request may cross it, and the caller must say so explicitly. The old contract
+// remains live until finishLocalize commits the successful replacement.
+func (s *localizationTerminalState) beginLocalize(task string, newUserTask bool) (uint64, *mcpgo.CallToolResult) {
 	if s == nil {
-		return nil
+		return 0, nil
 	}
 	fingerprint := localizationTaskFingerprint(task)
 	if fingerprint == "" {
-		return nil
+		return 0, nil
 	}
 	s.mu.Lock()
-	if s.state == localizationStateInactive {
-		s.mu.Unlock()
-		return nil
+	defer s.mu.Unlock()
+	if s.reservation != nil {
+		return 0, localizationInProgressResult()
 	}
-	if fingerprint != "" && fingerprint == s.taskFingerprint {
+	if s.state != localizationStateInactive && !newUserTask {
 		completion := newLocalizationCompletion(s.state == localizationStateAnswerReady, s.exactSymbol)
-		s.mu.Unlock()
-		return NewStructuredErrorResult(StructuredError{
+		return 0, NewStructuredErrorResult(StructuredError{
 			ErrorCode: ErrCodeLocalizationComplete,
-			Message:   "this localization request already has a completion contract; follow it instead of repeating localize",
+			Message:   "this user request already has a localization completion contract; follow it instead of starting another localize call",
 			Data: map[string]any{
 				"completion": completion,
 				"facade":     "explore",
@@ -115,8 +143,49 @@ func (s *localizationTerminalState) beginLocalize(task string) *mcpgo.CallToolRe
 			},
 		})
 	}
-	s.mu.Unlock()
-	return nil
+	s.nextReservation++
+	if s.nextReservation == 0 {
+		s.nextReservation++
+	}
+	token := s.nextReservation
+	s.reservation = &localizationReservation{token: token, generation: s.generation}
+	return token, nil
+}
+
+// finishLocalize commits only the completion staged by the matching reservation
+// and only if no reset changed its generation. Errors and panics pass success=false
+// and leave the prior contract untouched. A stale finisher can never clear or
+// overwrite a newer reservation.
+func (s *localizationTerminalState) finishLocalize(token uint64, success bool) bool {
+	if s == nil || token == 0 {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	reservation := s.reservation
+	if reservation == nil || reservation.token != token {
+		return false
+	}
+	s.reservation = nil
+	if !success || !reservation.staged || reservation.generation != s.generation {
+		return false
+	}
+	s.commitLocalizationLocked(reservation.pendingCompletion, reservation.pendingTaskFingerprint)
+	return true
+}
+
+func localizationInProgressResult() *mcpgo.CallToolResult {
+	return NewStructuredErrorResult(StructuredError{
+		ErrorCode: ErrCodeLocalizationComplete,
+		Message:   "a localization request is already in progress for this session",
+		Data: map[string]any{
+			"completion": map[string]any{
+				"state": "localization_in_progress", "scope": "localization",
+				"required_action": "wait", "allowed_tool_calls": 0,
+			},
+			"facade": "explore", "operation": "localize",
+		},
+	})
 }
 
 func localizationTaskFingerprint(task string) string {
@@ -133,6 +202,9 @@ func (s *localizationTerminalState) authorize(facade, operation string, argument
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.reservation != nil {
+		return localizationInProgressResult(), false
+	}
 	if s.state == localizationStateInactive {
 		return nil, false
 	}

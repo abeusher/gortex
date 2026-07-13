@@ -122,9 +122,20 @@ func TestCompactToolsListIsStaticAndBudgeted(t *testing.T) {
 	}
 	require.NoError(t, json.Unmarshal(raw, &parsed))
 	require.Len(t, parsed.Result.Tools, 21)
+	foundExplore := false
 	for _, tool := range parsed.Result.Tools {
 		require.True(t, isFacadeToolName(tool.Name), "legacy tool leaked into facade-v1: %s", tool.Name)
+		if tool.Name != "explore" {
+			continue
+		}
+		foundExplore = true
+		operation := tool.InputSchema.Properties["operation"].(map[string]any)
+		require.Contains(t, operation["enum"], "localize")
+		require.Contains(t, operation["enum"], "task")
+		require.Contains(t, operation["description"], "Use localize")
+		require.Contains(t, operation["description"], "Use task only")
 	}
+	require.True(t, foundExplore, "runtime tools/list omitted explore")
 }
 
 func TestFacadeSchemasAcceptUniversalCLIOutput(t *testing.T) {
@@ -400,6 +411,27 @@ func TestFacadeCapabilitiesProtocolDoesNotChangeSurface(t *testing.T) {
 	require.Equal(t, true, capability["available"])
 	require.NotNil(t, capability["input_schema"])
 	require.NotEmpty(t, capability["schema_hash"])
+
+	exploreFrame := []byte(`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"capabilities","arguments":{"domain":"explore"}}}`)
+	exploreRaw, err := json.Marshal(srv.MCPServer().HandleMessage(ctx, exploreFrame))
+	require.NoError(t, err)
+	var explored struct {
+		Error  any                   `json:"error"`
+		Result *mcpgo.CallToolResult `json:"result"`
+	}
+	require.NoError(t, json.Unmarshal(exploreRaw, &explored))
+	require.Nil(t, explored.Error)
+	exploreDomain := unmarshalResult(t, explored.Result)
+	operations := exploreDomain["operations"].([]any)
+	summaries := make(map[string]string, len(operations))
+	for _, rawOperation := range operations {
+		operation := rawOperation.(map[string]any)
+		summaries[operation["operation"].(string)] = operation["summary"].(string)
+	}
+	require.Contains(t, summaries, "localize")
+	require.Contains(t, summaries["localize"], "stop navigation")
+	require.Contains(t, summaries, "task")
+	require.Contains(t, summaries["task"], "nonterminal")
 
 	require.Equal(t, wantSurface, listToolNamesForSession(t, srv, "facade_capabilities"),
 		"capability discovery must not promote schemas or mutate tools/list")

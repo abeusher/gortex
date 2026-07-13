@@ -335,9 +335,9 @@ func enrich(input HookInput, port int) enrichResult {
 	case "Read":
 		return enrichRead(input.ToolInput, input.CWD)
 	case "Grep":
-		return enrichGrep(input.ToolInput, port)
+		return enrichGrep(input.ToolInput, port, input.CWD)
 	case "Glob":
-		return enrichGlob(input.ToolInput)
+		return enrichGlob(input.ToolInput, input.CWD)
 	case "Task":
 		return enrichTask(input.ToolInput, port)
 	case "Bash":
@@ -353,8 +353,8 @@ func enrich(input HookInput, port int) enrichResult {
 	}
 }
 
-// enrichRead blocks whole-file reads of indexed source files and suggests graph tools.
-// Narrow reads (with offset+limit for editing) are allowed through with advisory context.
+// enrichRead blocks reads of indexed source files and suggests graph tools.
+// Ranged reads are included: indexed source must stay on the graph-aware read path.
 func enrichRead(toolInput map[string]any, cwd string) enrichResult {
 	filePath, ok := toolInput["file_path"].(string)
 	if !ok || filePath == "" {
@@ -363,12 +363,6 @@ func enrichRead(toolInput map[string]any, cwd string) enrichResult {
 
 	// Skip non-source files — allow reading .md, .yaml, .json, etc.
 	if !looksLikeSourceFile(filePath) {
-		return enrichResult{}
-	}
-
-	// Detect narrow reads (offset+limit for editing). These are legitimate
-	// and should pass through — the agent already knows what it needs.
-	if isNarrowRead(toolInput) {
 		return enrichResult{}
 	}
 
@@ -465,13 +459,61 @@ type grepProbeFn func(pattern string, timeout time.Duration) ([]grepSymbolHit, e
 // tests reassign this var via a t.Cleanup-restored helper.
 var grepProbe grepProbeFn = probeViaDaemon
 
-// enrichGrep classifies the Grep pattern and, for symbol-shaped patterns,
-// probes the local daemon's search_symbols endpoint. On ≥1 hit the call is
-// denied with top matches and a bypass hint; on miss/timeout/non-symbol the
-// existing soft guidance is returned so Grep proceeds.
-func enrichGrep(toolInput map[string]any, _ int) enrichResult {
+// enrichGrep denies searches within a proven tracked/indexed scope, regardless
+// of pattern shape. When scope ownership cannot be established, the existing
+// symbol probe and soft fallback preserve the historical posture.
+func enrichGrep(toolInput map[string]any, _ int, cwdArg ...string) enrichResult {
+	cwd := ""
+	if len(cwdArg) > 0 {
+		cwd = cwdArg[0]
+	}
 	pattern, _ := toolInput["pattern"].(string)
+	if pattern == "" {
+		return enrichResult{}
+	}
+	if hookSearchScopeIndexed(cwd, toolInput) {
+		return enrichResult{
+			deny:   true,
+			reason: formatTrackedSearchDeny("Grep", pattern),
+		}
+	}
 	return probeSymbolPattern("Grep", pattern, defaultGrepGuidance())
+}
+
+func hookSearchScopeIndexed(cwd string, toolInput map[string]any) bool {
+	scope, _ := toolInput["path"].(string)
+	scope = strings.TrimSpace(scope)
+	if scope != "" {
+		abs := scope
+		if !filepath.IsAbs(abs) && cwd != "" {
+			abs = filepath.Join(cwd, abs)
+		}
+		if info, err := os.Stat(abs); err == nil && !info.IsDir() {
+			if !looksLikeSourceFile(scope) {
+				return false
+			}
+			indexed, _ := queryFileIndexed(cwd, scope)
+			return indexed
+		}
+		if filepath.Ext(scope) != "" {
+			if !looksLikeSourceFile(scope) {
+				return false
+			}
+			indexed, _ := queryFileIndexed(cwd, scope)
+			return indexed
+		}
+	}
+	return scopeTrackedFn(cwd, scope)
+}
+
+func formatTrackedSearchDeny(tool, query string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "[Gortex] BLOCKED: %s `%s` targets indexed source. Use the indexed search surface instead:\n", tool, query)
+	b.WriteString("  - `search(operation:\"text\", query:\"<literal>\")` — literal or regex-related source lookup\n")
+	b.WriteString("  - `search(operation:\"symbols\", query:\"<name>\")` — symbol lookup\n")
+	b.WriteString(gcxTip)
+	b.WriteString(toolref.MCPRequiredLine())
+	return b.String()
 }
 
 // maxAlternationProbes caps how many identifier-shaped alternatives of a
@@ -926,14 +968,100 @@ func enrichBash(toolInput map[string]any, cwd string) enrichResult {
 // without a real socket. Production reads daemon.IsRunning.
 var daemonReachableFn = daemon.IsRunning
 
-// enrichGlob denies "list all source files of extension X" patterns
-// when the daemon is reachable — those are exactly the queries the
-// graph already answers (via `get_repo_outline` / `search_symbols`).
-// Name-based patterns (e.g. `**/handler*.go`, `*test*.ts`) get soft
-// guidance only because grep-style filename search has no clean
-// graph equivalent. When the daemon is unreachable, every shape
-// degrades to soft guidance — no daemon means no enforcement.
-func enrichGlob(toolInput map[string]any) enrichResult {
+// scopeTrackedFn proves that a Grep/Glob scope contains at least one indexed
+// source file. Tests replace it so fallback cases stay deterministic.
+var scopeTrackedFn = scopeTrackedViaDaemon
+
+func scopeTrackedViaDaemon(cwd, scope string) bool {
+	if !daemonReachableFn() {
+		return false
+	}
+	scope = strings.TrimSpace(scope)
+	if scope == "" {
+		scope = cwd
+	}
+	if scope == "" {
+		return false
+	}
+	if !filepath.IsAbs(scope) {
+		if cwd == "" {
+			return false
+		}
+		scope = filepath.Join(cwd, scope)
+	}
+	scope = filepath.Clean(scope)
+	info, err := os.Stat(scope)
+	if err != nil || !info.IsDir() {
+		return false
+	}
+	root := repoRootForFile(scope)
+	if root == "" {
+		return false
+	}
+	rel, err := filepath.Rel(root, scope)
+	if err != nil {
+		return false
+	}
+
+	client, err := daemon.Dial(hookMCPHandshake(root))
+	if err != nil {
+		return false
+	}
+	defer client.Close()
+	_ = client.Conn.SetDeadline(time.Now().Add(fileIndexedTimeout))
+
+	arguments := map[string]any{"glob": "**/*", "limit": 1, "format": "json"}
+	if rel != "." {
+		arguments["path"] = filepath.ToSlash(rel)
+	}
+	frame, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name":      "find_files",
+			"arguments": arguments,
+		},
+	})
+	if err != nil || client.WriteMCPFrame(frame) != nil {
+		return false
+	}
+	resp, err := client.ReadMCPFrame()
+	return err == nil && parseFindFilesHasSource(resp)
+}
+
+func parseFindFilesHasSource(resp []byte) bool {
+	var rpc struct {
+		Result struct {
+			Content []struct {
+				Text string `json:"text"`
+			} `json:"content"`
+			IsError bool `json:"isError"`
+		} `json:"result"`
+	}
+	if json.Unmarshal(resp, &rpc) != nil || rpc.Result.IsError || len(rpc.Result.Content) == 0 {
+		return false
+	}
+	var files struct {
+		Count int `json:"count"`
+		Files []struct {
+			Path string `json:"path"`
+		} `json:"files"`
+	}
+	if json.Unmarshal([]byte(rpc.Result.Content[0].Text), &files) != nil {
+		return false
+	}
+	return files.Count > 0 && len(files.Files) > 0
+}
+
+// enrichGlob denies source enumeration within a proven tracked/indexed scope.
+// Pattern shape no longer creates a bypass; unproven or unavailable scopes
+// retain soft guidance so the hook never blocks code it cannot identify.
+func enrichGlob(toolInput map[string]any, cwdArg ...string) enrichResult {
+	cwd := ""
+	if len(cwdArg) > 0 {
+		cwd = cwdArg[0]
+	}
 	pattern, ok := toolInput["pattern"].(string)
 	if !ok || pattern == "" {
 		return enrichResult{}
@@ -942,25 +1070,19 @@ func enrichGlob(toolInput map[string]any) enrichResult {
 		return enrichResult{}
 	}
 
-	guidance := defaultGlobGuidance()
-
-	// Greedy source-ext patterns (`**/*.go`, `*.ts`) are the
-	// "enumerate every source file" shape. Hard-deny only when the
-	// daemon is up — we can't redirect to graph tools that aren't
-	// answering.
-	if isGreedySourceGlob(pattern) && daemonReachableFn() {
+	if hookSearchScopeIndexed(cwd, toolInput) {
 		var b strings.Builder
-		fmt.Fprintf(&b, "[Gortex] BLOCKED: Glob `%s` enumerates source files. The graph already indexes them — use:\n", pattern)
+		fmt.Fprintf(&b, "[Gortex] BLOCKED: Glob `%s` targets indexed source. Use:\n", pattern)
 		b.WriteString("  - `explore(operation:\"outline\")` — repository/file outline\n")
-		b.WriteString("  - `search(operation:\"symbols\")` — name-based lookup with file paths\n")
+		b.WriteString("  - `search(operation:\"files\", query:\"<name>\")` — filename lookup\n")
+		b.WriteString("  - `search(operation:\"symbols\", query:\"<name>\")` — symbols with file paths\n")
 		b.WriteString("  - `read(operation:\"summary\", target:{file:\"<path>\"})` — a specific file overview\n")
 		b.WriteString(gcxTip)
 		b.WriteString(toolref.MCPRequiredLine())
-		b.WriteString("If you genuinely need a file-system listing, run `find` or `ls` via Bash with a specific filename component — Glob deny only triggers on bare extension wildcards.")
 		return enrichResult{deny: true, reason: b.String()}
 	}
 
-	return enrichResult{context: guidance}
+	return enrichResult{context: defaultGlobGuidance()}
 }
 
 // defaultGlobGuidance is the soft-guidance message returned when a

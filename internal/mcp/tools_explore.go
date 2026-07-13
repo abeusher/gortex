@@ -87,17 +87,23 @@ const (
 )
 
 type exploreDraftEntry struct {
-	node             *graph.Node
-	evidence         string
-	exact            bool
-	overlap          int
-	direct           bool
-	structural       bool
-	structuralShared int
-	structuralLocal  bool
-	parentExact      bool
-	parentOverlap    int
-	parentRank       int
+	node                *graph.Node
+	evidence            string
+	exact               bool
+	overlap             int
+	bodyOverlap         int
+	rareOverlap         int
+	bodyDensity         int
+	generic             bool
+	direct              bool
+	structural          bool
+	structuralShared    int
+	structuralLocal     bool
+	structuralCallee    bool
+	structuralCrossFile bool
+	parentExact         bool
+	parentOverlap       int
+	parentRank          int
 }
 
 // exploreAnswerDraft puts a small, ready-to-use evidence set before the full
@@ -106,19 +112,86 @@ type exploreDraftEntry struct {
 // candidate below.
 func exploreAnswerDraft(task string, targets []exploreTarget) []exploreDraftEntry {
 	query := shapeExploreQuery(task)
-	if rerank.ClassifyQuery(query) == rerank.QueryClassConcept {
+	conceptTask := rerank.ClassifyQuery(query) == rerank.QueryClassConcept
+	if conceptTask {
 		query = stripLeadingExploreDirective(query)
 	}
 	queryTerms := exploreTerminalTerms(query)
-	makeEntry := func(n *graph.Node, evidence string, direct bool, parentRank int) (exploreDraftEntry, int) {
+
+	// Cache body term sets once per direct candidate. The bounded frequency
+	// table supplies a small inverse-frequency/density tie-break without
+	// repeatedly tokenizing source or allowing body prose to dominate names.
+	bodyTermCache := make(map[string]map[string]struct{}, len(targets))
+	candidateTermCache := make(map[string]map[string]struct{}, len(targets))
+	termFrequency := make(map[string]int, len(queryTerms))
+	if conceptTask {
+		for _, target := range targets {
+			if target.node == nil {
+				continue
+			}
+			key := exploreDraftNodeKey(target.node)
+			if _, cached := candidateTermCache[key]; cached {
+				continue
+			}
+			bodyTerms := exploreTerminalTerms(target.source)
+			bodyTermCache[key] = bodyTerms
+			candidateTerms := exploreDraftNodeTerms(target.node)
+			for term := range bodyTerms {
+				candidateTerms[term] = struct{}{}
+			}
+			candidateTermCache[key] = candidateTerms
+			for term := range queryTerms {
+				if _, matched := candidateTerms[term]; matched {
+					termFrequency[term]++
+				}
+			}
+		}
+	}
+	makeEntry := func(n *graph.Node, source, evidence string, direct bool, parentRank int) (exploreDraftEntry, int) {
 		overlap, longest := exploreDraftTermOverlap(queryTerms, n)
+		exact := exploreDraftExactAnchor(query, n) || exploreLocalizationExplicitAnchor(query, n)
+		bodyOverlap, rareOverlap, bodyDensity := 0, 0, 0
+		if conceptTask && n != nil {
+			key := exploreDraftNodeKey(n)
+			bodyTerms, cached := bodyTermCache[key]
+			if !cached && source != "" {
+				bodyTerms = exploreTerminalTerms(source)
+				bodyTermCache[key] = bodyTerms
+			}
+			bodyOverlap = exploreDraftTermSetOverlap(queryTerms, bodyTerms)
+			if candidateTerms, cached := candidateTermCache[key]; cached {
+				for term := range queryTerms {
+					if termFrequency[term] == 1 {
+						if _, matched := candidateTerms[term]; matched && rareOverlap < 2 {
+							rareOverlap++
+						}
+					}
+				}
+			}
+			denominator := len(bodyTerms)
+			if denominator > 12 {
+				denominator = 12
+			}
+			if denominator > 0 && bodyOverlap >= 2 {
+				switch {
+				case bodyOverlap*2 >= denominator:
+					bodyDensity = 2
+				case bodyOverlap*4 >= denominator:
+					bodyDensity = 1
+				}
+			}
+		}
 		return exploreDraftEntry{
-			node:       n,
-			evidence:   evidence,
-			exact:      exploreDraftExactAnchor(query, n),
-			overlap:    overlap,
-			direct:     direct,
-			parentRank: parentRank,
+			node:        n,
+			evidence:    evidence,
+			exact:       exact,
+			overlap:     overlap,
+			bodyOverlap: bodyOverlap,
+			rareOverlap: rareOverlap,
+			bodyDensity: bodyDensity,
+			generic:     conceptTask && !exact && exploreDraftGenericCandidate(n, source),
+			direct:      direct,
+			parentRank:  parentRank,
 		}, longest
 	}
 
@@ -141,82 +214,80 @@ func exploreAnswerDraft(task string, targets []exploreTarget) []exploreDraftEntr
 	// and one structural callee. The global quotas keep graph expansion useful
 	// without allowing a generic call neighborhood to consume the whole draft.
 	for i := 0; i < len(targets) && i < exploreDraftPrimaryLimit; i++ {
-		entry, _ := makeEntry(targets[i].node, fmt.Sprintf("ranked #%d", i+1), true, i)
+		entry, _ := makeEntry(targets[i].node, targets[i].source, fmt.Sprintf("ranked #%d", i+1), true, i)
 		appendEntry(entry)
 	}
 
-	var aligned, structuralCallers, structuralCallees []exploreDraftEntry
-	consider := func(n *graph.Node, evidence string, direct bool, parentRank int) {
+	var aligned, structuralNeighbors []exploreDraftEntry
+	consider := func(n *graph.Node, source, evidence string, direct bool, parentRank int) {
 		if n == nil || (!direct && exploreDraftIsTestNode(n)) {
 			return
 		}
-		entry, longest := makeEntry(n, evidence, direct, parentRank)
-		if !entry.exact && entry.overlap < 2 && (entry.overlap != 1 || longest < 5) {
+		entry, longest := makeEntry(n, source, evidence, direct, parentRank)
+		if !entry.exact && entry.bodyOverlap < 2 && entry.overlap < 2 && (entry.overlap != 1 || longest < 5) {
 			return
 		}
 		aligned = append(aligned, entry)
 	}
 	for i, target := range targets {
 		if i >= exploreDraftPrimaryLimit {
-			consider(target.node, fmt.Sprintf("ranked #%d", i+1), true, i)
+			consider(target.node, target.source, fmt.Sprintf("ranked #%d", i+1), true, i)
 		}
 		for _, n := range target.callers {
-			consider(n, fmt.Sprintf("caller of ranked #%d", i+1), false, i)
+			consider(n, "", fmt.Sprintf("caller of ranked #%d", i+1), false, i)
 		}
 		for _, n := range target.callees {
-			consider(n, fmt.Sprintf("callee of ranked #%d", i+1), false, i)
+			consider(n, "", fmt.Sprintf("callee of ranked #%d", i+1), false, i)
 		}
 
-		if target.node == nil {
+		if target.node == nil || !conceptTask {
 			continue
 		}
-		parent, longest := makeEntry(target.node, "", true, i)
-		strongParent := parent.exact || parent.overlap >= 2 || (parent.overlap == 1 && longest >= 5)
+		parent, longest := makeEntry(target.node, target.source, "", true, i)
+		strongParent := parent.exact || parent.overlap >= 2 || parent.bodyOverlap >= 2 || (parent.overlap == 1 && longest >= 5)
 		if !strongParent || exploreIdentifierSegmentCount(target.node.Name) < 2 {
 			continue
 		}
-		collectStructural := func(n *graph.Node, evidence string, dst *[]exploreDraftEntry) {
+		collectStructural := func(n *graph.Node, evidence string, callee bool) {
 			if n == nil || exploreDraftIsTestNode(n) || (n.Kind != graph.KindFunction && n.Kind != graph.KindMethod) || exploreIdentifierSegmentCount(n.Name) < 2 {
 				return
 			}
-			entry, _ := makeEntry(n, evidence, false, i)
+			entry, _ := makeEntry(n, "", evidence, false, i)
 			shared, local := exploreStructuralSignals(target.node, n)
-			if shared == 0 && !entry.exact && entry.overlap == 0 && !local {
+			if shared == 0 && !entry.exact && entry.overlap == 0 && entry.bodyOverlap == 0 && !local {
 				return
 			}
 			entry.structural = true
 			entry.structuralShared = shared
 			entry.structuralLocal = local
+			entry.structuralCallee = callee
+			entry.structuralCrossFile = nodeDisplayPath(target.node) != nodeDisplayPath(n)
 			entry.parentExact = parent.exact
 			entry.parentOverlap = parent.overlap
-			*dst = append(*dst, entry)
+			structuralNeighbors = append(structuralNeighbors, entry)
 		}
 		for _, n := range target.callers {
-			collectStructural(n, fmt.Sprintf("caller of ranked #%d", i+1), &structuralCallers)
+			collectStructural(n, fmt.Sprintf("caller of ranked #%d", i+1), false)
 		}
 		for _, n := range target.callees {
-			collectStructural(n, fmt.Sprintf("callee of ranked #%d", i+1), &structuralCallees)
+			collectStructural(n, fmt.Sprintf("callee of ranked #%d", i+1), true)
 		}
 	}
 
 	sort.SliceStable(aligned, func(i, j int) bool {
 		return exploreDraftEntryLess(aligned[i], aligned[j])
 	})
-	sort.SliceStable(structuralCallers, func(i, j int) bool {
-		return exploreStructuralEntryLess(structuralCallers[i], structuralCallers[j])
+	sort.SliceStable(structuralNeighbors, func(i, j int) bool {
+		return exploreStructuralEntryLess(structuralNeighbors[i], structuralNeighbors[j])
 	})
-	sort.SliceStable(structuralCallees, func(i, j int) bool {
-		return exploreStructuralEntryLess(structuralCallees[i], structuralCallees[j])
-	})
-	appendFirst := func(candidates []exploreDraftEntry) {
-		for _, entry := range candidates {
-			if appendEntry(entry) {
-				return
-			}
+	// Reserve one structural slot across both directions. A single causal
+	// implementation edge adds useful breadth without displacing two ranked
+	// candidates from the compact draft.
+	for _, entry := range structuralNeighbors {
+		if appendEntry(entry) {
+			break
 		}
 	}
-	appendFirst(structuralCallers)
-	appendFirst(structuralCallees)
 	for _, entry := range aligned {
 		if len(entries) >= exploreDraftTotalLimit {
 			break
@@ -224,7 +295,7 @@ func exploreAnswerDraft(task string, targets []exploreTarget) []exploreDraftEntr
 		appendEntry(entry)
 	}
 	for i := exploreDraftPrimaryLimit; i < len(targets) && len(entries) < exploreDraftTotalLimit; i++ {
-		entry, _ := makeEntry(targets[i].node, fmt.Sprintf("ranked #%d", i+1), true, i)
+		entry, _ := makeEntry(targets[i].node, targets[i].source, fmt.Sprintf("ranked #%d", i+1), true, i)
 		appendEntry(entry)
 	}
 	sort.SliceStable(entries, func(i, j int) bool {
@@ -234,15 +305,22 @@ func exploreAnswerDraft(task string, targets []exploreTarget) []exploreDraftEntr
 }
 
 func exploreDraftEntryLess(a, b exploreDraftEntry) bool {
+	alignment := func(entry exploreDraftEntry) int {
+		body := entry.bodyOverlap
+		if body > 2 {
+			body = 2
+		}
+		return entry.overlap + body
+	}
 	priority := func(entry exploreDraftEntry) int {
 		switch {
 		case entry.exact && entry.direct:
 			return 0
 		case entry.exact:
 			return 1
-		case entry.overlap > 0 && entry.direct:
+		case alignment(entry) > 0 && entry.direct:
 			return 2
-		case entry.overlap > 0:
+		case alignment(entry) > 0:
 			return 3
 		case entry.structural:
 			return 4
@@ -254,6 +332,21 @@ func exploreDraftEntryLess(a, b exploreDraftEntry) bool {
 	}
 	if ap, bp := priority(a), priority(b); ap != bp {
 		return ap < bp
+	}
+	if aa, ba := alignment(a), alignment(b); aa != ba {
+		return aa > ba
+	}
+	if a.rareOverlap != b.rareOverlap {
+		return a.rareOverlap > b.rareOverlap
+	}
+	if a.bodyDensity != b.bodyDensity {
+		return a.bodyDensity > b.bodyDensity
+	}
+	// Exact anchors and stronger term alignment already won above. Generic
+	// declarations are only a bounded tie-break within the same evidence
+	// family; they can never demote a better-aligned candidate.
+	if !a.exact && !b.exact && a.direct == b.direct && a.structural == b.structural && a.generic != b.generic {
+		return !a.generic
 	}
 	if a.overlap != b.overlap {
 		return a.overlap > b.overlap
@@ -271,14 +364,29 @@ func exploreDraftEntryLess(a, b exploreDraftEntry) bool {
 }
 
 func exploreStructuralEntryLess(a, b exploreDraftEntry) bool {
-	if a.structuralShared != b.structuralShared {
-		return a.structuralShared > b.structuralShared
+	causalAligned := func(entry exploreDraftEntry) bool {
+		return entry.structuralCallee && entry.structuralCrossFile && (entry.exact || entry.overlap > 0 || entry.bodyOverlap >= 2 || entry.rareOverlap > 0)
+	}
+	if ac, bc := causalAligned(a), causalAligned(b); ac != bc {
+		return ac
 	}
 	if a.exact != b.exact {
 		return a.exact
 	}
 	if a.overlap != b.overlap {
 		return a.overlap > b.overlap
+	}
+	if a.structuralShared != b.structuralShared {
+		return a.structuralShared > b.structuralShared
+	}
+	if a.generic != b.generic {
+		return !a.generic
+	}
+	if a.structuralCallee != b.structuralCallee {
+		return a.structuralCallee
+	}
+	if a.structuralCrossFile != b.structuralCrossFile {
+		return a.structuralCrossFile
 	}
 	if a.structuralLocal != b.structuralLocal {
 		return a.structuralLocal
@@ -358,15 +466,29 @@ func exploreDraftIsTestNode(n *graph.Node) bool {
 		strings.Contains(base, ".spec.") || strings.Contains(base, ".test.")
 }
 
+func exploreDraftNodeTerms(n *graph.Node) map[string]struct{} {
+	if n == nil {
+		return map[string]struct{}{}
+	}
+	retrieval := n.RetrievalMetadata()
+	return exploreTerminalTerms(n.Name + " " + retrieval.QualName + " " + nodeDisplayPath(n) + " " + retrieval.Signature)
+}
+
+func exploreDraftTermSetOverlap(queryTerms, candidateTerms map[string]struct{}) int {
+	count := 0
+	for term := range queryTerms {
+		if _, ok := candidateTerms[term]; ok {
+			count++
+		}
+	}
+	return count
+}
+
 func exploreDraftTermOverlap(queryTerms map[string]struct{}, n *graph.Node) (count, longest int) {
 	if n == nil || len(queryTerms) == 0 {
 		return 0, 0
 	}
-	text := n.Name + " " + n.QualName + " " + nodeDisplayPath(n)
-	if sig, _ := n.Meta["signature"].(string); sig != "" {
-		text += " " + sig
-	}
-	for term := range exploreTerminalTerms(text) {
+	for term := range exploreDraftNodeTerms(n) {
 		if _, ok := queryTerms[term]; !ok {
 			continue
 		}
@@ -378,8 +500,78 @@ func exploreDraftTermOverlap(queryTerms map[string]struct{}, n *graph.Node) (cou
 	return count, longest
 }
 
+// exploreDraftGenericCandidate identifies structurally generic API context:
+// interface/trait declarations, declaration-only methods, tiny accessors, and
+// one-step receiver forwarders. It is language-neutral and only participates
+// as a Concept-query tie-break; exact anchors bypass it at the call site.
+func exploreDraftGenericCandidate(n *graph.Node, source string) bool {
+	if n == nil {
+		return false
+	}
+	nameTerms := rerank.Tokenize(n.Name)
+	if len(nameTerms) > 0 && len(nameTerms) <= 3 {
+		switch strings.ToLower(nameTerms[0]) {
+		case "get", "set", "is", "has":
+			return true
+		}
+	}
+
+	retrieval := n.RetrievalMetadata()
+	declaration := strings.ToLower(strings.TrimSpace(retrieval.Signature + "\n" + source))
+	for _, keyword := range []string{"interface ", "trait ", "protocol "} {
+		if strings.Contains(declaration, keyword) {
+			return true
+		}
+	}
+	trimmed := strings.TrimSpace(declaration)
+	if strings.HasSuffix(trimmed, ";") && (strings.Contains(trimmed, "(") || strings.Contains(trimmed, " function ")) {
+		return true
+	}
+	if strings.TrimSpace(source) == "" {
+		return false
+	}
+
+	lines := make([]string, 0, 8)
+	for _, line := range strings.Split(strings.ToLower(source), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "//") || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "/*") || strings.HasPrefix(line, "*") {
+			continue
+		}
+		lines = append(lines, line)
+	}
+	if len(lines) > 10 {
+		return false
+	}
+	code := " " + strings.Join(lines, " ") + " "
+	if len(code) > 700 {
+		return false
+	}
+	for _, control := range []string{" if ", " for ", " while ", " loop ", " match ", " switch ", " let ", " try ", " catch "} {
+		if strings.Contains(code, control) {
+			return false
+		}
+	}
+	// Receiver syntax varies, but trivial implementations consistently contain
+	// a member access plus either one return/call or one field assignment.
+	hasMemberAccess := strings.Contains(code, ".")
+	hasOneStepReturn := strings.Contains(code, " return ") && strings.Contains(code, "(")
+	hasAccessorAssignment := strings.Contains(code, "=")
+	return hasMemberAccess && (hasOneStepReturn || hasAccessorAssignment)
+}
+
 func exploreDraftExactAnchor(query string, n *graph.Node) bool {
 	if n == nil {
+		return false
+	}
+	if pathAnchors, hasDirectory := exploreQueryPathAnchors(query); hasDirectory {
+		normalizedPath := exploreNormalizedPath(nodeDisplayPath(n))
+		for _, anchor := range pathAnchors {
+			if normalizedPath == anchor {
+				return true
+			}
+		}
+		// Directory-qualified requests are strict: neither a coincident symbol
+		// name nor the same basename in another directory is an exact draft hit.
 		return false
 	}
 	normalize := func(text string) string {
@@ -473,8 +665,10 @@ func exploreAnswerReady(task string, targets []exploreTarget) bool {
 	}
 
 	// Paths, signatures, and identifier-shaped queries carry explicit anchors.
+	// A shared token is not enough: the ranked head must cover the complete
+	// path, qualified symbol, or signature anchor from the request.
 	if class == rerank.QueryClassPath || class == rerank.QueryClassSymbol || class == rerank.QueryClassSignature {
-		return headMatches > 0
+		return exploreLocalizationExplicitAnchor(query, targets[0].node)
 	}
 	// Broad prompts need several independent anchors in the top result. This
 	// keeps a multi-area audit from becoming terminal merely because one generic
@@ -496,6 +690,163 @@ func exploreAnswerReady(task string, targets []exploreTarget) bool {
 		}
 	}
 	return false
+}
+
+func exploreNormalizedAnchor(text string) string {
+	return strings.ToLower(strings.Join(rerank.Tokenize(text), " "))
+}
+
+func exploreNormalizedPath(text string) string {
+	text = strings.TrimSpace(text)
+	text = strings.Trim(text, "`'\"()[]{}<>,;")
+	text = strings.ReplaceAll(text, "\\", "/")
+	text = strings.TrimPrefix(text, "./")
+	parts := strings.Split(text, "/")
+	normalized := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if value := exploreNormalizedAnchor(part); value != "" {
+			normalized = append(normalized, value)
+		}
+	}
+	return strings.Join(normalized, "/")
+}
+
+func exploreQueryPathAnchors(query string) ([]string, bool) {
+	anchors := make([]string, 0, 1)
+	hasDirectory := false
+	for _, field := range strings.Fields(query) {
+		field = strings.Trim(field, "`'\"()[]{}<>,;")
+		if !strings.ContainsAny(field, "/\\") {
+			continue
+		}
+		hasDirectory = true
+		if anchor := exploreNormalizedPath(field); anchor != "" {
+			anchors = append(anchors, anchor)
+		}
+	}
+	return anchors, hasDirectory
+}
+
+func exploreLocalizationExplicitAnchor(query string, n *graph.Node) bool {
+	if n == nil {
+		return false
+	}
+	normalizedQueryText := exploreNormalizedAnchor(query)
+	normalizedQuery := " " + normalizedQueryText + " "
+	retrieval := n.RetrievalMetadata()
+	name := exploreNormalizedAnchor(n.Name)
+	qualName := exploreNormalizedAnchor(retrieval.QualName)
+	if qualName == "" || qualName == name {
+		if separator := strings.LastIndex(n.ID, "::"); separator >= 0 {
+			qualName = exploreNormalizedAnchor(n.ID[separator+2:])
+		}
+	}
+	if qualName != "" && qualName != name && strings.Contains(normalizedQuery, " "+qualName+" ") {
+		return true
+	}
+
+	path := nodeDisplayPath(n)
+	normalizedPath := exploreNormalizedPath(path)
+	pathAnchors, hasDirectory := exploreQueryPathAnchors(query)
+	if hasDirectory {
+		for _, anchor := range pathAnchors {
+			if normalizedPath == anchor {
+				return true
+			}
+		}
+		// A directory-qualified request must never degrade to a basename match;
+		// that would make same-name files in different packages terminal.
+		return false
+	}
+	if slash := strings.LastIndex(path, "/"); slash >= 0 {
+		path = path[slash+1:]
+	}
+	basename := exploreNormalizedAnchor(path)
+	if len(basename) >= 3 && strings.Contains(normalizedQuery, " "+basename+" ") {
+		return true
+	}
+
+	class := rerank.ClassifyQuery(query)
+	if class == rerank.QueryClassSignature {
+		signature := exploreNormalizedAnchor(retrieval.Signature)
+		return signature != "" && strings.Contains(normalizedQuery, " "+signature+" ")
+	}
+	// An unqualified symbol cannot disambiguate same-name methods. Permit it
+	// only for nodes whose canonical name is itself unqualified.
+	return class == rerank.QueryClassSymbol && qualName == name && normalizedQueryText == name
+}
+
+// exploreLocalizationExactTarget selects the one permitted refinement read for
+// an explicit localization request. Explicit qualified/path anchors win. For
+// natural-language tasks, candidates with more independent task terms win and
+// inverse candidate frequency breaks ties so repeated generic setters do not
+// outrank a rarer conjunctive implementation target. Retrieval order is the
+// stable final tie-breaker.
+func exploreLocalizationExactTarget(task string, targets []exploreTarget) string {
+	fallback := ""
+	for _, target := range targets {
+		if target.node != nil {
+			fallback = target.node.ID
+			break
+		}
+	}
+	if fallback == "" {
+		return ""
+	}
+	query := shapeExploreQuery(task)
+	if rerank.ClassifyQuery(query) == rerank.QueryClassConcept {
+		query = stripLeadingExploreDirective(query)
+	}
+	for _, target := range targets {
+		if target.node != nil && exploreLocalizationExplicitAnchor(query, target.node) {
+			return target.node.ID
+		}
+	}
+	queryTerms := exploreTerminalTerms(query)
+	if len(queryTerms) == 0 {
+		return fallback
+	}
+
+	matches := make([]map[string]struct{}, len(targets))
+	frequency := make(map[string]int)
+	for i, target := range targets {
+		matches[i] = make(map[string]struct{})
+		if target.node == nil {
+			continue
+		}
+		for term := range exploreTerminalTerms(exploreTerminalNodeText(target.node)) {
+			if _, relevant := queryTerms[term]; !relevant {
+				continue
+			}
+			matches[i][term] = struct{}{}
+			frequency[term]++
+		}
+	}
+
+	best := -1
+	bestOverlap := -1
+	bestRarity := -1
+	for i, target := range targets {
+		if target.node == nil {
+			continue
+		}
+		overlap := len(matches[i])
+		rarity := 0
+		for term := range matches[i] {
+			if frequency[term] > 0 {
+				rarity += 1000 / frequency[term]
+			}
+		}
+		if best < 0 || overlap > bestOverlap || (overlap == bestOverlap && rarity > bestRarity) {
+			best = i
+			bestOverlap = overlap
+			bestRarity = rarity
+		}
+	}
+	if best < 0 {
+		return fallback
+	}
+	return targets[best].node.ID
 }
 
 func exploreTerminalNodeText(n *graph.Node) string {
@@ -676,7 +1027,9 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	for i, c := range prod {
 		prodNodes[i] = c.Node
 	}
-	_, prod = diversifyByFile(prodNodes, prod, defaultMaxPerFile)
+	if exploreShouldDiversifyByFile(queryClass) {
+		_, prod = diversifyByFile(prodNodes, prod, defaultMaxPerFile)
+	}
 	cands := prod
 	if len(cands) > maxSymbols {
 		cands = cands[:maxSymbols]
@@ -696,7 +1049,10 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 			truncateOneLine(task, 200))), nil
 	}
 
-	ringOpts := query.QueryOptions{Depth: 1, Limit: exploreRingCap * 3, Detail: "brief", WorkspaceID: resolved.WorkspaceID}
+	ringOpts := query.QueryOptions{
+		Depth: 1, Limit: exploreRingCap * 3, Detail: "brief",
+		WorkspaceID: resolved.WorkspaceID, ProjectID: resolved.ProjectID, RepoAllow: resolved.RepoAllow,
+	}
 	targets := make([]exploreTarget, 0, len(cands))
 	for _, c := range cands {
 		if c == nil || c.Node == nil {
@@ -713,13 +1069,18 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		t.source = s.manifestSymbolSource(ctx, n)
 		targets = append(targets, t)
 	}
+	// Direct retrieval owns the ranked head. Once graph promotion has selected
+	// a cross-file boundary, materialize exactly that one node so both text and
+	// structured responses can reserve a source body without a broad read.
+	targets = s.materializeExploreStructuralSource(ctx, task, targets, opts)
 
 	if !req.GetBool("localize", false) {
 		return mcp.NewToolResultText(s.renderExplore(task, targets, budget)), nil
 	}
-	completion := newLocalizationCompletion(exploreAnswerReady(task, targets), targets[0].node.ID)
+	exactSymbol := exploreLocalizationExactTarget(task, targets)
+	completion := newLocalizationCompletion(exploreAnswerReady(task, targets), exactSymbol)
 	s.localizationFor(ctx).armForTask(completion, task)
-	return newLocalizationExploreResult(completion, targets, budget), nil
+	return newLocalizationExploreResultForTask(completion, task, targets, budget), nil
 }
 
 // localizationExploreEnvelope is the compact, machine-readable result for an
@@ -753,49 +1114,379 @@ func (s *Server) completeEmptyLocalization(ctx context.Context, task string, bud
 	return newLocalizationExploreResult(completion, []exploreTarget{}, budget)
 }
 
+// exploreAllowsStructuralBody keeps graph-expanded source reads exclusive to
+// broad concept localization. Explicit directory-qualified paths are guarded
+// independently because prose around a path can still classify as Concept;
+// literal symbol and signature queries retain their direct-only behavior.
+func exploreAllowsStructuralBody(task string) bool {
+	shaped := shapeExploreQuery(task)
+	class := rerank.ClassifyQuery(shaped)
+	_, directoryQualified := exploreQueryPathAnchors(shaped)
+	return !directoryQualified && class != rerank.QueryClassSymbol && class != rerank.QueryClassSignature
+}
+
+// explorePreferredFullBodyIDs reserves the first source slot for the strongest
+// direct answer and, when available, the second for the promoted cross-file
+// structural boundary. Remaining direct targets fill unused slots.
+func explorePreferredFullBodyIDs(task string, targets []exploreTarget, draft []exploreDraftEntry, limit int) []string {
+	if limit <= 0 {
+		return nil
+	}
+	sources := make(map[string]struct{}, len(targets))
+	for _, target := range targets {
+		if target.node != nil && target.source != "" {
+			sources[exploreDraftNodeKey(target.node)] = struct{}{}
+		}
+	}
+	result := make([]string, 0, limit)
+	seen := make(map[string]struct{}, limit)
+	appendEntry := func(entry exploreDraftEntry) bool {
+		if entry.node == nil || len(result) >= limit {
+			return false
+		}
+		key := exploreDraftNodeKey(entry.node)
+		if _, hasSource := sources[key]; !hasSource {
+			return false
+		}
+		if _, exists := seen[key]; exists {
+			return false
+		}
+		seen[key] = struct{}{}
+		result = append(result, key)
+		return true
+	}
+	if draft == nil {
+		draft = exploreAnswerDraft(task, targets)
+	}
+	if !exploreAllowsStructuralBody(task) {
+		for _, entry := range draft {
+			if entry.direct && entry.exact {
+				appendEntry(entry)
+			}
+		}
+		return result
+	}
+	for _, entry := range draft {
+		if entry.direct && appendEntry(entry) {
+			break
+		}
+	}
+	for _, entry := range draft {
+		if entry.structural && entry.structuralCrossFile && appendEntry(entry) {
+			break
+		}
+	}
+	for _, entry := range draft {
+		if entry.direct {
+			appendEntry(entry)
+		}
+	}
+	return result
+}
+
+// materializeExploreStructuralSource loads source for at most one promoted
+// cross-file structural boundary. Graph expansion discovers the node without a
+// broad source read; this performs the same bounded symbol-range read used for
+// direct targets only after the draft has selected that boundary.
+func (s *Server) materializeExploreStructuralSource(ctx context.Context, task string, targets []exploreTarget, scope query.QueryOptions) []exploreTarget {
+	return materializeExploreStructuralSourceWithReader(ctx, task, targets, scope, s.manifestSymbolSource)
+}
+
+func materializeExploreStructuralSourceWithReader(
+	ctx context.Context,
+	task string,
+	targets []exploreTarget,
+	scope query.QueryOptions,
+	readSource func(context.Context, *graph.Node) string,
+) []exploreTarget {
+	if len(targets) == 0 || !exploreAllowsStructuralBody(task) || ctx.Err() != nil || readSource == nil {
+		return targets
+	}
+	draft := exploreAnswerDraft(task, targets)
+	present := make(map[string]struct{}, len(targets))
+	for _, target := range targets {
+		if target.node != nil {
+			present[exploreDraftNodeKey(target.node)] = struct{}{}
+		}
+	}
+	for _, entry := range draft {
+		if entry.node == nil || !entry.structural || !entry.structuralCrossFile {
+			continue
+		}
+		key := exploreDraftNodeKey(entry.node)
+		if _, exists := present[key]; exists {
+			return targets
+		}
+		if !exploreNodeWithinQueryScope(entry.node, scope) {
+			return targets
+		}
+		// Cancellation may arrive while graph promotion is ranking candidates;
+		// check at the actual source-read boundary so an abandoned request never
+		// opens a file merely to populate an output that cannot be delivered.
+		if ctx.Err() != nil {
+			return targets
+		}
+		source := readSource(ctx, entry.node)
+		if strings.TrimSpace(source) == "" {
+			return targets
+		}
+		materialized := make([]exploreTarget, 0, len(targets)+1)
+		materialized = append(materialized, targets...)
+		return append(materialized, exploreTarget{node: entry.node, source: source})
+	}
+	return targets
+}
+
+func exploreNodeWithinQueryScope(n *graph.Node, scope query.QueryOptions) bool {
+	if n == nil {
+		return false
+	}
+	if scope.WorkspaceID != "" && n.WorkspaceID != scope.WorkspaceID {
+		return false
+	}
+	if scope.ProjectID != "" && n.ProjectID != scope.ProjectID {
+		return false
+	}
+	if len(scope.RepoAllow) > 0 && !scope.RepoAllow[n.RepoPrefix] {
+		return false
+	}
+	return true
+}
+
+// localizationEvidenceTargets projects the same bounded answer-draft evidence
+// used by ordinary rendering into the structured terminal envelope. Promoted
+// callers/callees may replace low-ranked direct candidates, but never increase
+// the response cardinality. Direct targets retain their source and neighbors.
+func localizationEvidenceTargets(task, exactID string, targets []exploreTarget) []exploreTarget {
+	return localizationEvidenceTargetsFromDraft(task, exactID, targets, nil)
+}
+
+func localizationEvidenceTargetsFromDraft(task, exactID string, targets []exploreTarget, draft []exploreDraftEntry) []exploreTarget {
+	if len(targets) == 0 {
+		return targets
+	}
+	limit := len(targets)
+	direct := make(map[string]exploreTarget, len(targets))
+	for _, target := range targets {
+		if target.node != nil {
+			direct[exploreDraftNodeKey(target.node)] = target
+		}
+	}
+	selected := make([]exploreTarget, 0, limit)
+	seen := make(map[string]struct{}, limit)
+	appendTarget := func(target exploreTarget) {
+		if len(selected) >= limit || target.node == nil {
+			return
+		}
+		key := exploreDraftNodeKey(target.node)
+		if _, exists := seen[key]; exists {
+			return
+		}
+		seen[key] = struct{}{}
+		selected = append(selected, target)
+	}
+	if draft == nil && strings.TrimSpace(task) != "" {
+		draft = exploreAnswerDraft(task, targets)
+	}
+	appendTarget(targets[0])
+	// The completion contract names the exact refinement target. Reserve it
+	// before promoted structural neighbors so a tight evidence limit cannot
+	// advertise an exact_symbol that is absent from files/symbols/evidence.
+	if exactID != "" {
+		for _, target := range targets {
+			if target.node != nil && target.node.ID == exactID {
+				appendTarget(target)
+				break
+			}
+		}
+	}
+	appendEntry := func(entry exploreDraftEntry) {
+		if entry.node == nil {
+			return
+		}
+		if target, ok := direct[exploreDraftNodeKey(entry.node)]; ok {
+			appendTarget(target)
+		} else {
+			appendTarget(exploreTarget{node: entry.node})
+		}
+	}
+	// Reserve bounded space for promoted implementations before lower-ranked
+	// direct retrieval hits consume the envelope.
+	for _, entry := range draft {
+		if entry.structural || !entry.direct {
+			appendEntry(entry)
+		}
+	}
+	for _, entry := range draft {
+		appendEntry(entry)
+	}
+	for _, target := range targets {
+		appendTarget(target)
+	}
+	return selected
+}
+
 func newLocalizationExploreResult(completion localizationCompletion, targets []exploreTarget, budget int) *mcp.CallToolResult {
+	return newLocalizationExploreResultForTask(completion, "", targets, budget)
+}
+
+const (
+	localizationEnvelopeBytesPerToken = 4
+	localizationMaxNameRunes          = 120
+	localizationMaxQualNameRunes      = 180
+	localizationMaxSignatureRunes     = 240
+	localizationMaxNeighborIDs        = 3
+	localizationMaxNeighborIDRunes    = 96
+)
+
+func compactLocalizationField(text string, limit int) string {
+	text = strings.TrimSpace(text)
+	runes := []rune(text)
+	if limit <= 0 || len(runes) <= limit {
+		return text
+	}
+	return string(runes[:limit-1]) + "…"
+}
+
+func localizationEnvelopeFits(envelope localizationExploreEnvelope, maxBytes int) bool {
+	body, err := json.Marshal(envelope)
+	return err == nil && len(body) <= maxBytes
+}
+
+func newLocalizationExploreResultForTask(completion localizationCompletion, task string, targets []exploreTarget, budget int) *mcp.CallToolResult {
+	var draft []exploreDraftEntry
+	if strings.TrimSpace(task) != "" {
+		draft = exploreAnswerDraft(task, targets)
+	}
+	preferredBodyIDs := explorePreferredFullBodyIDs(task, targets, draft, exploreFullBodyLimit)
+	targets = localizationEvidenceTargetsFromDraft(task, completion.ExactSymbol, targets, draft)
 	envelope := localizationExploreEnvelope{
 		Completion: completion,
 		Files:      make([]string, 0),
 		Symbols:    make([]string, 0),
 		Evidence:   make([]localizationEvidence, 0),
 	}
+	maxBytes := budget * localizationEnvelopeBytesPerToken
+	if maxBytes < 1 {
+		maxBytes = 1
+	}
+
+	mandatoryCount := 0
+	if len(targets) > 0 {
+		mandatoryCount = 1
+	}
+	if completion.ExactSymbol != "" {
+		for index, target := range targets {
+			if target.node != nil && target.node.ID == completion.ExactSymbol && index+1 > mandatoryCount {
+				mandatoryCount = index + 1
+				break
+			}
+		}
+	}
+
 	seenFiles := make(map[string]struct{})
-	sourceBudget := budget / 2
-	for rank, target := range targets {
+	acceptedTargets := make([]exploreTarget, 0, len(targets))
+	for _, target := range targets {
 		if target.node == nil {
 			continue
 		}
 		n := target.node
 		path := nodeDisplayPath(n)
-		if _, seen := seenFiles[path]; !seen {
-			seenFiles[path] = struct{}{}
-			envelope.Files = append(envelope.Files, path)
-		}
-		envelope.Symbols = append(envelope.Symbols, n.ID)
 		retrieval := n.RetrievalMetadata()
 		evidence := localizationEvidence{
-			Rank: rank + 1, ID: n.ID, Name: n.Name, Kind: string(n.Kind), File: path,
+			Rank: len(envelope.Evidence) + 1, ID: n.ID,
+			Name: compactLocalizationField(n.Name, localizationMaxNameRunes),
+			Kind: string(n.Kind), File: path,
 			Line: n.StartLine, EndLine: n.EndLine,
-			QualName:  retrieval.QualName,
-			Signature: retrieval.Signature,
-			Callers:   localizationNeighborIDs(target.callers),
-			Callees:   localizationNeighborIDs(target.callees),
+			QualName:  compactLocalizationField(retrieval.QualName, localizationMaxQualNameRunes),
+			Signature: compactLocalizationField(retrieval.Signature, localizationMaxSignatureRunes),
+			Callers:   boundedLocalizationNeighborIDs(target.callers, localizationMaxNeighborIDs),
+			Callees:   boundedLocalizationNeighborIDs(target.callees, localizationMaxNeighborIDs),
 		}
-		if rank < exploreFullBodyLimit && target.source != "" {
-			cost := estimateTokens(target.source)
-			if cost <= budget/exploreBodyBudgetShare && cost <= sourceBudget {
-				evidence.Source = target.source
-				sourceBudget -= cost
+
+		candidate := envelope
+		candidate.Files = append([]string(nil), envelope.Files...)
+		candidate.Symbols = append([]string(nil), envelope.Symbols...)
+		candidate.Evidence = append([]localizationEvidence(nil), envelope.Evidence...)
+		if _, seen := seenFiles[path]; !seen {
+			candidate.Files = append(candidate.Files, path)
+		}
+		candidate.Symbols = append(candidate.Symbols, n.ID)
+		candidate.Evidence = append(candidate.Evidence, evidence)
+		mandatory := len(envelope.Evidence) < mandatoryCount
+		if !localizationEnvelopeFits(candidate, maxBytes) {
+			if !mandatory {
+				continue
+			}
+			// Primary and exact identifiers are contractual. If their optional
+			// metadata would exceed the envelope, retain the identifiers and
+			// locations while shedding expansion details first.
+			evidence.QualName = ""
+			evidence.Signature = ""
+			evidence.Callers = nil
+			evidence.Callees = nil
+			candidate.Evidence[len(candidate.Evidence)-1] = evidence
+		}
+		envelope = candidate
+		seenFiles[path] = struct{}{}
+		acceptedTargets = append(acceptedTargets, target)
+	}
+
+	// Add full bodies only when the complete serialized response still fits.
+	// JSON marshaling here accounts for metadata arrays and escaping that the
+	// previous source-only token estimate omitted. Preferred IDs reserve one
+	// slot for a promoted cross-file causal boundary when it has source.
+	bodyOrder := make([]int, 0, exploreFullBodyLimit)
+	seenBody := make(map[int]struct{}, exploreFullBodyLimit)
+	appendBodyIndex := func(index int) {
+		if index < 0 || index >= len(acceptedTargets) || len(bodyOrder) >= exploreFullBodyLimit {
+			return
+		}
+		if _, exists := seenBody[index]; exists {
+			return
+		}
+		seenBody[index] = struct{}{}
+		bodyOrder = append(bodyOrder, index)
+	}
+	for _, preferredID := range preferredBodyIDs {
+		for index, target := range acceptedTargets {
+			if target.node != nil && exploreDraftNodeKey(target.node) == preferredID {
+				appendBodyIndex(index)
+				break
 			}
 		}
-		envelope.Evidence = append(envelope.Evidence, evidence)
 	}
+	for index := range acceptedTargets {
+		appendBodyIndex(index)
+	}
+	for _, index := range bodyOrder {
+		if acceptedTargets[index].source == "" {
+			continue
+		}
+		candidate := envelope
+		candidate.Evidence = append([]localizationEvidence(nil), envelope.Evidence...)
+		candidate.Evidence[index].Source = acceptedTargets[index].source
+		if localizationEnvelopeFits(candidate, maxBytes) {
+			envelope = candidate
+		}
+	}
+
 	body, err := json.Marshal(envelope)
 	if err != nil {
 		return mcp.NewToolResultError("encode localization result: " + err.Error())
 	}
 	return mcp.NewToolResultText(string(body))
+}
+
+func boundedLocalizationNeighborIDs(nodes []*graph.Node, limit int) []string {
+	ids := localizationNeighborIDs(nodes)
+	if limit >= 0 && len(ids) > limit {
+		ids = ids[:limit]
+	}
+	for index := range ids {
+		ids[index] = compactLocalizationField(ids[index], localizationMaxNeighborIDRunes)
+	}
+	return ids
 }
 
 func localizationNeighborIDs(nodes []*graph.Node) []string {
@@ -838,11 +1529,8 @@ func (s *Server) renderExplore(task string, targets []exploreTarget, budget int)
 			nodeLoc(entry.node), exploreDraftSymbol(entry.node), entry.evidence)
 	}
 	fullBodyIDs := make(map[string]struct{}, exploreFullBodyLimit)
-	for _, entry := range draft {
-		if !entry.direct || len(fullBodyIDs) >= exploreFullBodyLimit {
-			continue
-		}
-		fullBodyIDs[exploreDraftNodeKey(entry.node)] = struct{}{}
+	for _, id := range explorePreferredFullBodyIDs(task, targets, draft, exploreFullBodyLimit) {
+		fullBodyIDs[id] = struct{}{}
 	}
 	b.WriteString("\n## Likely targets (most-relevant first)\n")
 	b.WriteString("Graph-verified details follow; all candidate locations and signatures are retained, with full source for the strongest direct draft targets.\n")
@@ -935,6 +1623,10 @@ func exploreDataDefinitionKind(k graph.NodeKind) bool {
 	default:
 		return false
 	}
+}
+
+func exploreShouldDiversifyByFile(class rerank.QueryClass) bool {
+	return class == rerank.QueryClassConcept
 }
 
 // exploreCandidateFetchLimit leaves enough headroom for concept localization

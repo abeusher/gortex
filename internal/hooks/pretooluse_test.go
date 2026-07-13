@@ -12,8 +12,9 @@ func withDaemonReachable(t *testing.T, reachable bool) {
 	t.Cleanup(func() { daemonReachableFn = prev })
 }
 
-func TestEnrichGlob_GreedySourcePattern_DaemonUp_Denies(t *testing.T) {
+func TestEnrichGlob_GreedySourcePattern_TrackedScope_Denies(t *testing.T) {
 	withDaemonReachable(t, true)
+	stubTrackedScope(t, true)
 	result := enrichGlob(map[string]any{"pattern": "**/*.go"})
 	if !result.deny {
 		t.Fatal("expected deny for greedy source glob with daemon up")
@@ -122,18 +123,18 @@ func TestEnrichRead_NonSourceFile(t *testing.T) {
 	}
 }
 
-func TestEnrichRead_NarrowRead_Allowed(t *testing.T) {
-	// A read with offset+limit is narrow (for editing) — should always pass through.
+func TestEnrichRead_NarrowUnindexedRead_GetsSoftGuidance(t *testing.T) {
+	// Range shape is no longer a policy bypass. An unindexed file remains soft.
 	result := enrichRead(map[string]any{
 		"file_path": "/tmp/foo.go",
 		"offset":    float64(100),
 		"limit":     float64(20),
 	}, "")
 	if result.deny {
-		t.Error("narrow read (offset+limit) should not be denied")
+		t.Error("unindexed narrow read should not be denied")
 	}
-	if result.context != "" {
-		t.Error("narrow read should not produce guidance")
+	if result.context == "" {
+		t.Error("unindexed narrow read should receive graph guidance")
 	}
 }
 

@@ -103,9 +103,14 @@ func facadeToolDefinitionWithOperations(name string, operations []string) mcpgo.
 	switch name {
 	case "explore":
 		opts = []mcpgo.ToolOption{
-			operation,
+			mcpgo.WithString("operation", mcpgo.Description("Use localize when the requested outcome is files or symbols; it returns terminal evidence. Use task only when diagnosis or implementation will continue.")),
 			mcpgo.WithString("task", mcpgo.Description("Task, bug, or question to localize.")),
-			mcpgo.WithString("path"), options, output,
+			mcpgo.WithString("path"),
+			mcpgo.WithObject("options",
+				mcpgo.Description("Set new_user_task=true only on the first localize call caused by a new user request. Never set it to retry, paraphrase, or continue the current request."),
+				mcpgo.AdditionalProperties(true),
+			),
+			output,
 		}
 	case "search":
 		opts = []mcpgo.ToolOption{operation, mcpgo.WithString("query"), options, output}
@@ -329,13 +334,21 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 		return invalid, nil
 	}
 	terminal := s.localizationFor(ctx)
-	// An explicit explore operation marks a new request boundary. Diagnosis and
-	// change flows stay non-terminal; localization-only flows replace any prior
-	// completion contract. Ordinary navigation cannot clear terminal state.
-	freshTaskFlow := facade == "explore" && operation == "task"
+	// An explicit localization request starts a transactional reservation. The
+	// first localization in an inactive session needs no boundary flag. Once a
+	// contract exists, only the first localize call caused by a new user request
+	// may set options.new_user_task=true; task text never implies a boundary.
 	freshLocalizeFlow := facade == "explore" && operation == "localize"
+	localizeReservation := uint64(0)
+	localizeFinished := false
 	if freshLocalizeFlow {
-		if blocked := terminal.beginLocalize(req.GetString("task", "")); blocked != nil {
+		newUserTask := false
+		if options, ok := req.GetArguments()["options"].(map[string]any); ok {
+			newUserTask, _ = options["new_user_task"].(bool)
+		}
+		var blocked *mcpgo.CallToolResult
+		localizeReservation, blocked = terminal.beginLocalize(req.GetString("task", ""), newUserTask)
+		if blocked != nil {
 			s.recordFacadeTelemetry(facade, operation, facadeOutcomeBlocked, time.Since(started))
 			return blocked, nil
 		}
@@ -346,8 +359,12 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 		if exactReadReserved {
 			terminal.finishExactRead(exactReadSucceeded)
 		}
+		if localizeReservation != 0 && !localizeFinished {
+			// Errors and panics roll back to the previous completion contract.
+			terminal.finishLocalize(localizeReservation, false)
+		}
 	}()
-	if !freshTaskFlow && !freshLocalizeFlow {
+	if !freshLocalizeFlow {
 		blocked, reserved := terminal.authorize(facade, operation, req.GetArguments())
 		if blocked != nil {
 			s.recordFacadeTelemetry(facade, operation, facadeOutcomeBlocked, time.Since(started))
@@ -360,8 +377,9 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 	if exactReadReserved {
 		exactReadSucceeded = succeeded
 	}
-	if freshTaskFlow && succeeded {
-		terminal.reset()
+	if freshLocalizeFlow {
+		terminal.finishLocalize(localizeReservation, succeeded)
+		localizeFinished = true
 	}
 	return result, err
 }
@@ -1323,7 +1341,11 @@ func (s *Server) facadeCapability(spec facadeOperationSpec, includeSchema bool) 
 		out["fixed_arguments"] = spec.Fixed
 	}
 	if available {
-		if spec.Facade == "analyze" && spec.Operation == "help" {
+		if spec.Facade == "explore" && spec.Operation == "localize" {
+			out["summary"] = "Locate files and symbols, then stop navigation and answer from the returned evidence. Set options.new_user_task=true only on the first localize call caused by a new user request; never use it to retry or continue the current request."
+		} else if spec.Facade == "explore" && spec.Operation == "task" {
+			out["summary"] = "Gather a nonterminal neighborhood for diagnosis or implementation that will continue."
+		} else if spec.Facade == "analyze" && spec.Operation == "help" {
 			out["summary"] = "List supported analysis kinds."
 		} else if summary := AnalyzeKindDescription(spec.Operation); spec.Legacy == "analyze" && summary != "" {
 			out["summary"] = summary

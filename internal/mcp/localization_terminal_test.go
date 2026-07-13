@@ -75,11 +75,11 @@ func TestCompleteEmptyLocalizationReplacesPriorContract(t *testing.T) {
 			t.Fatalf("%s = %#v, want empty array", field, envelope[field])
 		}
 	}
-	if blocked := terminal.beginLocalize("Locate B"); blocked == nil {
+	if _, blocked := terminal.beginLocalize("Locate B", false); blocked == nil {
 		t.Fatal("empty localization did not arm the new task contract")
 	}
-	if blocked := terminal.beginLocalize("Locate A"); blocked != nil {
-		t.Fatalf("prior task still owns terminal state: %v", blocked)
+	if _, blocked := terminal.beginLocalize("Locate A", false); blocked == nil {
+		t.Fatal("task text bypassed the active localization contract")
 	}
 }
 
@@ -189,15 +189,12 @@ func TestLocalizationTerminalStateIsPerSession(t *testing.T) {
 	}
 }
 
-func TestHandleFacadeTaskStartsFreshNonTerminalFlow(t *testing.T) {
+func TestHandleFacadeTaskCannotEscapeTerminalState(t *testing.T) {
 	registry := newFacadeRegistry()
 	called := false
-	registry.capture(mcpgo.NewTool("explore"), func(_ context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+	registry.capture(mcpgo.NewTool("explore"), func(context.Context, mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
 		called = true
-		if req.GetBool("localize", false) {
-			t.Fatal("explore(task) must not inherit the localize fixed argument")
-		}
-		return mcpgo.NewToolResultText("ordinary diagnostic localization"), nil
+		return mcpgo.NewToolResultText("unexpected"), nil
 	})
 	server := &Server{
 		facades:      registry,
@@ -205,40 +202,57 @@ func TestHandleFacadeTaskStartsFreshNonTerminalFlow(t *testing.T) {
 		sessions:     newSessionMap(),
 	}
 	ctx := WithSessionID(context.Background(), "diagnosis")
-	server.localizationFor(ctx).arm(newLocalizationCompletion(true, ""))
-	req := mcpgo.CallToolRequest{}
-	req.Params.Name = "explore"
-	req.Params.Arguments = map[string]any{"operation": "task", "task": "diagnose the failure"}
-	result, err := server.handleFacade(ctx, "explore", req)
-	if err != nil || result == nil || result.IsError || !called {
-		t.Fatalf("ordinary task flow did not dispatch: result=%#v err=%v called=%v", result, err, called)
+	terminal := server.localizationFor(ctx)
+	terminal.armForTask(newLocalizationCompletion(true, ""), "locate the failing writer")
+	for _, task := range []string{
+		"diagnose the failing writer",
+		"find where that writer failure originates",
+	} {
+		req := mcpgo.CallToolRequest{}
+		req.Params.Name = "explore"
+		req.Params.Arguments = map[string]any{"operation": "task", "task": task}
+		result, err := server.handleFacade(ctx, "explore", req)
+		if err != nil || result == nil || !result.IsError {
+			t.Fatalf("ordinary task escaped terminal state: result=%#v err=%v", result, err)
+		}
+		text, _ := singleTextContent(result)
+		if !strings.Contains(text, string(ErrCodeLocalizationComplete)) {
+			t.Fatalf("ordinary task returned wrong terminal error: %s", text)
+		}
 	}
-	if blocked := server.localizationFor(ctx).block("search", "symbols", nil); blocked != nil {
-		t.Fatalf("explore(task) left terminal state armed: %#v", blocked)
+	if called {
+		t.Fatal("ordinary explore(task) dispatched after localization completed")
+	}
+	if blocked := terminal.block("search", "symbols", nil); blocked == nil {
+		t.Fatal("ordinary explore(task) cleared terminal state")
 	}
 }
 
-func TestHandleFacadeFailedTaskDoesNotClearTerminalState(t *testing.T) {
+func TestHandleFacadeTaskRunsWhenTerminalInactive(t *testing.T) {
 	registry := newFacadeRegistry()
-	registry.capture(mcpgo.NewTool("explore"), func(context.Context, mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
-		return mcpgo.NewToolResultError("localization failed"), nil
+	called := false
+	registry.capture(mcpgo.NewTool("explore"), func(_ context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+		called = true
+		if req.GetBool("localize", false) {
+			t.Fatal("explore(task) must not inherit the localize fixed argument")
+		}
+		return mcpgo.NewToolResultText("ordinary diagnostic neighborhood"), nil
 	})
 	server := &Server{
 		facades:      registry,
 		localization: newLocalizationTerminalState(),
 		sessions:     newSessionMap(),
 	}
-	ctx := WithSessionID(context.Background(), "failed-diagnosis")
-	server.localizationFor(ctx).arm(newLocalizationCompletion(true, ""))
+	ctx := WithSessionID(context.Background(), "inactive-diagnosis")
 	req := mcpgo.CallToolRequest{}
 	req.Params.Name = "explore"
 	req.Params.Arguments = map[string]any{"operation": "task", "task": "diagnose the failure"}
 	result, err := server.handleFacade(ctx, "explore", req)
-	if err != nil || result == nil || !result.IsError {
-		t.Fatalf("expected failed task result: result=%#v err=%v", result, err)
+	if err != nil || result == nil || result.IsError || !called {
+		t.Fatalf("inactive ordinary task did not dispatch: result=%#v err=%v called=%v", result, err, called)
 	}
-	if blocked := server.localizationFor(ctx).block("search", "symbols", nil); blocked == nil {
-		t.Fatal("a failed task call must not clear an existing terminal state")
+	if blocked := server.localizationFor(ctx).block("search", "symbols", nil); blocked != nil {
+		t.Fatalf("ordinary task unexpectedly armed terminal state: %#v", blocked)
 	}
 }
 
@@ -277,7 +291,9 @@ func TestHandleFacadeExactReadCommitsOnlyOnSuccess(t *testing.T) {
 
 func TestHandleFacadeFailedDifferentLocalizePreservesTerminalState(t *testing.T) {
 	registry := newFacadeRegistry()
+	calls := 0
 	registry.capture(mcpgo.NewTool("explore"), func(context.Context, mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+		calls++
 		return mcpgo.NewToolResultError("localization failed"), nil
 	})
 	server := &Server{facades: registry, localization: &localizationTerminalState{}}
@@ -287,13 +303,174 @@ func TestHandleFacadeFailedDifferentLocalizePreservesTerminalState(t *testing.T)
 
 	req := mcpgo.CallToolRequest{}
 	req.Params.Name = "explore"
-	req.Params.Arguments = map[string]any{"operation": "localize", "task": "Locate Bar"}
+	req.Params.Arguments = map[string]any{
+		"operation": "localize", "task": "Locate Bar",
+		"options": map[string]any{"new_user_task": true},
+	}
 	result, err := server.handleFacade(ctx, "explore", req)
-	if err != nil || result == nil || !result.IsError {
-		t.Fatalf("failed localize = (%v, %v), want tool error", result, err)
+	if err != nil || result == nil || !result.IsError || calls != 1 {
+		t.Fatalf("failed boundary localize = (%v, %v), calls=%d, want one tool error", result, err, calls)
 	}
 	if blocked := terminal.block("search", "symbols", nil); blocked == nil {
-		t.Fatal("failed different localize cleared terminal state")
+		t.Fatal("failed boundary localize cleared terminal state")
+	}
+	terminal.mu.Lock()
+	fingerprint := terminal.taskFingerprint
+	terminal.mu.Unlock()
+	if fingerprint != "Locate Foo" {
+		t.Fatalf("failed boundary replaced task fingerprint with %q", fingerprint)
+	}
+}
+
+func TestHandleFacadeExplicitNewUserTaskCommitsOnSuccess(t *testing.T) {
+	registry := newFacadeRegistry()
+	var server *Server
+	calls := 0
+	registry.capture(mcpgo.NewTool("explore", mcpgo.WithString("task", mcpgo.Required())), func(ctx context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+		calls++
+		server.localizationFor(ctx).armForTask(newLocalizationCompletion(true, ""), req.GetString("task", ""))
+		return mcpgo.NewToolResultText("localized"), nil
+	})
+	server = &Server{facades: registry, localization: newLocalizationTerminalState(), sessions: newSessionMap()}
+	ctx := WithSessionID(context.Background(), "new-user-boundary")
+	terminal := server.localizationFor(ctx)
+	terminal.armForTask(newLocalizationCompletion(true, ""), "Locate Foo")
+
+	req := mcpgo.CallToolRequest{}
+	req.Params.Name = "explore"
+	req.Params.Arguments = map[string]any{
+		"operation": "localize", "task": "Locate Bar",
+		"options": map[string]any{"new_user_task": true},
+	}
+	result, err := server.handleFacade(ctx, "explore", req)
+	if err != nil || result == nil || result.IsError || calls != 1 {
+		t.Fatalf("explicit boundary localize = (%v, %v), calls=%d", result, err, calls)
+	}
+	terminal.mu.Lock()
+	fingerprint := terminal.taskFingerprint
+	terminal.mu.Unlock()
+	if fingerprint != "Locate Bar" {
+		t.Fatalf("successful boundary committed fingerprint %q", fingerprint)
+	}
+
+	req.Params.Arguments = map[string]any{"operation": "localize", "task": "Locate Baz"}
+	blocked, err := server.handleFacade(ctx, "explore", req)
+	if err != nil || blocked == nil || !blocked.IsError || calls != 1 {
+		t.Fatalf("later localize without boundary escaped: result=%#v err=%v calls=%d", blocked, err, calls)
+	}
+}
+
+func TestHandleFacadeNewUserTaskPanicRollsBack(t *testing.T) {
+	registry := newFacadeRegistry()
+	registry.capture(mcpgo.NewTool("explore"), func(context.Context, mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+		panic("localization panic")
+	})
+	server := &Server{facades: registry, localization: newLocalizationTerminalState(), sessions: newSessionMap()}
+	ctx := WithSessionID(context.Background(), "new-user-panic")
+	terminal := server.localizationFor(ctx)
+	terminal.armForTask(newLocalizationCompletion(true, ""), "Locate Foo")
+	req := mcpgo.CallToolRequest{}
+	req.Params.Name = "explore"
+	req.Params.Arguments = map[string]any{
+		"operation": "localize", "task": "Locate Bar",
+		"options": map[string]any{"new_user_task": true},
+	}
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		_, _ = server.handleFacade(ctx, "explore", req)
+	}()
+	if recovered == nil {
+		t.Fatal("handleFacade did not propagate localization panic")
+	}
+	terminal.mu.Lock()
+	fingerprint := terminal.taskFingerprint
+	reservation := terminal.reservation
+	terminal.mu.Unlock()
+	if fingerprint != "Locate Foo" || reservation != nil {
+		t.Fatalf("panic changed prior contract: fingerprint=%q reservation=%#v", fingerprint, reservation)
+	}
+}
+
+func TestHandleFacadeConcurrentLocalizeAdmitsOnlyOne(t *testing.T) {
+	registry := newFacadeRegistry()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var server *Server
+	registry.capture(mcpgo.NewTool("explore", mcpgo.WithString("task", mcpgo.Required())), func(ctx context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+		close(started)
+		<-release
+		server.localizationFor(ctx).armForTask(newLocalizationCompletion(true, ""), req.GetString("task", ""))
+		return mcpgo.NewToolResultText("localized"), nil
+	})
+	server = &Server{facades: registry, localization: newLocalizationTerminalState(), sessions: newSessionMap()}
+	ctx := WithSessionID(context.Background(), "concurrent-localize")
+	firstReq := mcpgo.CallToolRequest{}
+	firstReq.Params.Name = "explore"
+	firstReq.Params.Arguments = map[string]any{"operation": "localize", "task": "Locate First"}
+	type response struct {
+		result *mcpgo.CallToolResult
+		err    error
+	}
+	firstDone := make(chan response, 1)
+	go func() {
+		result, err := server.handleFacade(ctx, "explore", firstReq)
+		firstDone <- response{result: result, err: err}
+	}()
+	<-started
+
+	secondReq := mcpgo.CallToolRequest{}
+	secondReq.Params.Name = "explore"
+	secondReq.Params.Arguments = map[string]any{
+		"operation": "localize", "task": "Locate Second",
+		"options": map[string]any{"new_user_task": true},
+	}
+	second, err := server.handleFacade(ctx, "explore", secondReq)
+	if err != nil || second == nil || !second.IsError {
+		t.Fatalf("concurrent localize was not blocked: result=%#v err=%v", second, err)
+	}
+	close(release)
+	first := <-firstDone
+	if first.err != nil || first.result == nil || first.result.IsError {
+		t.Fatalf("admitted localize failed: result=%#v err=%v", first.result, first.err)
+	}
+	terminal := server.localizationFor(ctx)
+	terminal.mu.Lock()
+	fingerprint := terminal.taskFingerprint
+	terminal.mu.Unlock()
+	if fingerprint != "Locate First" {
+		t.Fatalf("blocked concurrent localize won state: fingerprint=%q", fingerprint)
+	}
+}
+
+func TestLocalizationStaleReservationCannotOverwriteNewerState(t *testing.T) {
+	terminal := newLocalizationTerminalState()
+	token, blocked := terminal.beginLocalize("Locate Stale", false)
+	if blocked != nil || token == 0 {
+		t.Fatalf("first reservation = (%d, %#v)", token, blocked)
+	}
+	terminal.armForTask(newLocalizationCompletion(true, ""), "Locate Stale")
+	terminal.reset()
+	if terminal.finishLocalize(token, true) {
+		t.Fatal("generation-stale reservation committed")
+	}
+
+	newToken, blocked := terminal.beginLocalize("Locate Current", false)
+	if blocked != nil || newToken == 0 {
+		t.Fatalf("new reservation = (%d, %#v)", newToken, blocked)
+	}
+	terminal.armForTask(newLocalizationCompletion(true, ""), "Locate Current")
+	if !terminal.finishLocalize(newToken, true) {
+		t.Fatal("current reservation did not commit")
+	}
+	if terminal.finishLocalize(token, true) {
+		t.Fatal("stale finisher matched a newer reservation")
+	}
+	terminal.mu.Lock()
+	fingerprint := terminal.taskFingerprint
+	terminal.mu.Unlock()
+	if fingerprint != "Locate Current" {
+		t.Fatalf("stale finisher overwrote %q", fingerprint)
 	}
 }
 
@@ -341,34 +518,39 @@ func TestHandleFacadeExactReadPanicRestoresReservation(t *testing.T) {
 	}
 }
 
-func TestHandleFacadeLocalizeFingerprintPreservesCase(t *testing.T) {
+func TestHandleFacadeLocalizeBlocksParaphrasesWithoutBoundary(t *testing.T) {
 	registry := newFacadeRegistry()
-	var server *Server
 	calls := 0
-	registry.capture(mcpgo.NewTool("explore", mcpgo.WithString("task", mcpgo.Required())), func(ctx context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+	registry.capture(mcpgo.NewTool("explore", mcpgo.WithString("task", mcpgo.Required())), func(context.Context, mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
 		calls++
-		server.localizationFor(ctx).armForTask(newLocalizationCompletion(true, ""), req.GetString("task", ""))
-		return mcpgo.NewToolResultText("localized"), nil
+		return mcpgo.NewToolResultText("unexpected"), nil
 	})
-	server = &Server{facades: registry, localization: newLocalizationTerminalState(), sessions: newSessionMap()}
+	server := &Server{facades: registry, localization: newLocalizationTerminalState(), sessions: newSessionMap()}
 	ctx := WithSessionID(context.Background(), "repeat-localize")
-	server.localizationFor(ctx).armForTask(newLocalizationCompletion(true, ""), "Locate Run Handler")
+	terminal := server.localizationFor(ctx)
+	terminal.armForTask(newLocalizationCompletion(true, ""), "Locate Run Handler")
 
-	req := mcpgo.CallToolRequest{}
-	req.Params.Name = "explore"
-	req.Params.Arguments = map[string]any{"operation": "localize", "task": "  Locate   Run Handler "}
-	same, err := server.handleFacade(ctx, "explore", req)
-	if err != nil || same == nil || !same.IsError || calls != 0 {
-		t.Fatalf("same normalized localization must remain blocked: result=%#v err=%v calls=%d", same, err, calls)
+	for _, task := range []string{
+		"  Locate   Run Handler ",
+		"Locate run Handler",
+		"find where the run handler fails",
+	} {
+		req := mcpgo.CallToolRequest{}
+		req.Params.Name = "explore"
+		req.Params.Arguments = map[string]any{"operation": "localize", "task": task}
+		result, err := server.handleFacade(ctx, "explore", req)
+		if err != nil || result == nil || !result.IsError {
+			t.Fatalf("localize(%q) bypassed active contract: result=%#v err=%v", task, result, err)
+		}
 	}
-
-	req.Params.Arguments = map[string]any{"operation": "localize", "task": "Locate run Handler"}
-	different, err := server.handleFacade(ctx, "explore", req)
-	if err != nil || different == nil || different.IsError || calls != 1 {
-		t.Fatalf("different localization task must start fresh: result=%#v err=%v calls=%d", different, err, calls)
+	if calls != 0 {
+		t.Fatalf("blocked localize calls dispatched %d legacy request(s)", calls)
 	}
-	if blocked := server.localizationFor(ctx).block("search", "symbols", nil); blocked == nil {
-		t.Fatal("fresh localization result did not arm its own terminal contract")
+	terminal.mu.Lock()
+	fingerprint := terminal.taskFingerprint
+	terminal.mu.Unlock()
+	if fingerprint != "Locate Run Handler" {
+		t.Fatalf("blocked localize changed task fingerprint to %q", fingerprint)
 	}
 }
 

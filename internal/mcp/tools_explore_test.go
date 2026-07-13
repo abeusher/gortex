@@ -2,7 +2,9 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 
@@ -185,7 +187,7 @@ func TestRenderExploreAnswerDraftPromotesBoundedStructuralNeighbors(t *testing.T
 		{node: node("parallel-rank9", "root_path", "crates/ignore/src/dir.rs")},
 		{node: node("parallel-rank10", "ignore_match", "crates/ignore/src/dir.rs")},
 	}
-	out = (&Server{}).renderExplore("nondeterminism WalkBuilder parallel multi-root walk current_dir standard_filters add build_parallel", targets, 1600)
+	out = (&Server{}).renderExplore("Nondeterminism in ignore::WalkBuilder parallel multi-root walk", targets, 1600)
 	draft = out[strings.Index(out, "## Answer draft"):strings.Index(out, "## Likely targets")]
 	for _, want := range []string{"SYMBOL: build_with_cwd", "ID: crates/ignore/src/dir.rs::IgnoreBuilder.build_with_cwd", "callee of ranked #2"} {
 		if !strings.Contains(draft, want) {
@@ -195,6 +197,295 @@ func TestRenderExploreAnswerDraftPromotesBoundedStructuralNeighbors(t *testing.T
 	if strings.Contains(draft, "get_or_set_current_dir") {
 		t.Fatalf("query-overlapping but parent-unrelated callee displaced structural implementation:\n%s", draft)
 	}
+}
+
+func TestExploreDraftGenericCandidateIsLanguageNeutral(t *testing.T) {
+	cases := []struct {
+		name   string
+		path   string
+		symbol string
+		source string
+	}{
+		{name: "rust", path: "matcher.rs", symbol: "set_replacement", source: "fn set_replacement(&mut self, value: bool) { self.replacement = value; }"},
+		{name: "go", path: "matcher.go", symbol: "SetReplacement", source: "func (m *Matcher) SetReplacement(value bool) { m.replacement = value }"},
+		{name: "java", path: "Matcher.java", symbol: "setReplacement", source: "void setReplacement(boolean value) { this.replacement = value; }"},
+		{name: "typescript", path: "matcher.ts", symbol: "setReplacement", source: "setReplacement(value: boolean) { this.replacement = value; }"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			n := &graph.Node{ID: tc.path + "::" + tc.symbol, Name: tc.symbol, Kind: graph.KindMethod, FilePath: tc.path}
+			if !exploreDraftGenericCandidate(n, tc.source) {
+				t.Fatalf("%s accessor was not classified structurally", tc.name)
+			}
+		})
+	}
+	concrete := &graph.Node{ID: "matcher.go::ApplyReplacement", Name: "ApplyReplacement", Kind: graph.KindMethod, FilePath: "matcher.go"}
+	concreteSource := "func (m *Matcher) ApplyReplacement(parts []Part) { for _, part := range parts { m.output = append(m.output, part.Bytes()...) } }"
+	if exploreDraftGenericCandidate(concrete, concreteSource) {
+		t.Fatal("multi-step concrete implementation classified as generic")
+	}
+}
+
+func TestExploreAnswerDraftExactTraitMethodBypassesGenericTieBreak(t *testing.T) {
+	traitMethod := &graph.Node{ID: "matcher.rs::Matcher.replace", Name: "replace", QualName: "Matcher.replace", Kind: graph.KindMethod, FilePath: "matcher.rs"}
+	implementation := &graph.Node{ID: "replacer.rs::Replacer.interpolate", Name: "interpolate", QualName: "Replacer.interpolate", Kind: graph.KindMethod, FilePath: "replacer.rs"}
+	task := "How does Matcher.replace choose replacement bytes?"
+	if rerank.ClassifyQuery(shapeExploreQuery(task)) != rerank.QueryClassConcept {
+		t.Fatalf("fixture must exercise the Concept path: %q", shapeExploreQuery(task))
+	}
+	entries := exploreAnswerDraft(task, []exploreTarget{
+		{node: implementation, source: "fn interpolate(&self, replacement: &[u8]) { for byte in replacement { self.output.push(*byte); } }"},
+		{node: traitMethod, source: "trait Matcher { fn replace(&self, replacement: &[u8]) { self.replace_at(replacement); } }"},
+	})
+	if len(entries) == 0 || entries[0].node.ID != traitMethod.ID || !entries[0].exact || entries[0].generic {
+		t.Fatalf("exact trait method lost its anchor exemption: %#v", entries)
+	}
+}
+
+func TestExploreAnswerDraftPrefersConcreteRustImplementationOverTraitDefaults(t *testing.T) {
+	node := func(id, name, qual string, kind graph.NodeKind) *graph.Node {
+		return &graph.Node{ID: id, Name: name, QualName: qual, Kind: kind, FilePath: "crates/grep-matcher/src/lib.rs", StartLine: 20}
+	}
+	matcher := node("matcher::Matcher", "Matcher", "Matcher", graph.KindType)
+	defaultReplace := node("matcher::Matcher.replace", "replace", "Matcher.replace", graph.KindMethod)
+	setter := node("matcher::Matcher.set_replacement", "set_replacement", "Matcher.set_replacement", graph.KindMethod)
+	replacer := node("matcher::Replacer", "Replacer", "Replacer", graph.KindType)
+	targets := []exploreTarget{
+		{node: matcher, source: "pub trait Matcher { fn replace(&self, bytes: &[u8]); }"},
+		{node: defaultReplace, source: "fn replace(&self, bytes: &[u8]) { self.replace_with_captures(bytes) }"},
+		{node: setter, source: "fn set_replacement(&mut self, yes: bool) -> &mut Self { self.replacement = yes; self }"},
+		{node: replacer, source: "pub struct Replacer; impl Replacer { fn interpolate(&self, captures: Captures, replacement: &[u8]) { for capture in captures.iter() { output.extend_from_slice(capture.bytes()); } } }"},
+	}
+
+	conceptTask := "How does replacement byte capture interpolation produce incorrect output?"
+	if rerank.ClassifyQuery(shapeExploreQuery(conceptTask)) != rerank.QueryClassConcept {
+		t.Fatalf("fixture must exercise the Concept path: %q", shapeExploreQuery(conceptTask))
+	}
+	entries := exploreAnswerDraft(conceptTask, targets)
+	if len(entries) == 0 || entries[0].node.ID != replacer.ID {
+		t.Fatalf("concrete replacement implementation must precede trait defaults: %#v", entries)
+	}
+	for _, entry := range entries {
+		if entry.node.ID == replacer.ID && entry.generic {
+			t.Fatalf("concrete implementation classified as generic: %#v", entry)
+		}
+	}
+
+	exact := exploreAnswerDraft("Matcher", targets)
+	if len(exact) == 0 || exact[0].node.ID != matcher.ID {
+		t.Fatalf("exact trait lookup must retain anchor order: %#v", exact)
+	}
+}
+
+func TestExploreAnswerDraftReservesOneCrossFileCausalNeighborWithinBudget(t *testing.T) {
+	scope := query.QueryOptions{
+		WorkspaceID: "bench", ProjectID: "ripgrep", RepoAllow: map[string]bool{"ripgrep": true},
+	}
+	node := func(id, name, qual, file string) *graph.Node {
+		return &graph.Node{
+			ID: id, Name: name, QualName: qual, Kind: graph.KindMethod,
+			FilePath: file, Language: "rust", StartLine: 1, EndLine: 1,
+			WorkspaceID: "bench", ProjectID: "ripgrep", RepoPrefix: "ripgrep",
+		}
+	}
+	const causalBody = "fn build_with_cwd(&self) {\n    let ignore = self.parents_for_each_root();\n    record(\"CROSS_FILE_CAUSAL_BODY_MARKER\", ignore);\n}\n"
+	causalPath := t.TempDir() + "/dir.rs"
+	if err := os.WriteFile(causalPath, []byte(causalBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	buildParallel := node("walk::build_parallel", "build_parallel", "WalkBuilder.build_parallel", "crates/ignore/src/walk.rs")
+	buildWithCWD := node("dir::build_with_cwd", "build_with_cwd", "IgnoreBuilder.build_with_cwd", causalPath)
+	buildWithCWD.EndLine = 4
+	sameFileBuild := node("walk::build", "build", "WalkBuilder.build", "crates/ignore/src/walk.rs")
+	genericGetter := node("walk::get_current_dir", "get_current_dir", "WalkBuilder.get_current_dir", "crates/ignore/src/walk.rs")
+	genericCaller := node("walk::set_parallel", "set_parallel", "WalkBuilder.set_parallel", "crates/ignore/src/walk.rs")
+	targets := []exploreTarget{
+		{node: buildParallel, callers: []*graph.Node{genericCaller}, callees: []*graph.Node{sameFileBuild, genericGetter, buildWithCWD}, source: "fn build_parallel(&self) { self.ignore.build_with_cwd(&self.cwd); }"},
+		{node: node("walk::parallel", "parallel_walk", "WalkBuilder.parallel_walk", "crates/ignore/src/walk.rs")},
+		{node: node("walk::roots", "multiple_roots", "WalkBuilder.multiple_roots", "crates/ignore/src/walk.rs")},
+		{node: node("walk::filters", "standard_filters", "WalkBuilder.standard_filters", "crates/ignore/src/walk.rs")},
+	}
+	task := "Nondeterminism in ignore::WalkBuilder parallel multi-root walk\n" +
+		"ignore::WalkBuilder appears to produce nondeterministic results for a parallel multi-root walk when one root has a scoped ignore rule that should not apply to another root.\n" +
+		"The racy result suggests the per-directory ignore stack is inherited across roots."
+	if strings.Contains(task, "build_with_cwd") {
+		t.Fatal("fixture must not name the expected callee")
+	}
+	for _, target := range targets {
+		if target.node != nil && target.node.ID == buildWithCWD.ID {
+			t.Fatal("graph-only promoted neighbor must be absent from direct targets")
+		}
+	}
+	if rerank.ClassifyQuery(shapeExploreQuery(task)) != rerank.QueryClassConcept {
+		t.Fatalf("fixture must exercise the Concept path: %q", shapeExploreQuery(task))
+	}
+	entries := exploreAnswerDraft(task, targets)
+	structural := 0
+	for _, entry := range entries {
+		if entry.structural {
+			structural++
+			if entry.node.ID != buildWithCWD.ID {
+				t.Fatalf("reserved structural slot = %q, want cross-file causal callee %q: %#v", entry.node.ID, buildWithCWD.ID, entries)
+			}
+		}
+	}
+	if structural != 1 {
+		t.Fatalf("structural quota = %d, want exactly 1: %#v", structural, entries)
+	}
+	if len(entries) > exploreDraftTotalLimit {
+		t.Fatalf("draft exceeded bounded cardinality: %d", len(entries))
+	}
+	shuffledTargets := append([]exploreTarget(nil), targets...)
+	shuffledTargets[0].callers = []*graph.Node{genericCaller}
+	shuffledTargets[0].callees = []*graph.Node{genericGetter, buildWithCWD, sameFileBuild}
+	shuffled := exploreAnswerDraft(task, shuffledTargets)
+	if len(shuffled) != len(entries) {
+		t.Fatalf("shuffled draft size = %d, want %d", len(shuffled), len(entries))
+	}
+	for i := range entries {
+		if shuffled[i].node.ID != entries[i].node.ID {
+			t.Fatalf("neighbor input order changed draft at %d: got %q want %q", i, shuffled[i].node.ID, entries[i].node.ID)
+		}
+	}
+
+	server := &Server{}
+	reads := 0
+	materialized := materializeExploreStructuralSourceWithReader(
+		context.Background(), task, targets, scope,
+		func(ctx context.Context, n *graph.Node) string {
+			reads++
+			return server.manifestSymbolSource(ctx, n)
+		},
+	)
+	if reads != 1 {
+		t.Fatalf("promoted source reads = %d, want exactly one", reads)
+	}
+	if len(materialized) != len(targets)+1 || materialized[len(materialized)-1].node.ID != buildWithCWD.ID {
+		t.Fatalf("materialized targets = %#v, want one appended graph-only boundary", materialized)
+	}
+	if !strings.Contains(materialized[len(materialized)-1].source, "CROSS_FILE_CAUSAL_BODY_MARKER") {
+		t.Fatalf("promoted source was not read from its graph node range: %q", materialized[len(materialized)-1].source)
+	}
+	rendered := server.renderExplore(task, materialized, 1600)
+	if !strings.Contains(rendered, "CROSS_FILE_CAUSAL_BODY_MARKER") {
+		t.Fatalf("promoted cross-file boundary missing reserved rendered body:\n%s", rendered)
+	}
+
+	const budget = 1000
+	result := newLocalizationExploreResultForTask(newLocalizationCompletion(true, ""), task, materialized, budget)
+	text, ok := singleTextContent(result)
+	if !ok {
+		t.Fatalf("expected one text result: %#v", result)
+	}
+	if len(text) > budget*localizationEnvelopeBytesPerToken {
+		t.Fatalf("serialized envelope = %d bytes, budget = %d", len(text), budget*localizationEnvelopeBytesPerToken)
+	}
+	var envelope localizationExploreEnvelope
+	if err := json.Unmarshal([]byte(text), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(envelope.Symbols, "\n"), buildWithCWD.ID) {
+		t.Fatalf("cross-file causal boundary missing from bounded envelope: %#v", envelope.Symbols)
+	}
+	foundSource := false
+	for _, evidence := range envelope.Evidence {
+		if evidence.ID == buildWithCWD.ID && strings.Contains(evidence.Source, "CROSS_FILE_CAUSAL_BODY_MARKER") {
+			foundSource = true
+			break
+		}
+	}
+	if !foundSource {
+		t.Fatalf("promoted cross-file boundary did not receive its reserved source slot: %#v", envelope.Evidence)
+	}
+}
+
+func TestExploreStructuralSourceMaterializationHonorsReadBoundary(t *testing.T) {
+	const baseTask = "Nondeterminism in ignore::WalkBuilder parallel multi-root walk\n" +
+		"ignore::WalkBuilder appears to produce nondeterministic results for a parallel multi-root walk when one root has a scoped ignore rule that should not apply to another root.\n" +
+		"The racy result suggests the per-directory ignore stack is inherited across roots."
+	scope := query.QueryOptions{
+		WorkspaceID: "bench", ProjectID: "ripgrep", RepoAllow: map[string]bool{"ripgrep": true},
+	}
+	makeTargets := func(neighborProject, neighborRepo string) ([]exploreTarget, *graph.Node) {
+		node := func(id, name, qual, file string) *graph.Node {
+			return &graph.Node{
+				ID: id, Name: name, QualName: qual, Kind: graph.KindMethod,
+				FilePath: file, Language: "rust", StartLine: 1, EndLine: 4,
+				WorkspaceID: "bench", ProjectID: "ripgrep", RepoPrefix: "ripgrep",
+			}
+		}
+		neighbor := node("dir::build_with_cwd", "build_with_cwd", "IgnoreBuilder.build_with_cwd", "crates/ignore/src/dir.rs")
+		neighbor.ProjectID = neighborProject
+		neighbor.RepoPrefix = neighborRepo
+		primary := node("walk::build_parallel", "build_parallel", "WalkBuilder.build_parallel", "crates/ignore/src/walk.rs")
+		return []exploreTarget{
+			{node: primary, callees: []*graph.Node{neighbor}, source: "fn build_parallel(&self) { self.ignore.build_with_cwd(&self.cwd); }"},
+			{node: node("walk::parallel", "parallel_walk", "WalkBuilder.parallel_walk", "crates/ignore/src/walk.rs")},
+			{node: node("walk::roots", "multiple_roots", "WalkBuilder.multiple_roots", "crates/ignore/src/walk.rs")},
+			{node: node("walk::filters", "standard_filters", "WalkBuilder.standard_filters", "crates/ignore/src/walk.rs")},
+		}, neighbor
+	}
+	assertPromoted := func(task string, targets []exploreTarget, wantID string) {
+		t.Helper()
+		for _, entry := range exploreAnswerDraft(task, targets) {
+			if entry.structural && entry.node != nil && entry.node.ID == wantID {
+				return
+			}
+		}
+		t.Fatalf("fixture did not promote %q before source guard", wantID)
+	}
+	assertNoRead := func(name string, ctx context.Context, task string, targets []exploreTarget, scope query.QueryOptions) {
+		t.Helper()
+		reads := 0
+		got := materializeExploreStructuralSourceWithReader(
+			ctx, task, targets, scope,
+			func(context.Context, *graph.Node) string {
+				reads++
+				return "SHOULD_NOT_BE_READ"
+			},
+		)
+		if reads != 0 {
+			t.Fatalf("%s: source reads = %d, want zero", name, reads)
+		}
+		if len(got) != len(targets) {
+			t.Fatalf("%s: materialized %d targets, want unchanged %d", name, len(got), len(targets))
+		}
+	}
+
+	for _, explicit := range []string{
+		"build_parallel",
+		"WalkBuilder.build_parallel",
+		"fn build_parallel(&self) -> WalkParallel",
+	} {
+		if exploreAllowsStructuralBody(explicit) {
+			t.Errorf("explicit query %q must remain direct-only", explicit)
+		}
+	}
+
+	pathTargets, pathNeighbor := makeTargets("ripgrep", "ripgrep")
+	pathTask := baseTask + "\nInvestigate crates/ignore/src/walk.rs without letting one root inherit another root's scoped rules."
+	if rerank.ClassifyQuery(shapeExploreQuery(pathTask)) != rerank.QueryClassConcept {
+		t.Fatalf("path fixture must remain prose Concept: %q", shapeExploreQuery(pathTask))
+	}
+	assertPromoted(pathTask, pathTargets, pathNeighbor.ID)
+	assertNoRead("directory-qualified Concept prose", context.Background(), pathTask, pathTargets, scope)
+
+	cancelTargets, cancelNeighbor := makeTargets("ripgrep", "ripgrep")
+	assertPromoted(baseTask, cancelTargets, cancelNeighbor.ID)
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	assertNoRead("canceled context", canceled, baseTask, cancelTargets, scope)
+	if got := (&Server{}).materializeExploreStructuralSource(canceled, baseTask, cancelTargets, scope); len(got) != len(cancelTargets) {
+		t.Fatalf("production wrapper materialized source after cancellation: got %d targets, want %d", len(got), len(cancelTargets))
+	}
+
+	projectTargets, projectNeighbor := makeTargets("other-project", "ripgrep")
+	assertPromoted(baseTask, projectTargets, projectNeighbor.ID)
+	assertNoRead("cross-project neighbor", context.Background(), baseTask, projectTargets, scope)
+
+	repoTargets, repoNeighbor := makeTargets("ripgrep", "other-repo")
+	assertPromoted(baseTask, repoTargets, repoNeighbor.ID)
+	assertNoRead("cross-repository neighbor", context.Background(), baseTask, repoTargets, scope)
 }
 
 func TestExploreAnswerDraftCapsAndDeduplicates(t *testing.T) {
@@ -228,6 +519,36 @@ func TestExploreAnswerDraftCapsAndDeduplicates(t *testing.T) {
 		if count != 1 {
 			t.Fatalf("draft node %q appears %d times", id, count)
 		}
+	}
+}
+
+func TestExploreDirectoryQualifiedDraftAndBodiesRejectSameBasename(t *testing.T) {
+	node := func(id, name, path, source string) exploreTarget {
+		return exploreTarget{node: &graph.Node{ID: id, Name: name, QualName: name, Kind: graph.KindFunction, FilePath: path, Language: "go", StartLine: 10}, source: source}
+	}
+	wrong := node("pkg/wrong/config.go::Load", "Load", "pkg/wrong/config.go", "func Load() string {\n\treturn \"WRONG_FULL_BODY_MARKER\"\n}")
+	rightLoad := node("pkg/right/config.go::Load", "Load", "pkg/right/config.go", "func Load() string {\n\treturn \"RIGHT_LOAD_BODY_MARKER\"\n}")
+	rightSave := node("pkg/right/config.go::Save", "Save", "pkg/right/config.go", "func Save() string {\n\treturn \"RIGHT_SAVE_BODY_MARKER\"\n}")
+	targets := []exploreTarget{wrong, rightLoad, rightSave}
+	entries := exploreAnswerDraft("pkg/right/config.go", targets)
+	if len(entries) < 3 || entries[0].node.ID != rightLoad.node.ID || entries[1].node.ID != rightSave.node.ID {
+		t.Fatalf("strict path anchors did not preserve same-file retrieval order: %#v", entries)
+	}
+	if entries[0].exact != true || entries[1].exact != true || entries[2].exact {
+		t.Fatalf("same-basename path leaked into exact draft anchors: %#v", entries)
+	}
+	preferred := explorePreferredFullBodyIDs("pkg/right/config.go", targets, entries, exploreFullBodyLimit)
+	if len(preferred) != 2 || preferred[0] != exploreDraftNodeKey(rightLoad.node) || preferred[1] != exploreDraftNodeKey(rightSave.node) {
+		t.Fatalf("explicit path full-body order = %#v", preferred)
+	}
+	out := (&Server{}).renderExplore("pkg/right/config.go", targets, 1600)
+	for _, marker := range []string{"RIGHT_LOAD_BODY_MARKER", "RIGHT_SAVE_BODY_MARKER"} {
+		if !strings.Contains(out, marker) {
+			t.Fatalf("exact same-file body %q missing:\n%s", marker, out)
+		}
+	}
+	if strings.Contains(out, "WRONG_FULL_BODY_MARKER") {
+		t.Fatalf("same-basename body was promoted:\n%s", out)
 	}
 }
 
@@ -537,6 +858,17 @@ func TestFacadeExploreDemotesRepeatedDataLeafNames(t *testing.T) {
 	}
 }
 
+func TestExploreFileDiversificationIsStrictlyConceptOnly(t *testing.T) {
+	if !exploreShouldDiversifyByFile(rerank.QueryClassConcept) {
+		t.Fatal("Concept query must retain bounded per-file diversification")
+	}
+	for _, class := range []rerank.QueryClass{rerank.QueryClassSymbol, rerank.QueryClassSignature} {
+		if exploreShouldDiversifyByFile(class) {
+			t.Fatalf("explicit query class %v must preserve retrieval order", class)
+		}
+	}
+}
+
 func TestDiversifyRepeatedExploreNamesIsConceptOnlyAndStable(t *testing.T) {
 	leaf1 := &rerank.Candidate{Node: &graph.Node{ID: "a", Name: "client", Kind: graph.KindVariable}}
 	leaf2 := &rerank.Candidate{Node: &graph.Node{ID: "b", Name: "client", Kind: graph.KindField}}
@@ -577,5 +909,237 @@ func TestStripLeadingExploreDirective(t *testing.T) {
 		if got := stripLeadingExploreDirective(input); got != want {
 			t.Errorf("stripLeadingExploreDirective(%q)=%q want %q", input, got, want)
 		}
+	}
+}
+
+func TestExploreLocalizationExactTargetPrefersRareTaskCoverage(t *testing.T) {
+	method := func(id, name, qualName, file string) exploreTarget {
+		return exploreTarget{node: &graph.Node{
+			ID: id, Name: name, QualName: qualName, Kind: graph.KindMethod,
+			FilePath: file, Meta: map[string]any{"search_qual_name": qualName},
+		}}
+	}
+	targets := []exploreTarget{
+		method("regex/matcher.rs::RegexMatcherBuilder.case_insensitive", "case_insensitive", "RegexMatcherBuilder.case_insensitive", "regex/matcher.rs"),
+		method("pcre/matcher.rs::RegexMatcherBuilder.case_insensitive", "case_insensitive", "RegexMatcherBuilder.case_insensitive", "pcre/matcher.rs"),
+		method("ignore/walk.rs::WalkBuilder.case_insensitive", "case_insensitive", "WalkBuilder.case_insensitive", "ignore/walk.rs"),
+		method("regex/literal.rs::Extractor.extract_alternation", "extract_alternation", "Extractor.extract_alternation", "regex/literal.rs"),
+	}
+	task := "case-insensitive literal alternation optimization causes missed matches"
+	if got, want := exploreLocalizationExactTarget(task, targets), targets[3].node.ID; got != want {
+		t.Fatalf("exact target=%q want rare conjunctive implementation %q", got, want)
+	}
+}
+
+func TestExploreLocalizationExactTargetIsStableAndHonorsExplicitAnchor(t *testing.T) {
+	head := exploreTarget{node: &graph.Node{ID: "a.go::Alpha", Name: "Alpha", Kind: graph.KindFunction, FilePath: "a.go"}}
+	second := exploreTarget{node: &graph.Node{ID: "b.go::Beta", Name: "Beta", Kind: graph.KindFunction, FilePath: "b.go"}}
+	if got := exploreLocalizationExactTarget("alpha beta behavior", []exploreTarget{head, second}); got != head.node.ID {
+		t.Fatalf("equal evidence must retain retrieval order, got %q", got)
+	}
+	setter := exploreTarget{node: &graph.Node{
+		ID: "regex/matcher.rs::RegexMatcherBuilder.case_insensitive", Name: "case_insensitive",
+		QualName: "RegexMatcherBuilder.case_insensitive", Kind: graph.KindMethod, FilePath: "regex/matcher.rs",
+		Meta: map[string]any{"search_qual_name": "RegexMatcherBuilder.case_insensitive"},
+	}}
+	if got := exploreLocalizationExactTarget("inspect RegexMatcherBuilder.case_insensitive", []exploreTarget{head, setter}); got != setter.node.ID {
+		t.Fatalf("explicit qualified anchor must win, got %q", got)
+	}
+}
+
+func TestExploreAnswerReadyRequiresQualifiedSymbolAnchor(t *testing.T) {
+	wrong := &graph.Node{
+		ID: "repo/pkg/other.go::Other.Validate", Name: "Validate", Kind: graph.KindMethod,
+		FilePath: "pkg/other.go", StartLine: 10, EndLine: 20,
+	}
+	if exploreAnswerReady("Client.Validate", []exploreTarget{{node: wrong}}) {
+		t.Fatal("same-name method in a different qualifier must not be terminal")
+	}
+
+	right := &graph.Node{
+		ID: "repo/pkg/client.go::Client.Validate", Name: "Validate", Kind: graph.KindMethod,
+		FilePath: "pkg/client.go", StartLine: 10, EndLine: 20,
+	}
+	if !exploreAnswerReady("Client.Validate", []exploreTarget{{node: right}}) {
+		t.Fatal("fully-qualified symbol anchor should be terminal")
+	}
+}
+
+func TestExploreExplicitPathAnchorDoesNotCrossSameBasename(t *testing.T) {
+	n := &graph.Node{
+		ID: "repo/pkg/b/config.go::Load", Name: "Load", Kind: graph.KindFunction,
+		FilePath: "pkg/b/config.go", StartLine: 1, EndLine: 5,
+	}
+	if exploreAnswerReady("pkg/a/config.go", []exploreTarget{{node: n}}) {
+		t.Fatal("directory-qualified path must not fall back to the matching basename")
+	}
+	if !exploreAnswerReady("pkg/b/config.go", []exploreTarget{{node: n}}) {
+		t.Fatal("full normalized repository-relative path should be terminal")
+	}
+	if !exploreLocalizationExplicitAnchor("config.go", n) {
+		t.Fatal("basename fallback should remain available without a directory")
+	}
+}
+
+func TestLocalizationEvidenceReservesExactBeforePromotedNeighbor(t *testing.T) {
+	primary := &graph.Node{
+		ID: "repo/walk.go::WalkBuilder.build_parallel", Name: "build_parallel", Kind: graph.KindMethod,
+		FilePath: "walk.go", StartLine: 10, EndLine: 20,
+	}
+	exact := &graph.Node{
+		ID: "repo/walk.go::WalkBuilder.build_serial", Name: "build_serial", Kind: graph.KindMethod,
+		FilePath: "walk.go", StartLine: 30, EndLine: 40,
+	}
+	promoted := &graph.Node{
+		ID: "repo/ignore.go::IgnoreBuilder.build_with_cwd", Name: "build_with_cwd", Kind: graph.KindMethod,
+		FilePath: "ignore.go", StartLine: 50, EndLine: 60,
+	}
+	targets := []exploreTarget{
+		{node: primary, callees: []*graph.Node{promoted}},
+		{node: exact},
+	}
+	selected := localizationEvidenceTargets("parallel multi-root walk build_with_cwd", exact.ID, targets)
+	if len(selected) != 2 {
+		t.Fatalf("selected evidence = %d, want 2", len(selected))
+	}
+	if selected[0].node.ID != primary.ID || selected[1].node.ID != exact.ID {
+		t.Fatalf("selected evidence = [%s, %s], want primary then exact", selected[0].node.ID, selected[1].node.ID)
+	}
+
+	result := newLocalizationExploreResultForTask(
+		newLocalizationCompletion(false, exact.ID),
+		"parallel multi-root walk build_with_cwd",
+		targets,
+		512,
+	)
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire struct {
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(encoded, &wire); err != nil || len(wire.Content) == 0 {
+		t.Fatalf("decode tool result: %v", err)
+	}
+	var envelope localizationExploreEnvelope
+	if err := json.Unmarshal([]byte(wire.Content[0].Text), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if len(envelope.Symbols) != 2 || envelope.Symbols[0] != primary.ID || envelope.Symbols[1] != exact.ID {
+		t.Fatalf("symbols = %v, want primary and exact", envelope.Symbols)
+	}
+	if len(envelope.Evidence) != 2 || envelope.Evidence[1].ID != exact.ID {
+		t.Fatalf("exact evidence missing: %+v", envelope.Evidence)
+	}
+	if len(envelope.Files) != 1 || envelope.Files[0] != "walk.go" {
+		t.Fatalf("files = %v, want exact target file retained with primary", envelope.Files)
+	}
+}
+
+func TestLocalizationEnvelopeEnforcesSerializedBudgetWithLongMetadata(t *testing.T) {
+	primary := &graph.Node{
+		ID: "repo/primary.go::Primary", Name: "Primary", Kind: graph.KindFunction,
+		FilePath: "primary.go", StartLine: 1, EndLine: 10,
+	}
+	exact := &graph.Node{
+		ID: "repo/exact.go::Exact", Name: "Exact", Kind: graph.KindFunction,
+		FilePath: "exact.go", StartLine: 1, EndLine: 10,
+	}
+	longMetadata := strings.Repeat("quoted-\"-slash-\\-metadata-", 24)
+	neighbors := make([]*graph.Node, 0, 12)
+	for i := 0; i < 12; i++ {
+		neighbors = append(neighbors, &graph.Node{ID: fmt.Sprintf("repo/neighbor-%02d-%s", i, longMetadata)})
+	}
+	targets := []exploreTarget{
+		{node: primary, callers: neighbors, callees: neighbors, source: longMetadata},
+		{node: exact, callers: neighbors, callees: neighbors, source: longMetadata},
+	}
+	for i := 0; i < 10; i++ {
+		targets = append(targets, exploreTarget{node: &graph.Node{
+			ID:   fmt.Sprintf("repo/optional-%02d.go::%s", i, longMetadata),
+			Name: longMetadata, Kind: graph.KindFunction,
+			FilePath: fmt.Sprintf("optional/%02d/%s.go", i, longMetadata), StartLine: 1, EndLine: 2,
+		}, source: longMetadata})
+	}
+
+	const budget = 512
+	result := newLocalizationExploreResultForTask(newLocalizationCompletion(false, exact.ID), "", targets, budget)
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire struct {
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(encoded, &wire); err != nil || len(wire.Content) == 0 {
+		t.Fatalf("decode tool result: %v", err)
+	}
+	text := wire.Content[0].Text
+	if len(text) > budget*localizationEnvelopeBytesPerToken {
+		t.Fatalf("serialized envelope = %d bytes, budget = %d", len(text), budget*localizationEnvelopeBytesPerToken)
+	}
+	var envelope localizationExploreEnvelope
+	if err := json.Unmarshal([]byte(text), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if len(envelope.Symbols) < 2 || envelope.Symbols[0] != primary.ID || envelope.Symbols[1] != exact.ID {
+		t.Fatalf("mandatory symbols not retained: %v", envelope.Symbols)
+	}
+	if len(envelope.Evidence) < 2 || envelope.Evidence[0].ID != primary.ID || envelope.Evidence[1].ID != exact.ID {
+		t.Fatalf("mandatory evidence not retained: %+v", envelope.Evidence)
+	}
+	for _, evidence := range envelope.Evidence {
+		if len(evidence.Callers) > localizationMaxNeighborIDs || len(evidence.Callees) > localizationMaxNeighborIDs {
+			t.Fatalf("neighbor metadata not capped: callers=%d callees=%d", len(evidence.Callers), len(evidence.Callees))
+		}
+		if len([]rune(evidence.Signature)) > localizationMaxSignatureRunes {
+			t.Fatalf("signature metadata not capped: %d", len([]rune(evidence.Signature)))
+		}
+	}
+	if got := compactLocalizationField(longMetadata, localizationMaxSignatureRunes); len([]rune(got)) > localizationMaxSignatureRunes {
+		t.Fatalf("signature compaction = %d runes", len([]rune(got)))
+	}
+}
+
+func TestLocalizationEnvelopeIncludesBoundedStructuralNeighbor(t *testing.T) {
+	buildParallel := &graph.Node{ID: "crates/ignore/src/walk.rs::WalkBuilder.build_parallel", Name: "build_parallel", QualName: "WalkBuilder.build_parallel", Kind: graph.KindMethod, FilePath: "crates/ignore/src/walk.rs"}
+	buildWithCWD := &graph.Node{ID: "crates/ignore/src/dir.rs::IgnoreBuilder.build_with_cwd", Name: "build_with_cwd", QualName: "IgnoreBuilder.build_with_cwd", Kind: graph.KindMethod, FilePath: "crates/ignore/src/dir.rs"}
+	unrelated := &graph.Node{ID: "crates/core/src/log.rs::trace_event", Name: "trace_event", Kind: graph.KindFunction, FilePath: "crates/core/src/log.rs"}
+	targets := []exploreTarget{
+		{node: buildParallel, callees: []*graph.Node{unrelated, buildWithCWD}},
+		{node: &graph.Node{ID: "crates/ignore/src/walk.rs::WalkParallel", Name: "WalkParallel", Kind: graph.KindType, FilePath: "crates/ignore/src/walk.rs"}},
+	}
+	result := newLocalizationExploreResultForTask(
+		newLocalizationCompletion(true, ""),
+		"nondeterministic WalkBuilder parallel multi-root walk build_parallel",
+		targets,
+		1600,
+	)
+	text, ok := singleTextContent(result)
+	if !ok {
+		t.Fatalf("expected one text result: %#v", result)
+	}
+	var envelope localizationExploreEnvelope
+	if err := json.Unmarshal([]byte(text), &envelope); err != nil {
+		t.Fatalf("decode localization envelope: %v", err)
+	}
+	if len(envelope.Evidence) > len(targets) {
+		t.Fatalf("promoted evidence exceeded direct target bound: %#v", envelope.Evidence)
+	}
+	joinedSymbols := strings.Join(envelope.Symbols, "\n")
+	if !strings.Contains(joinedSymbols, buildWithCWD.ID) {
+		t.Fatalf("structural implementation missing from terminal symbols: %#v", envelope.Symbols)
+	}
+	if strings.Contains(joinedSymbols, unrelated.ID) {
+		t.Fatalf("unrelated graph neighbor leaked into terminal symbols: %#v", envelope.Symbols)
+	}
+	joinedFiles := strings.Join(envelope.Files, "\n")
+	if !strings.Contains(joinedFiles, buildWithCWD.FilePath) {
+		t.Fatalf("structural implementation file missing: %#v", envelope.Files)
 	}
 }

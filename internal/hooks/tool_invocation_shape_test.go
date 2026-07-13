@@ -17,11 +17,14 @@ func collectHookGuidance(t *testing.T) map[string]string {
 
 	prevIndexed := fileIndexedFn
 	prevReach := daemonReachableFn
+	prevScope := scopeTrackedFn
 	t.Cleanup(func() {
 		fileIndexedFn = prevIndexed
 		daemonReachableFn = prevReach
+		scopeTrackedFn = prevScope
 	})
 	daemonReachableFn = func() bool { return true }
+	scopeTrackedFn = func(string, string) bool { return true }
 
 	out := map[string]string{}
 
