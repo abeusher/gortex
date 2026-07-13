@@ -3,13 +3,14 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"sync"
 	"time"
 
 	"github.com/zzet/gortex/internal/daemon"
@@ -98,20 +99,19 @@ func runProxy(ctx context.Context, surface *gortexmcp.ToolSurface) (ran bool, er
 	}
 	toolSpec, toolMode := clientToolPreference()
 	h := daemon.Handshake{
-		Mode:       daemon.ModeMCP,
-		CWD:        cwd,
-		ClientName: detectClientName(),
-		Tools:      toolSpec,
-		ToolsMode:  toolMode,
+		Mode:             daemon.ModeMCP,
+		CWD:              cwd,
+		ClientName:       detectClientName(),
+		PID:              os.Getpid(),
+		LogicalSessionID: newProxyLogicalSessionID(),
+		Tools:            toolSpec,
+		ToolsMode:        toolMode,
 	}
 	client, recoverable, err := dialDaemonWithRetry(ctx, h)
 	if err != nil && !recoverable {
 		return false, fmt.Errorf("dial daemon: %w", err)
 	}
 	if client == nil {
-		// The daemon isn't reachable (even after the retry window) or it's
-		// running a mismatched protocol version — both are recoverable by
-		// falling back to the embedded in-process server.
 		if errors.Is(err, daemon.ErrProtocolVersionMismatch) {
 			fmt.Fprintln(os.Stderr, "[gortex mcp] daemon protocol mismatch; falling back to embedded server")
 		} else {
@@ -119,58 +119,12 @@ func runProxy(ctx context.Context, surface *gortexmcp.ToolSurface) (ran bool, er
 		}
 		return false, nil
 	}
-	defer client.Close()
 
-	// A daemon that is still warming up acks the handshake immediately and
-	// serves whatever the graph holds so far, filling in as warmup completes —
-	// so staying connected is strictly better than dead-ending on an empty
-	// embedded server. Surface the state so the launch log isn't misleading.
-	if client.Ack.Warming {
-		fmt.Fprintf(os.Stderr,
-			"[gortex mcp] proxying to daemon (session %s, daemon warming up — phase %q; graph still filling)\n",
-			client.Ack.SessionID, client.Ack.WarmupPhase)
-	} else {
-		fmt.Fprintf(os.Stderr,
-			"[gortex mcp] proxying to daemon (session %s, default_repo=%q)\n",
-			client.Ack.SessionID, client.Ack.DefaultRepo)
-	}
-
-	// Bidirectional pump:
-	//   stdin → socket (MCP requests from the client)
-	//   socket → stdout (MCP responses + notifications)
-	//
-	// We run both on goroutines and exit when either side hits EOF.
-	errCh := make(chan error, 2)
-	var wg sync.WaitGroup
-	var outMu sync.Mutex // serialises the two writers into os.Stdout
-	wg.Add(2)
-
-	if surface.Active() {
+	logProxyConnection(os.Stderr, client, false)
+	if surface != nil && surface.Active() {
 		fmt.Fprintf(os.Stderr, "[gortex mcp] tool surface restricted (preset %q)\n", surface.Preset())
-		go func() {
-			defer wg.Done()
-			errCh <- pumpRequestsFiltered(os.Stdin, client.Conn, os.Stdout, &outMu, surface)
-		}()
-		go func() {
-			defer wg.Done()
-			errCh <- pumpResponsesFiltered(client.Conn, os.Stdout, &outMu, surface)
-		}()
-	} else {
-		go func() {
-			defer wg.Done()
-			errCh <- pumpLines(os.Stdin, client.Conn)
-		}()
-		go func() {
-			defer wg.Done()
-			errCh <- pumpLines(client.Conn, os.Stdout)
-		}()
 	}
 
-	// Orphan watchdog: if our parent (the MCP client) dies, stdin EOF is the
-	// normal shutdown signal — but a client that is SIGKILLed, or whose stdin
-	// pipe is inherited and held open elsewhere, can leave this proxy wedged
-	// forever, pinning a daemon session. Poll the parent PID and unblock the
-	// select when we get reparented (to init or a subreaper).
 	orphanCh := make(chan struct{}, 1)
 	watchCtx, cancelWatch := context.WithCancel(ctx)
 	defer cancelWatch()
@@ -182,26 +136,20 @@ func runProxy(ctx context.Context, surface *gortexmcp.ToolSurface) (ran bool, er
 		}
 	})
 
-	// Wait for first completion; exit on context cancellation or orphaning too.
-	select {
-	case pumpErr := <-errCh:
-		if pumpErr != nil && !errors.Is(pumpErr, io.EOF) {
-			return true, fmt.Errorf("proxy pump: %w", pumpErr)
-		}
-	case <-orphanCh:
-	case <-ctx.Done():
-	}
-	cancelWatch()
-	_ = client.Close()
-	// Bound the drain: a pump blocked reading a never-closing stdin (the exact
-	// orphan case) must not pin shutdown — the process is exiting regardless.
-	drained := make(chan struct{})
-	go func() { wg.Wait(); close(drained) }()
-	select {
-	case <-drained:
-	case <-time.After(proxyDrainTimeout):
+	if err := relayProxySession(ctx, h, client, os.Stdin, os.Stdout, os.Stderr, surface, orphanCh); err != nil {
+		return true, fmt.Errorf("proxy relay: %w", err)
 	}
 	return true, nil
+}
+
+func newProxyLogicalSessionID() string {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err == nil {
+		return hex.EncodeToString(raw[:])
+	}
+	// crypto/rand failure should not make MCP unavailable. PID + monotonic
+	// wall-clock entropy is sufficient for the user-local daemon namespace.
+	return fmt.Sprintf("proxy-%d-%d", os.Getpid(), time.Now().UnixNano())
 }
 
 // orphanPollInterval is how often the proxy checks whether its parent

@@ -64,6 +64,7 @@ type Server struct {
 	httpListener net.Listener
 	httpServer   *http.Server
 	started      time.Time
+	instanceID   string // unique to this daemon process; exposed in handshake acks
 
 	shutdown chan struct{}
 	doneOnce sync.Once
@@ -146,6 +147,7 @@ func New(socketPath, version string, logger *zap.Logger) *Server {
 		SocketPath: socketPath,
 		Version:    version,
 		Logger:     logger,
+		instanceID: newSessionID(),
 		sessions:   NewSessionRegistry(),
 		shutdown:   make(chan struct{}),
 		conns:      make(map[net.Conn]struct{}),
@@ -311,6 +313,9 @@ func (s *Server) runMaintenance() {
 			return
 		case <-t.C:
 			for _, sd := range s.sessions.SweepDead(platform.ProcessAlive) {
+				if hook, ok := s.MCPDispatcher.(SessionEndedHook); ok && hook != nil {
+					hook.SessionEnded(sd)
+				}
 				s.Logger.Info("daemon: swept dead session",
 					zap.String("session_id", sd.ID), zap.Int("client_pid", sd.ClientPID))
 				if sd.Conn != nil {
@@ -438,9 +443,10 @@ func (s *Server) handshake(conn net.Conn, reader *bufio.Reader) (*Session, error
 	sess := s.sessions.Register(conn, h)
 
 	ack := HandshakeAck{
-		OK:            true,
-		SessionID:     sess.ID,
-		DaemonVersion: s.Version,
+		OK:             true,
+		SessionID:      sess.ID,
+		DaemonVersion:  s.Version,
+		DaemonInstance: s.instanceID,
 	}
 	// Stamp warmup state so the client can tell a still-warming daemon from a
 	// ready one. The session is established either way — Warming is advisory.
@@ -496,7 +502,9 @@ func (s *Server) serveMCP(conn net.Conn, reader *bufio.Reader, sess *Session) {
 		}
 
 		ctx := context.Background()
-		reply, err := s.MCPDispatcher.Dispatch(ctx, sess, line)
+		reply, _, err := sess.dispatchMCPOnce(line, func() ([]byte, error) {
+			return s.MCPDispatcher.Dispatch(ctx, sess, line)
+		})
 		if err != nil {
 			s.Logger.Warn("daemon: dispatch error",
 				zap.String("session_id", sess.ID), zap.Error(err))
