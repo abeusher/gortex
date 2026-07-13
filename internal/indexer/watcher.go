@@ -1006,15 +1006,20 @@ func (w *Watcher) patchGraph(path string, kind ChangeKind) {
 	start := time.Now()
 	var nodesAdded, nodesRemoved, edgesAdded, edgesRemoved int
 
-	// Compute the relative path for snapshotting old symbols. RelKey
-	// folds it to the canonical key (slash form, Unicode NFC) so the
-	// GetFileNodes / snapshotSymbols lookups below hit the same graph
-	// key the indexer stored — a watcher event for a non-ASCII-named
-	// file arrives in the filesystem's Unicode form (NFD on macOS),
-	// which would otherwise miss an NFC-keyed node.
+	// Two keys for this file. relPath (RelKey: slash form + NFC) is the
+	// mtime-forget / change-callback key. graphKey (graphRelKey:
+	// OS-native separators + NFC, repo-prefixed) is what the graph
+	// stores the file's nodes under, so the GetFileNodes /
+	// snapshotSymbols lookups below MUST use it — a slash-form key
+	// misses the backslash-keyed nodes on Windows and would report every
+	// symbol as added/removed. Both fold an NFD (macOS) event path to
+	// NFC so a non-ASCII name still hits the indexed node. On POSIX the
+	// two keys coincide.
 	relPath := path
+	graphKey := path
 	if w.indexer.rootPath != "" {
 		relPath = w.indexer.RelKey(path)
+		graphKey = w.indexer.prefixPath(w.indexer.graphRelKey(path))
 	}
 
 	switch kind {
@@ -1023,7 +1028,7 @@ func (w *Watcher) patchGraph(path string, kind ChangeKind) {
 			w.logger.Warn("index file failed", zap.String("path", path), zap.Error(err))
 			return
 		}
-		newSymbols := w.indexer.graph.GetFileNodes(relPath)
+		newSymbols := w.indexer.graph.GetFileNodes(graphKey)
 		nodesAdded = len(newSymbols)
 		edgesAdded = w.countFileEdges(newSymbols)
 
@@ -1037,7 +1042,7 @@ func (w *Watcher) patchGraph(path string, kind ChangeKind) {
 
 	case ChangeModified:
 		// Snapshot old symbols before eviction.
-		oldSymbols := w.snapshotSymbols(relPath)
+		oldSymbols := w.snapshotSymbols(graphKey)
 
 		// Content-aware skip: if the saved file's structural symbols
 		// are byte-for-byte identical to the ones already in the
@@ -1065,7 +1070,7 @@ func (w *Watcher) patchGraph(path string, kind ChangeKind) {
 		// count first (still present pre-swap) so removed/added telemetry
 		// stays gross: a rename removes one node and adds one even though
 		// the net node delta is zero.
-		priorNodes := w.indexer.graph.GetFileNodes(relPath)
+		priorNodes := w.indexer.graph.GetFileNodes(graphKey)
 		fileEdgesBefore := w.countFileEdges(priorNodes)
 		resolvedBefore := w.countResolvedFileEdges(priorNodes)
 		incomingBeforeByID := w.resolvedIncomingByNode(priorNodes)
@@ -1074,7 +1079,7 @@ func (w *Watcher) patchGraph(path string, kind ChangeKind) {
 			return
 		}
 		nodesRemoved = len(priorNodes)
-		newSymbols := w.indexer.graph.GetFileNodes(relPath)
+		newSymbols := w.indexer.graph.GetFileNodes(graphKey)
 		nodesAdded = len(newSymbols)
 		// Edge churn scoped to this file's nodes. A graph-wide
 		// EdgeCount delta would also pick up edges landed by whatever
@@ -1103,7 +1108,7 @@ func (w *Watcher) patchGraph(path string, kind ChangeKind) {
 
 	case ChangeDeleted, ChangeRenamed:
 		// Snapshot old symbols before eviction.
-		oldSymbols := w.snapshotSymbols(relPath)
+		oldSymbols := w.snapshotSymbols(graphKey)
 
 		nr, er := w.indexer.EvictFile(path)
 		nodesRemoved = nr
@@ -1437,8 +1442,8 @@ func (w *Watcher) recordInertModify(path, relPath string, symbols []*graph.Node,
 
 // snapshotSymbols returns a deep copy of the symbols for a file, preserving
 // their signatures in Meta so they can be compared after re-indexing.
-func (w *Watcher) snapshotSymbols(relPath string) []*graph.Node {
-	nodes := w.indexer.graph.GetFileNodes(relPath)
+func (w *Watcher) snapshotSymbols(graphKey string) []*graph.Node {
+	nodes := w.indexer.graph.GetFileNodes(graphKey)
 	snapshot := make([]*graph.Node, 0, len(nodes))
 	for _, n := range nodes {
 		// Skip file and import nodes — we only track code symbols.
