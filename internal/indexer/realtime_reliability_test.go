@@ -450,7 +450,12 @@ func TestWatcher_NewSubdirScanIndexesPreWatchFile(t *testing.T) {
 	require.NoError(t, os.MkdirAll(subdir, 0o755))
 	ext.setFuncs("Buried")
 	writeFile(t, filepath.Join(subdir, "buried.fk"), "buried body")
-	require.Empty(t, g.GetFileNodes("pkg/buried.fk"),
+	// The graph keys file nodes under OS-native separators (see
+	// graphRelKey), so build the expected key with filepath.Join instead
+	// of a hard-coded "pkg/buried.fk" — the slash form only matches on
+	// POSIX and would spuriously fail this test on Windows.
+	buriedKey := filepath.Join("pkg", "buried.fk")
+	require.Empty(t, g.GetFileNodes(buriedKey),
 		"the pre-watch file must be absent before the directory scan")
 
 	w.handleEvent(fswatcher.WatchEvent{
@@ -459,7 +464,7 @@ func TestWatcher_NewSubdirScanIndexesPreWatchFile(t *testing.T) {
 	})
 
 	require.Eventually(t, func() bool {
-		return len(g.GetFileNodes("pkg/buried.fk")) > 0
+		return len(g.GetFileNodes(buriedKey)) > 0
 	}, 5*time.Second, 10*time.Millisecond,
 		"the new-directory create must trigger a scoped scan that indexes the pre-watch file")
 }

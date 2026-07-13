@@ -1282,6 +1282,27 @@ func (idx *Indexer) relKey(absPath string) string {
 	return pathkey.Normalize(filepath.ToSlash(rel))
 }
 
+// graphRelKey reduces an absolute path to the key the GRAPH stores a
+// file's nodes under: repo-relative, OS-native separators (the exact
+// form the bulk-walk extractor stamps on node IDs / FilePaths),
+// NFC-folded. It is the graph-node analogue of relKey — relKey
+// slash-normalises for the mtime map, graphRelKey keeps the OS-native
+// separators so an incremental re-index's evict lookup actually matches
+// the nodes the cold walk created (graph.GetFileNodes / EvictFile key on
+// the exact string, with no separator folding). On POSIX the two are
+// identical (filepath.Rel already yields '/'); they diverge only on
+// Windows, where relKey's ToSlash would key the lookup as
+// "repo/a/b.go" while the cold walk stored "repo/a\b.go" — the miss
+// leaves the stale nodes un-evicted and the re-parse leaks a duplicate
+// set on every save (issue: slash-path duplicate indexing).
+func (idx *Indexer) graphRelKey(absPath string) string {
+	rel, err := filepath.Rel(idx.rootPath, absPath)
+	if err != nil {
+		return pathkey.Normalize(absPath)
+	}
+	return pathkey.Normalize(rel)
+}
+
 // RelKey exposes relKey to in-package collaborators (the watcher) that
 // hold an absolute filesystem path and need the canonical repo-relative
 // graph key for it — e.g. to look up a file's nodes before and after a
@@ -1446,7 +1467,7 @@ func (idx *Indexer) graphFilePaths(files []string) []string {
 		if !filepath.IsAbs(abs) && idx.rootPath != "" {
 			abs = filepath.Join(idx.rootPath, f)
 		}
-		out = append(out, idx.prefixPath(idx.relKey(abs)))
+		out = append(out, idx.prefixPath(idx.graphRelKey(abs)))
 	}
 	return out
 }
@@ -2258,7 +2279,7 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 			skippedBytes += info.Size()
 			rel, _ := filepath.Rel(absRoot, path)
 			skippedBySize = append(skippedBySize, skippedFile{
-				relPath: filepath.ToSlash(rel), lang: lang, size: info.Size(),
+				relPath: pathkey.Normalize(rel), lang: lang, size: info.Size(),
 			})
 			return nil
 		}
@@ -2266,7 +2287,7 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 			skippedContentBytes += info.Size()
 			rel, _ := filepath.Rel(absRoot, path)
 			skippedByContent = append(skippedByContent, skippedFile{
-				relPath: filepath.ToSlash(rel), lang: lang, size: info.Size(), reason: reason,
+				relPath: pathkey.Normalize(rel), lang: lang, size: info.Size(), reason: reason,
 			})
 			return nil
 		}
@@ -2274,7 +2295,7 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 			skippedContentBytes += info.Size()
 			rel, _ := filepath.Rel(absRoot, path)
 			skippedByContent = append(skippedByContent, skippedFile{
-				relPath: filepath.ToSlash(rel), lang: lang, size: info.Size(), reason: reason,
+				relPath: pathkey.Normalize(rel), lang: lang, size: info.Size(), reason: reason,
 			})
 			return nil
 		}
@@ -3444,12 +3465,19 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 		return err
 	}
 
-	// relKey gives the canonical key (slash form, Unicode NFC). Using
-	// it here keeps an incremental re-index — which may be driven by a
-	// git-watcher path in NFC or an FSEvents path in NFD — landing on
-	// the exact graph key the bulk walk created, so the evict below
-	// finds the file's existing nodes instead of leaking a duplicate.
-	relPath := idx.relKey(absPath)
+	// Two keys for the same file, deliberately distinct on Windows.
+	// mtimeKey (relKey: slash form + NFC) is the fileMtimes map key.
+	// relPath (graphRelKey: OS-native separators + NFC) is what the
+	// graph stores a file's nodes under — the exact form the cold bulk
+	// walk stamped on their IDs / FilePaths. The evict below MUST use
+	// the graph form: a slash-keyed lookup misses the backslash-keyed
+	// cold nodes on Windows, so the re-parse would leak a duplicate node
+	// set on every save. On POSIX the two keys are identical
+	// (filepath.Rel already yields '/'), so this split is a Windows-only
+	// correction. Both drive an FSEvents-NFD / git-watcher-NFC path onto
+	// the same NFC key so a re-index still lands on the bulk-walk key.
+	mtimeKey := idx.relKey(absPath)
+	relPath := idx.graphRelKey(absPath)
 
 	// In multi-repo mode, the graph stores prefixed file paths.
 	graphPath := idx.prefixPath(relPath)
@@ -3501,7 +3529,7 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 	// prior state and installs the synthetic node, same as before.
 	if maxSize := idx.config.MaxFileSize; maxSize > 0 && int64(len(src)) > maxSize {
 		n := sizeSkipNode(skippedFile{
-			relPath: filepath.ToSlash(relPath), lang: lang, size: int64(len(src)),
+			relPath: relPath, lang: lang, size: int64(len(src)),
 		}, maxSize)
 		idx.applyRepoPrefix([]*graph.Node{n}, nil)
 		evictExisting()
@@ -3515,7 +3543,7 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 	// — same synthetic-skip-node treatment as the size cap above.
 	if reason, skip := idx.newContentAdmissionGate().skip(lang, int64(len(src))); skip {
 		n := contentSkipNode(skippedFile{
-			relPath: filepath.ToSlash(relPath), lang: lang, size: int64(len(src)), reason: reason,
+			relPath: relPath, lang: lang, size: int64(len(src)), reason: reason,
 		})
 		idx.applyRepoPrefix([]*graph.Node{n}, nil)
 		evictExisting()
@@ -3554,7 +3582,7 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 		// from perpetually seeing this one unparseable file as "the
 		// repo changed" and routing the whole repo through the
 		// expensive shadow re-track path on every restart.
-		idx.recordFileMtime(relPath, absPath)
+		idx.recordFileMtime(mtimeKey, absPath)
 		return err
 	}
 
@@ -3745,10 +3773,11 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 		}
 	}
 
-	// Update mtime for this file. relPath is already the canonical
-	// key (relKey applied slash + NFC), so the mtime entry lines up
-	// with the graph file-node key and with the bulk-walk mtimes.
-	idx.recordFileMtime(relPath, absPath)
+	// Update mtime for this file, keyed by mtimeKey (the relKey slash
+	// form), NOT relPath — relPath is the OS-native graph key, whereas
+	// the fileMtimes map and IsStale / TrackedFileState all key on the
+	// slash form.
+	idx.recordFileMtime(mtimeKey, absPath)
 
 	return nil
 }
@@ -3909,7 +3938,10 @@ func (idx *Indexer) EvictFile(filePath string) (int, int) {
 	if !filepath.IsAbs(absPath) {
 		absPath = filepath.Join(idx.rootPath, filePath)
 	}
-	relPath := idx.relKey(absPath)
+	// graphRelKey (OS-native + NFC), not relKey (slash + NFC): the graph
+	// stores nodes under OS-native separators, so a slash-form lookup
+	// would miss them on Windows and leave a stale subtree behind.
+	relPath := idx.graphRelKey(absPath)
 	// In multi-repo mode, the graph stores prefixed file paths.
 	graphPath := idx.prefixPath(relPath)
 	// Remove from search index.
@@ -3937,7 +3969,10 @@ func (idx *Indexer) ReresolveFileScoped(filePath string) error {
 	if !filepath.IsAbs(absPath) {
 		absPath = filepath.Join(idx.rootPath, filePath)
 	}
-	graphPath := idx.prefixPath(idx.relKey(absPath))
+	// graphRelKey (OS-native + NFC): the graph keys nodes under OS-native
+	// separators, so a relKey slash-form graphPath would miss them on
+	// Windows and wrongly report the file as evicted.
+	graphPath := idx.prefixPath(idx.graphRelKey(absPath))
 	if len(idx.graph.GetFileNodes(graphPath)) == 0 {
 		return nil // file gone / evicted; nothing to re-resolve
 	}
@@ -5016,7 +5051,11 @@ func (idx *Indexer) IncrementalReindexPaths(root string, paths []string) (*Index
 	}
 
 	for _, relPath := range deletedFiles {
-		graphPath := idx.prefixPath(relPath)
+		// relPath is a fileMtimes key (relKey: slash + NFC); the graph
+		// keys nodes under OS-native separators, so convert before the
+		// evict or a deleted file's nodes leak on Windows. FromSlash is
+		// a no-op on POSIX.
+		graphPath := idx.prefixPath(filepath.FromSlash(relPath))
 		idx.restubIncomingRefs(graphPath)
 		idx.evictEnrichment(graphPath)
 		idx.graph.EvictFile(graphPath)
@@ -5247,7 +5286,11 @@ func (idx *Indexer) IncrementalReindex(root string) (*IndexResult, error) {
 
 	// Evict only files that are truly absent from disk.
 	for _, relPath := range deletedFiles {
-		graphPath := idx.prefixPath(relPath)
+		// relPath is a fileMtimes key (relKey: slash + NFC); the graph
+		// keys nodes under OS-native separators, so convert before the
+		// evict or a deleted file's nodes leak on Windows. FromSlash is
+		// a no-op on POSIX.
+		graphPath := idx.prefixPath(filepath.FromSlash(relPath))
 		idx.restubIncomingRefs(graphPath)
 		idx.evictEnrichment(graphPath)
 		idx.graph.EvictFile(graphPath)
