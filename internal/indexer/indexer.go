@@ -492,7 +492,10 @@ func searchIndexFields(n *graph.Node, projectName string) []string {
 		body, _ := n.Meta["section_text"].(string)
 		return []string{n.Name, indexedPath, body}
 	}
-	sig, _ := n.Meta["signature"].(string)
+	// Retrieval-only fields are normalized at the shared extraction boundary.
+	// The graph-owned accessor keeps search, embeddings, and MCP presentation
+	// on the same fallback contract without exposing metadata keys.
+	retrieval := n.RetrievalMetadata()
 	// A symbol's doc comment is the natural-language statement of what it
 	// does — precisely the vocabulary a task-intent query carries ("union
 	// the two sequences", "performs matching on the ignore files") when it
@@ -503,8 +506,7 @@ func searchIndexFields(n *graph.Node, projectName string) []string {
 	// can't dilute the name/signature tokens under BM25 length
 	// normalisation. Empty doc → empty field, dropped by the caller, so a
 	// symbol with no doc indexes exactly as before.
-	doc, _ := n.Meta["doc"].(string)
-	return []string{n.Name, indexedPath, sig, docSummary(doc)}
+	return []string{n.Name, indexedPath, retrieval.QualName, retrieval.Signature, docSummary(retrieval.Doc)}
 }
 
 // docSummaryMaxRunes bounds how much of a doc comment enters the search
@@ -621,15 +623,9 @@ func lessEdgeKey(a, b *graph.Edge) bool {
 // same recall against either backend. Joined with spaces so the
 // downstream COPY FROM sees a single STRING column value.
 func ftsTokensFor(n *graph.Node, projectName string) string {
+	// searchIndexFields includes the resolver qualifier or its retrieval-only
+	// replacement, so both BM25 backends and embeddings see the same token bag.
 	fields := searchIndexFields(n, projectName)
-	if n.QualName != "" {
-		// QualName carries the dotted form (`pkg.Sub.Type.Method`)
-		// that adds qualifier-hop recall ("auth" matching
-		// "auth.ValidateToken"). searchIndexFields omits it for
-		// the legacy BM25 path (which folds qual into the
-		// name-token bag separately), so we add it explicitly here.
-		fields = append(fields, n.QualName)
-	}
 	tokens := make([]string, 0, 16)
 	for _, f := range fields {
 		if f == "" {
