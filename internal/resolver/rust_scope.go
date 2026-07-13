@@ -406,6 +406,16 @@ func (idx *rustScopeIndex) resolve(e *graph.Edge, caller *graph.Node) string {
 				idx.set(graph.OriginASTResolved, 0.88, "receiver_type")
 				return id
 			}
+			// A parameter whose declared type is a generic (`matcher: M`)
+			// has no concrete method owner. If the enclosing function's
+			// effective type parameters constrain M to a trait that declares
+			// this method, bind to that trait declaration. The helper scans
+			// every bound and returns a target only when the declaration is
+			// unique across the full bound set.
+			if id := idx.uniqueGenericBoundTraitMethod(repo, caller, rustBaseTypeName(rt), name); id != "" {
+				idx.set(graph.OriginASTResolved, 0.86, "generic_trait_bound")
+				return id
+			}
 		}
 	}
 
@@ -612,6 +622,126 @@ func (idx *rustScopeIndex) uniqueTraitMethod(repo, owner, name string) string {
 		hit = m.ID
 	}
 	return hit
+}
+
+// uniqueGenericBoundTraitMethod returns the single trait declaration method
+// named by all bounds on generic parameter param. It deliberately scans the raw
+// candidate lists rather than composing uniqueTraitMethod calls: a duplicated
+// declaration for one bound must keep the call unresolved even if another bound
+// happens to have one unique declaration.
+func (idx *rustScopeIndex) uniqueGenericBoundTraitMethod(repo string, caller *graph.Node, param, name string) string {
+	if caller == nil || caller.Meta == nil || param == "" || name == "" {
+		return ""
+	}
+	bound := rustTypeParamBound(caller.Meta["type_params"], param)
+	if bound == "" {
+		return ""
+	}
+	var hit string
+	for _, owner := range rustTraitBoundNames(bound) {
+		for _, method := range idx.methodsByOwner[rustOwnerKey{repo: repo, owner: owner}] {
+			if method == nil || method.Name != name || method.Meta == nil {
+				continue
+			}
+			if traitDecl, _ := method.Meta["trait_decl"].(string); traitDecl != "true" {
+				continue
+			}
+			if hit != "" && hit != method.ID {
+				return ""
+			}
+			hit = method.ID
+		}
+	}
+	return hit
+}
+
+func rustTypeParamBound(value any, param string) string {
+	switch entries := value.(type) {
+	case []map[string]string:
+		for _, entry := range entries {
+			if entry["name"] == param {
+				return strings.TrimSpace(entry["bound"])
+			}
+		}
+	case []any:
+		for _, raw := range entries {
+			switch entry := raw.(type) {
+			case map[string]any:
+				name, _ := entry["name"].(string)
+				bound, _ := entry["bound"].(string)
+				if name == param {
+					return strings.TrimSpace(bound)
+				}
+			case map[string]string:
+				if entry["name"] == param {
+					return strings.TrimSpace(entry["bound"])
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func rustTraitBoundNames(bound string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, raw := range splitRustTraitBounds(bound) {
+		name := strings.TrimSpace(raw)
+		name = strings.TrimPrefix(name, "?")
+		if strings.HasPrefix(name, "for<") {
+			if end := strings.Index(name, ">"); end >= 0 {
+				name = strings.TrimSpace(name[end+1:])
+			}
+		}
+		if strings.HasPrefix(name, "'") {
+			continue
+		}
+		if i := strings.IndexAny(name, "<("); i >= 0 {
+			name = strings.TrimSpace(name[:i])
+		}
+		if i := strings.LastIndex(name, "::"); i >= 0 {
+			name = strings.TrimSpace(name[i+2:])
+		}
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		out = append(out, name)
+	}
+	return out
+}
+
+func splitRustTraitBounds(bound string) []string {
+	var out []string
+	start := 0
+	angle, paren := 0, 0
+	for i := 0; i < len(bound); i++ {
+		switch bound[i] {
+		case '<':
+			angle++
+		case '>':
+			if angle > 0 {
+				angle--
+			}
+		case '(':
+			paren++
+		case ')':
+			if paren > 0 {
+				paren--
+			}
+		case '+':
+			if angle == 0 && paren == 0 {
+				if part := strings.TrimSpace(bound[start:i]); part != "" {
+					out = append(out, part)
+				}
+				start = i + 1
+			}
+		}
+	}
+	if part := strings.TrimSpace(bound[start:]); part != "" {
+		out = append(out, part)
+	}
+	return out
 }
 
 // uniqueFreeFunc returns the ID of a free function named `name` in repo,
