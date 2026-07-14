@@ -13,6 +13,7 @@ import (
 
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/telemetry"
 )
 
@@ -513,6 +514,14 @@ func (s *Server) invokeFacadeSpec(ctx context.Context, req mcpgo.CallToolRequest
 		return invalid, nil
 	}
 	normalized := normalizeFacadeArguments(spec, req.GetArguments())
+	if targetErr := normalizeFacadeChangeTargets(spec, req.GetArguments(), normalized); targetErr != nil {
+		outcome = facadeOutcomeInvalidArgument
+		return NewStructuredErrorResult(StructuredError{
+			ErrorCode: ErrCodeInvalidArgument,
+			Message:   targetErr.Error(),
+			Data:      map[string]any{"facade": spec.Facade, "operation": spec.Operation},
+		}), nil
+	}
 	if spec.Facade == "read" && (spec.Operation == "source" || spec.Operation == "symbols") {
 		ids := []string{strings.TrimSpace(fmt.Sprint(normalized["id"]))}
 		field := "id"
@@ -539,6 +548,65 @@ func (s *Server) invokeFacadeSpec(ctx context.Context, req mcpgo.CallToolRequest
 		}
 		if len(resolved) > 0 {
 			normalized[field] = strings.Join(resolved, ",")
+		}
+	}
+	if spec.Facade == "read" && spec.Operation == "editing_context" {
+		if rawID, exists := normalized["id"]; exists {
+			if id := strings.TrimSpace(fmt.Sprint(rawID)); id != "" {
+				canonical, ambiguous := s.resolveFacadeSymbolShorthand(ctx, id)
+				if len(ambiguous) > 0 {
+					outcome = facadeOutcomeInvalidArgument
+					return NewStructuredErrorResult(StructuredError{
+						ErrorCode: ErrCodeInvalidArgument,
+						Message:   fmt.Sprintf("symbol shorthand %q is ambiguous", id),
+						Data:      map[string]any{"symbol": id, "candidates": ambiguous},
+					}), nil
+				}
+				var node *graph.Node
+				if s.graph != nil {
+					node = s.graph.GetNode(canonical)
+				}
+				if node == nil || node.FilePath == "" || !s.nodeInSessionScope(ctx, node) {
+					outcome = facadeOutcomeInvalidArgument
+					return NewStructuredErrorResult(StructuredError{
+						ErrorCode: ErrCodeSymbolNotFound,
+						Message:   fmt.Sprintf("symbol %q is not indexed in this session scope", id),
+						Data:      map[string]any{"symbol": id},
+					}), nil
+				}
+				normalized["path"] = node.FilePath
+				delete(normalized, "id")
+			}
+		}
+	}
+	if spec.Facade == "change" && spec.Operation == "impact" {
+		if rawPath, exists := normalized["path"]; exists {
+			if path := strings.TrimSpace(fmt.Sprint(rawPath)); path != "" {
+				path = s.graphRelPath(path)
+				eng := s.engineFor(ctx)
+				ids := make([]string, 0)
+				if eng != nil {
+					if symbols := eng.GetFileSymbols(path); symbols != nil {
+						for _, node := range symbols.Nodes {
+							if node == nil || node.Kind == graph.KindFile || !exploreLocalizableKind(node.Kind) || !s.nodeInSessionScope(ctx, node) {
+								continue
+							}
+							ids = append(ids, node.ID)
+						}
+					}
+				}
+				if len(ids) == 0 {
+					outcome = facadeOutcomeInvalidArgument
+					return NewStructuredErrorResult(StructuredError{
+						ErrorCode: ErrCodeFileNotIndexed,
+						Message:   fmt.Sprintf("no indexed symbols found for file %q", path),
+						Data:      map[string]any{"file": path},
+					}), nil
+				}
+				sort.Strings(ids)
+				normalized["ids"] = strings.Join(ids, ",")
+				delete(normalized, "path")
+			}
 		}
 	}
 	if spec.Facade == "analyze" && analyzeKindRequiresAdmin(normalizeFacadeOperation(fmt.Sprint(normalized["kind"]))) {
@@ -990,6 +1058,20 @@ func normalizeFacadeAliases(spec facadeOperationSpec, input, out map[string]any)
 		}
 		delete(out, "range")
 	}
+	// Explore's public path is a repository-selection anchor, not a legacy
+	// retrieval field. Lower it to repo so a caller working outside the active
+	// repository is either scoped to the containing tracked repo or receives an
+	// explicit scope error. A non-empty path wins over options.repo: silently
+	// ignoring an explicit filesystem anchor would be less safe than rejecting
+	// an untracked path.
+	if spec.Facade == "explore" {
+		if path, exists := out["path"]; exists {
+			if strings.TrimSpace(fmt.Sprint(path)) != "" {
+				out["repo"] = path
+			}
+			delete(out, "path")
+		}
+	}
 	switch spec.Facade + "." + spec.Operation {
 	case "read.file":
 		normalizeFacadeReadWindow(out)
@@ -1074,6 +1156,169 @@ func normalizeFacadeAliases(spec facadeOperationSpec, input, out map[string]any)
 		}
 		delete(out, "id")
 	}
+	// Capability/schema probes use this same lowering path as live dispatch.
+	// Invalid selector combinations are rejected by invokeFacadeSpec; probes
+	// deliberately ignore the error so they can still discover captured fields.
+	_ = normalizeFacadeChangeTargets(spec, input, out)
+}
+
+// normalizeFacadeChangeTargets lowers every supported symbol-selector shape to
+// the one legacy field consumed by the selected change operation. The same
+// function is used during capability probing and live dispatch so schemas cannot
+// advertise a selector that handlers interpret differently.
+func normalizeFacadeChangeTargets(spec facadeOperationSpec, input, out map[string]any) error {
+	if spec.Facade != "change" {
+		return nil
+	}
+	switch spec.Operation {
+	case "edit_plan", "guards", "tests", "contract":
+	default:
+		return nil
+	}
+
+	type selection struct {
+		label string
+		ids   []string
+	}
+	selections := make([]selection, 0, 4)
+	collect := func(container string, raw any) error {
+		fields, ok := raw.(map[string]any)
+		if !ok || fields == nil {
+			return nil
+		}
+		for _, field := range []string{"symbol", "symbols", "id", "ids"} {
+			value, present := fields[field]
+			if !present {
+				continue
+			}
+			ids, err := facadeChangeTargetIDs(value, field == "symbol" || field == "id")
+			if err != nil {
+				return fmt.Errorf("change.%s %s.%s: %w", spec.Operation, container, field, err)
+			}
+			selections = append(selections, selection{label: container + "." + field, ids: ids})
+		}
+		return nil
+	}
+
+	// Canonical target selectors lead so equivalent compatibility forms retain
+	// target order. Different selectors must name the same set or the request is
+	// ambiguous; silently choosing one is unsafe for change analysis.
+	if err := collect("target", input["target"]); err != nil {
+		return err
+	}
+	for _, container := range []string{"source", "options", "arguments"} {
+		if err := collect(container, input[container]); err != nil {
+			return err
+		}
+	}
+	top := make(map[string]any, 4)
+	for _, field := range []string{"symbol", "symbols", "id", "ids"} {
+		if value, present := input[field]; present {
+			top[field] = value
+		}
+	}
+	if err := collect("request", top); err != nil {
+		return err
+	}
+
+	var ids []string
+	if len(selections) > 0 {
+		ids = selections[0].ids
+		for _, candidate := range selections[1:] {
+			if !sameFacadeChangeTargetSet(ids, candidate.ids) {
+				return fmt.Errorf("change.%s received conflicting symbol selectors %s and %s",
+					spec.Operation, selections[0].label, candidate.label)
+			}
+		}
+	}
+
+	if spec.Operation == "contract" {
+		source := strings.ToLower(strings.TrimSpace(fmt.Sprint(out["source"])))
+		if source == "<nil>" {
+			source = ""
+		}
+		if len(ids) > 0 {
+			if source != "" && source != "auto" && source != "symbols" {
+				return fmt.Errorf("change.contract symbol targets conflict with source=%s", source)
+			}
+			out["source"] = "symbols"
+			out["symbols"] = strings.Join(ids, ",")
+			delete(out, "id")
+			delete(out, "ids")
+			return nil
+		}
+		if source == "" || source == "auto" || source == "symbols" {
+			return fmt.Errorf("change.contract requires target.symbol/target.symbols or an explicit non-symbol source")
+		}
+		return nil
+	}
+
+	if len(ids) == 0 {
+		return fmt.Errorf("change.%s requires target.symbol, target.symbols, or ids", spec.Operation)
+	}
+	out["ids"] = strings.Join(ids, ",")
+	delete(out, "id")
+	delete(out, "symbols")
+	return nil
+}
+
+func facadeChangeTargetIDs(raw any, singular bool) ([]string, error) {
+	var values []string
+	switch value := raw.(type) {
+	case string:
+		if singular && strings.Contains(value, ",") {
+			return nil, fmt.Errorf("singular selector contains multiple IDs")
+		}
+		values = strings.Split(value, ",")
+	case []string:
+		values = append(values, value...)
+	case []any:
+		values = make([]string, 0, len(value))
+		for _, item := range value {
+			text, ok := item.(string)
+			if !ok {
+				return nil, fmt.Errorf("IDs must be strings")
+			}
+			values = append(values, text)
+		}
+	default:
+		return nil, fmt.Errorf("expected a string or string array")
+	}
+	if singular && len(values) != 1 {
+		return nil, fmt.Errorf("singular selector requires exactly one ID")
+	}
+	if len(values) == 0 {
+		return nil, fmt.Errorf("selector must not be empty")
+	}
+
+	ids := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		id := strings.TrimSpace(value)
+		if id == "" {
+			return nil, fmt.Errorf("selector contains an empty ID")
+		}
+		if _, duplicate := seen[id]; duplicate {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 {
+		return nil, fmt.Errorf("selector must not be empty")
+	}
+	return ids, nil
+}
+
+func sameFacadeChangeTargetSet(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	left = append([]string(nil), left...)
+	right = append([]string(nil), right...)
+	sort.Strings(left)
+	sort.Strings(right)
+	return slices.Equal(left, right)
 }
 
 func normalizeFacadeReadWindow(out map[string]any) {
@@ -1652,7 +1897,9 @@ func facadeRequestShape(spec facadeOperationSpec, properties map[string]any, req
 			source["file"] = "<file>"
 		case "impact":
 			args["target"] = placeholder("symbol")
-		case "edit_plan", "guards", "pattern", "tests":
+		case "edit_plan", "guards", "tests":
+			args["target"] = map[string]any{"symbols": []string{"<symbol>"}}
+		case "pattern":
 			source["symbols"] = []string{"<symbol>"}
 		case "verify":
 			source["changes"] = []map[string]any{{"symbol_id": "<symbol>", "new_signature": "<signature>"}}
@@ -1668,8 +1915,7 @@ func facadeRequestShape(spec facadeOperationSpec, properties map[string]any, req
 		case "simulate":
 			source["steps"] = "<WorkspaceEdit JSON array>"
 		case "contract":
-			source["source"] = "symbols"
-			source["symbols"] = []string{"<symbol>"}
+			args["target"] = map[string]any{"symbols": []string{"<symbol>"}}
 		}
 		if len(source) > 0 {
 			args["source"] = source

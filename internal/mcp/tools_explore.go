@@ -110,9 +110,129 @@ type exploreDraftEntry struct {
 // neighborhood. The ranked head always leads; the remaining slots promote
 // query-aligned deeper targets or graph neighbors without hiding any detailed
 // candidate below.
+func exploreQueryIsConceptTask(query string) bool {
+	query = strings.TrimSpace(stripLeadingExploreDirective(query))
+	if query == "" {
+		return false
+	}
+	class := rerank.ClassifyQuery(query)
+	lower := strings.ToLower(query)
+	// Catch declaration-shaped signatures whose return type is project-specific
+	// and therefore may not be recognized by the generic query classifier. A
+	// call at the end of prose is not a declaration: its pre-call prefix is a
+	// sentence, not a compact return-type/name pair.
+	open, close := strings.Index(lower, "("), strings.LastIndex(lower, ")")
+	if open > 0 && close > open {
+		suffix := strings.TrimSpace(lower[close+1:])
+		terminalDeclaration := suffix == "" || suffix == ";" || suffix == "{" || suffix == "const" || suffix == "noexcept" || strings.HasPrefix(suffix, "->") || strings.HasPrefix(suffix, ": ") || strings.HasPrefix(suffix, "throws ")
+		prefixFields := strings.Fields(strings.TrimSpace(lower[:open]))
+		if terminalDeclaration && len(prefixFields) >= 2 && len(prefixFields) <= 6 {
+			previous := strings.Trim(prefixFields[len(prefixFields)-2], "*&[]<>,:;")
+			switch previous {
+			case "a", "an", "and", "at", "before", "by", "calls", "does", "for", "from", "how", "in", "into", "of", "on", "or", "reaches", "the", "through", "to", "via", "when", "where", "why", "with":
+				// Natural-language call site; continue with concept detection.
+			default:
+				return false
+			}
+		}
+	}
+	if class == rerank.QueryClassConcept {
+		return true
+	}
+
+	// A symbol, path, or signature embedded in a natural-language task must not
+	// turn the whole task into an exact lookup. Pure lookup shapes are compact;
+	// prose has several ordinary words around a bounded amount of code syntax.
+	fields := strings.Fields(query)
+	if len(fields) < 8 || len(query) < 48 {
+		return false
+	}
+	for _, prefix := range []string{
+		"func ", "fn ", "pub ", "async ", "unsafe ", "extern ",
+		"def ", "class ", "interface ", "trait ", "type ",
+		"public ", "private ", "protected ", "internal ", "static ",
+		"export ", "declare ", "function ", "const ", "constexpr ",
+		"void ", "bool ", "char ", "int ", "long ", "short ",
+		"float ", "double ", "auto ", "unsigned ", "signed ", "std::", "@",
+	} {
+		if strings.HasPrefix(lower, prefix) {
+			return false
+		}
+	}
+	plain, codeShaped := 0, 0
+	for _, field := range fields {
+		token := strings.Trim(field, ".,;:!?\"'")
+		if token == "" {
+			continue
+		}
+		if strings.ContainsAny(token, `/\\(){}[]<>=&|*_:;`) {
+			codeShaped++
+			continue
+		}
+		plain++
+	}
+	return plain >= 6 && plain*2 >= len(fields) && codeShaped*2 < len(fields)
+}
+
+func exploreQueryHasCallAnchor(query, name string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return false
+	}
+	isIdentifierByte := func(b byte) bool {
+		return b == '_' || b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9'
+	}
+	for offset := 0; offset < len(query); {
+		index := strings.Index(query[offset:], name)
+		if index < 0 {
+			return false
+		}
+		index += offset
+		beforeOK := index == 0 || !isIdentifierByte(query[index-1])
+		after := index + len(name)
+		for after < len(query) && (query[after] == ' ' || query[after] == '\t') {
+			after++
+		}
+		if beforeOK && after < len(query) && query[after] == '(' {
+			return true
+		}
+		offset = index + len(name)
+	}
+	return false
+}
+
+func exploreQueryHasPathSymbolAnchor(query string, n *graph.Node) bool {
+	if n == nil {
+		return false
+	}
+	normalizedPath := exploreNormalizedPath(nodeDisplayPath(n))
+	name := exploreNormalizedAnchor(n.Name)
+	qualName := exploreNormalizedAnchor(n.RetrievalMetadata().QualName)
+	if qualName == "" || qualName == name {
+		if separator := strings.LastIndex(n.ID, "::"); separator >= 0 {
+			qualName = exploreNormalizedAnchor(n.ID[separator+2:])
+		}
+	}
+	for _, field := range strings.Fields(query) {
+		field = strings.Trim(field, "`'\"()[]{}<>,;")
+		separator := strings.LastIndex(field, "::")
+		if separator <= 0 || !strings.ContainsAny(field[:separator], "/\\") {
+			continue
+		}
+		if exploreNormalizedPath(field[:separator]) != normalizedPath {
+			continue
+		}
+		symbol := exploreNormalizedAnchor(field[separator+2:])
+		if symbol == name || symbol == qualName || strings.HasSuffix(qualName, " "+symbol) {
+			return true
+		}
+	}
+	return false
+}
+
 func exploreAnswerDraft(task string, targets []exploreTarget) []exploreDraftEntry {
 	query := shapeExploreQuery(task)
-	conceptTask := rerank.ClassifyQuery(query) == rerank.QueryClassConcept
+	conceptTask := exploreQueryIsConceptTask(query)
 	if conceptTask {
 		query = stripLeadingExploreDirective(query)
 	}
@@ -149,7 +269,15 @@ func exploreAnswerDraft(task string, targets []exploreTarget) []exploreDraftEntr
 	}
 	makeEntry := func(n *graph.Node, source, evidence string, direct bool, parentRank int) (exploreDraftEntry, int) {
 		overlap, longest := exploreDraftTermOverlap(queryTerms, n)
-		exact := exploreDraftExactAnchor(query, n) || exploreLocalizationExplicitAnchor(query, n)
+		explicitAnchor := exploreLocalizationExplicitAnchor(query, n)
+		exact := exploreDraftExactAnchor(query, n) || explicitAnchor
+		// Concept prompts often mention a nearby test helper while asking how the
+		// production path works. Do not let that lexical anchor outrank the
+		// implementation. A genuinely explicit symbol/path request remains exact.
+		conceptTestHelper := conceptTask && exploreDraftIsTestNode(n) && !explicitAnchor
+		if conceptTestHelper {
+			exact = false
+		}
 		bodyOverlap, rareOverlap, bodyDensity := 0, 0, 0
 		if conceptTask && n != nil {
 			key := exploreDraftNodeKey(n)
@@ -189,7 +317,7 @@ func exploreAnswerDraft(task string, targets []exploreTarget) []exploreDraftEntr
 			bodyOverlap: bodyOverlap,
 			rareOverlap: rareOverlap,
 			bodyDensity: bodyDensity,
-			generic:     conceptTask && !exact && exploreDraftGenericCandidate(n, source),
+			generic:     conceptTask && !exact && (conceptTestHelper || exploreDraftGenericCandidate(n, source)),
 			direct:      direct,
 			parentRank:  parentRank,
 		}, longest
@@ -240,28 +368,33 @@ func exploreAnswerDraft(task string, targets []exploreTarget) []exploreDraftEntr
 			consider(n, "", fmt.Sprintf("callee of ranked #%d", i+1), false, i)
 		}
 
-		if target.node == nil || !conceptTask {
+		if target.node == nil || !conceptTask || exploreDraftIsTestNode(target.node) {
 			continue
 		}
 		parent, longest := makeEntry(target.node, target.source, "", true, i)
 		strongParent := parent.exact || parent.overlap >= 2 || parent.bodyOverlap >= 2 || (parent.overlap == 1 && longest >= 5)
-		if !strongParent || exploreIdentifierSegmentCount(target.node.Name) < 2 {
+		if !strongParent || (!parent.exact && exploreIdentifierSegmentCount(target.node.Name) < 2) {
 			continue
 		}
 		collectStructural := func(n *graph.Node, evidence string, callee bool) {
-			if n == nil || exploreDraftIsTestNode(n) || (n.Kind != graph.KindFunction && n.Kind != graph.KindMethod) || exploreIdentifierSegmentCount(n.Name) < 2 {
+			if n == nil || exploreDraftIsTestNode(n) || (n.Kind != graph.KindFunction && n.Kind != graph.KindMethod) || exploreIdentifierSegmentCount(n.Name) < 3 {
 				return
 			}
 			entry, _ := makeEntry(n, "", evidence, false, i)
 			shared, local := exploreStructuralSignals(target.node, n)
-			if shared == 0 && !entry.exact && entry.overlap == 0 && entry.bodyOverlap == 0 && !local {
+			crossFile := nodeDisplayPath(target.node) != nodeDisplayPath(n)
+			// A concrete cross-file callee is causal graph evidence even when its
+			// name shares no useful query token with the parent. This is the path
+			// from orchestration methods to the implementation agents need to read.
+			causalCrossFile := callee && crossFile
+			if shared == 0 && !entry.exact && entry.overlap == 0 && entry.bodyOverlap == 0 && !local && !causalCrossFile {
 				return
 			}
 			entry.structural = true
 			entry.structuralShared = shared
 			entry.structuralLocal = local
 			entry.structuralCallee = callee
-			entry.structuralCrossFile = nodeDisplayPath(target.node) != nodeDisplayPath(n)
+			entry.structuralCrossFile = crossFile
 			entry.parentExact = parent.exact
 			entry.parentOverlap = parent.overlap
 			structuralNeighbors = append(structuralNeighbors, entry)
@@ -677,7 +810,11 @@ func exploreAnswerReady(task string, targets []exploreTarget) bool {
 		return headMatches >= 3 && len(union) >= 3
 	}
 	if len(queryTerms) == 1 {
-		return headMatches == 1
+		// A concept phrase can repeat one generic word many times, but the term
+		// set intentionally de-duplicates it. One such token is not independent
+		// evidence and must never make localization terminal. Explicit path,
+		// symbol, and signature anchors already returned above.
+		return false
 	}
 	if headMatches >= 1 && len(union) >= 2 {
 		return true
@@ -741,12 +878,29 @@ func exploreLocalizationExplicitAnchor(query string, n *graph.Node) bool {
 			qualName = exploreNormalizedAnchor(n.ID[separator+2:])
 		}
 	}
+	if exploreQueryHasPathSymbolAnchor(query, n) || exploreQueryHasCallAnchor(query, n.Name) {
+		return true
+	}
 	if qualName != "" && qualName != name && strings.Contains(normalizedQuery, " "+qualName+" ") {
 		return true
 	}
 
 	path := nodeDisplayPath(n)
 	normalizedPath := exploreNormalizedPath(path)
+	for _, field := range strings.Fields(query) {
+		field = strings.Trim(field, "`'\"()[]{}<>,;")
+		separator := strings.LastIndex(field, "::")
+		if separator <= 0 || !strings.ContainsAny(field[:separator], "/\\") {
+			continue
+		}
+		if exploreNormalizedPath(field[:separator]) != normalizedPath {
+			continue
+		}
+		symbol := exploreNormalizedAnchor(field[separator+2:])
+		if symbol == name || symbol == qualName || strings.HasSuffix(qualName, " "+symbol) {
+			return true
+		}
+	}
 	pathAnchors, hasDirectory := exploreQueryPathAnchors(query)
 	if hasDirectory {
 		for _, anchor := range pathAnchors {
@@ -783,18 +937,9 @@ func exploreLocalizationExplicitAnchor(query string, n *graph.Node) bool {
 // outrank a rarer conjunctive implementation target. Retrieval order is the
 // stable final tie-breaker.
 func exploreLocalizationExactTarget(task string, targets []exploreTarget) string {
-	fallback := ""
-	for _, target := range targets {
-		if target.node != nil {
-			fallback = target.node.ID
-			break
-		}
-	}
-	if fallback == "" {
-		return ""
-	}
 	query := shapeExploreQuery(task)
-	if rerank.ClassifyQuery(query) == rerank.QueryClassConcept {
+	class := rerank.ClassifyQuery(query)
+	if class == rerank.QueryClassConcept {
 		query = stripLeadingExploreDirective(query)
 	}
 	for _, target := range targets {
@@ -804,7 +949,7 @@ func exploreLocalizationExactTarget(task string, targets []exploreTarget) string
 	}
 	queryTerms := exploreTerminalTerms(query)
 	if len(queryTerms) == 0 {
-		return fallback
+		return ""
 	}
 
 	matches := make([]map[string]struct{}, len(targets))
@@ -843,8 +988,16 @@ func exploreLocalizationExactTarget(task string, targets []exploreTarget) string
 			bestRarity = rarity
 		}
 	}
-	if best < 0 {
-		return fallback
+	if best < 0 || bestOverlap == 0 {
+		return ""
+	}
+	// Concept localization needs two independent lexical anchors before it may
+	// prescribe an exact source read. They may jointly support an equal-evidence
+	// neighborhood, in which case retrieval order remains the stable tie-breaker.
+	// Repeating one generic token (for example walk/walker/walking) still leaves
+	// frequency with one key and cannot turn retrieval order into exactness.
+	if class == rerank.QueryClassConcept && bestOverlap < 2 && len(frequency) < 2 {
+		return ""
 	}
 	return targets[best].node.ID
 }
@@ -1077,8 +1230,24 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	if !req.GetBool("localize", false) {
 		return mcp.NewToolResultText(s.renderExplore(task, targets, budget)), nil
 	}
+	answerReady := exploreAnswerReady(task, targets)
 	exactSymbol := exploreLocalizationExactTarget(task, targets)
-	completion := newLocalizationCompletion(exploreAnswerReady(task, targets), exactSymbol)
+	if !answerReady && exactSymbol == "" {
+		anchors := make([]string, 0, 3)
+		for _, target := range targets {
+			if target.node == nil {
+				continue
+			}
+			anchors = append(anchors, fmt.Sprintf("%s (%s)", target.node.ID, nodeDisplayPath(target.node)))
+			if len(anchors) == cap(anchors) {
+				break
+			}
+		}
+		return mcp.NewToolResultError(fmt.Sprintf(
+			"localization confidence is insufficient: no candidate has an explicit file/symbol anchor or two distinct task-term matches; top candidates: %s. Add a concrete file or symbol anchor, or use explore(operation:\"task\") when investigation must continue.",
+			strings.Join(anchors, ", "))), nil
+	}
+	completion := newLocalizationCompletion(answerReady, exactSymbol)
 	s.localizationFor(ctx).armForTask(completion, task)
 	return newLocalizationExploreResultForTask(completion, task, targets, budget), nil
 }

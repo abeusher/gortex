@@ -162,6 +162,24 @@ func facadePublicCapabilitySchema(
 		}
 	}
 
+	// Some public selectors are resolved against the graph before the legacy
+	// handler runs, so they cannot be inferred from legacy schema fields alone.
+	// Keep them in the same canonical target envelope as their static sibling.
+	if target, ok := properties["target"].(map[string]any); ok {
+		targetProperties, _ := target["properties"].(map[string]any)
+		var dynamicSelector string
+		switch spec.Facade + "." + spec.Operation {
+		case "read.editing_context":
+			dynamicSelector = "symbol"
+		case "change.impact":
+			dynamicSelector = "file"
+		}
+		if dynamicSelector != "" {
+			raw := facadeTargetProperties()[dynamicSelector]
+			targetProperties[dynamicSelector] = facadePublicValueSchema(facadeSchemaPlaceholder(dynamicSelector, raw), raw)
+		}
+	}
+
 	// Every remaining captured field is still public, but only through a stable
 	// envelope. Cold domains keep their operation payload under arguments;
 	// common domains use semantic envelopes with options as the safe fallback.
