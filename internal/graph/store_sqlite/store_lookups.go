@@ -29,6 +29,12 @@ const lookupNodeCols = `id, kind, name, qual_name, file_path, start_line, end_li
 // can never drift out of sync with lookupNodeCols / scanNode.
 var lookupNodeColsLight = strings.TrimSuffix(lookupNodeCols, ", meta")
 
+// lookupNodeSummaryCols is the identity/location prefix consumed by
+// graph.NodeLightScanner. Unlike lookupNodeColsLight it deliberately excludes
+// promoted metadata columns too, so whole-graph algorithms do not allocate a
+// Meta map (or retain docs/signatures) for every node.
+var lookupNodeSummaryCols = strings.SplitN(lookupNodeCols, ", signature", 2)[0]
+
 const lookupEdgeCols = `from_id, to_id, kind, file_path, line, confidence, confidence_label, origin, tier, cross_repo, meta, resolve_terminal, resolve_terminal_reason`
 
 // Compile-time assertion: *Store satisfies graph.NodeNameClassCounter.

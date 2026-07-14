@@ -61,6 +61,13 @@ type Store struct {
 
 	edgeIdentityRevs atomic.Int64
 
+	// analysisMutationRevision closes the in-process race between loading or
+	// computing a persisted whole-graph analysis and a concurrent graph write.
+	// analysisGenerationPresent is guarded by writeMu and avoids a redundant cache
+	// DELETE on every row after the first fail-closed invalidation.
+	analysisMutationRevision atomic.Uint64
+	analysisGenerationPresent     bool
+
 	// wiped records that Open dropped an incompatible on-disk DB and
 	// recreated it empty (a schema-version mismatch that an in-place ALTER
 	// could not satisfy). Surfaced via NeedsRebuild so the daemon forces a
@@ -220,6 +227,26 @@ var ErrSchemaRebuildRequired = errors.New("store_sqlite: on-disk schema is incom
 // registry, and rebuild permission so tests can drive the baseline / in-place
 // / rebuild arms without mutating package globals. Open passes the package
 // defaults (currentSchemaVersion, schemaMigrations) and the WithRebuild flag.
+const (
+	// Each modernc SQLite connection can map up to sqliteMmapSizeBytes and
+	// grow a separate page cache. Bounding the pool prevents a read burst on
+	// a high-core machine from multiplying clean file mappings into several
+	// GiB of resident address space. Four readers retained full-scan
+	// throughput in the pool benchmark while cutting the 16-reader peak by
+	// roughly 75%.
+	sqliteMaxOpenConns = 4
+	sqliteMaxIdleConns = 1
+)
+
+func configureConnectionPool(db *sql.DB) {
+	maxOpen := runtime.NumCPU()
+	if maxOpen > sqliteMaxOpenConns {
+		maxOpen = sqliteMaxOpenConns
+	}
+	db.SetMaxOpenConns(maxOpen)
+	db.SetMaxIdleConns(sqliteMaxIdleConns)
+}
+
 func openWith(path string, current int, migrations []schemaMigration, allowRebuild bool) (*Store, error) {
 	// Pragmas: WAL + synchronous=NORMAL is the standard write-heavy
 	// embedded tradeoff. cache_size(-32768) gives each pooled connection a
@@ -235,7 +262,7 @@ func openWith(path string, current int, migrations []schemaMigration, allowRebui
 	// it), which is how a 535 MB DB ends up with an 11 GB -wal. This bounds
 	// the file even between the explicit TRUNCATE checkpoints runCheckpointLoop
 	// issues, and even if that loop is not running.
-	dsn := path + "?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(OFF)&_pragma=cache_size(-32768)&_pragma=temp_store(MEMORY)&_pragma=mmap_size(268435456)&_pragma=journal_size_limit(67108864)"
+	dsn := path + "?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)&_pragma=cache_size(-32768)&_pragma=temp_store(MEMORY)&_pragma=mmap_size(268435456)&_pragma=journal_size_limit(67108864)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("sqlite open: %w", err)
@@ -251,7 +278,7 @@ func openWith(path string, current int, migrations []schemaMigration, allowRebui
 	// the pool opens picks up the journal-mode / synchronous /
 	// busy-timeout pragmas from the DSN above, so we don't need to
 	// pin one connection to "remember" them.
-	db.SetMaxOpenConns(runtime.NumCPU())
+	configureConnectionPool(db)
 
 	// Reconcile the on-disk schema version before applying schemaSQL. The graph
 	// store is a rebuildable cache, so an incompatible (older needing a rebuild
@@ -299,7 +326,7 @@ func openWith(path string, current int, migrations []schemaMigration, allowRebui
 		if err != nil {
 			return nil, fmt.Errorf("sqlite reopen for rebuild: %w", err)
 		}
-		db.SetMaxOpenConns(runtime.NumCPU())
+		configureConnectionPool(db)
 		didWipe = true
 	}
 
@@ -375,6 +402,18 @@ func openWith(path string, current int, migrations []schemaMigration, allowRebui
 			return nil, fmt.Errorf("sqlite stamp schema version: %w", err)
 		}
 	}
+	// A schema transition invalidates any generation produced against the old
+	// graph shape. The v4 migration also drops the unreleased blob-only table.
+	if stored != current {
+		if _, err := db.Exec(`UPDATE analysis_generations SET state = ? WHERE generation_id IN (SELECT generation_id FROM analysis_active_generation)`, analysisGenerationStale); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("sqlite stale analysis generation after migration: %w", err)
+		}
+		if _, err := db.Exec(`DELETE FROM analysis_active_generation`); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("sqlite clear active analysis generation after migration: %w", err)
+		}
+	}
 
 	s := &Store{db: db, dbPath: path, wiped: didWipe}
 	// Initialise the bundle cache at construction so its pointer is
@@ -383,6 +422,10 @@ func openWith(path string, current int, migrations []schemaMigration, allowRebui
 	// own mutex-guarded maps, not on the Store field. The cache stays
 	// inert (every lookup a miss) until the daemon supplies fingerprints.
 	s.bundles = newBundleCache()
+	if err := s.initAnalysisGenerationState(); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("sqlite analysis generation state: %w", err)
+	}
 	if err := s.prepare(); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("sqlite prepare: %w", err)
@@ -690,6 +733,26 @@ func scanNodeLight(scanner interface {
 	return &n, nil
 }
 
+// scanNodeSummary scans the identity/location projection used by whole-graph
+// algorithms. It deliberately leaves Meta nil: even promoted docs and
+// signatures are unnecessary for adjacency, centrality, communities, and
+// concept-name mining, and allocating them once per node dominates large
+// SQLite scans.
+func scanNodeSummary(scanner interface {
+	Scan(...any) error
+}) (*graph.Node, error) {
+	var n graph.Node
+	err := scanner.Scan(
+		&n.ID, &n.Kind, &n.Name, &n.QualName, &n.FilePath,
+		&n.StartLine, &n.EndLine, &n.StartColumn, &n.EndColumn, &n.Language,
+		&n.RepoPrefix, &n.WorkspaceID, &n.ProjectID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &n, nil
+}
+
 func scanEdge(scanner interface {
 	Scan(...any) error
 }) (*graph.Edge, error) {
@@ -765,22 +828,28 @@ func (s *Store) AddNode(n *graph.Node) {
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	if err := s.insertNodeLocked(s.stmtInsertNode, n); err != nil {
+	if !s.invalidateAnalysisBeforeNodeMutationLocked(n) {
+		return
+	}
+	changed, err := s.insertNodeLocked(s.stmtInsertNode, n)
+	if err != nil {
 		// graph.Store.AddNode has no error channel; the in-memory
 		// store can't fail either. We swallow the error here for API
 		// parity; surface as a panic only on a clearly catastrophic
 		// failure (closed DB), not on a transient busy.
 		panicOnFatal(err)
+		return
 	}
+	s.finishAnalysisMutationLocked(changed)
 }
 
-func (s *Store) insertNodeLocked(stmt *sql.Stmt, n *graph.Node) error {
+func (s *Store) insertNodeLocked(stmt *sql.Stmt, n *graph.Node) (bool, error) {
 	p, blobMeta := extractPromotedMeta(n.Meta)
 	metaBlob, err := encodeMeta(blobMeta)
 	if err != nil {
-		return err
+		return false, err
 	}
-	_, err = stmt.Exec(
+	res, err := stmt.Exec(
 		n.ID, string(n.Kind), n.Name, n.QualName, n.FilePath,
 		n.StartLine, n.EndLine, n.StartColumn, n.EndColumn, n.Language,
 		n.RepoPrefix, n.WorkspaceID, n.ProjectID,
@@ -788,7 +857,11 @@ func (s *Store) insertNodeLocked(stmt *sql.Stmt, n *graph.Node) error {
 		p.isAsync, p.isStatic, p.isAbstract, p.isExported, p.updatedAt,
 		p.dataClass, p.semanticType, p.semanticSource, metaBlob,
 	)
-	return err
+	if err != nil {
+		return false, err
+	}
+	changed, err := res.RowsAffected()
+	return changed > 0, err
 }
 
 // AddEdge inserts an edge. Idempotent on the logical edge key (from,
@@ -811,27 +884,37 @@ func (s *Store) AddEdge(e *graph.Edge) {
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	if err := s.insertEdgeLocked(s.stmtInsertEdge, e); err != nil {
-		panicOnFatal(err)
+	if !s.invalidateAnalysisBeforeMutationLocked() {
+		return
 	}
+	changed, err := s.insertEdgeLocked(s.stmtInsertEdge, e)
+	if err != nil {
+		panicOnFatal(err)
+		return
+	}
+	s.finishAnalysisMutationLocked(changed)
 }
 
-func (s *Store) insertEdgeLocked(stmt *sql.Stmt, e *graph.Edge) error {
+func (s *Store) insertEdgeLocked(stmt *sql.Stmt, e *graph.Edge) (bool, error) {
 	p, blobMeta := extractPromotedEdgeMeta(e.Meta)
 	metaBlob, err := encodeMeta(blobMeta)
 	if err != nil {
-		return err
+		return false, err
 	}
 	var crossRepo int64
 	if e.CrossRepo {
 		crossRepo = 1
 	}
-	_, err = stmt.Exec(
+	res, err := stmt.Exec(
 		e.From, e.To, string(e.Kind), e.FilePath, e.Line,
 		e.Confidence, e.ConfidenceLabel, e.Origin, e.Tier,
 		crossRepo, metaBlob, p.resolveTerminal, p.resolveTerminalReason,
 	)
-	return err
+	if err != nil {
+		return false, err
+	}
+	changed, err := res.RowsAffected()
+	return changed > 0, err
 }
 
 // AddBatch inserts nodes and edges in a single transaction -- the
@@ -842,6 +925,10 @@ func (s *Store) AddBatch(nodes []*graph.Node, edges []*graph.Edge) {
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	if !s.invalidateAnalysisBeforeMutationLocked() {
+		return
+	}
+	changed := false
 
 	tx, err := s.beginWrite()
 	if err != nil {
@@ -868,10 +955,12 @@ func (s *Store) AddBatch(nodes []*graph.Node, edges []*graph.Edge) {
 		if graph.IsProxyNode(n) {
 			continue
 		}
-		if err := s.insertNodeLocked(insertNode, n); err != nil {
+		inserted, err := s.insertNodeLocked(insertNode, n)
+		if err != nil {
 			panicOnFatal(err)
 			return
 		}
+		changed = changed || inserted
 	}
 	for _, e := range edges {
 		if e == nil {
@@ -883,10 +972,12 @@ func (s *Store) AddBatch(nodes []*graph.Node, edges []*graph.Edge) {
 		if graph.IsProxyID(e.From) || graph.IsProxyID(e.To) {
 			continue
 		}
-		if err := s.insertEdgeLocked(insertEdge, e); err != nil {
+		inserted, err := s.insertEdgeLocked(insertEdge, e)
+		if err != nil {
 			panicOnFatal(err)
 			return
 		}
+		changed = changed || inserted
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -894,6 +985,7 @@ func (s *Store) AddBatch(nodes []*graph.Node, edges []*graph.Edge) {
 		return
 	}
 	commit = true
+	s.finishAnalysisMutationLocked(changed)
 }
 
 // SetEdgeProvenance mutates an existing edge's origin in-place and
@@ -922,6 +1014,9 @@ func (s *Store) SetEdgeProvenance(e *graph.Edge, newOrigin string) bool {
 	if storedOrigin == newOrigin {
 		return false
 	}
+	if !s.invalidateAnalysisBeforeMutationLocked() {
+		return false
+	}
 	newTier := e.Tier
 	if newTier != "" {
 		newTier = graph.ResolvedBy(newOrigin)
@@ -937,6 +1032,7 @@ func (s *Store) SetEdgeProvenance(e *graph.Edge, newOrigin string) bool {
 		e.Tier = newTier
 	}
 	s.edgeIdentityRevs.Add(1)
+	s.finishAnalysisMutationLocked(true)
 	return true
 }
 
@@ -959,13 +1055,24 @@ func (s *Store) PersistEdgeAttributes(e *graph.Edge) {
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	if _, err := s.stmtUpdateEdgeAttrs.Exec(
+	if !s.invalidateAnalysisBeforeMutationLocked() {
+		return
+	}
+	res, err := s.stmtUpdateEdgeAttrs.Exec(
 		e.Confidence, e.ConfidenceLabel, e.Origin, e.Tier, metaBlob,
 		p.resolveTerminal, p.resolveTerminalReason,
 		e.From, e.To, string(e.Kind), e.FilePath, e.Line,
-	); err != nil {
+	)
+	if err != nil {
 		panicOnFatal(err)
+		return
 	}
+	changed, err := res.RowsAffected()
+	if err != nil {
+		panicOnFatal(err)
+		return
+	}
+	s.finishAnalysisMutationLocked(changed > 0)
 }
 
 // Compile-time assertion: *Store satisfies the batched meta persister.
@@ -984,6 +1091,9 @@ func (s *Store) PersistEdgeAttributesBatch(edges []*graph.Edge) {
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	if !s.invalidateAnalysisBeforeMutationLocked() {
+		return
+	}
 	for i := 0; i < len(edges); i += reindexChunkSize {
 		end := minInt(i+reindexChunkSize, len(edges))
 		chunk := edges[i:end]
@@ -993,6 +1103,7 @@ func (s *Store) PersistEdgeAttributesBatch(edges []*graph.Edge) {
 			return
 		}
 		updStmt := tx.Stmt(s.stmtUpdateEdgeAttrs)
+		chunkChanged := false
 		for _, e := range chunk {
 			if e == nil {
 				continue
@@ -1004,20 +1115,25 @@ func (s *Store) PersistEdgeAttributesBatch(edges []*graph.Edge) {
 				panicOnFatal(err)
 				return
 			}
-			if _, err := updStmt.Exec(
+			res, err := updStmt.Exec(
 				e.Confidence, e.ConfidenceLabel, e.Origin, e.Tier, metaBlob,
 				p.resolveTerminal, p.resolveTerminalReason,
 				e.From, e.To, string(e.Kind), e.FilePath, e.Line,
-			); err != nil {
+			)
+			if err != nil {
 				_ = tx.Rollback()
 				panicOnFatal(err)
 				return
+			}
+			if changed, err := res.RowsAffected(); err == nil && changed > 0 {
+				chunkChanged = true
 			}
 		}
 		if err := tx.Commit(); err != nil {
 			panicOnFatal(err)
 			return
 		}
+		s.finishAnalysisMutationLocked(chunkChanged)
 	}
 }
 
@@ -1034,15 +1150,26 @@ func (s *Store) ReindexEdge(e *graph.Edge, oldTo string) {
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	if !s.invalidateAnalysisBeforeMutationLocked() {
+		return
+	}
 
-	if _, err := s.stmtDeleteEdgeByKey.Exec(e.From, oldTo, string(e.Kind), e.FilePath, e.Line); err != nil {
+	res, err := s.stmtDeleteEdgeByKey.Exec(e.From, oldTo, string(e.Kind), e.FilePath, e.Line)
+	if err != nil {
 		panicOnFatal(err)
 		return
 	}
-	if err := s.insertEdgeLocked(s.stmtInsertEdge, e); err != nil {
+	deleted, err := res.RowsAffected()
+	if err != nil {
 		panicOnFatal(err)
 		return
 	}
+	inserted, err := s.insertEdgeLocked(s.stmtInsertEdge, e)
+	if err != nil {
+		panicOnFatal(err)
+		return
+	}
+	s.finishAnalysisMutationLocked(deleted > 0 || inserted)
 }
 
 // reindexChunkSize bounds the number of edge re-binds per BEGIN/COMMIT.
@@ -1062,6 +1189,9 @@ func (s *Store) ReindexEdges(batch []graph.EdgeReindex) {
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	if !s.invalidateAnalysisBeforeMutationLocked() {
+		return
+	}
 	for i := 0; i < len(batch); i += reindexChunkSize {
 		end := minInt(i+reindexChunkSize, len(batch))
 		chunk := batch[i:end]
@@ -1072,25 +1202,39 @@ func (s *Store) ReindexEdges(batch []graph.EdgeReindex) {
 		}
 		delStmt := tx.Stmt(s.stmtDeleteEdgeByKey)
 		insStmt := tx.Stmt(s.stmtInsertEdge)
+		chunkChanged := false
 		for _, r := range chunk {
-			if r.Edge == nil || r.OldTo == r.Edge.To {
+			if r.Edge == nil {
 				continue
 			}
-			if _, err := delStmt.Exec(r.Edge.From, r.OldTo, string(r.Edge.Kind), r.Edge.FilePath, r.Edge.Line); err != nil {
+			oldFilePath, oldLine := r.Edge.FilePath, r.Edge.Line
+			if r.RefreshIdentity {
+				oldFilePath, oldLine = r.OldFilePath, r.OldLine
+			} else if r.OldTo == r.Edge.To {
+				continue
+			}
+			res, err := delStmt.Exec(r.Edge.From, r.OldTo, string(r.Edge.Kind), oldFilePath, oldLine)
+			if err != nil {
 				_ = tx.Rollback()
 				panicOnFatal(err)
 				return
 			}
-			if err := s.insertEdgeLocked(insStmt, r.Edge); err != nil {
+			if deleted, err := res.RowsAffected(); err == nil && deleted > 0 {
+				chunkChanged = true
+			}
+			inserted, err := s.insertEdgeLocked(insStmt, r.Edge)
+			if err != nil {
 				_ = tx.Rollback()
 				panicOnFatal(err)
 				return
 			}
+			chunkChanged = chunkChanged || inserted
 		}
 		if err := tx.Commit(); err != nil {
 			panicOnFatal(err)
 			return
 		}
+		s.finishAnalysisMutationLocked(chunkChanged)
 	}
 }
 
@@ -1104,6 +1248,9 @@ func (s *Store) SetEdgeProvenanceBatch(batch []graph.EdgeProvenanceUpdate) int {
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	if !s.invalidateAnalysisBeforeMutationLocked() {
+		return 0
+	}
 	totalChanged := 0
 	for i := 0; i < len(batch); i += reindexChunkSize {
 		end := minInt(i+reindexChunkSize, len(batch))
@@ -1154,6 +1301,7 @@ func (s *Store) SetEdgeProvenanceBatch(batch []graph.EdgeProvenanceUpdate) int {
 		}
 		if chunkChanged > 0 {
 			s.edgeIdentityRevs.Add(int64(chunkChanged))
+			s.finishAnalysisMutationLocked(true)
 		}
 		totalChanged += chunkChanged
 	}
@@ -1172,6 +1320,9 @@ func minInt(a, b int) int {
 func (s *Store) RemoveEdge(from, to string, kind graph.EdgeKind) bool {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	if !s.invalidateAnalysisBeforeMutationLocked() {
+		return false
+	}
 	res, err := s.stmtRemoveEdge.Exec(from, to, string(kind))
 	if err != nil {
 		panicOnFatal(err)
@@ -1182,6 +1333,7 @@ func (s *Store) RemoveEdge(from, to string, kind graph.EdgeKind) bool {
 		panicOnFatal(err)
 		return false
 	}
+	s.finishAnalysisMutationLocked(n > 0)
 	return n > 0
 }
 
@@ -1230,6 +1382,13 @@ func (s *Store) evictByScopeLocked(selectIDs, deleteNodes *sql.Stmt, scope strin
 	if len(ids) == 0 {
 		return 0, 0
 	}
+	if !s.invalidateAnalysisBeforeMutationLocked() {
+		return 0, 0
+	}
+	// At least one selected node is about to be evicted. Advance before the
+	// chunked deletes so a later partial failure still invalidates an in-flight
+	// analysis save.
+	s.finishAnalysisMutationLocked(true)
 
 	// Delete every edge touching one of these nodes. A DELETE-per-node
 	// (… WHERE from_id = ? OR to_id = ?) is one statement round-trip and
@@ -1359,11 +1518,34 @@ func (s *Store) GetRepoNonContentNodes(repoPrefix string) []*graph.Node {
 	return s.scanNodeQuery(`SELECT `+lookupNodeCols+` FROM nodes WHERE repo_prefix = ? AND `+filter, repoPrefix)
 }
 
-// GetRepoNodesLight is the graph.LightNodeReader fast path: repo_prefix
-// still uses the nodes_by_repo index, but the meta column is left out of
-// the projection entirely, so a repo's already-enriched majority never
-// crosses the driver boundary as a blob to decode. See LightNodeReader's
-// doc for the read-only-use invariant this projection depends on.
+// AllNodesLight implements graph.NodeLightScanner with the identity/location
+// projection only. Whole-graph analyses avoid both the opaque metadata blob and
+// promoted docs/signatures, so returned nodes always have nil Meta.
+func (s *Store) AllNodesLight() []*graph.Node {
+	rows, err := s.db.Query(`SELECT ` + lookupNodeSummaryCols + ` FROM nodes`)
+	if err != nil {
+		panicOnFatal(err)
+		return nil
+	}
+	defer rows.Close()
+	var out []*graph.Node
+	for rows.Next() {
+		n, err := scanNodeSummary(rows)
+		if err != nil {
+			panicOnFatal(err)
+			return out
+		}
+		out = append(out, n)
+	}
+	if err := rows.Err(); err != nil {
+		panicOnFatal(err)
+	}
+	return out
+}
+
+// GetRepoNodesLight omits the opaque meta column for repo-scoped callers that
+// only need promoted structural fields. This keeps an already-enriched repo's
+// metadata blobs out of the driver and decoder hot path.
 func (s *Store) GetRepoNodesLight(repoPrefix string) []*graph.Node {
 	rows, err := s.db.Query(`SELECT `+lookupNodeColsLight+` FROM nodes WHERE repo_prefix = ?`, repoPrefix)
 	if err != nil {
