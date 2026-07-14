@@ -52,6 +52,10 @@ type Store struct {
 	// concurrency test predictable.
 	writeMu sync.Mutex
 
+	// mutationReceipts is guarded only by writeMu, making Begin/End atomic
+	// with every durable graph write without another lock-ordering edge.
+	mutationReceipts sqliteMutationReceiptState
+
 	// resolveMu is the resolver-coordination mutex returned by
 	// ResolveMutex. Held by cross-repo / temporal / external resolver
 	// passes to keep their edge mutations from interleaving. Separate
@@ -65,8 +69,8 @@ type Store struct {
 	// computing a persisted whole-graph analysis and a concurrent graph write.
 	// analysisGenerationPresent is guarded by writeMu and avoids a redundant cache
 	// DELETE on every row after the first fail-closed invalidation.
-	analysisMutationRevision atomic.Uint64
-	analysisGenerationPresent     bool
+	analysisMutationRevision  atomic.Uint64
+	analysisGenerationPresent bool
 
 	// wiped records that Open dropped an incompatible on-disk DB and
 	// recreated it empty (a schema-version mismatch that an in-place ALTER
@@ -567,7 +571,20 @@ func (s *Store) prepare() error {
 		 is_abstract=excluded.is_abstract, is_exported=excluded.is_exported,
 		 updated_at=excluded.updated_at, data_class=excluded.data_class,
 		 semantic_type=excluded.semantic_type, semantic_source=excluded.semantic_source,
-		 meta=excluded.meta`)
+		 meta=excluded.meta
+		 WHERE nodes.kind IS NOT excluded.kind OR nodes.name IS NOT excluded.name OR
+		       nodes.qual_name IS NOT excluded.qual_name OR nodes.file_path IS NOT excluded.file_path OR
+		       nodes.start_line IS NOT excluded.start_line OR nodes.end_line IS NOT excluded.end_line OR
+		       nodes.start_column IS NOT excluded.start_column OR nodes.end_column IS NOT excluded.end_column OR
+		       nodes.language IS NOT excluded.language OR nodes.repo_prefix IS NOT excluded.repo_prefix OR
+		       nodes.workspace_id IS NOT excluded.workspace_id OR nodes.project_id IS NOT excluded.project_id OR
+		       nodes.signature IS NOT excluded.signature OR nodes.visibility IS NOT excluded.visibility OR
+		       nodes.doc IS NOT excluded.doc OR nodes.external IS NOT excluded.external OR
+		       nodes.return_type IS NOT excluded.return_type OR nodes.is_async IS NOT excluded.is_async OR
+		       nodes.is_static IS NOT excluded.is_static OR nodes.is_abstract IS NOT excluded.is_abstract OR
+		       nodes.is_exported IS NOT excluded.is_exported OR nodes.updated_at IS NOT excluded.updated_at OR
+		       nodes.data_class IS NOT excluded.data_class OR nodes.semantic_type IS NOT excluded.semantic_type OR
+		       nodes.semantic_source IS NOT excluded.semantic_source OR nodes.meta IS NOT excluded.meta`)
 	prep(&s.stmtGetNode,
 		`SELECT `+nodeCols+` FROM nodes WHERE id = ?`)
 	prep(&s.stmtGetNodeByQual,
@@ -828,6 +845,17 @@ func (s *Store) AddNode(n *graph.Node) {
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+
+	var (
+		oldIdentity   sqliteMutationNodeIdentity
+		oldFound      bool
+		identityExact = true
+	)
+	if s.hasActiveMutationReceiptsLocked() {
+		var err error
+		oldIdentity, oldFound, err = s.mutationNodeIdentityLocked(n.ID)
+		identityExact = err == nil
+	}
 	if !s.invalidateAnalysisBeforeNodeMutationLocked(n) {
 		return
 	}
@@ -841,6 +869,7 @@ func (s *Store) AddNode(n *graph.Node) {
 		return
 	}
 	s.finishAnalysisMutationLocked(changed)
+	s.publishSQLiteNodeWriteLocked(n, oldIdentity, oldFound, identityExact, changed)
 }
 
 func (s *Store) insertNodeLocked(stmt *sql.Stmt, n *graph.Node) (bool, error) {
@@ -884,6 +913,16 @@ func (s *Store) AddEdge(e *graph.Edge) {
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	if s.analysisGenerationPresent {
+		exists, err := s.edgeExistsLocked(e)
+		if err != nil {
+			panicOnFatal(err)
+			return
+		}
+		if exists {
+			return
+		}
+	}
 	if !s.invalidateAnalysisBeforeMutationLocked() {
 		return
 	}
@@ -893,6 +932,7 @@ func (s *Store) AddEdge(e *graph.Edge) {
 		return
 	}
 	s.finishAnalysisMutationLocked(changed)
+	s.publishSQLiteEdgeInsertLocked(e, changed)
 }
 
 func (s *Store) insertEdgeLocked(stmt *sql.Stmt, e *graph.Edge) (bool, error) {
@@ -925,8 +965,52 @@ func (s *Store) AddBatch(nodes []*graph.Node, edges []*graph.Edge) {
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	if !s.invalidateAnalysisBeforeMutationLocked() {
+
+	hasGraphInput := false
+	for _, n := range nodes {
+		if n != nil && n.ID != "" && !graph.IsProxyNode(n) {
+			hasGraphInput = true
+			break
+		}
+	}
+	if !hasGraphInput {
+		for _, e := range edges {
+			if e != nil && !graph.IsProxyID(e.From) && !graph.IsProxyID(e.To) {
+				hasGraphInput = true
+				break
+			}
+		}
+	}
+	if !hasGraphInput {
 		return
+	}
+
+	// Preserve an active analysis generation for a genuinely idempotent batch.
+	// Node preflights reuse the exact analysis-facing field comparison; edge
+	// identities are checked in bounded queries. writeMu keeps the preflight,
+	// invalidation, and subsequent transaction one atomic visibility interval.
+	if s.analysisGenerationPresent {
+		for _, n := range nodes {
+			if n == nil || n.ID == "" || graph.IsProxyNode(n) {
+				continue
+			}
+			if !s.invalidateAnalysisBeforeNodeMutationLocked(n) {
+				return
+			}
+			if !s.analysisGenerationPresent {
+				break
+			}
+		}
+		if s.analysisGenerationPresent {
+			containsNewEdge, err := s.batchContainsNewEdgeLocked(edges)
+			if err != nil {
+				panicOnFatal(err)
+				return
+			}
+			if containsNewEdge && !s.invalidateAnalysisBeforeMutationLocked() {
+				return
+			}
+		}
 	}
 	changed := false
 
@@ -942,6 +1026,31 @@ func (s *Store) AddBatch(nodes []*graph.Node, edges []*graph.Edge) {
 		}
 	}()
 
+	var (
+		receiptDelta  *sqliteMutationReceiptAccumulator
+		identities    map[string]sqliteMutationNodeIdentity
+		identityExact = true
+	)
+	if s.hasActiveMutationReceiptsLocked() {
+		receiptDelta = newSQLiteMutationReceiptAccumulator()
+		ids := make([]string, 0, len(nodes)+len(edges))
+		for _, n := range nodes {
+			if n != nil && n.ID != "" && !graph.IsProxyNode(n) {
+				ids = append(ids, n.ID)
+			}
+		}
+		for _, e := range edges {
+			if e != nil && e.FilePath == "" && !graph.IsProxyID(e.From) && !graph.IsProxyID(e.To) {
+				ids = append(ids, e.From)
+			}
+		}
+		identities, err = mutationNodeIdentitiesTx(tx, ids)
+		if err != nil {
+			identityExact = false
+			identities = make(map[string]sqliteMutationNodeIdentity)
+		}
+	}
+
 	insertNode := tx.Stmt(s.stmtInsertNode)
 	defer insertNode.Close()
 	insertEdge := tx.Stmt(s.stmtInsertEdge)
@@ -955,12 +1064,24 @@ func (s *Store) AddBatch(nodes []*graph.Node, edges []*graph.Edge) {
 		if graph.IsProxyNode(n) {
 			continue
 		}
+		oldIdentity, oldFound := identities[n.ID]
 		inserted, err := s.insertNodeLocked(insertNode, n)
 		if err != nil {
 			panicOnFatal(err)
 			return
 		}
 		changed = changed || inserted
+		if receiptDelta != nil && inserted {
+			switch {
+			case !identityExact:
+				receiptDelta.complete = false
+			case !oldFound:
+				recordSQLiteAddedNode(receiptDelta, n)
+			case !oldIdentity.equalsNode(n):
+				receiptDelta.complete = false
+			}
+			identities[n.ID] = sqliteIdentityForNode(n)
+		}
 	}
 	for _, e := range edges {
 		if e == nil {
@@ -978,6 +1099,17 @@ func (s *Store) AddBatch(nodes []*graph.Node, edges []*graph.Edge) {
 			return
 		}
 		changed = changed || inserted
+		if receiptDelta != nil && inserted {
+			file := e.FilePath
+			if file == "" {
+				if source, found := identities[e.From]; found {
+					file = source.filePath
+				} else if !identityExact {
+					receiptDelta.complete = false
+				}
+			}
+			recordSQLiteAddedEdge(receiptDelta, e, file)
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -986,6 +1118,9 @@ func (s *Store) AddBatch(nodes []*graph.Node, edges []*graph.Edge) {
 	}
 	commit = true
 	s.finishAnalysisMutationLocked(changed)
+	if changed {
+		s.mergeMutationReceiptLocked(receiptDelta)
+	}
 }
 
 // SetEdgeProvenance mutates an existing edge's origin in-place and
@@ -1154,7 +1289,27 @@ func (s *Store) ReindexEdge(e *graph.Edge, oldTo string) {
 		return
 	}
 
-	res, err := s.stmtDeleteEdgeByKey.Exec(e.From, oldTo, string(e.Kind), e.FilePath, e.Line)
+	// Delete and reinsert are one topology change. Keeping them in one
+	// transaction prevents an encoding/insert failure from committing only the
+	// delete while both analysis and mutation receipts still describe the old
+	// graph as current.
+	tx, err := s.beginWrite()
+	if err != nil {
+		panicOnFatal(err)
+		return
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	deleteStmt := tx.Stmt(s.stmtDeleteEdgeByKey)
+	defer deleteStmt.Close()
+	insertStmt := tx.Stmt(s.stmtInsertEdge)
+	defer insertStmt.Close()
+
+	res, err := deleteStmt.Exec(e.From, oldTo, string(e.Kind), e.FilePath, e.Line)
 	if err != nil {
 		panicOnFatal(err)
 		return
@@ -1164,12 +1319,21 @@ func (s *Store) ReindexEdge(e *graph.Edge, oldTo string) {
 		panicOnFatal(err)
 		return
 	}
-	inserted, err := s.insertEdgeLocked(s.stmtInsertEdge, e)
+	inserted, err := s.insertEdgeLocked(insertStmt, e)
 	if err != nil {
 		panicOnFatal(err)
 		return
 	}
-	s.finishAnalysisMutationLocked(deleted > 0 || inserted)
+	if err := tx.Commit(); err != nil {
+		panicOnFatal(err)
+		return
+	}
+	committed = true
+	changed := deleted > 0 || inserted
+	s.finishAnalysisMutationLocked(changed)
+	if changed {
+		s.markMutationReceiptsIncompleteLocked()
+	}
 }
 
 // reindexChunkSize bounds the number of edge re-binds per BEGIN/COMMIT.
@@ -1235,6 +1399,9 @@ func (s *Store) ReindexEdges(batch []graph.EdgeReindex) {
 			return
 		}
 		s.finishAnalysisMutationLocked(chunkChanged)
+		if chunkChanged {
+			s.markMutationReceiptsIncompleteLocked()
+		}
 	}
 }
 
@@ -1333,8 +1500,12 @@ func (s *Store) RemoveEdge(from, to string, kind graph.EdgeKind) bool {
 		panicOnFatal(err)
 		return false
 	}
-	s.finishAnalysisMutationLocked(n > 0)
-	return n > 0
+	changed := n > 0
+	s.finishAnalysisMutationLocked(changed)
+	if changed {
+		s.markMutationReceiptsIncompleteLocked()
+	}
+	return changed
 }
 
 // EvictFile removes every node anchored to filePath and every edge
@@ -1389,6 +1560,12 @@ func (s *Store) evictByScopeLocked(selectIDs, deleteNodes *sql.Stmt, scope strin
 	// chunked deletes so a later partial failure still invalidates an in-flight
 	// analysis save.
 	s.finishAnalysisMutationLocked(true)
+	receiptChanged := false
+	defer func() {
+		if receiptChanged {
+			s.markMutationReceiptsIncompleteLocked()
+		}
+	}()
 
 	// Delete every edge touching one of these nodes. A DELETE-per-node
 	// (… WHERE from_id = ? OR to_id = ?) is one statement round-trip and
@@ -1414,6 +1591,7 @@ func (s *Store) evictByScopeLocked(selectIDs, deleteNodes *sql.Stmt, scope strin
 			}
 			if n, err := res.RowsAffected(); err == nil {
 				edgesRemoved += int(n)
+				receiptChanged = receiptChanged || n > 0
 			}
 		}
 	}
@@ -1428,6 +1606,7 @@ func (s *Store) evictByScopeLocked(selectIDs, deleteNodes *sql.Stmt, scope strin
 		panicOnFatal(err)
 		return 0, edgesRemoved
 	}
+	receiptChanged = receiptChanged || n > 0
 	return int(n), edgesRemoved
 }
 
