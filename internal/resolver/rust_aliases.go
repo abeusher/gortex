@@ -233,9 +233,7 @@ func expandRustUseTree(prefix, tree string) []rustUseBinding {
 		return nil
 	}
 	source := joinRustUsePath(prefix, leaf)
-	if strings.HasSuffix(source, "::self") {
-		source = strings.TrimSuffix(source, "::self")
-	}
+	source = strings.TrimSuffix(source, "::self")
 	if alias == "" {
 		alias = rustUseBindingName(source)
 	}
