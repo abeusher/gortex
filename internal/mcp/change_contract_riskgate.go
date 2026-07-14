@@ -71,8 +71,9 @@ func (s *Server) isRiskGated(n *graph.Node) bool {
 	if fanIn[n.ID] >= riskGateCallerThreshold() {
 		return true
 	}
-	if s.pageRank != nil && s.pageRank.Max > 0 {
-		if s.pageRank.ScoreOf(n.ID)/s.pageRank.Max >= riskGatePRThreshold {
+	metrics, err := s.analysisNodeMetrics([]string{n.ID})
+	if err == nil && len(metrics) > 0 {
+		if maxPR := s.topAnalysisMetricValue(graph.AnalysisMetricPageRank); maxPR > 0 && metrics[0].PageRank/maxPR >= riskGatePRThreshold {
 			return true
 		}
 	}
@@ -81,10 +82,34 @@ func (s *Server) isRiskGated(n *graph.Node) bool {
 
 // riskGatedSymbols returns the changed symbols that require an ack.
 func (s *Server) riskGatedSymbols(p *prediction) []*graph.Node {
-	var out []*graph.Node
-	for _, n := range p.nodes {
-		if s.isRiskGated(n) {
-			out = append(out, n)
+	if p == nil || len(p.nodes) == 0 {
+		return nil
+	}
+	fanIn, _ := computeFanInOut(s.graph, p.nodes)
+	ids := make([]string, 0, len(p.nodes))
+	for _, node := range p.nodes {
+		if node != nil {
+			ids = append(ids, node.ID)
+		}
+	}
+	pageRank := make(map[string]float64, len(ids))
+	if metrics, err := s.analysisNodeMetricsBatched(ids); err == nil {
+		for _, metric := range metrics {
+			pageRank[metric.NodeID] = metric.PageRank
+		}
+	}
+	maxPR := s.topAnalysisMetricValue(graph.AnalysisMetricPageRank)
+	out := make([]*graph.Node, 0, len(p.nodes))
+	for _, node := range p.nodes {
+		if node == nil {
+			continue
+		}
+		gated := fanIn[node.ID] >= riskGateCallerThreshold()
+		if !gated && maxPR > 0 {
+			gated = pageRank[node.ID]/maxPR >= riskGatePRThreshold
+		}
+		if gated {
+			out = append(out, node)
 		}
 	}
 	return out
