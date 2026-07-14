@@ -13,11 +13,12 @@ import (
 	"go.uber.org/zap"
 )
 
+const analysisGenerationFormatVersion uint32 = 1
+
 const (
-	analysisGenerationFormatVersion uint32 = 1
-	analysisGenerationWriteChunk           = 1000
-	analysisGenerationPruneBatch           = 1000
-	analysisGenerationPruneKeep            = 2
+	analysisGenerationWriteChunk = 1000
+	analysisGenerationPruneBatch = 1000
+	analysisGenerationPruneKeep  = 2
 )
 
 func (s *Server) analysisGenerationBackends() (graph.AnalysisGenerationStore, graph.AnalysisQueryStore) {

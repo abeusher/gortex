@@ -147,7 +147,6 @@ func BenchmarkAdaptiveIdleRelease(b *testing.B) {
 			burst[i] = 1
 		}
 		runtime.KeepAlive(burst)
-		burst = nil
 		runtime.GC()
 
 		var before runtime.MemStats

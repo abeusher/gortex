@@ -108,7 +108,7 @@ func (s *Server) loadOrCreateBatchTransaction(transactionID, fingerprint string)
 		if fingerprint != "" && persisted.Fingerprint != fingerprint {
 			return nil, "", fmt.Errorf("transaction_id %q is already bound to a different edit payload", transactionID)
 		}
-		terminal := persisted.Status != "prepared" && !(persisted.Status == "committed" && persisted.GraphStatus == "pending")
+		terminal := persisted.Status != "prepared" && (persisted.Status != "committed" || persisted.GraphStatus != "pending")
 		state := &batchTransactionState{
 			fingerprint: persisted.Fingerprint,
 			done:        make(chan struct{}),

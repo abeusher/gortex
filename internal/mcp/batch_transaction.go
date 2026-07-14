@@ -287,7 +287,7 @@ func applyBatchFileToContent(edit batchEditItem, content []byte) ([]byte, bool, 
 		return nil, false, fmt.Errorf("old_string not found in file")
 	}
 	if matches.count > 1 && !edit.ReplaceAll {
-		return nil, false, fmt.Errorf("old_string matches %d locations%s. Provide a larger fragment for uniqueness or set replace_all=true.", matches.count, matchSpansHint(fileStr, matches.spans))
+		return nil, false, fmt.Errorf("old_string matches %d locations%s. Provide a larger fragment for uniqueness or set replace_all=true", matches.count, matchSpansHint(fileStr, matches.spans))
 	}
 	var newContent string
 	normalized := false

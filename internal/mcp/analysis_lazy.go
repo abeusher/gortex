@@ -139,26 +139,6 @@ func (s *Server) analysisProcessesForNodes(nodeIDs []string) ([]graph.AnalysisPr
 	return query.AnalysisProcessesForNodes(header.GenerationID, ids)
 }
 
-func (s *Server) analysisConcepts(tokens []string, direction graph.AnalysisConceptDirection) (graph.AnalysisConceptQueryResult, error) {
-	bounded, err := boundedAnalysisIDs(tokens)
-	if err != nil || len(bounded) == 0 {
-		return graph.AnalysisConceptQueryResult{}, err
-	}
-	query, header, ok := s.activeAnalysisQuery()
-	if !ok {
-		return graph.AnalysisConceptQueryResult{}, errAnalysisGenerationUnavailable
-	}
-	return query.AnalysisConcepts(header.GenerationID, bounded, direction)
-}
-
-func (s *Server) analysisBlob(component graph.AnalysisBlobComponent) ([]byte, bool, error) {
-	query, header, ok := s.activeAnalysisQuery()
-	if !ok {
-		return nil, false, errAnalysisGenerationUnavailable
-	}
-	return query.LoadAnalysisBlob(header.GenerationID, component)
-}
-
 // releaseTransientAnalysisIfIdle drops request-scoped compatibility views only
 // after every tracked foreground/background operation is quiet. The compact
 // generation receipt and graph tokens remain published, so the next request can
@@ -479,7 +459,7 @@ func (s *Server) ensureLeidenMaterialized() bool {
 	payload, found, err := query.LoadAnalysisBlob(header.GenerationID, graph.AnalysisBlobLeiden)
 	if err != nil || !found {
 		if err == nil {
-			err = errors.New("Leiden blob is missing")
+			err = errors.New("leiden blob is missing")
 		}
 		s.logAnalysisMaterializationError("leiden", err)
 		return false

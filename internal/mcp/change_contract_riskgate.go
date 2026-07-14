@@ -62,24 +62,6 @@ func riskGateCallerThreshold() int {
 	return riskGateCallerDefault
 }
 
-// isRiskGated reports whether a symbol is load-bearing enough to require an ack.
-func (s *Server) isRiskGated(n *graph.Node) bool {
-	if n == nil {
-		return false
-	}
-	fanIn, _ := computeFanInOut(s.graph, []*graph.Node{n})
-	if fanIn[n.ID] >= riskGateCallerThreshold() {
-		return true
-	}
-	metrics, err := s.analysisNodeMetrics([]string{n.ID})
-	if err == nil && len(metrics) > 0 {
-		if maxPR := s.topAnalysisMetricValue(graph.AnalysisMetricPageRank); maxPR > 0 && metrics[0].PageRank/maxPR >= riskGatePRThreshold {
-			return true
-		}
-	}
-	return false
-}
-
 // riskGatedSymbols returns the changed symbols that require an ack.
 func (s *Server) riskGatedSymbols(p *prediction) []*graph.Node {
 	if p == nil || len(p.nodes) == 0 {
