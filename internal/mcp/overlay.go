@@ -88,6 +88,11 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 	// sees the real arguments and the real result (see sanitize.go).
 	h = s.sanitizeToolHandler(h)
 	return func(ctx context.Context, req mcp.CallToolRequest) (res *mcp.CallToolResult, retErr error) {
+		beginMCPToolCall()
+		defer func() {
+			endMCPToolCall(s.logger, req.Params.Name)
+		}()
+
 		// Last-resort panic firewall around EVERY tool handler. A Go
 		// panic in any handler (e.g. when the store surfaces a fatal
 		// engine error) would otherwise unwind past the mcp-go server

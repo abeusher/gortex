@@ -6,10 +6,10 @@ import (
 	"fmt"
 	"math"
 	"os"
-	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -47,20 +47,57 @@ type SymbolModification struct {
 	SignatureChanged bool      `json:"signature_changed"`
 }
 
-// symbolHistory tracks symbol modifications during the current session.
+const (
+	maxSymbolHistorySymbols   = 256
+	maxSymbolHistoryPerSymbol = 32
+)
+
+// symbolHistory tracks a bounded, daemon-wide working set of recent symbol
+// modifications. A per-symbol cap prevents one hot file from growing forever;
+// the LRU symbol cap bounds the aggregate to 8,192 modification records.
 type symbolHistory struct {
 	mu      sync.Mutex
-	entries map[string][]SymbolModification // symbolID → modifications
+	entries map[string][]SymbolModification // symbolID → oldest-to-newest modifications
+	order   []string                        // least-to-most recently modified symbol IDs
 }
 
 // Record adds a modification entry for the given symbol.
 func (sh *symbolHistory) Record(symbolID string, signatureChanged bool) {
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
-	sh.entries[symbolID] = append(sh.entries[symbolID], SymbolModification{
+	if sh.entries == nil {
+		sh.entries = make(map[string][]SymbolModification)
+	}
+
+	mods := append(sh.entries[symbolID], SymbolModification{
 		Timestamp:        time.Now(),
 		SignatureChanged: signatureChanged,
 	})
+	if len(mods) > maxSymbolHistoryPerSymbol {
+		copy(mods, mods[len(mods)-maxSymbolHistoryPerSymbol:])
+		mods = mods[:maxSymbolHistoryPerSymbol]
+	}
+	sh.entries[symbolID] = mods
+	sh.touchSymbolLocked(symbolID)
+	for len(sh.entries) > maxSymbolHistorySymbols && len(sh.order) > 0 {
+		oldest := sh.order[0]
+		copy(sh.order, sh.order[1:])
+		sh.order[len(sh.order)-1] = ""
+		sh.order = sh.order[:len(sh.order)-1]
+		delete(sh.entries, oldest)
+	}
+}
+
+func (sh *symbolHistory) touchSymbolLocked(symbolID string) {
+	for i, id := range sh.order {
+		if id != symbolID {
+			continue
+		}
+		copy(sh.order[i:], sh.order[i+1:])
+		sh.order[len(sh.order)-1] = symbolID
+		return
+	}
+	sh.order = append(sh.order, symbolID)
 }
 
 // Get returns the modification history for a specific symbol.
@@ -2324,29 +2361,31 @@ func (s *Server) RunAnalysis() {
 		s.graphInvalidatedBroadcaster.broadcast(s.graph.NodeCount(), s.graph.EdgeCount(), "reanalysis")
 	}
 
-	// A full analysis pass (PageRank / Leiden / HITS / hotspots over the
-	// whole graph) is one of the daemon's largest on-demand allocation
-	// bursts. Scavenge its high-water back to the OS so a client-triggered
-	// reanalysis doesn't ratchet the idle footprint up and leave it there.
-	freeOSMemoryAfterBurst(s.logger, "mcp_analysis")
+	scheduleOSMemoryReleaseAfterBurst(s.logger, "mcp_analysis")
 }
 
-// freeOSMemoryAfterBurst returns a completed whole-graph burst's heap
-// high-water to the OS. debug.FreeOSMemory forces a GC + scavenge;
-// GORTEX_DAEMON_MEMRELEASE=0 (or "false") disables it. The env check is
-// duplicated here (rather than shared) because the canonical release helper
-// lives in the cmd layer, which this package must not import.
-func freeOSMemoryAfterBurst(logger *zap.Logger, reason string) {
-	if v := os.Getenv("GORTEX_DAEMON_MEMRELEASE"); v == "0" || strings.EqualFold(v, "false") {
+var osMemoryReleaseScheduled atomic.Bool
+
+// scheduleOSMemoryReleaseAfterBurst coalesces full-graph query bursts and
+// releases their heap high-water after the response has had time to leave the
+// handler. The short delay keeps debug.FreeOSMemory's stop-the-world work out
+// of the user-visible tool latency while bounding idle RSS after analysis.
+func scheduleOSMemoryReleaseAfterBurst(logger *zap.Logger, reason string) {
+	ScheduleMemoryReleaseAfterBurst(logger, reason)
+}
+
+// ScheduleMemoryReleaseAfterBurst coalesces process-wide allocation bursts and
+// reclaims their idle heap only after all tracked foreground and background work
+// has remained quiet. It is exported for the daemon lifecycle, which shares the
+// same process and therefore must share the same gate and scheduler.
+func ScheduleMemoryReleaseAfterBurst(logger *zap.Logger, reason string) {
+	if !memoryReleaseEnabled() {
 		return
 	}
-	start := time.Now()
-	debug.FreeOSMemory()
-	if logger != nil {
-		logger.Debug("mcp: released heap to OS",
-			zap.String("reason", reason),
-			zap.Duration("elapsed", time.Since(start)))
+	if !osMemoryReleaseScheduled.CompareAndSwap(false, true) {
+		return
 	}
+	go runScheduledMCPMemoryRelease(logger, reason)
 }
 
 // resetConfirmedRefs clears the lazy-enrichment ledger (see the
