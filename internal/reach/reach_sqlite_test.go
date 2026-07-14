@@ -78,6 +78,7 @@ func TestReadCachedValidatesLegacySlicesAtomically(t *testing.T) {
 	build := BuildCounter()
 	n := &graph.Node{Meta: map[string]any{
 		MetaReachBuild:    int64(build),
+		MetaReachEpoch:    reachProcessEpoch,
 		MetaReachComplete: true,
 		MetaReachD1:       []any{"caller"},
 		MetaReachD1Conf:   []any{0.75},

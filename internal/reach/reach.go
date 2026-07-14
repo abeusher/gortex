@@ -12,8 +12,11 @@ package reach
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"math"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -33,8 +36,9 @@ import (
 // GetInEdges calls at query time — so a precomputed AnalyzeImpact
 // stays sub-ms even on graphs with high fan-in.
 //
-// Stored on Node.Meta — gob-serialized into the daemon snapshot so
-// warm starts keep O(1) impact lookups without paying the build cost.
+// Eager records are stored on Node.Meta. A process epoch deliberately rejects
+// records persisted by a prior daemon process: graph topology may have changed
+// while the restart-local numeric build counter reused the same value.
 const (
 	MetaReachD1      = "reach_d1"
 	MetaReachD2      = "reach_d2"
@@ -52,6 +56,11 @@ const (
 	// and return a false-safe zero-impact result. New records are assembled
 	// on a copy of the node and published only after this marker is set.
 	MetaReachComplete = "reach_complete"
+	// MetaReachEpoch identifies the daemon process that published a record.
+	// The numeric build counter restarts with each process; without a separate
+	// epoch, a warm database can make a new build generation collide with an
+	// old persisted record and temporarily expose stale or empty tiers.
+	MetaReachEpoch = "reach_epoch"
 	// MetaReachTruncated marks a complete-but-bounded record. Its tiers are
 	// valid lower-bound evidence, but callers must not interpret their end as
 	// proof that no more dependents exist.
@@ -81,7 +90,7 @@ var reachMetaKeys = [...]string{
 	MetaReachD1, MetaReachD2, MetaReachD3,
 	MetaReachD1Conf, MetaReachD2Conf, MetaReachD3Conf,
 	MetaReachD1Label, MetaReachD2Label, MetaReachD3Label,
-	MetaReachBuild, MetaReachComplete, MetaReachTruncated,
+	MetaReachBuild, MetaReachComplete, MetaReachEpoch, MetaReachTruncated,
 }
 
 // ReachableEdge returns true when an edge participates in the impact
@@ -118,9 +127,23 @@ type Stats struct {
 }
 
 // buildCounter is a process-wide monotonic generation counter used to
-// invalidate cached reach sets across snapshot reloads and
-// incremental rebuilds. Bumped on every BuildIndex / ClearIndex call.
-var buildCounter uint64
+// invalidate cached reach sets after graph mutations and incremental rebuilds.
+// reachProcessEpoch prevents a counter value reused by a restarted process from
+// matching a record persisted by the previous process.
+var (
+	buildCounter      uint64
+	reachProcessEpoch = newReachProcessEpoch()
+)
+
+func newReachProcessEpoch() string {
+	var token [16]byte
+	if _, err := rand.Read(token[:]); err == nil {
+		return hex.EncodeToString(token[:])
+	}
+	// crypto/rand failure is exceptional. A nanosecond process-start token still
+	// keeps the safety marker independent from the restart-local build counter.
+	return strconv.FormatInt(time.Now().UnixNano(), 36)
+}
 
 // topologyGate serialises impact readers/eager reach maintenance with a
 // watcher topology transaction. It is separate from Store.ResolveMutex:
@@ -287,7 +310,12 @@ func BuildIndexCtx(ctx context.Context, g graph.Store) *Stats {
 	releaseTopology()
 	stats := &Stats{Build: build}
 
-	nodes := g.AllNodes()
+	// Reachability only needs identity and kind during the graph-wide seed
+	// scan. On SQLite, AllNodes decodes every node's opaque metadata — including
+	// prior reach payloads — and retains those blobs for the whole build. Use the
+	// metadata-free projection and fetch a full node only for each bounded
+	// publication batch below.
+	nodes := graph.AllNodesLight(g)
 	// Sort by ID so the deterministic iteration order produces stable
 	// reach slices — important for snapshot determinism and for tests
 	// that compare reach payloads across runs.
@@ -445,6 +473,7 @@ func writeRecord(meta map[string]any, build uint64, tiers [3]tier, truncated boo
 	// A node with no callers deliberately has no tier keys. These two
 	// fields distinguish that valid empty record from an interrupted write.
 	meta[MetaReachBuild] = build
+	meta[MetaReachEpoch] = reachProcessEpoch
 	meta[MetaReachTruncated] = truncated
 	meta[MetaReachComplete] = true
 }
@@ -517,7 +546,11 @@ func compute(ctx context.Context, g graph.Store, seedID string) ([3]tier, bool) 
 		for i := range cands {
 			ids[i] = cands[i].from
 		}
-		nodes := g.GetNodesByIDs(ids)
+		nodes, nodeErr := getNodesContext(ctx, g, ids)
+		if nodeErr != nil {
+			truncated = true
+			break
+		}
 		slot := depth - 1
 		for _, c := range cands {
 			n := nodes[c.from]
@@ -654,31 +687,18 @@ type Entry struct {
 	Label string
 }
 
-// Lookup returns the per-depth reach for seedID. On a fresh cache hit
-// (build counter matches current generation and the completion marker
-// is present) it returns the cached tiers in sub-millisecond. On a miss —
-// first call for this seed, an interrupted/legacy record, or
-// the global build counter has advanced past the stamped value
-// because the graph mutated — it runs the BFS on demand under
-// g.ResolveMutex(), caches the result onto n.Meta, and returns the
-// fresh tiers. Returns hit=false only when seedID names no node or
-// names a node whose kind is not an impact seed (KindFunction,
-// KindMethod, KindType, KindInterface).
+// Lookup returns the per-depth reach for seedID. A current, complete eager
+// record is read in sub-millisecond. On a miss it performs one bounded,
+// cancellable BFS and returns that lower-bound-aware result without writing to
+// the graph. Read-only lazy traversal is intentional: publishing from an
+// interactive safety check can wait behind SQLite writers after the request
+// deadline and starve edits. Returns hit=false only when seedID is absent or is
+// not an impact-seed kind.
 //
-// This is the "lazy reach index" — the eager BuildIndex pass that
-// used to walk every impact seed during cold-index has been removed
-// from the IndexCtx hot path because the breakeven was untenable on
-// monorepo graphs: ~2000 s of cold-index work on k8s to save ~10 ms
-// per query, requiring ~200 k queries to break even. The lazy form
-// pays the 10 ms only on the first AnalyzeImpact call that names a
-// given seed, then caches forever. BuildIndex remains available for
-// `gortex enrich reach` (explicit prebuild) and for callers that
-// want to pay the cost up front under controlled conditions.
-//
-// Callers must not already hold g.ResolveMutex(): Lookup acquires that
-// non-reentrant mutex to serialize every Node.Meta read with graph-wide
-// metadata writers. Current production callers enter from analysis/MCP paths,
-// outside resolver critical sections.
+// The eager BuildIndex pass is no longer part of cold indexing because its
+// monorepo breakeven is poor. It remains available for explicit prebuilding;
+// normal impact calls pay only for their requested seed and never recurse over
+// every symbol in the repository.
 func Lookup(g graph.Store, seedID string) (d1, d2, d3 []Entry, hit bool) {
 	d1, d2, d3, hit, truncated := LookupContext(context.Background(), g, seedID)
 	// The legacy API has no channel for lower-bound status. Never call a
@@ -738,6 +758,20 @@ func getNodeContext(ctx context.Context, g graph.Store, id string) (*graph.Node,
 		return nil, err
 	}
 	return g.GetNode(id), nil
+}
+
+type contextNodesGetter interface {
+	GetNodesByIDsContext(context.Context, []string) (map[string]*graph.Node, error)
+}
+
+func getNodesContext(ctx context.Context, g graph.Store, ids []string) (map[string]*graph.Node, error) {
+	if getter, ok := g.(contextNodesGetter); ok {
+		return getter.GetNodesByIDsContext(ctx, ids)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return g.GetNodesByIDs(ids), nil
 }
 
 func LookupContext(parent context.Context, g graph.Store, seedID string) (d1, d2, d3 []Entry, hit, truncated bool) {
@@ -841,6 +875,12 @@ func readCached(n *graph.Node, currentBuild uint64) (d1, d2, d3 []Entry, truncat
 		return nil, nil, nil, false, false
 	}
 	if stamped != currentBuild {
+		return nil, nil, nil, false, false
+	}
+	epoch, valid := n.Meta[MetaReachEpoch].(string)
+	if !valid || epoch == "" || epoch != reachProcessEpoch {
+		// A restart-local build number may equal a persisted record's number.
+		// Never accept that record unless this process published it.
 		return nil, nil, nil, false, false
 	}
 	complete, _ := n.Meta[MetaReachComplete].(bool)
