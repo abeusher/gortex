@@ -15,14 +15,23 @@ import (
 )
 
 type proxyRestartDispatcher struct {
-	mu      sync.Mutex
-	methods []string
+	mu                    sync.Mutex
+	methods               []string
+	blockEditingContext   bool
+	editingContextStarted chan struct{}
+	editingContextOnce    sync.Once
 }
 
-func (d *proxyRestartDispatcher) Dispatch(_ context.Context, _ *daemon.Session, frame []byte) ([]byte, error) {
+func (d *proxyRestartDispatcher) Dispatch(ctx context.Context, _ *daemon.Session, frame []byte) ([]byte, error) {
 	var request struct {
 		ID     json.RawMessage `json:"id"`
 		Method string          `json:"method"`
+		Params struct {
+			Name      string `json:"name"`
+			Arguments struct {
+				Operation string `json:"operation"`
+			} `json:"arguments"`
+		} `json:"params"`
 	}
 	if err := json.Unmarshal(frame, &request); err != nil {
 		return nil, err
@@ -30,6 +39,15 @@ func (d *proxyRestartDispatcher) Dispatch(_ context.Context, _ *daemon.Session, 
 	d.mu.Lock()
 	d.methods = append(d.methods, request.Method)
 	d.mu.Unlock()
+	if d.blockEditingContext && request.Method == "tools/call" && request.Params.Name == "read" && request.Params.Arguments.Operation == "editing_context" {
+		d.editingContextOnce.Do(func() {
+			if d.editingContextStarted != nil {
+				close(d.editingContextStarted)
+			}
+		})
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
 	if len(request.ID) == 0 {
 		return nil, nil
 	}
@@ -63,7 +81,7 @@ func TestRelayProxySessionRestoresProtocolAgainstRealRestartedDaemon(t *testing.
 		proxyDialRetryWindow = oldWindow
 		proxyDialRetryInterval = oldInterval
 	})
-	proxyDialRetryWindow = 100 * time.Millisecond
+	proxyDialRetryWindow = 2 * time.Second
 	proxyDialRetryInterval = time.Millisecond
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 
@@ -81,7 +99,10 @@ func TestRelayProxySessionRestoresProtocolAgainstRealRestartedDaemon(t *testing.
 		CWD:              t.TempDir(),
 	}
 
-	firstDispatcher := &proxyRestartDispatcher{}
+	firstDispatcher := &proxyRestartDispatcher{
+		blockEditingContext:   true,
+		editingContextStarted: make(chan struct{}),
+	}
 	firstServer, firstDone := startProxyRestartDaemon(t, socket, firstDispatcher)
 	initial, err := daemon.DialTo(socket, h)
 	if err != nil {
@@ -106,18 +127,44 @@ func TestRelayProxySessionRestoresProtocolAgainstRealRestartedDaemon(t *testing.
 	mustWriteTestFrame(t, stdinW, []byte(`{"jsonrpc":"2.0","method":"notifications/initialized"}`+"\n"))
 	waitForProxyMethods(t, firstDispatcher, 2)
 
+	// Interrupt a real read(editing_context) while it is executing. Closing
+	// the first daemon socket must not close the host's stdin/stdout transport.
+	interrupted := []byte(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read","arguments":{"operation":"editing_context","target":{"file":"internal/mcp/tools_explore.go"}}}}` + "\n")
+	mustWriteTestFrame(t, stdinW, interrupted)
+	select {
+	case <-firstDispatcher.editingContextStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("editing_context did not start before daemon restart")
+	}
+
 	stopProxyRestartDaemon(t, firstServer, firstDone)
 	secondDispatcher := &proxyRestartDispatcher{}
 	secondServer, secondDone := startProxyRestartDaemon(t, socket, secondDispatcher)
 	t.Cleanup(func() { stopProxyRestartDaemon(t, secondServer, secondDone) })
 
-	trigger := []byte(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search"}}` + "\n")
-	mustWriteTestFrame(t, stdinW, trigger)
 	warning := mustReadTestFrame(t, stdoutR)
 	listChanged := mustReadTestFrame(t, stdoutR)
 	resetError := mustReadTestFrame(t, stdoutR)
-	if !jsonFrameMethod(warning, "notifications/message") || !jsonFrameMethod(listChanged, "notifications/tools/list_changed") {
-		t.Fatalf("restart notifications missing: warning=%s list=%s", warning, listChanged)
+	if !jsonFrameMethod(listChanged, "notifications/tools/list_changed") {
+		t.Fatalf("restart tools/list_changed notification missing: %s", listChanged)
+	}
+	var resetNotification struct {
+		Method string `json:"method"`
+		Params struct {
+			Data struct {
+				Code             string `json:"code"`
+				PreviousInstance string `json:"previous_daemon_instance"`
+				CurrentInstance  string `json:"daemon_instance"`
+			} `json:"data"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal(warning, &resetNotification); err != nil ||
+		resetNotification.Method != "notifications/message" ||
+		resetNotification.Params.Data.Code != "gortex_session_reset" ||
+		resetNotification.Params.Data.PreviousInstance != firstInstance ||
+		resetNotification.Params.Data.CurrentInstance == "" ||
+		resetNotification.Params.Data.CurrentInstance == firstInstance {
+		t.Fatalf("machine-readable daemon instance reset missing: %s (%v)", warning, err)
 	}
 	assertTestResponse(t, resetError, 2, true)
 	if initial.Ack.DaemonInstance == "" || initial.Ack.DaemonInstance != firstInstance {
@@ -133,7 +180,7 @@ func TestRelayProxySessionRestoresProtocolAgainstRealRestartedDaemon(t *testing.
 		}
 	}
 
-	retry := []byte(`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"search"}}` + "\n")
+	retry := []byte(`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read","arguments":{"operation":"editing_context","target":{"file":"internal/mcp/tools_explore.go"}}}}` + "\n")
 	mustWriteTestFrame(t, stdinW, retry)
 	assertTestResponse(t, mustReadTestFrame(t, stdoutR), 3, false)
 	methods = waitForProxyMethods(t, secondDispatcher, 3)
@@ -156,6 +203,34 @@ func startProxyRestartDaemon(t *testing.T, socket string, dispatcher daemon.MCPD
 	done := make(chan error, 1)
 	go func() { done <- server.Serve() }()
 	return server, done
+}
+
+func testProtocolRestoreClient(t *testing.T) (*daemon.Client, func()) {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", "gxpd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	socket := filepath.Join(dir, "s")
+	server, done := startProxyRestartDaemon(t, socket, &proxyRestartDispatcher{})
+	client, err := daemon.DialTo(socket, daemon.Handshake{
+		Version:          daemon.ProtocolVersion,
+		Mode:             daemon.ModeMCP,
+		PID:              os.Getpid(),
+		LogicalSessionID: testLogicalSessionID,
+		CWD:              t.TempDir(),
+	})
+	if err != nil {
+		stopProxyRestartDaemon(t, server, done)
+		_ = os.RemoveAll(dir)
+		t.Fatal(err)
+	}
+	cleanup := func() {
+		_ = client.Close()
+		stopProxyRestartDaemon(t, server, done)
+		_ = os.RemoveAll(dir)
+	}
+	return client, cleanup
 }
 
 func stopProxyRestartDaemon(t *testing.T, server *daemon.Server, done <-chan error) {

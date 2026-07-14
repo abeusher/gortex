@@ -1,14 +1,12 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"time"
@@ -153,12 +151,8 @@ func newProxyLogicalSessionID() string {
 }
 
 // orphanPollInterval is how often the proxy checks whether its parent
-// process is still alive; proxyDrainTimeout bounds the post-close drain.
-// Both are vars so tests can shorten them.
-var (
-	orphanPollInterval = 5 * time.Second
-	proxyDrainTimeout  = 2 * time.Second
-)
+// process is still alive. It is a var so tests can shorten it.
+var orphanPollInterval = 5 * time.Second
 
 // dialDaemon is the seam runProxy dials through. A package var so tests can
 // substitute a fake without a real socket.
@@ -239,27 +233,6 @@ func orphanWatch(ctx context.Context, interval time.Duration, getppid func() int
 				onOrphan()
 				return
 			}
-		}
-	}
-}
-
-// pumpLines copies newline-delimited frames from src to dst. Uses a
-// line-aware scanner so partial reads don't split a single MCP message
-// between two writes (which would confuse the peer's parser).
-func pumpLines(src io.Reader, dst io.Writer) error {
-	r := bufio.NewReaderSize(src, 1<<20) // 1 MB — some MCP replies are chunky
-	for {
-		line, err := r.ReadBytes('\n')
-		if len(line) > 0 {
-			if _, werr := dst.Write(line); werr != nil {
-				return werr
-			}
-		}
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return nil
-			}
-			return err
 		}
 	}
 }

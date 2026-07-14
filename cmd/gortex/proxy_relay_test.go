@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -62,6 +63,99 @@ func TestRelayProxySessionReplaysSafeReadAfterDaemonRestart(t *testing.T) {
 	if got := dialCalls.Load(); got != 1 {
 		t.Fatalf("dial calls = %d, want 1", got)
 	}
+	assertRelayRunning(t, done)
+
+	cancel()
+	_ = stdinW.Close()
+	_ = recoveredDaemon.Close()
+	waitRelay(t, done)
+}
+
+func TestRelayProxySessionKeepsTransportAfterEditingContextInterruptedByRestart(t *testing.T) {
+	oldDial := dialDaemon
+	oldWindow := proxyDialRetryWindow
+	oldInterval := proxyDialRetryInterval
+	t.Cleanup(func() {
+		dialDaemon = oldDial
+		proxyDialRetryWindow = oldWindow
+		proxyDialRetryInterval = oldInterval
+	})
+	proxyDialRetryWindow = 10 * time.Millisecond
+	proxyDialRetryInterval = time.Millisecond
+
+	initialClient, initialDaemon := testDaemonPipe()
+	recoveredClient, recoveredDaemon := testDaemonPipe()
+	recoveredClient.Ack.DaemonInstance = "daemon-instance-b"
+	var daemonRecovered atomic.Bool
+	var recoveredClientTaken atomic.Bool
+	dialDaemon = func(daemon.Handshake) (*daemon.Client, error) {
+		if !daemonRecovered.Load() {
+			return nil, daemon.ErrDaemonUnavailable
+		}
+		if recoveredClientTaken.Swap(true) {
+			return nil, daemon.ErrDaemonUnavailable
+		}
+		return recoveredClient, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	stdinR, stdinW := io.Pipe()
+	stdoutR, stdoutW := io.Pipe()
+	var stderr bytes.Buffer
+	done := make(chan error, 1)
+	go func() {
+		done <- relayProxySession(ctx, testProxyHandshake(), initialClient, stdinR, stdoutW, &stderr, nil, nil)
+	}()
+
+	interrupted := []byte(`{"jsonrpc":"2.0","id":41,"method":"tools/call","params":{"name":"read","arguments":{"operation":"editing_context","target":{"file":"internal/mcp/tools_explore.go"},"context":{"compress_bodies":true}}}}` + "\n")
+	mustWriteTestFrame(t, stdinW, interrupted)
+	if got := mustReadTestFrame(t, initialDaemon); !bytes.Equal(got, interrupted) {
+		t.Fatalf("initial editing-context request mismatch:\n got %s\nwant %s", got, interrupted)
+	}
+	if err := initialDaemon.Close(); err != nil {
+		t.Fatal(err)
+	}
+	assertTestResponse(t, mustReadTestFrame(t, stdoutR), 41, true)
+	assertRelayRunning(t, done)
+
+	daemonRecovered.Store(true)
+	restartTrigger := []byte(`{"jsonrpc":"2.0","id":42,"method":"tools/call","params":{"name":"read","arguments":{"operation":"editing_context","target":{"file":"internal/mcp/facade_tools.go"},"context":{"compress_bodies":true}}}}` + "\n")
+	mustWriteTestFrame(t, stdinW, restartTrigger)
+	warning := mustReadTestFrame(t, stdoutR)
+	var notification struct {
+		Method string `json:"method"`
+		Params struct {
+			Data struct {
+				Code string `json:"code"`
+			} `json:"data"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal(warning, &notification); err != nil || notification.Method != "notifications/message" || notification.Params.Data.Code != "gortex_session_reset" {
+		t.Fatalf("missing restart warning: %s (%v)", warning, err)
+	}
+	listChanged := mustReadTestFrame(t, stdoutR)
+	var listNotification struct {
+		Method string `json:"method"`
+	}
+	if err := json.Unmarshal(listChanged, &listNotification); err != nil || listNotification.Method != "notifications/tools/list_changed" {
+		t.Fatalf("missing tools/list_changed after restart: %s (%v)", listChanged, err)
+	}
+	resetError := mustReadTestFrame(t, stdoutR)
+	assertTestResponse(t, resetError, 42, true)
+	if !bytes.Contains(resetError, []byte(`"session_reset":true`)) {
+		t.Fatalf("restart error is not machine-detectable: %s", resetError)
+	}
+	assertRelayRunning(t, done)
+
+	// The request that discovers a new daemon instance is deliberately not
+	// forwarded. An explicit retry succeeds on the same host stdio transport.
+	retry := []byte(`{"jsonrpc":"2.0","id":43,"method":"tools/call","params":{"name":"read","arguments":{"operation":"editing_context","target":{"file":"internal/mcp/facade_tools.go"},"context":{"compress_bodies":true}}}}` + "\n")
+	mustWriteTestFrame(t, stdinW, retry)
+	if got := mustReadTestFrame(t, recoveredDaemon); !bytes.Equal(got, retry) {
+		t.Fatalf("post-restart retry mismatch:\n got %s\nwant %s", got, retry)
+	}
+	mustWriteTestFrame(t, recoveredDaemon, []byte(`{"jsonrpc":"2.0","id":43,"result":{"content":[]}}`+"\n"))
+	assertTestResponse(t, mustReadTestFrame(t, stdoutR), 43, false)
 	assertRelayRunning(t, done)
 
 	cancel()
@@ -222,6 +316,88 @@ func (*zeroWriteConn) RemoteAddr() net.Addr             { return &net.TCPAddr{} 
 func (*zeroWriteConn) SetDeadline(time.Time) error      { return nil }
 func (*zeroWriteConn) SetReadDeadline(time.Time) error  { return nil }
 func (*zeroWriteConn) SetWriteDeadline(time.Time) error { return nil }
+
+type deadlineErrorConn struct {
+	net.Conn
+	setErr   error
+	clearErr error
+}
+
+func (c *deadlineErrorConn) SetDeadline(deadline time.Time) error {
+	if deadline.IsZero() {
+		return c.clearErr
+	}
+	return c.setErr
+}
+
+func TestRestoreProtocolStateRejectsDeadlineFailures(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	initialize := []byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`)
+	t.Run("set", func(t *testing.T) {
+		sentinel := errors.New("set deadline")
+		proxyConn, daemonConn := net.Pipe()
+		defer proxyConn.Close()
+		defer daemonConn.Close()
+		client := &daemon.Client{Conn: &deadlineErrorConn{Conn: proxyConn, setErr: sentinel}}
+		state := &proxyRelayState{initialize: initialize}
+		if err := state.restoreProtocolState(client); !errors.Is(err, sentinel) {
+			t.Fatalf("restore error = %v, want wrapped set-deadline error", err)
+		}
+	})
+
+	t.Run("clear", func(t *testing.T) {
+		sentinel := errors.New("clear deadline")
+		client, cleanup := testProtocolRestoreClient(t)
+		defer cleanup()
+		client.Conn = &deadlineErrorConn{Conn: client.Conn, clearErr: sentinel}
+		state := &proxyRelayState{initialize: initialize}
+		if err := state.restoreProtocolState(client); !errors.Is(err, sentinel) {
+			t.Fatalf("restore error = %v, want wrapped clear-deadline error", err)
+		}
+	})
+}
+
+func TestRestoreProtocolStateForwardsInterleavedNotification(t *testing.T) {
+	proxyConn, daemonConn := net.Pipe()
+	defer proxyConn.Close()
+	defer daemonConn.Close()
+
+	client := &daemon.Client{Conn: proxyConn}
+	daemonSide := &daemon.Client{Conn: daemonConn}
+	initialize := []byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`)
+	notification := []byte(`{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}`)
+	response := []byte(`{"jsonrpc":"2.0","id":"gortex-reconnect-initialize","result":{"protocolVersion":"2025-06-18"}}`)
+	var stdout bytes.Buffer
+
+	done := make(chan error, 1)
+	go func() {
+		if _, err := daemonSide.ReadMCPFrame(); err != nil {
+			done <- err
+			return
+		}
+		if err := daemonSide.WriteMCPFrame(notification); err != nil {
+			done <- err
+			return
+		}
+		if err := daemonSide.WriteMCPFrame(response); err != nil {
+			done <- err
+			return
+		}
+		_, err := daemonSide.ReadMCPFrame() // notifications/initialized
+		done <- err
+	}()
+
+	state := &proxyRelayState{initialize: initialize, stdout: &stdout}
+	if err := state.restoreProtocolState(client); err != nil {
+		t.Fatalf("restore protocol state: %v", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("daemon side: %v", err)
+	}
+	if got := bytes.TrimSpace(stdout.Bytes()); !bytes.Equal(got, notification) {
+		t.Fatalf("forwarded frame = %s, want %s", got, notification)
+	}
+}
 
 func TestRelayProxySessionReportsDaemonProcessReset(t *testing.T) {
 	oldDial := dialDaemon

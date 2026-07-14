@@ -294,7 +294,7 @@ func (s *proxyRelayState) noteProtocolFrame(frame []byte) {
 	}
 }
 
-func (s *proxyRelayState) restoreProtocolState(client *daemon.Client) error {
+func (s *proxyRelayState) restoreProtocolState(client *daemon.Client) (err error) {
 	if len(s.initialize) == 0 {
 		return nil
 	}
@@ -303,19 +303,34 @@ func (s *proxyRelayState) restoreProtocolState(client *daemon.Client) error {
 		return err
 	}
 	if client.Conn != nil {
-		_ = client.Conn.SetDeadline(time.Now().Add(proxyReinitializeTimeout))
-		defer client.Conn.SetDeadline(time.Time{})
+		if deadlineErr := client.Conn.SetDeadline(time.Now().Add(proxyReinitializeTimeout)); deadlineErr != nil {
+			return fmt.Errorf("set protocol restore deadline: %w", deadlineErr)
+		}
+		defer func() {
+			if clearErr := client.Conn.SetDeadline(time.Time{}); clearErr != nil && err == nil {
+				err = fmt.Errorf("clear protocol restore deadline: %w", clearErr)
+			}
+		}()
 	}
 	if err := client.WriteMCPFrame(frame); err != nil {
 		return err
 	}
-	response, err := client.ReadMCPFrame()
-	if err != nil {
-		return err
-	}
-	gotKey, ok := responseIDKey(response)
-	if !ok || gotKey != responseKey {
-		return fmt.Errorf("initialize response id mismatch")
+	var response []byte
+	for {
+		response, err = client.ReadMCPFrame()
+		if err != nil {
+			return err
+		}
+		gotKey, ok := responseIDKey(response)
+		if ok && gotKey == responseKey {
+			break
+		}
+		// MCP notifications and server-initiated requests may legally race the
+		// initialize response. Preserve their ordering on the host transport
+		// instead of treating the first unrelated frame as a reconnect failure.
+		if _, writeErr := writeProxyFrame(s.stdout, response); writeErr != nil {
+			return fmt.Errorf("forward protocol-restore frame: %w", writeErr)
+		}
 	}
 	var envelope struct {
 		Error json.RawMessage `json:"error"`
