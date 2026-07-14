@@ -700,6 +700,11 @@ func (s *Server) handleEditFile(ctx context.Context, req mcp.CallToolRequest) (*
 	if resolveErr != nil {
 		return mcp.NewToolResultError(resolveErr.Error()), nil
 	}
+	releaseMutation, lockErr := acquireMutationPath(ctx, absPath)
+	if lockErr != nil {
+		return mcp.NewToolResultError("edit cancelled while waiting for exclusive file access: " + lockErr.Error()), nil
+	}
+	defer releaseMutation()
 
 	content, err := os.ReadFile(absPath)
 	if err != nil {
@@ -802,14 +807,13 @@ func (s *Server) handleEditFile(ctx context.Context, req mcp.CallToolRequest) (*
 	sess := s.sessionFor(ctx)
 	sess.recordModified(relPath)
 
-	reindexed := s.reindexFile(absPath)
+	reindexOutcome := s.mutationReindexState(ctx, absPath)
 
 	resp := map[string]any{
 		"path":          relPath,
 		"status":        "applied",
 		"replacements":  replacements,
 		"bytes_written": len(newContentBytes),
-		"reindexed":     reindexed,
 		"new_sha":       newSHA,
 	}
 	if matches.normalized {
@@ -818,9 +822,10 @@ func (s *Server) handleEditFile(ctx context.Context, req mcp.CallToolRequest) (*
 	if info := parseGateInfo(gate, allowParseErrors); info != nil {
 		resp["parse_gate"] = info
 	}
-	if health := s.fileSyntaxHealth(relPath, absPath); health != nil {
-		resp["syntax_health"] = health
+	if reindexOutcome.Err != nil {
+		resp["reindex_error"] = reindexOutcome.Err.Error()
 	}
+	s.attachMutationFreshness(resp, relPath, absPath, reindexOutcome)
 	return s.respondJSONOrTOON(ctx, req, resp)
 }
 
@@ -840,6 +845,11 @@ func (s *Server) handleWriteFile(ctx context.Context, req mcp.CallToolRequest) (
 	if resolveErr != nil {
 		return mcp.NewToolResultError(resolveErr.Error()), nil
 	}
+	releaseMutation, lockErr := acquireMutationPath(ctx, absPath)
+	if lockErr != nil {
+		return mcp.NewToolResultError("write cancelled while waiting for exclusive file access: " + lockErr.Error()), nil
+	}
+	defer releaseMutation()
 
 	status := "created"
 	perm := os.FileMode(0o644)
@@ -919,21 +929,21 @@ func (s *Server) handleWriteFile(ctx context.Context, req mcp.CallToolRequest) (
 	sess := s.sessionFor(ctx)
 	sess.recordModified(relPath)
 
-	reindexed := s.reindexFile(absPath)
+	reindexOutcome := s.mutationReindexState(ctx, absPath)
 
 	resp := map[string]any{
 		"path":          relPath,
 		"status":        status,
 		"bytes_written": len(contentBytes),
-		"reindexed":     reindexed,
 		"new_sha":       newSHA,
 	}
 	if info := parseGateInfo(gate, allowParseErrors); info != nil {
 		resp["parse_gate"] = info
 	}
-	if health := s.fileSyntaxHealth(relPath, absPath); health != nil {
-		resp["syntax_health"] = health
+	if reindexOutcome.Err != nil {
+		resp["reindex_error"] = reindexOutcome.Err.Error()
 	}
+	s.attachMutationFreshness(resp, relPath, absPath, reindexOutcome)
 	return s.respondJSONOrTOON(ctx, req, resp)
 }
 

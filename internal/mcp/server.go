@@ -92,6 +92,7 @@ type Server struct {
 	engine        *query.Engine
 	graph         graph.Store
 	indexer       *indexer.Indexer
+	watcherMu     sync.RWMutex
 	watcher       watcherHistory
 	multiIndexer  *indexer.MultiIndexer
 	configManager *config.ConfigManager
@@ -268,6 +269,24 @@ type Server struct {
 	// positives by stable identity; the suppress_finding tool mutates it. Nil
 	// until InitSuppressions fires; the review flow tolerates a nil store.
 	suppressions *suppressionManager
+
+	// mutationReceipts tracks watcher tickets that outlive an edit response.
+	// Safety-critical graph consumers wait on these receipts before reading the
+	// graph, so a slow patch is explicit rather than a silent stale read. Test
+	// servers may shorten the two bounded waits; zero selects production
+	// defaults. sync.Map keeps directly-constructed servers usable.
+	mutationReceipts    sync.Map
+	mutationReindexWait time.Duration
+	mutationSafetyWait  time.Duration
+
+	// batchTransactions holds daemon-lifetime delivery receipts for atomic
+	// batch edits. sync.Map's zero value keeps directly-constructed test and
+	// embedded servers usable without constructor wiring. batchWriteOverride is
+	// a narrow target-write fault-injection seam; batchDurabilityOverride covers
+	// journal, fsync, rollback, and cleanup ordering. Production leaves both nil.
+	batchTransactions       sync.Map
+	batchWriteOverride      func(string, []byte, os.FileMode) error
+	batchDurabilityOverride *batchDurabilityOps
 
 	// packCache retains recent smart_context pack views keyed by pack
 	// root so a later call with delta_from=<root> returns only the
@@ -2695,8 +2714,16 @@ type watcherHistory interface {
 // a symbol change callback to record modifications in symbolHistory.
 // Accepts either a single-repo *indexer.Watcher or a multi-repo
 // *indexer.MultiWatcher — both satisfy watcherHistory.
+func (s *Server) currentWatcher() watcherHistory {
+	s.watcherMu.RLock()
+	defer s.watcherMu.RUnlock()
+	return s.watcher
+}
+
 func (s *Server) SetWatcher(w watcherHistory) {
+	s.watcherMu.Lock()
 	s.watcher = w
+	s.watcherMu.Unlock()
 
 	// Register callback to track symbol modifications for
 	// get_symbol_history AND fan stale_refs notifications to any

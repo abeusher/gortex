@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/zzet/gortex/internal/agents"
 	"github.com/zzet/gortex/internal/elide"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/query"
@@ -733,7 +734,8 @@ func (s *Server) handleFindImportPath(ctx context.Context, req mcp.CallToolReque
 }
 
 func (s *Server) handleGetRecentChanges(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	if s.watcher == nil {
+	watcher := s.currentWatcher()
+	if watcher == nil {
 		return mcp.NewToolResultError("watch mode is not active"), nil
 	}
 
@@ -745,7 +747,7 @@ func (s *Server) handleGetRecentChanges(ctx context.Context, req mcp.CallToolReq
 		if err != nil {
 			return mcp.NewToolResultError("invalid timestamp: " + sinceStr), nil
 		}
-		for _, ev := range s.watcher.HistorySince(t) {
+		for _, ev := range watcher.HistorySince(t) {
 			changes = append(changes, map[string]any{
 				"file":          ev.FilePath,
 				"kind":          ev.Kind,
@@ -755,7 +757,7 @@ func (s *Server) handleGetRecentChanges(ctx context.Context, req mcp.CallToolReq
 			})
 		}
 	} else {
-		for _, ev := range s.watcher.History() {
+		for _, ev := range watcher.History() {
 			changes = append(changes, map[string]any{
 				"file":          ev.FilePath,
 				"kind":          ev.Kind,
@@ -2639,6 +2641,11 @@ func (s *Server) handleEditSymbol(ctx context.Context, req mcp.CallToolRequest) 
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+	releaseMutation, lockErr := acquireMutationPath(ctx, absPath)
+	if lockErr != nil {
+		return mcp.NewToolResultError("edit cancelled while waiting for exclusive file access: " + lockErr.Error()), nil
+	}
+	defer releaseMutation()
 
 	// Read the entire file ONCE — both the drift check and the
 	// patch operate on the same byte snapshot so a concurrent
@@ -2768,15 +2775,19 @@ func (s *Server) handleEditSymbol(ctx context.Context, req mcp.CallToolRequest) 
 		return s.respondJSONOrTOON(ctx, req, preview)
 	}
 
-	// Write the file.
-	if err := os.WriteFile(absPath, newContentBytes, 0o644); err != nil {
+	// Write the file atomically while holding the path mutation lock.
+	perm := os.FileMode(0o644)
+	if info, statErr := os.Stat(absPath); statErr == nil {
+		perm = info.Mode().Perm()
+	}
+	if err := agents.AtomicWriteFile(absPath, newContentBytes, perm); err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("could not write file: %v", err)), nil
 	}
 	sess := s.sessionFor(ctx)
 	sess.recordModified(node.FilePath)
 	sess.recordSymbol(id)
 
-	reindexed := s.reindexFile(absPath)
+	reindexOutcome := s.mutationReindexState(ctx, absPath)
 
 	// Count lines changed.
 	oldLines := strings.Count(oldSource, "\n") + 1
@@ -2789,15 +2800,15 @@ func (s *Server) handleEditSymbol(ctx context.Context, req mcp.CallToolRequest) 
 		"lines_after":  newLines,
 		"start_line":   node.StartLine,
 		"status":       "applied",
-		"reindexed":    reindexed,
 		"new_sha":      gitBlobSHA(newContentBytes),
 	}
 	if regionMatches.normalized {
 		resp["eol_normalized"] = true
 	}
-	if health := s.fileSyntaxHealth(node.FilePath, absPath); health != nil {
-		resp["syntax_health"] = health
+	if reindexOutcome.Err != nil {
+		resp["reindex_error"] = reindexOutcome.Err.Error()
 	}
+	s.attachMutationFreshness(resp, node.FilePath, absPath, reindexOutcome)
 	return s.respondJSONOrTOON(ctx, req, resp)
 }
 
