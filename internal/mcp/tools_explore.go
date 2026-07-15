@@ -1352,7 +1352,7 @@ func reserveExploreConceptImplementation(
 
 	best := exploreConceptImplementationMetric{index: -1}
 	for _, metric := range metrics {
-		if metric.overlap < 2 && !(metric.overlap == 1 && metric.longest >= 5 && metric.segments >= 2) {
+		if metric.overlap < 2 && (metric.overlap != 1 || metric.longest < 5 || metric.segments < 2) {
 			continue
 		}
 		for j, count := range frequency {
@@ -1429,7 +1429,7 @@ func exploreIdentifierTerminalMatchesWithMask(text string, terms []string, match
 		}
 		rootEnd := end
 		if end-start > 4 && (text[end-1] == 's' || text[end-1] == 'S') &&
-			!(end-start >= 2 && (text[end-2] == 's' || text[end-2] == 'S')) {
+			text[end-2] != 's' && text[end-2] != 'S' {
 			rootEnd--
 		}
 		token := text[start:rootEnd]
