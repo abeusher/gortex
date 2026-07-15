@@ -142,7 +142,7 @@ func exploreArtifactFile(value string) bool {
 }
 
 func exploreArtifactWords(text string) []string {
-	return strings.FieldsFunc(strings.ToLower(text), func(r rune) bool { return !(unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_') })
+	return strings.FieldsFunc(strings.ToLower(text), func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '_' })
 }
 
 func exploreArtifactWord(word string) bool     { return exploreInSet(exploreArtifactWordsSet, word) }
