@@ -1,14 +1,20 @@
 package mcp
 
 import (
+	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 
+	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/search/trigram"
 )
@@ -102,6 +108,45 @@ func TestMapExploreSourceLiteralMatchesHardCapsRecall(t *testing.T) {
 func TestExploreHighestInformationQuotedLiteral(t *testing.T) {
 	require.Equal(t, "registration-key", exploreHighestInformationQuotedLiteral([]string{"ku", "日本", "registration-key"}))
 	require.Empty(t, exploreHighestInformationQuotedLiteral(nil))
+}
+
+func TestGatherExploreQuotedContentCandidatesMergesSourceLiteralWithExactContentNode(t *testing.T) {
+	root := t.TempDir()
+	rel := "src/FormatterRegistry.cs"
+	path := filepath.Join(root, filepath.FromSlash(rel))
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+	require.NoError(t, os.WriteFile(path, []byte("public sealed class FormatterRegistry {\n    public FormatterRegistry() {\n        Register(\"ku\", new CentralKurdishFormatter());\n    }\n}\n"), 0o644))
+
+	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	document := &graph.Node{
+		ID: "demo/docs/locales.md::content", Name: "locales", QualName: "docs.locales",
+		Kind: graph.KindFile, FilePath: "docs/locales.md", RepoPrefix: "demo",
+	}
+	typeNode := sourceLiteralNode("demo/src/FormatterRegistry.cs::FormatterRegistry#type", "FormatterRegistry", rel, graph.KindType, 1, 5)
+	constructor := sourceLiteralNode("demo/src/FormatterRegistry.cs::FormatterRegistry", "FormatterRegistry", rel, graph.KindMethod, 2, 4)
+	store.AddBatch([]*graph.Node{document, typeNode, constructor}, nil)
+	counting := &quotedRecallCountingStore{
+		Store: store,
+		hits: map[string][]graph.ContentHit{
+			"ku": {{NodeID: document.ID, FilePath: document.FilePath, Snippet: `locale "ku" reference`}},
+		},
+	}
+	idx := indexer.New(counting, parser.NewRegistry(), config.IndexConfig{}, zap.NewNop())
+	_, err = idx.IndexCtx(context.Background(), root)
+	require.NoError(t, err)
+	idx.SetFileMtimes(map[string]int64{rel: 1})
+	store.AddBatch([]*graph.Node{document, typeNode, constructor}, nil)
+	server := &Server{graph: counting, indexer: idx}
+
+	candidates := server.gatherExploreQuotedContentCandidates(
+		context.Background(), `find registration for "ku"`, 20,
+		query.QueryOptions{RepoAllow: map[string]bool{"demo": true}},
+	)
+
+	require.NotNil(t, candidateByID(candidates, document.ID), "exact content evidence must be retained")
+	require.NotNil(t, candidateByID(candidates, constructor.ID), "an exact non-source content hit must not suppress bounded source recall")
 }
 
 func BenchmarkMapExploreSourceLiteralMatches(b *testing.B) {

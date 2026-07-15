@@ -83,6 +83,7 @@ type exploreTarget struct {
 	callees               []*graph.Node
 	causalCallees         []exploreCausalNeighbor
 	source                string // full body (may be empty for non-source kinds)
+	conceptImplementation bool   // one identifier-backed callable protected from final truncation
 	exactContent          bool   // verified full quoted-literal hit from content_fts
 	exactContentAmbiguous bool   // exact evidence has visible or possibly truncated peers
 }
@@ -438,7 +439,8 @@ func exploreAnswerDraft(task string, targets []exploreTarget) []exploreDraftEntr
 		appendEntry(entry)
 	}
 
-	var aligned, structuralNeighbors []exploreDraftEntry
+	var aligned, structuralNeighbors, protectedStructuralNeighbors []exploreDraftEntry
+	protectedStructuralMentions := make(map[string]int)
 	consider := func(n *graph.Node, source, evidence string, direct bool, parentRank int) {
 		if n == nil || (!direct && exploreDraftIsTestNode(n)) {
 			return
@@ -469,27 +471,46 @@ func exploreAnswerDraft(task string, targets []exploreTarget) []exploreDraftEntr
 			continue
 		}
 		collectStructural := func(n *graph.Node, evidence string, callee bool, hop int) {
-			if n == nil || exploreDraftIsTestNode(n) || (n.Kind != graph.KindFunction && n.Kind != graph.KindMethod) || (hop <= 1 && exploreIdentifierSegmentCount(n.Name) < 3) {
+			if n == nil || exploreDraftIsTestNode(n) || (n.Kind != graph.KindFunction && n.Kind != graph.KindMethod) {
+				return
+			}
+			mentions := 0
+			shortProtected := false
+			if target.conceptImplementation && callee && hop == 1 && exploreSameCallableOwner(target.node, n) {
+				mentions = exploreBodyIdentifierMentions(target.source, n.Name)
+				shortProtected = mentions > 0
+			}
+			if hop <= 1 && exploreIdentifierSegmentCount(n.Name) < 3 && !shortProtected {
 				return
 			}
 			entry, _ := makeEntry(n, "", evidence, false, i)
 			shared, local := exploreStructuralSignals(target.node, n)
 			crossFile := nodeDisplayPath(target.node) != nodeDisplayPath(n)
 			// A concrete cross-file callee is causal graph evidence even when its
-			// name shares no useful query token with the parent. Multi-hop nodes
-			// compete for the same single structural slot as direct neighbors.
+			// name shares no useful query token with the parent. A protected
+			// implementation may instead contribute one short same-owner callee
+			// when its already-loaded body names that callee.
 			causalCrossFile := callee && crossFile
-			if shared == 0 && !entry.exact && entry.overlap == 0 && entry.bodyOverlap == 0 && !local && !causalCrossFile {
+			if shared == 0 && !entry.exact && entry.overlap == 0 && entry.bodyOverlap == 0 && !local && !causalCrossFile && !shortProtected {
 				return
 			}
 			entry.structural = true
 			entry.structuralShared = shared
 			entry.structuralLocal = local
 			entry.structuralCallee = callee
-			entry.structuralCrossFile = crossFile
+			// The existing single-source materializer keys on this bounded
+			// boundary flag. A protected same-owner callee is equally source-worthy
+			// because its parent body explicitly names it, while still consuming
+			// the same one structural slot and one read.
+			entry.structuralCrossFile = crossFile || shortProtected
 			entry.structuralHop = hop
 			entry.parentExact = parent.exact
 			entry.parentOverlap = parent.overlap
+			if shortProtected {
+				protectedStructuralMentions[exploreDraftNodeKey(n)] = mentions
+				protectedStructuralNeighbors = append(protectedStructuralNeighbors, entry)
+				return
+			}
 			structuralNeighbors = append(structuralNeighbors, entry)
 		}
 		for _, n := range target.callers {
@@ -509,6 +530,17 @@ func exploreAnswerDraft(task string, targets []exploreTarget) []exploreDraftEntr
 	sort.SliceStable(structuralNeighbors, func(i, j int) bool {
 		return exploreStructuralEntryLess(structuralNeighbors[i], structuralNeighbors[j])
 	})
+	if len(protectedStructuralNeighbors) > 0 {
+		sort.SliceStable(protectedStructuralNeighbors, func(i, j int) bool {
+			left := protectedStructuralMentions[exploreDraftNodeKey(protectedStructuralNeighbors[i].node)]
+			right := protectedStructuralMentions[exploreDraftNodeKey(protectedStructuralNeighbors[j].node)]
+			if left != right {
+				return left > right
+			}
+			return exploreStructuralEntryLess(protectedStructuralNeighbors[i], protectedStructuralNeighbors[j])
+		})
+		structuralNeighbors = append(protectedStructuralNeighbors[:1], structuralNeighbors...)
+	}
 	// Reserve one structural slot across both directions. A single causal
 	// implementation edge adds useful breadth without displacing two ranked
 	// candidates from the compact draft.
@@ -934,8 +966,61 @@ func exploreAnswerReady(task string, targets []exploreTarget) bool {
 		}
 		return headEvidence >= 2 || (headEvidence >= 1 && structuralAligned)
 	}
+	if exploreLocalizationExplicitAnchor(query, head.node) {
+		return true
+	}
 
-	// Broad prompts require more evidence concentrated in the ranked head.
+	// Ordinary non-literal concept localization needs one identifier-backed
+	// callable with a real body. Fields, enum variants, types, and signature-only
+	// declarations remain useful evidence, but cannot terminate navigation.
+	var implementation *exploreTarget
+	if class == rerank.QueryClassConcept {
+		for i := range targets {
+			target := &targets[i]
+			callable := target.node != nil &&
+				(target.node.Kind == graph.KindFunction || target.node.Kind == graph.KindMethod)
+			if target.conceptImplementation && callable && strings.TrimSpace(target.source) != "" {
+				implementation = target
+				break
+			}
+		}
+		if implementation == nil {
+			return false
+		}
+
+		implementationMatches := matchedNode(implementation.node)
+		identifierOverlap, longest := exploreDraftTermOverlap(queryTerms, implementation.node)
+		identifierStrong := identifierOverlap >= 2 ||
+			(identifierOverlap == 1 && longest >= 5 && exploreIdentifierSegmentCount(implementation.node.Name) >= 2)
+		implementationStructural := false
+		for _, neighbors := range [][]*graph.Node{implementation.callers, implementation.callees} {
+			for _, neighbor := range neighbors {
+				if matchedNode(neighbor) >= 2 {
+					implementationStructural = true
+				}
+			}
+		}
+		hasCallableCallee := false
+		for _, callee := range implementation.callees {
+			if callee != nil && (callee.Kind == graph.KindFunction || callee.Kind == graph.KindMethod) {
+				hasCallableCallee = true
+				break
+			}
+		}
+		if len(queryTerms) > 10 {
+			return implementationMatches >= 3 ||
+				(implementationMatches >= 1 && implementationStructural) ||
+				(identifierStrong && hasCallableCallee)
+		}
+		if len(queryTerms) == 1 {
+			return false
+		}
+		return implementationMatches >= 2 ||
+			(implementationMatches >= 1 && implementationStructural) ||
+			(identifierStrong && hasCallableCallee)
+	}
+
+	// Non-concept prompts retain the existing head-centric confidence rule.
 	if len(queryTerms) > 10 {
 		return headMatches >= 3 || (headMatches >= 1 && structuralAligned)
 	}
@@ -1179,6 +1264,290 @@ func exploreTerminalTermRoot(term string) string {
 	return term
 }
 
+type exploreConceptImplementationMetric struct {
+	index       int
+	overlap     int
+	rare        int
+	longest     int
+	segments    int
+	matchedMask uint64
+}
+
+// reserveExploreConceptImplementation keeps one identifier-backed callable in
+// the final window without widening retrieval or increasing response size.
+// The semantic head is preserved whenever maxSymbols permits a second slot.
+func reserveExploreConceptImplementation(
+	query string,
+	queryClass rerank.QueryClass,
+	candidates []*rerank.Candidate,
+	maxSymbols int,
+) ([]*rerank.Candidate, string) {
+	if queryClass != rerank.QueryClassConcept || len(candidates) == 0 || maxSymbols <= 0 {
+		return candidates, ""
+	}
+	queryTermSet := exploreTerminalTerms(query)
+	if len(queryTermSet) == 0 {
+		return candidates, ""
+	}
+
+	// Candidate identifiers are compared against the query terms directly.
+	// Building a token map for every row dominated this bounded selector's
+	// latency and allocations even though only set membership is needed.
+	var queryTermStorage [64]string
+	queryTerms := queryTermStorage[:0]
+	if len(queryTermSet) > len(queryTermStorage) {
+		queryTerms = make([]string, 0, len(queryTermSet))
+	}
+	for term := range queryTermSet {
+		queryTerms = append(queryTerms, term)
+	}
+	var frequencyStorage [64]int
+	frequency := frequencyStorage[:len(queryTerms)]
+	if len(queryTerms) > len(frequencyStorage) {
+		frequency = make([]int, len(queryTerms))
+	}
+	var metricStorage [80]exploreConceptImplementationMetric
+	metrics := metricStorage[:0]
+	if len(candidates) > len(metricStorage) {
+		metrics = make([]exploreConceptImplementationMetric, 0, len(candidates))
+	}
+
+	for i, candidate := range candidates {
+		if candidate == nil || candidate.Node == nil ||
+			(candidate.Node.Kind != graph.KindFunction && candidate.Node.Kind != graph.KindMethod) {
+			continue
+		}
+		node := candidate.Node
+		metric := exploreConceptImplementationMetric{
+			index: i, segments: exploreIdentifierSegmentCountBounded(node.Name),
+		}
+		if len(queryTerms) <= 64 {
+			metric.matchedMask = exploreConceptImplementationMatches(node, queryTerms)
+			for j, term := range queryTerms {
+				if metric.matchedMask&(uint64(1)<<j) == 0 {
+					continue
+				}
+				metric.overlap++
+				frequency[j]++
+				if len(term) > metric.longest {
+					metric.longest = len(term)
+				}
+			}
+		} else {
+			// Very long issue bodies are uncommon after query shaping. Preserve
+			// unbounded semantics without inflating the normal 80-row hot path.
+			for j, term := range queryTerms {
+				if !exploreConceptImplementationHasTerm(node, term) {
+					continue
+				}
+				metric.overlap++
+				frequency[j]++
+				if len(term) > metric.longest {
+					metric.longest = len(term)
+				}
+			}
+		}
+		metrics = append(metrics, metric)
+	}
+
+	best := exploreConceptImplementationMetric{index: -1}
+	for _, metric := range metrics {
+		if metric.overlap < 2 && !(metric.overlap == 1 && metric.longest >= 5 && metric.segments >= 2) {
+			continue
+		}
+		for j, count := range frequency {
+			if count != 1 {
+				continue
+			}
+			matched := len(queryTerms) <= 64 && metric.matchedMask&(uint64(1)<<j) != 0
+			if len(queryTerms) > 64 {
+				matched = exploreConceptImplementationHasTerm(candidates[metric.index].Node, queryTerms[j])
+			}
+			if matched {
+				metric.rare++
+			}
+		}
+		if best.index < 0 || metric.overlap > best.overlap ||
+			(metric.overlap == best.overlap && metric.rare > best.rare) ||
+			(metric.overlap == best.overlap && metric.rare == best.rare && metric.longest > best.longest) ||
+			(metric.overlap == best.overlap && metric.rare == best.rare && metric.longest == best.longest && metric.segments > best.segments) {
+			best = metric
+		}
+	}
+	if best.index < 0 {
+		return candidates, ""
+	}
+	protected := candidates[best.index]
+	targetIndex := 0
+	if maxSymbols > 1 && best.index > 0 {
+		targetIndex = 1
+	}
+	if best.index == targetIndex {
+		return candidates, protected.Node.ID
+	}
+	result := append([]*rerank.Candidate(nil), candidates...)
+	if best.index > targetIndex {
+		copy(result[targetIndex+1:best.index+1], result[targetIndex:best.index])
+		result[targetIndex] = protected
+	}
+	return result, protected.Node.ID
+}
+
+func exploreConceptImplementationMatches(node *graph.Node, terms []string) uint64 {
+	matched := exploreIdentifierTerminalMatches(node.Name, terms)
+	return exploreIdentifierTerminalMatchesWithMask(node.QualName, terms, matched)
+}
+
+func exploreConceptImplementationHasTerm(node *graph.Node, term string) bool {
+	if node == nil {
+		return false
+	}
+	return exploreIdentifierTerminalMatches(node.Name, []string{term}) != 0 ||
+		exploreIdentifierTerminalMatches(node.QualName, []string{term}) != 0
+}
+
+func exploreIdentifierTerminalMatches(text string, terms []string) uint64 {
+	return exploreIdentifierTerminalMatchesWithMask(text, terms, 0)
+}
+
+func exploreIdentifierTerminalMatchesWithMask(text string, terms []string, matched uint64) uint64 {
+	for offset := 0; offset < len(text); {
+		start, end, next, ascii := nextExploreASCIIIdentifierToken(text, offset)
+		if !ascii {
+			for _, token := range rerank.Tokenize(text) {
+				token = exploreTerminalTermRoot(token)
+				for j, term := range terms {
+					if j < 64 && token == term {
+						matched |= uint64(1) << j
+					}
+				}
+			}
+			return matched
+		}
+		if start < 0 {
+			break
+		}
+		rootEnd := end
+		if end-start > 4 && (text[end-1] == 's' || text[end-1] == 'S') &&
+			!(end-start >= 2 && (text[end-2] == 's' || text[end-2] == 'S')) {
+			rootEnd--
+		}
+		token := text[start:rootEnd]
+		for j, term := range terms {
+			if j < 64 && strings.EqualFold(token, term) {
+				matched |= uint64(1) << j
+			}
+		}
+		offset = next
+	}
+	return matched
+}
+
+func exploreIdentifierSegmentCountBounded(text string) int {
+	var starts, ends [16]int
+	count := 0
+	for offset := 0; offset < len(text); {
+		start, end, next, ascii := nextExploreASCIIIdentifierToken(text, offset)
+		if !ascii {
+			return len(rerank.Tokenize(text))
+		}
+		if start < 0 {
+			break
+		}
+		duplicate := false
+		for i := 0; i < count && i < len(starts); i++ {
+			if strings.EqualFold(text[start:end], text[starts[i]:ends[i]]) {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			if count == len(starts) {
+				return len(rerank.Tokenize(text))
+			}
+			starts[count], ends[count] = start, end
+			count++
+		}
+		offset = next
+	}
+	return count
+}
+
+func nextExploreASCIIIdentifierToken(text string, offset int) (start, end, next int, ascii bool) {
+	for offset < len(text) {
+		if text[offset] >= 0x80 {
+			return 0, 0, 0, false
+		}
+		if exploreASCIIIdentifierByte(text[offset]) {
+			break
+		}
+		offset++
+	}
+	if offset >= len(text) {
+		return -1, -1, len(text), true
+	}
+	start = offset
+	for i := start + 1; i < len(text); i++ {
+		current := text[i]
+		if current >= 0x80 {
+			return 0, 0, 0, false
+		}
+		if !exploreASCIIIdentifierByte(current) {
+			return start, i, i + 1, true
+		}
+		previous := text[i-1]
+		camelBoundary := exploreASCIIUpper(current) && exploreASCIILower(previous)
+		acronymBoundary := exploreASCIIUpper(current) && exploreASCIIUpper(previous) &&
+			i+1 < len(text) && exploreASCIILower(text[i+1])
+		digitBoundary := exploreASCIIDigit(current) != exploreASCIIDigit(previous)
+		if camelBoundary || acronymBoundary || digitBoundary {
+			return start, i, i, true
+		}
+	}
+	return start, len(text), len(text), true
+}
+
+func exploreASCIIIdentifierByte(value byte) bool {
+	return exploreASCIILower(value) || exploreASCIIUpper(value) || exploreASCIIDigit(value)
+}
+
+func exploreASCIILower(value byte) bool { return value >= 'a' && value <= 'z' }
+func exploreASCIIUpper(value byte) bool { return value >= 'A' && value <= 'Z' }
+func exploreASCIIDigit(value byte) bool { return value >= '0' && value <= '9' }
+
+func exploreSameCallableOwner(parent, child *graph.Node) bool {
+	if parent == nil || child == nil || parent.Kind != graph.KindMethod || child.Kind != graph.KindMethod {
+		return false
+	}
+	owner := func(node *graph.Node) string {
+		qual := strings.ReplaceAll(strings.TrimSpace(node.QualName), "::", ".")
+		qual = strings.Trim(qual, ".")
+		if split := strings.LastIndexByte(qual, '.'); split >= 0 {
+			return strings.ToLower(qual[:split])
+		}
+		return ""
+	}
+	parentOwner, childOwner := owner(parent), owner(child)
+	return parentOwner != "" && parentOwner == childOwner
+}
+
+func exploreBodyIdentifierMentions(source, identifier string) int {
+	if strings.TrimSpace(source) == "" || strings.TrimSpace(identifier) == "" {
+		return 0
+	}
+	wanted := exploreTerminalTerms(identifier)
+	if len(wanted) == 0 {
+		return 0
+	}
+	mentions := 0
+	for _, token := range rerank.Tokenize(source) {
+		if _, ok := wanted[strings.ToLower(token)]; ok {
+			mentions++
+		}
+	}
+	return mentions
+}
+
 // handleExplore is the one-shot localization verb: free text in, a ranked
 // neighborhood (symbols + source + call paths + file map + completeness
 // cue) out, bounded by a token budget, in a single response.
@@ -1331,6 +1700,7 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	if exploreShouldDiversifyByFile(queryClass) {
 		_, prod = diversifyByFile(prodNodes, prod, defaultMaxPerFile)
 	}
+	prod, protectedImplementationID := reserveExploreConceptImplementation(searchQuery, queryClass, prod, maxSymbols)
 	cands := prod
 	if len(cands) > maxSymbols {
 		cands = cands[:maxSymbols]
@@ -1378,7 +1748,10 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 			continue
 		}
 		n := c.Node
-		t := exploreTarget{node: n, score: c.Score}
+		t := exploreTarget{
+			node: n, score: c.Score,
+			conceptImplementation: n.ID == protectedImplementationID,
+		}
 		if c.Signals != nil {
 			t.exactContent = c.Signals[exploreContentRecallExactSignal] > 0
 			t.exactContentAmbiguous = c.Signals[exploreContentRecallAmbiguousSignal] > 0
@@ -2579,9 +2952,10 @@ func exploreQuotedRecallTerms(task string) []string {
 	return out
 }
 
-// gatherExploreQuotedContentCandidates performs at most four bounded indexed
-// point searches: three literals plus one adaptive retry. It never scans source files:
-// content_fts returns symbol IDs, then one batched graph lookup supplies nodes.
+// gatherExploreQuotedContentCandidates performs at most four bounded content
+// searches (three literals plus one adaptive retry) and one separately bounded
+// source-literal lookup. Both paths return symbol IDs before one batched graph
+// hydration; neither builds or persists a new index.
 func (s *Server) gatherExploreQuotedContentCandidates(ctx context.Context, task string, limit int, scope query.QueryOptions) []*rerank.Candidate {
 	if s == nil || s.graph == nil || ctx.Err() != nil {
 		return nil
@@ -2698,14 +3072,12 @@ func (s *Server) gatherExploreQuotedContentCandidates(ctx context.Context, task 
 			}
 		}
 	}
-	hasExact := false
-	for _, exact := range exactHit {
-		if exact {
-			hasExact = true
-			break
-		}
-	}
-	if !hasExact && ctx.Err() == nil {
+	// content_fts stores content-class nodes rather than ordinary source bodies.
+	// An exact document hit therefore does not prove that the source declaration
+	// containing the literal is represented. Run one separately bounded source
+	// lookup for the highest-information literal and merge it before the existing
+	// single graph hydration.
+	if ctx.Err() == nil {
 		sourceRecall := s.gatherExploreSourceLiteralRecall(ctx, terms, repoPrefix, scope)
 		for _, hit := range sourceRecall.hits {
 			if previous, exists := bestRank[hit.nodeID]; !exists {
