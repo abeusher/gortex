@@ -6,13 +6,15 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"go.uber.org/zap"
+
 	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/search/trigram"
 )
 
 const (
 	exploreSourceLiteralRecallMaxHits  = 24
-	exploreSourceLiteralRecallMaxFiles = 512
+	exploreSourceLiteralRecallMaxFiles = 0
 	exploreSourceLiteralRecallBudget   = 75 * time.Millisecond
 )
 
@@ -24,6 +26,14 @@ type exploreSourceLiteralHit struct {
 type exploreSourceLiteralRecall struct {
 	hits      []exploreSourceLiteralHit
 	ambiguous bool
+}
+
+type exploreSourceLiteralSearch struct {
+	matches          []trigram.Match
+	incomplete       bool
+	backend          string
+	owned            bool
+	lookupRepoPrefix string
 }
 
 // exploreHighestInformationQuotedLiteral picks one deterministic source-search
@@ -60,14 +70,43 @@ func (s *Server) gatherExploreSourceLiteralRecall(
 		return exploreSourceLiteralRecall{}
 	}
 
+	started := time.Now()
 	searchCtx, cancel := context.WithTimeout(ctx, exploreSourceLiteralRecallBudget)
 	defer cancel()
-	matches, incomplete := s.searchExploreSourceLiteral(searchCtx, term, repoPrefix, scope)
+	search := s.searchExploreSourceLiteral(searchCtx, term, repoPrefix, scope)
 	if ctx.Err() != nil {
 		return exploreSourceLiteralRecall{}
 	}
-	recall := s.mapExploreSourceLiteralMatches(term, matches, scope)
-	recall.ambiguous = recall.ambiguous || incomplete
+	recall := s.mapExploreSourceLiteralMatchesContext(searchCtx, term, search.matches, scope)
+	recall.ambiguous = recall.ambiguous || search.incomplete || searchCtx.Err() != nil
+	if s.logger != nil {
+		contextError := ""
+		if err := searchCtx.Err(); err != nil {
+			contextError = err.Error()
+		}
+		firstMatchPath := ""
+		if len(search.matches) > 0 {
+			firstMatchPath = search.matches[0].Path
+		}
+		fields := []zap.Field{
+			zap.Int("term_runes", utf8.RuneCountInString(term)),
+			zap.String("requested_repo_prefix", repoPrefix),
+			zap.String("lookup_repo_prefix", search.lookupRepoPrefix),
+			zap.String("first_match_path", firstMatchPath),
+			zap.String("backend", search.backend),
+			zap.Bool("owned", search.owned),
+			zap.Int("raw_matches", len(search.matches)),
+			zap.Int("mapped_symbols", len(recall.hits)),
+			zap.Bool("incomplete", search.incomplete),
+			zap.String("context_error", contextError),
+			zap.Duration("elapsed", time.Since(started)),
+		}
+		if len(recall.hits) == 0 || search.incomplete || contextError != "" {
+			s.logger.Info("mcp: explore source literal recall incomplete", fields...)
+		} else {
+			s.logger.Debug("mcp: explore source literal recall", fields...)
+		}
+	}
 	return recall
 }
 
@@ -76,7 +115,16 @@ func (s *Server) mapExploreSourceLiteralMatches(
 	matches []trigram.Match,
 	scope query.QueryOptions,
 ) exploreSourceLiteralRecall {
-	if s == nil || len(matches) == 0 {
+	return s.mapExploreSourceLiteralMatchesContext(context.Background(), term, matches, scope)
+}
+
+func (s *Server) mapExploreSourceLiteralMatchesContext(
+	ctx context.Context,
+	term string,
+	matches []trigram.Match,
+	scope query.QueryOptions,
+) exploreSourceLiteralRecall {
+	if s == nil || len(matches) == 0 || ctx.Err() != nil {
 		return exploreSourceLiteralRecall{}
 	}
 	saturated := len(matches) >= exploreSourceLiteralRecallMaxHits
@@ -102,7 +150,7 @@ func (s *Server) mapExploreSourceLiteralMatches(
 			aliases[match.Path] = alias
 		}
 	}
-	indexes := s.buildFileSymbolIndexForPaths(paths)
+	indexes := s.buildFileSymbolIndexForPathsContext(ctx, paths)
 	seen := make(map[string]struct{}, len(matches))
 	hits := make([]exploreSourceLiteralHit, 0, len(matches))
 	for rank, match := range matches {
@@ -166,7 +214,7 @@ func (s *Server) searchExploreSourceLiteral(
 	term string,
 	repoPrefix string,
 	scope query.QueryOptions,
-) ([]trigram.Match, bool) {
+) exploreSourceLiteralSearch {
 	if s.multiIndexer != nil {
 		if repoPrefix == "" {
 			haveScopedPrefix := false
@@ -176,27 +224,49 @@ func (s *Server) searchExploreSourceLiteral(
 				}
 				prefix = strings.TrimSuffix(strings.TrimSpace(prefix), "/")
 				if haveScopedPrefix && repoPrefix != prefix {
-					return nil, false
+					return exploreSourceLiteralSearch{backend: "multi-ambiguous-scope"}
 				}
 				repoPrefix = prefix
 				haveScopedPrefix = true
 			}
 		}
-		matches, incomplete, owned := s.multiIndexer.GrepLiteralForRepoBounded(
+		result := s.multiIndexer.GrepLiteralForRepoBounded(
 			ctx, repoPrefix, term,
 			exploreSourceLiteralRecallMaxHits,
 			exploreSourceLiteralRecallMaxFiles,
 		)
-		if owned {
-			return matches, incomplete
+		if result.Owned {
+			return exploreSourceLiteralSearch{
+				matches:          result.Matches,
+				incomplete:       result.Incomplete,
+				backend:          "multi",
+				owned:            true,
+				lookupRepoPrefix: result.RepoPrefix,
+			}
+		}
+		// Once MultiIndexer owns any repository, an unresolved prefix is an
+		// ownership failure rather than permission to scan the base indexer.
+		// Falling through here can leak matches from a different repository.
+		if result.Configured {
+			return exploreSourceLiteralSearch{
+				backend:          "multi-unresolved",
+				lookupRepoPrefix: repoPrefix,
+			}
 		}
 	}
 	if s.indexer != nil {
-		return s.indexer.GrepLiteralBounded(
+		matches, incomplete := s.indexer.GrepLiteralBounded(
 			ctx, term,
 			exploreSourceLiteralRecallMaxHits,
 			exploreSourceLiteralRecallMaxFiles,
 		)
+		return exploreSourceLiteralSearch{
+			matches:          matches,
+			incomplete:       incomplete,
+			backend:          "direct",
+			owned:            true,
+			lookupRepoPrefix: s.indexer.RepoPrefix(),
+		}
 	}
-	return nil, false
+	return exploreSourceLiteralSearch{backend: "none", lookupRepoPrefix: repoPrefix}
 }

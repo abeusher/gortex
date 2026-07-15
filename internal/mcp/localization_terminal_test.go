@@ -186,11 +186,16 @@ func TestLocalizationNeedsExactlyOneRead(t *testing.T) {
 func TestLocalizationRefinementAllowsExactlyOneCandidateRead(t *testing.T) {
 	state := newLocalizationTerminalState()
 	candidate := "repo/pkg/file.go::Resolver.Run"
-	state.armRefinementForTask("locate resolver behavior", []string{candidate, "repo/pkg/other.go::Other"})
+	other := "repo/pkg/other.go::Other"
+	state.armRefinementForTask("locate resolver behavior", candidate, []string{candidate, other})
 
 	wrong := map[string]any{"target": map[string]any{"symbol": "repo/pkg/wrong.go::Wrong"}}
 	if blocked, reserved := state.authorize("read", "source", wrong); blocked == nil || reserved {
 		t.Fatalf("unreturned refinement target was admitted: blocked=%#v reserved=%v", blocked, reserved)
+	}
+	alternate := map[string]any{"target": map[string]any{"symbol": other}}
+	if blocked, reserved := state.authorize("read", "source", alternate); blocked == nil || reserved {
+		t.Fatalf("non-preferred refinement target was admitted: blocked=%#v reserved=%v", blocked, reserved)
 	}
 	if blocked, reserved := state.authorize("search", "text", map[string]any{"query": "Run"}); blocked == nil || reserved {
 		t.Fatalf("broad refinement search was admitted: blocked=%#v reserved=%v", blocked, reserved)
@@ -229,7 +234,7 @@ func TestHandleFacadeRefinementReadReturnsAnswerReadyCompletion(t *testing.T) {
 	})
 	server := &Server{facades: registry, localization: newLocalizationTerminalState(), sessions: newSessionMap()}
 	ctx := WithSessionID(context.Background(), "refinement-read-completion")
-	server.localizationFor(ctx).armRefinementForTask("locate resolver behavior", []string{candidate})
+	server.localizationFor(ctx).armRefinementForTask("locate resolver behavior", candidate, []string{candidate})
 
 	req := mcpgo.CallToolRequest{}
 	req.Params.Name = "read"

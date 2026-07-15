@@ -86,6 +86,7 @@ type exploreTarget struct {
 	conceptImplementation bool   // one identifier-backed callable protected from final truncation
 	exactContent          bool   // verified full quoted-literal hit from content_fts
 	exactContentAmbiguous bool   // exact evidence has visible or possibly truncated peers
+	sourceLiteral         bool   // exact source-body hit that must survive final envelope packing
 }
 
 type exploreCausalNeighbor struct {
@@ -1643,6 +1644,17 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		ranked = rerankExploreConceptCoverage(searchQuery, ranked)
 	} else {
 		ranked = eng.SearchSymbolsRanked(searchQuery, fetch, opts, rctx)
+		// Quoted source evidence is useful regardless of the query classifier.
+		// Identifier-like issue text (for example, a short locale or protocol
+		// value) previously bypassed this lane entirely even when the ordinary
+		// symbol search could not see source bodies. The bounded literal scan
+		// supplies at most one candidate per matching file, and the final
+		// source-evidence reservation keeps its strongest result without
+		// reranking the already-ranked primary channel a second time.
+		if content := s.gatherExploreQuotedContentCandidates(ctx, task, fetch, opts); len(content) > 0 {
+			ranked = mergeExploreCandidates(ranked, content, 0)
+			ranked = limitExploreCandidatesPreservingSourceLiteral(ranked, fetch*2)
+		}
 	}
 	// Resilience ladder: a warm-restarted daemon can transiently return an
 	// empty scoped ranked result (workspace stamps not yet backfilled, or
@@ -1753,6 +1765,7 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		if c.Signals != nil {
 			t.exactContent = c.Signals[exploreContentRecallExactSignal] > 0
 			t.exactContentAmbiguous = c.Signals[exploreContentRecallAmbiguousSignal] > 0
+			t.sourceLiteral = c.Signals[exploreSourceLiteralSignal] > 0
 		}
 		t.source = s.manifestSymbolSource(ctx, n)
 		if callers := eng.GetCallers(n.ID, ringOpts); callers != nil {
@@ -1814,15 +1827,17 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	if !answerReady && exactSymbol == "" {
 		// Uncertain localization is still useful evidence. Returning it as an
 		// MCP error makes hosts discard the ranked candidates and restart broad
-		// exploration, multiplying turns and payloads. Keep the session open and
-		// direct at most one refinement call at the evidence already returned.
-		completion := newLocalizationRefinementCompletion()
+		// exploration, multiplying turns and payloads. Name one concrete ranked
+		// target for the only permitted refinement read; source-literal evidence
+		// wins because it is absent from ordinary symbol metadata.
+		preferredSymbol := explorePreferredRefinementSymbol(symbolTargets)
+		completion := newLocalizationRefinementCompletion(preferredSymbol)
 		result, returnedSymbols := buildLocalizationExploreResultForTask(completion, task, targets, budget)
 		// Authorization is derived from the exact serialized projection, not
-		// the larger pre-budget candidate set. A promoted structural target is
-		// therefore readable when it appears in symbols/evidence, while compact
-		// caller/callee hints remain non-targetable.
-		s.localizationFor(ctx).armRefinementForTask(task, returnedSymbols)
+		// the larger pre-budget candidate set. The preferred symbol is mandatory
+		// in that projection and is the only candidate accepted by the session
+		// guard, so the instruction and enforcement cannot diverge.
+		s.localizationFor(ctx).armRefinementForTask(task, preferredSymbol, returnedSymbols)
 		return result, nil
 	}
 	completion := newLocalizationCompletion(answerReady, exactSymbol)
@@ -2008,6 +2023,24 @@ func exploreNodeWithinQueryScope(n *graph.Node, scope query.QueryOptions) bool {
 	return true
 }
 
+// explorePreferredRefinementSymbol turns an uncertain ranked neighborhood into
+// one concrete, bounded follow-up. Exact source-literal evidence wins because
+// ordinary symbol metadata cannot represent it; otherwise the ranked head is
+// the deterministic refinement target.
+func explorePreferredRefinementSymbol(targets []exploreTarget) string {
+	for _, target := range targets {
+		if target.sourceLiteral && target.node != nil && target.node.ID != "" {
+			return target.node.ID
+		}
+	}
+	for _, target := range targets {
+		if target.node != nil && target.node.ID != "" {
+			return target.node.ID
+		}
+	}
+	return ""
+}
+
 // localizationEvidenceTargets projects the same bounded answer-draft evidence
 // used by ordinary rendering into the structured terminal envelope. Promoted
 // callers/callees may replace low-ranked direct candidates, but never increase
@@ -2053,6 +2086,15 @@ func localizationEvidenceTargetsFromDraft(task, exactID string, targets []explor
 				appendTarget(target)
 				break
 			}
+		}
+	}
+	// A source-body literal is the only direct evidence that can identify an
+	// implementation absent from symbol metadata. Reserve the strongest one
+	// before draft promotion and byte-budget packing can consume every slot.
+	for _, target := range targets {
+		if target.sourceLiteral {
+			appendTarget(target)
+			break
 		}
 	}
 	appendEntry := func(entry exploreDraftEntry) {
@@ -2123,7 +2165,11 @@ func buildLocalizationExploreResultForTask(completion localizationCompletion, ta
 		draft = exploreAnswerDraft(task, targets)
 	}
 	preferredBodyIDs := explorePreferredFullBodyIDs(task, targets, draft, exploreFullBodyLimit)
-	targets = localizationEvidenceTargetsFromDraft(task, completion.ExactSymbol, targets, draft)
+	requiredSymbol := completion.ExactSymbol
+	if completion.State == localizationStateNeedsRefinement {
+		requiredSymbol = completion.refinementSymbol
+	}
+	targets = localizationEvidenceTargetsFromDraft(task, requiredSymbol, targets, draft)
 	envelope := localizationExploreEnvelope{
 		Completion: completion,
 		Files:      make([]string, 0),
@@ -2139,12 +2185,18 @@ func buildLocalizationExploreResultForTask(completion localizationCompletion, ta
 	if len(targets) > 0 {
 		mandatoryCount = 1
 	}
-	if completion.ExactSymbol != "" {
+	if requiredSymbol != "" {
 		for index, target := range targets {
-			if target.node != nil && target.node.ID == completion.ExactSymbol && index+1 > mandatoryCount {
+			if target.node != nil && target.node.ID == requiredSymbol && index+1 > mandatoryCount {
 				mandatoryCount = index + 1
 				break
 			}
+		}
+	}
+	for index, target := range targets {
+		if target.sourceLiteral && index+1 > mandatoryCount {
+			mandatoryCount = index + 1
+			break
 		}
 	}
 
@@ -2972,10 +3024,7 @@ func (s *Server) gatherExploreQuotedContentCandidates(ctx context.Context, task 
 	if s == nil || s.graph == nil || ctx.Err() != nil {
 		return nil
 	}
-	content, ok := s.graph.(graph.ContentSearcher)
-	if !ok {
-		return nil
-	}
+	content, hasContent := s.graph.(graph.ContentSearcher)
 	terms := exploreQuotedRecallTerms(task)
 	if len(terms) == 0 {
 		return nil
@@ -3000,6 +3049,9 @@ func (s *Server) gatherExploreQuotedContentCandidates(ctx context.Context, task 
 	}
 	pages := make([]recallPage, 0, len(terms))
 	for _, term := range terms {
+		if !hasContent {
+			break
+		}
 		if ctx.Err() != nil {
 			break
 		}

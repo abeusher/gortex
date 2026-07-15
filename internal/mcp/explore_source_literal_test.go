@@ -2,22 +2,53 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
+	mcpgo "github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/parser"
+	"github.com/zzet/gortex/internal/parser/languages"
 	"github.com/zzet/gortex/internal/query"
+	"github.com/zzet/gortex/internal/search"
+	"github.com/zzet/gortex/internal/search/rerank"
 	"github.com/zzet/gortex/internal/search/trigram"
 )
+
+type exploreSourceLiteralCountingStore struct {
+	graph.Store
+	allNodesCalls int
+}
+
+func (s *exploreSourceLiteralCountingStore) AllNodes() []*graph.Node {
+	s.allNodesCalls++
+	return s.Store.AllNodes()
+}
+
+type exploreSourceLiteralBlockingStore struct {
+	graph.Store
+	started chan struct{}
+}
+
+func (s *exploreSourceLiteralBlockingStore) GetFileNodesContext(ctx context.Context, _ string) []*graph.Node {
+	select {
+	case s.started <- struct{}{}:
+	default:
+	}
+	<-ctx.Done()
+	return nil
+}
 
 func newExploreSourceLiteralServer(t testing.TB, nodes []*graph.Node) *Server {
 	t.Helper()
@@ -182,6 +213,107 @@ func TestGatherExploreQuotedContentCandidatesMergesSourceLiteralWithExactContent
 	require.NotNil(t, candidateByID(candidates, constructor.ID), "an exact non-source content hit must not suppress bounded source recall")
 }
 
+func TestExplorePreferredRefinementSymbolPrefersSourceLiteral(t *testing.T) {
+	ordinary := &graph.Node{ID: "repo/ordinary.go::ordinary"}
+	source := &graph.Node{ID: "repo/source.go::source"}
+	targets := []exploreTarget{{node: ordinary}, {node: source, sourceLiteral: true}}
+
+	require.Equal(t, source.ID, explorePreferredRefinementSymbol(targets))
+	require.Equal(t, ordinary.ID, explorePreferredRefinementSymbol(targets[:1]))
+}
+
+func TestGatherExploreSourceLiteralRecallMapsParsedCSharpConstructor(t *testing.T) {
+	root := t.TempDir()
+	rel := "src/Humanizer/Configuration/FormatterRegistry.cs"
+	path := filepath.Join(root, filepath.FromSlash(rel))
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+	require.NoError(t, os.WriteFile(path, []byte("public sealed class FormatterRegistry {\n    public FormatterRegistry() {\n        RegisterDefaultFormatter(\"ku\");\n    }\n}\n"), 0o644))
+
+	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	registry := parser.NewRegistry()
+	languages.RegisterAll(registry)
+	idx := indexer.New(store, registry, config.IndexConfig{}, zap.NewNop())
+	_, err = idx.IndexCtx(context.Background(), root)
+	require.NoError(t, err)
+	counting := &exploreSourceLiteralCountingStore{Store: store}
+	server := &Server{graph: counting, indexer: idx, logger: zap.NewNop()}
+
+	recall := server.gatherExploreSourceLiteralRecall(
+		context.Background(), []string{"ku"}, "", query.QueryOptions{},
+	)
+
+	found := false
+	for _, hit := range recall.hits {
+		node := store.GetNode(hit.nodeID)
+		if node != nil && node.FilePath == rel && node.Name == "FormatterRegistry.<init>" {
+			found = true
+		}
+	}
+	require.True(t, found, "literal line must map to the parsed enclosing constructor")
+
+	task := `CultureNotFoundException for "ku" culture - code adds/uses "ku" (Kurdish) CultureInfo which is not supported on Xamarin.Android, causing crash. Find where "ku" culture is registered/used in fallback resolution logic.`
+	require.NotEqual(t, rerank.QueryClassConcept, rerank.ClassifyQuery(shapeExploreQuery(task)), "regression requires the non-concept retrieval branch")
+	engine := query.NewEngine(counting)
+	engine.SetSearchProvider(idx.Search)
+	fullServer := NewServer(engine, counting, idx, nil, zap.NewNop(), nil)
+	req := mcpgo.CallToolRequest{}
+	req.Params.Arguments = map[string]any{
+		"task": task, "localize": true, "max_symbols": 10,
+	}
+	result, err := fullServer.handleExplore(context.Background(), req)
+	require.NoError(t, err)
+	require.NotEmpty(t, result.Content)
+	text, ok := result.Content[0].(mcpgo.TextContent)
+	require.True(t, ok)
+	var envelope localizationExploreEnvelope
+	require.NoError(t, json.Unmarshal([]byte(text.Text), &envelope))
+	require.NotEmpty(t, envelope.Evidence)
+	require.Equal(t, "FormatterRegistry.<init>", envelope.Evidence[0].Name, "source evidence must lead the final localization envelope")
+	if envelope.Completion.State == localizationStateNeedsRefinement {
+		require.Contains(t, envelope.Completion.RequiredAction, envelope.Evidence[0].ID)
+	}
+	require.Zero(t, counting.allNodesCalls, "literal mapping must stay bounded to matched files")
+}
+
+func TestGatherExploreSourceLiteralRecallBoundsMappingByRequestDeadline(t *testing.T) {
+	root := t.TempDir()
+	rel := "src/Registry.cs"
+	path := filepath.Join(root, filepath.FromSlash(rel))
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+	require.NoError(t, os.WriteFile(path, []byte("Register(\"needle\")\n"), 0o644))
+
+	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	idx := indexer.New(store, parser.NewRegistry(), config.IndexConfig{}, zap.NewNop())
+	_, err = idx.IndexCtx(context.Background(), root)
+	require.NoError(t, err)
+	idx.SetFileMtimes(map[string]int64{rel: 1})
+	started := make(chan struct{}, 1)
+	server := &Server{
+		graph:   &exploreSourceLiteralBlockingStore{Store: store, started: started},
+		indexer: idx,
+		logger:  zap.NewNop(),
+	}
+
+	began := time.Now()
+	recall := server.gatherExploreSourceLiteralRecall(
+		context.Background(), []string{"needle"}, "", query.QueryOptions{},
+	)
+	elapsed := time.Since(began)
+
+	select {
+	case <-started:
+	default:
+		t.Fatal("mapping did not use the context-aware file-node reader")
+	}
+	require.Less(t, elapsed, 500*time.Millisecond, "mapping must not outlive the bounded recall budget")
+	require.Empty(t, recall.hits)
+	require.True(t, recall.ambiguous, "deadline-truncated mapping must remain non-terminal")
+}
+
 func TestSearchExploreSourceLiteralFallsBackWhenMultiIndexerDoesNotOwnRepo(t *testing.T) {
 	root := t.TempDir()
 	rel := "src/FormatterRegistry.cs"
@@ -199,13 +331,69 @@ func TestSearchExploreSourceLiteralFallsBackWhenMultiIndexerDoesNotOwnRepo(t *te
 	multi := indexer.NewMultiIndexer(store, parser.NewRegistry(), nil, nil, zap.NewNop())
 	server := &Server{graph: store, indexer: idx, multiIndexer: multi}
 
-	matches, incomplete := server.searchExploreSourceLiteral(
+	search := server.searchExploreSourceLiteral(
 		context.Background(), "ku", "", query.QueryOptions{},
 	)
 
-	require.Len(t, matches, 1)
-	require.Equal(t, rel, matches[0].Path)
-	require.False(t, incomplete)
+	require.Len(t, search.matches, 1)
+	require.Equal(t, rel, search.matches[0].Path)
+	require.False(t, search.incomplete)
+	require.Equal(t, "direct", search.backend)
+	require.True(t, search.owned)
+}
+
+func TestSearchExploreSourceLiteralDoesNotCrossConfiguredRepository(t *testing.T) {
+	directRoot := t.TempDir()
+	rel := "src/FormatterRegistry.cs"
+	path := filepath.Join(directRoot, filepath.FromSlash(rel))
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+	require.NoError(t, os.WriteFile(path, []byte("Register(\"ku\")\n"), 0o644))
+
+	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	registry := parser.NewRegistry()
+	direct := indexer.New(store, registry, config.IndexConfig{}, zap.NewNop())
+	_, err = direct.IndexCtx(context.Background(), directRoot)
+	require.NoError(t, err)
+	direct.SetFileMtimes(map[string]int64{rel: 1})
+
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	manager, err := config.NewConfigManager(configPath)
+	require.NoError(t, err)
+	multi := indexer.NewMultiIndexer(store, registry, search.NewAuto(), manager, zap.NewNop())
+	otherRoot := filepath.Join(t.TempDir(), "repo-a")
+	require.NoError(t, os.MkdirAll(otherRoot, 0o755))
+	_, err = multi.TrackRepoCtx(context.Background(), config.RepoEntry{Path: otherRoot, Force: true})
+	require.NoError(t, err)
+	server := &Server{graph: store, indexer: direct, multiIndexer: multi}
+
+	search := server.searchExploreSourceLiteral(
+		context.Background(), "ku", "repo-b", query.QueryOptions{},
+	)
+
+	require.Empty(t, search.matches, "unresolved multi-repo scope must not scan the direct backend")
+	require.False(t, search.incomplete)
+	require.Equal(t, "multi-unresolved", search.backend)
+	require.False(t, search.owned)
+}
+
+func TestGatherExploreSourceLiteralRecallDoesNotLogRawLiteral(t *testing.T) {
+	core, logs := observer.New(zap.InfoLevel)
+	server := &Server{logger: zap.New(core)}
+	const secret = "customer-secret-日本"
+
+	server.gatherExploreSourceLiteralRecall(
+		context.Background(), []string{secret}, "demo", query.QueryOptions{},
+	)
+
+	entries := logs.FilterMessage("mcp: explore source literal recall incomplete").All()
+	require.Len(t, entries, 1)
+	fields := entries[0].ContextMap()
+	require.NotContains(t, fields, "term")
+	require.EqualValues(t, 18, fields["term_runes"])
+	require.NotContains(t, entries[0].Message, secret)
+	require.NotContains(t, fmt.Sprint(fields), secret)
 }
 
 func BenchmarkMapExploreSourceLiteralMatches(b *testing.B) {

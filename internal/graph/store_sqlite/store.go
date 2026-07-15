@@ -1667,7 +1667,14 @@ func (s *Store) FindNodesByNameInRepo(name, repoPrefix string) []*graph.Node {
 }
 
 func (s *Store) GetFileNodes(filePath string) []*graph.Node {
-	return s.queryNodes(s.stmtFileNodes, filePath)
+	return s.GetFileNodesContext(context.Background(), filePath)
+}
+
+// GetFileNodesContext is the deadline-aware file lookup used by bounded MCP
+// localization. QueryContext covers both pool acquisition and SQLite execution,
+// so a busy store cannot extend a request beyond its context budget.
+func (s *Store) GetFileNodesContext(ctx context.Context, filePath string) []*graph.Node {
+	return s.queryNodesContext(ctx, s.stmtFileNodes, filePath)
 }
 
 func (s *Store) GetRepoNodes(repoPrefix string) []*graph.Node {
@@ -1679,8 +1686,15 @@ func (s *Store) AllNodes() []*graph.Node {
 }
 
 func (s *Store) queryNodes(stmt *sql.Stmt, args ...any) []*graph.Node {
-	rows, err := stmt.Query(args...)
+	return s.queryNodesContext(context.Background(), stmt, args...)
+}
+
+func (s *Store) queryNodesContext(ctx context.Context, stmt *sql.Stmt, args ...any) []*graph.Node {
+	rows, err := stmt.QueryContext(ctx, args...)
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
 		panicOnFatal(err)
 		return nil
 	}
@@ -1689,10 +1703,16 @@ func (s *Store) queryNodes(stmt *sql.Stmt, args ...any) []*graph.Node {
 	for rows.Next() {
 		n, err := scanNode(rows)
 		if err != nil {
+			if ctx.Err() != nil {
+				return out
+			}
 			panicOnFatal(err)
 			return out
 		}
 		out = append(out, n)
+	}
+	if err := rows.Err(); err != nil && ctx.Err() == nil {
+		panicOnFatal(err)
 	}
 	return out
 }

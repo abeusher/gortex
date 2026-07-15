@@ -98,6 +98,96 @@ func TestGrepLiteralPathsBoundedSkipsSubstringNoiseAndDeduplicatesFiles(t *testi
 	require.False(t, stats.Incomplete)
 }
 
+func TestGrepLiteralPathsBoundedFindsArbitraryFileBeyondLegacyCap(t *testing.T) {
+	const target = 537
+	root, paths := boundedSearchFixture(t, 600, func(i int) string {
+		if i == target {
+			return "Register(\"ku\");\n"
+		}
+		return "no matching locale\n"
+	})
+
+	matches, stats := GrepLiteralPathsBounded(
+		context.Background(), root, paths, "ku", 24, 0, func(string) bool { return true },
+	)
+
+	require.Len(t, matches, 1)
+	require.Equal(t, paths[target], matches[0].Path)
+	require.Greater(t, stats.ScannedFiles, 0)
+	require.LessOrEqual(t, stats.ScannedFiles, len(paths))
+	require.False(t, stats.Incomplete)
+}
+
+func TestGrepLiteralPathsBoundedStopsBeforeOpeningFilesWhenCancelled(t *testing.T) {
+	paths := make([]string, 900)
+	for i := range paths {
+		paths[i] = fmt.Sprintf("src/file-%04d.go", i)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	matches, stats := GrepLiteralPathsBounded(
+		ctx, t.TempDir(), paths, "ku", 24, 0, func(string) bool { return true },
+	)
+
+	require.Empty(t, matches)
+	require.Zero(t, stats.ScannedFiles)
+	require.True(t, stats.Incomplete)
+}
+
+func TestSelectBoundedPathsSpreadsDeterministicallyWithinPreferredClass(t *testing.T) {
+	paths := make([]string, 0, 1026)
+	for i := 0; i < 1024; i++ {
+		paths = append(paths, fmt.Sprintf("src/file-%04d.go", i))
+	}
+	paths = append(paths, "tests/first_test.go", "tests/second_test.go")
+	prefer := func(path string) bool { return strings.HasPrefix(path, "src/") }
+
+	first := selectBoundedPaths(paths, 512, prefer, "ku")
+	second := selectBoundedPaths(paths, 512, prefer, "ku")
+	otherQuery := selectBoundedPaths(paths, 512, prefer, "fr")
+
+	require.Equal(t, first, second)
+	require.NotEqual(t, first, otherQuery)
+	require.Len(t, first, 512)
+	quarters := [4]int{}
+	for _, path := range first {
+		require.True(t, prefer(path), "test path displaced a production sample: %s", path)
+		var index int
+		_, err := fmt.Sscanf(path, "src/file-%04d.go", &index)
+		require.NoError(t, err)
+		quarters[index/256]++
+	}
+	require.Equal(t, [4]int{128, 128, 128, 128}, quarters)
+}
+
+func TestSelectBoundedPathsFullPermutationKeepsProductionBeforeTests(t *testing.T) {
+	paths := make([]string, 0, 602)
+	for i := 0; i < 600; i++ {
+		paths = append(paths, fmt.Sprintf("src/file-%04d.go", i))
+	}
+	paths = append(paths, "tests/first_test.go", "tests/second_test.go")
+	prefer := func(path string) bool { return strings.HasPrefix(path, "src/") }
+
+	selected := selectBoundedPaths(paths, 0, prefer, "ku")
+
+	require.Len(t, selected, len(paths))
+	require.Len(t, uniqueStrings(selected), len(paths))
+	for _, path := range selected[:600] {
+		require.True(t, prefer(path), "test path preceded production path: %s", path)
+	}
+	require.False(t, prefer(selected[600]))
+	require.False(t, prefer(selected[601]))
+}
+
+func uniqueStrings(values []string) map[string]struct{} {
+	unique := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		unique[value] = struct{}{}
+	}
+	return unique
+}
+
 func TestGrepLiteralBoundedWarmSkipsSubstringNoise(t *testing.T) {
 	root, paths := boundedSearchFixture(t, 32, func(i int) string {
 		if i == 31 {

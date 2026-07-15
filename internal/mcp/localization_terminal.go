@@ -29,9 +29,11 @@ type localizationCompletion struct {
 	AllowedToolCalls int    `json:"allowed_tool_calls"`
 	ExactSymbol      string `json:"exact_symbol,omitempty"`
 
-	// refinementSymbols is session-only authorization state. Candidate IDs are
+	// Refinement routing is session-only authorization state. Candidate IDs are
 	// already present once in the envelope's symbols field, so they are not
-	// serialized again in the completion payload.
+	// serialized again. The concrete preferred ID remains in required_action;
+	// exact_symbol is reserved for the semantically exact-read state.
+	refinementSymbol  string
 	refinementSymbols []string
 }
 
@@ -57,12 +59,14 @@ func newLocalizationCompletion(answerReady bool, exactSymbol string) localizatio
 // and bounded. The ranked evidence remains usable, while the server permits
 // exactly one source read of a returned candidate instead of allowing another
 // broad exploration loop.
-func newLocalizationRefinementCompletion() localizationCompletion {
+func newLocalizationRefinementCompletion(preferredSymbol string) localizationCompletion {
+	preferredSymbol = strings.TrimSpace(preferredSymbol)
 	return localizationCompletion{
 		State:            localizationStateNeedsRefinement,
 		Scope:            "localization",
-		RequiredAction:   localizationRefinementRequiredAction,
+		RequiredAction:   fmt.Sprintf(localizationRefinementRequiredActionFormat, preferredSymbol),
 		AllowedToolCalls: 1,
+		refinementSymbol: preferredSymbol,
 	}
 }
 
@@ -73,6 +77,7 @@ type localizationTerminalState struct {
 	mu                sync.Mutex
 	state             string
 	exactSymbol       string
+	refinementSymbol  string
 	refinementSymbols []string
 	taskFingerprint   string
 	generation        uint64
@@ -100,6 +105,7 @@ func (s *localizationTerminalState) reset() {
 	s.generation++
 	s.state = localizationStateInactive
 	s.exactSymbol = ""
+	s.refinementSymbol = ""
 	s.refinementSymbols = nil
 	s.taskFingerprint = ""
 	// Keep an in-flight reservation until its owner finishes. Its captured
@@ -136,10 +142,10 @@ func (s *localizationTerminalState) keepOpenForTask(task string) {
 	s.armForTask(localizationCompletion{State: localizationStateInactive}, task)
 }
 
-func (s *localizationTerminalState) armRefinementForTask(task string, symbols []string) {
-	completion := newLocalizationRefinementCompletion()
+func (s *localizationTerminalState) armRefinementForTask(task, preferredSymbol string, symbols []string) {
+	preferredSymbol = strings.TrimSpace(preferredSymbol)
 	seen := make(map[string]struct{}, min(len(symbols), 12))
-	completion.refinementSymbols = make([]string, 0, min(len(symbols), 12))
+	refinementSymbols := make([]string, 0, min(len(symbols), 12))
 	for _, symbol := range symbols {
 		symbol = strings.TrimSpace(symbol)
 		if symbol == "" {
@@ -149,15 +155,20 @@ func (s *localizationTerminalState) armRefinementForTask(task string, symbols []
 			continue
 		}
 		seen[symbol] = struct{}{}
-		completion.refinementSymbols = append(completion.refinementSymbols, symbol)
-		if len(completion.refinementSymbols) == 12 {
+		refinementSymbols = append(refinementSymbols, symbol)
+		if len(refinementSymbols) == 12 {
 			break
 		}
 	}
-	if len(completion.refinementSymbols) == 0 {
+	if len(refinementSymbols) == 0 {
 		s.keepOpenForTask(task)
 		return
 	}
+	if _, exists := seen[preferredSymbol]; !exists {
+		preferredSymbol = refinementSymbols[0]
+	}
+	completion := newLocalizationRefinementCompletion(preferredSymbol)
+	completion.refinementSymbols = refinementSymbols
 	s.armForTask(completion, task)
 }
 
@@ -165,8 +176,10 @@ func (s *localizationTerminalState) commitLocalizationLocked(completion localiza
 	s.generation++
 	s.state = completion.State
 	s.exactSymbol = completion.ExactSymbol
+	s.refinementSymbol = ""
 	s.refinementSymbols = nil
 	if completion.State == localizationStateNeedsRefinement {
+		s.refinementSymbol = completion.refinementSymbol
 		s.refinementSymbols = append([]string(nil), completion.refinementSymbols...)
 	}
 	s.taskFingerprint = fingerprint
@@ -175,7 +188,7 @@ func (s *localizationTerminalState) commitLocalizationLocked(completion localiza
 func (s *localizationTerminalState) completionLocked() localizationCompletion {
 	switch s.state {
 	case localizationStateNeedsRefinement, localizationStateRefineInFlight:
-		completion := newLocalizationRefinementCompletion()
+		completion := newLocalizationRefinementCompletion(s.refinementSymbol)
 		if s.state == localizationStateRefineInFlight {
 			completion.State = localizationStateRefineInFlight
 			completion.AllowedToolCalls = 0
@@ -189,7 +202,7 @@ func (s *localizationTerminalState) completionLocked() localizationCompletion {
 }
 
 func (s *localizationTerminalState) refinementAllowsLocked(symbol string) bool {
-	if symbol == "" {
+	if symbol == "" || (s.refinementSymbol != "" && symbol != s.refinementSymbol) {
 		return false
 	}
 	for _, candidate := range s.refinementSymbols {
@@ -313,7 +326,7 @@ func (s *localizationTerminalState) authorize(facade, operation string, argument
 	case localizationStateExactReadInFlight:
 		message = "the permitted exact localization read is already in progress"
 	case localizationStateNeedsRefinement:
-		message = "localization permits exactly one read(operation:\"source\") of a returned candidate symbol; other navigation calls are blocked"
+		message = fmt.Sprintf("localization permits exactly one read(operation:\"source\") for %q; other navigation calls are blocked", s.refinementSymbol)
 	case localizationStateRefineInFlight:
 		message = "the permitted localization refinement read is already in progress"
 	}
@@ -345,6 +358,7 @@ func (s *localizationTerminalState) finishReservedRead(success bool) {
 	case localizationStateRefineInFlight:
 		if success {
 			s.state = localizationStateAnswerReady
+			s.refinementSymbol = ""
 			s.refinementSymbols = nil
 			return
 		}

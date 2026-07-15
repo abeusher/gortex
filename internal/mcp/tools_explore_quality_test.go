@@ -241,7 +241,8 @@ func TestHandleExploreLocalizeReturnsBoundedEvidenceWhenConfidenceIsLow(t *testi
 	var envelope localizationExploreEnvelope
 	require.NoError(t, json.Unmarshal([]byte(text), &envelope))
 	require.Equal(t, localizationStateNeedsRefinement, envelope.Completion.State)
-	require.Equal(t, localizationRefinementRequiredAction, envelope.Completion.RequiredAction)
+	require.Empty(t, envelope.Completion.ExactSymbol)
+	require.NotContains(t, envelope.Completion.RequiredAction, "<candidate.id>")
 	require.Equal(t, 1, envelope.Completion.AllowedToolCalls)
 	require.NotEmpty(t, envelope.Evidence)
 	require.NotEmpty(t, envelope.Symbols)
@@ -251,11 +252,15 @@ func TestHandleExploreLocalizeReturnsBoundedEvidenceWhenConfidenceIsLow(t *testi
 
 	terminal := server.localizationFor(context.Background())
 	terminal.mu.Lock()
+	preferred := terminal.refinementSymbol
 	authorized := append([]string(nil), terminal.refinementSymbols...)
 	terminal.mu.Unlock()
+	require.NotEmpty(t, preferred)
+	require.Contains(t, envelope.Symbols, preferred)
+	require.Contains(t, envelope.Completion.RequiredAction, preferred)
 	require.Equal(t, envelope.Symbols, authorized, "only serialized evidence IDs may be refined")
 	require.NotNil(t, terminal.block("search", "symbols", map[string]any{"query": "locale formatter"}))
-	candidateRead := map[string]any{"target": map[string]any{"symbol": envelope.Symbols[0]}}
+	candidateRead := map[string]any{"target": map[string]any{"symbol": preferred}}
 	blocked, reserved := terminal.authorize("read", "source", candidateRead)
 	require.Nil(t, blocked)
 	require.True(t, reserved)

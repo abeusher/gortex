@@ -3,6 +3,7 @@ package trigram
 import (
 	"bufio"
 	"context"
+	"math/bits"
 	"os"
 	"path/filepath"
 	"strings"
@@ -134,7 +135,7 @@ func grepPathsBounded(
 		cancelled := false
 		for scanner.Scan() {
 			line++
-			if line&63 == 0 && ctx.Err() != nil {
+			if ctx.Err() != nil {
 				stats.Incomplete = true
 				cancelled = true
 				break
@@ -175,11 +176,9 @@ func grepLiteralPathsBounded(
 		stats.Incomplete = ctx.Err() != nil
 		return nil, stats
 	}
-	if preferPath != nil {
-		paths = prioritizeBoundedPaths(paths, preferPath)
-	}
-	if maxFiles > 0 && len(paths) > maxFiles {
-		paths = paths[:maxFiles]
+	candidateCount := len(paths)
+	paths = selectBoundedPaths(paths, maxFiles, preferPath, query)
+	if len(paths) < candidateCount {
 		stats.Incomplete = true
 	}
 
@@ -207,7 +206,7 @@ func grepLiteralPathsBounded(
 		accepted := false
 		for scanner.Scan() {
 			line++
-			if line&63 == 0 && ctx.Err() != nil {
+			if ctx.Err() != nil {
 				stats.Incomplete = true
 				cancelled = true
 				break
@@ -233,6 +232,89 @@ func grepLiteralPathsBounded(
 		}
 	}
 	return matches, stats
+}
+
+// selectBoundedPaths preserves the preferred class (production before tests)
+// and orders each class as a deterministic low-discrepancy permutation. The
+// query seed changes which evenly distributed prefix is visited first, so a
+// bounded scan does not reuse one permanently fixed subset for every literal.
+// A non-positive maxFiles means that the shared context and result limit are
+// the functional bounds; a positive value remains an emergency I/O ceiling.
+func selectBoundedPaths(paths []string, maxFiles int, prefer func(string) bool, query string) []string {
+	if len(paths) == 0 {
+		return paths
+	}
+	if prefer != nil {
+		paths = prioritizeBoundedPaths(paths, prefer)
+	}
+	limit := len(paths)
+	if maxFiles > 0 && maxFiles < limit {
+		limit = maxFiles
+	}
+	seed := boundedPathSeed(query)
+	if prefer == nil {
+		return permuteBoundedPaths(paths, limit, seed)
+	}
+
+	preferredCount := 0
+	for preferredCount < len(paths) && prefer(paths[preferredCount]) {
+		preferredCount++
+	}
+	if preferredCount >= limit {
+		return permuteBoundedPaths(paths[:preferredCount], limit, seed)
+	}
+	selected := make([]string, 0, limit)
+	selected = append(selected, permuteBoundedPaths(paths[:preferredCount], preferredCount, seed)...)
+	selected = append(selected, permuteBoundedPaths(paths[preferredCount:], limit-preferredCount, mixBoundedPathSeed(seed))...)
+	return selected
+}
+
+// permuteBoundedPaths uses bit-reversed indexes. Every power-of-two prefix is
+// spread across the full input rather than clustered at either lexicographic
+// end, and filtering indexes outside a non-power-of-two input still yields a
+// complete permutation when limit reaches len(paths).
+func permuteBoundedPaths(paths []string, limit int, seed uint64) []string {
+	if len(paths) == 0 || limit <= 0 {
+		return nil
+	}
+	if limit > len(paths) {
+		limit = len(paths)
+	}
+	if len(paths) == 1 {
+		return []string{paths[0]}
+	}
+
+	width := bits.Len(uint(len(paths) - 1))
+	space := uint(1) << width
+	offset := uint(seed) & (space - 1)
+	selected := make([]string, 0, limit)
+	for i := uint(0); i < space && len(selected) < limit; i++ {
+		idx := bits.Reverse(i^offset) >> (bits.UintSize - width)
+		if idx < uint(len(paths)) {
+			selected = append(selected, paths[idx])
+		}
+	}
+	return selected
+}
+
+func boundedPathSeed(query string) uint64 {
+	const (
+		offset64 = uint64(14695981039346656037)
+		prime64  = uint64(1099511628211)
+	)
+	hash := offset64
+	for i := 0; i < len(query); i++ {
+		hash ^= uint64(query[i])
+		hash *= prime64
+	}
+	return mixBoundedPathSeed(hash)
+}
+
+func mixBoundedPathSeed(seed uint64) uint64 {
+	seed += 0x9e3779b97f4a7c15
+	seed = (seed ^ (seed >> 30)) * 0xbf58476d1ce4e5b9
+	seed = (seed ^ (seed >> 27)) * 0x94d049bb133111eb
+	return seed ^ (seed >> 31)
 }
 
 func prioritizeBoundedPaths(paths []string, prefer func(string) bool) []string {

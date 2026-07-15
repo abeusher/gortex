@@ -1153,7 +1153,7 @@ func TestRefinementEnvelopeAuthorizesSerializedEvidenceAndOmitsSource(t *testing
 		{node: &graph.Node{ID: "crates/ignore/src/walk.rs::WalkParallel", Name: "WalkParallel", Kind: graph.KindType, FilePath: "crates/ignore/src/walk.rs"}, source: "struct WalkParallel;"},
 	}
 	result, authorized := buildLocalizationExploreResultForTask(
-		newLocalizationRefinementCompletion(),
+		newLocalizationRefinementCompletion(buildParallel.ID),
 		"nondeterministic WalkBuilder parallel multi-root walk build_parallel",
 		targets,
 		1600,
@@ -1165,6 +1165,12 @@ func TestRefinementEnvelopeAuthorizesSerializedEvidenceAndOmitsSource(t *testing
 	var envelope localizationExploreEnvelope
 	if err := json.Unmarshal([]byte(text), &envelope); err != nil {
 		t.Fatalf("decode localization envelope: %v", err)
+	}
+	if !strings.Contains(envelope.Completion.RequiredAction, buildParallel.ID) {
+		t.Fatalf("refinement action did not name preferred symbol: %#v", envelope.Completion)
+	}
+	if envelope.Completion.ExactSymbol != "" {
+		t.Fatalf("uncertain refinement advertised exact symbol: %#v", envelope.Completion)
 	}
 	if strings.Join(authorized, "\n") != strings.Join(envelope.Symbols, "\n") {
 		t.Fatalf("authorization differs from serialized symbols: authorized=%#v symbols=%#v", authorized, envelope.Symbols)

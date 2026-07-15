@@ -102,48 +102,61 @@ func (mi *MultiIndexer) GrepTextForRepoBounded(
 		return nil, false
 	}
 	matches, incomplete := idx.GrepTextBounded(ctx, query, limit, maxFiles)
-	return stampGrepMatchPaths(repoPrefix, matches), incomplete
+	return stampGrepMatchPaths(idx.RepoPrefix(), matches), incomplete
+}
+
+type BoundedRepoLiteralResult struct {
+	Matches    []trigram.Match
+	Incomplete bool
+	Owned      bool
+	Configured bool
+	RepoPrefix string
 }
 
 // GrepLiteralForRepoBounded is the single-repository bridge for the
-// localization-specific literal policy. The third result reports ownership,
-// separating an owned zero-match result from an unresolved repository.
+// localization-specific literal policy. Ownership and configured state are
+// captured under one MultiIndexer lock, so an unresolved repository cannot
+// race into a direct-backend fallback.
 func (mi *MultiIndexer) GrepLiteralForRepoBounded(
 	ctx context.Context,
 	repoPrefix string,
 	query string,
 	limit int,
 	maxFiles int,
-) ([]trigram.Match, bool, bool) {
-	if mi == nil {
-		return nil, false, false
-	}
-	idx := mi.GetIndexer(repoPrefix)
-	if repoPrefix == "" {
-		idx = mi.soleIndexer()
-	}
+) BoundedRepoLiteralResult {
+	idx, configured := mi.boundedRepoIndexer(repoPrefix)
 	if idx == nil {
-		return nil, false, false
+		return BoundedRepoLiteralResult{Configured: configured}
 	}
 	matches, incomplete := idx.GrepLiteralBounded(ctx, query, limit, maxFiles)
-	return stampGrepMatchPaths(repoPrefix, matches), incomplete, true
+	graphPrefix := idx.RepoPrefix()
+	return BoundedRepoLiteralResult{
+		Matches:    stampGrepMatchPaths(graphPrefix, matches),
+		Incomplete: incomplete,
+		Owned:      true,
+		Configured: true,
+		RepoPrefix: graphPrefix,
+	}
 }
 
-// soleIndexer returns the only registered indexer, regardless of its registry
-// key. A graph may use unprefixed file paths even when the repository is stored
-// under a canonical name; cardinality, rather than the key spelling, makes an
-// empty graph prefix unambiguous.
-func (mi *MultiIndexer) soleIndexer() *Indexer {
+// boundedRepoIndexer resolves ownership and the presence of any configured
+// repository atomically. Empty prefix remains valid only for one registered
+// indexer, regardless of the registry key used to store it.
+func (mi *MultiIndexer) boundedRepoIndexer(repoPrefix string) (*Indexer, bool) {
 	if mi == nil {
-		return nil
+		return nil, false
 	}
 	mi.mu.RLock()
 	defer mi.mu.RUnlock()
+	configured := len(mi.indexers) > 0
+	if repoPrefix != "" {
+		return mi.indexers[repoPrefix], configured
+	}
 	if len(mi.indexers) != 1 {
-		return nil
+		return nil, configured
 	}
 	for _, idx := range mi.indexers {
-		return idx
+		return idx, true
 	}
-	return nil
+	return nil, configured
 }
