@@ -526,7 +526,16 @@ func (s *Server) invokeFacadeSpec(ctx context.Context, req mcpgo.CallToolRequest
 		ids := []string{strings.TrimSpace(fmt.Sprint(normalized["id"]))}
 		field := "id"
 		if spec.Operation == "symbols" {
-			ids = strings.Split(fmt.Sprint(normalized["ids"]), ",")
+			var valid bool
+			ids, valid = parseBatchSymbolIDs(normalized["ids"])
+			if !valid {
+				outcome = facadeOutcomeInvalidArgument
+				return NewStructuredErrorResult(StructuredError{
+					ErrorCode: ErrCodeInvalidArgument,
+					Message:   "read.symbols requires a non-empty symbol ID array or scalar shorthand",
+					Data:      map[string]any{"field": "target.symbols"},
+				}), nil
+			}
 			field = "ids"
 		}
 		resolved := make([]string, 0, len(ids))
@@ -547,7 +556,12 @@ func (s *Server) invokeFacadeSpec(ctx context.Context, req mcpgo.CallToolRequest
 			resolved = append(resolved, canonical)
 		}
 		if len(resolved) > 0 {
-			normalized[field] = strings.Join(resolved, ",")
+			if field == "ids" {
+				encoded, _ := json.Marshal(resolved)
+				normalized[field] = string(encoded)
+			} else {
+				normalized[field] = resolved[0]
+			}
 		}
 	}
 	if spec.Facade == "read" && spec.Operation == "editing_context" {

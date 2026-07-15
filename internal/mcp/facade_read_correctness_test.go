@@ -1,10 +1,16 @@
 package mcp
 
 import (
+	"context"
 	"reflect"
 	"strings"
 	"testing"
 	"unicode/utf8"
+
+	mcpgo "github.com/mark3labs/mcp-go/mcp"
+
+	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/query"
 )
 
 func TestApplyFacadeTargetPreservesSymbolIDArrayElements(t *testing.T) {
@@ -175,6 +181,43 @@ func TestParseBatchSymbolIDsSplitsOnlyScalarShorthand(t *testing.T) {
 	}
 	if _, ok := parseBatchSymbolIDs([]any{"valid", 42}); ok {
 		t.Fatal("mixed-type ID array unexpectedly accepted")
+	}
+}
+
+func TestFacadeReadSymbolsKeepsGenericIDsAtomicThroughResolution(t *testing.T) {
+	ids := []string{
+		"crates/searcher/src/searcher/glue.rs::MultiLine<'s, M, S>.sink",
+		"crates/searcher/src/searcher/glue.rs::MultiLine<'s, M, S>.sink_matched",
+	}
+	g := graph.New()
+	for i, id := range ids {
+		g.AddNode(&graph.Node{
+			ID: id, Name: []string{"sink", "sink_matched"}[i], Kind: graph.KindMethod,
+			FilePath: "crates/searcher/src/searcher/glue.rs",
+		})
+	}
+	registry := newFacadeRegistry()
+	var forwarded map[string]any
+	registry.capture(mcpgo.NewTool("batch_symbols", mcpgo.WithString("ids", mcpgo.Required())), func(_ context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+		forwarded = req.GetArguments()
+		return mcpgo.NewToolResultJSON(forwarded)
+	})
+	server := &Server{
+		engine: query.NewEngine(g), graph: g, facades: registry,
+		localization: newLocalizationTerminalState(),
+	}
+	req := mcpgo.CallToolRequest{}
+	req.Params.Arguments = map[string]any{
+		"target": map[string]any{"symbols": []any{ids[0], ids[1]}},
+	}
+
+	result, err := server.handleFacade(context.Background(), "read", req)
+	if err != nil || result == nil || result.IsError {
+		t.Fatalf("read facade failed: result=%#v err=%v", result, err)
+	}
+	got, ok := parseBatchSymbolIDs(forwarded["ids"])
+	if !ok || !reflect.DeepEqual(got, ids) {
+		t.Fatalf("forwarded ids = %#v, want atomic generic IDs %#v", forwarded["ids"], ids)
 	}
 }
 
