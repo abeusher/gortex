@@ -37,6 +37,41 @@ func TestLimitExploreCandidatesPreservingSourceLiteralReservesOneFullCapSlot(t *
 	require.NotNil(t, candidateByID(bounded, "source"))
 }
 
+func TestSelectFinalExploreCandidatesPreservesSourceLiteralAfterRerank(t *testing.T) {
+	prod := []*rerank.Candidate{
+		sourcePreservationCandidate("primary-0", 0, 0),
+		sourcePreservationCandidate("primary-1", 1, 0),
+		sourcePreservationCandidate("primary-2", 2, 0),
+		sourcePreservationCandidate("source", 80, 1),
+	}
+	tests := []*rerank.Candidate{sourcePreservationCandidate("test", 0, 0)}
+
+	require.Nil(t, candidateByID(prod[:3], "source"), "the fixture must put source evidence outside the final reranked window")
+	selected := selectFinalExploreCandidates(prod, tests, 3)
+
+	require.Len(t, selected, 3)
+	require.Equal(t, []string{"primary-0", "primary-1", "source"}, []string{
+		selected[0].Node.ID,
+		selected[1].Node.ID,
+		selected[2].Node.ID,
+	})
+	require.Nil(t, candidateByID(selected, "test"), "source reservation must replace, not widen, the production cap")
+}
+
+func TestSelectFinalExploreCandidatesKeepsSettledProductionOrder(t *testing.T) {
+	prod := []*rerank.Candidate{
+		sourcePreservationCandidate("settled-0", 80, 0),
+		sourcePreservationCandidate("settled-1", 70, 0),
+		sourcePreservationCandidate("earlier-channel-rank", 0, 0),
+	}
+
+	selected := selectFinalExploreCandidates(prod, nil, 2)
+
+	require.Len(t, selected, 2)
+	require.Equal(t, "settled-0", selected[0].Node.ID)
+	require.Equal(t, "settled-1", selected[1].Node.ID)
+}
+
 func TestMergeExploreCandidatesPreservesSourceLiteralSignalThroughDedupe(t *testing.T) {
 	node := &graph.Node{ID: "same", Name: "same", Kind: graph.KindFunction, FilePath: "same.go"}
 	primarySignals := map[string]float64{"ordinary": 1}

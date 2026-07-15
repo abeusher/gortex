@@ -1708,16 +1708,7 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		_, prod = diversifyByFile(prodNodes, prod, defaultMaxPerFile)
 	}
 	prod, protectedImplementationID := reserveExploreConceptImplementation(searchQuery, queryClass, prod, maxSymbols)
-	cands := prod
-	if len(cands) > maxSymbols {
-		cands = cands[:maxSymbols]
-	} else if len(cands) < maxSymbols {
-		room := maxSymbols - len(cands)
-		if room > len(test) {
-			room = len(test)
-		}
-		cands = append(cands, test[:room]...)
-	}
+	cands := selectFinalExploreCandidates(prod, test, maxSymbols)
 	if len(cands) == 0 && len(artifactLane.targets) == 0 {
 		if req.GetBool("localize", false) {
 			return s.completeEmptyLocalization(ctx, task, budget), nil
@@ -3431,7 +3422,16 @@ func limitExploreCandidatesPreservingSourceLiteral(candidates []*rerank.Candidat
 	if limit <= 0 || len(candidates) <= limit || len(bounded) == 0 {
 		return bounded
 	}
+	return reserveExploreSourceLiteralCandidate(candidates, bounded)
+}
 
+// reserveExploreSourceLiteralCandidate inserts the strongest source-literal
+// candidate into an already-selected window. It deliberately leaves the
+// window's established order untouched unless a replacement is required.
+func reserveExploreSourceLiteralCandidate(candidates, bounded []*rerank.Candidate) []*rerank.Candidate {
+	if len(bounded) == 0 || len(candidates) <= len(bounded) {
+		return bounded
+	}
 	var best *rerank.Candidate
 	bestSignal := 0.0
 	for _, candidate := range candidates {
@@ -3455,6 +3455,32 @@ func limitExploreCandidatesPreservingSourceLiteral(candidates []*rerank.Candidat
 	reserved := append([]*rerank.Candidate(nil), bounded...)
 	reserved[len(reserved)-1] = best
 	return reserved
+}
+
+// selectFinalExploreCandidates applies the source-literal reservation at the
+// last production boundary, after every reranker and concept reservation has
+// settled candidate order. The source hit replaces the weakest bounded
+// production candidate, so response width never grows. With a very small
+// maxSymbols value there may be no room for the semantic head, a concept
+// implementation, and direct source evidence simultaneously; direct source
+// evidence owns the weakest final slot in that case.
+func selectFinalExploreCandidates(prod, test []*rerank.Candidate, maxSymbols int) []*rerank.Candidate {
+	if maxSymbols <= 0 {
+		return nil
+	}
+	cands := prod
+	if len(cands) > maxSymbols {
+		cands = cands[:maxSymbols]
+	}
+	cands = reserveExploreSourceLiteralCandidate(prod, cands)
+	if len(cands) >= maxSymbols {
+		return cands
+	}
+	room := maxSymbols - len(cands)
+	if room > len(test) {
+		room = len(test)
+	}
+	return append(cands, test[:room]...)
 }
 
 // exploreConceptRecallTerms preserves the query's discriminative concepts in
