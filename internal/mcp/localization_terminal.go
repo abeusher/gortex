@@ -12,6 +12,7 @@ import (
 const (
 	localizationStateInactive          = ""
 	localizationStateNeedsExactRead    = "needs_exact_read"
+	localizationStateNeedsRefinement   = "needs_refinement"
 	localizationStateExactReadInFlight = "exact_read_in_flight"
 	localizationStateAnswerReady       = "answer_ready"
 )
@@ -43,6 +44,19 @@ func newLocalizationCompletion(answerReady bool, exactSymbol string) localizatio
 		RequiredAction:   "read_exact",
 		AllowedToolCalls: 1,
 		ExactSymbol:      exactSymbol,
+	}
+}
+
+// newLocalizationRefinementCompletion keeps uncertain localization successful
+// and bounded. The ranked evidence remains usable, while the host is directed
+// to spend at most one follow-up on those candidates instead of restarting a
+// broad exploration loop.
+func newLocalizationRefinementCompletion() localizationCompletion {
+	return localizationCompletion{
+		State:            localizationStateNeedsRefinement,
+		Scope:            "localization",
+		RequiredAction:   "refine_from_candidates",
+		AllowedToolCalls: 1,
 	}
 }
 
@@ -104,6 +118,14 @@ func (s *localizationTerminalState) armForTask(completion localizationCompletion
 		return
 	}
 	s.commitLocalizationLocked(completion, fingerprint)
+}
+
+// keepOpenForTask transactionally replaces any prior terminal contract with
+// inactive navigation state. Under facade dispatch the inactive state is
+// staged until the localization response succeeds; direct handlers commit it
+// immediately.
+func (s *localizationTerminalState) keepOpenForTask(task string) {
+	s.armForTask(localizationCompletion{State: localizationStateInactive}, task)
 }
 
 func (s *localizationTerminalState) commitLocalizationLocked(completion localizationCompletion, fingerprint string) {

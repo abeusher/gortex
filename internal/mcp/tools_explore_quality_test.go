@@ -224,6 +224,27 @@ func TestHandleExploreLocalizeKeepsEmptyResultNonTerminal(t *testing.T) {
 	require.Nil(t, server.localization.block("search", "symbols", map[string]any{"query": "better anchor"}))
 }
 
+func TestHandleExploreLocalizeReturnsBoundedEvidenceWhenConfidenceIsLow(t *testing.T) {
+	server := newExploreQualityServer(t)
+	store, ok := server.graph.(*store_sqlite.Store)
+	require.True(t, ok)
+	require.NoError(t, store.AppendContent("demo", []graph.ContentFTSItem{{
+		NodeID: "demo/route.go::routeMessage", FilePath: "demo/route.go", Ordinal: 0,
+		Body: `func routeMessage() { supported["ku"] = route }`,
+	}}))
+	require.NoError(t, store.BuildContentIndex())
+
+	result, text := callExploreQuality(t, server, `find "ku" behavior`, true)
+
+	require.False(t, result.IsError, text)
+	require.Contains(t, text, `"state":"needs_refinement"`)
+	require.Contains(t, text, `"required_action":"refine_from_candidates"`)
+	require.Contains(t, text, `"allowed_tool_calls":1`)
+	require.Contains(t, text, `"evidence":[{`)
+	require.NotContains(t, text, "localization confidence is insufficient")
+	require.Nil(t, server.localization.block("search", "symbols", map[string]any{"query": "locale formatter"}))
+}
+
 func TestHandleExploreLocalizeAcceptsVerifiedLiteralAndExplicitSymbol(t *testing.T) {
 	t.Run("verified literal", func(t *testing.T) {
 		server := newExploreQualityServer(t)

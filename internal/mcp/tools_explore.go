@@ -1441,19 +1441,13 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	// synthetic exact-symbol read. Exact reads remain declaration-only.
 	exactSymbol := exploreLocalizationExplicitTarget(task, symbolTargets)
 	if !answerReady && exactSymbol == "" {
-		anchors := make([]string, 0, 3)
-		for _, target := range targets {
-			if target.node == nil {
-				continue
-			}
-			anchors = append(anchors, fmt.Sprintf("%s (%s)", target.node.ID, nodeDisplayPath(target.node)))
-			if len(anchors) == cap(anchors) {
-				break
-			}
-		}
-		return mcp.NewToolResultError(fmt.Sprintf(
-			"localization confidence is insufficient: no candidate has an explicit file/symbol anchor or two distinct task-term matches; top candidates: %s. Add a concrete file or symbol anchor, or use explore(operation:\"task\") when investigation must continue.",
-			strings.Join(anchors, ", "))), nil
+		// Uncertain localization is still useful evidence. Returning it as an
+		// MCP error makes hosts discard the ranked candidates and restart broad
+		// exploration, multiplying turns and payloads. Keep the session open and
+		// direct at most one refinement call at the evidence already returned.
+		completion := newLocalizationRefinementCompletion()
+		s.localizationFor(ctx).keepOpenForTask(task)
+		return newLocalizationExploreResultForTask(completion, task, targets, budget), nil
 	}
 	completion := newLocalizationCompletion(answerReady, exactSymbol)
 	s.localizationFor(ctx).armForTask(completion, task)
@@ -1485,7 +1479,7 @@ type localizationEvidence struct {
 	Source    string   `json:"source,omitempty"`
 }
 
-func (s *Server) completeEmptyLocalization(ctx context.Context, _ string, budget int) *mcp.CallToolResult {
+func (s *Server) completeEmptyLocalization(ctx context.Context, task string, budget int) *mcp.CallToolResult {
 	completion := localizationCompletion{
 		State:            localizationStateInactive,
 		Scope:            "localization",
@@ -1493,9 +1487,9 @@ func (s *Server) completeEmptyLocalization(ctx context.Context, _ string, budget
 		AllowedToolCalls: 0,
 	}
 	// An empty result supersedes any previous task contract but must not arm
-	// answer-ready or an exact-read allowance. Navigation remains available for
-	// the caller to continue investigation with a better anchor.
-	s.localizationFor(ctx).reset()
+	// answer-ready or an exact-read allowance. Stage the open state so facade
+	// dispatch commits it only after the successful response.
+	s.localizationFor(ctx).keepOpenForTask(task)
 	return newLocalizationExploreResult(completion, []exploreTarget{}, budget)
 }
 
