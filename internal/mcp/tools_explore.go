@@ -1826,14 +1826,13 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		// exploration, multiplying turns and payloads. Keep the session open and
 		// direct at most one refinement call at the evidence already returned.
 		completion := newLocalizationRefinementCompletion()
-		candidateSymbols := make([]string, 0, len(targets))
-		for _, target := range targets {
-			if target.node != nil {
-				candidateSymbols = append(candidateSymbols, target.node.ID)
-			}
-		}
-		s.localizationFor(ctx).armRefinementForTask(task, candidateSymbols)
-		return newLocalizationExploreResultForTask(completion, task, targets, budget), nil
+		result, returnedSymbols := buildLocalizationExploreResultForTask(completion, task, targets, budget)
+		// Authorization is derived from the exact serialized projection, not
+		// the larger pre-budget candidate set. A promoted structural target is
+		// therefore readable when it appears in symbols/evidence, while compact
+		// caller/callee hints remain non-targetable.
+		s.localizationFor(ctx).armRefinementForTask(task, returnedSymbols)
+		return result, nil
 	}
 	completion := newLocalizationCompletion(answerReady, exactSymbol)
 	s.localizationFor(ctx).armForTask(completion, task)
@@ -2119,6 +2118,15 @@ func localizationEnvelopeFits(envelope localizationExploreEnvelope, maxBytes int
 }
 
 func newLocalizationExploreResultForTask(completion localizationCompletion, task string, targets []exploreTarget, budget int) *mcp.CallToolResult {
+	result, _ := buildLocalizationExploreResultForTask(completion, task, targets, budget)
+	return result
+}
+
+// buildLocalizationExploreResultForTask returns both the result and the exact
+// bounded symbol projection serialized into it. Refinement authorization uses
+// this projection so every authorized ID is visible and every visible evidence
+// target is authorized without a second ranking or budgeting pass.
+func buildLocalizationExploreResultForTask(completion localizationCompletion, task string, targets []exploreTarget, budget int) (*mcp.CallToolResult, []string) {
 	var draft []exploreDraftEntry
 	if strings.TrimSpace(task) != "" {
 		draft = exploreAnswerDraft(task, targets)
@@ -2224,23 +2232,28 @@ func newLocalizationExploreResultForTask(completion localizationCompletion, task
 	for index := range acceptedTargets {
 		appendBodyIndex(index)
 	}
-	for _, index := range bodyOrder {
-		if acceptedTargets[index].source == "" {
-			continue
-		}
-		candidate := envelope
-		candidate.Evidence = append([]localizationEvidence(nil), envelope.Evidence...)
-		candidate.Evidence[index].Source = acceptedTargets[index].source
-		if localizationEnvelopeFits(candidate, maxBytes) {
-			envelope = candidate
+	// A needs-refinement response deliberately carries no source body. The
+	// single authorized read supplies the chosen body once; embedding it here
+	// would duplicate the largest payload and still require the same read.
+	if completion.State != localizationStateNeedsRefinement {
+		for _, index := range bodyOrder {
+			if acceptedTargets[index].source == "" {
+				continue
+			}
+			candidate := envelope
+			candidate.Evidence = append([]localizationEvidence(nil), envelope.Evidence...)
+			candidate.Evidence[index].Source = acceptedTargets[index].source
+			if localizationEnvelopeFits(candidate, maxBytes) {
+				envelope = candidate
+			}
 		}
 	}
 
 	body, err := json.Marshal(envelope)
 	if err != nil {
-		return mcp.NewToolResultError("encode localization result: " + err.Error())
+		return mcp.NewToolResultError("encode localization result: " + err.Error()), nil
 	}
-	return mcp.NewToolResultText(string(body))
+	return mcp.NewToolResultText(string(body)), append([]string(nil), envelope.Symbols...)
 }
 
 func boundedLocalizationNeighborIDs(nodes []*graph.Node, limit int) []string {

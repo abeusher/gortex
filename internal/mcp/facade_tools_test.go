@@ -1454,6 +1454,16 @@ func TestFacadeTelemetryRespectsDisabledConsent(t *testing.T) {
 	require.Empty(t, days)
 }
 
+func TestFacadeReadSchemaAdvertisesExactlyOneTargetSelector(t *testing.T) {
+	tool := facadeToolDefinitionWithOperations("read", []string{"source", "file", "symbols"})
+	target, ok := tool.InputSchema.Properties["target"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, 1, target["minProperties"])
+	require.Equal(t, 1, target["maxProperties"])
+	require.Contains(t, target["description"], "exactly one selector")
+	require.Contains(t, target["description"], "symbol for one source symbol")
+}
+
 func TestFacadeReadSelectorCardinalityDefaultsAndAliases(t *testing.T) {
 	srv := &Server{facades: newFacadeRegistry()}
 	capture := func(_ context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {

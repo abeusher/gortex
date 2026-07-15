@@ -1143,3 +1143,44 @@ func TestLocalizationEnvelopeIncludesBoundedStructuralNeighbor(t *testing.T) {
 		t.Fatalf("structural implementation file missing: %#v", envelope.Files)
 	}
 }
+
+func TestRefinementEnvelopeAuthorizesSerializedEvidenceAndOmitsSource(t *testing.T) {
+	buildParallel := &graph.Node{ID: "crates/ignore/src/walk.rs::WalkBuilder.build_parallel", Name: "build_parallel", QualName: "WalkBuilder.build_parallel", Kind: graph.KindMethod, FilePath: "crates/ignore/src/walk.rs"}
+	buildWithCWD := &graph.Node{ID: "crates/ignore/src/dir.rs::IgnoreBuilder.build_with_cwd", Name: "build_with_cwd", QualName: "IgnoreBuilder.build_with_cwd", Kind: graph.KindMethod, FilePath: "crates/ignore/src/dir.rs"}
+	unrelated := &graph.Node{ID: "crates/core/src/log.rs::trace_event", Name: "trace_event", Kind: graph.KindFunction, FilePath: "crates/core/src/log.rs"}
+	targets := []exploreTarget{
+		{node: buildParallel, source: "fn build_parallel(&self) {}", callees: []*graph.Node{unrelated, buildWithCWD}},
+		{node: &graph.Node{ID: "crates/ignore/src/walk.rs::WalkParallel", Name: "WalkParallel", Kind: graph.KindType, FilePath: "crates/ignore/src/walk.rs"}, source: "struct WalkParallel;"},
+	}
+	result, authorized := buildLocalizationExploreResultForTask(
+		newLocalizationRefinementCompletion(),
+		"nondeterministic WalkBuilder parallel multi-root walk build_parallel",
+		targets,
+		1600,
+	)
+	text, ok := singleTextContent(result)
+	if !ok {
+		t.Fatalf("expected one text result: %#v", result)
+	}
+	var envelope localizationExploreEnvelope
+	if err := json.Unmarshal([]byte(text), &envelope); err != nil {
+		t.Fatalf("decode localization envelope: %v", err)
+	}
+	if strings.Join(authorized, "\n") != strings.Join(envelope.Symbols, "\n") {
+		t.Fatalf("authorization differs from serialized symbols: authorized=%#v symbols=%#v", authorized, envelope.Symbols)
+	}
+	if len(authorized) > 12 {
+		t.Fatalf("refinement authorization exceeded cap: %d", len(authorized))
+	}
+	if !strings.Contains(strings.Join(authorized, "\n"), buildWithCWD.ID) {
+		t.Fatalf("serialized structural target was not authorized: %#v", authorized)
+	}
+	if strings.Contains(strings.Join(authorized, "\n"), unrelated.ID) {
+		t.Fatalf("neighbor hint became a refinement target: %#v", authorized)
+	}
+	for _, evidence := range envelope.Evidence {
+		if evidence.Source != "" {
+			t.Fatalf("needs-refinement duplicated source for %s", evidence.ID)
+		}
+	}
+}

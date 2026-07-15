@@ -216,6 +216,46 @@ func TestLocalizationRefinementAllowsExactlyOneCandidateRead(t *testing.T) {
 	}
 }
 
+func TestHandleFacadeRefinementReadReturnsAnswerReadyCompletion(t *testing.T) {
+	registry := newFacadeRegistry()
+	candidate := "repo/pkg/file.go::Resolver.Run"
+	registry.capture(mcpgo.NewTool("get_symbol_source", mcpgo.WithString("id", mcpgo.Required())), func(context.Context, mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+		return mcpgo.NewToolResultText(`{"id":"repo/pkg/file.go::Resolver.Run","source":"func (r Resolver) Run() {}"}`), nil
+	})
+	server := &Server{facades: registry, localization: newLocalizationTerminalState(), sessions: newSessionMap()}
+	ctx := WithSessionID(context.Background(), "refinement-read-completion")
+	server.localizationFor(ctx).armRefinementForTask("locate resolver behavior", []string{candidate})
+
+	req := mcpgo.CallToolRequest{}
+	req.Params.Name = "read"
+	req.Params.Arguments = map[string]any{
+		"operation": "source",
+		"target":    map[string]any{"symbol": candidate},
+	}
+	result, err := server.handleFacade(ctx, "read", req)
+	if err != nil || result == nil || result.IsError {
+		t.Fatalf("refinement read failed: result=%#v err=%v", result, err)
+	}
+	body, ok := singleTextContent(result)
+	if !ok {
+		t.Fatalf("refinement read returned no text: %#v", result)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(body), &payload); err != nil {
+		t.Fatalf("refinement response is not one JSON object: %v: %q", err, body)
+	}
+	if payload["source"] != "func (r Resolver) Run() {}" {
+		t.Fatalf("refinement response lost source payload: %#v", payload)
+	}
+	completion, ok := payload["completion"].(map[string]any)
+	if !ok || completion["state"] != localizationStateAnswerReady || completion["required_action"] != "respond" || completion["allowed_tool_calls"] != float64(0) {
+		t.Fatalf("refinement response omitted answer-ready completion: %#v", payload["completion"])
+	}
+	if blocked := server.localizationFor(ctx).block("explore", "localize", nil); blocked == nil {
+		t.Fatal("successful refinement read did not commit terminal state")
+	}
+}
+
 func TestLocalizationTerminalStateIsPerSession(t *testing.T) {
 	server := &Server{
 		localization: newLocalizationTerminalState(),
@@ -328,6 +368,10 @@ func TestHandleFacadeExactReadCommitsOnlyOnSuccess(t *testing.T) {
 	second, err := server.handleFacade(ctx, "read", req)
 	if err != nil || second == nil || second.IsError {
 		t.Fatalf("retry should retain and consume the allowance on success: result=%#v err=%v", second, err)
+	}
+	body, ok := singleTextContent(second)
+	if !ok || !strings.Contains(body, `{"completion":{"state":"answer_ready","scope":"localization","required_action":"respond","allowed_tool_calls":0}}`) {
+		t.Fatalf("successful exact read omitted terminal completion: %q", body)
 	}
 	third, err := server.handleFacade(ctx, "read", req)
 	if err != nil || third == nil || !third.IsError || calls != 2 {

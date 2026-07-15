@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -237,14 +238,24 @@ func TestHandleExploreLocalizeReturnsBoundedEvidenceWhenConfidenceIsLow(t *testi
 	result, text := callExploreQuality(t, server, `find "ku" behavior`, true)
 
 	require.False(t, result.IsError, text)
-	require.Contains(t, text, `"state":"needs_refinement"`)
-	require.Contains(t, text, `"required_action":"read_one_candidate"`)
-	require.Contains(t, text, `"allowed_tool_calls":1`)
-	require.Contains(t, text, `"evidence":[{`)
-	require.NotContains(t, text, "localization confidence is insufficient")
+	var envelope localizationExploreEnvelope
+	require.NoError(t, json.Unmarshal([]byte(text), &envelope))
+	require.Equal(t, localizationStateNeedsRefinement, envelope.Completion.State)
+	require.Equal(t, "read_one_candidate", envelope.Completion.RequiredAction)
+	require.Equal(t, 1, envelope.Completion.AllowedToolCalls)
+	require.NotEmpty(t, envelope.Evidence)
+	require.NotEmpty(t, envelope.Symbols)
+	for _, evidence := range envelope.Evidence {
+		require.Empty(t, evidence.Source, "refinement evidence must not duplicate the authorized source read")
+	}
+
 	terminal := server.localizationFor(context.Background())
+	terminal.mu.Lock()
+	authorized := append([]string(nil), terminal.refinementSymbols...)
+	terminal.mu.Unlock()
+	require.Equal(t, envelope.Symbols, authorized, "only serialized evidence IDs may be refined")
 	require.NotNil(t, terminal.block("search", "symbols", map[string]any{"query": "locale formatter"}))
-	candidateRead := map[string]any{"target": map[string]any{"symbol": "demo/registry.go::registerFormats"}}
+	candidateRead := map[string]any{"target": map[string]any{"symbol": envelope.Symbols[0]}}
 	blocked, reserved := terminal.authorize("read", "source", candidateRead)
 	require.Nil(t, blocked)
 	require.True(t, reserved)

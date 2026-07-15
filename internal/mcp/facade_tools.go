@@ -172,6 +172,17 @@ func facadeToolDefinitionWithOperations(name string, operations []string) mcpgo.
 	opts = append(opts, output)
 	opts = append([]mcpgo.ToolOption{mcpgo.WithDescription(desc), annotation}, opts...)
 	tool := mcpgo.NewTool(name, opts...)
+	if targetSchema, ok := tool.InputSchema.Properties["target"].(map[string]any); ok {
+		// The public facade validator already requires one selector. Encode that
+		// contract in tools/list as well so a caller can construct its first read
+		// without a capabilities round-trip or a rejected probe.
+		targetSchema["minProperties"] = 1
+		targetSchema["maxProperties"] = 1
+		targetSchema["description"] = "Choose exactly one selector."
+		if name == "read" {
+			targetSchema["description"] = "Choose exactly one selector: symbol for one source symbol, symbols for a batch, or file for file content."
+		}
+	}
 	discriminator := "operation"
 	if name == "analyze" {
 		discriminator = "kind"
@@ -267,6 +278,33 @@ func (s *Server) wrapLegacyFacade(name string, raw server.ToolHandlerFunc) serve
 		}
 		return s.handleFacade(ctx, name, req)
 	}
+}
+
+// decorateLocalizationReadResult makes the successful refinement read
+// self-terminal. JSON object results retain their public shape with one added
+// completion field; text results receive the same compact JSON contract as a
+// final block. Hosts therefore need no blocked follow-up call to discover that
+// localization is complete.
+func decorateLocalizationReadResult(result *mcpgo.CallToolResult, completion localizationCompletion) *mcpgo.CallToolResult {
+	body, ok := singleTextContent(result)
+	if !ok {
+		return result
+	}
+	contract, err := json.Marshal(struct {
+		Completion localizationCompletion `json:"completion"`
+	}{Completion: completion})
+	if err != nil {
+		return result
+	}
+	trimmed := strings.TrimSpace(body)
+	if len(trimmed) >= 2 && trimmed[0] == '{' && trimmed[len(trimmed)-1] == '}' && json.Valid([]byte(trimmed)) {
+		if trimmed == "{}" {
+			return rebuildTextResult(result, string(contract))
+		}
+		merged := trimmed[:len(trimmed)-1] + "," + string(contract[1:])
+		return rebuildTextResult(result, merged)
+	}
+	return rebuildTextResult(result, body+"\n\n"+string(contract))
 }
 
 func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
@@ -377,6 +415,9 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 	succeeded := err == nil && result != nil && !result.IsError
 	if localizationReadReserved {
 		localizationReadSucceeded = succeeded
+		if succeeded {
+			result = decorateLocalizationReadResult(result, newLocalizationCompletion(true, ""))
+		}
 	}
 	if freshLocalizeFlow {
 		terminal.finishLocalize(localizeReservation, succeeded)
