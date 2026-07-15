@@ -189,7 +189,7 @@ func TestExploreAnswerDraftPromotesOneAccurateMultiHopCallee(t *testing.T) {
 	queryTerms := exploreTerminalTerms(task)
 	overlap, longest := exploreDraftTermOverlap(queryTerms, seed)
 	bodyOverlap := exploreDraftTermSetOverlap(queryTerms, exploreTerminalTerms(targets[0].source))
-	if overlap < 2 && bodyOverlap < 2 && !(overlap == 1 && longest >= 5) {
+	if overlap < 2 && bodyOverlap < 2 && (overlap != 1 || longest < 5) {
 		t.Fatalf("seed unexpectedly weak: overlap=%d body=%d longest=%d terms=%v", overlap, bodyOverlap, longest, queryTerms)
 	}
 	entries := exploreAnswerDraft(task, targets)
