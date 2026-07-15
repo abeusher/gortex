@@ -7,6 +7,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/mark3labs/mcp-go/mcp"
 
@@ -74,11 +76,12 @@ func (s *Server) registerExploreTool() {
 // exploreTarget is one ranked candidate plus its 1-hop neighborhood,
 // gathered before rendering so the renderer can honour the token budget.
 type exploreTarget struct {
-	node    *graph.Node
-	score   float64
-	callers []*graph.Node
-	callees []*graph.Node
-	source  string // full body (may be empty for non-source kinds)
+	node         *graph.Node
+	score        float64
+	callers      []*graph.Node
+	callees      []*graph.Node
+	source       string // full body (may be empty for non-source kinds)
+	exactContent bool   // verified full quoted-literal hit from content_fts
 }
 
 const (
@@ -766,13 +769,11 @@ func exploreAnswerReady(task string, targets []exploreTarget) bool {
 		return false
 	}
 
-	matched := func(target exploreTarget) int {
-		if target.node == nil {
+	matchedNode := func(node *graph.Node) int {
+		if node == nil {
 			return 0
 		}
-		n := target.node
-		text := exploreTerminalNodeText(n)
-		candidateTerms := exploreTerminalTerms(text)
+		candidateTerms := exploreTerminalTerms(exploreTerminalNodeText(node))
 		count := 0
 		for term := range queryTerms {
 			if _, ok := candidateTerms[term]; ok {
@@ -781,52 +782,46 @@ func exploreAnswerReady(task string, targets []exploreTarget) bool {
 		}
 		return count
 	}
-
-	headMatches := matched(targets[0])
-	union := make(map[string]struct{})
-	for i := 0; i < len(targets) && i < 3; i++ {
-		if targets[i].node == nil {
-			continue
-		}
-		n := targets[i].node
-		text := exploreTerminalNodeText(n)
-		for term := range exploreTerminalTerms(text) {
-			if _, relevant := queryTerms[term]; relevant {
-				union[term] = struct{}{}
-			}
-		}
-	}
+	head := targets[0]
+	headMatches := matchedNode(head.node)
 
 	// Paths, signatures, and identifier-shaped queries carry explicit anchors.
 	// A shared token is not enough: the ranked head must cover the complete
 	// path, qualified symbol, or signature anchor from the request.
 	if class == rerank.QueryClassPath || class == rerank.QueryClassSymbol || class == rerank.QueryClassSignature {
-		return exploreLocalizationExplicitAnchor(query, targets[0].node)
+		return exploreLocalizationExplicitAnchor(query, head.node)
 	}
-	// Broad prompts need several independent anchors in the top result. This
-	// keeps a multi-area audit from becoming terminal merely because one generic
-	// word matched somewhere in the neighborhood.
-	if len(queryTerms) > 10 {
-		return headMatches >= 3 && len(union) >= 3
-	}
-	if len(queryTerms) == 1 {
-		// A concept phrase can repeat one generic word many times, but the term
-		// set intentionally de-duplicates it. One such token is not independent
-		// evidence and must never make localization terminal. Explicit path,
-		// symbol, and signature anchors already returned above.
-		return false
-	}
-	if headMatches >= 1 && len(union) >= 2 {
+	// A verified full quoted literal is direct implementation evidence. Prefix
+	// FTS matches never set this bit, so a nearby vocabulary collision cannot
+	// make a concept request terminal.
+	if head.exactContent {
 		return true
 	}
-	// A sharply separated ranked head is useful supporting evidence, but only
-	// when it also has a visible lexical anchor to the request.
-	if headMatches > 0 && targets[0].score > 0 {
-		if len(targets) == 1 || targets[1].score <= 0 || targets[0].score/targets[1].score >= 1.5 {
-			return true
+
+	// Structural evidence is useful only when a directly connected helper
+	// independently covers multiple task concepts. Merely spreading one token
+	// each across unrelated top-ranked symbols is not sufficient.
+	structuralAligned := false
+	for _, neighbors := range [][]*graph.Node{head.callers, head.callees} {
+		for _, neighbor := range neighbors {
+			if matchedNode(neighbor) >= 2 {
+				structuralAligned = true
+				break
+			}
+		}
+		if structuralAligned {
+			break
 		}
 	}
-	return false
+
+	// Broad prompts require more evidence concentrated in the ranked head.
+	if len(queryTerms) > 10 {
+		return headMatches >= 3 || (headMatches >= 1 && structuralAligned)
+	}
+	if len(queryTerms) == 1 {
+		return false
+	}
+	return headMatches >= 2 || (headMatches >= 1 && structuralAligned)
 }
 
 func exploreNormalizedAnchor(text string) string {
@@ -930,8 +925,27 @@ func exploreLocalizationExplicitAnchor(query string, n *graph.Node) bool {
 	return class == rerank.QueryClassSymbol && qualName == name && normalizedQueryText == name
 }
 
-// exploreLocalizationExactTarget selects the one permitted refinement read for
-// an explicit localization request. Explicit qualified/path anchors win. For
+// exploreLocalizationExplicitTarget returns only a concrete path, qualified
+// symbol, signature, or call anchor. Concept-term overlap is intentionally not
+// accepted here: it can rank a neighborhood but must not prescribe the one
+// allowed post-localization source read.
+func exploreLocalizationExplicitTarget(task string, targets []exploreTarget) string {
+	query := shapeExploreQuery(task)
+	if rerank.ClassifyQuery(query) == rerank.QueryClassConcept {
+		query = stripLeadingExploreDirective(query)
+	}
+	for _, target := range targets {
+		if target.node != nil && exploreLocalizationExplicitAnchor(query, target.node) {
+			return target.node.ID
+		}
+	}
+	return ""
+}
+
+// exploreLocalizationExactTarget selects the strongest exact-like target for
+// ordering and backwards-compatible callers. Explicit qualified/path anchors
+// win; concept overlap may still pick a stable evidence head, but the facade
+// uses exploreLocalizationExplicitTarget before issuing a refinement read.
 // natural-language tasks, candidates with more independent task terms win and
 // inverse candidate frequency breaks ties so repeated generic setters do not
 // outrank a rarer conjunctive implementation target. Retrieval order is the
@@ -1114,9 +1128,14 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		// graph-aware reranker: its centrality and edge hydration costs scale
 		// with every candidate, not just the final response size.
 		ranked = limitExploreCandidates(ranked, fetch*2)
+		if content := s.gatherExploreQuotedContentCandidates(ctx, task, fetch, opts); len(content) > 0 {
+			ranked = mergeExploreCandidates(ranked, content, 0)
+			ranked = limitExploreCandidates(ranked, fetch*2)
+		}
 		if pipeline := eng.Rerank(); pipeline != nil {
 			ranked = pipeline.Rerank(searchQuery, ranked, rctx)
 		}
+		ranked = rerankExploreConceptCoverage(searchQuery, ranked)
 	} else {
 		ranked = eng.SearchSymbolsRanked(searchQuery, fetch, opts, rctx)
 	}
@@ -1213,6 +1232,9 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		}
 		n := c.Node
 		t := exploreTarget{node: n, score: c.Score}
+		if c.Signals != nil {
+			t.exactContent = c.Signals[exploreContentRecallExactSignal] > 0
+		}
 		if callers := eng.GetCallers(n.ID, ringOpts); callers != nil {
 			t.callers = ringNeighbors(callers.Nodes, n.ID, exploreRingCap)
 		}
@@ -1231,7 +1253,7 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		return mcp.NewToolResultText(s.renderExplore(task, targets, budget)), nil
 	}
 	answerReady := exploreAnswerReady(task, targets)
-	exactSymbol := exploreLocalizationExactTarget(task, targets)
+	exactSymbol := exploreLocalizationExplicitTarget(task, targets)
 	if !answerReady && exactSymbol == "" {
 		anchors := make([]string, 0, 3)
 		for _, target := range targets {
@@ -1277,9 +1299,17 @@ type localizationEvidence struct {
 	Source    string   `json:"source,omitempty"`
 }
 
-func (s *Server) completeEmptyLocalization(ctx context.Context, task string, budget int) *mcp.CallToolResult {
-	completion := newLocalizationCompletion(true, "")
-	s.localizationFor(ctx).armForTask(completion, task)
+func (s *Server) completeEmptyLocalization(ctx context.Context, _ string, budget int) *mcp.CallToolResult {
+	completion := localizationCompletion{
+		State:            localizationStateInactive,
+		Scope:            "localization",
+		RequiredAction:   "continue",
+		AllowedToolCalls: 0,
+	}
+	// An empty result supersedes any previous task contract but must not arm
+	// answer-ready or an exact-read allowance. Navigation remains available for
+	// the caller to continue investigation with a better anchor.
+	s.localizationFor(ctx).reset()
 	return newLocalizationExploreResult(completion, []exploreTarget{}, budget)
 }
 
@@ -2202,10 +2232,53 @@ func quotedLiteralIsNoise(content string) bool {
 	return false
 }
 
-// unicodeIsLetter is a tiny ASCII-fast letter check (the quoted-literal
-// rubric only needs letter-vs-not).
+// unicodeIsLetter uses Unicode categories so quoted identifiers and locale
+// values remain useful retrieval anchors in every indexed language.
 func unicodeIsLetter(r rune) bool {
-	return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || r > 127
+	return unicode.IsLetter(r)
+}
+
+func exploreLiteralWordRune(r rune) bool {
+	return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_'
+}
+
+// exploreTextHasExactLiteral distinguishes a true quoted-literal occurrence
+// from content_fts prefix recall (for example, `ku` must not be considered an
+// exact hit merely because the body contains `kubernetes`). SearchContent
+// snippets are unhighlighted, so a bounded case-folded substring scan with
+// Unicode-aware word boundaries is sufficient and does not read source again.
+func exploreTextHasExactLiteral(text, literal string) bool {
+	literal = strings.TrimSpace(literal)
+	if text == "" || literal == "" {
+		return false
+	}
+	text = strings.ToLower(text)
+	literal = strings.ToLower(literal)
+	first, _ := utf8.DecodeRuneInString(literal)
+	last, _ := utf8.DecodeLastRuneInString(literal)
+	for offset := 0; offset <= len(text)-len(literal); {
+		relative := strings.Index(text[offset:], literal)
+		if relative < 0 {
+			return false
+		}
+		start := offset + relative
+		end := start + len(literal)
+		beforeOK := true
+		if start > 0 && exploreLiteralWordRune(first) {
+			previous, _ := utf8.DecodeLastRuneInString(text[:start])
+			beforeOK = !exploreLiteralWordRune(previous)
+		}
+		afterOK := true
+		if end < len(text) && exploreLiteralWordRune(last) {
+			next, _ := utf8.DecodeRuneInString(text[end:])
+			afterOK = !exploreLiteralWordRune(next)
+		}
+		if beforeOK && afterOK {
+			return true
+		}
+		offset = start + 1
+	}
+	return false
 }
 
 // dropInertTokens removes commit-SHA-shaped hex and bare version tokens
@@ -2259,6 +2332,276 @@ func inlineLeadClause(task string) string {
 	return lead
 }
 
+const (
+	exploreContentRecallRankSignal  = "explore_content_rank"
+	exploreContentRecallTermSignal  = "explore_content_terms"
+	exploreContentRecallExactSignal = "explore_content_exact"
+	exploreQuotedRecallMaxTerms     = 3
+	exploreQuotedRecallMaxPerTerm   = 12
+)
+
+// exploreQuotedRecallTerms extracts only explicit, high-signal literal anchors
+// from prose. The ordinary symbol corpus intentionally excludes function bodies;
+// these literals are the bounded bridge to the existing source-content FTS for
+// errors, configuration values, protocol names, and other evidence that exists
+// only inside an implementation. Regex/pattern literals remain in the shaped
+// symbol query but are not sent to content recall because their punctuation
+// decomposes into noisy one-character terms.
+func exploreQuotedRecallTerms(task string) []string {
+	literals := make([]string, 0, exploreQuotedRecallMaxTerms)
+	for _, match := range reInlineQuoted.FindAllString(task, -1) {
+		if len(match) >= 2 {
+			literals = append(literals, match[1:len(match)-1])
+		}
+	}
+	// Backticks are common in agent-written tasks for exact config values and
+	// error fragments. Scan them without treating apostrophes in prose as quote
+	// delimiters.
+	for rest := task; ; {
+		start := strings.IndexByte(rest, '`')
+		if start < 0 {
+			break
+		}
+		rest = rest[start+1:]
+		end := strings.IndexByte(rest, '`')
+		if end < 0 {
+			break
+		}
+		literals = append(literals, rest[:end])
+		rest = rest[end+1:]
+	}
+
+	seen := make(map[string]struct{}, len(literals))
+	out := make([]string, 0, min(len(literals), exploreQuotedRecallMaxTerms))
+	for _, literal := range literals {
+		literal = strings.TrimSpace(literal)
+		if len(literal) < 2 || len(literal) > 128 || quotedLiteralIsNoise(literal) {
+			continue
+		}
+		key := strings.ToLower(literal)
+		if _, duplicate := seen[key]; duplicate {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, literal)
+		if len(out) >= exploreQuotedRecallMaxTerms {
+			break
+		}
+	}
+	return out
+}
+
+// gatherExploreQuotedContentCandidates performs at most three bounded indexed
+// point searches. It never scans source files and never materializes bodies:
+// content_fts returns symbol IDs, then one batched graph lookup supplies nodes.
+func (s *Server) gatherExploreQuotedContentCandidates(ctx context.Context, task string, limit int, scope query.QueryOptions) []*rerank.Candidate {
+	if s == nil || s.graph == nil || ctx.Err() != nil {
+		return nil
+	}
+	content, ok := s.graph.(graph.ContentSearcher)
+	if !ok {
+		return nil
+	}
+	terms := exploreQuotedRecallTerms(task)
+	if len(terms) == 0 {
+		return nil
+	}
+	perTerm := clampInt(limit/4, 4, exploreQuotedRecallMaxPerTerm)
+	repoPrefix := ""
+	if len(scope.RepoAllow) == 1 {
+		for prefix, allowed := range scope.RepoAllow {
+			if allowed {
+				repoPrefix = prefix
+			}
+		}
+	}
+	if repoPrefix == "" {
+		repoPrefix, _ = s.sessionLocality(ctx)
+	}
+
+	order := make([]string, 0, len(terms)*perTerm)
+	bestRank := make(map[string]int, len(terms)*perTerm)
+	termCount := make(map[string]int, len(terms)*perTerm)
+	exactHit := make(map[string]bool, len(terms)*perTerm)
+	for _, term := range terms {
+		if ctx.Err() != nil {
+			break
+		}
+		hits, err := content.SearchContent(term, repoPrefix, perTerm)
+		if err != nil {
+			continue
+		}
+		seenForTerm := make(map[string]struct{}, len(hits))
+		for rank, hit := range hits {
+			if hit.NodeID == "" {
+				continue
+			}
+			if _, duplicate := seenForTerm[hit.NodeID]; duplicate {
+				continue
+			}
+			seenForTerm[hit.NodeID] = struct{}{}
+			if previous, exists := bestRank[hit.NodeID]; !exists {
+				order = append(order, hit.NodeID)
+				bestRank[hit.NodeID] = rank
+			} else if rank < previous {
+				bestRank[hit.NodeID] = rank
+			}
+			termCount[hit.NodeID]++
+			if exploreTextHasExactLiteral(hit.Snippet, term) {
+				exactHit[hit.NodeID] = true
+			}
+		}
+	}
+	if len(order) == 0 {
+		return nil
+	}
+	nodes := s.graph.GetNodesByIDs(order)
+	candidates := make([]*rerank.Candidate, 0, len(order))
+	for _, id := range order {
+		node := nodes[id]
+		if node == nil || !scope.ScopeAllows(node) {
+			continue
+		}
+		rank := bestRank[id]
+		signals := map[string]float64{
+			exploreContentRecallRankSignal: 1 / float64(rank+1),
+			exploreContentRecallTermSignal: float64(termCount[id]),
+		}
+		if exactHit[id] {
+			signals[exploreContentRecallExactSignal] = 1
+		}
+		candidates = append(candidates, &rerank.Candidate{
+			Node:       node,
+			TextRank:   rank,
+			VectorRank: -1,
+			Signals:    signals,
+		})
+	}
+	return candidates
+}
+
+// rerankExploreConceptCoverage corrects the principal weakness of prefix-OR
+// symbol retrieval: one rare identifier can otherwise outrank an implementation
+// whose metadata covers several independent task concepts. Explicit anchors and
+// bounded exact body-literal hits remain strongest. Vector-backed candidates
+// retain their semantic ordering; coverage only reorders lexical-only rows.
+func rerankExploreConceptCoverage(query string, candidates []*rerank.Candidate) []*rerank.Candidate {
+	if rerank.ClassifyQuery(query) != rerank.QueryClassConcept || len(candidates) < 2 {
+		return candidates
+	}
+	queryTerms := exploreTerminalTerms(query)
+	if len(queryTerms) < 2 {
+		return candidates
+	}
+	type evidence struct {
+		explicit     bool
+		exactContent bool
+		overlap      int
+		contentTerms float64
+		contentRank  float64
+	}
+	metrics := make(map[*rerank.Candidate]evidence, len(candidates))
+	for _, candidate := range candidates {
+		if candidate == nil || candidate.Node == nil {
+			continue
+		}
+		retrieval := candidate.Node.RetrievalMetadata()
+		doc := retrieval.Doc
+		if len(doc) > 768 {
+			doc = doc[:768]
+		}
+		// Candidate-side token maps are disproportionately expensive on the
+		// 80-row over-fetch window. Query terms are already normalized and at
+		// least three bytes long; a lowercase retrieval projection plus bounded
+		// substring checks preserves camelCase/path matching with no per-term
+		// allocations.
+		text := strings.ToLower(strings.Join([]string{
+			candidate.Node.Name, retrieval.QualName, nodeDisplayPath(candidate.Node),
+			retrieval.Signature, doc,
+		}, " "))
+		overlap := 0
+		for term := range queryTerms {
+			if strings.Contains(text, term) {
+				overlap++
+			}
+		}
+		metric := evidence{explicit: exploreLocalizationExplicitAnchor(query, candidate.Node), overlap: overlap}
+		if candidate.Signals != nil {
+			metric.contentTerms = candidate.Signals[exploreContentRecallTermSignal]
+			metric.contentRank = candidate.Signals[exploreContentRecallRankSignal]
+			metric.exactContent = candidate.Signals[exploreContentRecallExactSignal] > 0
+		}
+		metrics[candidate] = metric
+	}
+	coverageTier := func(overlap int) int {
+		switch {
+		case overlap >= 4:
+			return 3
+		case overlap >= 2:
+			return 2
+		case overlap == 1:
+			return 1
+		default:
+			return 0
+		}
+	}
+	priorityTier := func(candidate *rerank.Candidate) int {
+		metric := metrics[candidate]
+		if metric.explicit {
+			return 2
+		}
+		if metric.exactContent {
+			return 1
+		}
+		return 0
+	}
+	// Explicit anchors and verified full quoted literals may cross semantic
+	// candidates. All other coverage evidence only reorders lexical-only slots,
+	// preserving both the positions and relative order learned by the vector
+	// pipeline.
+	sort.SliceStable(candidates, func(i, j int) bool {
+		return priorityTier(candidates[i]) > priorityTier(candidates[j])
+	})
+	priorityEnd := 0
+	for priorityEnd < len(candidates) && priorityTier(candidates[priorityEnd]) > 0 {
+		priorityEnd++
+	}
+	positions := make([]int, 0, len(candidates)-priorityEnd)
+	lexical := make([]*rerank.Candidate, 0, len(candidates)-priorityEnd)
+	for i := priorityEnd; i < len(candidates); i++ {
+		candidate := candidates[i]
+		if candidate != nil && candidate.VectorRank < 0 {
+			positions = append(positions, i)
+			lexical = append(lexical, candidate)
+		}
+	}
+	sort.SliceStable(lexical, func(i, j int) bool {
+		a, b := lexical[i], lexical[j]
+		am, bm := metrics[a], metrics[b]
+		if am.contentTerms != bm.contentTerms {
+			return am.contentTerms > bm.contentTerms
+		}
+		if am.contentRank != bm.contentRank {
+			return am.contentRank > bm.contentRank
+		}
+		at, bt := coverageTier(am.overlap), coverageTier(bm.overlap)
+		if at != bt {
+			return at > bt
+		}
+		if am.overlap != bm.overlap {
+			return am.overlap > bm.overlap
+		}
+		if a.Score != b.Score {
+			return a.Score > b.Score
+		}
+		return false
+	})
+	for i, position := range positions {
+		candidates[position] = lexical[i]
+	}
+	return candidates
+}
+
 // mergeExploreCandidates unions retrieval passes by symbol ID without mutating
 // either input. Expansion text ranks are offset so a reduced concept bag can
 // add recall without claiming the same authority as the original query.
@@ -2286,6 +2629,19 @@ func mergeExploreCandidates(primary, expanded []*rerank.Candidate, expansionRank
 			}
 			if clone.VectorRank >= 0 && (current.VectorRank < 0 || clone.VectorRank < current.VectorRank) {
 				current.VectorRank = clone.VectorRank
+			}
+			// Request-local recall annotations survive dedup when a source-body
+			// hit names a symbol already present in the ordinary metadata channel.
+			for _, key := range []string{exploreContentRecallRankSignal, exploreContentRecallTermSignal, exploreContentRecallExactSignal} {
+				if clone.Signals == nil || clone.Signals[key] <= 0 {
+					continue
+				}
+				if current.Signals == nil {
+					current.Signals = make(map[string]float64, 2)
+				}
+				if clone.Signals[key] > current.Signals[key] {
+					current.Signals[key] = clone.Signals[key]
+				}
 			}
 			return
 		}

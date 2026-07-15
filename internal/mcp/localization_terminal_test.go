@@ -75,11 +75,24 @@ func TestCompleteEmptyLocalizationReplacesPriorContract(t *testing.T) {
 			t.Fatalf("%s = %#v, want empty array", field, envelope[field])
 		}
 	}
-	if _, blocked := terminal.beginLocalize("Locate B", false); blocked == nil {
-		t.Fatal("empty localization did not arm the new task contract")
+	completion, ok := envelope["completion"].(map[string]any)
+	if !ok {
+		t.Fatalf("completion = %#v, want object", envelope["completion"])
 	}
-	if _, blocked := terminal.beginLocalize("Locate A", false); blocked == nil {
-		t.Fatal("task text bypassed the active localization contract")
+	if state, _ := completion["state"].(string); state != localizationStateInactive {
+		t.Fatalf("empty completion state = %q, want inactive", state)
+	}
+	if action, _ := completion["required_action"].(string); action != "continue" {
+		t.Fatalf("empty completion action = %q, want continue", action)
+	}
+	terminal.mu.Lock()
+	state, exact := terminal.state, terminal.exactSymbol
+	terminal.mu.Unlock()
+	if state != localizationStateInactive || exact != "" {
+		t.Fatalf("empty localization armed terminal state=%q exact=%q", state, exact)
+	}
+	if blocked := terminal.block("search", "symbols", map[string]any{"query": "better anchor"}); blocked != nil {
+		t.Fatalf("empty localization blocked continued investigation: %v", blocked)
 	}
 }
 
