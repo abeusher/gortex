@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -73,20 +74,29 @@ func (s *Server) registerExploreTool() {
 	)
 }
 
-// exploreTarget is one ranked candidate plus its 1-hop neighborhood,
+// exploreTarget is one ranked candidate plus its bounded neighborhood,
 // gathered before rendering so the renderer can honour the token budget.
 type exploreTarget struct {
-	node         *graph.Node
-	score        float64
-	callers      []*graph.Node
-	callees      []*graph.Node
-	source       string // full body (may be empty for non-source kinds)
-	exactContent bool   // verified full quoted-literal hit from content_fts
+	node          *graph.Node
+	score         float64
+	callers       []*graph.Node
+	callees       []*graph.Node
+	causalCallees []exploreCausalNeighbor
+	source        string // full body (may be empty for non-source kinds)
+	exactContent  bool   // verified full quoted-literal hit from content_fts
+}
+
+type exploreCausalNeighbor struct {
+	node *graph.Node
+	hop  int
 }
 
 const (
-	exploreDraftPrimaryLimit = 3
-	exploreDraftTotalLimit   = 5
+	exploreCausalSeedLimit       = 3
+	exploreCausalDepth           = 4
+	exploreCausalAdmissionBudget = 10 * time.Millisecond
+	exploreDraftPrimaryLimit     = 3
+	exploreDraftTotalLimit       = 5
 )
 
 type exploreDraftEntry struct {
@@ -104,6 +114,7 @@ type exploreDraftEntry struct {
 	structuralLocal     bool
 	structuralCallee    bool
 	structuralCrossFile bool
+	structuralHop       int
 	parentExact         bool
 	parentOverlap       int
 	parentRank          int
@@ -231,6 +242,83 @@ func exploreQueryHasPathSymbolAnchor(query string, n *graph.Node) bool {
 		}
 	}
 	return false
+}
+
+func exploreAdmitCausalSeed(conceptTask, explicit, strong bool, admitted int, elapsed time.Duration) bool {
+	return conceptTask && !explicit && strong && admitted < exploreCausalSeedLimit && elapsed < exploreCausalAdmissionBudget
+}
+
+func exploreStrongCausalSeed(query string, target exploreTarget) bool {
+	n := target.node
+	if n == nil || (n.Kind != graph.KindFunction && n.Kind != graph.KindMethod) || exploreDraftIsTestNode(n) || exploreIdentifierSegmentCount(n.Name) < 2 {
+		return false
+	}
+	queryTerms := exploreTerminalTerms(query)
+	overlap, longest := exploreDraftTermOverlap(queryTerms, n)
+	bodyOverlap := exploreDraftTermSetOverlap(queryTerms, exploreTerminalTerms(target.source))
+	return overlap >= 2 || bodyOverlap >= 2 || (overlap == 1 && longest >= 5)
+}
+
+// minimumExploreCausalHops derives a deterministic, bounded reachable set from
+// the edges already returned by GetCallChain. It never re-queries the graph:
+// the traversal cost is linear in the at-most-limit subgraph admitted above.
+func minimumExploreCausalHops(seedID string, sg *query.SubGraph, scope query.QueryOptions, maxDepth, limit int) []exploreCausalNeighbor {
+	if seedID == "" || sg == nil || maxDepth < 1 || limit < 1 {
+		return nil
+	}
+	nodes := make(map[string]*graph.Node, len(sg.Nodes))
+	for _, n := range sg.Nodes {
+		if n != nil && n.ID != "" {
+			nodes[n.ID] = n
+		}
+	}
+	adjacent := make(map[string][]string, len(sg.Edges))
+	for _, edge := range sg.Edges {
+		if edge == nil || (edge.Kind != graph.EdgeCalls && edge.Kind != graph.EdgeMatches) || edge.From == "" || edge.To == "" {
+			continue
+		}
+		adjacent[edge.From] = append(adjacent[edge.From], edge.To)
+	}
+	for from := range adjacent {
+		sort.Strings(adjacent[from])
+	}
+
+	hops := map[string]int{seedID: 0}
+	queue := []string{seedID}
+	result := make([]exploreCausalNeighbor, 0, min(limit, len(nodes)))
+	for head := 0; head < len(queue); head++ {
+		from := queue[head]
+		fromHop := hops[from]
+		if fromHop >= maxDepth {
+			continue
+		}
+		for _, to := range adjacent[from] {
+			if _, seen := hops[to]; seen {
+				continue
+			}
+			n := nodes[to]
+			if n == nil || !exploreNodeWithinQueryScope(n, scope) {
+				continue
+			}
+			hop := fromHop + 1
+			hops[to] = hop
+			queue = append(queue, to)
+			if exploreDraftIsTestNode(n) || (n.Kind != graph.KindFunction && n.Kind != graph.KindMethod) {
+				continue
+			}
+			result = append(result, exploreCausalNeighbor{node: n, hop: hop})
+		}
+	}
+	sort.SliceStable(result, func(i, j int) bool {
+		if result[i].hop != result[j].hop {
+			return result[i].hop < result[j].hop
+		}
+		return exploreDraftNodeKey(result[i].node) < exploreDraftNodeKey(result[j].node)
+	})
+	if len(result) > limit {
+		result = result[:limit]
+	}
+	return result
 }
 
 func exploreAnswerDraft(task string, targets []exploreTarget) []exploreDraftEntry {
@@ -379,16 +467,16 @@ func exploreAnswerDraft(task string, targets []exploreTarget) []exploreDraftEntr
 		if !strongParent || (!parent.exact && exploreIdentifierSegmentCount(target.node.Name) < 2) {
 			continue
 		}
-		collectStructural := func(n *graph.Node, evidence string, callee bool) {
-			if n == nil || exploreDraftIsTestNode(n) || (n.Kind != graph.KindFunction && n.Kind != graph.KindMethod) || exploreIdentifierSegmentCount(n.Name) < 3 {
+		collectStructural := func(n *graph.Node, evidence string, callee bool, hop int) {
+			if n == nil || exploreDraftIsTestNode(n) || (n.Kind != graph.KindFunction && n.Kind != graph.KindMethod) || (hop <= 1 && exploreIdentifierSegmentCount(n.Name) < 3) {
 				return
 			}
 			entry, _ := makeEntry(n, "", evidence, false, i)
 			shared, local := exploreStructuralSignals(target.node, n)
 			crossFile := nodeDisplayPath(target.node) != nodeDisplayPath(n)
 			// A concrete cross-file callee is causal graph evidence even when its
-			// name shares no useful query token with the parent. This is the path
-			// from orchestration methods to the implementation agents need to read.
+			// name shares no useful query token with the parent. Multi-hop nodes
+			// compete for the same single structural slot as direct neighbors.
 			causalCrossFile := callee && crossFile
 			if shared == 0 && !entry.exact && entry.overlap == 0 && entry.bodyOverlap == 0 && !local && !causalCrossFile {
 				return
@@ -398,15 +486,19 @@ func exploreAnswerDraft(task string, targets []exploreTarget) []exploreDraftEntr
 			entry.structuralLocal = local
 			entry.structuralCallee = callee
 			entry.structuralCrossFile = crossFile
+			entry.structuralHop = hop
 			entry.parentExact = parent.exact
 			entry.parentOverlap = parent.overlap
 			structuralNeighbors = append(structuralNeighbors, entry)
 		}
 		for _, n := range target.callers {
-			collectStructural(n, fmt.Sprintf("caller of ranked #%d", i+1), false)
+			collectStructural(n, fmt.Sprintf("caller of ranked #%d", i+1), false, 1)
 		}
 		for _, n := range target.callees {
-			collectStructural(n, fmt.Sprintf("callee of ranked #%d", i+1), true)
+			collectStructural(n, fmt.Sprintf("callee of ranked #%d", i+1), true, 1)
+		}
+		for _, neighbor := range target.causalCallees {
+			collectStructural(neighbor.node, fmt.Sprintf("%d-hop callee of ranked #%d", neighbor.hop, i+1), true, neighbor.hop)
 		}
 	}
 
@@ -523,6 +615,9 @@ func exploreStructuralEntryLess(a, b exploreDraftEntry) bool {
 	}
 	if a.structuralCrossFile != b.structuralCrossFile {
 		return a.structuralCrossFile
+	}
+	if a.structuralHop != b.structuralHop {
+		return a.structuralHop < b.structuralHop
 	}
 	if a.structuralLocal != b.structuralLocal {
 		return a.structuralLocal
@@ -1225,6 +1320,20 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		Depth: 1, Limit: exploreRingCap * 3, Detail: "brief",
 		WorkspaceID: resolved.WorkspaceID, ProjectID: resolved.ProjectID, RepoAllow: resolved.RepoAllow,
 	}
+	explicitTarget := false
+	if _, hasPath := exploreQueryPathAnchors(searchQuery); hasPath {
+		explicitTarget = true
+	}
+	if !explicitTarget {
+		for _, c := range cands {
+			if c != nil && c.Node != nil && exploreLocalizationExplicitAnchor(searchQuery, c.Node) {
+				explicitTarget = true
+				break
+			}
+		}
+	}
+	causalAdmitted := 0
+	var causalElapsed time.Duration
 	targets := make([]exploreTarget, 0, len(cands))
 	for _, c := range cands {
 		if c == nil || c.Node == nil {
@@ -1235,13 +1344,48 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		if c.Signals != nil {
 			t.exactContent = c.Signals[exploreContentRecallExactSignal] > 0
 		}
+		t.source = s.manifestSymbolSource(ctx, n)
 		if callers := eng.GetCallers(n.ID, ringOpts); callers != nil {
 			t.callers = ringNeighbors(callers.Nodes, n.ID, exploreRingCap)
 		}
-		if callees := eng.GetCallChain(n.ID, ringOpts); callees != nil {
-			t.callees = ringNeighbors(callees.Nodes, n.ID, exploreRingCap)
+
+		calleeOpts := ringOpts
+		expanded := exploreAdmitCausalSeed(
+			queryClass == rerank.QueryClassConcept,
+			explicitTarget,
+			exploreStrongCausalSeed(searchQuery, t),
+			causalAdmitted,
+			causalElapsed,
+		)
+		if expanded {
+			calleeOpts.Depth = exploreCausalDepth
+			causalAdmitted++
 		}
-		t.source = s.manifestSymbolSource(ctx, n)
+		started := time.Now()
+		callees := eng.GetCallChain(n.ID, calleeOpts)
+		if expanded {
+			causalElapsed += time.Since(started)
+		}
+		if callees != nil {
+			if expanded {
+				neighbors := minimumExploreCausalHops(n.ID, callees, opts, exploreCausalDepth, ringOpts.Limit)
+				direct := make([]*graph.Node, 0, exploreRingCap)
+				for _, neighbor := range neighbors {
+					if neighbor.hop == 1 {
+						direct = append(direct, neighbor.node)
+					} else {
+						t.causalCallees = append(t.causalCallees, neighbor)
+					}
+				}
+				if len(neighbors) > 0 {
+					t.callees = ringNeighbors(direct, n.ID, exploreRingCap)
+				} else {
+					t.callees = ringNeighbors(callees.Nodes, n.ID, exploreRingCap)
+				}
+			} else {
+				t.callees = ringNeighbors(callees.Nodes, n.ID, exploreRingCap)
+			}
+		}
 		targets = append(targets, t)
 	}
 	// Direct retrieval owns the ranked head. Once graph promotion has selected
