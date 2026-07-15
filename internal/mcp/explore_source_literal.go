@@ -72,18 +72,32 @@ func (s *Server) gatherExploreSourceLiteralRecall(
 	}
 
 	started := time.Now()
-	searchCtx, cancel := context.WithTimeout(ctx, exploreSourceLiteralRecallBudget)
-	defer cancel()
+	searchCtx, cancelSearch := context.WithTimeout(ctx, exploreSourceLiteralRecallBudget)
 	search := s.searchExploreSourceLiteral(searchCtx, term, repoPrefix, scope)
+	searchErr := searchCtx.Err()
+	cancelSearch()
 	if ctx.Err() != nil {
 		return exploreSourceLiteralRecall{}
 	}
-	recall := s.mapExploreSourceLiteralMatchesContext(searchCtx, term, search.matches, scope)
-	recall.ambiguous = recall.ambiguous || search.incomplete || searchCtx.Err() != nil
+
+	// Discovery and graph mapping have independent bounded phases. A backend
+	// may return useful partial matches as its deadline expires; reusing that
+	// expired context would discard those matches before they can be mapped to
+	// enclosing symbols. The request context remains the parent bound, while
+	// each phase gets the same small local budget.
+	recall, mappingErr := s.mapDiscoveredExploreSourceLiteralMatches(
+		ctx, term, search, scope, searchErr,
+	)
 	if s.logger != nil {
 		contextError := ""
-		if err := searchCtx.Err(); err != nil {
-			contextError = err.Error()
+		if searchErr != nil {
+			contextError = "search: " + searchErr.Error()
+		}
+		if mappingErr != nil {
+			if contextError != "" {
+				contextError += "; "
+			}
+			contextError += "mapping: " + mappingErr.Error()
 		}
 		firstMatchPath := ""
 		if len(search.matches) > 0 {
@@ -109,6 +123,21 @@ func (s *Server) gatherExploreSourceLiteralRecall(
 		}
 	}
 	return recall
+}
+
+func (s *Server) mapDiscoveredExploreSourceLiteralMatches(
+	ctx context.Context,
+	term string,
+	search exploreSourceLiteralSearch,
+	scope query.QueryOptions,
+	discoveryErr error,
+) (exploreSourceLiteralRecall, error) {
+	mappingCtx, cancelMapping := context.WithTimeout(ctx, exploreSourceLiteralRecallBudget)
+	recall := s.mapExploreSourceLiteralMatchesContext(mappingCtx, term, search.matches, scope)
+	mappingErr := mappingCtx.Err()
+	cancelMapping()
+	recall.ambiguous = recall.ambiguous || search.incomplete || discoveryErr != nil || mappingErr != nil
+	return recall, mappingErr
 }
 
 func (s *Server) mapExploreSourceLiteralMatches(

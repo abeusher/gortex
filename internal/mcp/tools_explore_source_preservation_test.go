@@ -50,12 +50,43 @@ func TestSelectFinalExploreCandidatesPreservesSourceLiteralAfterRerank(t *testin
 	selected := selectFinalExploreCandidates(prod, tests, 3)
 
 	require.Len(t, selected, 3)
-	require.Equal(t, []string{"primary-0", "primary-1", "source"}, []string{
+	require.Equal(t, []string{"source", "primary-0", "primary-1"}, []string{
 		selected[0].Node.ID,
 		selected[1].Node.ID,
 		selected[2].Node.ID,
 	})
 	require.Nil(t, candidateByID(selected, "test"), "source reservation must replace, not widen, the production cap")
+}
+
+func TestSelectFinalExploreCandidatesPromotesCompleteSourceForReversedInput(t *testing.T) {
+	for name, prod := range map[string][]*rerank.Candidate{
+		"source-last": {
+			sourcePreservationCandidate("primary", 0, 0),
+			sourcePreservationCandidate("source", 1, 1),
+		},
+		"source-first": {
+			sourcePreservationCandidate("source", 1, 1),
+			sourcePreservationCandidate("primary", 0, 0),
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			selected := selectFinalExploreCandidates(prod, nil, 2)
+			require.Len(t, selected, 2)
+			require.Equal(t, "source", selected[0].Node.ID)
+		})
+	}
+}
+
+func TestSelectFinalExploreCandidatesKeepsAmbiguousSourceBehindOrdinaryHead(t *testing.T) {
+	primary := sourcePreservationCandidate("primary", 0, 0)
+	ambiguous := sourcePreservationCandidate("source", 1, 1)
+	ambiguous.Signals[exploreContentRecallAmbiguousSignal] = 1
+
+	selected := selectFinalExploreCandidates([]*rerank.Candidate{primary, ambiguous}, nil, 2)
+
+	require.Len(t, selected, 2)
+	require.Equal(t, "primary", selected[0].Node.ID)
+	require.Equal(t, "source", selected[1].Node.ID)
 }
 
 func TestSelectFinalExploreCandidatesKeepsSettledProductionOrder(t *testing.T) {

@@ -3574,6 +3574,34 @@ func reserveExploreSourceLiteralCandidate(candidates, bounded []*rerank.Candidat
 	return reserved
 }
 
+// promoteExploreSourceLiteralCandidate moves the strongest complete source
+// literal hit to the ranked head after final selection. Deadline-truncated or
+// otherwise ambiguous evidence remains in the bounded set but cannot displace
+// the ordinary retrieval head.
+func promoteExploreSourceLiteralCandidate(candidates []*rerank.Candidate) []*rerank.Candidate {
+	bestIndex := -1
+	bestSignal := 0.0
+	for index, candidate := range candidates {
+		if candidate == nil || candidate.Node == nil || candidate.Signals == nil ||
+			candidate.Signals[exploreContentRecallAmbiguousSignal] > 0 {
+			continue
+		}
+		if signal := candidate.Signals[exploreSourceLiteralSignal]; signal > bestSignal {
+			bestIndex = index
+			bestSignal = signal
+		}
+	}
+	if bestIndex <= 0 {
+		return candidates
+	}
+
+	promoted := append([]*rerank.Candidate(nil), candidates...)
+	best := promoted[bestIndex]
+	copy(promoted[1:bestIndex+1], promoted[:bestIndex])
+	promoted[0] = best
+	return promoted
+}
+
 // selectFinalExploreCandidates applies the source-literal reservation at the
 // last production boundary, after every reranker and concept reservation has
 // settled candidate order. The source hit replaces the weakest bounded
@@ -3590,14 +3618,14 @@ func selectFinalExploreCandidates(prod, test []*rerank.Candidate, maxSymbols int
 		cands = cands[:maxSymbols]
 	}
 	cands = reserveExploreSourceLiteralCandidate(prod, cands)
-	if len(cands) >= maxSymbols {
-		return cands
+	if len(cands) < maxSymbols {
+		room := maxSymbols - len(cands)
+		if room > len(test) {
+			room = len(test)
+		}
+		cands = append(cands, test[:room]...)
 	}
-	room := maxSymbols - len(cands)
-	if room > len(test) {
-		room = len(test)
-	}
-	return append(cands, test[:room]...)
+	return promoteExploreSourceLiteralCandidate(cands)
 }
 
 // exploreConceptRecallTerms preserves the query's discriminative concepts in

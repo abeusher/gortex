@@ -212,6 +212,31 @@ func TestMapExploreSourceLiteralMatchesHardCapsRecall(t *testing.T) {
 	require.True(t, recall.ambiguous)
 }
 
+func TestMapDiscoveredExploreSourceLiteralMatchesPreservesHitsAfterDiscoveryDeadline(t *testing.T) {
+	path := "demo/src/FormatterRegistry.cs"
+	constructor := sourceLiteralNode(
+		"demo/src/FormatterRegistry.cs::FormatterRegistry", "FormatterRegistry.<init>",
+		path, graph.KindMethod, 2, 4,
+	)
+	server := newExploreSourceLiteralServer(t, []*graph.Node{constructor})
+	search := exploreSourceLiteralSearch{
+		matches: []trigram.Match{{
+			Path: path, Line: 3, Text: `RegisterDefaultFormatter("ku");`,
+		}},
+		incomplete: true,
+	}
+
+	recall, mappingErr := server.mapDiscoveredExploreSourceLiteralMatches(
+		context.Background(), "ku", search,
+		query.QueryOptions{RepoAllow: map[string]bool{"demo": true}},
+		context.DeadlineExceeded,
+	)
+
+	require.NoError(t, mappingErr)
+	require.Equal(t, []exploreSourceLiteralHit{{nodeID: constructor.ID, rank: 0}}, recall.hits)
+	require.True(t, recall.ambiguous, "deadline-truncated discovery must remain non-terminal")
+}
+
 func TestExploreHighestInformationQuotedLiteral(t *testing.T) {
 	require.Equal(t, "registration-key", exploreHighestInformationQuotedLiteral([]string{"ku", "日本", "registration-key"}))
 	require.Empty(t, exploreHighestInformationQuotedLiteral(nil))
