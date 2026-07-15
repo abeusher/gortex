@@ -50,6 +50,39 @@ func TestMapExploreSourceLiteralMatchesFindsCSharpConstructor(t *testing.T) {
 	require.False(t, recall.ambiguous)
 }
 
+func TestMapExploreSourceLiteralMatchesFallsBackToSingleRepoUnprefixedPath(t *testing.T) {
+	graphPath := "src/Humanizer/Configuration/FormatterRegistry.cs"
+	matchPath := "humanizer-1059/" + graphPath
+	class := sourceLiteralNode("src/FormatterRegistry.cs::FormatterRegistry#type", "FormatterRegistry", graphPath, graph.KindType, 5, 66)
+	constructor := sourceLiteralNode("src/FormatterRegistry.cs::FormatterRegistry", "FormatterRegistry", graphPath, graph.KindMethod, 7, 55)
+	class.RepoPrefix = ""
+	constructor.RepoPrefix = ""
+	server := newExploreSourceLiteralServer(t, []*graph.Node{class, constructor})
+
+	recall := server.mapExploreSourceLiteralMatches("ku", []trigram.Match{{
+		Path: matchPath, Line: 24, Text: `RegisterDefaultFormatter("ku");`,
+	}}, query.QueryOptions{RepoAllow: map[string]bool{"humanizer-1059": true}})
+
+	require.Equal(t, []exploreSourceLiteralHit{{nodeID: constructor.ID, rank: 0}}, recall.hits)
+	require.False(t, recall.ambiguous)
+}
+
+func TestMapExploreSourceLiteralMatchesPrefersExactPathOverAlias(t *testing.T) {
+	graphPath := "src/Humanizer/Configuration/FormatterRegistry.cs"
+	matchPath := "humanizer-1059/" + graphPath
+	alias := sourceLiteralNode("alias::FormatterRegistry", "AliasFormatterRegistry", graphPath, graph.KindMethod, 7, 55)
+	alias.RepoPrefix = ""
+	exact := sourceLiteralNode("exact::FormatterRegistry", "ExactFormatterRegistry", matchPath, graph.KindMethod, 7, 55)
+	exact.RepoPrefix = "humanizer-1059"
+	server := newExploreSourceLiteralServer(t, []*graph.Node{alias, exact})
+
+	recall := server.mapExploreSourceLiteralMatches("ku", []trigram.Match{{
+		Path: matchPath, Line: 24, Text: `RegisterDefaultFormatter("ku");`,
+	}}, query.QueryOptions{RepoAllow: map[string]bool{"humanizer-1059": true}})
+
+	require.Equal(t, []exploreSourceLiteralHit{{nodeID: exact.ID, rank: 0}}, recall.hits)
+}
+
 func TestMapExploreSourceLiteralMatchesChoosesSmallestEnclosingSymbol(t *testing.T) {
 	path := "demo/src/Registry.cs"
 	typeNode := sourceLiteralNode("demo/Registry.cs::Registry#type", "Registry", path, graph.KindType, 1, 80)

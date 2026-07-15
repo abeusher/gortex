@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -83,10 +84,22 @@ func (s *Server) mapExploreSourceLiteralMatches(
 		matches = matches[:exploreSourceLiteralRecallMaxHits]
 	}
 
-	paths := make(map[string]struct{}, len(matches))
+	// Multi-repo grep stamps paths with the repository prefix. During an
+	// isolated single-repo session the graph can still contain unprefixed file
+	// paths, so admit one exact, scope-derived alias into the same index build.
+	// Exact paths remain authoritative; this is not a fuzzy suffix match and it
+	// does not add another AllNodes scan.
+	repoPrefix := exploreSourceLiteralSingleRepoPrefix(scope)
+	paths := make(map[string]struct{}, len(matches)*2)
+	aliases := make(map[string]string, len(matches))
 	for _, match := range matches {
-		if exploreTextHasExactLiteral(match.Text, term) {
-			paths[match.Path] = struct{}{}
+		if !exploreTextHasExactLiteral(match.Text, term) {
+			continue
+		}
+		paths[match.Path] = struct{}{}
+		if alias := exploreSourceLiteralUnprefixedPath(match.Path, repoPrefix); alias != "" {
+			paths[alias] = struct{}{}
+			aliases[match.Path] = alias
 		}
 	}
 	indexes := s.buildFileSymbolIndexForPaths(paths)
@@ -97,6 +110,9 @@ func (s *Server) mapExploreSourceLiteralMatches(
 			continue
 		}
 		index := indexes[match.Path]
+		if index == nil {
+			index = indexes[aliases[match.Path]]
+		}
 		if index == nil {
 			continue
 		}
@@ -114,6 +130,32 @@ func (s *Server) mapExploreSourceLiteralMatches(
 		hits:      hits,
 		ambiguous: saturated || len(hits) > 1,
 	}
+}
+
+func exploreSourceLiteralSingleRepoPrefix(scope query.QueryOptions) string {
+	prefix := ""
+	for candidate, allowed := range scope.RepoAllow {
+		if !allowed {
+			continue
+		}
+		candidate = strings.TrimSuffix(strings.TrimSpace(candidate), "/")
+		if candidate == "" {
+			continue
+		}
+		if prefix != "" && prefix != candidate {
+			return ""
+		}
+		prefix = candidate
+	}
+	return prefix
+}
+
+func exploreSourceLiteralUnprefixedPath(path, repoPrefix string) string {
+	marker := repoPrefix + "/"
+	if repoPrefix == "" || !strings.HasPrefix(path, marker) || len(path) == len(marker) {
+		return ""
+	}
+	return strings.TrimPrefix(path, marker)
 }
 
 // searchExploreSourceLiteral mirrors search_text's literal backend while
