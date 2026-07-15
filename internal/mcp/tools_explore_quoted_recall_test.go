@@ -95,7 +95,7 @@ func TestGatherExploreQuotedContentCandidatesRetriesOneSaturatedTermWithinBounds
 	}
 	server, store := newQuotedRecallCountingServer(t, hits)
 	candidates := server.gatherExploreQuotedContentCandidates(
-		context.Background(), `find registration for "ku", "aa", and "zz"`, 20,
+		context.Background(), `find registration for "ku", "aa", and "zz"`, nil, 20,
 		query.QueryOptions{RepoAllow: map[string]bool{"demo": true}},
 	)
 
@@ -122,7 +122,7 @@ func TestGatherExploreQuotedContentCandidatesKeepsUniqueExactFastPath(t *testing
 	}
 	server, store := newQuotedRecallCountingServer(t, hits)
 	candidates := server.gatherExploreQuotedContentCandidates(
-		context.Background(), `find locale "日本"`, 16,
+		context.Background(), `find locale "日本"`, nil, 16,
 		query.QueryOptions{RepoAllow: map[string]bool{"demo": true}},
 	)
 

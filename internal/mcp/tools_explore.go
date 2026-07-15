@@ -1634,7 +1634,7 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		// graph-aware reranker: its centrality and edge hydration costs scale
 		// with every candidate, not just the final response size.
 		ranked = limitExploreCandidates(ranked, fetch*2)
-		if content := s.gatherExploreQuotedContentCandidates(ctx, task, fetch, opts); len(content) > 0 {
+		if content := s.gatherExploreQuotedContentCandidates(ctx, task, ranked, fetch, opts); len(content) > 0 {
 			ranked = mergeExploreCandidates(ranked, content, 0)
 			ranked = limitExploreCandidatesPreservingSourceLiteral(ranked, fetch*2)
 		}
@@ -1651,7 +1651,7 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		// supplies at most one candidate per matching file, and the final
 		// source-evidence reservation keeps its strongest result without
 		// reranking the already-ranked primary channel a second time.
-		if content := s.gatherExploreQuotedContentCandidates(ctx, task, fetch, opts); len(content) > 0 {
+		if content := s.gatherExploreQuotedContentCandidates(ctx, task, ranked, fetch, opts); len(content) > 0 {
 			ranked = mergeExploreCandidates(ranked, content, 0)
 			ranked = limitExploreCandidatesPreservingSourceLiteral(ranked, fetch*2)
 		}
@@ -3016,11 +3016,57 @@ func exploreQuotedRecallTerms(task string) []string {
 	return out
 }
 
+func exploreQuotedRecallHasExactSourceCandidate(
+	task string,
+	terms []string,
+	candidates []*rerank.Candidate,
+	scope query.QueryOptions,
+) bool {
+	for _, candidate := range candidates {
+		if candidate != nil && exploreQuotedRecallHasExactSourceNode(task, terms, candidate.Node, scope) {
+			return true
+		}
+	}
+	return false
+}
+
+func exploreQuotedRecallHasExactSourceNode(
+	task string,
+	terms []string,
+	node *graph.Node,
+	scope query.QueryOptions,
+) bool {
+	if node == nil || nodeDisplayPath(node) == "" || !scope.ScopeAllows(node) ||
+		!exploreLocalizableKind(node.Kind) || !exploreCodeDefinitionKind(node.Kind) {
+		return false
+	}
+	if exploreLocalizationExplicitAnchor(task, node) {
+		return true
+	}
+	retrieval := node.RetrievalMetadata()
+	fields := [...]string{node.Name, retrieval.QualName, retrieval.Signature}
+	for _, term := range terms {
+		for _, field := range fields {
+			if exploreTextHasExactLiteral(field, term) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // gatherExploreQuotedContentCandidates performs at most four bounded content
-// searches (three literals plus one adaptive retry) and one separately bounded
-// source-literal lookup. Both paths return symbol IDs before one batched graph
-// hydration; neither builds or persists a new index.
-func (s *Server) gatherExploreQuotedContentCandidates(ctx context.Context, task string, limit int, scope query.QueryOptions) []*rerank.Candidate {
+// searches (three literals plus one adaptive retry). It scans source bodies only
+// when neither the ordinary nor content channels already contain an exact,
+// localizable code symbol. The fallback is request-local and never persists a
+// source-body index.
+func (s *Server) gatherExploreQuotedContentCandidates(
+	ctx context.Context,
+	task string,
+	ordinary []*rerank.Candidate,
+	limit int,
+	scope query.QueryOptions,
+) []*rerank.Candidate {
 	if s == nil || s.graph == nil || ctx.Err() != nil {
 		return nil
 	}
@@ -3137,17 +3183,32 @@ func (s *Server) gatherExploreQuotedContentCandidates(ctx context.Context, task 
 			}
 		}
 	}
+	nodes := make(map[string]*graph.Node, len(order))
+	if len(order) > 0 {
+		nodes = s.graph.GetNodesByIDs(order)
+	}
+	exactSourceFound := exploreQuotedRecallHasExactSourceCandidate(task, terms, ordinary, scope)
+	if !exactSourceFound {
+		for _, id := range order {
+			if exploreQuotedRecallHasExactSourceNode(task, terms, nodes[id], scope) {
+				exactSourceFound = true
+				break
+			}
+		}
+	}
+
 	// content_fts stores content-class nodes rather than ordinary source bodies.
 	// An exact document hit therefore does not prove that the source declaration
-	// containing the literal is represented. Run one separately bounded source
-	// lookup for the highest-information literal and merge it before the existing
-	// single graph hydration.
-	if ctx.Err() == nil {
+	// containing the literal is represented. Only a miss across both ordinary
+	// retrieval and hydrated content symbols activates the bounded source scan.
+	if ctx.Err() == nil && !exactSourceFound {
 		sourceRecall := s.gatherExploreSourceLiteralRecall(ctx, terms, repoPrefix, scope)
+		missingNodes := make([]string, 0, len(sourceRecall.hits))
 		for _, hit := range sourceRecall.hits {
 			if previous, exists := bestRank[hit.nodeID]; !exists {
 				order = append(order, hit.nodeID)
 				bestRank[hit.nodeID] = hit.rank
+				missingNodes = append(missingNodes, hit.nodeID)
 			} else if hit.rank < previous {
 				bestRank[hit.nodeID] = hit.rank
 			}
@@ -3168,11 +3229,15 @@ func (s *Server) gatherExploreQuotedContentCandidates(ctx context.Context, task 
 				uniqueExact[hit.nodeID] = true
 			}
 		}
+		if len(missingNodes) > 0 {
+			for id, node := range s.graph.GetNodesByIDs(missingNodes) {
+				nodes[id] = node
+			}
+		}
 	}
 	if len(order) == 0 {
 		return nil
 	}
-	nodes := s.graph.GetNodesByIDs(order)
 	candidates := make([]*rerank.Candidate, 0, len(order))
 	for _, id := range order {
 		node := nodes[id]

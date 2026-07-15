@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -138,19 +139,37 @@ func (s *Server) mapExploreSourceLiteralMatchesContext(
 	// Exact paths remain authoritative; this is not a fuzzy suffix match and it
 	// does not add another AllNodes scan.
 	repoPrefix := exploreSourceLiteralSingleRepoPrefix(scope)
-	paths := make(map[string]struct{}, len(matches)*2)
+	exactPaths := make([]string, 0, len(matches))
+	aliasPaths := make([]string, 0, len(matches))
+	exactSeen := make(map[string]struct{}, len(matches))
+	aliasSeen := make(map[string]struct{}, len(matches))
 	aliases := make(map[string]string, len(matches))
 	for _, match := range matches {
 		if !exploreTextHasExactLiteral(match.Text, term) {
 			continue
 		}
-		paths[match.Path] = struct{}{}
+		if _, duplicate := exactSeen[match.Path]; !duplicate {
+			exactSeen[match.Path] = struct{}{}
+			exactPaths = append(exactPaths, match.Path)
+		}
 		if alias := exploreSourceLiteralUnprefixedPath(match.Path, repoPrefix); alias != "" {
-			paths[alias] = struct{}{}
 			aliases[match.Path] = alias
+			if _, duplicate := aliasSeen[alias]; !duplicate {
+				aliasSeen[alias] = struct{}{}
+				aliasPaths = append(aliasPaths, alias)
+			}
 		}
 	}
-	indexes := s.buildFileSymbolIndexForPathsContext(ctx, paths)
+	sort.Strings(exactPaths)
+	sort.Strings(aliasPaths)
+	orderedPaths := make([]string, 0, len(exactPaths)+len(aliasPaths))
+	orderedPaths = append(orderedPaths, exactPaths...)
+	for _, alias := range aliasPaths {
+		if _, isExact := exactSeen[alias]; !isExact {
+			orderedPaths = append(orderedPaths, alias)
+		}
+	}
+	indexes := s.buildFileSymbolIndexForOrderedPathsContext(ctx, orderedPaths)
 	seen := make(map[string]struct{}, len(matches))
 	hits := make([]exploreSourceLiteralHit, 0, len(matches))
 	for rank, match := range matches {

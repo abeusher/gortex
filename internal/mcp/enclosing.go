@@ -211,12 +211,24 @@ type contextFileNodeReader interface {
 }
 
 func (s *Server) buildFileSymbolIndexForPathsContext(ctx context.Context, paths map[string]struct{}) map[string]*fileSymbolIndex {
+	ordered := make([]string, 0, len(paths))
+	for path := range paths {
+		ordered = append(ordered, path)
+	}
+	sort.Strings(ordered)
+	return s.buildFileSymbolIndexForOrderedPathsContext(ctx, ordered)
+}
+
+// buildFileSymbolIndexForOrderedPathsContext preserves caller priority while
+// keeping file-node lookup bounded by ctx. Source-literal mapping uses this to
+// query authoritative match paths before compatibility aliases.
+func (s *Server) buildFileSymbolIndexForOrderedPathsContext(ctx context.Context, paths []string) map[string]*fileSymbolIndex {
 	if s.graph == nil || len(paths) == 0 || ctx.Err() != nil {
 		return nil
 	}
 	out := make(map[string]*fileSymbolIndex, len(paths))
 	contextReader, hasContextReader := s.graph.(contextFileNodeReader)
-	for path := range paths {
+	for _, path := range paths {
 		if ctx.Err() != nil {
 			break
 		}

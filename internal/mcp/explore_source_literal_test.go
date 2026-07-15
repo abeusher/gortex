@@ -50,6 +50,22 @@ func (s *exploreSourceLiteralBlockingStore) GetFileNodesContext(ctx context.Cont
 	return nil
 }
 
+type exploreSourceLiteralOrderedStore struct {
+	graph.Store
+	nodesByPath map[string][]*graph.Node
+	blockPath   string
+	calls       []string
+}
+
+func (s *exploreSourceLiteralOrderedStore) GetFileNodesContext(ctx context.Context, path string) []*graph.Node {
+	s.calls = append(s.calls, path)
+	if path == s.blockPath {
+		<-ctx.Done()
+		return nil
+	}
+	return s.nodesByPath[path]
+}
+
 func newExploreSourceLiteralServer(t testing.TB, nodes []*graph.Node) *Server {
 	t.Helper()
 	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
@@ -112,6 +128,33 @@ func TestMapExploreSourceLiteralMatchesPrefersExactPathOverAlias(t *testing.T) {
 	}}, query.QueryOptions{RepoAllow: map[string]bool{"humanizer-1059": true}})
 
 	require.Equal(t, []exploreSourceLiteralHit{{nodeID: exact.ID, rank: 0}}, recall.hits)
+}
+
+func TestMapExploreSourceLiteralMatchesQueriesExactPathsBeforeAliases(t *testing.T) {
+	exactA := sourceLiteralNode("demo/src/a.cs::Register", "RegisterA", "demo/src/a.cs", graph.KindMethod, 1, 5)
+	exactB := sourceLiteralNode("demo/src/b.cs::Register", "RegisterB", "demo/src/b.cs", graph.KindMethod, 1, 5)
+	store := &exploreSourceLiteralOrderedStore{
+		nodesByPath: map[string][]*graph.Node{
+			exactA.FilePath: {exactA},
+			exactB.FilePath: {exactB},
+		},
+		blockPath: "src/a.cs",
+	}
+	server := &Server{graph: store}
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+
+	recall := server.mapExploreSourceLiteralMatchesContext(ctx, "ku", []trigram.Match{
+		{Path: exactB.FilePath, Line: 3, Text: `Register("ku")`},
+		{Path: exactA.FilePath, Line: 3, Text: `Register("ku")`},
+	}, query.QueryOptions{RepoAllow: map[string]bool{"demo": true}})
+
+	require.Equal(t, []string{"demo/src/a.cs", "demo/src/b.cs", "src/a.cs"}, store.calls)
+	require.Equal(t, []exploreSourceLiteralHit{
+		{nodeID: exactB.ID, rank: 0},
+		{nodeID: exactA.ID, rank: 1},
+	}, recall.hits)
+	require.True(t, recall.ambiguous)
 }
 
 func TestMapExploreSourceLiteralMatchesChoosesSmallestEnclosingSymbol(t *testing.T) {
@@ -205,12 +248,47 @@ func TestGatherExploreQuotedContentCandidatesMergesSourceLiteralWithExactContent
 	server := &Server{graph: counting, indexer: idx}
 
 	candidates := server.gatherExploreQuotedContentCandidates(
-		context.Background(), `find registration for "ku"`, 20,
+		context.Background(), `find registration for "ku"`, nil, 20,
 		query.QueryOptions{RepoAllow: map[string]bool{"demo": true}},
 	)
 
 	require.NotNil(t, candidateByID(candidates, document.ID), "exact content evidence must be retained")
 	require.NotNil(t, candidateByID(candidates, constructor.ID), "an exact non-source content hit must not suppress bounded source recall")
+}
+
+func TestGatherExploreQuotedContentCandidatesSkipsSourceScanForExactOrdinaryCandidate(t *testing.T) {
+	root := t.TempDir()
+	rel := "src/RawRegistry.cs"
+	path := filepath.Join(root, filepath.FromSlash(rel))
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+	require.NoError(t, os.WriteFile(path, []byte("public sealed class RawRegistry {\n    public void Configure() { Register(\"KnownFormatter\"); }\n}\n"), 0o644))
+
+	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	idx := indexer.New(store, parser.NewRegistry(), config.IndexConfig{}, zap.NewNop())
+	_, err = idx.IndexCtx(context.Background(), root)
+	require.NoError(t, err)
+	idx.SetFileMtimes(map[string]int64{rel: 1})
+
+	exact := sourceLiteralNode("demo/src/KnownFormatter.cs::KnownFormatter", "KnownFormatter", "src/KnownFormatter.cs", graph.KindType, 1, 2)
+	raw := sourceLiteralNode("demo/src/RawRegistry.cs::RawRegistry.Configure", "RawRegistry.Configure", rel, graph.KindMethod, 1, 3)
+	store.AddBatch([]*graph.Node{exact, raw}, nil)
+	core, logs := observer.New(zap.DebugLevel)
+	server := &Server{graph: store, indexer: idx, logger: zap.New(core)}
+
+	candidates := server.gatherExploreQuotedContentCandidates(
+		context.Background(), `find symbol "KnownFormatter"`,
+		[]*rerank.Candidate{{Node: exact, TextRank: 0, VectorRank: -1}}, 20,
+		query.QueryOptions{RepoAllow: map[string]bool{"demo": true}},
+	)
+
+	require.Nil(t, candidateByID(candidates, raw.ID), "a distinct raw-source match must not be admitted after an exact ordinary hit")
+	require.Zero(t,
+		logs.FilterMessage("mcp: explore source literal recall").Len()+
+			logs.FilterMessage("mcp: explore source literal recall incomplete").Len(),
+		"the miss-only gate must avoid opening source files when ordinary retrieval is already exact",
+	)
 }
 
 func TestExplorePreferredRefinementSymbolPrefersSourceLiteral(t *testing.T) {
