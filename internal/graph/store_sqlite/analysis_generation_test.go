@@ -233,12 +233,25 @@ func TestAnalysisGenerationForeignKeysEnabledOnPoolAndNoLiveNodeFK(t *testing.T)
 		t.Fatal(err)
 	}
 	defer store.Close()
-	ctx := context.Background()
-	connections := make([]*sql.Conn, 0, sqliteMaxOpenConns)
-	for i := 0; i < sqliteMaxOpenConns; i++ {
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	poolSize := store.db.Stats().MaxOpenConnections
+	if poolSize < 1 {
+		t.Fatalf("invalid configured SQLite pool size: %d", poolSize)
+	}
+	connections := make([]*sql.Conn, 0, poolSize)
+	defer func() {
+		// On an acquisition/query failure, release every lease before the
+		// deferred Store.Close runs its final checkpoint.
+		for _, conn := range connections {
+			_ = conn.Close()
+		}
+	}()
+	for i := 0; i < poolSize; i++ {
 		conn, err := store.db.Conn(ctx)
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("acquire pooled connection %d/%d: %v", i+1, poolSize, err)
 		}
 		connections = append(connections, conn)
 	}
@@ -252,18 +265,67 @@ func TestAnalysisGenerationForeignKeysEnabledOnPoolAndNoLiveNodeFK(t *testing.T)
 		}
 	}
 	for _, conn := range connections {
-		conn.Close()
+		if err := conn.Close(); err != nil {
+			t.Fatalf("release pooled connection: %v", err)
+		}
 	}
-	if _, err := store.db.Exec(`INSERT INTO analysis_nodes(generation_id,node_id,pagerank,authority,hub) VALUES(999,'orphan',0,0,0)`); err == nil {
+	connections = nil
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO analysis_nodes(generation_id,node_id,pagerank,authority,hub) VALUES(999,'orphan',0,0,0)`); err == nil {
 		t.Fatal("orphan analysis node bypassed generation FK")
 	}
 	store.AddNode(&graph.Node{ID: "same-id", Kind: graph.KindFunction, Name: "Same", FilePath: "same.go"})
 	generationID := buildMinimalAnalysisGeneration(t, store, "same-id", 0, true)
 	store.EvictFile("same.go")
 	var retained int
-	if err := store.db.QueryRow(`SELECT COUNT(*) FROM analysis_nodes WHERE generation_id = ?`, generationID).Scan(&retained); err != nil || retained != 1 {
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM analysis_nodes WHERE generation_id = ?`, generationID).Scan(&retained); err != nil || retained != 1 {
 		t.Fatalf("live node eviction cascaded generation-local node: count=%d err=%v", retained, err)
 	}
+}
+
+func TestCheckpointWALPoolWaitHonorsContext(t *testing.T) {
+	store, err := Open(filepathForAnalysisTest(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	acquireCtx, cancelAcquire := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelAcquire()
+	poolSize := store.db.Stats().MaxOpenConnections
+	if poolSize < 1 {
+		t.Fatalf("invalid configured SQLite pool size: %d", poolSize)
+	}
+	connections := make([]*sql.Conn, 0, poolSize)
+	defer func() {
+		for _, conn := range connections {
+			_ = conn.Close()
+		}
+	}()
+	for i := 0; i < poolSize; i++ {
+		conn, err := store.db.Conn(acquireCtx)
+		if err != nil {
+			t.Fatalf("acquire pooled connection %d/%d: %v", i+1, poolSize, err)
+		}
+		connections = append(connections, conn)
+	}
+
+	checkpointCtx, cancelCheckpoint := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	started := time.Now()
+	err = store.checkpointWAL(checkpointCtx)
+	cancelCheckpoint()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("checkpoint with exhausted pool error = %v, want context deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("checkpoint ignored pool-wait deadline: elapsed=%s", elapsed)
+	}
+
+	for _, conn := range connections {
+		if err := conn.Close(); err != nil {
+			t.Fatalf("release pooled connection: %v", err)
+		}
+	}
+	connections = nil
 }
 
 func TestAnalysisGenerationV4MigrationPreservesGraphAndDropsProvisionalCache(t *testing.T) {

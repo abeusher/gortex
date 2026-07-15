@@ -22,6 +22,7 @@
 package store_sqlite
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -455,7 +456,14 @@ func hasGraphStoreTables(db *sql.DB) (bool, error) {
 // the main DB and truncates the -wal file. Five minutes keeps the file
 // bounded under steady writes without making the checkpoint itself a hot
 // path; journal_size_limit in the DSN bounds growth between ticks.
-const walCheckpointInterval = 5 * time.Minute
+const (
+	walCheckpointInterval = 5 * time.Minute
+	// walCheckpointTimeout bounds both database/sql pool acquisition and the
+	// SQLite checkpoint itself. Checkpoints are maintenance: if every pooled
+	// connection is busy, the background loop should retry on its next tick
+	// instead of becoming an unbounded waiter or delaying shutdown forever.
+	walCheckpointTimeout = 10 * time.Second
+)
 
 // runCheckpointLoop issues a TRUNCATE checkpoint every interval until Close
 // stops it. Best-effort: a checkpoint that can't fully complete because a
@@ -484,7 +492,16 @@ func (s *Store) runCheckpointLoop(interval time.Duration) {
 // SQLite coordinates checkpoints against writers internally, and blocking
 // steady-state writes on a maintenance op is the wrong tradeoff.
 func (s *Store) CheckpointWAL() error {
-	_, err := s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+	ctx, cancel := context.WithTimeout(context.Background(), walCheckpointTimeout)
+	defer cancel()
+	return s.checkpointWAL(ctx)
+}
+
+// checkpointWAL is the context-aware core used by CheckpointWAL and tests.
+// ExecContext applies the deadline while waiting for a database/sql pool slot
+// as well as while SQLite executes the pragma.
+func (s *Store) checkpointWAL(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)")
 	return err
 }
 
