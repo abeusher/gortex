@@ -361,7 +361,7 @@ func (s *localizationTerminalState) block(facade, operation string, arguments ma
 
 func localizationNavigationFacade(facade string) bool {
 	switch facade {
-	case "explore", "search", "read", "relations", "trace":
+	case "explore", "search", "read", "relations", "trace", "analyze":
 		return true
 	default:
 		return false

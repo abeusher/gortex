@@ -150,7 +150,7 @@ func TestLocalizationCompletionEnvelope(t *testing.T) {
 func TestLocalizationTerminalStateBlocksOnlyNavigation(t *testing.T) {
 	state := newLocalizationTerminalState()
 	state.arm(newLocalizationCompletion(true, ""))
-	for _, facade := range []string{"explore", "search", "read", "relations", "trace"} {
+	for _, facade := range []string{"explore", "search", "read", "relations", "trace", "analyze"} {
 		blocked := state.block(facade, "anything", nil)
 		if blocked == nil || !blocked.IsError {
 			t.Fatalf("%s should be terminally blocked", facade)
@@ -160,7 +160,7 @@ func TestLocalizationTerminalStateBlocksOnlyNavigation(t *testing.T) {
 			t.Fatalf("%s returned the wrong error: %s", facade, text)
 		}
 	}
-	for _, facade := range []string{"change", "edit", "refactor", "analyze", "workspace", "recall", "remember"} {
+	for _, facade := range []string{"change", "edit", "refactor", "workspace", "recall", "remember"} {
 		if blocked := state.block(facade, "anything", nil); blocked != nil {
 			t.Fatalf("%s must remain available after localization: %#v", facade, blocked)
 		}
@@ -222,6 +222,11 @@ func TestHandleFacadeRefinementReadReturnsAnswerReadyCompletion(t *testing.T) {
 	registry.capture(mcpgo.NewTool("get_symbol_source", mcpgo.WithString("id", mcpgo.Required())), func(context.Context, mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
 		return mcpgo.NewToolResultText(`{"id":"repo/pkg/file.go::Resolver.Run","source":"func (r Resolver) Run() {}"}`), nil
 	})
+	analyzeCalls := 0
+	registry.capture(mcpgo.NewTool("why"), func(context.Context, mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+		analyzeCalls++
+		return mcpgo.NewToolResultText(`{"result":"unexpected"}`), nil
+	})
 	server := &Server{facades: registry, localization: newLocalizationTerminalState(), sessions: newSessionMap()}
 	ctx := WithSessionID(context.Background(), "refinement-read-completion")
 	server.localizationFor(ctx).armRefinementForTask("locate resolver behavior", []string{candidate})
@@ -253,6 +258,27 @@ func TestHandleFacadeRefinementReadReturnsAnswerReadyCompletion(t *testing.T) {
 	}
 	if blocked := server.localizationFor(ctx).block("explore", "localize", nil); blocked == nil {
 		t.Fatal("successful refinement read did not commit terminal state")
+	}
+
+	analyzeReq := mcpgo.CallToolRequest{}
+	analyzeReq.Params.Name = "analyze"
+	analyzeReq.Params.Arguments = map[string]any{
+		"kind":   "why",
+		"target": map[string]any{"symbol": candidate},
+	}
+	blockedAnalyze, err := server.handleFacade(ctx, "analyze", analyzeReq)
+	if err != nil {
+		t.Fatalf("terminal analyze returned transport error: %v", err)
+	}
+	if blockedAnalyze == nil || !blockedAnalyze.IsError {
+		t.Fatalf("terminal analyze was not blocked: %#v", blockedAnalyze)
+	}
+	if analyzeCalls != 0 {
+		t.Fatalf("terminal analyze reached its legacy handler %d time(s)", analyzeCalls)
+	}
+	text, _ := singleTextContent(blockedAnalyze)
+	if !strings.Contains(text, string(ErrCodeLocalizationComplete)) {
+		t.Fatalf("terminal analyze returned the wrong error: %s", text)
 	}
 }
 
