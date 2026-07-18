@@ -540,6 +540,7 @@ func (r *Resolver) resolveDeferredLSPWithPassBudget(
 	}
 	if len(reindexBatch) > 0 {
 		r.graph.ReindexEdges(reindexBatch)
+		reconcilePlaceholderSources(r.graph, &r.placeholderSrcIdx, reindexBatch)
 	}
 	return result
 }

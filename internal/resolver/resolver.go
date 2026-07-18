@@ -341,6 +341,13 @@ type Resolver struct {
 	// mutated only from the pass's serial phases — page prepare, lookup warm,
 	// and guard warm — never from parallel resolve workers.
 	hotCache *resolveHotCache
+	// placeholderSrcIdx caches, for one ResolveAll pass, which dataflow
+	// (arg_of / value_flow) source IDs are unresolved placeholders, so the
+	// per-batch source reconciliation probes only froms that can match
+	// instead of point-looking-up every resolved placeholder (see
+	// placeholder_sources.go). Reset at pass start; touched only from the
+	// pass's serial apply phases.
+	placeholderSrcIdx placeholderSourceIndex
 	// lspDeferredRetry preserves only budget-skipped LSP work across
 	// ResolveAll calls. This is required for heuristic-resolved edges: after
 	// the heuristic rewrites To they no longer appear in
@@ -515,6 +522,10 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 
 	r.logUnresolvedFrontier("start")
 	defer r.logUnresolvedFrontier("end")
+
+	// Fresh placeholder-source set per pass: dataflow edges indexed since the
+	// previous pass must be visible, and a moved source must not linger.
+	r.placeholderSrcIdx = placeholderSourceIndex{}
 
 	// Keep the unresolved corpus disk-resident. SQLite captures a rowid
 	// high-water mark and keyset-pages beneath it; legacy stores are consumed
@@ -863,6 +874,7 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 			}
 			if len(reindexBatch) > 0 {
 				r.graph.ReindexEdges(reindexBatch)
+				reconcilePlaceholderSources(r.graph, &r.placeholderSrcIdx, reindexBatch)
 				reindexTotal += len(reindexBatch)
 				if pageRevisionKnown {
 					// Ignore this pass's own committed mutations. A later delta
@@ -2394,6 +2406,9 @@ func (r *Resolver) applyIncrementalReindexesLocked(
 ) {
 	if len(reindexBatch) > 0 {
 		r.graph.ReindexEdges(reindexBatch)
+		// nil index: incremental batches are file-sized, direct probes
+		// stay under the single-save latency budget.
+		reconcilePlaceholderSources(r.graph, nil, reindexBatch)
 	}
 	// Cross-package name-match guard — same contract as in ResolveAll.
 	if len(jobs) == 0 {

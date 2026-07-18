@@ -86,8 +86,13 @@ type CrossRepoResolver struct {
 	// created during the pass (it only reindexes edges), so retention is
 	// sound; an interleaving writer is detected via the store mutation
 	// revision at the chunk yield and flushes it.
-	hotCache        *resolveHotCache
-	nodesByName     map[string][]*graph.Node
+	hotCache *resolveHotCache
+	// placeholderSrcIdx is the cross-repo mirror of the field of the same
+	// name on Resolver: the per-ResolveAll-pass set of dataflow placeholder
+	// sources consulted before any reconciliation probe (see
+	// placeholder_sources.go). Reset at pass start.
+	placeholderSrcIdx placeholderSourceIndex
+	nodesByName       map[string][]*graph.Node
 	nodesByNameRepo map[string]map[string][]*graph.Node
 	nodesByQualName map[string]*graph.Node
 	dirIndex        map[string][]*graph.Node
@@ -298,6 +303,9 @@ func (cr *CrossRepoResolver) ResolveAll() *CrossRepoStats {
 	defer cr.mu.Unlock()
 
 	stats := &CrossRepoStats{ByRepo: make(map[string]int)}
+	// Fresh placeholder-source set per pass — same rationale as ResolveAll
+	// on the master resolver.
+	cr.placeholderSrcIdx = placeholderSourceIndex{}
 	// Share the master resolver's stable high-water/keyset stream. The cold
 	// residual can exceed 200k edges; retaining it plus the cross-repo name,
 	// raw-name, repo and qualified-name caches was the second whole-corpus heap
@@ -446,6 +454,7 @@ func (cr *CrossRepoResolver) ResolveAll() *CrossRepoStats {
 					scBatch = cr.filterLiveReindex(scBatch)
 				}
 				cr.graph.ReindexEdges(scBatch)
+				reconcilePlaceholderSources(cr.graph, &cr.placeholderSrcIdx, scBatch)
 				reindexTotal += len(scBatch)
 				DetectCrossRepoEdgesForReindexes(cr.graph, scBatch)
 			}
@@ -570,6 +579,9 @@ func (cr *CrossRepoResolver) resolveScopedLocked(edges []*graph.Edge) *CrossRepo
 	}
 	if len(reindexBatch) > 0 {
 		cr.graph.ReindexEdges(reindexBatch)
+		// nil index: scoped batches are repo- or file-sized, direct
+		// probes beat a whole-graph placeholder-source stream.
+		reconcilePlaceholderSources(cr.graph, nil, reindexBatch)
 	}
 	return stats
 }
