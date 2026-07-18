@@ -32,31 +32,25 @@ func (idx *Indexer) extractDIContracts(reg *contracts.Registry) {
 	// also keeps bean extraction independent of the contract-side —
 	// a repo that only uses Spring still gets usable bean links even
 	// if no @Inject / useClass contracts exist anywhere.
-	idx.linkSpringBeans()
+	rows := graph.ReadRepoEdgesByKinds(idx.graph, []string{idx.repoPrefix}, []graph.EdgeKind{
+		graph.EdgeProvides,
+		graph.EdgeConsumes,
+	})
+	edges := make([]*graph.Edge, 0, len(rows))
+	for _, row := range rows {
+		if row.Edge != nil {
+			edges = append(edges, row.Edge)
+		}
+	}
+	idx.linkSpringBeansFromEdges(edges)
 
 	var discovered []contracts.Contract
-	if idx.repoPrefix != "" {
-		// Multi-repo: walk only this repo's outgoing edges via a
-		// single backend query. The previous GetRepoNodes ×
-		// GetOutEdges nested walk was O(repo_nodes) per-node round-
-		// trips on disk backends — at ~68k repo nodes that meant
-		// 68k backend queries per pass on a disk backend.
-		for _, e := range idx.graph.GetRepoEdges(idx.repoPrefix) {
-			c, ok := diContractFromEdge(e)
-			if !ok {
-				continue
-			}
-			discovered = append(discovered, c)
+	for _, e := range edges {
+		c, ok := diContractFromEdge(e)
+		if !ok {
+			continue
 		}
-	} else {
-		// Single-repo: every edge belongs to this repo.
-		for _, e := range idx.graph.AllEdges() {
-			c, ok := diContractFromEdge(e)
-			if !ok {
-				continue
-			}
-			discovered = append(discovered, c)
-		}
+		discovered = append(discovered, c)
 	}
 	if len(discovered) == 0 {
 		return
@@ -75,6 +69,17 @@ func (idx *Indexer) extractDIContracts(reg *contracts.Registry) {
 // per-repo cost stays proportional to the repo's own size, not the
 // shared workspace graph.
 func (idx *Indexer) linkSpringBeans() {
+	rows := graph.ReadRepoEdgesByKinds(idx.graph, []string{idx.repoPrefix}, []graph.EdgeKind{graph.EdgeProvides})
+	edges := make([]*graph.Edge, 0, len(rows))
+	for _, row := range rows {
+		if row.Edge != nil {
+			edges = append(edges, row.Edge)
+		}
+	}
+	idx.linkSpringBeansFromEdges(edges)
+}
+
+func (idx *Indexer) linkSpringBeansFromEdges(repoEdges []*graph.Edge) {
 	type beanRef struct {
 		methodID string
 		typeName string
@@ -97,17 +102,8 @@ func (idx *Indexer) linkSpringBeans() {
 		beans = append(beans, beanRef{methodID: e.To, typeName: rt, filePath: e.FilePath, line: e.Line})
 	}
 
-	if idx.repoPrefix != "" {
-		// Single backend query instead of one GetOutEdges per
-		// repo node — see extractDIContracts above for the round-
-		// trip math.
-		for _, e := range idx.graph.GetRepoEdges(idx.repoPrefix) {
-			collectBean(e)
-		}
-	} else {
-		for _, e := range idx.graph.AllEdges() {
-			collectBean(e)
-		}
+	for _, e := range repoEdges {
+		collectBean(e)
 	}
 	if len(beans) == 0 {
 		return
@@ -118,17 +114,9 @@ func (idx *Indexer) linkSpringBeans() {
 	// bean — the dominant cost on workspaces that mix one Java repo
 	// with hundreds of non-Java siblings.
 	var candidates []*graph.Node
-	if idx.repoPrefix != "" {
-		for _, n := range idx.graph.GetRepoNodes(idx.repoPrefix) {
-			if n.Kind == graph.KindMethod && n.Language == "java" {
-				candidates = append(candidates, n)
-			}
-		}
-	} else {
-		for _, n := range idx.graph.AllNodes() {
-			if n.Kind == graph.KindMethod && n.Language == "java" {
-				candidates = append(candidates, n)
-			}
+	for _, n := range idx.graph.GetRepoNodesByLanguage(idx.repoPrefix, "java") {
+		if n.Kind == graph.KindMethod {
+			candidates = append(candidates, n)
 		}
 	}
 
@@ -136,17 +124,22 @@ func (idx *Indexer) linkSpringBeans() {
 	// whose params_src (captured at extraction time) mentions the return
 	// type. Dedupe by (consumer_class, bean_method) so an overloaded
 	// constructor or factory method only links once.
+	// Index candidates by identifier token once. The previous bean×method
+	// nested scan repeated signature parsing for every bean; preserving the
+	// candidate append order keeps emission deterministic while reducing the
+	// work to signature bytes plus actual matches.
+	candidatesByType := make(map[string][]*graph.Node)
+	for _, n := range candidates {
+		params, _ := n.Meta["params_src"].(string)
+		for token := range javaIdentifierSet(params) {
+			candidatesByType[token] = append(candidatesByType[token], n)
+		}
+	}
 	linked := make(map[string]struct{})
+	var links []*graph.Edge
 	for _, b := range beans {
-		for _, n := range candidates {
+		for _, n := range candidatesByType[b.typeName] {
 			if n.ID == b.methodID {
-				continue
-			}
-			params, _ := n.Meta["params_src"].(string)
-			if params == "" {
-				continue
-			}
-			if !signatureReferencesType(params, b.typeName) {
 				continue
 			}
 			cls := enclosingClassID(n)
@@ -158,7 +151,7 @@ func (idx *Indexer) linkSpringBeans() {
 				continue
 			}
 			linked[key] = struct{}{}
-			idx.graph.AddEdge(&graph.Edge{
+			links = append(links, &graph.Edge{
 				From:     cls,
 				To:       b.methodID,
 				Kind:     graph.EdgeCalls,
@@ -171,6 +164,26 @@ func (idx *Indexer) linkSpringBeans() {
 			})
 		}
 	}
+	if len(links) > 0 {
+		idx.graph.AddBatch(nil, links)
+	}
+}
+
+func javaIdentifierSet(src string) map[string]struct{} {
+	out := make(map[string]struct{})
+	for i := 0; i < len(src); {
+		if !isJavaIdentChar(src[i]) || (src[i] >= '0' && src[i] <= '9') {
+			i++
+			continue
+		}
+		start := i
+		i++
+		for i < len(src) && isJavaIdentChar(src[i]) {
+			i++
+		}
+		out[src[start:i]] = struct{}{}
+	}
+	return out
 }
 
 // signatureReferencesType returns true when sig contains typeName as a

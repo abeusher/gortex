@@ -32,9 +32,59 @@ import (
 // bare-name collisions via package qualification (`pkg.Type`) and the
 // in-file resolveTypeInFile pass already handles those.
 func (mi *MultiIndexer) disambiguateBareTypesViaImports(cr *contracts.Registry, g graph.Store) {
+	mi.disambiguateBareTypesViaImportsBatch([]*contracts.Registry{cr}, g)
+}
+
+// disambiguateBareTypesViaImportsBatch resolves every registry from one
+// FindNodesByNames projection. Registry indexes contain value copies and invoke
+// the resolver repeatedly; prefetching here prevents those copies—and multiple
+// repositories—from multiplying SQLite name queries.
+func (mi *MultiIndexer) disambiguateBareTypesViaImportsBatch(registries []*contracts.Registry, g graph.Store) {
 	srcCache := map[string][]byte{}
 	importCache := map[string]map[string]string{}
+	nameSet := map[string]struct{}{}
+	for _, cr := range registries {
+		if cr == nil {
+			continue
+		}
+		for _, c := range cr.All() {
+			if c.Meta == nil || !isImportResolvableLang(c.FilePath) {
+				continue
+			}
+			for _, key := range []string{"response_type", "request_type"} {
+				name, _ := c.Meta[key].(string)
+				if name == "" || strings.Contains(name, "::") {
+					continue
+				}
+				nameSet[name] = struct{}{}
+				if isRustFile(c.FilePath) {
+					for _, candidateName := range mi.rustImportCandidateNames(c.FilePath, name, srcCache) {
+						nameSet[candidateName] = struct{}{}
+					}
+				}
+			}
+		}
+	}
+	names := make([]string, 0, len(nameSet))
+	for name := range nameSet {
+		names = append(names, name)
+	}
+	candidatesByName := g.FindNodesByNames(names)
 
+	for _, cr := range registries {
+		if cr == nil {
+			continue
+		}
+		mi.disambiguateBareTypesViaImportsPrefetched(cr, srcCache, importCache, candidatesByName)
+	}
+}
+
+func (mi *MultiIndexer) disambiguateBareTypesViaImportsPrefetched(
+	cr *contracts.Registry,
+	srcCache map[string][]byte,
+	importCache map[string]map[string]string,
+	candidatesByName map[string][]*graph.Node,
+) {
 	for _, c := range cr.All() {
 		if c.Meta == nil {
 			continue
@@ -53,7 +103,7 @@ func (mi *MultiIndexer) disambiguateBareTypesViaImports(cr *contracts.Registry, 
 				if name == "" || strings.Contains(name, "::") {
 					continue
 				}
-				resolved := mi.resolveBareTypeViaImports(c.FilePath, name, g, srcCache, importCache)
+				resolved := mi.resolveBareTypeViaImportsPrefetched(c.FilePath, name, srcCache, importCache, candidatesByName)
 				if resolved == "" {
 					continue
 				}
@@ -78,6 +128,19 @@ func (mi *MultiIndexer) resolveBareTypeViaImports(
 	srcCache map[string][]byte,
 	importCache map[string]map[string]string,
 ) string {
+	names := []string{name}
+	if isRustFile(srcFile) {
+		names = append(names, mi.rustImportCandidateNames(srcFile, name, srcCache)...)
+	}
+	return mi.resolveBareTypeViaImportsPrefetched(srcFile, name, srcCache, importCache, g.FindNodesByNames(names))
+}
+
+func (mi *MultiIndexer) resolveBareTypeViaImportsPrefetched(
+	srcFile, name string,
+	srcCache map[string][]byte,
+	importCache map[string]map[string]string,
+	candidatesByName map[string][]*graph.Node,
+) string {
 	if isRustFile(srcFile) {
 		src := mi.cachedSource(srcFile, srcCache)
 		if len(src) == 0 {
@@ -87,10 +150,10 @@ func (mi *MultiIndexer) resolveBareTypeViaImports(
 		if !ok {
 			return ""
 		}
-		return mi.resolveRustUseFactsTarget(rustFacts, g, srcCache)
+		return mi.resolveRustUseFactsTargetPrefetched(rustFacts, candidatesByName, srcCache)
 	}
 
-	candidates := g.FindNodesByName(name)
+	candidates := candidatesByName[name]
 	if len(candidates) == 0 {
 		return ""
 	}
@@ -144,6 +207,27 @@ func (mi *MultiIndexer) resolveBareTypeViaImports(
 }
 
 func (mi *MultiIndexer) resolveRustUseFactsTarget(facts []rustUseFact, g graph.Store, srcCache map[string][]byte) string {
+	nameSet := map[string]struct{}{}
+	for _, fact := range facts {
+		chain := mi.followReExportChainDetailed(fact.fromFile, fact.sourceName, srcCache)
+		for _, names := range chain.names {
+			for name := range names {
+				nameSet[name] = struct{}{}
+			}
+		}
+	}
+	names := make([]string, 0, len(nameSet))
+	for name := range nameSet {
+		names = append(names, name)
+	}
+	return mi.resolveRustUseFactsTargetPrefetched(facts, g.FindNodesByNames(names), srcCache)
+}
+
+func (mi *MultiIndexer) resolveRustUseFactsTargetPrefetched(
+	facts []rustUseFact,
+	candidatesByName map[string][]*graph.Node,
+	srcCache map[string][]byte,
+) string {
 	seen := map[string]bool{}
 	var hit string
 	for _, fact := range facts {
@@ -153,7 +237,7 @@ func (mi *MultiIndexer) resolveRustUseFactsTarget(facts []rustUseFact, g graph.S
 		}
 		for file, names := range chain.names {
 			for name := range names {
-				for _, node := range g.FindNodesByName(name) {
+				for _, node := range candidatesByName[name] {
 					if node == nil || node.FilePath != file || seen[node.ID] {
 						continue
 					}
@@ -170,6 +254,31 @@ func (mi *MultiIndexer) resolveRustUseFactsTarget(facts []rustUseFact, g graph.S
 		}
 	}
 	return hit
+}
+
+func (mi *MultiIndexer) rustImportCandidateNames(srcFile, name string, srcCache map[string][]byte) []string {
+	src := mi.cachedSource(srcFile, srcCache)
+	if len(src) == 0 {
+		return nil
+	}
+	facts, ok := rustImportFactsForName(string(src), srcFile, name)
+	if !ok {
+		return nil
+	}
+	set := map[string]struct{}{}
+	for _, fact := range facts {
+		chain := mi.followReExportChainDetailed(fact.fromFile, fact.sourceName, srcCache)
+		for _, names := range chain.names {
+			for candidateName := range names {
+				set[candidateName] = struct{}{}
+			}
+		}
+	}
+	out := make([]string, 0, len(set))
+	for candidateName := range set {
+		out = append(out, candidateName)
+	}
+	return out
 }
 
 // tsAliasCache caches the per-repo Collection of tsconfig/jsconfig
