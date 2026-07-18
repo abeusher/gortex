@@ -256,6 +256,121 @@ func (it *deferredLSPSpoolIter) bounds() (string, []any) {
 	return "WHERE " + tuple + " > (?,?,?,?,?) AND " + tuple + " < (?,?,?,?,?)", args
 }
 
+// keysPage reads one key-only page in spool order within (after, before) —
+// nil bounds are open. The expensive-path drain uses it instead of the full
+// iterator: no payload columns cross SQLite, no record decode, just the PK
+// tuple straight off the primary index.
+func (s *deferredLSPSpool) keysPage(after, before *deferredLSPWorkKey, limit int) ([]deferredLSPWorkKey, bool, error) {
+	if limit <= 0 {
+		limit = resolvePendingPageRows
+	}
+	tuple := `(file_path,line,from_id,kind,target)`
+	where := ""
+	var args []any
+	appendKey := func(key *deferredLSPWorkKey) {
+		args = append(args, key.filePath, key.line, key.from, string(key.kind), key.target)
+	}
+	switch {
+	case after != nil && before != nil:
+		where = "WHERE " + tuple + " > (?,?,?,?,?) AND " + tuple + " < (?,?,?,?,?)"
+		appendKey(after)
+		appendKey(before)
+	case after != nil:
+		where = "WHERE " + tuple + " > (?,?,?,?,?)"
+		appendKey(after)
+	case before != nil:
+		where = "WHERE " + tuple + " < (?,?,?,?,?)"
+		appendKey(before)
+	}
+	args = append(args, limit)
+	rows, err := s.db.Query(`SELECT file_path,line,from_id,kind,target FROM work `+where+`
+ORDER BY file_path,line,from_id,kind,target LIMIT ?`, args...)
+	if err != nil {
+		return nil, false, err
+	}
+	defer rows.Close()
+	keys := make([]deferredLSPWorkKey, 0, limit)
+	for rows.Next() {
+		var key deferredLSPWorkKey
+		var kind string
+		if err := rows.Scan(&key.filePath, &key.line, &key.from, &kind, &key.target); err != nil {
+			return nil, false, err
+		}
+		key.kind = graph.EdgeKind(kind)
+		keys = append(keys, key)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+	return keys, len(keys) < limit, nil
+}
+
+// markCarriedRange sets carried=1 for every row in (after, before) — nil
+// bounds are open — as ONE statement, so a drained segment pays a single
+// range update instead of page-by-page tuple lists.
+func (s *deferredLSPSpool) markCarriedRange(after, before *deferredLSPWorkKey) error {
+	tuple := `(file_path,line,from_id,kind,target)`
+	where := ""
+	var args []any
+	appendKey := func(key *deferredLSPWorkKey) {
+		args = append(args, key.filePath, key.line, key.from, string(key.kind), key.target)
+	}
+	switch {
+	case after != nil && before != nil:
+		where = " WHERE " + tuple + " > (?,?,?,?,?) AND " + tuple + " < (?,?,?,?,?)"
+		appendKey(after)
+		appendKey(before)
+	case after != nil:
+		where = " WHERE " + tuple + " > (?,?,?,?,?)"
+		appendKey(after)
+	case before != nil:
+		where = " WHERE " + tuple + " < (?,?,?,?,?)"
+		appendKey(before)
+	}
+	if _, err := s.db.Exec(`UPDATE work SET carried=1`+where, args...); err != nil {
+		return fmt.Errorf("mark carried range: %w", err)
+	}
+	return nil
+}
+
+// lspSpoolRevert names one guard-reverted edge whose spool verify-record
+// must follow it back to the unresolved placeholder. Matching includes the
+// abandoned bound target so only the record that observed that exact bind is
+// refreshed — an exact refresh, not site-level reattachment, preserving the
+// spool's precise liveness matching.
+type lspSpoolRevert struct {
+	edge       *graph.Edge // post-revert state, after both guard batches applied
+	oldBoundTo string      // the abandoned resolved target the record observed
+}
+
+// refreshRevertedEdges re-snapshots the FULL payload of records whose edges
+// the cross-package guard just reverted. The next pass's liveness matching
+// (persistedEdgeSnapshot.matches) compares every payload column — target,
+// confidence, label, origin, tier, cross_repo, canonical meta — so rewriting
+// current_to alone would still leave the row "stale": it must mirror the
+// exact post-revert edge state or the queued LSP verify is silently dropped.
+func (s *deferredLSPSpool) refreshRevertedEdges(reverts []lspSpoolRevert) error {
+	if s == nil || len(reverts) == 0 {
+		return nil
+	}
+	for _, rv := range reverts {
+		if rv.edge == nil {
+			continue
+		}
+		snap := snapshotPersistedEdge(rv.edge)
+		if _, err := s.db.Exec(
+			`UPDATE work SET current_to=?, confidence=?, confidence_label=?, origin=?, tier=?, cross_repo=?, meta=?
+  WHERE file_path=? AND line=? AND from_id=? AND kind=? AND current_to=?`,
+			snap.to, snap.confidence, snap.confidenceLabel, snap.origin, snap.tier,
+			boolInt(snap.crossRepo), snap.meta,
+			rv.edge.FilePath, rv.edge.Line, rv.edge.From, string(rv.edge.Kind), rv.oldBoundTo,
+		); err != nil {
+			return fmt.Errorf("refresh reverted spool records: %w", err)
+		}
+	}
+	return nil
+}
+
 func (s *deferredLSPSpool) deleteKeys(keys []deferredLSPWorkKey) error {
 	return s.mutateKeys("DELETE FROM work WHERE ", "", keys)
 }

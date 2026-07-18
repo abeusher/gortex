@@ -315,11 +315,23 @@ type Resolver struct {
 	// tsserver). See lsp_helper.go for the contract. Set via
 	// SetLSPHelper before ResolveAll runs.
 	lspHelper LSPHelper
-	// lspResolvePassBudget bounds the cumulative deferred LSP batch in a
-	// whole-graph ResolveAll. Zero intentionally means unlimited for
-	// compatibility. Individual helper calls retain their own timeout, so the
-	// wall bound can overrun by at most the one call already in flight.
+	// lspResolvePassBudget bounds when NEW helper attempts may start in the
+	// deferred LSP batch of a whole-graph ResolveAll — it is not a phase
+	// wall bound. Per-page spool/hydration/liveness overhead is bounded by
+	// the expensive-path cutoff derived from it (4×, floor 60s): once
+	// tripped, remaining spool pages drain record-only. Zero intentionally
+	// means unlimited for compatibility and disables the cutoff. Individual
+	// helper calls retain their own timeout, so attempts can overrun by at
+	// most the one call already in flight.
 	lspResolvePassBudget time.Duration
+
+	// lspSpoolPageRows overrides the deferred-LSP spool page size; zero uses
+	// resolvePendingPageRows. Test-only injection point so multi-page drain
+	// behaviour is exercisable without thousand-row fixtures.
+	lspSpoolPageRows int
+	// lspNow overrides the clock the expensive-path cutoff reads; nil uses
+	// time.Now. Test-only injection point — cutoff tests must not sleep.
+	lspNow func() time.Time
 
 	// hotCache retains node-by-ID and repository-scoped name-group lookups
 	// across the pages of one resolver pass (see resolve_hot_cache.go). It is
@@ -936,6 +948,49 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 	lspStart := time.Now()
 	lspCtx := context.Background()
 	lspPassBudget := &deferredLSPPassBudget{duration: r.lspResolvePassBudget}
+	// The attempt budget bounds helper calls only. Every other per-page cost —
+	// spool reads, edge hydration, liveness projection, bookkeeping — runs
+	// outside its clock, and on a cold-cache host those pages were measured at
+	// ~11s each with zero attempts. The expensive-path cutoff below is the
+	// bound on that work: once it trips (or the attempt budget exhausts), the
+	// remaining spool pages take a record-only drain — exclusions and carried
+	// marks straight from spool keys, no hydration, no liveness. The drain
+	// itself remains unbounded (it is a cheap key scan), so this is a cutoff
+	// of the expensive path, NOT a whole-phase wall bound. Budget zero keeps
+	// today's unlimited mode: no attempt budget, no cutoff.
+	lspClock := r.lspNow
+	if lspClock == nil {
+		lspClock = time.Now
+	}
+	var lspCutoffAt time.Time
+	if r.lspResolvePassBudget > 0 {
+		wall := r.lspResolvePassBudget * 4
+		if wall < r.lspResolvePassBudget {
+			// Saturate the multiply for absurd configured budgets.
+			wall = time.Duration(1<<63 - 1)
+		}
+		if wall < lspPhaseCutoffFloor {
+			wall = lspPhaseCutoffFloor
+		}
+		if anchor := lspClock(); anchor.Add(wall).After(anchor) {
+			lspCutoffAt = anchor.Add(wall)
+		}
+	}
+	lspCutoffTripped := func() bool {
+		return !lspCutoffAt.IsZero() && !lspClock().Before(lspCutoffAt)
+	}
+	lspPageRows := r.lspSpoolPageRows
+	if lspPageRows <= 0 {
+		lspPageRows = resolvePendingPageRows
+	}
+	var (
+		lspPhaseCutoff    bool
+		lspPagesHydrated  int
+		lspPagesDrained   int
+		lspRecordsDrained int
+		lspSpoolReadDur   time.Duration
+		lspHydrateDur     time.Duration
+	)
 	if r.lspDeferredSpool != nil {
 		var start *deferredLSPWorkKey
 		if r.lspDeferredCursorSet {
@@ -943,10 +998,122 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 			start = &cursor
 		}
 		iterator := r.lspDeferredSpool.iterator(start)
-		var passRetryCursor deferredLSPWorkKey
-		passRetryCursorSet := false
+		attemptCursorSet := false
+		drainCursorPinned := false
+		excludeDrained := func(keys []deferredLSPWorkKey) {
+			if len(keys) == 0 {
+				return
+			}
+			if lspResult.terminalityExcluded == nil {
+				lspResult.terminalityExcluded = make(map[deferredLSPWorkKey]struct{}, len(keys))
+			}
+			for _, key := range keys {
+				lspResult.terminalityExcluded[key] = struct{}{}
+			}
+			lspRecordsDrained += len(keys)
+			if !drainCursorPinned && !attemptCursorSet {
+				// Cutoff before any attempt was skipped: pin the resume
+				// cursor to the first unprocessed (drained) key so the next
+				// pass starts exactly where this one stopped.
+				r.lspDeferredCursor = keys[0]
+				r.lspDeferredCursorSet = true
+				drainCursorPinned = true
+			}
+		}
+		// drainRecordsPage retires one already-read page without the
+		// expensive path. Hydration knowledge is respected: only when the
+		// page WAS hydrated may its proven-stale rows be deleted; an
+		// unhydrated row can never be classified from its snapshot alone and
+		// is always retained as carried.
+		drainRecordsPage := func(records []lspSpoolRecord, staleKeys []deferredLSPWorkKey, hydrated bool) bool {
+			keys := make([]deferredLSPWorkKey, 0, len(records))
+			if hydrated && len(staleKeys) > 0 {
+				staleSet := make(map[deferredLSPWorkKey]struct{}, len(staleKeys))
+				for _, key := range staleKeys {
+					staleSet[key] = struct{}{}
+				}
+				for _, record := range records {
+					if _, dead := staleSet[record.key]; dead {
+						continue
+					}
+					keys = append(keys, record.key)
+				}
+				if err := r.lspDeferredSpool.deleteKeys(staleKeys); err != nil {
+					r.logger.Error("resolver: delete stale deferred LSP work", zap.Error(err))
+					return false
+				}
+			} else {
+				for _, record := range records {
+					keys = append(keys, record.key)
+				}
+			}
+			excludeDrained(keys)
+			if err := r.lspDeferredSpool.markCarried(keys); err != nil {
+				r.logger.Error("resolver: mark drained deferred LSP work", zap.Error(err))
+				return false
+			}
+			lspPagesDrained++
+			return true
+		}
+		drainKeySegment := func(from, to *deferredLSPWorkKey) bool {
+			after := from
+			for {
+				readStart := time.Now()
+				keys, segDone, err := r.lspDeferredSpool.keysPage(after, to, lspPageRows)
+				lspSpoolReadDur += time.Since(readStart)
+				if err != nil {
+					r.logger.Error("resolver: drain deferred LSP spool keys", zap.Error(err))
+					return false
+				}
+				if len(keys) == 0 {
+					return true
+				}
+				excludeDrained(keys)
+				lspPagesDrained++
+				last := keys[len(keys)-1]
+				after = &last
+				if segDone {
+					return true
+				}
+			}
+		}
+		// drainRemaining retires every not-yet-read spool row: exclusions via
+		// key-only pages (no payload decode), then ONE carried range-update
+		// per traversal segment. Rows stay durable in the spool for the next
+		// pass — work may be retried unnecessarily, but is never lost.
+		drainRemaining := func() {
+			from := iterator.after
+			if iterator.wrapped || iterator.start == nil {
+				var to *deferredLSPWorkKey
+				if iterator.wrapped {
+					to = iterator.start
+				}
+				if drainKeySegment(from, to) {
+					if err := r.lspDeferredSpool.markCarriedRange(from, to); err != nil {
+						r.logger.Error("resolver: mark drained deferred LSP range", zap.Error(err))
+					}
+				}
+				return
+			}
+			// Un-wrapped traversal with a resume cursor: the remaining rows
+			// are the tail (after, end] plus the wrapped head [begin, start).
+			if !drainKeySegment(from, nil) {
+				return
+			}
+			if err := r.lspDeferredSpool.markCarriedRange(from, nil); err != nil {
+				r.logger.Error("resolver: mark drained deferred LSP range", zap.Error(err))
+				return
+			}
+			if drainKeySegment(nil, iterator.start) {
+				if err := r.lspDeferredSpool.markCarriedRange(nil, iterator.start); err != nil {
+					r.logger.Error("resolver: mark drained deferred LSP range", zap.Error(err))
+				}
+			}
+		}
 		for {
-			records, done, err := iterator.next(resolvePendingPageRows)
+			spoolReadStart := time.Now()
+			records, done, err := iterator.next(lspPageRows)
+			lspSpoolReadDur += time.Since(spoolReadStart)
 			if err != nil {
 				r.logger.Error("resolver: read deferred LSP spool", zap.Error(err))
 				break
@@ -954,33 +1121,49 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 			if len(records) == 0 && done {
 				break
 			}
-			edges, stale := lspEdgesFromRecords(r.graph, records, r.scope)
-			lspDeferred += len(edges)
-			alreadyExhausted := lspResult.budgetExhausted
-			pageResult := r.resolveDeferredLSPWithPassBudget(lspCtx, edges, lspPassBudget)
-			if pageResult.budgetExhausted {
-				if !alreadyExhausted {
-					passRetryCursor = r.lspDeferredCursor
-					passRetryCursorSet = r.lspDeferredCursorSet
-				} else if passRetryCursorSet {
-					// Later disk pages are all skipped under the same expired
-					// context. Keep the first skipped key from this pass, exactly
-					// as the former single whole-pass slice did.
-					r.lspDeferredCursor = passRetryCursor
-					r.lspDeferredCursorSet = true
+			// Cutoff site 1 — after the spool read, before hydration.
+			if lspResult.budgetExhausted || lspCutoffTripped() {
+				if !lspResult.budgetExhausted {
+					lspPhaseCutoff = true
 				}
+				if drainRecordsPage(records, nil, false) && !done {
+					drainRemaining()
+				}
+				break
+			}
+			hydrateStart := time.Now()
+			edges, stale := lspEdgesFromRecords(r.graph, records, r.scope)
+			lspHydrateDur += time.Since(hydrateStart)
+			lspDeferred += len(edges)
+			lspPagesHydrated++
+			// Cutoff site 2 — after hydration, before the liveness projection
+			// inside the batch resolver.
+			if lspCutoffTripped() {
+				lspPhaseCutoff = true
+				if drainRecordsPage(records, stale, true) && !done {
+					drainRemaining()
+				}
+				break
+			}
+			pageResult := r.resolveDeferredLSPWithPassBudget(lspCtx, edges, lspPassBudget)
+			if pageResult.budgetExhausted && pageResult.skipped > 0 {
+				// resolveDeferredLSPWithPassBudget pinned the resume cursor
+				// to its first skipped key.
+				attemptCursorSet = true
 			}
 			lspResult.newlyResolved += pageResult.newlyResolved
 			lspResult.resolved += pageResult.resolved
 			lspResult.attempted += pageResult.attempted
 			lspResult.skipped += pageResult.skipped
 			lspResult.budgetExhausted = lspResult.budgetExhausted || pageResult.budgetExhausted
+			lspResult.livenessDur += pageResult.livenessDur
+			lspResult.attemptsDur += pageResult.attemptsDur
 			// Merge the skip exclusions: terminal stamping runs even on a
 			// budget-exhausted pass and must see every edge whose LSP verdict
 			// is still pending, across all spool pages.
 			if len(pageResult.terminalityExcluded) > 0 {
 				if lspResult.terminalityExcluded == nil {
-					lspResult.terminalityExcluded = make(map[deferredLSPEdgeKey]struct{}, len(pageResult.terminalityExcluded))
+					lspResult.terminalityExcluded = make(map[deferredLSPWorkKey]struct{}, len(pageResult.terminalityExcluded))
 				}
 				for key := range pageResult.terminalityExcluded {
 					lspResult.terminalityExcluded[key] = struct{}{}
@@ -1037,14 +1220,18 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 		}
 	}
 	lspElapsed := time.Since(lspStart)
-	if lspResult.budgetExhausted {
-		r.logger.Warn("resolver: deferred LSP pass budget exhausted",
+	if lspResult.budgetExhausted || lspPhaseCutoff {
+		r.logger.Warn("resolver: deferred LSP expensive path stopped early",
+			zap.Bool("attempt_budget_exhausted", lspResult.budgetExhausted),
+			zap.Bool("phase_cutoff_triggered", lspPhaseCutoff),
 			zap.Duration("budget", r.lspResolvePassBudget),
 			zap.Duration("elapsed", lspElapsed),
 			zap.Int("attempted", lspResult.attempted),
 			zap.Int("resolved", lspResult.resolved),
 			zap.Int("skipped", lspResult.skipped),
-			zap.String("bound", "budget plus at most one in-flight helper call"))
+			zap.Int("pages_drained", lspPagesDrained),
+			zap.Int("records_drained", lspRecordsDrained),
+			zap.String("bound", "attempt budget bounds helper calls; the cutoff stops per-page hydration and liveness — the record-only drain that follows is an unbounded cheap key scan"))
 	}
 	// Bulk mode covers only the parallel compute + the deferred LSP batch; the
 	// guard and tail attribution passes below run identically to the single-
@@ -1061,6 +1248,14 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 		zap.Int("lsp_batch_resolved", lspResult.resolved),
 		zap.Int("lsp_budget_skipped", lspResult.skipped),
 		zap.Bool("lsp_budget_exhausted", lspResult.budgetExhausted),
+		zap.Bool("lsp_phase_cutoff", lspPhaseCutoff),
+		zap.Int("lsp_pages_hydrated", lspPagesHydrated),
+		zap.Int("lsp_pages_drained", lspPagesDrained),
+		zap.Int("lsp_records_drained", lspRecordsDrained),
+		zap.Duration("lsp_spool_read", lspSpoolReadDur),
+		zap.Duration("lsp_hydrate", lspHydrateDur),
+		zap.Duration("lsp_liveness", lspResult.livenessDur),
+		zap.Duration("lsp_attempts", lspResult.attemptsDur),
 		zap.Duration("lsp_budget", r.lspResolvePassBudget),
 		zap.Duration("warm_lookup", warmElapsed),
 		zap.Duration("compute_loop", loopElapsed),

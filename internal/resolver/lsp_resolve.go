@@ -162,20 +162,25 @@ func deferredLSPWorkKeyLess(a, b deferredLSPWorkKey) bool {
 	return a.target < b.target
 }
 
-type deferredLSPEdgeKey struct {
-	from     string
-	to       string
-	kind     graph.EdgeKind
-	filePath string
-	line     int
-}
-
-func deferredLSPKey(e *graph.Edge) deferredLSPEdgeKey {
+// deferredLSPWorkKeyForEdge derives the spool work key from a live edge whose
+// target is still (or again) unresolved. Terminal reconciliation matches
+// exclusion keys through this: the key deliberately excludes the edge's
+// current To — a spool record written while an edge was heuristically bound
+// carries a stale current_to after a guard revert, and a To-bearing key
+// would miss the match and let the edge be stamped permanently terminal with
+// LSP work still queued. target uses the same normalization as spooling
+// (lspTargetFromUnresolvedTo), and a guard revert restores the original
+// placeholder, so both sides reproduce the identical key.
+func deferredLSPWorkKeyForEdge(e *graph.Edge) deferredLSPWorkKey {
 	if e == nil {
-		return deferredLSPEdgeKey{}
+		return deferredLSPWorkKey{}
 	}
-	return deferredLSPEdgeKey{
-		from: e.From, to: e.To, kind: e.Kind, filePath: e.FilePath, line: e.Line,
+	return deferredLSPWorkKey{
+		filePath: e.FilePath,
+		line:     e.Line,
+		from:     e.From,
+		kind:     e.Kind,
+		target:   lspTargetFromUnresolvedTo(e.To),
 	}
 }
 
@@ -185,15 +190,25 @@ type deferredLSPBatchResult struct {
 	attempted           int
 	skipped             int
 	budgetExhausted     bool
-	terminalityExcluded map[deferredLSPEdgeKey]struct{}
+	terminalityExcluded map[deferredLSPWorkKey]struct{}
+	livenessDur         time.Duration
+	attemptsDur         time.Duration
 	retry               map[deferredLSPWorkKey]deferredLSPEdge
 }
+
+// lspPhaseCutoffFloor is the minimum expensive-path cutoff (see ResolveAll):
+// even a tiny attempt budget leaves the first pages a real chance to hydrate
+// and attempt before the drain takes over.
+const lspPhaseCutoffFloor = 60 * time.Second
 
 // deferredLSPPassBudget is shared across every disk page in one ResolveAll LSP
 // pass. Its clock starts at the first helper attempt, so spool reads and
 // set-oriented liveness validation do not consume a budget intended to bound
-// language-server work. The first call is therefore the sole in-flight call
-// allowed to outlive the budget; every later call checks the absolute deadline.
+// language-server work — those per-page costs are bounded separately by the
+// resolver's expensive-path cutoff, which switches remaining pages to a
+// record-only drain. This budget bounds NEW helper attempts only: the first
+// call is the sole in-flight call allowed to outlive it; every later call
+// checks the absolute deadline.
 type deferredLSPPassBudget struct {
 	duration time.Duration
 	deadline time.Time
@@ -328,14 +343,24 @@ func (r *Resolver) lspDeferTarget(e *graph.Edge) (string, bool) {
 	if !r.lspHelper.SupportsPath(e.FilePath) {
 		return "", false
 	}
-	target := graph.UnresolvedName(e.To)
-	if target == "" {
-		target = strings.TrimPrefix(e.To, unresolvedPrefix)
-	}
+	target := lspTargetFromUnresolvedTo(e.To)
 	if identifierFromTarget(target) == "" {
 		return "", false
 	}
 	return target, true
+}
+
+// lspTargetFromUnresolvedTo is the one normalization from an unresolved edge
+// target to the spool's `target` key component. Spooling (via lspDeferTarget)
+// and terminal reconciliation MUST share it: exclusion keys are matched
+// between spool records and live unresolved edges, and any divergence here
+// silently re-opens the wrongful-terminal-stamp class.
+func lspTargetFromUnresolvedTo(to string) string {
+	target := graph.UnresolvedName(to)
+	if target == "" {
+		target = strings.TrimPrefix(to, unresolvedPrefix)
+	}
+	return target
 }
 
 // resolveDeferredLSP binds the LSP-eligible edges the bulk-mode compute loop
@@ -405,7 +430,9 @@ func (r *Resolver) resolveDeferredLSPWithPassBudget(
 				candidates = append(candidates, edges[i].edge)
 			}
 		}
+		livenessStart := time.Now()
 		liveEdges = loadEdgeLiveness(r.graph, candidates)
+		result.livenessDur = time.Since(livenessStart)
 	}
 
 	// Start at the first key at-or-after the prior pass's first skipped item.
@@ -480,19 +507,26 @@ func (r *Resolver) resolveDeferredLSPWithPassBudget(
 				r.lspDeferredCursorSet = true
 				cursorRecorded = true
 			}
-			if graph.IsUnresolvedTarget(e.To) {
-				if result.terminalityExcluded == nil {
-					result.terminalityExcluded = make(map[deferredLSPEdgeKey]struct{})
-				}
-				result.terminalityExcluded[deferredLSPKey(e)] = struct{}{}
+			// Every skipped record is excluded from terminal stamping —
+			// including one whose edge is currently heuristic-RESOLVED: the
+			// guard runs after this batch and may revert that bind to
+			// unresolved, and without the exclusion the same pass's
+			// reconciliation would stamp it permanently terminal with its
+			// LSP verify still queued.
+			if result.terminalityExcluded == nil {
+				result.terminalityExcluded = make(map[deferredLSPWorkKey]struct{})
 			}
+			result.terminalityExcluded[workKey] = struct{}{}
 			continue
 		}
 		oldTo := e.To
 		oldKind := e.Kind
 		wasUnresolved := graph.IsUnresolvedTarget(oldTo)
 		result.attempted++
-		if r.tryResolveViaLSP(e, de.target, &stats) {
+		attemptStart := time.Now()
+		resolvedViaLSP := r.tryResolveViaLSP(e, de.target, &stats)
+		result.attemptsDur += time.Since(attemptStart)
+		if resolvedViaLSP {
 			result.resolved++
 			reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: e, OldTo: oldTo, OldKind: oldKind})
 			if wasUnresolved {

@@ -4,6 +4,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"go.uber.org/zap"
+
 	"github.com/zzet/gortex/internal/graph"
 )
 
@@ -59,6 +61,7 @@ func (r *Resolver) guardCrossPackageCallEdges(jobs []reindexJob, closure map[str
 	// catastrophic on a 30k-job pass.
 	var provBatch []graph.EdgeProvenanceUpdate
 	var reindexBatch []graph.EdgeReindex
+	var spoolReverts []lspSpoolRevert
 	for i := range jobs {
 		j := &jobs[i]
 		// A concurrent edit during a chunked ResolveAll yield may have evicted
@@ -132,12 +135,23 @@ func (r *Resolver) guardCrossPackageCallEdges(jobs []reindexJob, closure map[str
 		j.edge.To = j.oldTo
 		j.edge.Confidence = 0
 		reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: j.edge, OldTo: oldResolved})
+		spoolReverts = append(spoolReverts, lspSpoolRevert{edge: j.edge, oldBoundTo: oldResolved})
 	}
 	if len(provBatch) > 0 {
 		r.graph.SetEdgeProvenanceBatch(provBatch)
 	}
 	if len(reindexBatch) > 0 {
 		r.graph.ReindexEdges(reindexBatch)
+	}
+	// A reverted edge may still hold a deferred LSP verify-record spooled
+	// while it was heuristically bound. Re-snapshot those records to the
+	// post-revert edge state (after both batches, so the struct fields are
+	// authoritative on either backend) — otherwise the next pass's exact
+	// liveness matching declares them stale and deletes the queued retry.
+	if len(spoolReverts) > 0 && r.lspDeferredSpool != nil {
+		if err := r.lspDeferredSpool.refreshRevertedEdges(spoolReverts); err != nil {
+			r.logger.Error("resolver: refresh reverted LSP spool records", zap.Error(err))
+		}
 	}
 	return len(reindexBatch)
 }
