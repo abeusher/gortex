@@ -1,6 +1,7 @@
 package store_sqlite
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"sort"
@@ -19,12 +20,21 @@ type sqliteMutationReceiptState struct {
 
 type sqliteMutationReceiptAccumulator struct {
 	complete           bool
+	incompleteReason   string
 	resolutionRelevant bool
 	changedFiles       map[string]struct{}
 	definitionFiles    map[string]struct{}
 	targetNames        map[string]struct{}
 	targetIDs          map[string]struct{}
 	importCandidates   map[string]struct{}
+}
+
+// noteIncomplete voids the receipt, keeping the FIRST cause.
+func (a *sqliteMutationReceiptAccumulator) noteIncomplete(reason string) {
+	a.complete = false
+	if a.incompleteReason == "" {
+		a.incompleteReason = reason
+	}
 }
 
 type sqliteMutationNodeIdentity struct {
@@ -49,6 +59,7 @@ func newSQLiteMutationReceiptAccumulator() *sqliteMutationReceiptAccumulator {
 func (a *sqliteMutationReceiptAccumulator) receipt() graph.MutationReceipt {
 	return graph.MutationReceipt{
 		Complete:           a.complete,
+		IncompleteReason:   a.incompleteReason,
 		ResolutionRelevant: a.resolutionRelevant,
 		ChangedFiles:       sortedSQLiteReceiptKeys(a.changedFiles),
 		DefinitionFiles:    sortedSQLiteReceiptKeys(a.definitionFiles),
@@ -99,7 +110,7 @@ func (s *Store) EndMutationReceipt(token graph.MutationReceiptToken) graph.Mutat
 
 	acc := s.mutationReceipts.active[token]
 	if acc == nil {
-		return graph.MutationReceipt{Complete: false}
+		return graph.MutationReceipt{Complete: false, IncompleteReason: "unknown_receipt_token"}
 	}
 	delete(s.mutationReceipts.active, token)
 	return acc.receipt()
@@ -110,8 +121,12 @@ func (s *Store) hasActiveMutationReceiptsLocked() bool {
 }
 
 func (s *Store) markMutationReceiptsIncompleteLocked() {
+	if len(s.mutationReceipts.active) == 0 {
+		return
+	}
+	reason := graph.ReceiptIncompleteCallerReason()
 	for _, acc := range s.mutationReceipts.active {
-		acc.complete = false
+		acc.noteIncomplete(reason)
 	}
 }
 
@@ -121,7 +136,11 @@ func (s *Store) mergeMutationReceiptLocked(delta *sqliteMutationReceiptAccumulat
 	}
 	for _, acc := range s.mutationReceipts.active {
 		if !delta.complete {
-			acc.complete = false
+			reason := delta.incompleteReason
+			if reason == "" {
+				reason = "merged_incomplete_delta"
+			}
+			acc.noteIncomplete(reason)
 		}
 		acc.resolutionRelevant = acc.resolutionRelevant || delta.resolutionRelevant
 		mergeSQLiteReceiptSet(acc.changedFiles, delta.changedFiles)
@@ -141,7 +160,7 @@ func mergeSQLiteReceiptSet(dst, src map[string]struct{}) {
 }
 
 func recordSQLiteAddedNode(acc *sqliteMutationReceiptAccumulator, n *graph.Node) {
-	if acc == nil || n == nil {
+	if acc == nil || n == nil || !graph.IsReferenceableSymbol(n.Kind) {
 		return
 	}
 	if n.ID != "" {
@@ -153,22 +172,16 @@ func recordSQLiteAddedNode(acc *sqliteMutationReceiptAccumulator, n *graph.Node)
 	if n.QualName != "" {
 		acc.targetNames[n.QualName] = struct{}{}
 	}
-	if n.FilePath != "" {
-		acc.changedFiles[n.FilePath] = struct{}{}
-	}
-	if !graph.IsReferenceableSymbol(n.Kind) {
-		return
-	}
 	acc.resolutionRelevant = true
 	if n.FilePath != "" {
 		acc.definitionFiles[n.FilePath] = struct{}{}
 	} else {
-		acc.complete = false
+		acc.noteIncomplete("node_write_without_exact_file")
 	}
 }
 
 func recordSQLiteAddedEdge(acc *sqliteMutationReceiptAccumulator, e *graph.Edge, exactFile string) {
-	if acc == nil || e == nil {
+	if acc == nil || e == nil || !graph.IsUnresolvedTarget(e.To) {
 		return
 	}
 	if e.To != "" {
@@ -187,15 +200,11 @@ func recordSQLiteAddedEdge(acc *sqliteMutationReceiptAccumulator, e *graph.Edge,
 			acc.importCandidates[e.Alias] = struct{}{}
 		}
 	}
+	acc.resolutionRelevant = true
 	if exactFile != "" {
 		acc.changedFiles[exactFile] = struct{}{}
-	}
-	if !graph.IsUnresolvedTarget(e.To) {
-		return
-	}
-	acc.resolutionRelevant = true
-	if exactFile == "" {
-		acc.complete = false
+	} else {
+		acc.noteIncomplete("edge_write_without_exact_file")
 	}
 }
 
@@ -252,8 +261,14 @@ func (s *Store) publishSQLiteEdgeInsertLocked(e *graph.Edge, inserted bool) {
 }
 
 func (s *Store) mutationNodeIdentityLocked(id string) (sqliteMutationNodeIdentity, bool, error) {
+	conn, release, err := s.activeWriteConnLocked(context.Background())
+	if err != nil {
+		return sqliteMutationNodeIdentity{}, false, err
+	}
+	defer release()
+
 	var identity sqliteMutationNodeIdentity
-	err := s.db.QueryRow(
+	err = conn.QueryRowContext(context.Background(),
 		`SELECT kind, name, qual_name, file_path, repo_prefix FROM nodes WHERE id = ?`, id,
 	).Scan(&identity.kind, &identity.name, &identity.qualName, &identity.filePath, &identity.repoPrefix)
 	if errors.Is(err, sql.ErrNoRows) {

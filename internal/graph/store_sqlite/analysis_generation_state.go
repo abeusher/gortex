@@ -1,6 +1,7 @@
 package store_sqlite
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 
@@ -17,11 +18,11 @@ func (s *Store) AnalysisMutationRevision() uint64 {
 // initAnalysisGenerationState makes interrupted builders collectible and
 // initializes the mutation hot-path latch from the active singleton.
 func (s *Store) initAnalysisGenerationState() error {
-	if _, err := s.db.Exec(`UPDATE analysis_generations SET state = ? WHERE state = ?`, analysisGenerationStale, analysisGenerationBuilding); err != nil {
+	if _, err := s.writerDB.Exec(`UPDATE analysis_generations SET state = ? WHERE state = ?`, analysisGenerationStale, analysisGenerationBuilding); err != nil {
 		return err
 	}
 	var present int
-	if err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM analysis_active_generation LIMIT 1)`).Scan(&present); err != nil {
+	if err := s.writerDB.QueryRow(`SELECT EXISTS(SELECT 1 FROM analysis_active_generation LIMIT 1)`).Scan(&present); err != nil {
 		return err
 	}
 	s.analysisGenerationPresent = present != 0
@@ -63,10 +64,7 @@ func (s *Store) invalidateAnalysisGenerationLocked() error {
 			_ = tx.Rollback()
 		}
 	}()
-	if _, err := tx.Exec(`UPDATE analysis_generations SET state = ? WHERE state = ? OR generation_id IN (SELECT generation_id FROM analysis_active_generation)`, analysisGenerationStale, analysisGenerationBuilding); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(`DELETE FROM analysis_active_generation`); err != nil {
+	if err := invalidateAnalysisGenerationTx(tx); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
@@ -77,11 +75,31 @@ func (s *Store) invalidateAnalysisGenerationLocked() error {
 	return nil
 }
 
+// invalidateAnalysisGenerationTx performs the durable half of analysis
+// invalidation inside a caller-owned transaction. Keeping this separate lets
+// SQLite-native topology rewrites invalidate the active snapshot and mutate
+// graph rows atomically on one pinned connection. That is required when the
+// pool has MaxOpenConns=1: checking out a second transaction while a pinned
+// connection is held would otherwise deadlock.
+func invalidateAnalysisGenerationTx(tx *sql.Tx) error {
+	if _, err := tx.Exec(`UPDATE analysis_generations SET state = ? WHERE state = ? OR generation_id IN (SELECT generation_id FROM analysis_active_generation)`, analysisGenerationStale, analysisGenerationBuilding); err != nil {
+		return err
+	}
+	_, err := tx.Exec(`DELETE FROM analysis_active_generation`)
+	return err
+}
+
 // finishAnalysisMutationLocked advances the in-process race detector only
 // after a graph mutation committed. writeMu must be held.
 func (s *Store) finishAnalysisMutationLocked(changed bool) {
 	if changed {
 		s.analysisMutationRevision.Add(1)
+		// Resolver liveness snapshots need one cheap process-local token for
+		// every committed edge-state change. This hook is intentionally coarse:
+		// node-only changes are safe false positives, while centralising the
+		// bump here covers reindex, attribute, eviction, contract replacement,
+		// and other edge mutation families without N per-row atomics.
+		s.edgeMutationRevision.Add(1)
 	}
 }
 
@@ -98,15 +116,21 @@ func (s *Store) invalidateAnalysisBeforeNodeMutationLocked(n *graph.Node) bool {
 		kind, name, qualName, filePath, language   string
 		repoPrefix, workspaceID, projectID         string
 		startLine, endLine, startColumn, endColumn int
-		visibility                                 sql.NullString
-		metaBlob                                   []byte
+		visibility, entryPointKind                 sql.NullString
+		entryPoint                                 sql.NullBool
 	)
-	err := s.db.QueryRow(`SELECT kind, name, qual_name, file_path, start_line, end_line, start_column, end_column, language, repo_prefix, workspace_id, project_id, visibility, meta FROM nodes WHERE id = ?`, n.ID).Scan(
+	conn, release, connErr := s.activeWriteConnLocked(context.Background())
+	if connErr != nil {
+		panicOnFatal(connErr)
+		return false
+	}
+	err := conn.QueryRowContext(context.Background(), `SELECT kind, name, qual_name, file_path, start_line, end_line, start_column, end_column, language, repo_prefix, workspace_id, project_id, visibility, entry_point, entry_point_kind FROM nodes WHERE id = ?`, n.ID).Scan(
 		&kind, &name, &qualName, &filePath,
 		&startLine, &endLine, &startColumn, &endColumn,
 		&language, &repoPrefix, &workspaceID, &projectID,
-		&visibility, &metaBlob,
+		&visibility, &entryPoint, &entryPointKind,
 	)
+	release()
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		panicOnFatal(err)
 		return false
@@ -119,13 +143,13 @@ func (s *Store) invalidateAnalysisBeforeNodeMutationLocked(n *graph.Node) bool {
 		workspaceID != n.WorkspaceID || projectID != n.ProjectID
 	processChanged := false
 	if !errors.Is(err, sql.ErrNoRows) {
-		storedMeta, decodeErr := decodeMeta(metaBlob)
-		if decodeErr != nil {
-			panicOnFatal(decodeErr)
-			return false
-		}
-		storedEntry, _ := storedMeta["entry_point"].(bool)
-		storedEntryKind, _ := storedMeta["entry_point_kind"].(string)
+		// Promoted columns only — the Meta blob is never decoded on this
+		// per-node write hot path. A pre-promotion row (key still in the
+		// blob, columns NULL) reads as unset, so a write carrying the flag
+		// invalidates once and the rewrite self-migrates the row: a bounded
+		// one-time over-invalidation, never a missed one.
+		storedEntry := entryPoint.Valid && entryPoint.Bool
+		storedEntryKind := entryPointKind.String
 		newEntry, _ := n.Meta["entry_point"].(bool)
 		newEntryKind, _ := n.Meta["entry_point_kind"].(string)
 		newVisibility, _ := n.Meta["visibility"].(string)
