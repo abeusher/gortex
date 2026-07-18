@@ -149,12 +149,15 @@ type Resolver struct {
 	dirIndex     map[string][]*graph.Node
 	lastDirIndex map[string][]*graph.Node
 	// OnComputeDone, when set, fires once per ResolveAll immediately after
-	// the parallel compute loop (and its deferred LSP batch) has committed —
-	// before the serial refinement tail (guard, attribution, dispatch
+	// the parallel compute loop has committed — BEFORE the deferred LSP
+	// batch and the serial refinement tail (guard, attribution, dispatch
 	// reconcile, terminal stamping). At that point every same-repo reference
-	// the pass will resolve is already queryable; the tail only refines
-	// confidence and reverts unreachable weak matches. The daemon uses this
-	// to mark the graph queryable minutes before the tail completes.
+	// the pass will resolve is already queryable; the LSP batch and the tail
+	// only verify, override, and revert on top of a queryable graph. The
+	// deferred LSP batch deliberately sits past this hook: its store-standing
+	// yield measured 0.19% of the pending set while costing 450–512s of cold
+	// wall, and the daemon uses this hook to mark the graph queryable minutes
+	// before that verification work completes.
 	OnComputeDone func()
 	// receiverTypeIdxByDir memoizes, per package directory, the Go type index
 	// the per-file method-receiver rebind builds. On a scoped tail that visits
@@ -939,6 +942,16 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 	close(progressDone)
 	loopElapsed := time.Since(passStart) - warmElapsed
 
+	// Publish compute readiness BEFORE the deferred LSP batch. The batch is
+	// verification/override work whose store-standing yield measured 2,409
+	// edges of a 1.29M pending set (0.19%) while costing 450–512s of wall on
+	// a cold pass — it has no business inside the time-to-queryable window.
+	// Like the guard and cross-repo tails that already run after this hook,
+	// its rewrites land on an already-queryable graph.
+	if r.OnComputeDone != nil {
+		r.OnComputeDone()
+	}
+
 	// Deferred LSP work is replayed in the same stable source-key order as the
 	// former whole-pass slice, but from a disk-backed dedup spool. Completed
 	// keys are deleted in batches; budget-skipped keys remain carried in the
@@ -1261,10 +1274,6 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 		zap.Duration("compute_loop", loopElapsed),
 		zap.Duration("deferred_lsp", lspElapsed),
 		zap.Duration("elapsed", computeElapsed))
-
-	if r.OnComputeDone != nil {
-		r.OnComputeDone()
-	}
 
 	tailStart := time.Now()
 

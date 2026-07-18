@@ -211,6 +211,29 @@ func TestResolveAllLSPConsecutiveDrainedPassesKeepCursorThenRecover(t *testing.T
 	assert.False(t, r.lspDeferredCursorSet)
 }
 
+// Compute readiness must be published BEFORE the deferred LSP batch: the
+// batch's store-standing yield measured 0.19% of the pending set while its
+// cold wall was minutes, and time-to-queryable gates on this hook. The batch
+// still runs — after the hook, like the guard and cross-repo tails.
+func TestOnComputeDoneFiresBeforeDeferredLSPBatch(t *testing.T) {
+	g, edges := lspBudgetGraph("Alpha", "Beta")
+	g.AddNode(&graph.Node{
+		ID: "src/target.ts::Target", Kind: graph.KindFunction, Name: "Target",
+		FilePath: "src/target.ts", StartLine: 50, Language: "typescript",
+	})
+	helper := &flippingLSPHelper{defPath: "src/target.ts", defLine: 50}
+	r := New(g)
+	r.SetLSPHelper(helper)
+	r.SetLSPResolvePassBudget(0)
+	attemptsAtHook := -1
+	r.OnComputeDone = func() { attemptsAtHook = helper.callCount() }
+
+	r.ResolveAll()
+
+	require.Zero(t, attemptsAtHook, "readiness hook must fire before any LSP attempt")
+	assert.Equal(t, len(edges), helper.callCount(), "the batch must still run after the hook")
+}
+
 // A guard revert must re-snapshot the spool record to the post-revert edge
 // state; without the refresh the next pass's exact matching declares the row
 // stale and silently drops the queued verify.
