@@ -519,6 +519,21 @@ func (s *Store) addBatchSetOriented(nodes []*graph.Node, edges []*graph.Edge) (s
 		edges = kept
 		log.Printf("store_sqlite: dropped %d structurally invalid edges (kind cannot target a param/local node)", dropped)
 	}
+	// Lazy builtin-sentinel materialization, mirroring Graph.AddBatch: give
+	// every ::builtin:: edge target a real KindBuiltin node so those edges
+	// stop reading as orphans. The per-store seen-set keeps warm re-indexes
+	// from re-upserting identical stubs on every batch.
+	if stubs := graph.BuiltinStubNodes(edges); len(stubs) > 0 {
+		var fresh []*graph.Node
+		for _, stub := range stubs {
+			if _, dup := s.builtinSeen.LoadOrStore(stub.ID, struct{}{}); !dup {
+				fresh = append(fresh, stub)
+			}
+		}
+		if len(fresh) > 0 {
+			nodes = append(append(make([]*graph.Node, 0, len(nodes)+len(fresh)), nodes...), fresh...)
+		}
+	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 

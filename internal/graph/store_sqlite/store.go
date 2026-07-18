@@ -60,6 +60,11 @@ type Store struct {
 	// runaway -wal is observable rather than silently filling the disk.
 	dbPath string
 
+	// builtinSeen records ::builtin:: sentinel targets already materialised
+	// as KindBuiltin stub nodes (see graph.BuiltinStubNodes), so warm
+	// re-indexes don't re-upsert identical stubs on every batch.
+	builtinSeen sync.Map
+
 	// writeMu serialises every mutation. SQLite serialises writers
 	// internally; doing the same on the Go side turns SQLITE_BUSY
 	// contention into clean lock-wait and keeps the conformance

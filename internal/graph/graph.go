@@ -487,6 +487,10 @@ type Graph struct {
 	// upgraded Origin). The count is the tamper-evidence surface:
 	// provenance cannot churn without it moving.
 	edgeIdentityRevisions atomic.Int64
+	// builtinSeen records ::builtin:: sentinel targets already materialised
+	// as KindBuiltin stub nodes (see BuiltinStubNodes), so re-indexing the
+	// same files doesn't re-upsert identical stubs on every batch.
+	builtinSeen sync.Map
 	// edgeMutGen bumps whenever the AllEdges output would change —
 	// new edge inserted, existing edge removed, or an edge's
 	// canonical key changed via ReindexEdge. Origin-only updates
@@ -2587,6 +2591,19 @@ func (g *Graph) AddBatch(nodes []*Node, edges []*Edge) {
 	}
 	// Structural-shape backstop: see StructuralEdgeTargetInvalid.
 	edges, _ = FilterStructuralEdgeViolations(edges)
+	// Lazy builtin-sentinel materialization: see BuiltinStubNodes. The
+	// per-store seen-set keeps it one upsert per stub per store lifetime.
+	if stubs := BuiltinStubNodes(edges); len(stubs) > 0 {
+		var fresh []*Node
+		for _, stub := range stubs {
+			if _, dup := g.builtinSeen.LoadOrStore(stub.ID, struct{}{}); !dup {
+				fresh = append(fresh, stub)
+			}
+		}
+		if len(fresh) > 0 {
+			nodes = append(append(make([]*Node, 0, len(nodes)+len(fresh)), nodes...), fresh...)
+		}
+	}
 	receiptActive := g.beginReceiptMutation()
 	if receiptActive {
 		defer g.endReceiptMutation()
