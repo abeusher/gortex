@@ -197,7 +197,16 @@ func TestFrameworkFamilyGateNeeded(t *testing.T) {
 	require.Positive(t, vueSummary.all["web"])
 	assert.False(t, frameworkFamilyGateNeeded(nil, vueSummary))
 	// Scoped runs always run the gate: off-scope endpoints are uncensused.
-	assert.True(t, frameworkFamilyGateNeeded(map[string]bool{"a": true}, summarize(ts)))
+	// The summary carries its own coverage marker, so it is built with the
+	// same scope the production call site passes.
+	scoped := map[string]bool{"a": true}
+	scopedSummary := summarizeFrameworkCandidates(edgeCensusStore([]*graph.Node{ts}, nil), scoped)
+	assert.True(t, frameworkFamilyGateNeeded(scoped, scopedSummary))
+	// Under the daemon's full-coverage attestation the same non-nil scope
+	// yields a full census, and the gate may again prove itself unnecessary.
+	attested := summarizeFrameworkCandidatesCensus(edgeCensusStore([]*graph.Node{ts}, nil), scoped, nil, true)
+	assert.False(t, frameworkFamilyGateNeeded(scoped, attested),
+		"a full-coverage census proves a one-family graph cannot drop")
 }
 
 // The cold engine still drops a cross-strict-family synthesized reference:
@@ -232,7 +241,14 @@ func TestFrameworkReceiverGateNeeded(t *testing.T) {
 	assert.False(t, frameworkReceiverGateNeeded(nil, summarize(recv, goType)),
 		"only csharp type names feed the demote index")
 	assert.True(t, frameworkReceiverGateNeeded(nil, summarize(recv, other)))
-	assert.True(t, frameworkReceiverGateNeeded(map[string]bool{"a": true}, summarize()))
+	scoped := map[string]bool{"a": true}
+	scopedSummary := summarizeFrameworkCandidates(edgeCensusStore(nil, nil), scoped)
+	assert.True(t, frameworkReceiverGateNeeded(scoped, scopedSummary))
+	// Full-coverage attestation: the C# name census fills from the raw
+	// stream even under a non-nil scope, so the gate can prove itself
+	// unnecessary again.
+	attested := summarizeFrameworkCandidatesCensus(edgeCensusStore(nil, nil), scoped, nil, true)
+	assert.False(t, frameworkReceiverGateNeeded(scoped, attested))
 }
 
 // The cold engine still demotes a receiver-type misattribution when two

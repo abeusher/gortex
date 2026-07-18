@@ -127,6 +127,9 @@ type MultiIndexer struct {
 	// incremental clone index is reseeded lazily on its first later edit.
 	// Consumed and cleared by RunGlobalGraphPasses. Guarded by mi.mu.
 	batchChangedPrefixes map[string]struct{}
+	// batchCensusEligible is the daemon's one-shot full-coverage attestation
+	// for the armed batch scope — see ArmBatchCensusEligible.
+	batchCensusEligible bool
 
 	// resolverLSPHelper is the resolve-time LSP helper propagated
 	// onto every per-repo Indexer and onto the global post-pass
@@ -1134,6 +1137,33 @@ func (mi *MultiIndexer) ArmBatchScope(changedPrefixes map[string]struct{}) {
 	mi.mu.Unlock()
 }
 
+// ArmBatchCensusEligible records the daemon's attestation that the armed
+// batch scope covers EVERY tracked repository (a cold index or a full warm
+// reconciliation). The framework-synthesis pass then builds its admission
+// census from the raw whole store while execution stays scoped. One-shot:
+// consumed by the next RunGlobalGraphPasses and reset, so it can never leak
+// into a later incremental batch. The attestation is the caller's — it is
+// deliberately not inferred here from scope size.
+func (mi *MultiIndexer) ArmBatchCensusEligible() {
+	if mi == nil {
+		return
+	}
+	mi.mu.Lock()
+	mi.batchCensusEligible = true
+	mi.mu.Unlock()
+}
+
+func (mi *MultiIndexer) takeBatchCensusEligible() bool {
+	if mi == nil {
+		return false
+	}
+	mi.mu.Lock()
+	eligible := mi.batchCensusEligible
+	mi.batchCensusEligible = false
+	mi.mu.Unlock()
+	return eligible
+}
+
 // takeBatchScope returns the armed clone-pass scope and clears it, so the
 // scope governs exactly one RunGlobalGraphPasses run. A nil result means
 // "no scope — run the clone passes for every repo".
@@ -1391,7 +1421,10 @@ func (mi *MultiIndexer) RunGlobalGraphPasses(ctx context.Context) {
 	reporter.Report("framework dispatch synthesis (global)", 0, 0)
 	passStart("framework_synthesis")
 	fwStart := time.Now()
-	fwRep := resolver.RunFrameworkSynthesizersScoped(mi.graph, changedPrefixes)
+	// A full-coverage batch (cold index / whole-workspace reconciliation)
+	// carries the daemon's one-shot census attestation: admission censuses
+	// read the raw store while synthesizer execution keeps the scoped view.
+	fwRep := resolver.RunFrameworkSynthesizersScopedWithCensus(mi.graph, changedPrefixes, mi.takeBatchCensusEligible())
 	mi.logger.Info("global pass: framework dispatch synthesis",
 		zap.Int("edges", fwRep.Total),
 		zap.Any("per_synthesizer", fwRep.Per),

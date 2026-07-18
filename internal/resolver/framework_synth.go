@@ -257,8 +257,13 @@ type frameworkCandidateSummary struct {
 	edges frameworkEdgeCensus
 	// csharpTypeNames counts distinct C# type/interface names, saturating at
 	// two — the receiver-gate tail can demote only when the receiver and
-	// target names differ and both are indexed C# types. Cold runs only.
+	// target names differ and both are indexed C# types. Full-census runs only.
 	csharpTypeNames frameworkDistinctNames
+	// fullCensus records that this summary walked the ENTIRE store — a nil
+	// scope, or a non-nil scope under the daemon's full-coverage attestation.
+	// Absence-proof gates (edge census, family/receiver tails) may only
+	// trust counts from a full walk; a partial summary cannot prove absence.
+	fullCensus bool
 }
 
 // frameworkDistinctNames counts distinct non-empty names, saturating at two.
@@ -302,6 +307,19 @@ type frameworkEdgeCensus struct {
 	// objectRegistryValue: a non-empty Meta["registry_value"] rode on an
 	// object-registry via edge.
 	objectRegistryValue bool
+	// grpcStub mirrors ResolveGRPCStubCalls' EXACT admission predicate: a
+	// via=="grpc.stub" EdgeCalls edge carrying non-empty grpc_service AND
+	// grpc_method metadata. Presence of the via alone is not enough — the
+	// pass discards service/method-less stubs before building its index.
+	grpcStub bool
+	// temporalVia: some EdgeCalls via has the "temporal." prefix — the first
+	// half of ResolveTemporalCalls' presence probe.
+	temporalVia bool
+	// temporalAnnotation: some EdgeAnnotated target satisfies the exact Java
+	// temporal annotation-role predicate — the probe's second half. Filled by
+	// a break-on-first-hit EdgeAnnotated walk that runs only when no
+	// temporal via was seen, mirroring the pass's own short-circuit.
+	temporalAnnotation bool
 }
 
 // collectFrameworkEdgeCensus makes the cold-run EdgeCalls pass feeding
@@ -327,6 +345,16 @@ func collectFrameworkEdgeCensus(g graph.Store) frameworkEdgeCensus {
 					census.objectRegistryValue = true
 				}
 			}
+			if via == "grpc.stub" && !census.grpcStub {
+				service, _ := e.Meta["grpc_service"].(string)
+				method, _ := e.Meta["grpc_method"].(string)
+				if service != "" && method != "" {
+					census.grpcStub = true
+				}
+			}
+			if !census.temporalVia && strings.HasPrefix(via, "temporal.") {
+				census.temporalVia = true
+			}
 		}
 		if graph.IsUnresolvedTarget(e.To) {
 			if _, ok := e.Meta["express_handler_ref"]; ok {
@@ -334,6 +362,17 @@ func collectFrameworkEdgeCensus(g graph.Store) frameworkEdgeCensus {
 			}
 			if recv, _ := e.Meta["recv_const"].(string); recv != "" {
 				census.recvConst = true
+			}
+		}
+	}
+	if !census.temporalVia {
+		for e := range g.EdgesByKind(graph.EdgeAnnotated) {
+			if e == nil {
+				continue
+			}
+			if role, member := temporalRoleForJavaAnnotation(e.To); role != "" || member != "" {
+				census.temporalAnnotation = true
+				break
 			}
 		}
 	}
@@ -353,16 +392,36 @@ func summarizeFrameworkCandidatesForFiles(
 	scope map[string]bool,
 	filePaths []string,
 ) frameworkCandidateSummary {
+	return summarizeFrameworkCandidatesCensus(g, scope, filePaths, false)
+}
+
+// summarizeFrameworkCandidatesCensus is the census-aware form. censusEligible
+// carries the daemon's attestation that a non-nil scope covers every tracked
+// repository (a cold / full-reconciliation batch): the summary then reads the
+// RAW node stream and builds the full edge census — census scope and
+// execution scope deliberately diverge, execution stays on the scoped store.
+func summarizeFrameworkCandidatesCensus(
+	g graph.Store,
+	scope map[string]bool,
+	filePaths []string,
+	censusEligible bool,
+) frameworkCandidateSummary {
 	summary := frameworkCandidateSummary{
 		all:           map[string]int{},
 		scoped:        map[string]int{},
 		allMarkers:    map[string]int{},
 		scopedMarkers: map[string]int{},
 	}
+	// fullCensus: the summary may treat the store as fully covered. True on a
+	// nil scope (the classic cold form) or under the daemon's full-coverage
+	// attestation. filePaths narrows an incremental frontier and is never
+	// combined with the attestation.
+	fullCensus := scope == nil || (censusEligible && len(filePaths) == 0)
+	summary.fullCensus = fullCensus
 	var observerRoles map[string]uint8
 	observerRolesOverflow := false
 	var nodes iter.Seq[*graph.Node]
-	if scope != nil {
+	if scope != nil && !fullCensus {
 		nodes = graph.NodesLightInScopeSeq(g, frameworkScopePrefixes(scope), filePaths)
 	} else {
 		nodes = graph.NodesLightSeq(g)
@@ -372,7 +431,7 @@ func summarizeFrameworkCandidatesForFiles(
 			continue
 		}
 		family := frameworkLanguageFamily(n.Language)
-		if scope == nil {
+		if fullCensus {
 			summary.noteColdCSharpTypeName(n)
 		}
 		if role := recordFrameworkNodeCandidates(summary.allMarkers, n, family); role != 0 && n.ID != "" {
@@ -424,7 +483,7 @@ func summarizeFrameworkCandidatesForFiles(
 			}
 			return true
 		}
-		if scope == nil {
+		if fullCensus {
 			if _, streaming := g.(graph.LightEdgeSequencer); streaming {
 				for edge := range graph.EdgesLightSeq(g, graph.EdgeAccessesField) {
 					if !visit(edge) {
@@ -470,7 +529,7 @@ func summarizeFrameworkCandidatesForFiles(
 			}
 		}
 	}
-	if scope == nil {
+	if fullCensus {
 		summary.edges = collectFrameworkEdgeCensus(g)
 	}
 	return summary
@@ -567,6 +626,12 @@ var frameworkSynthEdgePreflights = map[string]func(frameworkEdgeCensus) bool{
 	SynthReactSetState:   func(c frameworkEdgeCensus) bool { return c.setStateTarget },
 	SynthFlutterSetState: func(c frameworkEdgeCensus) bool { return c.setStateTarget },
 	SynthRailsResolve:    func(c frameworkEdgeCensus) bool { return c.recvConst },
+	// grpc/temporal were historically ungated: their internal presence
+	// probes short-circuit the yield but still pay a full EdgeCalls scan
+	// each (measured 52s + 30s for zero edges on a stub-free workspace).
+	// The census answers the same predicates in its single shared walk.
+	SynthGRPCStub:     func(c frameworkEdgeCensus) bool { return c.grpcStub },
+	SynthTemporalStub: func(c frameworkEdgeCensus) bool { return c.temporalVia || c.temporalAnnotation },
 }
 
 func recordFrameworkNodeCandidates(markers map[string]int, n *graph.Node, family string) uint8 {
@@ -948,7 +1013,21 @@ func RunFrameworkSynthesizers(g graph.Store) FrameworkSynthReport {
 // passes use the changed repositories plus their exact reverse dependency
 // frontier; nil scope retains full/cold whole-graph reconciliation.
 func RunFrameworkSynthesizersScoped(g graph.Store, scope map[string]bool) FrameworkSynthReport {
-	return runFrameworkSynthesizersScoped(g, scope, nil)
+	return runFrameworkSynthesizersScoped(g, scope, nil, false)
+}
+
+// RunFrameworkSynthesizersScopedWithCensus is the full-coverage batch form:
+// the caller (the daemon's cold / full-reconciliation warmup) attests that
+// the scope covers every tracked repository, so the admission census may be
+// built from the RAW whole store even though synthesizer execution keeps the
+// scoped view. The attestation must come from the repo registry's owner —
+// it is never inferred here from the scope's size.
+func RunFrameworkSynthesizersScopedWithCensus(
+	g graph.Store,
+	scope map[string]bool,
+	censusEligible bool,
+) FrameworkSynthReport {
+	return runFrameworkSynthesizersScoped(g, scope, nil, censusEligible)
 }
 
 // RunFrameworkSynthesizersScopedForFiles is the exact incremental form. The
@@ -960,19 +1039,20 @@ func RunFrameworkSynthesizersScopedForFiles(
 	scope map[string]bool,
 	filePaths []string,
 ) FrameworkSynthReport {
-	return runFrameworkSynthesizersScoped(g, scope, filePaths)
+	return runFrameworkSynthesizersScoped(g, scope, filePaths, false)
 }
 
 func runFrameworkSynthesizersScoped(
 	g graph.Store,
 	scope map[string]bool,
 	filePaths []string,
+	censusEligible bool,
 ) FrameworkSynthReport {
 	rep := FrameworkSynthReport{}
 	if g == nil {
 		return rep
 	}
-	candidates := summarizeFrameworkCandidatesForFiles(g, scope, filePaths)
+	candidates := summarizeFrameworkCandidatesCensus(g, scope, filePaths, censusEligible)
 	var genericScope graph.Store
 	if scope != nil {
 		genericScope = newFrameworkScopedStore(g, scope, filePaths)
@@ -1048,8 +1128,8 @@ var frameworkStrictFamilies = []string{"jvm", "apple", "web", "c", "dotnet"}
 // vue/svelte nodes whose strict family is empty and which can never
 // trigger a drop. Scoped runs always run the gate — a scoped census does
 // not walk off-scope endpoint nodes.
-func frameworkFamilyGateNeeded(scope map[string]bool, summary frameworkCandidateSummary) bool {
-	if scope != nil {
+func frameworkFamilyGateNeeded(_ map[string]bool, summary frameworkCandidateSummary) bool {
+	if !summary.fullCensus {
 		return true
 	}
 	distinct := 0
@@ -1068,8 +1148,8 @@ func frameworkFamilyGateNeeded(scope map[string]bool, summary frameworkCandidate
 // type/interface names proves the gate returns zero on any graph. Scoped
 // runs always run the gate — the gate's name index is whole-graph while a
 // scoped census is not.
-func frameworkReceiverGateNeeded(scope map[string]bool, summary frameworkCandidateSummary) bool {
-	if scope != nil {
+func frameworkReceiverGateNeeded(_ map[string]bool, summary frameworkCandidateSummary) bool {
+	if !summary.fullCensus {
 		return true
 	}
 	return summary.csharpTypeNames.count >= 2

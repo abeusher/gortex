@@ -846,6 +846,16 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// disabled or the set is empty (run every repo, the prior behaviour).
 	if anyChanged && !scopeUnknown.Load() {
 		state.multiIndexer.ArmBatchScope(changed)
+		// Full-coverage attestation: every tracked repository re-indexed in
+		// this warmup (a cold index, or a warm restart that reconciled the
+		// whole workspace). The framework-synthesis admission census may
+		// then read the raw store even though the batch scope is non-nil —
+		// without this, the cold path's all-repos scope silently bypassed
+		// every census gate. Computed here, against the daemon's own repo
+		// registry, never inferred downstream from scope size.
+		if len(changed) == len(repos) {
+			state.multiIndexer.ArmBatchCensusEligible()
+		}
 	}
 
 	phaseStart = time.Now()
