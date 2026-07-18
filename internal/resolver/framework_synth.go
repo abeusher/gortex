@@ -1,6 +1,8 @@
 package resolver
 
 import (
+	"iter"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -177,11 +179,10 @@ func UnstampSynthesized(e *graph.Edge) {
 // the existing passes (ResolveGRPCStubCalls, …) register without a
 // wrapper type each.
 //
-// scopedFn is optional: when set, the end-of-batch driver calls it with the
-// changed-repo prefix set so the synthesizer can restrict its CANDIDATE scan to
-// those repos (resolution stays whole-graph). A synthesizer without a scopedFn
-// always runs whole-graph — correct, just not narrowed — so scoping any one
-// pass is opt-in and additive.
+// scopedFn is optional: passes with bespoke cross-repository reconciliation may
+// consume the changed-repo prefix set directly. Every other pass runs through
+// frameworkScopedStore on a partial invocation; no synthFunc is permitted to
+// fall back to the unfiltered workspace store.
 type synthFunc struct {
 	name     string
 	fn       func(graph.Store) int
@@ -191,14 +192,16 @@ type synthFunc struct {
 func (s synthFunc) Name() string                 { return s.name }
 func (s synthFunc) Synthesize(g graph.Store) int { return s.fn(g) }
 
-// synthesizeScoped runs the scoped variant when one is registered and a scope
-// is armed; otherwise it falls back to the whole-graph pass. A nil scope always
-// means whole-graph, so the fresh-index path is byte-identical to before.
+// synthesizeScoped preserves the legacy entry point used by focused tests. A
+// non-nil scope never reaches fn with the unfiltered store.
 func (s synthFunc) synthesizeScoped(g graph.Store, scope map[string]bool) int {
-	if scope != nil && s.scopedFn != nil {
+	if scope == nil {
+		return runLegacyFrameworkSynth(g, s.fn)
+	}
+	if s.scopedFn != nil {
 		return s.scopedFn(g, scope)
 	}
-	return s.fn(g)
+	return runLegacyFrameworkSynth(newFrameworkScopedStore(g, scope, nil), s.fn)
 }
 
 // frameworkSynthLanguageFamilies is deliberately conservative. An absent
@@ -249,13 +252,107 @@ type frameworkCandidateSummary struct {
 	scoped        map[string]int
 	allMarkers    map[string]int
 	scopedMarkers map[string]int
+	// edges is the cold-run EdgeCalls admission census. Valid only when the
+	// census walked the full stream (nil scope); scoped runs never consult it.
+	edges frameworkEdgeCensus
+	// csharpTypeNames counts distinct C# type/interface names, saturating at
+	// two — the receiver-gate tail can demote only when the receiver and
+	// target names differ and both are indexed C# types. Cold runs only.
+	csharpTypeNames frameworkDistinctNames
+}
+
+// frameworkDistinctNames counts distinct non-empty names, saturating at two.
+type frameworkDistinctNames struct {
+	first string
+	count int
+}
+
+func (d *frameworkDistinctNames) note(name string) {
+	if name == "" || d.count >= 2 {
+		return
+	}
+	if d.count == 0 {
+		d.first = name
+		d.count = 1
+		return
+	}
+	if name != d.first {
+		d.count = 2
+	}
+}
+
+// frameworkEdgeCensus is the shared EdgeCalls admission census for the
+// via-gated synthesizers: one Meta-decoding pass over the same edge stream
+// those passes read, so each pass's own admission predicate is answered once
+// instead of per pass. valid is set only on a nil-scope run — a scoped
+// synthesizer view can admit incident placeholder edges a scoped stream walk
+// would not see, so a partial census cannot prove absence.
+type frameworkEdgeCensus struct {
+	valid bool
+	// via holds every Meta["via"] string present on an EdgeCalls edge.
+	via map[string]bool
+	// expressHandlerRef: the express_handler_ref Meta key rode on an
+	// unresolved-target edge.
+	expressHandlerRef bool
+	// recvConst: a non-empty Meta["recv_const"] rode on an unresolved-target
+	// edge.
+	recvConst bool
+	// setStateTarget: some edge's To satisfies isSetStateTarget.
+	setStateTarget bool
+	// objectRegistryValue: a non-empty Meta["registry_value"] rode on an
+	// object-registry via edge.
+	objectRegistryValue bool
+}
+
+// collectFrameworkEdgeCensus makes the cold-run EdgeCalls pass feeding
+// frameworkSynthEdgePreflights. Every flag is a necessary condition copied
+// verbatim from the consuming pass's own loop filter, so a missed flag can
+// only keep a pass enabled, never skip one that could land an edge.
+func collectFrameworkEdgeCensus(g graph.Store) frameworkEdgeCensus {
+	census := frameworkEdgeCensus{valid: true, via: map[string]bool{}}
+	for e := range g.EdgesByKind(graph.EdgeCalls) {
+		if e == nil {
+			continue
+		}
+		if isSetStateTarget(e.To) {
+			census.setStateTarget = true
+		}
+		if e.Meta == nil {
+			continue
+		}
+		if via, _ := e.Meta["via"].(string); via != "" {
+			census.via[via] = true
+			if via == objectRegistryVia && !census.objectRegistryValue {
+				if value, _ := e.Meta["registry_value"].(string); value != "" {
+					census.objectRegistryValue = true
+				}
+			}
+		}
+		if graph.IsUnresolvedTarget(e.To) {
+			if _, ok := e.Meta["express_handler_ref"]; ok {
+				census.expressHandlerRef = true
+			}
+			if recv, _ := e.Meta["recv_const"].(string); recv != "" {
+				census.recvConst = true
+			}
+		}
+	}
+	return census
 }
 
 // summarizeFrameworkCandidates makes one metadata-free node pass for the
-// entire synthesizer run. Both the whole-graph and changed-repo views are
-// populated in that same pass so a synthesizer that falls back to its global
-// implementation is never gated by the narrower repo scope.
+// synthesizer run. Full/cold runs retain the whole-graph projection; partial
+// runs read only the changed repository buckets and use that same candidate
+// census to gate both scoped and legacy synthesizers.
 func summarizeFrameworkCandidates(g graph.Store, scope map[string]bool) frameworkCandidateSummary {
+	return summarizeFrameworkCandidatesForFiles(g, scope, nil)
+}
+
+func summarizeFrameworkCandidatesForFiles(
+	g graph.Store,
+	scope map[string]bool,
+	filePaths []string,
+) frameworkCandidateSummary {
 	summary := frameworkCandidateSummary{
 		all:           map[string]int{},
 		scoped:        map[string]int{},
@@ -263,25 +360,39 @@ func summarizeFrameworkCandidates(g graph.Store, scope map[string]bool) framewor
 		scopedMarkers: map[string]int{},
 	}
 	var observerRoles map[string]uint8
-	for _, n := range graph.AllNodesLight(g) {
+	observerRolesOverflow := false
+	var nodes iter.Seq[*graph.Node]
+	if scope != nil {
+		nodes = graph.NodesLightInScopeSeq(g, frameworkScopePrefixes(scope), filePaths)
+	} else {
+		nodes = graph.NodesLightSeq(g)
+	}
+	for n := range nodes {
 		if n == nil {
 			continue
 		}
 		family := frameworkLanguageFamily(n.Language)
+		if scope == nil {
+			summary.noteColdCSharpTypeName(n)
+		}
 		if role := recordFrameworkNodeCandidates(summary.allMarkers, n, family); role != 0 && n.ID != "" {
 			if observerRoles == nil {
 				observerRoles = map[string]uint8{}
 			}
-			observerRoles[n.ID] = role
+			if len(observerRoles) < frameworkScopeRetainedRowCap {
+				observerRoles[n.ID] = role
+			} else {
+				observerRolesOverflow = true
+			}
 		}
-		if scope != nil && scope[n.RepoPrefix] {
+		if scope != nil {
 			recordFrameworkNodeCandidates(summary.scopedMarkers, n, family)
 		}
 		if family == "" {
 			continue
 		}
 		summary.all[family]++
-		if scope != nil && scope[n.RepoPrefix] {
+		if scope != nil {
 			summary.scoped[family]++
 		}
 	}
@@ -290,25 +401,92 @@ func summarizeFrameworkCandidates(g graph.Store, scope map[string]bool) framewor
 	// accesses_field edges proves whether such a channel can exist. This is
 	// stricter than two unrelated name hits but retains every candidate the
 	// synthesizer itself can consume.
-	if summary.allMarkers[frameworkMarkerObserverRegistrar] > 0 &&
+	if observerRolesOverflow {
+		// The proof cache is deliberately capped. Overflow cannot prove the
+		// pass inert, so retain it; the scoped synthesizer view still bounds
+		// its actual candidate rows.
+		summary.allMarkers[SynthObserverChannel]++
+	} else if summary.allMarkers[frameworkMarkerObserverRegistrar] > 0 &&
 		summary.allMarkers[frameworkMarkerObserverDispatcher] > 0 {
 		fieldRoles := map[string]uint8{}
-		for _, e := range graph.EdgesForKindsLight(g, graph.EdgeAccessesField) {
+		visit := func(e *graph.Edge) bool {
 			if e == nil || e.From == "" || e.To == "" {
-				continue
+				return true
 			}
 			role := observerRoles[e.From]
 			if role == 0 {
-				continue
+				return true
 			}
 			fieldRoles[e.To] |= role
 			if fieldRoles[e.To] == (frameworkObserverRegistrarRole | frameworkObserverDispatcherRole) {
 				summary.allMarkers[SynthObserverChannel]++
-				break
+				return false
+			}
+			return true
+		}
+		if scope == nil {
+			if _, streaming := g.(graph.LightEdgeSequencer); streaming {
+				for edge := range graph.EdgesLightSeq(g, graph.EdgeAccessesField) {
+					if !visit(edge) {
+						break
+					}
+				}
+			} else if light, ok := g.(graph.LightEdgeScanner); ok {
+				for _, edge := range light.AllEdgesLight(graph.EdgeAccessesField) {
+					if !visit(edge) {
+						break
+					}
+				}
+			} else {
+				for edge := range g.EdgesByKind(graph.EdgeAccessesField) {
+					if !visit(edge) {
+						break
+					}
+				}
+			}
+		} else {
+			if _, streaming := g.(graph.ScopedProjectionSequencer); streaming {
+				for row := range graph.EdgesInScopeSeq(
+					g, frameworkScopePrefixes(scope), filePaths, graph.EdgeAccessesField,
+				) {
+					if !visit(row.Edge) {
+						break
+					}
+				}
+			} else if light, ok := g.(graph.LightEdgeScanner); ok {
+				for _, edge := range light.AllEdgesLight(graph.EdgeAccessesField) {
+					if !visit(edge) {
+						break
+					}
+				}
+			} else {
+				for row := range graph.EdgesInScopeSeq(
+					g, frameworkScopePrefixes(scope), filePaths, graph.EdgeAccessesField,
+				) {
+					if !visit(row.Edge) {
+						break
+					}
+				}
 			}
 		}
 	}
+	if scope == nil {
+		summary.edges = collectFrameworkEdgeCensus(g)
+	}
 	return summary
+}
+
+// noteColdCSharpTypeName feeds the receiver-gate tail census: only nodes the
+// demote pass itself can index (C# type/interface names) are counted, and
+// only up to the two distinct names a demotion minimally requires.
+func (s *frameworkCandidateSummary) noteColdCSharpTypeName(n *graph.Node) {
+	if n.Kind != graph.KindType && n.Kind != graph.KindInterface {
+		return
+	}
+	if !strings.EqualFold(strings.TrimSpace(n.Language), "csharp") {
+		return
+	}
+	s.csharpTypeNames.note(n.Name)
 }
 
 const (
@@ -316,6 +494,11 @@ const (
 	frameworkMarkerObserverDispatcher = "observer-channel:dispatcher"
 	frameworkMarkerSwift              = "swift-objc-bridge:swift"
 	frameworkMarkerObjC               = "swift-objc-bridge:objc"
+	frameworkMarkerSvelteKitPage      = "sveltekit-load:page"
+	frameworkMarkerSvelteKitServer    = "sveltekit-load:server"
+	frameworkMarkerPascalSource       = "pascal-form:source"
+	frameworkMarkerPascalForm         = "pascal-form:form"
+	frameworkMarkerStrictFamilyPrefix = "family-strict:"
 
 	frameworkObserverRegistrarRole  uint8 = 1
 	frameworkObserverDispatcherRole uint8 = 2
@@ -327,17 +510,63 @@ const (
 // graph scans. These are deliberately one-way gates; a marker hit only keeps
 // the pass enabled and does not claim that an edge will be produced.
 var frameworkSynthNodePreflights = map[string][]string{
-	SynthEventChannel:    {SynthEventChannel},
-	SynthSwiftObjC:       {frameworkMarkerSwift, frameworkMarkerObjC},
-	SynthObserverChannel: {SynthObserverChannel},
-	SynthReactSetState:   {SynthReactSetState},
-	SynthFlutterSetState: {SynthFlutterSetState},
-	SynthMyBatis:         {SynthMyBatis},
-	SynthSidekiq:         {SynthSidekiq},
-	SynthLaravelEvent:    {SynthLaravelEvent},
-	SynthSwiftUIResolve:  {SynthSwiftUIResolve},
-	SynthUIKitResolve:    {SynthUIKitResolve},
-	SynthVaporResolve:    {SynthVaporResolve},
+	SynthEventChannel:        {SynthEventChannel},
+	SynthSwiftObjC:           {frameworkMarkerSwift, frameworkMarkerObjC},
+	SynthObserverChannel:     {SynthObserverChannel},
+	SynthReactSetState:       {SynthReactSetState},
+	SynthFlutterSetState:     {SynthFlutterSetState},
+	SynthMyBatis:             {SynthMyBatis},
+	SynthSidekiq:             {SynthSidekiq},
+	SynthLaravelEvent:        {SynthLaravelEvent},
+	SynthSwiftUIResolve:      {SynthSwiftUIResolve},
+	SynthUIKitResolve:        {SynthUIKitResolve},
+	SynthVaporResolve:        {SynthVaporResolve},
+	SynthCSharpIfaceDispatch: {SynthCSharpIfaceDispatch},
+	SynthKMPExpectActual:     {SynthKMPExpectActual},
+	SynthMacroExpansion:      {SynthMacroExpansion},
+	SynthGoFrameRoute:        {SynthGoFrameRoute},
+	SynthSvelteKitLoad:       {frameworkMarkerSvelteKitPage, frameworkMarkerSvelteKitServer},
+	SynthPascalFormName:      {frameworkMarkerPascalSource, frameworkMarkerPascalForm},
+}
+
+// frameworkSynthFamilyConjunctions strengthens the OR family gate for
+// cross-ecosystem bridge passes: every GROUP must have at least one present
+// family (OR within a group, AND across groups). A bridge that links two
+// sides provably cannot emit when either side's family census is zero.
+var frameworkSynthFamilyConjunctions = map[string][][]string{
+	SynthExpoModules:     {{"web"}, {"apple", "jvm"}},
+	SynthFabric:          {{"web"}, {"apple", "jvm"}},
+	SynthReactNativePair: {{"apple"}, {"jvm"}},
+	SynthSQLCallsite:     {{"sql"}, {"web", "python"}},
+}
+
+// frameworkSynthEdgePreflights names passes whose necessary edge evidence is
+// visible in the cold EdgeCalls census. Each predicate is a verbatim copy of
+// the pass's own admission filter, evaluated on the same edge stream the
+// pass reads: a false result proves the pass cannot land, rebind, or stamp
+// an edge on this graph, while true only keeps it enabled. Conjunctive with
+// the family and node gates; consulted only when the census saw the full
+// stream (nil scope).
+//
+// rtk-query additionally leans on an extractor invariant: every
+// rtk_generated_hook node is minted together with a via=rtk-query
+// placeholder in the same extraction, so no via edge implies no generated
+// hooks and the hook-name branch is inert too. Pinned by
+// TestRTKQueryExtractorMintsHookWithViaPlaceholder.
+var frameworkSynthEdgePreflights = map[string]func(frameworkEdgeCensus) bool{
+	SynthObjectRegistry:  func(c frameworkEdgeCensus) bool { return c.objectRegistryValue },
+	SynthNgRxEffect:      func(c frameworkEdgeCensus) bool { return c.via[ngrxEffectVia] },
+	SynthExpressResolve:  func(c frameworkEdgeCensus) bool { return c.expressHandlerRef },
+	SynthReduxThunk:      func(c frameworkEdgeCensus) bool { return c.via[reduxThunkVia] },
+	SynthLaravelEvent:    func(c frameworkEdgeCensus) bool { return c.via[laravelEventVia] },
+	SynthVuexDispatch:    func(c frameworkEdgeCensus) bool { return c.via[vuexDispatchVia] },
+	SynthRTKQuery:        func(c frameworkEdgeCensus) bool { return c.via[rtkQueryVia] },
+	SynthCelery:          func(c frameworkEdgeCensus) bool { return c.via[celeryVia] },
+	SynthSpringEvent:     func(c frameworkEdgeCensus) bool { return c.via[springEventVia] },
+	SynthMediatR:         func(c frameworkEdgeCensus) bool { return c.via[mediatrVia] },
+	SynthReactSetState:   func(c frameworkEdgeCensus) bool { return c.setStateTarget },
+	SynthFlutterSetState: func(c frameworkEdgeCensus) bool { return c.setStateTarget },
+	SynthRailsResolve:    func(c frameworkEdgeCensus) bool { return c.recvConst },
 }
 
 func recordFrameworkNodeCandidates(markers map[string]int, n *graph.Node, family string) uint8 {
@@ -346,6 +575,9 @@ func recordFrameworkNodeCandidates(markers map[string]int, n *graph.Node, family
 	}
 
 	language := strings.ToLower(strings.TrimSpace(n.Language))
+	if strict := languageFamily(language); strict != "" {
+		markers[frameworkMarkerStrictFamilyPrefix+strict]++
+	}
 	switch language {
 	case "swift":
 		markers[frameworkMarkerSwift]++
@@ -362,6 +594,38 @@ func recordFrameworkNodeCandidates(markers map[string]int, n *graph.Node, family
 	case "php":
 		if (n.Kind == graph.KindMethod || n.Kind == graph.KindFunction) && n.Name == "handle" {
 			markers[SynthLaravelEvent]++
+		}
+	case "csharp":
+		if n.Kind == graph.KindInterface {
+			markers[SynthCSharpIfaceDispatch]++
+		}
+	case "kotlin":
+		markers[SynthKMPExpectActual]++
+	}
+	if n.Kind == graph.KindMacro {
+		markers[SynthMacroExpansion]++
+	}
+	// GoFrame route contracts are minted with a stable id namespace; any id
+	// carrying it (bare or repo-prefixed) proves route candidates exist.
+	if strings.Contains(n.ID, "route::goframe::") {
+		markers[SynthGoFrameRoute]++
+	}
+	// SvelteKit load synthesis needs both a +page/+layout consumer and a
+	// server-load producer file; Pascal form binding needs both a source
+	// unit and a form file. Path/extension shapes are visible in the light
+	// projection.
+	if strings.Contains(n.FilePath, "+page.") || strings.Contains(n.FilePath, "+layout.") {
+		markers[frameworkMarkerSvelteKitPage]++
+		if strings.Contains(n.FilePath, "+page.server.") || strings.Contains(n.FilePath, "+layout.server.") {
+			markers[frameworkMarkerSvelteKitServer]++
+		}
+	}
+	if n.Kind == graph.KindFile {
+		switch strings.ToLower(filepath.Ext(n.FilePath)) {
+		case ".pas", ".pp", ".dpr", ".lpr":
+			markers[frameworkMarkerPascalSource]++
+		case ".dfm", ".lfm", ".fmx":
+			markers[frameworkMarkerPascalForm]++
 		}
 	}
 
@@ -441,11 +705,10 @@ func frameworkSynthUsesScopedCandidates(s FrameworkSynthesizer, scope map[string
 	if scope == nil {
 		return false
 	}
-	// synthFunc implements scopedSynthesizer even when scopedFn is nil so it
-	// can transparently fall back to fn. Inspect the adapter directly to avoid
-	// mistaking that global fallback for a scoped pass.
-	if sf, ok := s.(synthFunc); ok {
-		return sf.scopedFn != nil
+	// Every synthFunc uses either its explicit scoped implementation or the
+	// bounded frameworkScopedStore candidate view.
+	if _, ok := s.(synthFunc); ok {
+		return true
 	}
 	_, ok := s.(scopedSynthesizer)
 	return ok
@@ -470,8 +733,25 @@ func shouldRunFrameworkSynthesizer(s FrameworkSynthesizer, scope map[string]bool
 			return false
 		}
 	}
+	for _, groups := range frameworkSynthFamilyConjunctions[s.Name()] {
+		found := false
+		for _, family := range groups {
+			if present[family] > 0 {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
 	for _, marker := range frameworkSynthNodePreflights[s.Name()] {
 		if markers[marker] == 0 {
+			return false
+		}
+	}
+	if summary.edges.valid {
+		if preflight := frameworkSynthEdgePreflights[s.Name()]; preflight != nil && !preflight(summary.edges) {
 			return false
 		}
 	}
@@ -537,7 +817,7 @@ func defaultFrameworkSynthesizers() []FrameworkSynthesizer {
 		// implementation, at the ast_inferred tier so it rides in the default
 		// find_usages / get_callers result. After the implements-producing
 		// passes so the impl fan-out is complete.
-		synthFunc{name: SynthCSharpIfaceDispatch, fn: ResolveCSharpInterfaceDispatch},
+		synthFunc{name: SynthCSharpIfaceDispatch, fn: ResolveCSharpInterfaceDispatch, scopedFn: ResolveCSharpInterfaceDispatchScoped},
 		// Sidekiq job dispatch: Worker.perform_async(...) → the worker's
 		// perform, namespace-aware. Include-gated, typed tier.
 		synthFunc{name: SynthSidekiq, fn: ResolveSidekiqCalls},
@@ -664,23 +944,60 @@ func RunFrameworkSynthesizers(g graph.Store) FrameworkSynthReport {
 // narrows its candidate scan to those repos, the rest run whole-graph. A nil
 // scope uses the whole-graph candidate census; language-specific passes proven
 // irrelevant are skipped, while generic or unaudited passes always run. The
-// claiming-resolver, family-gate and receiver-gate tail passes always run
-// whole-graph — they reconcile
-// the settled cross-repo call graph, not a per-repo candidate set.
+// claiming-resolver, family-gate, C# interface-dispatch, and receiver-gate tail
+// passes use the changed repositories plus their exact reverse dependency
+// frontier; nil scope retains full/cold whole-graph reconciliation.
 func RunFrameworkSynthesizersScoped(g graph.Store, scope map[string]bool) FrameworkSynthReport {
+	return runFrameworkSynthesizersScoped(g, scope, nil)
+}
+
+// RunFrameworkSynthesizersScopedForFiles is the exact incremental form. The
+// changed-file frontier owns candidate scans; incident incoming edges and exact
+// name dependencies are admitted by frameworkScopedStore so target-side edits
+// reconcile without widening to the repository corpus.
+func RunFrameworkSynthesizersScopedForFiles(
+	g graph.Store,
+	scope map[string]bool,
+	filePaths []string,
+) FrameworkSynthReport {
+	return runFrameworkSynthesizersScoped(g, scope, filePaths)
+}
+
+func runFrameworkSynthesizersScoped(
+	g graph.Store,
+	scope map[string]bool,
+	filePaths []string,
+) FrameworkSynthReport {
 	rep := FrameworkSynthReport{}
 	if g == nil {
 		return rep
 	}
-	candidates := summarizeFrameworkCandidates(g, scope)
+	candidates := summarizeFrameworkCandidatesForFiles(g, scope, filePaths)
+	var genericScope graph.Store
+	if scope != nil {
+		genericScope = newFrameworkScopedStore(g, scope, filePaths)
+	}
 	for _, s := range defaultFrameworkSynthesizers() {
 		start := time.Now()
 		var n int
 		if shouldRunFrameworkSynthesizer(s, scope, candidates) {
-			if ss, ok := s.(scopedSynthesizer); ok {
-				n = ss.synthesizeScoped(g, scope)
+			if sf, ok := s.(synthFunc); ok {
+				switch {
+				case scope == nil:
+					n = runLegacyFrameworkSynth(g, sf.fn)
+				case sf.scopedFn != nil:
+					n = sf.scopedFn(g, scope)
+				default:
+					n = runLegacyFrameworkSynth(genericScope, sf.fn)
+				}
+			} else if ss, ok := s.(scopedSynthesizer); ok {
+				n = runLegacyFrameworkSynth(g, func(store graph.Store) int {
+					return ss.synthesizeScoped(store, scope)
+				})
+			} else if scope == nil {
+				n = runLegacyFrameworkSynth(g, s.Synthesize)
 			} else {
-				n = s.Synthesize(g)
+				panic("framework partial run has an unscoped synthesizer: " + s.Name())
 			}
 		}
 		rep.Per = append(rep.Per, SynthCount{Name: s.Name(), Edges: n, Millis: time.Since(start).Milliseconds()})
@@ -690,14 +1007,16 @@ func RunFrameworkSynthesizersScoped(g graph.Store, scope map[string]bool) Framew
 	// the claiming resolvers run, so a gated edge cannot be mistaken for a
 	// resolved placeholder downstream. Bridge synthesizers are exempt.
 	gateStart := time.Now()
-	rep.Gated = applyFrameworkFamilyGate(g)
+	if frameworkFamilyGateNeeded(scope, candidates) {
+		rep.Gated = applyFrameworkFamilyGateScoped(g, scope)
+	}
 	rep.GateMillis = time.Since(gateStart).Milliseconds()
 	// Claiming resolvers run last — after every framework synthesizer has
 	// had its chance to consume a pre-stamped placeholder, but before
 	// external-call synthesis classifies the residual unresolved refs as
 	// external. Reported in registration order for determinism.
 	claimStart := time.Now()
-	claimed := RunClaimingResolvers(g)
+	claimed := RunClaimingResolversScoped(g, scope)
 	rep.ClaimMillis = time.Since(claimStart).Milliseconds()
 	for _, r := range defaultClaimingResolvers() {
 		n := claimed[r.Name()]
@@ -707,9 +1026,53 @@ func RunFrameworkSynthesizersScoped(g graph.Store, scope map[string]bool) Framew
 	// Receiver-type gate runs last: it corrects (demotes) already-bound C#
 	// member calls, so it must see the settled call graph.
 	demoteStart := time.Now()
-	rep.ReceiverGated = demoteCSharpMisattributedMemberCalls(g)
+	if frameworkReceiverGateNeeded(scope, candidates) {
+		rep.ReceiverGated = demoteCSharpMisattributedMemberCallsScoped(g, scope)
+	}
 	rep.DemoteMillis = time.Since(demoteStart).Milliseconds()
 	return rep
+}
+
+// frameworkStrictFamilies enumerates every non-empty languageFamily value.
+// The census records one strict-family marker per node so the tail gates can
+// count how many distinct families are present; keep in sync with
+// languageFamily's switch arms.
+var frameworkStrictFamilies = []string{"jvm", "apple", "web", "c", "dotnet"}
+
+// frameworkFamilyGateNeeded reports whether the cross-family gate can drop
+// an edge. A drop requires both endpoint nodes to map to two different
+// non-empty strict families, and the cold census walks every node — so
+// fewer than two distinct strict families proves the gate returns zero on
+// any graph. Uses the strict languageFamily marker, not the framework
+// family census: summary.all["web"] can be satisfied entirely by
+// vue/svelte nodes whose strict family is empty and which can never
+// trigger a drop. Scoped runs always run the gate — a scoped census does
+// not walk off-scope endpoint nodes.
+func frameworkFamilyGateNeeded(scope map[string]bool, summary frameworkCandidateSummary) bool {
+	if scope != nil {
+		return true
+	}
+	distinct := 0
+	for _, family := range frameworkStrictFamilies {
+		if summary.allMarkers[frameworkMarkerStrictFamilyPrefix+family] > 0 {
+			distinct++
+		}
+	}
+	return distinct >= 2
+}
+
+// frameworkReceiverGateNeeded reports whether the C# receiver gate can
+// demote an edge. A demotion requires the edge's receiver_type and the
+// target's receiver to be two different names, each resolving to an indexed
+// C# type/interface node — so a cold census with fewer than two distinct C#
+// type/interface names proves the gate returns zero on any graph. Scoped
+// runs always run the gate — the gate's name index is whole-graph while a
+// scoped census is not.
+func frameworkReceiverGateNeeded(scope map[string]bool, summary frameworkCandidateSummary) bool {
+	if scope != nil {
+		return true
+	}
+	return summary.csharpTypeNames.count >= 2
 }
 
 // ClaimingResolver retroactively claims a residual unresolved reference —
@@ -728,6 +1091,59 @@ type ClaimingResolver interface {
 	Resolve(g graph.Store, e *graph.Edge) bool
 }
 
+// batchClaimingResolver is the set-oriented form used by the framework tail.
+// The returned map contains only edges actually rebound by this resolver.
+type batchClaimingResolver interface {
+	ResolveBatch(g graph.Store, edges []*graph.Edge) map[*graph.Edge]bool
+}
+
+// claimTargetVocabulary is the optional admission probe a ClaimingResolver
+// exposes. RequiredTargetNames lists the node names the resolver binds
+// claims to; AdmitsTarget reports whether one indexed node retrieved for
+// such a name satisfies the resolver's bind-time shape. Before the tail
+// pays the unresolved-edge collection scan, each resolver's vocabulary is
+// probed against the live name index — the same index the resolver reads at
+// bind time — so an absent vocabulary proves the resolver cannot claim on
+// this graph. A resolver without the interface is always admissible.
+type claimTargetVocabulary interface {
+	RequiredTargetNames() []string
+	AdmitsTarget(n *graph.Node) bool
+}
+
+// RequiredTargetNames: a Django descriptor claim binds only to an indexed
+// __iter__ method; without one, ResolveBatch resolves nothing.
+func (DjangoDescriptorResolver) RequiredTargetNames() []string {
+	return []string{"__iter__"}
+}
+
+// AdmitsTarget reports whether an __iter__ candidate has the method shape
+// ResolveBatch indexes into iterMethods.
+func (DjangoDescriptorResolver) AdmitsTarget(n *graph.Node) bool {
+	return n != nil && n.Kind == graph.KindMethod
+}
+
+// claimingResolverAdmissible evaluates a resolver's declared vocabulary with
+// one indexed name lookup. An inadmissible resolver cannot claim any edge,
+// so dropping it leaves every other resolver's candidate set unchanged.
+func claimingResolverAdmissible(g graph.Store, r ClaimingResolver) bool {
+	vocab, ok := r.(claimTargetVocabulary)
+	if !ok {
+		return true
+	}
+	names := vocab.RequiredTargetNames()
+	if len(names) == 0 {
+		return true
+	}
+	for _, nodes := range g.FindNodesByNames(names) {
+		for _, n := range nodes {
+			if n != nil && vocab.AdmitsTarget(n) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // defaultClaimingResolvers returns the registered claiming resolvers, in
 // offer order.
 func defaultClaimingResolvers() []ClaimingResolver {
@@ -742,6 +1158,13 @@ func defaultClaimingResolvers() []ClaimingResolver {
 // count of claimed edges. Unresolved edges are collected before resolving so
 // a resolver's ReindexEdges does not mutate a live iteration.
 func RunClaimingResolvers(g graph.Store) map[string]int {
+	return RunClaimingResolversScoped(g, nil)
+}
+
+// RunClaimingResolversScoped limits partial-index work to unresolved calls and
+// references sourced by changed repositories. Resolver precedence is retained:
+// each registered resolver receives only edges not claimed by an earlier one.
+func RunClaimingResolversScoped(g graph.Store, scope map[string]bool) map[string]int {
 	out := map[string]int{}
 	if g == nil {
 		return out
@@ -750,19 +1173,45 @@ func RunClaimingResolvers(g graph.Store) map[string]int {
 	if len(resolvers) == 0 {
 		return out
 	}
-	var pending []*graph.Edge
-	for _, kind := range []graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences} {
-		for e := range g.EdgesByKind(kind) {
-			if e != nil && e.To != "" && graph.IsUnresolvedTarget(e.To) {
-				pending = append(pending, e)
-			}
+	admissible := make([]ClaimingResolver, 0, len(resolvers))
+	for _, r := range resolvers {
+		if claimingResolverAdmissible(g, r) {
+			admissible = append(admissible, r)
 		}
 	}
-	for _, e := range pending {
-		for _, r := range resolvers {
-			if r.Claims(e) && r.Resolve(g, e) {
+	if len(admissible) == 0 {
+		return out
+	}
+	var pending []*graph.Edge
+	for _, e := range frameworkRepoEdges(g, scope, graph.EdgeCalls, graph.EdgeReferences) {
+		if e != nil && e.To != "" && graph.IsUnresolvedTarget(e.To) {
+			pending = append(pending, e)
+		}
+	}
+	claimed := make(map[*graph.Edge]bool)
+	for _, r := range admissible {
+		candidates := make([]*graph.Edge, 0, len(pending))
+		for _, e := range pending {
+			if !claimed[e] && r.Claims(e) {
+				candidates = append(candidates, e)
+			}
+		}
+		if len(candidates) == 0 {
+			continue
+		}
+		if batcher, ok := r.(batchClaimingResolver); ok {
+			for edge := range batcher.ResolveBatch(g, candidates) {
+				if edge != nil && !claimed[edge] {
+					claimed[edge] = true
+					out[r.Name()]++
+				}
+			}
+			continue
+		}
+		for _, e := range candidates {
+			if r.Resolve(g, e) {
+				claimed[e] = true
 				out[r.Name()]++
-				break
 			}
 		}
 	}
