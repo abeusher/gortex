@@ -3,6 +3,7 @@ package store_sqlite
 import (
 	"context"
 	"database/sql"
+	"log"
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -509,6 +510,14 @@ func (s *Store) addBatchSetOriented(nodes []*graph.Node, edges []*graph.Edge) (s
 	var stats sqliteAddBatchStats
 	if len(nodes) == 0 && len(edges) == 0 {
 		return stats, nil
+	}
+	// Structural-shape backstop covering every SQLite ingest path (AddEdge
+	// and AddBatch route here; the bulk JSONB chunks are emitted below).
+	// See graph.StructuralEdgeTargetInvalid for the mapper-bug class this
+	// stops at the door.
+	if kept, dropped := graph.FilterStructuralEdgeViolations(edges); dropped > 0 {
+		edges = kept
+		log.Printf("store_sqlite: dropped %d structurally invalid edges (kind cannot target a param/local node)", dropped)
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()

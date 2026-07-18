@@ -2585,6 +2585,8 @@ func (g *Graph) AddBatch(nodes []*Node, edges []*Edge) {
 	if len(nodes) == 0 && len(edges) == 0 {
 		return
 	}
+	// Structural-shape backstop: see StructuralEdgeTargetInvalid.
+	edges, _ = FilterStructuralEdgeViolations(edges)
 	receiptActive := g.beginReceiptMutation()
 	if receiptActive {
 		defer g.endReceiptMutation()
@@ -2699,6 +2701,10 @@ func (g *Graph) AddBatch(nodes []*Node, edges []*Edge) {
 // adjacency-list length is unchanged. Drops the double-edge problem
 // that used to surface after daemon restarts (bug B1).
 func (g *Graph) AddEdge(e *Edge) {
+	// Structural-shape backstop: see StructuralEdgeTargetInvalid.
+	if e != nil && StructuralEdgeTargetInvalid(e.Kind, e.To) {
+		return
+	}
 	receiptActive := g.beginReceiptMutation()
 	if receiptActive {
 		defer g.endReceiptMutation()

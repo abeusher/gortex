@@ -153,6 +153,46 @@ const FnValuePlaceholderMarker = UnresolvedMarker + "fnvalue::"
 
 // IsUnresolvedTarget reports whether id names an unresolved
 // extractor stub in either the bare or the multi-repo form.
+// StructuralEdgeTargetInvalid reports an edge whose kind can never
+// legitimately point at a parameter or local node: nothing implements,
+// extends, overrides, is a member of, or instantiates a `#param:`/`#local:`
+// symbol. This is the store-level backstop for mapper bugs upstream — one
+// mis-mapped interface object once fanned 130,250 implements edges onto a
+// single `#param:ctx` node (57% of a workspace's implements set) before the
+// pass-level gates existed. Both backends consult it at batch-write time and
+// drop violations, so no current or future pass can persist the shape.
+func StructuralEdgeTargetInvalid(kind EdgeKind, toID string) bool {
+	switch kind {
+	case EdgeImplements, EdgeExtends, EdgeOverrides, EdgeInstantiates, EdgeMemberOf:
+	default:
+		return false
+	}
+	return strings.Contains(toID, "#param:") || strings.Contains(toID, "#local:")
+}
+
+// FilterStructuralEdgeViolations drops edges StructuralEdgeTargetInvalid
+// rejects, copying the slice only when a violation exists — the clean path
+// (every real batch) allocates nothing. Returns the kept slice and the
+// number dropped, so write funnels can surface a one-line count instead of
+// silently eating mapper bugs.
+func FilterStructuralEdgeViolations(edges []*Edge) ([]*Edge, int) {
+	dropped := 0
+	kept := edges
+	for i, e := range edges {
+		if e != nil && StructuralEdgeTargetInvalid(e.Kind, e.To) {
+			if dropped == 0 {
+				kept = append(make([]*Edge, 0, len(edges)), edges[:i]...)
+			}
+			dropped++
+			continue
+		}
+		if dropped > 0 {
+			kept = append(kept, e)
+		}
+	}
+	return kept, dropped
+}
+
 func IsUnresolvedTarget(id string) bool {
 	if id == "" {
 		return false
