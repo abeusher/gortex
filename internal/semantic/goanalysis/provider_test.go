@@ -1007,7 +1007,8 @@ func TestEnrichImplementsUsesOneInboundBatchWithoutKindScan(t *testing.T) {
 	types.NewNamed(interfaceObj, types.NewInterfaceType(nil, nil).Complete(), nil)
 	provider := newTestProvider(t)
 
-	confirmed := provider.enrichImplements(store, map[types.Object]string{interfaceObj: interfaceID})
+	confirmed := provider.enrichImplements(store, map[types.Object]string{interfaceObj: interfaceID},
+		map[string]*graph.Node{interfaceID: {ID: interfaceID, Kind: graph.KindInterface}})
 	assert.Equal(t, 1, confirmed)
 	assert.Equal(t, 1, store.inboundBatchCalls)
 	assert.Equal(t, 1, store.fullNodeBatches)

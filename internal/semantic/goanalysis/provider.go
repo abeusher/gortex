@@ -733,7 +733,7 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 
 	// Phase 3: Interface implementations via go/types.
 	implementsStart := time.Now()
-	result.EdgesConfirmed += p.enrichImplements(g, objToNode)
+	result.EdgesConfirmed += p.enrichImplements(g, objToNode, nodesByID)
 	result.EdgesAdded += p.addMissingImplements(g, objToNode, nodesByID)
 	applyImplementsDur = time.Since(implementsStart)
 	stampsStart := time.Now()
@@ -1596,12 +1596,32 @@ func resolveGoUse(
 }
 
 // enrichImplements confirms existing EdgeImplements edges using go/types.
-func (p *Provider) enrichImplements(g graph.Store, objToNode map[types.Object]string) int {
+// implementsInterfaceNode reports whether nodeID can legitimately stand as
+// the interface side of an implements edge. Phase-1 maps go/types objects to
+// graph nodes by innermost file/line containment, and on a signature line the
+// innermost node is a PARAMETER — one interface object mis-mapped that way
+// fanned a single empty interface into 130,250 implements edges targeting a
+// lone `#param:ctx` node (57% of the workspace's implements set). Node kind
+// is the exact guard: only an interface-kind node may host an interface.
+func implementsInterfaceNode(nodesByID map[string]*graph.Node, nodeID string) bool {
+	node := nodesByID[nodeID]
+	return node != nil && node.Kind == graph.KindInterface
+}
+
+// implementsConcreteNode is the symmetric guard for the concrete side: a
+// mis-mapped concrete TypeName must not source implements edges from a
+// param/local/function node.
+func implementsConcreteNode(nodesByID map[string]*graph.Node, nodeID string) bool {
+	node := nodesByID[nodeID]
+	return node != nil && node.Kind == graph.KindType
+}
+
+func (p *Provider) enrichImplements(g graph.Store, objToNode map[types.Object]string, nodesByID map[string]*graph.Node) int {
 	// Collect all interfaces from the loaded packages.
 	ifaceTypes := make(map[string]*types.Interface) // Gortex node ID → interface type
 	for obj, nodeID := range objToNode {
 		if tn, ok := obj.(*types.TypeName); ok {
-			if iface, ok := tn.Type().Underlying().(*types.Interface); ok {
+			if iface, ok := tn.Type().Underlying().(*types.Interface); ok && implementsInterfaceNode(nodesByID, nodeID) {
 				ifaceTypes[nodeID] = iface
 			}
 		}
@@ -1684,8 +1704,18 @@ func (p *Provider) addMissingImplements(g graph.Store, objToNode map[types.Objec
 			continue
 		}
 		if iface, ok := tn.Type().Underlying().(*types.Interface); ok {
+			// Kind gate — see implementsInterfaceNode: an interface object
+			// mis-mapped onto a non-interface node (a signature-line param)
+			// must never enter this list, or an empty interface fans out an
+			// edge from EVERY concrete type to that junk node.
+			if !implementsInterfaceNode(nodesByID, nodeID) {
+				continue
+			}
 			ifaces = append(ifaces, ifaceEntry{nodeID: nodeID, iface: iface.Complete()})
 		} else {
+			if !implementsConcreteNode(nodesByID, nodeID) {
+				continue
+			}
 			typ := tn.Type()
 			pointer := types.NewPointer(typ)
 			concretes = append(concretes, concreteEntry{
