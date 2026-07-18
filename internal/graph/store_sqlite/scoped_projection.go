@@ -249,7 +249,13 @@ func scopedNodeProjectionQuery(
 	}
 	if haveRepos {
 		ctes = append(ctes, `requested_repos(repo_prefix) AS (SELECT CAST(value AS TEXT) FROM json_each(?))`)
-		joins = append(joins, `JOIN requested_repos AS r ON r.repo_prefix = n.repo_prefix`)
+		// +n.repo_prefix: keep repo-leading indexes OUT of this keyset query.
+		// Its streaming contract rides on an id-ordered access path —
+		// nodes_by_kind's (kind, id) entries, or the id-ordered PK scan —
+		// and nodes_by_repo_kind's (repo, kind, id) order interleaves ids
+		// across the requested repos, forcing the temp B-tree the round-5
+		// lock forbids. The repo CTE stays a per-row filter here.
+		joins = append(joins, `JOIN requested_repos AS r ON r.repo_prefix = +n.repo_prefix`)
 		args = append(args, reposJSON)
 	}
 	kindPredicate := ""

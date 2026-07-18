@@ -136,17 +136,7 @@ func (s *Store) RepoNodeIDsByKinds(repoPrefixes []string, kinds []graph.NodeKind
 	if !ok {
 		return nil
 	}
-	rows, err := s.db.Query(`
-WITH requested_repos(repo_prefix) AS (
-    SELECT CAST(value AS TEXT) FROM json_each(?)
-), requested_kinds(kind) AS (
-    SELECT CAST(value AS TEXT) FROM json_each(?)
-)
-SELECT n.id
-FROM requested_repos AS r
-JOIN nodes AS n ON n.repo_prefix = r.repo_prefix
-JOIN requested_kinds AS k ON k.kind = n.kind
-ORDER BY n.id`, reposJSON, kindsJSON)
+	rows, err := s.db.Query(repoNodeIDsByKindsQuery(), reposJSON, kindsJSON)
 	if err != nil {
 		panicOnFatal(err)
 		return nil
@@ -165,7 +155,37 @@ ORDER BY n.id`, reposJSON, kindsJSON)
 	if err := rows.Err(); err != nil {
 		panicOnFatal(err)
 	}
+	// The former ORDER BY n.id forced a temp B-tree over every matched row;
+	// the ID contract is kept with a Go-side sort instead.
+	sort.Strings(out)
 	return out
+}
+
+// repoNodeIDsByKindsQuery and repoEdgesByKindsQuery are pure string builders
+// (no I/O) so the plan-lock test can EXPLAIN the exact production SQL.
+//
+// Both drive REPO-FIRST through nodes_by_repo_kind: the flat kind index
+// invites whole-kind-range scans that the repo filter then discards. The
+// requested_repos CTE stays the driving (scanned) side by construction; the
+// kind predicate is a plain IN so SQLite multi-seeks (repo_prefix, kind) —
+// and, for edges, (from_id, kind) — per kind value. No SQL ORDER BY: both
+// callers restore their ordering contract with a Go-side sort.
+func repoNodeIDsByKindsQuery() string {
+	return `
+WITH requested_repos(repo_prefix) AS (
+    SELECT CAST(value AS TEXT) FROM json_each(?)
+), requested_kinds(kind) AS (
+    SELECT CAST(value AS TEXT) FROM json_each(?)
+)
+SELECT n.id
+FROM requested_repos AS r
+CROSS JOIN requested_kinds AS k
+CROSS JOIN nodes AS n ON n.repo_prefix = r.repo_prefix AND n.kind = k.kind`
+	// CROSS JOIN (not INDEXED BY): SQLite never reorders CROSS JOIN, which is
+	// the whole fix — n can only be the probed side. INDEXED BY would be a
+	// hard runtime error whenever the partial index cannot serve the query
+	// (solo-repo '' prefixes; bulk-load windows with droppable indexes off),
+	// and this path panics on query errors.
 }
 
 // RepoFilePaths projects only paths for file nodes in one repository/workspace.
@@ -296,21 +316,7 @@ func (s *Store) RepoEdgesByKinds(repoPrefixes []string, kinds []graph.EdgeKind) 
 	if !ok {
 		return nil
 	}
-	rows, err := s.db.Query(`
-WITH requested_repos(repo_prefix) AS (
-    SELECT CAST(value AS TEXT) FROM json_each(?)
-), requested_kinds(kind) AS (
-    SELECT CAST(value AS TEXT) FROM json_each(?)
-)
-SELECT n.repo_prefix,
-       e.from_id, e.to_id, e.kind, e.file_path, e.line,
-	       e.confidence, e.confidence_label, e.origin, e.tier,
-	       e.cross_repo, e.meta, e.resolve_terminal, e.resolve_terminal_reason, e.semantic_source
-FROM requested_repos AS r
-JOIN nodes AS n ON n.repo_prefix = r.repo_prefix
-JOIN edges AS e ON e.from_id = n.id
-JOIN requested_kinds AS k ON k.kind = e.kind
-ORDER BY n.repo_prefix, e.from_id, e.to_id, e.kind, e.file_path, e.line`, reposJSON, kindsJSON)
+	rows, err := s.db.Query(repoEdgesByKindsQuery(), reposJSON, kindsJSON)
 	if err != nil {
 		panicOnFatal(err)
 		return nil
@@ -330,7 +336,49 @@ ORDER BY n.repo_prefix, e.from_id, e.to_id, e.kind, e.file_path, e.line`, reposJ
 	if err := rows.Err(); err != nil {
 		panicOnFatal(err)
 	}
+	// The former six-column ORDER BY forced a temp B-tree over the whole
+	// result; the ordering contract is restored in Go.
+	sort.Slice(out, func(i, j int) bool {
+		a, b := out[i], out[j]
+		if a.RepoPrefix != b.RepoPrefix {
+			return a.RepoPrefix < b.RepoPrefix
+		}
+		if a.Edge.From != b.Edge.From {
+			return a.Edge.From < b.Edge.From
+		}
+		if a.Edge.To != b.Edge.To {
+			return a.Edge.To < b.Edge.To
+		}
+		if a.Edge.Kind != b.Edge.Kind {
+			return a.Edge.Kind < b.Edge.Kind
+		}
+		if a.Edge.FilePath != b.Edge.FilePath {
+			return a.Edge.FilePath < b.Edge.FilePath
+		}
+		return a.Edge.Line < b.Edge.Line
+	})
 	return out
+}
+
+func repoEdgesByKindsQuery() string {
+	// r → n → k → e under CROSS JOIN (never reordered): every edge lookup is
+	// a full (from_id, kind) seek on edges_by_from — the flat-kind global
+	// range scan the old shape invited is structurally unreachable, and the
+	// compound seek survives the node-first drive.
+	return `
+WITH requested_repos(repo_prefix) AS (
+    SELECT CAST(value AS TEXT) FROM json_each(?)
+), requested_kinds(kind) AS (
+    SELECT CAST(value AS TEXT) FROM json_each(?)
+)
+SELECT n.repo_prefix,
+       e.from_id, e.to_id, e.kind, e.file_path, e.line,
+	       e.confidence, e.confidence_label, e.origin, e.tier,
+	       e.cross_repo, e.meta, e.resolve_terminal, e.resolve_terminal_reason, e.semantic_source
+FROM requested_repos AS r
+CROSS JOIN nodes AS n ON n.repo_prefix = r.repo_prefix
+CROSS JOIN requested_kinds AS k
+CROSS JOIN edges AS e ON e.from_id = n.id AND e.kind = k.kind`
 }
 
 var (

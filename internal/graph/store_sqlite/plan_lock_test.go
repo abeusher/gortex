@@ -79,6 +79,31 @@ func TestHotQueryPlansLocked(t *testing.T) {
 			want:   []string{"USING INDEX edges_by_from"},
 			forbid: []string{"SCAN e"},
 		},
+		{
+			// Repo projections are CROSS JOIN pinned, so the plan shape is
+			// the same across cardinality regimes: nodes are probed through
+			// a repo-leading index (either nodes_by_repo variant qualifies —
+			// the lock is on the property, not the index name), never a
+			// global kind scan.
+			name:   "repo_node_ids_by_kinds",
+			query:  repoNodeIDsByKindsQuery(),
+			args:   2,
+			want:   []string{"nodes_by_repo_kind (repo_prefix=? AND kind=?)"},
+			forbid: []string{"SCAN n", "USE TEMP B-TREE"},
+		},
+		{
+			// Node-first drive must keep the full (from_id, kind) seek on
+			// edges — losing the kind column would trade the global scan for
+			// per-node over-reads.
+			name:  "repo_edges_by_kinds",
+			query: repoEdgesByKindsQuery(),
+			args:  2,
+			want: []string{
+				"nodes_by_repo_kind (repo_prefix=?)",
+				"SEARCH e USING INDEX edges_by_from (from_id=? AND kind=?)",
+			},
+			forbid: []string{"SCAN n", "SCAN e", "USE TEMP B-TREE"},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -124,13 +149,14 @@ func newPlanLockFixture(t *testing.T) *Store {
 			kind := kinds[n%len(kinds)]
 			id := fmt.Sprintf("%s::sym%02d", file, n)
 			nodes = append(nodes, &graph.Node{
-				ID:        id,
-				Name:      fmt.Sprintf("sym%02d", n),
-				Kind:      kind,
-				FilePath:  file,
-				Language:  "go",
-				StartLine: n*10 + 1,
-				EndLine:   n*10 + 8,
+				ID:         id,
+				Name:       fmt.Sprintf("sym%02d", n),
+				Kind:       kind,
+				FilePath:   file,
+				Language:   "go",
+				RepoPrefix: fmt.Sprintf("repo%d", f%3),
+				StartLine:  n*10 + 1,
+				EndLine:    n*10 + 8,
 			})
 			if kind == graph.KindFunction || kind == graph.KindMethod {
 				edges = append(edges, &graph.Edge{
