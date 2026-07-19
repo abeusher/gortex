@@ -419,6 +419,14 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 			result = decorateLocalizationReadResult(result, newLocalizationCompletion(true, ""))
 		}
 	}
+	// A read executed after answer_ready carries the answer-now directive:
+	// the read may sharpen the retained answer, but the host must not
+	// mistake it for permission to keep navigating.
+	if succeeded && facade == "read" && !localizationReadReserved {
+		if note, ok := terminal.answerReadyDirective(); ok {
+			result.Content = append(result.Content, mcpgo.NewTextContent(note))
+		}
+	}
 	if freshLocalizeFlow {
 		terminal.finishLocalize(localizeReservation, succeeded)
 		localizeFinished = true

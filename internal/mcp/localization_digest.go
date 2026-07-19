@@ -108,6 +108,22 @@ const localizationReplayDirective = "You already hold the localization answer â€
 	"below: name the files and symbols, citing the locations already returned. Further Gortex navigation " +
 	"returns this same evidence; a confident answer beats an exhausted turn budget with no answer."
 
+// answerReadyDirective returns the answer-now note a post-terminal READ
+// result carries: reads execute after answer_ready (starving them produced
+// empty finals), but every such result reminds the host it already holds
+// the answer and repeats the deterministic final response.
+func (s *localizationTerminalState) answerReadyDirective() (string, bool) {
+	if s == nil {
+		return "", false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state != localizationStateAnswerReady || s.digest == nil {
+		return "", false
+	}
+	return localizationReplayDirective + "\n\n" + s.digest.FinalResponse, true
+}
+
 // localizationEvidenceReplayResult is the successful, idempotent response to
 // any post-terminal navigation call. It is deliberately NOT an error: error
 // results push non-adapted hosts into error-recovery loops and count as

@@ -154,3 +154,25 @@ func TestDigestByteCapShedsEvidenceTail(t *testing.T) {
 		t.Fatal("final response must be rebuilt after shedding")
 	}
 }
+
+// Post-terminal reads execute (with the directive attached by dispatch)
+// instead of being replayed: starving reads produced empty finals in
+// sessions that held the correct file and asked to read it.
+func TestPostTerminalReadsExecuteWhileNavigationReplays(t *testing.T) {
+	state := &localizationTerminalState{}
+	completion := newLocalizationCompletion(true, "")
+	completion.digest = testEvidenceDigest()
+	state.armForTask(completion, "find the storage load implementations")
+
+	if blocked, reserved := state.authorize("read", "source", map[string]any{
+		"target": map[string]any{"symbol": "repo/storage/disk.go::DiskStorage.Load"},
+	}); blocked != nil || reserved {
+		t.Fatalf("post-terminal read = (%v, %v), want allowed without reservation", blocked, reserved)
+	}
+	if replay, _ := state.authorize("search", "symbols", nil); replay == nil || replay.IsError {
+		t.Fatal("post-terminal navigation must still replay")
+	}
+	if note, ok := state.answerReadyDirective(); !ok || !strings.Contains(note, "FILES:") {
+		t.Fatalf("directive must carry the final response, got %q ok=%v", note, ok)
+	}
+}

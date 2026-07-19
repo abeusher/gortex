@@ -350,7 +350,17 @@ func (s *localizationTerminalState) authorize(facade, operation string, argument
 	// non-adapted hosts into error-recovery loops — a burned turn per call
 	// with the correct answer already in hand; the replay is actionable on
 	// the very next turn and identical on every subsequent call.
+	//
+	// Reads are exempt from the replay: a post-terminal source read can only
+	// sharpen the answer the session already owns, and replaying it starves
+	// a non-adapted host into an empty final (observed: a session holding
+	// the correct file asked to read it twice, received the replay twice,
+	// and exhausted its turns with no answer). The read executes and the
+	// dispatcher attaches the answer-now directive to its result.
 	if s.state == localizationStateAnswerReady && s.digest != nil {
+		if facade == "read" {
+			return nil, false
+		}
 		return localizationEvidenceReplayResult(completion, s.digest), false
 	}
 	message := "localization is complete; return the existing evidence without another Gortex navigation call"
