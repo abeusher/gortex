@@ -987,6 +987,12 @@ type FrameworkSynthReport struct {
 	GateMillis   int64 `json:"gate_ms,omitempty"`
 	ClaimMillis  int64 `json:"claim_ms,omitempty"`
 	DemoteMillis int64 `json:"demote_ms,omitempty"`
+	// CensusMillis times the admission census that runs before the loop. It
+	// walks the node stream plus the cold EdgeCalls census; against a
+	// checkpointed store it costs ~11s, but a measured cold run spent ~533s
+	// here with every synthesizer gated to zero — the census, not the
+	// synthesizers, owned the pass. It must never be silent again.
+	CensusMillis int64 `json:"census_ms,omitempty"`
 }
 
 // scopedSynthesizer is the optional capability a FrameworkSynthesizer exposes
@@ -1052,7 +1058,9 @@ func runFrameworkSynthesizersScoped(
 	if g == nil {
 		return rep
 	}
+	censusStart := time.Now()
 	candidates := summarizeFrameworkCandidatesCensus(g, scope, filePaths, censusEligible)
+	rep.CensusMillis = time.Since(censusStart).Milliseconds()
 	var genericScope graph.Store
 	if scope != nil {
 		genericScope = newFrameworkScopedStore(g, scope, filePaths)

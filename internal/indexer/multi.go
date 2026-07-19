@@ -1287,6 +1287,20 @@ func (mi *MultiIndexer) RunGlobalGraphPasses(ctx context.Context) {
 			zap.Bool("scoped", scope != nil))
 	}
 
+	// The global passes below are the first big read sweeps after the
+	// resolve/enrich write storm (a cold pass rewrites 600k+ edge rows).
+	// Reading through a multi-GB WAL pays a wal-index lookup per page — a
+	// census that takes ~11s against a checkpointed store was measured at
+	// ~533s in-run. Drain the log once at this boundary so every pass below
+	// reads the main file.
+	if cp, ok := mi.graph.(interface{ CheckpointWAL() error }); ok {
+		cpStart := time.Now()
+		err := cp.CheckpointWAL()
+		mi.logger.Info("global passes: WAL checkpoint at read boundary",
+			zap.Duration("elapsed", time.Since(cpStart)),
+			zap.Error(err))
+	}
+
 	passStart("infer_implements")
 	implStart := time.Now()
 	implAdded := 0
@@ -1428,6 +1442,7 @@ func (mi *MultiIndexer) RunGlobalGraphPasses(ctx context.Context) {
 	mi.logger.Info("global pass: framework dispatch synthesis",
 		zap.Int("edges", fwRep.Total),
 		zap.Any("per_synthesizer", fwRep.Per),
+		zap.Int64("census_ms", fwRep.CensusMillis),
 		zap.Int64("gate_ms", fwRep.GateMillis),
 		zap.Int64("claim_ms", fwRep.ClaimMillis),
 		zap.Int64("demote_ms", fwRep.DemoteMillis),
