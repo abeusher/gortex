@@ -64,3 +64,29 @@ func TestFoldMemberOwnersPromotesSharedOwner(t *testing.T) {
 		t.Fatalf("leading owner must be untouched, got %d entries head=%s", len(same), same[0].node.ID)
 	}
 }
+
+// A same-file helper named in a wrapper body is promotable into the answer
+// draft as a callee of the ranked wrapper — the generic wrapper-to-helper
+// shape. Verified covered by the existing draft promotion; pinned so
+// selection work cannot regress it.
+func TestDraftPromotesWrapperHelperCallee(t *testing.T) {
+	task := "case insensitive path lookup returns the wrong file"
+	wrapper := &graph.Node{ID: "repo/fs/path.go::findCaseInsensitivePath", Kind: graph.KindFunction,
+		Name: "findCaseInsensitivePath", FilePath: "repo/fs/path.go"}
+	helper := &graph.Node{ID: "repo/fs/path.go::findCaseInsensitivePathRec", Kind: graph.KindFunction,
+		Name: "findCaseInsensitivePathRec", FilePath: "repo/fs/path.go"}
+	targets := []exploreTarget{{
+		node: wrapper, score: 1.0,
+		source:  "func findCaseInsensitivePath(p string) string { return findCaseInsensitivePathRec(p, 0) }",
+		callees: []*graph.Node{helper},
+	}}
+	found := false
+	for _, entry := range exploreAnswerDraft(task, targets) {
+		if entry.node != nil && entry.node.ID == helper.ID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("wrapper body helper must be promotable into the answer draft")
+	}
+}
