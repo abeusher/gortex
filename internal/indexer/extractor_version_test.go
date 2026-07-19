@@ -39,10 +39,16 @@ func TestStaleLangsDetection(t *testing.T) {
 		if got := ExtractorVersionStaleLangs("not json"); got != nil {
 			t.Errorf("bad json = %v, want nil", got)
 		}
-		// Against the live extractor versions (all baseline 1), a stored go@1
+		// Against the live extractor versions, an unchanged baseline language
 		// is not stale.
 		if got := ExtractorVersionStaleLangs(`{"go":1}`); len(got) != 0 {
 			t.Errorf("stored at current = %v, want empty", got)
+		}
+		if got := ExtractorVersionStaleLangs(`{"go":1,"php":1}`); !reflect.DeepEqual(got, []string{"php"}) {
+			t.Errorf("stored PHP structural-edge version = %v, want [php]", got)
+		}
+		if got := merkleSaltFor("src/Handler.php"); got != "php@2" {
+			t.Errorf("PHP extractor salt = %q, want php@2", got)
 		}
 	})
 
