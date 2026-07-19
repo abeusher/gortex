@@ -289,6 +289,8 @@ func decorateLocalizationReadResult(result *mcpgo.CallToolResult, completion loc
 	if result == nil || result.IsError {
 		return result
 	}
+	originalContent := append([]mcpgo.Content(nil), result.Content...)
+	originalStructured := result.StructuredContent
 	contract, err := json.Marshal(struct {
 		Completion localizationCompletion `json:"completion"`
 	}{Completion: completion})
@@ -325,9 +327,9 @@ func decorateLocalizationReadResult(result *mcpgo.CallToolResult, completion loc
 	if !decoratedText {
 		result.Content = append(result.Content, mcpgo.NewTextContent(string(contract)))
 	}
-	switch payload := result.StructuredContent.(type) {
+	switch payload := originalStructured.(type) {
 	case nil:
-		result.StructuredContent = map[string]any{"completion": completion}
+		result.StructuredContent = localizationReadStructuredPayload(originalContent, completion)
 	case map[string]any:
 		decorated := make(map[string]any, len(payload)+1)
 		for key, value := range payload {
@@ -342,6 +344,33 @@ func decorateLocalizationReadResult(result *mcpgo.CallToolResult, completion loc
 		}
 	}
 	return attachLocalizationHostEnvelope(result, completion.digest)
+}
+
+// localizationReadStructuredPayload mirrors a content-only legacy response
+// into structuredContent before adding completion. Some MCP hosts prefer
+// structuredContent whenever it is present, so a completion-only object would
+// otherwise hide the source payload that remains in content.
+func localizationReadStructuredPayload(content []mcpgo.Content, completion localizationCompletion) map[string]any {
+	structured := map[string]any{"completion": completion}
+	if len(content) == 0 {
+		return structured
+	}
+	if len(content) == 1 {
+		if text, ok := mcpgo.AsTextContent(content[0]); ok {
+			trimmed := strings.TrimSpace(text.Text)
+			if len(trimmed) >= 2 && trimmed[0] == '{' && trimmed[len(trimmed)-1] == '}' && json.Valid([]byte(trimmed)) {
+				payload := make(map[string]any)
+				if err := json.Unmarshal([]byte(trimmed), &payload); err == nil {
+					payload["completion"] = completion
+					return payload
+				}
+			}
+			structured["text"] = text.Text
+			return structured
+		}
+	}
+	structured["content"] = content
+	return structured
 }
 
 func parseLocalizationNewUserBoundary(facade, operation string, arguments map[string]any) (bool, *mcpgo.CallToolResult) {

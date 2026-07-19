@@ -382,6 +382,134 @@ func TestDecorateLocalizationReadResultPreservesStructuredOnlyPayload(t *testing
 	}
 }
 
+func TestDecorateLocalizationReadResultMirrorsContentOnlyPayloadForHosts(t *testing.T) {
+	completion := newLocalizationCompletion(true, "")
+
+	plain := mcpgo.NewToolResultText("func Load() {}")
+	decoratedPlain := decorateLocalizationReadResult(plain, completion)
+	plainStructured, ok := decoratedPlain.StructuredContent.(map[string]any)
+	if !ok || plainStructured["text"] != "func Load() {}" || plainStructured["completion"] == nil {
+		t.Fatalf("plain content was not mirrored for structured-first hosts: %#v", decoratedPlain.StructuredContent)
+	}
+	plainText, ok := singleTextContent(decoratedPlain)
+	if !ok || !strings.Contains(plainText, "func Load() {}") {
+		t.Fatalf("plain content block was lost: %#v", decoratedPlain.Content)
+	}
+
+	multi := &mcpgo.CallToolResult{Content: []mcpgo.Content{
+		mcpgo.NewTextContent("primary"),
+		mcpgo.NewTextContent("secondary"),
+	}}
+	decoratedMulti := decorateLocalizationReadResult(multi, completion)
+	multiStructured, ok := decoratedMulti.StructuredContent.(map[string]any)
+	mirrored, mirroredOK := multiStructured["content"].([]mcpgo.Content)
+	if !ok || !mirroredOK || len(mirrored) != 2 || multiStructured["completion"] == nil {
+		t.Fatalf("multi-content payload was not mirrored: %#v", decoratedMulti.StructuredContent)
+	}
+	if len(decoratedMulti.Content) != 2 {
+		t.Fatalf("multi-content blocks = %d, want 2", len(decoratedMulti.Content))
+	}
+}
+
+func TestPermittedRefinementReadInvokesHandlerAndPreservesPayload(t *testing.T) {
+	srv := setupPresetServer(t, ToolPolicyConfig{Preset: "core", Mode: "defer"})
+	ctx := WithSessionID(context.Background(), "refinement_read_payload")
+	initFrame := []byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"codex","version":"1.0"}}}`)
+	if reply := srv.MCPServer().HandleMessage(ctx, initFrame); reply == nil {
+		t.Fatal("initialize returned nil")
+	}
+
+	readSpec, ok := srv.facades.operation("read", "source")
+	if !ok {
+		t.Fatal("read.source facade operation is missing")
+	}
+	searchSpec, ok := srv.facades.operation("search", "symbols")
+	if !ok {
+		t.Fatal("search.symbols facade operation is missing")
+	}
+
+	const symbol = "repo/storage/disk.go::DiskStorage.Load"
+	readCalls := 0
+	searchCalls := 0
+	srv.facades.capture(mcpgo.NewTool(readSpec.Legacy), func(context.Context, mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+		readCalls++
+		result := mcpgo.NewToolResultText(`{"source":"func (s *DiskStorage) Load() {}","language":"go"}`)
+		result.Meta = mcpgo.NewMetaFromMap(map[string]any{"handler": "kept"})
+		return result, nil
+	})
+	srv.facades.capture(mcpgo.NewTool(searchSpec.Legacy), func(context.Context, mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+		searchCalls++
+		return mcpgo.NewToolResultText("unexpected search result"), nil
+	})
+	srv.localizationFor(ctx).armRefinementForTask(
+		"find the storage load implementation",
+		symbol,
+		[]string{symbol},
+		testEvidenceDigest(),
+	)
+
+	readRequest := mcpgo.CallToolRequest{Params: mcpgo.CallToolParams{
+		Name: "read",
+		Arguments: map[string]any{
+			"operation": "source",
+			"target":    map[string]any{"symbol": symbol},
+		},
+	}}
+	result, err := srv.handleFacade(ctx, "read", readRequest)
+	if err != nil || result == nil || result.IsError {
+		t.Fatalf("permitted refinement read = (%+v, %v)", result, err)
+	}
+	if readCalls != 1 {
+		t.Fatalf("read handler calls = %d, want 1", readCalls)
+	}
+	if len(result.Content) != 1 {
+		t.Fatalf("content blocks = %d, want 1", len(result.Content))
+	}
+	first, ok := mcpgo.AsTextContent(result.Content[0])
+	if !ok || !strings.Contains(first.Text, `"source":"func (s *DiskStorage) Load() {}"`) ||
+		!strings.Contains(first.Text, `"state":"answer_ready"`) {
+		t.Fatalf("decorated first payload = %#v", result.Content[0])
+	}
+	structured, ok := result.StructuredContent.(map[string]any)
+	if !ok || structured["source"] != "func (s *DiskStorage) Load() {}" ||
+		structured["language"] != "go" || structured["completion"] == nil {
+		t.Fatalf("structured source payload was lost: %#v", result.StructuredContent)
+	}
+	if result.Meta == nil || result.Meta.AdditionalFields["handler"] != "kept" {
+		t.Fatalf("handler metadata was lost: %#v", result.Meta)
+	}
+	wire, err := json.Marshal(result)
+	if err != nil {
+		t.Fatalf("marshal MCP result: %v", err)
+	}
+	var roundTrip struct {
+		Content           []map[string]any `json:"content"`
+		StructuredContent map[string]any   `json:"structuredContent"`
+	}
+	if err := json.Unmarshal(wire, &roundTrip); err != nil {
+		t.Fatalf("unmarshal MCP result: %v", err)
+	}
+	if len(roundTrip.Content) != 1 || roundTrip.StructuredContent["source"] != "func (s *DiskStorage) Load() {}" ||
+		roundTrip.StructuredContent["language"] != "go" || roundTrip.StructuredContent["completion"] == nil {
+		t.Fatalf("wire result lost source payload: %s", wire)
+	}
+
+	searchRequest := mcpgo.CallToolRequest{Params: mcpgo.CallToolParams{
+		Name:      "search",
+		Arguments: map[string]any{"operation": "symbols", "query": "Load"},
+	}}
+	terminal, err := srv.handleFacade(ctx, "search", searchRequest)
+	if err != nil || terminal == nil || terminal.IsError {
+		t.Fatalf("post-refinement navigation = (%+v, %v)", terminal, err)
+	}
+	if searchCalls != 0 {
+		t.Fatalf("search handler calls after answer_ready = %d, want 0", searchCalls)
+	}
+	if text, _ := singleTextContent(terminal); text != localizationAnswerReadyNotice {
+		t.Fatalf("post-refinement navigation text = %q", text)
+	}
+}
+
 func TestAnswerReadyNavigationDispatchNeverInvokesLegacyHandler(t *testing.T) {
 	srv := setupPresetServer(t, ToolPolicyConfig{Preset: "core", Mode: "defer"})
 	ctx := WithSessionID(context.Background(), "terminal_handler_intercept")
