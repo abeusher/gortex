@@ -130,6 +130,14 @@ var bulkDroppableIndexes = []bulkDroppableIndex{
 	// sort the full edge corpus; the partial index preserves rowid ordering while
 	// shrinking rebuild and steady-state maintenance to the pending frontier.
 	{"edges_by_unresolved", `CREATE INDEX IF NOT EXISTS edges_by_unresolved ON edges(is_unresolved) WHERE is_unresolved = 1`},
+	// The repo-prefixed fn-value placeholder namespace is read once per
+	// framework-synthesis pass through a leading-wildcard LIKE that no
+	// general index can serve — without this partial index the reader
+	// walked every unresolved edge. The reader states the predicate
+	// verbatim as its only WHERE clause (the OR-arm implication prover
+	// will not bind it otherwise). Near-empty at rest; populated only
+	// mid-pass while placeholders await the fn-value gate.
+	{"edges_fnvalue_prefixed", `CREATE INDEX IF NOT EXISTS edges_fnvalue_prefixed ON edges(to_id) WHERE to_id LIKE '%::unresolved::fnvalue::%'`},
 	// Canonical Go receiver types remain indexed for the SQLite-native repair.
 	// The edge side reuses edges_by_kind for its one global cold pass; scoped
 	// warm/partial passes continue to seek member_of edges through edges_by_from.

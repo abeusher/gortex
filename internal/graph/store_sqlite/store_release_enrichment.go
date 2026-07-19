@@ -118,7 +118,7 @@ func (s *Store) ReleaseRows(repoPrefix string) []graph.ReleaseEnrichment {
 	if repoPrefix == "" {
 		rows, err = s.db.Query(`SELECT ` + releaseCols + ` FROM release_enrichment`)
 	} else {
-		rows, err = s.db.Query(`SELECT `+releaseCols+` FROM release_enrichment WHERE repo_prefix = ?`, repoPrefix)
+		rows, err = s.db.Query(`SELECT `+releaseCols+` FROM release_enrichment WHERE repo_prefix = ? AND repo_prefix <> ''`, repoPrefix)
 	}
 	if err != nil {
 		return nil

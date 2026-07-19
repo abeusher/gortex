@@ -121,7 +121,7 @@ func (s *Store) CoverageRows(repoPrefix string) []graph.CoverageEnrichment {
 	if repoPrefix == "" {
 		rows, err = s.db.Query(`SELECT ` + coverageCols + ` FROM coverage_enrichment`)
 	} else {
-		rows, err = s.db.Query(`SELECT `+coverageCols+` FROM coverage_enrichment WHERE repo_prefix = ?`, repoPrefix)
+		rows, err = s.db.Query(`SELECT `+coverageCols+` FROM coverage_enrichment WHERE repo_prefix = ? AND repo_prefix <> ''`, repoPrefix)
 	}
 	if err != nil {
 		return nil

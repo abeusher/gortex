@@ -268,3 +268,56 @@ func TestPreparedStatementPlansNeverScanBigTables(t *testing.T) {
 		}
 	}
 }
+
+// The WARN-class shapes from the sweep, post-fix: enrichment repo readers
+// ride their partial indexes via the literal predicate, and each fn-value
+// placeholder arm rides its own index standalone (the OR form defeated the
+// partial-index prover).
+func TestSweepWarnPlanLocks(t *testing.T) {
+	s := newPlanLockFixture(t)
+	cases := []struct {
+		name   string
+		query  string
+		args   int
+		want   []string
+		forbid []string
+	}{
+		{
+			name:   "blame_enrichment_by_repo",
+			query:  "SELECT node_id FROM blame_enrichment WHERE repo_prefix = ? AND repo_prefix <> \x27\x27",
+			args:   1,
+			want:   []string{"blame_by_repo (repo_prefix=?)"},
+			forbid: []string{"SCAN blame_enrichment"},
+		},
+		{
+			name:   "fnvalue_bare_range",
+			query:  "SELECT id FROM edges WHERE to_id >= \x27unresolved::fnvalue::\x27 AND to_id < \x27unresolved::fnvalue:;\x27",
+			args:   0,
+			want:   []string{"edges_by_to (to_id>? AND to_id<?)"},
+			forbid: []string{"SCAN edges USING COVERING INDEX edges_by_unresolved"},
+		},
+		{
+			name:   "fnvalue_prefixed_partial",
+			query:  "SELECT id FROM edges WHERE to_id LIKE \x27%::unresolved::fnvalue::%\x27",
+			args:   0,
+			want:   []string{"edges_fnvalue_prefixed"},
+			forbid: []string{"edges_by_unresolved"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			plan := explainPlanTolerant(t, s, tc.query)
+			joined := strings.Join(plan, "\n")
+			for _, want := range tc.want {
+				if !strings.Contains(joined, want) {
+					t.Fatalf("plan missing %q:\n%s", want, joined)
+				}
+			}
+			for _, forbid := range tc.forbid {
+				if strings.Contains(joined, forbid) {
+					t.Fatalf("plan contains forbidden %q:\n%s", forbid, joined)
+				}
+			}
+		})
+	}
+}
