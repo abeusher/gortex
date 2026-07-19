@@ -200,7 +200,7 @@ func (s *frameworkEdgeBatchStore) NodesByKinds(kinds []graph.NodeKind) []*graph.
 			continue
 		}
 		wanted[kind] = struct{}{}
-		for node := range s.Store.NodesByKind(kind) {
+		for node := range s.NodesByKind(kind) {
 			if node == nil {
 				continue
 			}
@@ -277,7 +277,7 @@ func (s *frameworkEdgeBatchStore) GetRepoEdges(repoPrefix string) []*graph.Edge 
 	for _, edge := range s.staged {
 		fromIDs = append(fromIDs, edge.From)
 	}
-	sources := s.Store.GetNodesByIDs(fromIDs)
+	sources := s.GetNodesByIDs(fromIDs)
 	return s.mergeEdges(base, func(edge *graph.Edge) bool {
 		source := sources[edge.From]
 		return source != nil && source.RepoPrefix == repoPrefix
@@ -304,7 +304,7 @@ func (s *frameworkEdgeBatchStore) RepoEdgesByKinds(
 	for _, edge := range s.staged {
 		fromIDs = append(fromIDs, edge.From)
 	}
-	sources := s.Store.GetNodesByIDs(fromIDs)
+	sources := s.GetNodesByIDs(fromIDs)
 	merged := s.mergeEdges(base, func(edge *graph.Edge) bool {
 		if _, ok := wantedKinds[edge.Kind]; !ok {
 			return false
@@ -332,7 +332,7 @@ func (s *frameworkEdgeBatchStore) RepoEdgesByKinds(
 		for _, edge := range merged {
 			allIDs = append(allIDs, edge.From)
 		}
-		allSources := s.Store.GetNodesByIDs(allIDs)
+		allSources := s.GetNodesByIDs(allIDs)
 		out = out[:0]
 		for _, edge := range merged {
 			if source := allSources[edge.From]; source != nil {

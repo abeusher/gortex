@@ -30,8 +30,6 @@ func TestBoundedDestructiveGraphDrainLargeRepository(t *testing.T) {
 		)
 	}
 	g.AddBatch(nodes, edges)
-	nodes = nil
-	edges = nil
 
 	seenNodes := make(map[string]struct{}, nodeCount)
 	nodeBatches := 0

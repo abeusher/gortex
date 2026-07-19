@@ -81,7 +81,7 @@ func (s *queryCountingStore) GetRepoNodeSummariesByLanguage(repoPrefix, language
 	if reader, ok := s.Store.(graph.RepoLanguageNodeSummaryReader); ok {
 		return reader.GetRepoNodeSummariesByLanguage(repoPrefix, language)
 	}
-	return s.Store.GetRepoNodesByLanguage(repoPrefix, language)
+	return s.GetRepoNodesByLanguage(repoPrefix, language)
 }
 
 func (s *queryCountingStore) PersistSemanticNodeStamps(updates []graph.SemanticNodeStamp) int {
@@ -924,7 +924,7 @@ func TestClaimByExactStubSelectsCandidateKind(t *testing.T) {
 		newTarget  = "ext::go:example.com/ext::Do"
 	)
 	pkg := types.NewPackage(importPath, "ext")
-	obj := types.NewFunc(token.NoPos, pkg, "Do", types.NewSignature(nil, nil, nil, false))
+	obj := types.NewFunc(token.NoPos, pkg, "Do", types.NewSignatureType(nil, nil, nil, nil, nil, false))
 	targets := stubEdgeTargets("", importPath, obj)
 	require.NotEmpty(t, targets)
 

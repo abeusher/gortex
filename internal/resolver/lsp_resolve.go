@@ -227,48 +227,6 @@ func (b *deferredLSPPassBudget) allowAttempt(now time.Time) bool {
 	return now.Before(b.deadline)
 }
 
-// prepareDeferredLSPBatch merges newly collected work with budget-skipped
-// work from the prior pass, de-duplicates it by stable source identity, and
-// returns a deterministic order. Retry work outside an active scope remains
-// parked for a later compatible/full pass rather than leaking across the
-// scope boundary or being lost.
-func (r *Resolver) prepareDeferredLSPBatch(current []deferredLSPEdge) (
-	[]deferredLSPEdge,
-	map[deferredLSPWorkKey]deferredLSPEdge,
-) {
-	merged := make(map[deferredLSPWorkKey]deferredLSPEdge, len(current)+len(r.lspDeferredRetry))
-	retained := make(map[deferredLSPWorkKey]deferredLSPEdge)
-
-	for key, de := range r.lspDeferredRetry {
-		if r.lspHelper == nil || (len(r.scope) > 0 && de.edge != nil && !edgeInResolveScope(de.edge, r.scope)) {
-			retained[key] = de
-			continue
-		}
-		merged[key] = de
-	}
-	for _, de := range current {
-		if de.edge == nil {
-			continue
-		}
-		merged[deferredLSPWorkKeyFor(de)] = de
-	}
-
-	ordered := make([]deferredLSPEdge, 0, len(merged))
-	for _, de := range merged {
-		ordered = append(ordered, de)
-	}
-	sort.Slice(ordered, func(i, j int) bool {
-		return deferredLSPWorkKeyLess(
-			deferredLSPWorkKeyFor(ordered[i]),
-			deferredLSPWorkKeyFor(ordered[j]),
-		)
-	})
-	if len(retained) == 0 {
-		retained = nil
-	}
-	return ordered, retained
-}
-
 func (r *Resolver) hasDeferredLSPRetryForScope() bool {
 	if r.lspHelper == nil {
 		return false
@@ -290,23 +248,6 @@ func (r *Resolver) deferredLSPRetryCount() int {
 		count += r.lspDeferredSpool.count()
 	}
 	return count
-}
-
-func (r *Resolver) replaceDeferredLSPRetries(
-	retained, skipped map[deferredLSPWorkKey]deferredLSPEdge,
-) {
-	if len(retained) == 0 && len(skipped) == 0 {
-		r.lspDeferredRetry = nil
-		return
-	}
-	next := make(map[deferredLSPWorkKey]deferredLSPEdge, len(retained)+len(skipped))
-	for key, de := range retained {
-		next[key] = de
-	}
-	for key, de := range skipped {
-		next[key] = de
-	}
-	r.lspDeferredRetry = next
 }
 
 // compactDeferredLSPRetries drops skipped entries that are still unresolved

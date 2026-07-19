@@ -79,7 +79,7 @@ func (s *resolveLivenessCountingStore) EdgeExists(
 	from, to string, kind graph.EdgeKind, filePath string, line int,
 ) bool {
 	s.edgeExistsCalls++
-	for _, edge := range s.Store.GetOutEdges(from) {
+	for _, edge := range s.GetOutEdges(from) {
 		if edge.To == to && edge.Kind == kind && edge.FilePath == filePath && edge.Line == line {
 			return true
 		}

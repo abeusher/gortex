@@ -826,10 +826,8 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		}
 	}
 	// The compiler program's last consumer was the stamps loop above — stamps
-	// hold only strings from here on. Drop every reference to the program so
-	// it is collectible while the graph-write persistence below runs. (The
-	// admission gate was already released right after the load.)
-	pkgs, fset, objToNode, defsByName, externals = nil, nil, nil, nil, nil
+	// hold only strings from here on; frame liveness already lets the GC
+	// collect the program while the graph-write persistence below runs.
 
 	persistedStamps, err := persistGoNodeStamps(ctx, g, stamps, p.Name())
 	if err != nil {

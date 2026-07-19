@@ -1,9 +1,7 @@
 package store_sqlite
 
 import (
-	"context"
 	"database/sql"
-	"errors"
 	"sort"
 	"strings"
 
@@ -221,60 +219,6 @@ func sqliteIdentityForNode(n *graph.Node) sqliteMutationNodeIdentity {
 func (i sqliteMutationNodeIdentity) equalsNode(n *graph.Node) bool {
 	return i.kind == string(n.Kind) && i.name == n.Name && i.qualName == n.QualName &&
 		i.filePath == n.FilePath && i.repoPrefix == n.RepoPrefix
-}
-
-func (s *Store) publishSQLiteNodeWriteLocked(n *graph.Node, old sqliteMutationNodeIdentity, found, exact, changed bool) {
-	if !changed || !s.hasActiveMutationReceiptsLocked() {
-		return
-	}
-	if !exact {
-		s.markMutationReceiptsIncompleteLocked()
-		return
-	}
-	if found {
-		if !old.equalsNode(n) {
-			s.markMutationReceiptsIncompleteLocked()
-		}
-		return
-	}
-	delta := newSQLiteMutationReceiptAccumulator()
-	recordSQLiteAddedNode(delta, n)
-	s.mergeMutationReceiptLocked(delta)
-}
-
-func (s *Store) publishSQLiteEdgeInsertLocked(e *graph.Edge, inserted bool) {
-	if !inserted || !s.hasActiveMutationReceiptsLocked() {
-		return
-	}
-	file := e.FilePath
-	delta := newSQLiteMutationReceiptAccumulator()
-	if file == "" {
-		source, found, err := s.mutationNodeIdentityLocked(e.From)
-		if err != nil {
-			delta.complete = false
-		} else if found {
-			file = source.filePath
-		}
-	}
-	recordSQLiteAddedEdge(delta, e, file)
-	s.mergeMutationReceiptLocked(delta)
-}
-
-func (s *Store) mutationNodeIdentityLocked(id string) (sqliteMutationNodeIdentity, bool, error) {
-	conn, release, err := s.activeWriteConnLocked(context.Background())
-	if err != nil {
-		return sqliteMutationNodeIdentity{}, false, err
-	}
-	defer release()
-
-	var identity sqliteMutationNodeIdentity
-	err = conn.QueryRowContext(context.Background(),
-		`SELECT kind, name, qual_name, file_path, repo_prefix FROM nodes WHERE id = ?`, id,
-	).Scan(&identity.kind, &identity.name, &identity.qualName, &identity.filePath, &identity.repoPrefix)
-	if errors.Is(err, sql.ErrNoRows) {
-		return sqliteMutationNodeIdentity{}, false, nil
-	}
-	return identity, err == nil, err
 }
 
 // mutationNodeIdentitiesTx preloads node identities in bounded batches. It is

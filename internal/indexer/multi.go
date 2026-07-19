@@ -673,7 +673,7 @@ func (mi *MultiIndexer) resolveDeferredMutations(receipt *graph.MutationReceipt,
 				return deferredResolveSkipped
 			}
 			mi.logger.Info("DEFERRED-TIMING mutation receipt incomplete; resolving all",
-			zap.String("incomplete_reason", receipt.IncompleteReason))
+				zap.String("incomplete_reason", receipt.IncompleteReason))
 			mi.runMasterResolve(nil, false)
 			return deferredResolveFallback
 		}
@@ -3695,23 +3695,6 @@ func (mi *MultiIndexer) ReconcileContractEdges() int {
 	// graph; in the meantime we lean on EvictRepo / EvictFile to
 	// reclaim memory when a whole repo's topic vocabulary changes.
 	return added
-}
-
-// emitTopicEdges materialises the KindTopic node and the
-// EdgeProducesTopic / EdgeConsumesTopic edges that pair a matched
-// producer/consumer pair across the workspace. The topic ID is
-// reconstructed from the Contract.ID (already `topic::<broker>::
-// <name>`) so the node ID matches the contract ID 1:1 — agents that
-// have the contract ID can also look up the topic node directly.
-// Meta on the node carries the broker family and the raw topic name
-// for filterless queries.
-func emitTopicEdges(g graph.Store, m contracts.CrossLink, topicNodes map[string]struct{}) {
-	var nodes []*graph.Node
-	var edges []*graph.Edge
-	appendTopicEdges(m, topicNodes, &nodes, &edges)
-	if len(nodes) > 0 || len(edges) > 0 {
-		g.AddBatch(nodes, edges)
-	}
 }
 
 // appendTopicEdges stages one topic match into the reconciliation generation.

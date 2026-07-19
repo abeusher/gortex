@@ -1486,18 +1486,6 @@ func (w *Watcher) failMutationWaiters(err error) {
 	}
 }
 
-func (w *Watcher) mutationEventCount(path string) int {
-	w.historyMu.Lock()
-	defer w.historyMu.Unlock()
-	count := 0
-	for _, event := range w.history {
-		if event.FilePath == path {
-			count++
-		}
-	}
-	return count
-}
-
 func (w *Watcher) mutationGenerationSuperseded(path string, generation uint64) bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()

@@ -247,8 +247,8 @@ func Original() {}
 	w.runDirScan(map[string]struct{}{dir: {}}, nil)
 	require.NotEmpty(t, g.FindNodesByName("Original"))
 
-	w.patchGraph(path, ChangeDeleted)
-	w.patchGraph(path, ChangeDeleted) // redundant producer is suppressed
+	_ = w.patchGraph(path, ChangeDeleted)
+	_ = w.patchGraph(path, ChangeDeleted) // redundant producer is suppressed
 
 	require.Len(t, calls, 1)
 	require.NotEmpty(t, calls[0].oldSymbols)

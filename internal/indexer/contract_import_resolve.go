@@ -12,29 +12,6 @@ import (
 	"github.com/zzet/gortex/internal/parser/tsalias"
 )
 
-// disambiguateBareTypesViaImports is the post-pass that handles bare
-// type refs UpgradeBareTypeRefs left alone because the lookup
-// returned ≥2 same-repo candidates. The classic case is a TS web app
-// that defines two `DashboardSnapshot` types — one in
-// `web/src/lib/schema.ts` (a `type` alias) and one in
-// `web/src/lib/types.ts` (an `interface`). The bare name has two
-// graph nodes; only the consumer's own `import` statement decides
-// which one was actually referenced.
-//
-// We re-read the contract's source file, parse its TS / JS imports,
-// and pick the candidate whose graph FilePath matches an imported
-// module. When exactly one candidate matches, the meta entry is
-// rewritten to its fully-qualified ID so the downstream
-// attachInlinedShapes pass can fold its field shape into the
-// contract's Meta.
-//
-// Languages other than TS / JS are skipped — Go disambiguates
-// bare-name collisions via package qualification (`pkg.Type`) and the
-// in-file resolveTypeInFile pass already handles those.
-func (mi *MultiIndexer) disambiguateBareTypesViaImports(cr *contracts.Registry, g graph.Store) {
-	mi.disambiguateBareTypesViaImportsBatch([]*contracts.Registry{cr}, g)
-}
-
 // disambiguateBareTypesViaImportsBatch resolves every registry from one
 // FindNodesByNames projection. Registry indexes contain value copies and invoke
 // the resolver repeatedly; prefetching here prevents those copies—and multiple
@@ -204,23 +181,6 @@ func (mi *MultiIndexer) resolveBareTypeViaImportsPrefetched(
 		hit = n.ID
 	}
 	return hit
-}
-
-func (mi *MultiIndexer) resolveRustUseFactsTarget(facts []rustUseFact, g graph.Store, srcCache map[string][]byte) string {
-	nameSet := map[string]struct{}{}
-	for _, fact := range facts {
-		chain := mi.followReExportChainDetailed(fact.fromFile, fact.sourceName, srcCache)
-		for _, names := range chain.names {
-			for name := range names {
-				nameSet[name] = struct{}{}
-			}
-		}
-	}
-	names := make([]string, 0, len(nameSet))
-	for name := range nameSet {
-		names = append(names, name)
-	}
-	return mi.resolveRustUseFactsTargetPrefetched(facts, g.FindNodesByNames(names), srcCache)
 }
 
 func (mi *MultiIndexer) resolveRustUseFactsTargetPrefetched(

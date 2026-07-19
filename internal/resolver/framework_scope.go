@@ -99,11 +99,3 @@ func frameworkCallsForScope(g graph.Store, scope map[string]bool) []*graph.Edge 
 	}
 	return out
 }
-
-func frameworkScopeMap(prefixes []string) map[string]bool {
-	out := make(map[string]bool, len(prefixes))
-	for _, prefix := range prefixes {
-		out[prefix] = true
-	}
-	return out
-}

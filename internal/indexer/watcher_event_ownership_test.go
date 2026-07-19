@@ -44,7 +44,7 @@ func TestWatcherModifyPublishesOnlyForMtimeOwner(t *testing.T) {
 	})
 
 	// A late startup replay owns neither the indexed file state nor a callback.
-	w.patchGraph(path, ChangeModified)
+	_ = w.patchGraph(path, ChangeModified)
 	require.Empty(t, callbacks)
 	requireNoWatcherEvent(t, w)
 
@@ -54,14 +54,14 @@ func TestWatcherModifyPublishesOnlyForMtimeOwner(t *testing.T) {
 	// filesystems can collapse two writes into one tick. The persisted BLAKE3
 	// receipt, not timestamp equality, must admit the changed bytes.
 	setWatcherTestMtime(t, path, initial)
-	w.patchGraph(path, ChangeModified)
+	_ = w.patchGraph(path, ChangeModified)
 	require.Equal(t, []callback{{oldNames: []string{"Original"}, newNames: []string{"Modified"}}}, callbacks)
 	event := waitForEvent(t, w, time.Second)
 	require.Equal(t, "structural", event.Classification)
 
 	// A duplicate native/poller report after commit must not replace the owning
 	// callback with a Modified -> Modified replay.
-	w.patchGraph(path, ChangeModified)
+	_ = w.patchGraph(path, ChangeModified)
 	require.Len(t, callbacks, 1)
 	requireNoWatcherEvent(t, w)
 
@@ -70,14 +70,14 @@ func TestWatcherModifyPublishesOnlyForMtimeOwner(t *testing.T) {
 	// allowed to suppress later duplicates.
 	writeTestFile(t, path, "package main\n\nfunc Modified() {}\n\n")
 	setWatcherTestMtime(t, path, initial)
-	w.patchGraph(path, ChangeModified)
+	_ = w.patchGraph(path, ChangeModified)
 	require.Len(t, callbacks, 2)
 	require.Equal(t, []string{"Modified"}, callbacks[1].oldNames)
 	require.Equal(t, []string{"Modified"}, callbacks[1].newNames)
 	event = waitForEvent(t, w, time.Second)
 	require.Contains(t, []string{"inert", "metadata_only"}, event.Classification)
 
-	w.patchGraph(path, ChangeModified)
+	_ = w.patchGraph(path, ChangeModified)
 	require.Len(t, callbacks, 2)
 	requireNoWatcherEvent(t, w)
 }

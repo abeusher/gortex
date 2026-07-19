@@ -403,7 +403,6 @@ func (idx *Indexer) commitIncrementalStages(
 		if stage.metadataOnly {
 			if !prepareMetadataRefreshFromView(stage, view.outByNode, existing) {
 				stage.metadataOnly = false
-				structuralPrior = structuralPriorIDs(stages)
 			}
 		}
 		if stage.metadataOnly {

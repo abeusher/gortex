@@ -143,9 +143,6 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			return nil, err
 		}
 		cancelParse()
-		// The producer and every parser worker have joined at this point; no
-		// goroutine retains file refs or can mutate state after return.
-		files = nil
 		// Parsing above is pure and fans out across workers; the apply
 		// phase mutates the shared graph (retargets edges, reindexes,
 		// stamps provenance) and MUST run under the graph-wide resolve

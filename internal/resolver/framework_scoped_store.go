@@ -392,7 +392,7 @@ func (v *frameworkScopedStore) seedChangedFileFrontier() {
 	if v.Store == nil || len(v.scope.filePaths) == 0 {
 		return
 	}
-	byFile := v.Store.GetFileNodesByPaths(v.scope.filePaths)
+	byFile := v.GetFileNodesByPaths(v.scope.filePaths)
 	ids := make([]string, 0)
 	tokens := make(map[string]struct{})
 	for _, filePath := range v.scope.filePaths {

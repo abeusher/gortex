@@ -575,44 +575,6 @@ func emitTestEdgesAndPersistLocked(g graph.Store, testNodes map[string]bool, cha
 	return len(edges)
 }
 
-// detectTestRunnerForFile resolves the runner identifier for a test file
-// node by consulting three signals, in priority order:
-//
-//  1. The file node's own Meta["test_runner"] — stamped by the JS / TS
-//     extractors at parse time using DetectJSTSTestRunner. This is the
-//     strongest signal because it has the file bytes to disambiguate
-//     Mocha-TDD `suite(` from BDD `describe`.
-//
-//  2. Outgoing EdgeImports targets — the import path is preserved in
-//     the target ID (e.g. `unresolved::import::pytest`) until the
-//     resolver promotes the edge. Used as the primary signal for
-//     languages where the parser does not run the JS / TS classifier
-//     (Python: pytest vs unittest; Ruby: rspec vs minitest).
-//
-//  3. Language-level defaults that hold regardless of imports:
-//     - Go always uses `gotest` — `go test` is the only runner.
-//     - Python defaults to `pytest` (auto-discovery picks up unittest
-//     test cases too; rare files that import only `unittest` are
-//     caught by step 2).
-//     - Ruby falls back to `rspec` for `_spec.rb` and `minitest` for
-//     `_test.rb`.
-//
-// Returns "" when no signal applies; the caller leaves test_runner
-// unset rather than guessing.
-func detectTestRunnerForFile(g graph.Store, fileNode *graph.Node) string {
-	if fileNode == nil {
-		return ""
-	}
-	// Preserve the focused helper's historical short-circuit: parser-stamped
-	// JS/TS runners are authoritative and need no graph read.
-	if fileNode.Meta != nil {
-		if runner, _ := fileNode.Meta["test_runner"].(string); runner != "" {
-			return runner
-		}
-	}
-	return detectTestRunnerForFileEdges(fileNode, g.GetOutEdgesByNodeIDs([]string{fileNode.ID})[fileNode.ID])
-}
-
 // detectTestRunnerForFileEdges is the adjacency-prefetched form used by the
 // indexing pass. Keeping runner precedence here makes the batched and focused
 // entry points byte-for-byte equivalent.
@@ -647,22 +609,6 @@ func detectTestRunnerForFileEdges(fileNode *graph.Node, outEdges []*graph.Edge) 
 		}
 	}
 	return ""
-}
-
-// detectRunnerFromImportEdges scans the outgoing EdgeImports of a test
-// file node and returns a runner ID inferred from import paths. The
-// import target ID format `unresolved::import::<path>` is preserved by
-// the extractors until the resolver promotes the edge, which never
-// happens for third-party / built-in modules — so this signal stays
-// valid for the runner identifiers we care about. Supports JS / TS
-// (mirrors DetectJSTSTestRunner so files compiled by a non-JS / TS
-// extractor still classify correctly), Python (pytest / unittest),
-// and Ruby (rspec / minitest).
-func detectRunnerFromImportEdges(g graph.Store, fileNode *graph.Node) string {
-	if fileNode == nil {
-		return ""
-	}
-	return detectRunnerFromImportEdgeSlice(fileNode, g.GetOutEdgesByNodeIDs([]string{fileNode.ID})[fileNode.ID])
 }
 
 func detectRunnerFromImportEdgeSlice(fileNode *graph.Node, edges []*graph.Edge) string {

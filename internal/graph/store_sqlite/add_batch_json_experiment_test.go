@@ -257,7 +257,7 @@ func TestJSONBIngestExperimentPreservesRawRowsAfterReopen(t *testing.T) {
 	if _, err := conn.ExecContext(ctx, `ATTACH DATABASE ? AS reference`, currentPath); err != nil {
 		t.Fatal(err)
 	}
-	defer conn.ExecContext(ctx, `DETACH DATABASE reference`)
+	defer func() { _, _ = conn.ExecContext(ctx, `DETACH DATABASE reference`) }()
 
 	nodeColumns := strings.Split(nodeInsertColumns, ", ")
 	if err := compareAttachedIngestTable(ctx, conn, "nodes", nodeColumns, "a.id = b.id"); err != nil {
@@ -332,7 +332,7 @@ func TestAddBatchJSONBPathMatchesPlaceholderPath(t *testing.T) {
 	if _, err := conn.ExecContext(ctx, `ATTACH DATABASE ? AS reference`, placeholderPath); err != nil {
 		t.Fatal(err)
 	}
-	defer conn.ExecContext(ctx, `DETACH DATABASE reference`)
+	defer func() { _, _ = conn.ExecContext(ctx, `DETACH DATABASE reference`) }()
 
 	nodeColumns := strings.Split(nodeInsertColumns, ", ")
 	if err := compareAttachedIngestTable(ctx, conn, "nodes", nodeColumns, "a.id = b.id"); err != nil {

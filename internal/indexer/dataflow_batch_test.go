@@ -29,7 +29,7 @@ func (s *dataflowBatchCountingStore) ScanDataflowEdgesBatched(batchSize int, yie
 	s.scanCalls++
 	var edges []*graph.Edge
 	for _, kind := range []graph.EdgeKind{graph.EdgeArgOf, graph.EdgeReturnsTo} {
-		for edge := range s.Store.EdgesByKind(kind) {
+		for edge := range s.EdgesByKind(kind) {
 			if edge != nil {
 				edges = append(edges, edge)
 			}
@@ -49,7 +49,7 @@ func (s *dataflowBatchCountingStore) ScanDataflowEdgesBatched(batchSize int, yie
 
 func (s *dataflowBatchCountingStore) GetDataflowParamEdgesByOwnerIDs(ids []string) map[string][]*graph.Edge {
 	s.paramBatchCalls++
-	all := s.Store.GetInEdgesByNodeIDs(ids)
+	all := s.GetInEdgesByNodeIDs(ids)
 	out := make(map[string][]*graph.Edge, len(all))
 	for owner, edges := range all {
 		for _, edge := range edges {
@@ -148,7 +148,7 @@ func TestMaterializeDataflowParamsUsesBatchesAndPreservesSemantics(t *testing.T)
 		From: caller, To: result, Kind: graph.EdgeReturnsTo,
 		FilePath: file, Line: 17, Origin: "dataflow", Confidence: 0.84, Meta: returnMeta,
 	}
-	store.Store.AddBatch(nodes, []*graph.Edge{
+	store.AddBatch(nodes, []*graph.Edge{
 		{From: param0, To: callee, Kind: graph.EdgeParamOf, FilePath: "repo/callee.go"},
 		{From: param1, To: callee, Kind: graph.EdgeParamOf, FilePath: "repo/callee.go"},
 		// Same-line fallback comes first; callee_target must select Target.
@@ -181,10 +181,10 @@ func TestMaterializeDataflowParamsUsesBatchesAndPreservesSemantics(t *testing.T)
 	assertDataflowScalarCallsZero(t, store)
 
 	writes := store.reindexCalls
-	revisions := store.Store.EdgeIdentityRevisions()
+	revisions := store.EdgeIdentityRevisions()
 	idx.materializeDataflowParams()
 	assert.Equal(t, writes, store.reindexCalls, "warm replay must be write-free")
-	assert.Equal(t, revisions, store.Store.EdgeIdentityRevisions())
+	assert.Equal(t, revisions, store.EdgeIdentityRevisions())
 	assertDataflowScalarCallsZero(t, store)
 }
 
@@ -194,7 +194,7 @@ func TestMaterializeDataflowParamsQueryAndWriteCountIsPerBatch(t *testing.T) {
 		callee = "repo/callee.go::Target"
 		param  = "repo/callee.go::Target#param:0"
 	)
-	store.Store.AddBatch([]*graph.Node{
+	store.AddBatch([]*graph.Node{
 		{ID: callee, Kind: graph.KindFunction, FilePath: "repo/callee.go"},
 		{ID: param, Kind: graph.KindParam, FilePath: "repo/callee.go", Meta: map[string]any{"position": 0}},
 	}, []*graph.Edge{{From: param, To: callee, Kind: graph.EdgeParamOf}})
@@ -208,7 +208,7 @@ func TestMaterializeDataflowParamsQueryAndWriteCountIsPerBatch(t *testing.T) {
 			Meta: map[string]any{"arg_position": 0},
 		})
 	}
-	store.Store.AddBatch(nil, edges)
+	store.AddBatch(nil, edges)
 
 	(&Indexer{graph: store}).materializeDataflowParams()
 
@@ -237,7 +237,7 @@ func TestMaterializeDataflowParamsForFileUsesOneFrontierReadAndBatchRewrite(t *t
 		param   = "repo/callee.go::Target#param:0"
 		argFrom = "repo/caller.go::value"
 	)
-	store.Store.AddBatch([]*graph.Node{
+	store.AddBatch([]*graph.Node{
 		{ID: argFrom, Kind: graph.KindVariable, FilePath: file},
 		{ID: callee, Kind: graph.KindFunction, FilePath: "repo/callee.go"},
 		{ID: param, Kind: graph.KindParam, FilePath: "repo/callee.go", Meta: map[string]any{"position": 0}},

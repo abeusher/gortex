@@ -519,16 +519,6 @@ func (idx *Indexer) contractGraphFrontier(
 	return nodesByFile, idx.graph.GetOutEdgesByNodeIDs(nodeIDs)
 }
 
-func (idx *Indexer) extractContractsForGraphFile(
-	graphPath string,
-	byLang map[string][]contracts.Extractor,
-) ([]contracts.Contract, int64, bool, bool) {
-	nodesByFile, edgesByNode := idx.contractGraphFrontier([]string{graphPath})
-	return idx.extractContractsForGraphFileFromBatch(
-		graphPath, byLang, nodesByFile[graphPath], edgesByNode,
-	)
-}
-
 func (idx *Indexer) extractIncrementalManifestContracts(
 	graphPath string,
 ) (fresh []contracts.Contract, mtimeNano int64, exists, preservePrior, handled bool) {

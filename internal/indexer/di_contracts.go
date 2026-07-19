@@ -58,27 +58,6 @@ func (idx *Indexer) extractDIContracts(reg *contracts.Registry) {
 	reg.AddAllScoped(discovered, idx.repoPrefix, idx.workspaceID, idx.projectID)
 }
 
-// linkSpringBeans emits EdgeCalls from every class that has an
-// incoming-method node whose signature mentions a @Bean return type
-// back to the bean method. Uses method signatures because the Java
-// extractor already stores them on constructor nodes — no second
-// parse pass needed. Kept tight by requiring an exact type-name
-// token match inside the signature string.
-//
-// In multi-repo mode the walks are scoped to this repo's nodes so the
-// per-repo cost stays proportional to the repo's own size, not the
-// shared workspace graph.
-func (idx *Indexer) linkSpringBeans() {
-	rows := graph.ReadRepoEdgesByKinds(idx.graph, []string{idx.repoPrefix}, []graph.EdgeKind{graph.EdgeProvides})
-	edges := make([]*graph.Edge, 0, len(rows))
-	for _, row := range rows {
-		if row.Edge != nil {
-			edges = append(edges, row.Edge)
-		}
-	}
-	idx.linkSpringBeansFromEdges(edges)
-}
-
 func (idx *Indexer) linkSpringBeansFromEdges(repoEdges []*graph.Edge) {
 	type beanRef struct {
 		methodID string
@@ -184,37 +163,6 @@ func javaIdentifierSet(src string) map[string]struct{} {
 		out[src[start:i]] = struct{}{}
 	}
 	return out
-}
-
-// signatureReferencesType returns true when sig contains typeName as a
-// whole identifier (e.g. "Clock", "UserService"). Conservative match —
-// substring-but-word-boundary to avoid `Clock` matching `ClockFactory`.
-func signatureReferencesType(sig, typeName string) bool {
-	i := 0
-	for i < len(sig) {
-		j := indexOf(sig[i:], typeName)
-		if j < 0 {
-			return false
-		}
-		start := i + j
-		end := start + len(typeName)
-		leftOK := start == 0 || !isJavaIdentChar(sig[start-1])
-		rightOK := end == len(sig) || !isJavaIdentChar(sig[end])
-		if leftOK && rightOK {
-			return true
-		}
-		i = end
-	}
-	return false
-}
-
-func indexOf(s, sub string) int {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return i
-		}
-	}
-	return -1
 }
 
 func isJavaIdentChar(b byte) bool {

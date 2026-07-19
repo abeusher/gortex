@@ -1,11 +1,7 @@
 package store_sqlite
 
 import (
-	"context"
 	"database/sql"
-	"errors"
-
-	"github.com/zzet/gortex/internal/graph"
 )
 
 // AnalysisMutationRevision is a process-local graph mutation clock. Durable
@@ -101,65 +97,6 @@ func (s *Store) finishAnalysisMutationLocked(changed bool) {
 		// and other edge mutation families without N per-row atomics.
 		s.edgeMutationRevision.Add(1)
 	}
-}
-
-// invalidateAnalysisBeforeNodeMutationLocked preserves a generation across a
-// metadata-only AddNode (reachability stamps are stored in Meta) while still
-// treating every identity/location field read by AllNodesLight as relevant.
-// In particular line/column shifts invalidate: consumers surface locations and
-// must never restore old coordinates after restart. writeMu must be held.
-func (s *Store) invalidateAnalysisBeforeNodeMutationLocked(n *graph.Node) bool {
-	if !s.analysisGenerationPresent {
-		return true
-	}
-	var (
-		kind, name, qualName, filePath, language   string
-		repoPrefix, workspaceID, projectID         string
-		startLine, endLine, startColumn, endColumn int
-		visibility, entryPointKind                 sql.NullString
-		entryPoint                                 sql.NullBool
-	)
-	conn, release, connErr := s.activeWriteConnLocked(context.Background())
-	if connErr != nil {
-		panicOnFatal(connErr)
-		return false
-	}
-	err := conn.QueryRowContext(context.Background(), `SELECT kind, name, qual_name, file_path, start_line, end_line, start_column, end_column, language, repo_prefix, workspace_id, project_id, visibility, entry_point, entry_point_kind FROM nodes WHERE id = ?`, n.ID).Scan(
-		&kind, &name, &qualName, &filePath,
-		&startLine, &endLine, &startColumn, &endColumn,
-		&language, &repoPrefix, &workspaceID, &projectID,
-		&visibility, &entryPoint, &entryPointKind,
-	)
-	release()
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		panicOnFatal(err)
-		return false
-	}
-	lightChanged := errors.Is(err, sql.ErrNoRows) ||
-		kind != string(n.Kind) || name != n.Name || qualName != n.QualName ||
-		filePath != n.FilePath || startLine != n.StartLine || endLine != n.EndLine ||
-		startColumn != n.StartColumn || endColumn != n.EndColumn ||
-		language != n.Language || repoPrefix != n.RepoPrefix ||
-		workspaceID != n.WorkspaceID || projectID != n.ProjectID
-	processChanged := false
-	if !errors.Is(err, sql.ErrNoRows) {
-		// Promoted columns only — the Meta blob is never decoded on this
-		// per-node write hot path. A pre-promotion row (key still in the
-		// blob, columns NULL) reads as unset, so a write carrying the flag
-		// invalidates once and the rewrite self-migrates the row: a bounded
-		// one-time over-invalidation, never a missed one.
-		storedEntry := entryPoint.Valid && entryPoint.Bool
-		storedEntryKind := entryPointKind.String
-		newEntry, _ := n.Meta["entry_point"].(bool)
-		newEntryKind, _ := n.Meta["entry_point_kind"].(string)
-		newVisibility, _ := n.Meta["visibility"].(string)
-		processChanged = visibility.String != newVisibility || storedEntry != newEntry ||
-			(storedEntry && storedEntryKind != newEntryKind)
-	}
-	if !lightChanged && !processChanged {
-		return true
-	}
-	return s.invalidateAnalysisBeforeMutationLocked()
 }
 
 // invalidateAnalysisBeforeMutationLocked is the common fail-closed gate for

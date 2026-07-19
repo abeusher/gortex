@@ -22,15 +22,6 @@ func sqliteIdentityForEdge(e *graph.Edge) sqliteEdgeIdentity {
 	}
 }
 
-func (s *Store) edgeExistsLocked(e *graph.Edge) (bool, error) {
-	var one int
-	err := s.stmtEdgeExists.QueryRow(e.From, e.To, string(e.Kind), e.FilePath, e.Line).Scan(&one)
-	if err == sql.ErrNoRows {
-		return false, nil
-	}
-	return err == nil, err
-}
-
 // batchContainsNewEdgeLocked determines whether AddBatch can change topology.
 // It runs only while an active analysis generation exists; ordinary indexing
 // pays no preflight cost. Composite keys are checked in bounded queries so an

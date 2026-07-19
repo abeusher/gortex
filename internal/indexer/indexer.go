@@ -646,27 +646,6 @@ func isSymbolSearcherBackend(b search.Backend) bool {
 	return ok
 }
 
-// lessEdgeKey orders edges by their logical key (from, to, kind,
-// file_path, line) — the same tuple the sqlite edges table's
-// UNIQUE(from_id, …) index is built on. Draining edges in this order on
-// the cold bulk load keeps that index's inserts local instead of random,
-// reducing B-tree page splits.
-func lessEdgeKey(a, b *graph.Edge) bool {
-	if a.From != b.From {
-		return a.From < b.From
-	}
-	if a.To != b.To {
-		return a.To < b.To
-	}
-	if a.Kind != b.Kind {
-		return a.Kind < b.Kind
-	}
-	if a.FilePath != b.FilePath {
-		return a.FilePath < b.FilePath
-	}
-	return a.Line < b.Line
-}
-
 // ftsTokensFor produces the pre-tokenised text the backend FTS path
 // indexes. Mirrors searchIndexFields' field selection but joins
 // every field through search.Tokenize (camelCase / snake_case /
@@ -6481,17 +6460,6 @@ func (idx *Indexer) resolveProviderHandlers(reg *contracts.Registry) {
 	}
 }
 
-// resolveInnermostHandler picks the innermost handler candidate from
-// the call trail that resolves to a real function or method in the
-// graph. Walks candidates in source order and keeps the LAST
-// successful lookup — for `WithAuth(h.ServeArchive)` that's
-// `h.ServeArchive`, not the `WithAuth` wrapper. Falls back to the
-// single identifier when no trail is available (e.g. simple bare
-// `r.GET("/x", listUsers)` patterns).
-func (idx *Indexer) resolveInnermostHandler(trail, fallback, repoHint, srcDir string) *graph.Node {
-	return idx.resolveInnermostHandlerFromCandidates(trail, fallback, repoHint, srcDir, nil)
-}
-
 func (idx *Indexer) resolveInnermostHandlerFromCandidates(
 	trail, fallback, repoHint, srcDir string,
 	byName map[string][]*graph.Node,
@@ -7740,26 +7708,6 @@ func (idx *Indexer) inlineEnvelopeShapes(reg *contracts.Registry) {
 		idx.logger.Info("response envelopes hydrated with shapes",
 			zap.Int("contracts", inlined))
 	}
-}
-
-// lookupShape resolves a Meta type reference to the snapshotted shape
-// stored on its graph node. Accepts string IDs (the only form used in
-// today's pipeline); other shapes pass through as nil so callers can
-// chain without type-asserting upstream.
-func (idx *Indexer) lookupShape(raw any) any {
-	id, ok := raw.(string)
-	if !ok || id == "" || !strings.Contains(id, "::") {
-		return nil
-	}
-	node := idx.graph.GetNode(id)
-	if node == nil || node.Meta == nil {
-		return nil
-	}
-	shape, ok := node.Meta["shape"]
-	if !ok || shape == nil {
-		return nil
-	}
-	return shape
 }
 
 // extractExternalModules parses the repo's go.mod once and writes

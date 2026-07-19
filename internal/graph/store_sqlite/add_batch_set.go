@@ -23,7 +23,6 @@ const (
 	edgeInsertColumns = `from_id, to_id, kind, file_path, line, confidence, confidence_label, origin, tier, cross_repo, meta, resolve_terminal, resolve_terminal_reason, semantic_source`
 	edgeInsertParams  = 14
 	// The package-private compatibility writer retains the conservative shape.
-	edgeInsertChunkSize = 70
 	// Edges carry half as many parameters as nodes, so the same variable and
 	// byte budgets permit twice as many rows per statement.
 	edgeInsertMaxChunkSize = 512

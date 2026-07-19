@@ -183,22 +183,6 @@ type wrapperInfo struct {
 	SymbolID string
 }
 
-// enrichInlinedWrapperContract runs the schema enrichment pipeline
-// against the caller's body so inlined wrapper consumer contracts
-// carry the same request_type / response_type / query_params facts
-// that natively-detected consumer contracts do.
-//
-// Mirrors the enrichment chain HTTPExtractor.extract runs after
-// matching a regex pattern: lines + fileNodes + lang + tree feed
-// EnrichHTTPContractWithTree, which dispatches to the per-language
-// schema_enrich_*.go detectors and (for Go) the AST overlay.
-func enrichInlinedWrapperContract(c *Contract, g graph.Store, caller *graph.Node, src []byte) {
-	if c == nil || caller == nil || len(src) == 0 {
-		return
-	}
-	enrichInlinedWrapperContractWithFileNodes(c, caller, src, g.GetFileNodes(caller.FilePath))
-}
-
 func enrichInlinedWrapperContractWithFileNodes(c *Contract, caller *graph.Node, src []byte, fileNodes []*graph.Node) {
 	if c == nil || caller == nil || len(src) == 0 {
 		return
@@ -239,17 +223,6 @@ var wrapperPathRE = regexp.MustCompile(`^/\{?[a-zA-Z][a-zA-Z0-9_]*\}?$`)
 
 func isWrapperPath(path string) bool {
 	return wrapperPathRE.MatchString(path)
-}
-
-// commitInlinedContractToGraph adds the contract as a graph node (if not
-// already present) and a symbol → contract EdgeConsumes edge (also
-// idempotent). Mirrors the commitContracts logic in the indexer but
-// runs at wrapper-inline time so late-emitted contracts appear in
-// contracts list output and in the matcher's graph view. Idempotency
-// matters because ReconcileContractEdges runs on every repo change —
-// without it each track/index would duplicate edges.
-func commitInlinedContractToGraph(g graph.Store, c Contract) {
-	commitInlinedContractsToGraph(g, []Contract{c})
 }
 
 func commitInlinedContractsToGraph(g graph.Store, contracts []Contract) {

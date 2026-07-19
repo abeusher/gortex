@@ -58,10 +58,7 @@ func (g *Graph) FindEdgesByIdentities(identities []EdgeIdentity) map[EdgeIdentit
 		s.mu.RLock()
 		for _, identity := range keys {
 			positions := s.outEdgeIdx[identity.From]
-			position, ok := positions[hashEdgeKey(edgeKey{
-				From: identity.From, To: identity.To, Kind: identity.Kind,
-				FilePath: identity.FilePath, Line: identity.Line,
-			})]
+			position, ok := positions[hashEdgeKey(edgeKey(identity))]
 			if !ok {
 				continue
 			}

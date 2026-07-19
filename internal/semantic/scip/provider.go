@@ -125,11 +125,6 @@ func (p *Provider) EnrichFile(g graph.Store, repoRoot, filePath string) (*semant
 	return nil, nil
 }
 
-// runIndexer executes the SCIP indexer and returns the path to the output file.
-func (p *Provider) runIndexer(repoRoot string) (string, error) {
-	return p.runIndexerContext(context.Background(), repoRoot)
-}
-
 func (p *Provider) runIndexerContext(ctx context.Context, repoRoot string) (string, error) {
 	tmpDir, err := os.MkdirTemp("", "gortex-scip-*")
 	if err != nil {

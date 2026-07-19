@@ -89,9 +89,7 @@ func (r *Resolver) attributeGoBuiltins() {
 	// graph's entire unresolved slice and discarding nearly every row.
 	byTarget := r.graph.GetInEdgesByNodeIDs(goBuiltinUnresolvedTargets)
 	for _, target := range goBuiltinUnresolvedTargets {
-		for _, e := range byTarget[target] {
-			candidates = append(candidates, e)
-		}
+		candidates = append(candidates, byTarget[target]...)
 	}
 	r.attributeGoBuiltinCandidates(candidates)
 }

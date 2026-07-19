@@ -117,23 +117,6 @@ func BindProviderSymbols(reg *Registry, g graph.Store) int {
 	return bound
 }
 
-// bindGRPCProvider returns the node ID of the Go/TS method implementing
-// the RPC, or "" if we can't uniquely pick one.
-//
-// Heuristic (highest-priority first):
-//  1. Method named <contract.Meta["method"]> whose receiver type is
-//     exactly `{Service}Server` (the common gRPC-generated server
-//     interface naming).
-//  2. Same method name, receiver type containing "Server" anywhere.
-//  3. Same method name, in a file that contains a
-//     `Register{Service}Server(` call.
-//  4. Same method name, any receiver — only if there's exactly one
-//     candidate in the repo.
-func bindGRPCProvider(c Contract, g graph.Store) string {
-	method, _ := c.Meta["method"].(string)
-	return bindGRPCProviderCandidates(c, g.FindNodesByName(method))
-}
-
 func bindGRPCProviderCandidates(c Contract, byName []*graph.Node) string {
 	method, _ := c.Meta["method"].(string)
 	service, _ := c.Meta["service"].(string)
@@ -167,26 +150,6 @@ func bindGRPCProviderCandidates(c Contract, byName []*graph.Node) string {
 		return candidates[0].ID
 	}
 	return ""
-}
-
-// bindOpenAPIProvider picks the Go/TS handler that implements the
-// OpenAPI-declared operation. Since operationId conventions vary
-// widely, this is lower-confidence than gRPC binding; a stricter
-// implementation would also check the Gin/Echo route registration
-// file, but v1 just name-matches. Returns "" if no unambiguous bind.
-func bindOpenAPIProvider(c Contract, g graph.Store) string {
-	op, _ := c.Meta["operationId"].(string)
-	if op == "" {
-		// Fall back to the last path segment; OpenAPI specs
-		// commonly use /{collection}/{action} and a handler named
-		// after the action (listUsers, createUser).
-		path, _ := c.Meta["path"].(string)
-		op = lastPathSegment(path)
-	}
-	if op == "" {
-		return ""
-	}
-	return bindOpenAPIProviderCandidates(c, g.FindNodesByName(op))
 }
 
 func bindOpenAPIProviderCandidates(c Contract, byName []*graph.Node) string {

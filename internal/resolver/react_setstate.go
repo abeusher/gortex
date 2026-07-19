@@ -94,13 +94,6 @@ func ResolveReactSetStateCalls(g graph.Store) int {
 	return synthesized
 }
 
-// methodCallsSetState reports whether a method has an outgoing call to
-// `this.setState(...)` (the unresolved `*.setState` placeholder, or a resolved
-// setState method).
-func methodCallsSetState(g graph.Store, methodID string) bool {
-	return edgesCallSetState(g.GetOutEdges(methodID))
-}
-
 func edgesCallSetState(edges []*graph.Edge) bool {
 	for _, e := range edges {
 		if e == nil || e.Kind != graph.EdgeCalls {

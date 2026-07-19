@@ -315,10 +315,6 @@ func cloneRepoNodes(g graph.Store, repoPrefix string) []*graph.Node {
 	return g.GetRepoNodes(repoPrefix)
 }
 
-func finaliseCloneSignatures(g graph.Store, repoPrefix string) []clones.Item {
-	return finaliseCloneSignaturesCtx(context.Background(), g, repoPrefix)
-}
-
 // finaliseCloneSignaturesCtx takes the SQLite-first compact projection path
 // when available. It keyset-pages the corpus twice only when at least one row
 // is pending; an unchanged warm corpus is read once and performs no writes.
