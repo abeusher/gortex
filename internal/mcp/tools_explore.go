@@ -85,6 +85,8 @@ type exploreTarget struct {
 	directCalleesComplete bool // false when the direct projection was truncated, bounded, or otherwise lower-bound
 	causalCallees         []exploreCausalNeighbor
 	source                string // full body (may be empty for non-source kinds)
+	divergentDefaultOwner bool   // unique child constructor whose concrete default causes the queried behavior
+	divergentDefaultType  bool   // owning type paired with divergentDefaultOwner for coherent file/symbol output
 	conceptImplementation bool   // one identifier-backed callable protected from final truncation
 	exactContent          bool   // verified full quoted-literal hit from content_fts
 	exactContentAmbiguous bool   // exact evidence has visible or possibly truncated peers
@@ -2016,6 +2018,12 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		}
 		targets = append(targets, t)
 	}
+	if exploreQueryIsConceptTask(task) && len(targets) > len(artifactTargets) {
+		symbolTargets := promoteExploreDivergentDefaultOwner(task, targets[len(artifactTargets):], s.graph, maxSymbols, func(node *graph.Node) string {
+			return s.manifestSymbolSource(ctx, node)
+		})
+		targets = append(targets[:len(artifactTargets):len(artifactTargets)], symbolTargets...)
+	}
 	// Direct retrieval owns the ranked head. Once graph promotion has selected
 	// a cross-file boundary, materialize exactly that one node so both text and
 	// structured responses can reserve a source body without a broad read.
@@ -2035,7 +2043,7 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		// Concept answers prefer the owning type when several of its members
 		// rank together; implementation-intent queries are exempt because
 		// they ask for exactly those members.
-		symbolTargets = s.foldMemberOwners(ctx, symbolTargets)
+		symbolTargets = preserveExploreDivergentDefaultOrder(s.foldMemberOwners(ctx, symbolTargets))
 		targets = append(targets[:len(artifactTargets):len(artifactTargets)], symbolTargets...)
 	}
 	answerReady := exploreAnswerReady(task, symbolTargets) || artifactLane.ready
@@ -2051,6 +2059,13 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	// File evidence can make localization answer-ready, but it never becomes a
 	// synthetic exact-symbol read. Exact reads remain declaration-only.
 	exactSymbol := exploreLocalizationExplicitTarget(task, symbolTargets)
+	// A unique graph + default-flow proof identifies the upstream cause behind
+	// an issue author's downstream symbol anchor. Read that proven constructor,
+	// while retaining the explicitly named consumer immediately after it in the
+	// evidence projection.
+	if causalSymbol := exploreDivergentDefaultOwnerSymbol(symbolTargets); causalSymbol != "" {
+		exactSymbol = causalSymbol
+	}
 	if !answerReady && exactSymbol == "" {
 		// Uncertain localization is still useful evidence. Returning it as an
 		// MCP error makes hosts discard the ranked candidates and restart broad
@@ -2232,6 +2247,14 @@ func materializeExploreStructuralSourceWithReader(
 	if len(targets) == 0 || !exploreAllowsStructuralBody(task) || ctx.Err() != nil || readSource == nil {
 		return targets
 	}
+	// Promotion already spent this request's single structural read proving the
+	// child forwards its divergent default. Reuse that source and never open a
+	// second boundary merely for presentation.
+	for _, target := range targets {
+		if target.divergentDefaultOwner {
+			return targets
+		}
+	}
 	draft := exploreAnswerDraft(task, targets)
 	present := make(map[string]struct{}, len(targets))
 	for _, target := range targets {
@@ -2371,6 +2394,12 @@ func explorePreferredRefinementSymbol(task string, targets []exploreTarget) stri
 		return candidate.identifierOverlap + body
 	}
 	better := func(left, right refinementCandidate) bool {
+		// A divergent-default owner is promoted only after a unique constructor
+		// call + inheritance proof over complete bounded projections. That causal
+		// proof supersedes an issue author's downstream symbol guess.
+		if left.target.divergentDefaultOwner != right.target.divergentDefaultOwner {
+			return left.target.divergentDefaultOwner
+		}
 		if left.explicit != right.explicit {
 			return left.explicit
 		}
@@ -2484,10 +2513,25 @@ func localizationEvidenceTargetsFromDraft(task, exactID string, targets []explor
 	if draft == nil && strings.TrimSpace(task) != "" {
 		draft = exploreAnswerDraft(task, targets)
 	}
-	// Primary retrieval evidence leads exact-read and answer-ready envelopes;
-	// both it and the exact target are contractual under tight budgets. A
-	// needs-refinement caller may move its authorized target ahead afterward,
-	// without changing this stable answer-draft projection.
+	// A graph-proven causal constructor and its owning type outrank the
+	// downstream retrieval seed. Their explicit admission metadata survives
+	// draft ranking, owner folding, and byte-budget packing, so this ordering is
+	// evidence-driven rather than a late symbol-name sort.
+	for _, target := range targets {
+		if target.divergentDefaultOwner {
+			appendTarget(target)
+			break
+		}
+	}
+	for _, target := range targets {
+		if target.divergentDefaultType {
+			appendTarget(target)
+			break
+		}
+	}
+	// Primary retrieval evidence remains contractual under tight budgets and
+	// follows the causal pair as its supporting consumer. A needs-refinement
+	// caller may move its authorized target ahead afterward.
 	appendTarget(targets[0])
 	if exactID != "" {
 		for _, target := range targets {
@@ -2651,6 +2695,11 @@ func buildLocalizationExploreResultForTask(
 	mandatoryCount := 0
 	if len(targets) > 0 {
 		mandatoryCount = 1
+	}
+	for index, target := range targets {
+		if (target.divergentDefaultOwner || target.divergentDefaultType) && index+1 > mandatoryCount {
+			mandatoryCount = index + 1
+		}
 	}
 	// Primary retrieval evidence and the authorized exact/refinement symbol are
 	// both mandatory regardless of which one leads the serialized projection.
