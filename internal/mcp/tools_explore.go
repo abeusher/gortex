@@ -1820,7 +1820,23 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		return mcp.NewToolResultText(s.renderExplore(task, targets, budget)), nil
 	}
 	symbolTargets := targets[len(artifactTargets):]
+	// An implementation-intent query expands abstract seeds into their
+	// concrete implementors before terminality is judged, so the envelope
+	// carries the code that changes and answer_ready can see it.
+	if exploreImplementationIntent(task) {
+		symbolTargets = s.expandImplementationTargets(ctx, symbolTargets)
+		targets = append(targets[:len(artifactTargets):len(artifactTargets)], symbolTargets...)
+	}
 	answerReady := exploreAnswerReady(task, symbolTargets) || artifactLane.ready
+	if answerReady && !artifactLane.ready {
+		eng := s.engineFor(ctx)
+		if eng != nil && exploreImplementationAnswerBlocked(task, symbolTargets, eng.GetOutEdges, eng.GetSymbol) {
+			// Only abstract declarations in evidence for an implementation
+			// question: stay nonterminal so the permitted refinement read
+			// can reach the concrete side.
+			answerReady = false
+		}
+	}
 	// File evidence can make localization answer-ready, but it never becomes a
 	// synthetic exact-symbol read. Exact reads remain declaration-only.
 	exactSymbol := exploreLocalizationExplicitTarget(task, symbolTargets)
