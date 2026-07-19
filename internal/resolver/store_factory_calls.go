@@ -22,13 +22,27 @@ const storeFactoryVia = "store-factory"
 // pass prefers the candidate in the caller's file (then a unique binding match,
 // then a singleton). Returns the number of call edges landed on an action.
 func ResolveStoreFactoryCalls(g graph.Store) int {
+	return resolveStoreFactoryCalls(g, nil)
+}
+
+// resolveStoreFactoryCalls is the census-multiplexed form: cands, when
+// non-nil, supplies the pre-matched via=store-factory EdgeCalls candidates
+// and the shared function-node snapshot, replacing this pass's own
+// whole-stream decode and whole-kind node scan.
+func resolveStoreFactoryCalls(g graph.Store, cands *frameworkPassCandidates) int {
 	if g == nil {
 		return 0
+	}
+	var functionNodes []*graph.Node
+	if cands != nil {
+		functionNodes = cands.nodes.kind(g, graph.KindFunction)
+	} else {
+		functionNodes = nodesByKindsOrAll(g, graph.KindFunction)
 	}
 	// index: binding → member → action nodes (multiple files may reuse the
 	// same binding name, hence a slice).
 	index := map[string]map[string][]*graph.Node{}
-	for _, n := range nodesByKindsOrAll(g, graph.KindFunction) {
+	for _, n := range functionNodes {
 		if n == nil || n.Meta == nil {
 			continue
 		}
@@ -49,9 +63,13 @@ func ResolveStoreFactoryCalls(g graph.Store) int {
 		return 0
 	}
 
+	stream := g.EdgesByKind(graph.EdgeCalls)
+	if cands != nil {
+		stream = frameworkEdgeSeq(refetchFrameworkCandidates(g, cands.calls))
+	}
 	resolved := 0
 	var reindex []graph.EdgeReindex
-	for e := range g.EdgesByKind(graph.EdgeCalls) {
+	for e := range stream {
 		if e == nil || e.Meta == nil {
 			continue
 		}

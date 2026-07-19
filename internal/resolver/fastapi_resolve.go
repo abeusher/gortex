@@ -1,6 +1,7 @@
 package resolver
 
 import (
+	"iter"
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -26,13 +27,26 @@ var (
 // references to their definitions by directory convention. Returns the count
 // bound.
 func ResolveFastAPIDeps(g graph.Store) int {
+	return resolveFastAPIDeps(g, nil)
+}
+
+// resolveFastAPIDeps is the census-multiplexed form: cands, when non-nil,
+// replaces both whole-stream decodes with the shared walk's pre-matched
+// candidates.
+func resolveFastAPIDeps(g graph.Store, cands *frameworkPassCandidates) int {
 	if g == nil {
 		return 0
 	}
+	callsStream := g.EdgesByKind(graph.EdgeCalls)
+	refsStream := g.EdgesByKind(graph.EdgeReferences)
+	if cands != nil {
+		callsStream = frameworkEdgeSeq(refetchFrameworkCandidates(g, cands.calls))
+		refsStream = frameworkEdgeSeq(refetchFrameworkCandidates(g, cands.refs))
+	}
 	resolved := 0
 	var reindex []graph.EdgeReindex
-	for _, kind := range []graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences} {
-		for e := range g.EdgesByKind(kind) {
+	for _, stream := range []iter.Seq[*graph.Edge]{callsStream, refsStream} {
+		for e := range stream {
 			if e == nil || e.Meta == nil || !graph.IsUnresolvedTarget(e.To) {
 				continue
 			}

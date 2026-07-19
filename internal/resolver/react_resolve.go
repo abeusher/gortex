@@ -1,6 +1,7 @@
 package resolver
 
 import (
+	"iter"
 	"regexp"
 	"strings"
 
@@ -39,13 +40,27 @@ var (
 // references to their definitions by directory convention. Returns the count
 // bound.
 func ResolveReactHooksContext(g graph.Store) int {
+	return resolveReactHooksContext(g, nil)
+}
+
+// resolveReactHooksContext is the census-multiplexed form: cands, when
+// non-nil, replaces the EdgeCalls and EdgeReferences decodes with the
+// shared walk's pre-matched candidates. The (small) EdgeRendersChild kind
+// keeps its own stream in both forms.
+func resolveReactHooksContext(g graph.Store, cands *frameworkPassCandidates) int {
 	if g == nil {
 		return 0
 	}
+	callsStream := g.EdgesByKind(graph.EdgeCalls)
+	refsStream := g.EdgesByKind(graph.EdgeReferences)
+	if cands != nil {
+		callsStream = frameworkEdgeSeq(refetchFrameworkCandidates(g, cands.calls))
+		refsStream = frameworkEdgeSeq(refetchFrameworkCandidates(g, cands.refs))
+	}
 	resolved := 0
 	var reindex []graph.EdgeReindex
-	for _, kind := range []graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences, graph.EdgeRendersChild} {
-		for e := range g.EdgesByKind(kind) {
+	for _, stream := range []iter.Seq[*graph.Edge]{callsStream, refsStream, g.EdgesByKind(graph.EdgeRendersChild)} {
+		for e := range stream {
 			if e == nil || !graph.IsUnresolvedTarget(e.To) {
 				continue
 			}

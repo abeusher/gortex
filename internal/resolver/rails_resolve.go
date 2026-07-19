@@ -34,14 +34,33 @@ var (
 // ResolveRailsRefs binds residual unresolved Ruby `Const.method` calls to
 // their Rails definitions by directory convention. Returns the count bound.
 func ResolveRailsRefs(g graph.Store) int {
+	return resolveRailsRefs(g, nil)
+}
+
+// resolveRailsRefs is the census-multiplexed form: cands, when non-nil,
+// replaces the whole EdgeCalls decode with the shared walk's pre-matched
+// recv_const candidates. The class/method node index keeps its own
+// combined-kind scan: its first-wins name map depends on the multi-kind
+// scan's row order, which per-kind snapshot slices cannot reproduce.
+func resolveRailsRefs(g graph.Store, cands *frameworkPassCandidates) int {
 	if g == nil {
 		return 0
+	}
+	stream := g.EdgesByKind(graph.EdgeCalls)
+	if cands != nil {
+		refetched := refetchFrameworkCandidates(g, cands.calls)
+		if len(refetched) == 0 {
+			// The convention indexes below are pure reads consumed only by
+			// the loop; with no candidates the pass provably lands nothing.
+			return 0
+		}
+		stream = frameworkEdgeSeq(refetched)
 	}
 	models := railsModelClassSet(g)
 	methodsByClass := railsClassMethodIndex(g)
 	resolved := 0
 	var reindex []graph.EdgeReindex
-	for e := range g.EdgesByKind(graph.EdgeCalls) {
+	for e := range stream {
 		if e == nil || e.Meta == nil || !graph.IsUnresolvedTarget(e.To) {
 			continue
 		}

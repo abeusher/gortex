@@ -58,6 +58,17 @@ const macroFunctionKindMeta = "function"
 //
 // Returns the number of use-site call edges the pass owns after this run.
 func ResolveMacroExpansionCalls(g graph.Store) int {
+	return resolveMacroExpansionCalls(g, nil)
+}
+
+// resolveMacroExpansionCalls is the census-multiplexed form: cands, when
+// non-nil, supplies the shared macro-node snapshot and the pre-matched
+// use-site candidates (edges naming a function-like macro), replacing the
+// pass's own whole-kind node scan and EdgeCalls decode. The candidate
+// vocabulary is a name-only superset of the index built here (it skips the
+// recovered-callee requirement), so the loop's own byKey / macroByID
+// filters remain the deciding gate.
+func resolveMacroExpansionCalls(g graph.Store, cands *frameworkPassCandidates) int {
 	if g == nil {
 		return 0
 	}
@@ -75,9 +86,15 @@ func ResolveMacroExpansionCalls(g graph.Store) int {
 	macroNames := map[string]struct{}{}
 	macroKey := func(repo, name string) string { return repo + "\x00" + name }
 
+	var macroNodes []*graph.Node
+	if cands != nil {
+		macroNodes = cands.nodes.kind(g, graph.KindMacro)
+	} else {
+		macroNodes = nodesByKindsOrAll(g, graph.KindMacro)
+	}
 	var macros []*graph.Node
 	var macroIDs []string
-	for _, n := range nodesByKindsOrAll(g, graph.KindMacro) {
+	for _, n := range macroNodes {
 		if n == nil || n.Meta == nil || n.Name == "" {
 			continue
 		}
@@ -121,10 +138,14 @@ func ResolveMacroExpansionCalls(g graph.Store) int {
 		line   int
 		entry  *macroEntry
 	}
+	useSiteStream := g.EdgesByKind(graph.EdgeCalls)
+	if cands != nil {
+		useSiteStream = frameworkEdgeSeq(refetchFrameworkCandidates(g, cands.calls))
+	}
 	var callEdges []*graph.Edge
 	var candidateCallerIDs []string
 	callerSeen := make(map[string]struct{})
-	for e := range g.EdgesByKind(graph.EdgeCalls) {
+	for e := range useSiteStream {
 		if e == nil || e.From == "" || e.To == "" {
 			continue
 		}

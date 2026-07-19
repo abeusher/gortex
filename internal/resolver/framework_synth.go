@@ -893,8 +893,8 @@ func frameworkSynthNodeGatesPass(name string, present, markers map[string]int) b
 // Native-bridge resolvers append to this slice.
 func defaultFrameworkSynthesizers() []FrameworkSynthesizer {
 	return []FrameworkSynthesizer{
-		synthFunc{name: SynthGRPCStub, fn: ResolveGRPCStubCalls},
-		synthFunc{name: SynthTemporalStub, fn: ResolveTemporalCalls},
+		synthFunc{name: SynthGRPCStub, fn: ResolveGRPCStubCalls, candFn: resolveGRPCStubCalls},
+		synthFunc{name: SynthTemporalStub, fn: ResolveTemporalCalls, candFn: resolveTemporalCalls},
 		synthFunc{name: SynthEventChannel, fn: ResolveEventChannelCalls},
 		synthFunc{name: SynthSwiftObjC, fn: ResolveSwiftObjCBridge},
 		synthFunc{name: SynthReactNative, fn: ResolveReactNativeBridge},
@@ -910,7 +910,7 @@ func defaultFrameworkSynthesizers() []FrameworkSynthesizer {
 		synthFunc{name: SynthSQLCallsite, fn: ResolveSQLCallsites},
 		// Store-factory (Zustand/Redux/Pinia/MobX) indirect action calls —
 		// binds getState()-chain and destructured calls to the action node.
-		synthFunc{name: SynthStoreFactory, fn: ResolveStoreFactoryCalls},
+		synthFunc{name: SynthStoreFactory, fn: ResolveStoreFactoryCalls, candFn: resolveStoreFactoryCalls},
 		// Redux Toolkit createAsyncThunk dispatch chains: a thunk →
 		// each action/thunk it dispatches from its payload-creator body.
 		// After store-factory so its action nodes are indexed for the
@@ -954,12 +954,12 @@ func defaultFrameworkSynthesizers() []FrameworkSynthesizer {
 		// C/C++ function-pointer dispatch: a fn registered into a struct's
 		// fn-pointer field → the indirect recv->field() call, keyed by
 		// (struct type, field) with a field-copy fixpoint.
-		synthFunc{name: SynthFnPointerDispatch, fn: ResolveFnPointerDispatch},
+		synthFunc{name: SynthFnPointerDispatch, fn: ResolveFnPointerDispatch, candFn: resolveFnPointerDispatch},
 		// C/C++ function-like macro expansion: a macro invocation
 		// `CALL_M(o)` → each call hidden in the macro's replacement list,
 		// attributed to the use-site line so a forward call walk shows the
 		// call where the macro is invoked, not at its `#define`.
-		synthFunc{name: SynthMacroExpansion, fn: ResolveMacroExpansionCalls},
+		synthFunc{name: SynthMacroExpansion, fn: ResolveMacroExpansionCalls, candFn: resolveMacroExpansionCalls},
 		// Gin middleware-chain dispatcher → registered handlers. Bridges the
 		// `c.handlers[idx](c)` indirection so ServeHTTP→handler reachability
 		// flows; repo-scoped, gated on a dispatcher existing.
@@ -970,16 +970,16 @@ func defaultFrameworkSynthesizers() []FrameworkSynthesizer {
 		// React custom-hook / context resolution: a `useAuth()` call binds to
 		// its /hooks/ definition; a `*Context`/`*Provider` reference binds to
 		// /context/ or /providers/, with the suffix-strip fallback.
-		synthFunc{name: SynthReactResolve, fn: ResolveReactHooksContext},
+		synthFunc{name: SynthReactResolve, fn: ResolveReactHooksContext, candFn: resolveReactHooksContext},
 		// FastAPI dependency / router fallback: a residual `Depends(get_db)`
 		// binds to a /dependencies/ provider, an `include_router(api_router)`
 		// to a /routers/ definition — only when reference resolution left the
 		// target unresolved.
-		synthFunc{name: SynthFastAPIResolve, fn: ResolveFastAPIDeps},
+		synthFunc{name: SynthFastAPIResolve, fn: ResolveFastAPIDeps, candFn: resolveFastAPIDeps},
 		// Rails receiver-constant resolution: a `UserService.perform` /
 		// `User.find` / `ApplicationHelper.fmt` call binds to the directory-
 		// located service / model / helper definition named by its receiver.
-		synthFunc{name: SynthRailsResolve, fn: ResolveRailsRefs},
+		synthFunc{name: SynthRailsResolve, fn: ResolveRailsRefs, candFn: resolveRailsRefs},
 		// SwiftUI directory-convention fallback: a residual `*View` /
 		// `*ViewModel` / `*Store` / `*Manager` / PascalCase-model reference
 		// binds to its /Views/ /ViewModels/ /Stores/ /Models/ definition.
@@ -1002,10 +1002,10 @@ func defaultFrameworkSynthesizers() []FrameworkSynthesizer {
 		// completion. Runs in the same settle window so residual
 		// unresolved Rust calls land before external-call synthesis
 		// classifies the rest as external.
-		synthFunc{name: SynthRustScope, fn: ResolveRustScopeCalls},
+		synthFunc{name: SynthRustScope, fn: ResolveRustScopeCalls, candFn: resolveRustScopeCalls},
 		// After rust-scope and the implements/extends-producing passes so the
 		// cross-file factory-chain walk + conformance hop see settled edges.
-		synthFunc{name: SynthFactoryChain, fn: ResolveFactoryChains},
+		synthFunc{name: SynthFactoryChain, fn: ResolveFactoryChains, candFn: resolveFactoryChains},
 		// Function-as-value callback registration — binds each captured
 		// value-position function identifier to its same-file definition and
 		// drops unbound candidates. The per-language capture feeds it via

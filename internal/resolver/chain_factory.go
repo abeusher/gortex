@@ -23,15 +23,30 @@ import (
 // overridden. Runs in the framework-synthesizer settle window, after the
 // implements/extends edges exist, so the conformance walk sees them.
 func ResolveFactoryChains(g graph.Store) int {
+	return resolveFactoryChains(g, nil)
+}
+
+// resolveFactoryChains is the census-multiplexed form: cands, when non-nil,
+// replaces the calls+references decode with the shared walk's pre-matched
+// candidates (calls first, then references — each edge's resolution is
+// independent, so the interleaving of the combined kind scan is not
+// load-bearing).
+func resolveFactoryChains(g graph.Store, cands *frameworkPassCandidates) int {
 	if g == nil {
 		return 0
 	}
-	resolved := 0
-	var batch []graph.EdgeReindex
 	// Scoped to the two kinds this pass ever acts on (below), instead of
 	// AllEdges() decoding every kind in the graph — calls+references is a
 	// fraction of the total edge count on a large multi-repo graph.
-	for e := range edgesByKinds(g, []graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences}) {
+	stream := edgesByKinds(g, []graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences})
+	if cands != nil {
+		merged := refetchFrameworkCandidates(g, cands.calls)
+		merged = append(merged, refetchFrameworkCandidates(g, cands.refs)...)
+		stream = frameworkEdgeSeq(merged)
+	}
+	resolved := 0
+	var batch []graph.EdgeReindex
+	for e := range stream {
 		if e == nil || e.Meta == nil {
 			continue
 		}

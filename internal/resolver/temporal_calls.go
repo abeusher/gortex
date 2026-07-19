@@ -187,10 +187,15 @@ func temporalWrapperStubExists(g graph.Store, from, kind, name string) bool {
 //	extract the arg at the wrapper's param position, emit a new stub
 //
 // KEYWORDS — wrapper-following, temporal.stub, arg_names, single-level
-// resolveTemporalWrapperCalls returns the number of fresh wrapper-stub edges
-// it synthesised, so the caller can iterate the pass to a fixpoint and follow
-// multi-hop (depth>1) wrapper chains.
-func resolveTemporalWrapperCalls(g graph.Store) int {
+// resolveTemporalWrapperCalls returns the fresh wrapper-stub edges it
+// synthesised, so the caller can iterate the pass to a fixpoint and follow
+// multi-hop (depth>1) wrapper chains. When shared is set, seed carries the
+// stub edges to discover wrappers among (the census candidates plus the
+// stubs earlier iterations emitted) in place of this function's own
+// whole-stream decode; the caller scan that finds each wrapper's invokers
+// keeps its stream — it matches arbitrary call edges, not a via-tagged
+// subset — and runs only when a wrapper actually exists.
+func resolveTemporalWrapperCalls(g graph.Store, seed []*graph.Edge, shared bool) []*graph.Edge {
 	type wrapper struct {
 		id, kind, name string
 		pos            int
@@ -198,7 +203,11 @@ func resolveTemporalWrapperCalls(g graph.Store) int {
 	byID := map[string]wrapper{}
 	byName := map[string][]wrapper{}
 
-	for e := range g.EdgesByKind(graph.EdgeCalls) {
+	stubStream := g.EdgesByKind(graph.EdgeCalls)
+	if shared {
+		stubStream = frameworkEdgeSeq(seed)
+	}
+	for e := range stubStream {
 		if e == nil || e.Meta == nil || e.From == "" {
 			continue
 		}
@@ -232,7 +241,7 @@ func resolveTemporalWrapperCalls(g graph.Store) int {
 		}
 	}
 	if len(byID) == 0 {
-		return 0
+		return nil
 	}
 
 	type pending struct {
@@ -292,7 +301,7 @@ func resolveTemporalWrapperCalls(g graph.Store) int {
 		}
 	}
 
-	added := 0
+	var added []*graph.Edge
 	for _, p := range out {
 		if temporalWrapperStubExists(g, p.from, p.kind, p.name) {
 			continue
@@ -309,17 +318,29 @@ func resolveTemporalWrapperCalls(g graph.Store) int {
 		if p.fwdParam != "" {
 			meta["temporal_name_param"] = p.fwdParam
 		}
-		g.AddEdge(&graph.Edge{
+		stub := &graph.Edge{
 			From: p.from, To: temporalStubPlaceholder(p.kind, p.name),
 			Kind: graph.EdgeCalls, FilePath: p.file, Line: p.line,
 			Meta: meta,
-		})
-		added++
+		}
+		g.AddEdge(stub)
+		added = append(added, stub)
 	}
 	return added
 }
 
 func ResolveTemporalCalls(g graph.Store) int {
+	return resolveTemporalCalls(g, nil)
+}
+
+// resolveTemporalCalls is the census-multiplexed form of the pass: cands,
+// when non-nil, carries every temporal.* EdgeCalls edge and every temporal
+// annotation edge the shared full-census walk collected, replacing this
+// pass's own presence probe and per-phase whole-stream decodes. The wrapper
+// fixpoint's caller scan and the cross-language node sweeps keep their own
+// streams: the former discovers arbitrary callers of wrapper functions, the
+// latter must observe the temporal_role stamps this very run writes.
+func resolveTemporalCalls(g graph.Store, cands *frameworkPassCandidates) int {
 	if g == nil {
 		return 0
 	}
@@ -332,29 +353,37 @@ func ResolveTemporalCalls(g graph.Store) int {
 	// and previously still paid the fixpoint's own full calls-scans
 	// (measured 43.9s for nothing on a temporal-free 28-repo workspace).
 	// Break-on-first-hit keeps temporal-using workspaces at ~zero extra cost.
-	temporalPresent := false
-	for e := range g.EdgesByKind(graph.EdgeCalls) {
-		if e == nil || e.Meta == nil {
-			continue
+	// On the multiplexed path the census already answered the same two
+	// predicates: the collected buffers ARE the probe.
+	if cands != nil {
+		if len(cands.calls) == 0 && len(cands.annotated) == 0 {
+			return 0
 		}
-		if v, _ := e.Meta["via"].(string); strings.HasPrefix(v, "temporal.") {
-			temporalPresent = true
-			break
-		}
-	}
-	if !temporalPresent {
-		for e := range g.EdgesByKind(graph.EdgeAnnotated) {
-			if e == nil {
+	} else {
+		temporalPresent := false
+		for e := range g.EdgesByKind(graph.EdgeCalls) {
+			if e == nil || e.Meta == nil {
 				continue
 			}
-			if r, m := temporalRoleForJavaAnnotation(e.To); r != "" || m != "" {
+			if v, _ := e.Meta["via"].(string); strings.HasPrefix(v, "temporal.") {
 				temporalPresent = true
 				break
 			}
 		}
-	}
-	if !temporalPresent {
-		return 0
+		if !temporalPresent {
+			for e := range g.EdgesByKind(graph.EdgeAnnotated) {
+				if e == nil {
+					continue
+				}
+				if r, m := temporalRoleForJavaAnnotation(e.To); r != "" || m != "" {
+					temporalPresent = true
+					break
+				}
+			}
+		}
+		if !temporalPresent {
+			return 0
+		}
 	}
 	// Serialise against other graph-wide passes that mutate Node.Meta
 	// (markTestSymbolsAndEmitEdges, detectClonesAndEmitEdges,
@@ -376,16 +405,36 @@ func ResolveTemporalCalls(g graph.Store) int {
 	// idempotent (temporalWrapperStubExists guards re-emission), so it
 	// terminates once no fresh stub is added; the bound caps pathological
 	// chains.
+	// On the multiplexed path each phase re-reads the collected candidates
+	// in their CURRENT store form — one batched read per phase in place of
+	// one whole-stream decode per phase, with the same per-phase object
+	// isolation a fresh scan gives each backend.
+	shared := cands != nil
+	var wrapperSeed []*graph.Edge
+	if shared {
+		wrapperSeed = refetchFrameworkCandidates(g, cands.calls)
+	}
 	for i := 0; i < 16; i++ {
-		if resolveTemporalWrapperCalls(g) == 0 {
+		added := resolveTemporalWrapperCalls(g, wrapperSeed, shared)
+		if len(added) == 0 {
 			break
+		}
+		if shared {
+			// The next iteration discovers transitive wrappers among the
+			// stubs this one just emitted; grow the seed instead of
+			// re-scanning the stream for them.
+			wrapperSeed = append(wrapperSeed, added...)
 		}
 	}
 
 	// Executor-field pre-pass: rewrite struct-field dispatch stubs to the
 	// literal name supplied at the executor's construction site. Also runs
 	// before the sweep so the rewritten stubs resolve below.
-	resolveTemporalExecutorFields(g)
+	if shared {
+		resolveTemporalExecutorFields(g, refetchFrameworkCandidates(g, cands.calls), true)
+	} else {
+		resolveTemporalExecutorFields(g, nil, false)
+	}
 
 	// Single sweep over EdgeCalls — the largest edge class — collecting
 	// both the temporal.register edges (index inputs) and the
@@ -399,7 +448,23 @@ func ResolveTemporalCalls(g graph.Store) int {
 	var stubs []stubEdge
 	var registerEdges []*graph.Edge
 	fromIDSet := map[string]struct{}{}
-	for e := range g.EdgesByKind(graph.EdgeCalls) {
+	sweepStream := g.EdgesByKind(graph.EdgeCalls)
+	if shared {
+		// The census candidates plus this pass's own staged wrapper stubs
+		// are exactly the overlay a fresh stream walk would surface here.
+		sweep := refetchFrameworkCandidates(g, cands.calls)
+		if bs, ok := g.(*frameworkEdgeBatchStore); ok {
+			sweep = append(sweep, bs.stagedEdgesMatching(func(e *graph.Edge) bool {
+				if e.Kind != graph.EdgeCalls || e.Meta == nil {
+					return false
+				}
+				v, _ := e.Meta["via"].(string)
+				return strings.HasPrefix(v, "temporal.")
+			})...)
+		}
+		sweepStream = frameworkEdgeSeq(sweep)
+	}
+	for e := range sweepStream {
 		if e == nil || e.Meta == nil {
 			continue
 		}
@@ -424,16 +489,22 @@ func ResolveTemporalCalls(g graph.Store) int {
 		}
 	}
 
-	// Probe the (smaller) annotation class for Java temporal tags.
+	// Probe the (smaller) annotation class for Java temporal tags. The
+	// census walk already collected the matching edges on the multiplexed
+	// path; no pass mutates annotation edges, so they are used directly.
 	var annotatedEdges []*graph.Edge
-	for e := range g.EdgesByKind(graph.EdgeAnnotated) {
-		if e == nil {
-			continue
+	if shared {
+		annotatedEdges = cands.annotated
+	} else {
+		for e := range g.EdgesByKind(graph.EdgeAnnotated) {
+			if e == nil {
+				continue
+			}
+			if r, m := temporalRoleForJavaAnnotation(e.To); r == "" && m == "" {
+				continue
+			}
+			annotatedEdges = append(annotatedEdges, e)
 		}
-		if r, m := temporalRoleForJavaAnnotation(e.To); r == "" && m == "" {
-			continue
-		}
-		annotatedEdges = append(annotatedEdges, e)
 	}
 
 	// Early-out: a graph with no Temporal register / stub / annotation
@@ -444,7 +515,11 @@ func ResolveTemporalCalls(g graph.Store) int {
 		return 0
 	}
 
-	idx := buildTemporalIndex(g, registerEdges, annotatedEdges)
+	var snap *frameworkNodeSnapshot
+	if shared {
+		snap = cands.nodes
+	}
+	idx := buildTemporalIndex(g, registerEdges, annotatedEdges, snap)
 	resolved := 0
 	var reindexBatch []graph.EdgeReindex
 	fromList := make([]string, 0, len(fromIDSet))
@@ -666,7 +741,11 @@ func ResolveTemporalCalls(g graph.Store) int {
 	// last: it reads temporal_role / temporal_name meta stamped by the
 	// sweep above and the via=temporal.handler edges emitted by the Go
 	// extractor. Additive — graph.AddEdge dedupes.
-	resolveTemporalCrossLanguage(g)
+	if shared {
+		resolveTemporalCrossLanguage(g, refetchFrameworkCandidates(g, cands.calls), true)
+	} else {
+		resolveTemporalCrossLanguage(g, nil, false)
+	}
 	return resolved
 }
 
@@ -691,7 +770,13 @@ func temporalStubPlaceholder(kind, name string) string {
 // All edges carry cross_language=true and are emitted at the inferred
 // tier (the link is by string name across the type-system boundary).
 // graph.AddEdge dedupes → idempotent.
-func resolveTemporalCrossLanguage(g graph.Store) {
+//
+// When shared is set, sharedCalls carries the pass's temporal.* candidates
+// in their current form and replaces the temporal.handler stream decode.
+// The four node sweeps keep their own streams deliberately: they read the
+// temporal_role / temporal_name stamps THIS run's earlier phases wrote, and
+// a census-time snapshot predates those stamps on disk-backed stores.
+func resolveTemporalCrossLanguage(g graph.Store, sharedCalls []*graph.Edge, shared bool) {
 	// Go provider indexes, by name.
 	goWorkflow := map[string][]string{}
 	goSignalWf := map[string][]string{}
@@ -718,7 +803,11 @@ func resolveTemporalCrossLanguage(g graph.Store) {
 	for n := range g.NodesByKind(graph.KindMethod) {
 		addGoWorkflow(n)
 	}
-	for e := range g.EdgesByKind(graph.EdgeCalls) {
+	handlerStream := g.EdgesByKind(graph.EdgeCalls)
+	if shared {
+		handlerStream = frameworkEdgeSeq(sharedCalls)
+	}
+	for e := range handlerStream {
 		if e == nil || e.Meta == nil || e.From == "" {
 			continue
 		}
@@ -1047,7 +1136,10 @@ func (idx *temporalIndex) lookupExactSig(kind, name, callerRepo string) string {
 // collected by the single ResolveTemporalCalls sweep — passing them in
 // avoids re-scanning the (largest) EdgeCalls class and the EdgeAnnotated
 // class a second time.
-func buildTemporalIndex(g graph.Store, registerEdges, annotatedEdges []*graph.Edge) *temporalIndex {
+// A non-nil snap feeds the function / method sweep from the run-wide shared
+// node snapshot instead of this pass's own kind scans; the sweep reads only
+// names and extractor-stamped signature meta, which no synthesizer mutates.
+func buildTemporalIndex(g graph.Store, registerEdges, annotatedEdges []*graph.Edge, snap *frameworkNodeSnapshot) *temporalIndex {
 	idx := &temporalIndex{
 		byKindName: map[string][]*graph.Node{},
 		funcExact:  map[string][]*graph.Node{},
@@ -1094,10 +1186,10 @@ func buildTemporalIndex(g graph.Store, registerEdges, annotatedEdges []*graph.Ed
 		indexExactFunc(n)
 		indexConventionFunc(n)
 	}
-	for n := range g.NodesByKind(graph.KindFunction) {
+	for _, n := range frameworkKindNodes(g, snap, graph.KindFunction) {
 		indexFuncNode(n)
 	}
-	for n := range g.NodesByKind(graph.KindMethod) {
+	for _, n := range frameworkKindNodes(g, snap, graph.KindMethod) {
 		indexFuncNode(n)
 	}
 
@@ -1862,14 +1954,21 @@ func methodsOfJavaTypeFromIndex(t *graph.Node, methodsByReceiver map[string][]*g
 // recvType::field with conflicting construction-site literals is left
 // unresolved — same unique-or-nothing policy as the const-deref join.
 // KEYWORDS — temporal, executor-field, resolver
-func resolveTemporalExecutorFields(g graph.Store) {
+// When shared is set, sharedCalls carries the pass's temporal.* candidates
+// in their current form and replaces both phases' whole-stream decodes (the
+// two phases filter disjoint via tags, so one slice serves both).
+func resolveTemporalExecutorFields(g graph.Store, sharedCalls []*graph.Edge, shared bool) {
 	// Phase 1: collect the method-stub edges that read a receiver field,
 	// grouped by `recvType::field`.
 	type dispatch struct {
 		stubs []*graph.Edge
 	}
 	byField := map[string]*dispatch{}
-	for e := range g.EdgesByKind(graph.EdgeCalls) {
+	stubStream := g.EdgesByKind(graph.EdgeCalls)
+	if shared {
+		stubStream = frameworkEdgeSeq(sharedCalls)
+	}
+	for e := range stubStream {
 		if e == nil || e.Meta == nil {
 			continue
 		}
@@ -1899,7 +1998,11 @@ func resolveTemporalExecutorFields(g graph.Store) {
 	// values across construction sites is ambiguous and dropped.
 	valByField := map[string]string{}
 	ambiguous := map[string]struct{}{}
-	for e := range g.EdgesByKind(graph.EdgeCalls) {
+	markerStream := g.EdgesByKind(graph.EdgeCalls)
+	if shared {
+		markerStream = frameworkEdgeSeq(sharedCalls)
+	}
+	for e := range markerStream {
 		if e == nil || e.Meta == nil || e.From == "" {
 			continue
 		}
