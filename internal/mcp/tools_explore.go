@@ -3500,6 +3500,9 @@ func exploreQuotedRecallTerms(task string) []string {
 		if len(literal) < 2 || len(literal) > 128 || quotedLiteralIsNoise(literal) {
 			continue
 		}
+		if exploreTwoLetterQuotedAnchor(literal) && !exploreAllowsTwoLetterQuotedAnchor(task) {
+			continue
+		}
 		key := strings.ToLower(literal)
 		if _, duplicate := seen[key]; duplicate {
 			continue
@@ -3511,6 +3514,45 @@ func exploreQuotedRecallTerms(task string) []string {
 		}
 	}
 	return out
+}
+
+func exploreTwoLetterQuotedAnchor(literal string) bool {
+	if utf8.RuneCountInString(literal) != 2 {
+		return false
+	}
+	for _, r := range literal {
+		if !unicode.IsLetter(r) {
+			return false
+		}
+	}
+	return true
+}
+
+// exploreAllowsTwoLetterQuotedAnchor keeps exceptionally collision-prone
+// literals out of fallback source scans unless the request identifies them as
+// a culture, locale, language, registry, protocol, or configuration value.
+// This is task-class gating rather than a vocabulary of specific codes, so it
+// applies equally to future repositories and languages.
+func exploreAllowsTwoLetterQuotedAnchor(task string) bool {
+	lower := strings.ToLower(task)
+	for _, phrase := range []string{
+		"configuration key", "config key", "country code", "culture code",
+		"language code", "language tag", "locale code", "protocol code",
+		"region code", "status code",
+	} {
+		if strings.Contains(lower, phrase) {
+			return true
+		}
+	}
+	for _, token := range strings.FieldsFunc(lower, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '_'
+	}) {
+		switch token {
+		case "bcp47", "charset", "culture", "cultureinfo", "cultures", "currency", "encoding", "ietf", "iso", "locale", "locales", "register", "registered", "registering", "registration", "registrations", "registry":
+			return true
+		}
+	}
+	return false
 }
 
 func exploreQuotedRecallHasExactSourceCandidate(

@@ -10,6 +10,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/search/trigram"
 )
@@ -486,9 +487,24 @@ func (s *Server) mapExploreSourceLiteralMatchesContext(
 		}
 	}
 	indexes := s.buildFileSymbolIndexForOrderedPathsContext(ctx, orderedPaths)
-	seen := make(map[string]struct{}, len(matches))
-	hits := make([]exploreSourceLiteralHit, 0, len(matches))
-	ownerFiles := make(map[string]string, len(matches))
+	type mappedLiteralOwner struct {
+		owner    *graph.Node
+		match    trigram.Match
+		rank     int
+		callName string
+	}
+	mapped := make([]mappedLiteralOwner, 0, len(matches))
+	ownerIDs := make([]string, 0, len(matches))
+	seenOwners := make(map[string]struct{}, len(matches))
+	calleeIDs := make([]string, 0, len(matches))
+	seenCallees := make(map[string]struct{}, len(matches))
+	ownerEdges := make(map[string][]*graph.Edge)
+
+	// First map each exact line to its smallest enclosing declaration. When
+	// the literal is syntactically inside one call on that line, retain the
+	// call name as a conservative hint; graph edges remain authoritative.
+	// This parser is deliberately line-bounded, so multiline or otherwise
+	// uncertain shapes keep the enclosing declaration instead of guessing.
 	for rank, match := range matches {
 		if !exploreTextHasExactLiteral(match.Text, term) {
 			continue
@@ -500,15 +516,72 @@ func (s *Server) mapExploreSourceLiteralMatchesContext(
 		if index == nil {
 			continue
 		}
-		node := index.smallestEnclosing(match.Line)
-		if node == nil || node.ID == "" || !scope.ScopeAllows(node) {
+		owner := index.smallestEnclosing(match.Line)
+		if owner == nil || owner.ID == "" || !scope.ScopeAllows(owner) {
 			continue
+		}
+		callName, _ := exploreSourceLiteralCallName(match.Text, term)
+		mapped = append(mapped, mappedLiteralOwner{owner: owner, match: match, rank: rank, callName: callName})
+		if callName != "" {
+			if _, duplicate := seenOwners[owner.ID]; duplicate {
+				continue
+			}
+			seenOwners[owner.ID] = struct{}{}
+			ownerIDs = append(ownerIDs, owner.ID)
+		}
+	}
+
+	if len(ownerIDs) > 0 {
+		ownerEdges = s.graph.GetOutEdgesByNodeIDs(ownerIDs)
+		for _, item := range mapped {
+			if item.callName == "" {
+				continue
+			}
+			for _, edge := range ownerEdges[item.owner.ID] {
+				if edge == nil || edge.Kind != graph.EdgeCalls || edge.Line != item.match.Line || edge.To == "" {
+					continue
+				}
+				if _, duplicate := seenCallees[edge.To]; duplicate {
+					continue
+				}
+				seenCallees[edge.To] = struct{}{}
+				calleeIDs = append(calleeIDs, edge.To)
+			}
+		}
+	}
+	calleeNodes := map[string]*graph.Node{}
+	if len(calleeIDs) > 0 {
+		calleeNodes = s.graph.GetNodesByIDs(calleeIDs)
+	}
+
+	seen := make(map[string]struct{}, len(mapped))
+	hits := make([]exploreSourceLiteralHit, 0, len(matches))
+	ownerFiles := make(map[string]string, len(matches))
+	for _, item := range mapped {
+		node := item.owner
+		if item.callName != "" {
+			resolved := make(map[string]*graph.Node)
+			for _, edge := range ownerEdges[item.owner.ID] {
+				if edge == nil || edge.Kind != graph.EdgeCalls || edge.Line != item.match.Line {
+					continue
+				}
+				callee := calleeNodes[edge.To]
+				if !exploreSourceLiteralLocalCallee(item.owner, callee, item.callName, scope) {
+					continue
+				}
+				resolved[callee.ID] = callee
+			}
+			if len(resolved) == 1 {
+				for _, callee := range resolved {
+					node = callee
+				}
+			}
 		}
 		if _, duplicate := seen[node.ID]; duplicate {
 			continue
 		}
 		seen[node.ID] = struct{}{}
-		hits = append(hits, exploreSourceLiteralHit{nodeID: node.ID, rank: rank})
+		hits = append(hits, exploreSourceLiteralHit{nodeID: node.ID, rank: item.rank})
 		ownerFiles[node.ID] = node.FilePath
 	}
 	return exploreSourceLiteralRecall{
@@ -516,6 +589,152 @@ func (s *Server) mapExploreSourceLiteralMatchesContext(
 		ambiguous:  saturated || len(hits) > 1,
 		ownerFiles: ownerFiles,
 	}
+}
+
+type exploreSourceLiteralSpan struct {
+	start int
+	end   int
+}
+
+// exploreSourceLiteralCallName returns the one direct call containing every
+// exact quoted occurrence of term on a source line. It intentionally declines
+// multiline calls, assignments, control-flow parentheses, and lines where the
+// literal participates in multiple calls. Those shapes retain the enclosing
+// callable and never receive callee promotion.
+func exploreSourceLiteralCallName(line, term string) (string, bool) {
+	spans := exploreSourceLiteralQuotedSpans(line, term)
+	if len(spans) == 0 {
+		return "", false
+	}
+	pairs := exploreSourceLiteralParenPairs(line)
+	names := make(map[string]string, len(spans))
+	for _, span := range spans {
+		bestOpen := -1
+		for _, pair := range pairs {
+			if pair.start < span.start && pair.end > span.end && pair.start > bestOpen {
+				bestOpen = pair.start
+			}
+		}
+		if bestOpen < 0 {
+			return "", false
+		}
+		name := exploreSourceLiteralIdentifierBefore(line, bestOpen)
+		if name == "" || exploreSourceLiteralControlWord(name) {
+			return "", false
+		}
+		names[strings.ToLower(name)] = name
+	}
+	if len(names) != 1 {
+		return "", false
+	}
+	for _, name := range names {
+		return name, true
+	}
+	return "", false
+}
+
+func exploreSourceLiteralQuotedSpans(line, term string) []exploreSourceLiteralSpan {
+	spans := make([]exploreSourceLiteralSpan, 0, 1)
+	for index := 0; index < len(line); {
+		quote := line[index]
+		if quote != '\'' && quote != '"' && quote != '`' {
+			index++
+			continue
+		}
+		start := index
+		index++
+		contentStart := index
+		for index < len(line) {
+			if line[index] == '\\' {
+				index += 2
+				continue
+			}
+			if line[index] == quote {
+				if line[contentStart:index] == term {
+					spans = append(spans, exploreSourceLiteralSpan{start: start, end: index})
+				}
+				index++
+				break
+			}
+			index++
+		}
+	}
+	return spans
+}
+
+func exploreSourceLiteralParenPairs(line string) []exploreSourceLiteralSpan {
+	stack := make([]int, 0, 4)
+	pairs := make([]exploreSourceLiteralSpan, 0, 4)
+	for index := 0; index < len(line); index++ {
+		switch line[index] {
+		case '\'', '"', '`':
+			quote := line[index]
+			for index++; index < len(line); index++ {
+				if line[index] == '\\' {
+					index++
+					continue
+				}
+				if line[index] == quote {
+					break
+				}
+			}
+		case '(':
+			stack = append(stack, index)
+		case ')':
+			if len(stack) == 0 {
+				continue
+			}
+			open := stack[len(stack)-1]
+			stack = stack[:len(stack)-1]
+			pairs = append(pairs, exploreSourceLiteralSpan{start: open, end: index})
+		}
+	}
+	return pairs
+}
+
+func exploreSourceLiteralIdentifierBefore(line string, end int) string {
+	for end > 0 {
+		r, size := utf8.DecodeLastRuneInString(line[:end])
+		if !unicode.IsSpace(r) {
+			break
+		}
+		end -= size
+	}
+	start := end
+	for start > 0 {
+		r, size := utf8.DecodeLastRuneInString(line[:start])
+		if !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '_' && r != '$' {
+			break
+		}
+		start -= size
+	}
+	return line[start:end]
+}
+
+func exploreSourceLiteralControlWord(name string) bool {
+	switch strings.ToLower(name) {
+	case "catch", "do", "for", "foreach", "if", "match", "new", "return", "sizeof", "switch", "typeof", "while", "with":
+		return true
+	default:
+		return false
+	}
+}
+
+func exploreSourceLiteralLocalCallee(owner, callee *graph.Node, callName string, scope query.QueryOptions) bool {
+	if owner == nil || callee == nil || callee.ID == "" || callee.ID == owner.ID || callee.FilePath == "" || !scope.ScopeAllows(callee) {
+		return false
+	}
+	if callee.Kind != graph.KindFunction && callee.Kind != graph.KindMethod {
+		return false
+	}
+	if callee.RepoPrefix != owner.RepoPrefix {
+		return false
+	}
+	name := callee.Name
+	if separator := strings.LastIndexAny(name, ".:#/"); separator >= 0 {
+		name = name[separator+1:]
+	}
+	return strings.EqualFold(name, callName)
 }
 
 func exploreSourceLiteralSingleRepoPrefix(scope query.QueryOptions) string {

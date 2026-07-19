@@ -32,6 +32,15 @@ func TestExploreQuotedRecallTermsPreservesShortSignalAndDropsPatterns(t *testing
 	}
 }
 
+func TestExploreQuotedRecallTermsGatesTwoLetterAnchorsByIntent(t *testing.T) {
+	require.Equal(t, []string{"ku"}, exploreQuotedRecallTerms(`find where culture "ku" is registered`))
+	require.Equal(t, []string{"go"}, exploreQuotedRecallTerms(`find the language code "go" fallback`))
+	require.Empty(t, exploreQuotedRecallTerms(`fix wording around "ku" in this comment`))
+	require.Empty(t, exploreQuotedRecallTerms(`find a mention of "it"`))
+	require.Equal(t, []string{"tenant-code"}, exploreQuotedRecallTerms(`find "tenant-code"`),
+		"longer explicit literals must remain independent of the short-anchor gate")
+}
+
 func TestRerankExploreConceptCoveragePromotesConjunctiveImplementation(t *testing.T) {
 	generic := &rerank.Candidate{
 		Node:     &graph.Node{ID: "generic", Name: "validate", Kind: graph.KindVariable, FilePath: "config.go"},
@@ -235,7 +244,7 @@ func TestHandleExploreLocalizeReturnsBoundedEvidenceWhenConfidenceIsLow(t *testi
 	}}))
 	require.NoError(t, store.BuildContentIndex())
 
-	result, text := callExploreQuality(t, server, `find "ku" behavior`, true)
+	result, text := callExploreQuality(t, server, `find culture "ku" behavior`, true)
 
 	require.False(t, result.IsError, text)
 	var envelope localizationExploreEnvelope

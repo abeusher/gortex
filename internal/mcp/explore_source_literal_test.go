@@ -28,12 +28,24 @@ import (
 
 type exploreSourceLiteralCountingStore struct {
 	graph.Store
-	allNodesCalls int
+	allNodesCalls     int
+	outEdgeBatchCalls int
+	nodeLookupBatches int
 }
 
 func (s *exploreSourceLiteralCountingStore) AllNodes() []*graph.Node {
 	s.allNodesCalls++
 	return s.Store.AllNodes()
+}
+
+func (s *exploreSourceLiteralCountingStore) GetOutEdgesByNodeIDs(ids []string) map[string][]*graph.Edge {
+	s.outEdgeBatchCalls++
+	return s.Store.GetOutEdgesByNodeIDs(ids)
+}
+
+func (s *exploreSourceLiteralCountingStore) GetNodesByIDs(ids []string) map[string]*graph.Node {
+	s.nodeLookupBatches++
+	return s.Store.GetNodesByIDs(ids)
 }
 
 type exploreSourceLiteralBlockingStore struct {
@@ -66,6 +78,10 @@ func (s *exploreSourceLiteralOrderedStore) GetFileNodesContext(ctx context.Conte
 	return s.nodesByPath[path]
 }
 
+func (s *exploreSourceLiteralOrderedStore) GetOutEdgesByNodeIDs([]string) map[string][]*graph.Edge {
+	return nil
+}
+
 func newExploreSourceLiteralServer(t testing.TB, nodes []*graph.Node) *Server {
 	t.Helper()
 	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
@@ -75,12 +91,147 @@ func newExploreSourceLiteralServer(t testing.TB, nodes []*graph.Node) *Server {
 	return &Server{graph: store}
 }
 
+func newExploreSourceLiteralGraphServer(
+	t testing.TB,
+	nodes []*graph.Node,
+	edges []*graph.Edge,
+) (*Server, *exploreSourceLiteralCountingStore) {
+	t.Helper()
+	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	store.AddBatch(nodes, edges)
+	counting := &exploreSourceLiteralCountingStore{Store: store}
+	return &Server{graph: counting}, counting
+}
+
 func sourceLiteralNode(id, name, path string, kind graph.NodeKind, start, end int) *graph.Node {
 	return &graph.Node{
 		ID: id, Name: name, QualName: id, Kind: kind,
 		FilePath: path, RepoPrefix: "demo", Language: "csharp",
 		StartLine: start, EndLine: end,
 	}
+}
+
+func TestExploreSourceLiteralCallNameAcrossLanguages(t *testing.T) {
+	tests := []struct {
+		name string
+		line string
+		want string
+		ok   bool
+	}{
+		{name: "csharp", line: `RegisterDefaultFormatter("ku", formatter);`, want: "RegisterDefaultFormatter", ok: true},
+		{name: "rust", line: `register_default_formatter("ku", formatter);`, want: "register_default_formatter", ok: true},
+		{name: "typescript member", line: `registry.registerDefaultFormatter('ku', formatter);`, want: "registerDefaultFormatter", ok: true},
+		{name: "nested", line: `install(resolve("ku"));`, want: "resolve", ok: true},
+		{name: "assignment", line: `const locale = "ku";`},
+		{name: "control expression", line: `if (locale == "ku") { register(); }`},
+		{name: "ambiguous calls", line: `left("ku"); right("ku");`},
+		{name: "multiline is conservative", line: `RegisterDefaultFormatter(`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, ok := exploreSourceLiteralCallName(test.line, "ku")
+			require.Equal(t, test.ok, ok)
+			require.Equal(t, test.want, got)
+		})
+	}
+}
+
+func TestMapExploreSourceLiteralMatchesPromotesUniqueDirectCalleeAcrossLanguages(t *testing.T) {
+	tests := []struct {
+		name     string
+		language string
+		line     string
+		callee   string
+	}{
+		{name: "csharp", language: "csharp", line: `RegisterDefaultFormatter("ku");`, callee: "RegisterDefaultFormatter"},
+		{name: "rust", language: "rust", line: `register_default_formatter("ku");`, callee: "register_default_formatter"},
+		{name: "typescript", language: "typescript", line: `registry.registerDefaultFormatter('ku');`, callee: "registerDefaultFormatter"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := "demo/src/registry"
+			owner := sourceLiteralNode(path+"::configure", "configure", path, graph.KindMethod, 1, 5)
+			callee := sourceLiteralNode(path+"::"+test.callee, test.callee, path, graph.KindMethod, 7, 9)
+			owner.Language = test.language
+			callee.Language = test.language
+			server, counting := newExploreSourceLiteralGraphServer(t, []*graph.Node{owner, callee}, []*graph.Edge{{
+				From: owner.ID, To: callee.ID, Kind: graph.EdgeCalls, FilePath: path, Line: 3,
+			}})
+
+			recall := server.mapExploreSourceLiteralMatches("ku", []trigram.Match{{
+				Path: path, Line: 3, Text: test.line,
+			}}, query.QueryOptions{RepoAllow: map[string]bool{"demo": true}})
+
+			require.Equal(t, []exploreSourceLiteralHit{{nodeID: callee.ID, rank: 0}}, recall.hits)
+			require.Equal(t, callee.FilePath, recall.ownerFiles[callee.ID])
+			require.Zero(t, counting.allNodesCalls, "callee promotion must remain batch- and file-bounded")
+			require.Equal(t, 1, counting.outEdgeBatchCalls)
+			require.Equal(t, 1, counting.nodeLookupBatches)
+		})
+	}
+}
+
+func TestMapExploreSourceLiteralMatchesDoesNotPromoteAmbiguousCallee(t *testing.T) {
+	path := "demo/src/registry.cs"
+	owner := sourceLiteralNode(path+"::configure", "configure", path, graph.KindMethod, 1, 5)
+	first := sourceLiteralNode(path+"::register-string", "RegisterDefaultFormatter", path, graph.KindMethod, 7, 9)
+	second := sourceLiteralNode(path+"::register-provider", "RegisterDefaultFormatter", path, graph.KindMethod, 11, 13)
+	server, _ := newExploreSourceLiteralGraphServer(t, []*graph.Node{owner, first, second}, []*graph.Edge{
+		{From: owner.ID, To: first.ID, Kind: graph.EdgeCalls, FilePath: path, Line: 3},
+		{From: owner.ID, To: second.ID, Kind: graph.EdgeCalls, FilePath: path, Line: 3},
+	})
+
+	recall := server.mapExploreSourceLiteralMatches("ku", []trigram.Match{{
+		Path: path, Line: 3, Text: `RegisterDefaultFormatter("ku");`,
+	}}, query.QueryOptions{RepoAllow: map[string]bool{"demo": true}})
+
+	require.Equal(t, []exploreSourceLiteralHit{{nodeID: owner.ID, rank: 0}}, recall.hits)
+}
+
+func TestMapExploreSourceLiteralMatchesDoesNotPromoteAssignment(t *testing.T) {
+	path := "demo/src/registry.cs"
+	owner := sourceLiteralNode(path+"::configure", "configure", path, graph.KindMethod, 1, 5)
+	callee := sourceLiteralNode(path+"::register", "RegisterDefaultFormatter", path, graph.KindMethod, 7, 9)
+	server, counting := newExploreSourceLiteralGraphServer(t, []*graph.Node{owner, callee}, []*graph.Edge{{
+		From: owner.ID, To: callee.ID, Kind: graph.EdgeCalls, FilePath: path, Line: 3,
+	}})
+
+	recall := server.mapExploreSourceLiteralMatches("ku", []trigram.Match{{
+		Path: path, Line: 3, Text: `const locale = "ku";`,
+	}}, query.QueryOptions{RepoAllow: map[string]bool{"demo": true}})
+
+	require.Equal(t, []exploreSourceLiteralHit{{nodeID: owner.ID, rank: 0}}, recall.hits,
+		"an unrelated same-line edge must not turn an assignment into a callsite")
+	require.Zero(t, counting.outEdgeBatchCalls, "non-call literal hits must not query graph adjacency")
+	require.Zero(t, counting.nodeLookupBatches, "non-call literal hits must not query callee nodes")
+}
+
+func TestExploreSourceLiteralLocalCalleeRejectsCrossRepositoryTarget(t *testing.T) {
+	owner := sourceLiteralNode("demo/registry.cs::configure", "configure", "demo/registry.cs", graph.KindMethod, 1, 5)
+	callee := sourceLiteralNode("other/registry.cs::register", "RegisterDefaultFormatter", "other/registry.cs", graph.KindMethod, 7, 9)
+	callee.RepoPrefix = "other"
+	require.False(t, exploreSourceLiteralLocalCallee(owner, callee, "RegisterDefaultFormatter", query.QueryOptions{}))
+}
+
+func TestSourceLiteralCalleeRemainsAuthorizedForRefinement(t *testing.T) {
+	task := `find where culture "ku" is registered`
+	owner := sourceLiteralNode("demo/registry.cs::configure", "configure", "demo/registry.cs", graph.KindMethod, 1, 5)
+	callee := sourceLiteralNode("demo/registry.cs::RegisterDefaultFormatter", "RegisterDefaultFormatter", "demo/registry.cs", graph.KindMethod, 7, 10)
+	targets := []exploreTarget{
+		{node: owner, source: `void configure() { ... }`},
+		{node: callee, source: `void RegisterDefaultFormatter(string culture) { ... }`, sourceLiteral: true},
+	}
+	preferred := explorePreferredRefinementSymbol(task, targets)
+	require.Equal(t, callee.ID, preferred)
+
+	_, completion, _, _ := buildLocalizationRefinementResultForTask(
+		preferred, task, targets, exploreDefaultBudgetTokens, exploreLocalizationRefinementRoutes(targets),
+	)
+	require.Equal(t, localizationStateNeedsRefinement, completion.State)
+	require.Contains(t, completion.AllowedSymbols, callee.ID)
+	require.Contains(t, completion.RequiredAction, callee.ID)
 }
 
 func TestMapExploreSourceLiteralMatchesFindsCSharpConstructor(t *testing.T) {
@@ -605,7 +756,7 @@ func TestGatherExploreSourceLiteralRecallMapsParsedCSharpConstructor(t *testing.
 	rel := "src/Humanizer/Configuration/FormatterRegistry.cs"
 	path := filepath.Join(root, filepath.FromSlash(rel))
 	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
-	require.NoError(t, os.WriteFile(path, []byte("public sealed class FormatterRegistry {\n    public FormatterRegistry() {\n        RegisterDefaultFormatter(\"ku\");\n    }\n}\n"), 0o644))
+	require.NoError(t, os.WriteFile(path, []byte("public sealed class FormatterRegistry {\n    public FormatterRegistry() {\n        RegisterDefaultFormatter(\"ku\");\n    }\n\n    private void RegisterDefaultFormatter(string culture) {\n    }\n}\n"), 0o644))
 
 	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
 	require.NoError(t, err)
@@ -615,6 +766,10 @@ func TestGatherExploreSourceLiteralRecallMapsParsedCSharpConstructor(t *testing.
 	idx := indexer.New(store, registry, config.IndexConfig{}, zap.NewNop())
 	_, err = idx.IndexCtx(context.Background(), root)
 	require.NoError(t, err)
+	constructors := store.FindNodesByName("FormatterRegistry.<init>")
+	callees := store.FindNodesByName("RegisterDefaultFormatter")
+	require.NotEmpty(t, constructors)
+	require.NotEmpty(t, callees)
 	counting := &exploreSourceLiteralCountingStore{Store: store}
 	server := &Server{graph: counting, indexer: idx, logger: zap.NewNop()}
 
@@ -625,11 +780,11 @@ func TestGatherExploreSourceLiteralRecallMapsParsedCSharpConstructor(t *testing.
 	found := false
 	for _, hit := range recall.hits {
 		node := store.GetNode(hit.nodeID)
-		if node != nil && node.FilePath == rel && node.Name == "FormatterRegistry.<init>" {
+		if node != nil && node.FilePath == rel && node.Name == "RegisterDefaultFormatter" {
 			found = true
 		}
 	}
-	require.True(t, found, "literal line must map to the parsed enclosing constructor")
+	require.True(t, found, "literal callsite must promote the uniquely resolved invoked method")
 
 	task := `CultureNotFoundException for "ku" culture - code adds/uses "ku" (Kurdish) CultureInfo which is not supported on Xamarin.Android, causing crash. Find where "ku" culture is registered/used in fallback resolution logic.`
 	require.NotEqual(t, rerank.QueryClassConcept, rerank.ClassifyQuery(shapeExploreQuery(task)), "regression requires the non-concept retrieval branch")
@@ -648,8 +803,9 @@ func TestGatherExploreSourceLiteralRecallMapsParsedCSharpConstructor(t *testing.
 	var envelope localizationExploreEnvelope
 	require.NoError(t, json.Unmarshal([]byte(text.Text), &envelope))
 	require.NotEmpty(t, envelope.Evidence)
-	require.Equal(t, "FormatterRegistry.<init>", envelope.Evidence[0].Name, "source evidence must lead the final localization envelope")
+	require.Equal(t, "RegisterDefaultFormatter", envelope.Evidence[0].Name, "invoked source evidence must lead the final localization envelope")
 	if envelope.Completion.State == localizationStateNeedsRefinement {
+		require.Contains(t, envelope.Completion.AllowedSymbols, callees[0].ID)
 		require.Contains(t, envelope.Completion.RequiredAction, envelope.Evidence[0].ID)
 	}
 	require.Zero(t, counting.allNodesCalls, "literal mapping must stay bounded to matched files")
