@@ -2,8 +2,6 @@ package mcp
 
 import (
 	"encoding/json"
-	"fmt"
-	"strings"
 
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
 )
@@ -11,10 +9,10 @@ import (
 // Terminal evidence retention.
 //
 // The localize handler builds a byte-budgeted evidence envelope once and
-// retains a compact projection for post-terminal calls. Replaying that evidence
-// as a successful result keeps non-adapted hosts out of error-recovery loops,
-// but the model-visible response must remain evidence rather than masquerade as
-// a prewritten answer.
+// retains a compact projection for host-side fallback and diagnostics. A
+// post-terminal tool call does not replay that projection: the original
+// localization response already supplied it, and repeating it consumed turns
+// and tokens while encouraging further navigation.
 
 const (
 	// localizationDigestMaxBytes bounds retained session state independently of
@@ -25,10 +23,10 @@ const (
 	// Five keeps the promoted structural/literal candidates reserved by the
 	// envelope builder while bounding repeat-turn cost.
 	localizationReplayEvidenceLimit = 5
-	// localizationHostFallbackMetaKey is deliberately carried in MCP _meta,
-	// which is available to an adapting host without duplicating a prewritten
-	// answer in model-visible TextContent or structuredContent.
-	localizationHostFallbackMetaKey = "gortex/localization-fallback"
+	// This canonical envelope is deliberately carried in MCP _meta. Adapting
+	// hosts may render its ordered evidence deterministically without exposing
+	// retained rows to model-visible text or structuredContent.
+	localizationHostMetaKey = "gortex/localization"
 )
 
 // localizationEvidenceDigest is the compact, session-retained projection of
@@ -149,85 +147,46 @@ func rebuildLocalizationDigestSkeleton(digest *localizationEvidenceDigest) {
 	}
 }
 
-const localizationReplayNotice = "The completed localization retained the ranked candidates below. " +
-	"Additional navigation repeats this evidence. Use the strongest supported rows when composing the final " +
-	"file-and-symbol answer; candidate presence alone does not prove a change target."
+const localizationAnswerReadyNotice = "Localization is complete. Do not call another tool. " +
+	"Answer the user now in your own words using the evidence already returned."
 
-// renderLocalizationReplayEvidence is model-visible. It presents provenance
-// and ranking without claiming every candidate is a target or asking the model
-// to repeat a prewritten answer.
-func renderLocalizationReplayEvidence(digest *localizationEvidenceDigest) string {
-	var b strings.Builder
-	b.WriteString(localizationReplayNotice)
-	if digest == nil || len(digest.Evidence) == 0 {
-		b.WriteString("\nNo retained candidate rows are available; use the original localization result.")
-		return b.String()
-	}
-	for index, row := range digest.Evidence {
-		rank := row.Rank
-		if rank <= 0 {
-			rank = index + 1
-		}
-		fmt.Fprintf(&b, "\n%d. %s:%d — %s", rank, row.File, row.Line, row.ID)
-		if row.Signature != "" {
-			fmt.Fprintf(&b, " (%s)", row.Signature)
-		}
-		if len(row.Callers) > 0 || len(row.Callees) > 0 {
-			fmt.Fprintf(&b, " [graph: %d caller(s), %d callee(s)]", len(row.Callers), len(row.Callees))
-		}
-	}
-	return b.String()
+// localizationHostEnvelope stores each retained row exactly once. Hosts render
+// the ordered rows with fallback_format; no prewritten answer or duplicate row
+// string crosses the wire.
+type localizationHostEnvelope struct {
+	Version        int                         `json:"version"`
+	FallbackFormat string                      `json:"fallback_format"`
+	Evidence       *localizationEvidenceDigest `json:"evidence"`
 }
 
-// buildLocalizationHostFallback provides a deterministic compact summary for
-// hosts that explicitly implement a no-inference fallback. It stays in MCP
-// _meta and is never concatenated into model-visible tool content.
-func buildLocalizationHostFallback(digest *localizationEvidenceDigest) string {
-	var b strings.Builder
-	b.WriteString("Localization candidates:\n")
-	if digest == nil || len(digest.Evidence) == 0 {
-		b.WriteString("- no retained candidate evidence")
-		return b.String()
+func attachLocalizationHostEnvelope(result *mcpgo.CallToolResult, digest *localizationEvidenceDigest) *mcpgo.CallToolResult {
+	if result == nil || digest == nil {
+		return result
 	}
-	for _, row := range digest.Evidence {
-		fmt.Fprintf(&b, "- %s:%d — %s", row.File, row.Line, row.ID)
-		if row.Signature != "" {
-			fmt.Fprintf(&b, " (%s)", row.Signature)
-		}
-		b.WriteByte('\n')
+	if result.Meta == nil {
+		result.Meta = &mcpgo.Meta{}
 	}
-	return strings.TrimRight(b.String(), "\n")
-}
-
-// answerReadyDirective returns a neutral evidence reminder for a post-terminal
-// READ. Reads remain executable because starving them produced empty finals;
-// the appended note makes the completion boundary explicit without presenting
-// an injected-looking answer script.
-func (s *localizationTerminalState) answerReadyDirective() (string, bool) {
-	if s == nil {
-		return "", false
+	if result.Meta.AdditionalFields == nil {
+		result.Meta.AdditionalFields = make(map[string]any)
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.state != localizationStateAnswerReady || s.digest == nil {
-		return "", false
+	result.Meta.AdditionalFields[localizationHostMetaKey] = localizationHostEnvelope{
+		Version:        1,
+		FallbackFormat: "{file}:{line} — {id} ({signature})",
+		Evidence:       digest,
 	}
-	return renderLocalizationReplayEvidence(s.digest), true
-}
-
-// localizationEvidenceReplayResult is the successful, idempotent response to
-// post-terminal navigation. Model-visible text contains neutral ranked evidence;
-// structuredContent carries the machine-readable completion and digest; an
-// adapting host can use the deterministic fallback from _meta.
-func localizationEvidenceReplayResult(completion localizationCompletion, digest *localizationEvidenceDigest) *mcpgo.CallToolResult {
-	result := mcpgo.NewToolResultText(renderLocalizationReplayEvidence(digest))
-	result.StructuredContent = map[string]any{
-		"completion":      completion,
-		"replay":          true,
-		"evidence_digest": digest,
-	}
-	result.Meta = mcpgo.NewMetaFromMap(map[string]any{
-		localizationHostFallbackMetaKey: buildLocalizationHostFallback(digest),
-	})
 	return result
+}
+
+// localizationAnswerReadyResult is deliberately successful, answer-neutral,
+// and constant-size. An error invites tool-recovery loops; replaying retained
+// evidence invites more analysis. The completion contract is sufficient for
+// hosts, while the imperative text reliably steers non-adapted models to a
+// final answer without supplying a prewritten one.
+func localizationAnswerReadyResult(completion localizationCompletion) *mcpgo.CallToolResult {
+	result := mcpgo.NewToolResultText(localizationAnswerReadyNotice)
+	result.StructuredContent = map[string]any{
+		"completion": completion,
+		"terminal":   true,
+	}
+	return attachLocalizationHostEnvelope(result, completion.digest)
 }

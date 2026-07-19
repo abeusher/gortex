@@ -7,7 +7,7 @@ import (
 
 func TestLocalizationRefinementRequiredActionNamesFacadeReadSelector(t *testing.T) {
 	const symbol = "repo/pkg/file.go::Resolver.Run"
-	const want = `Call Gortex MCP read(operation:"source", target:{symbol:"repo/pkg/file.go::Resolver.Run"}); do not call a host file-read tool.`
+	const want = `Call Gortex MCP read(operation:"source", target:{symbol:"repo/pkg/file.go::Resolver.Run"}); do not call a host file-read tool. The named symbol is recommended; one source read of any returned candidate symbol is permitted.`
 	completion := newLocalizationRefinementCompletion(symbol)
 	if got := completion.RequiredAction; got != want {
 		t.Fatalf("refinement action = %q, want %q", got, want)

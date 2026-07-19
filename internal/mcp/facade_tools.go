@@ -108,7 +108,7 @@ func facadeToolDefinitionWithOperations(name string, operations []string) mcpgo.
 			mcpgo.WithString("task", mcpgo.Description("Task, bug, or question to localize.")),
 			mcpgo.WithString("path"),
 			mcpgo.WithObject("options",
-				mcpgo.Description("Set new_user_task=true only on the first localize call caused by a new user request. Never set it to retry, paraphrase, or continue the current request."),
+				mcpgo.Description("Set new_user_task=true only on the first explore call (task or localize) caused by a new user request. Never set it to retry, paraphrase, or continue the current request."),
 				mcpgo.AdditionalProperties(true),
 			),
 			output,
@@ -282,12 +282,11 @@ func (s *Server) wrapLegacyFacade(name string, raw server.ToolHandlerFunc) serve
 
 // decorateLocalizationReadResult makes the successful refinement read
 // self-terminal. JSON object results retain their public shape with one added
-// completion field; text results receive the same compact JSON contract as a
-// final block. Hosts therefore need no blocked follow-up call to discover that
-// localization is complete.
+// completion field; text results receive the same compact JSON contract in one
+// text block. Existing content blocks, structured payloads, annotations, and
+// metadata remain intact.
 func decorateLocalizationReadResult(result *mcpgo.CallToolResult, completion localizationCompletion) *mcpgo.CallToolResult {
-	body, ok := singleTextContent(result)
-	if !ok {
+	if result == nil || result.IsError {
 		return result
 	}
 	contract, err := json.Marshal(struct {
@@ -296,15 +295,91 @@ func decorateLocalizationReadResult(result *mcpgo.CallToolResult, completion loc
 	if err != nil {
 		return result
 	}
-	trimmed := strings.TrimSpace(body)
-	if len(trimmed) >= 2 && trimmed[0] == '{' && trimmed[len(trimmed)-1] == '}' && json.Valid([]byte(trimmed)) {
-		if trimmed == "{}" {
-			return rebuildTextResult(result, string(contract))
+	decorateBody := func(body string) string {
+		trimmed := strings.TrimSpace(body)
+		if len(trimmed) >= 2 && trimmed[0] == '{' && trimmed[len(trimmed)-1] == '}' && json.Valid([]byte(trimmed)) {
+			payload := make(map[string]json.RawMessage)
+			if err := json.Unmarshal([]byte(trimmed), &payload); err == nil {
+				encodedCompletion, marshalErr := json.Marshal(completion)
+				if marshalErr == nil {
+					payload["completion"] = encodedCompletion
+					if merged, marshalErr := json.Marshal(payload); marshalErr == nil {
+						return string(merged)
+					}
+				}
+			}
 		}
-		merged := trimmed[:len(trimmed)-1] + "," + string(contract[1:])
-		return rebuildTextResult(result, merged)
+		return body + "\n\n" + string(contract)
 	}
-	return rebuildTextResult(result, body+"\n\n"+string(contract))
+	decoratedText := false
+	for index, content := range result.Content {
+		text, ok := mcpgo.AsTextContent(content)
+		if !ok {
+			continue
+		}
+		text.Text = decorateBody(text.Text)
+		result.Content[index] = *text
+		decoratedText = true
+		break
+	}
+	if !decoratedText {
+		result.Content = append(result.Content, mcpgo.NewTextContent(string(contract)))
+	}
+	switch payload := result.StructuredContent.(type) {
+	case nil:
+		result.StructuredContent = map[string]any{"completion": completion}
+	case map[string]any:
+		decorated := make(map[string]any, len(payload)+1)
+		for key, value := range payload {
+			decorated[key] = value
+		}
+		decorated["completion"] = completion
+		result.StructuredContent = decorated
+	default:
+		result.StructuredContent = map[string]any{
+			"payload":    payload,
+			"completion": completion,
+		}
+	}
+	return attachLocalizationHostEnvelope(result, completion.digest)
+}
+
+func parseLocalizationNewUserBoundary(facade, operation string, arguments map[string]any) (bool, *mcpgo.CallToolResult) {
+	rawOptions, present := arguments["options"]
+	if !present || rawOptions == nil {
+		return false, nil
+	}
+	options, ok := rawOptions.(map[string]any)
+	if !ok {
+		if facade != "explore" || (operation != "task" && operation != "localize") {
+			return false, nil
+		}
+		return false, NewStructuredErrorResult(StructuredError{
+			ErrorCode: ErrCodeInvalidArgument,
+			Message:   "options must be an object",
+			Data:      map[string]any{"field": "options", "operation": operation},
+		})
+	}
+	rawBoundary, present := options["new_user_task"]
+	if !present {
+		return false, nil
+	}
+	boundary, ok := rawBoundary.(bool)
+	if !ok {
+		return false, NewStructuredErrorResult(StructuredError{
+			ErrorCode: ErrCodeInvalidArgument,
+			Message:   "options.new_user_task must be a boolean",
+			Data:      map[string]any{"field": "options.new_user_task", "operation": operation},
+		})
+	}
+	if facade != "explore" || (operation != "task" && operation != "localize") {
+		return false, NewStructuredErrorResult(StructuredError{
+			ErrorCode: ErrCodeInvalidArgument,
+			Message:   "options.new_user_task is valid only on the first explore.task or explore.localize call of a new user request",
+			Data:      map[string]any{"field": "options.new_user_task", "facade": facade, "operation": operation},
+		})
+	}
+	return boundary, nil
 }
 
 func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
@@ -315,11 +390,38 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 		if operation == "" {
 			operation = "help"
 		}
-		if analyzeKindRequiresAdmin(operation) {
-			result := blockedAnalyzeKindResult(operation)
-			s.recordFacadeTelemetry("analyze", operation, facadeOutcomeBlocked, time.Since(started))
-			return result, nil
+	}
+	if operation == "" {
+		operation = inferFacadeOperation(facade, req.GetArguments())
+	}
+	if operation == "" {
+		operation = defaultFacadeOperation(facade)
+	}
+	if facade == "read" {
+		operation = normalizeFacadeReadOperation(operation, req.GetArguments())
+	}
+	terminal := s.localizationFor(ctx)
+	freshLocalizeFlow := facade == "explore" && operation == "localize"
+	newUserTask, invalidBoundary := parseLocalizationNewUserBoundary(facade, operation, req.GetArguments())
+	if invalidBoundary != nil {
+		s.recordFacadeTelemetry(facade, operation, facadeOutcomeInvalidArgument, time.Since(started))
+		return invalidBoundary, nil
+	}
+	newUserExploreFlow := facade == "explore" && newUserTask && (operation == "task" || operation == "localize")
+	// Parse enough of an explicit new-task boundary to validate it, then apply
+	// the cheap terminal gate before operation lookup, shorthand resolution,
+	// overlay construction, and legacy dispatch. Non-navigation facades never
+	// enter this gate.
+	if !newUserExploreFlow {
+		if blocked := terminal.interceptAnswerReady(facade); blocked != nil {
+			s.recordFacadeTelemetry(facade, operation, facadeOutcomeBlocked, time.Since(started))
+			return blocked, nil
 		}
+	}
+	if facade == "analyze" && analyzeKindRequiresAdmin(operation) {
+		result := blockedAnalyzeKindResult(operation)
+		s.recordFacadeTelemetry("analyze", operation, facadeOutcomeBlocked, time.Since(started))
+		return result, nil
 	}
 	if facade == "session" && (operation == "subscribe" || operation == "unsubscribe") {
 		channel := normalizeFacadeOperation(req.GetString("channel", ""))
@@ -335,15 +437,6 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 			return result, nil
 		}
 		operation += "_" + channel
-	}
-	if operation == "" {
-		operation = inferFacadeOperation(facade, req.GetArguments())
-	}
-	if operation == "" {
-		operation = defaultFacadeOperation(facade)
-	}
-	if facade == "read" {
-		operation = normalizeFacadeReadOperation(operation, req.GetArguments())
 	}
 	var spec facadeOperationSpec
 	var ok bool
@@ -372,24 +465,22 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 		s.recordFacadeTelemetry(facade, operation, facadeOutcomeInvalidArgument, time.Since(started))
 		return invalid, nil
 	}
-	terminal := s.localizationFor(ctx)
-	// An explicit localization request starts a transactional reservation. The
-	// first localization in an inactive session needs no boundary flag. Once a
-	// contract exists, only the first localize call caused by a new user request
-	// may set options.new_user_task=true; task text never implies a boundary.
-	freshLocalizeFlow := facade == "explore" && operation == "localize"
+	// Every localize call and an explicit new-user task call starts a
+	// transactional reservation. Task text never implies a boundary. A task
+	// boundary stages inactive navigation so later diagnosis calls are admitted
+	// only after the first explore call succeeds.
+	transactionalExploreFlow := freshLocalizeFlow || newUserExploreFlow
 	localizeReservation := uint64(0)
 	localizeFinished := false
-	if freshLocalizeFlow {
-		newUserTask := false
-		if options, ok := req.GetArguments()["options"].(map[string]any); ok {
-			newUserTask, _ = options["new_user_task"].(bool)
-		}
+	if transactionalExploreFlow {
 		var blocked *mcpgo.CallToolResult
 		localizeReservation, blocked = terminal.beginLocalize(req.GetString("task", ""), newUserTask)
 		if blocked != nil {
 			s.recordFacadeTelemetry(facade, operation, facadeOutcomeBlocked, time.Since(started))
 			return blocked, nil
+		}
+		if !freshLocalizeFlow {
+			terminal.keepOpenForTask(req.GetString("task", ""))
 		}
 	}
 	localizationReadReserved := false
@@ -403,7 +494,7 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 			terminal.finishLocalize(localizeReservation, false)
 		}
 	}()
-	if !freshLocalizeFlow {
+	if !transactionalExploreFlow {
 		blocked, reserved := terminal.authorize(facade, operation, req.GetArguments())
 		if blocked != nil {
 			s.recordFacadeTelemetry(facade, operation, facadeOutcomeBlocked, time.Since(started))
@@ -416,18 +507,10 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 	if localizationReadReserved {
 		localizationReadSucceeded = succeeded
 		if succeeded {
-			result = decorateLocalizationReadResult(result, newLocalizationCompletion(true, ""))
+			result = decorateLocalizationReadResult(result, terminal.answerReadyCompletion())
 		}
 	}
-	// A read executed after answer_ready carries the answer-now directive:
-	// the read may sharpen the retained answer, but the host must not
-	// mistake it for permission to keep navigating.
-	if succeeded && facade == "read" && !localizationReadReserved {
-		if note, ok := terminal.answerReadyDirective(); ok {
-			result.Content = append(result.Content, mcpgo.NewTextContent(note))
-		}
-	}
-	if freshLocalizeFlow {
+	if transactionalExploreFlow {
 		terminal.finishLocalize(localizeReservation, succeeded)
 		localizeFinished = true
 	}
@@ -1704,7 +1787,7 @@ func (s *Server) facadeCapability(spec facadeOperationSpec, includeSchema bool) 
 	}
 	if available {
 		if spec.Facade == "explore" && spec.Operation == "localize" {
-			out["summary"] = "Locate files and symbols, then stop navigation and answer from the returned evidence. Set options.new_user_task=true only on the first localize call caused by a new user request; never use it to retry or continue the current request."
+			out["summary"] = "Locate files and symbols, then stop navigation and answer from the returned evidence. Set options.new_user_task=true only on the first explore call (task or localize) caused by a new user request; never use it to retry or continue the current request."
 		} else if spec.Facade == "explore" && spec.Operation == "task" {
 			out["summary"] = "Gather a nonterminal neighborhood for diagnosis or implementation that will continue."
 		} else if spec.Facade == "analyze" && spec.Operation == "help" {

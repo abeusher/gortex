@@ -36,9 +36,9 @@ type localizationCompletion struct {
 	refinementSymbol  string
 	refinementSymbols []string
 
-	// digest is the retained evidence projection for this contract, carried
-	// session-only so a post-terminal navigation call can replay the answer
-	// instead of refusing it (see localization_digest.go). It rides the
+	// digest is the bounded evidence projection carried session-only through
+	// reservation staging (see localization_digest.go). Post-terminal results
+	// expose it only through host-only MCP _meta. It rides the
 	// completion through reservation staging into commitLocalizationLocked,
 	// which covers the direct-arm and facade finishLocalize paths alike.
 	digest *localizationEvidenceDigest
@@ -69,17 +69,18 @@ func newLocalizationCompletion(answerReady bool, exactSymbol string) localizatio
 func newLocalizationRefinementCompletion(preferredSymbol string) localizationCompletion {
 	preferredSymbol = strings.TrimSpace(preferredSymbol)
 	return localizationCompletion{
-		State:            localizationStateNeedsRefinement,
-		Scope:            "localization",
-		RequiredAction:   fmt.Sprintf(localizationRefinementRequiredActionFormat, preferredSymbol),
+		State: localizationStateNeedsRefinement,
+		Scope: "localization",
+		RequiredAction: fmt.Sprintf(localizationRefinementRequiredActionFormat, preferredSymbol) +
+			" The named symbol is recommended; one source read of any returned candidate symbol is permitted.",
 		AllowedToolCalls: 1,
 		refinementSymbol: preferredSymbol,
 	}
 }
 
-// localizationTerminalState is intentionally session-local. It never affects
-// mutation, analysis, workspace, or memory tools; it only prevents an agent
-// from reopening localization after an explicit localization-only request.
+// localizationTerminalState is intentionally session-local. It bounds only
+// localization navigation; mutation, workspace, session, memory, and
+// capability tools remain usable after answer_ready and across later work.
 type localizationTerminalState struct {
 	mu                sync.Mutex
 	state             string
@@ -206,23 +207,51 @@ func (s *localizationTerminalState) commitLocalizationLocked(completion localiza
 }
 
 func (s *localizationTerminalState) completionLocked() localizationCompletion {
+	var completion localizationCompletion
 	switch s.state {
 	case localizationStateNeedsRefinement, localizationStateRefineInFlight:
-		completion := newLocalizationRefinementCompletion(s.refinementSymbol)
+		completion = newLocalizationRefinementCompletion(s.refinementSymbol)
 		if s.state == localizationStateRefineInFlight {
 			completion.State = localizationStateRefineInFlight
 			completion.AllowedToolCalls = 0
 		}
-		return completion
 	case localizationStateNeedsExactRead, localizationStateExactReadInFlight:
-		return newLocalizationCompletion(false, s.exactSymbol)
+		completion = newLocalizationCompletion(false, s.exactSymbol)
 	default:
-		return newLocalizationCompletion(true, "")
+		completion = newLocalizationCompletion(true, "")
 	}
+	completion.digest = s.digest
+	return completion
+}
+
+func (s *localizationTerminalState) answerReadyCompletion() localizationCompletion {
+	completion := newLocalizationCompletion(true, "")
+	if s == nil {
+		return completion
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	completion.digest = s.digest
+	return completion
+}
+
+// interceptAnswerReady is the cheap pre-validation gate used by facade
+// dispatch. It makes localization terminality independent of operation
+// validity while deliberately leaving non-navigation facades untouched.
+func (s *localizationTerminalState) interceptAnswerReady(facade string) *mcpgo.CallToolResult {
+	if s == nil || !localizationNavigationFacade(facade) {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state != localizationStateAnswerReady {
+		return nil
+	}
+	return localizationAnswerReadyResult(s.completionLocked())
 }
 
 func (s *localizationTerminalState) refinementAllowsLocked(symbol string) bool {
-	if symbol == "" || (s.refinementSymbol != "" && symbol != s.refinementSymbol) {
+	if symbol == "" {
 		return false
 	}
 	for _, candidate := range s.refinementSymbols {
@@ -235,8 +264,9 @@ func (s *localizationTerminalState) refinementAllowsLocked(symbol string) bool {
 
 // beginLocalize reserves the only localization handler slot for this session.
 // An inactive session admits its first localization without a boundary flag.
-// Once a contract exists, only the first localize call for a genuinely new user
-// request may cross it, and the caller must say so explicitly. The old contract
+// Once a contract exists, only the first explore call for a genuinely new user
+// request may cross it, and the caller must say so explicitly. Localize stages
+// its returned completion; task stages inactive navigation. The old contract
 // remains live until finishLocalize commits the successful replacement.
 func (s *localizationTerminalState) beginLocalize(task string, newUserTask bool) (uint64, *mcpgo.CallToolResult) {
 	if s == nil {
@@ -253,11 +283,12 @@ func (s *localizationTerminalState) beginLocalize(task string, newUserTask bool)
 	}
 	if s.state != localizationStateInactive && !newUserTask {
 		completion := s.completionLocked()
-		// A repeat localize against a terminal contract gets the same
-		// successful evidence replay as any other post-terminal navigation:
-		// re-localizing hosts want the evidence again, not error recovery.
-		if s.state == localizationStateAnswerReady && s.digest != nil {
-			return 0, localizationEvidenceReplayResult(completion, s.digest)
+		// A repeat localize against a terminal contract gets the same compact,
+		// successful stop signal as every other post-terminal facade call.
+		// Returning an error invites recovery loops; replaying evidence invites
+		// more analysis. The original localization result already holds it.
+		if s.state == localizationStateAnswerReady {
+			return 0, localizationAnswerReadyResult(completion)
 		}
 		return 0, NewStructuredErrorResult(StructuredError{
 			ErrorCode: ErrCodeLocalizationComplete,
@@ -335,6 +366,12 @@ func (s *localizationTerminalState) authorize(facade, operation string, argument
 	if s.state == localizationStateInactive {
 		return nil, false
 	}
+	// answer_ready terminates only localization navigation. Catch those facades
+	// before their handlers can run and return a compact successful instruction;
+	// unrelated work remains dispatchable through the early return above.
+	if s.state == localizationStateAnswerReady {
+		return localizationAnswerReadyResult(s.completionLocked()), false
+	}
 	if s.state == localizationStateNeedsExactRead && facade == "read" && operation == "source" && exactLocalizationSymbol(arguments) == s.exactSymbol {
 		s.state = localizationStateExactReadInFlight
 		return nil, true
@@ -345,24 +382,6 @@ func (s *localizationTerminalState) authorize(facade, operation string, argument
 	}
 
 	completion := s.completionLocked()
-	// Terminal contract with retained evidence: replay the answer as a
-	// SUCCESSFUL idempotent result instead of a refusal. An error here sends
-	// non-adapted hosts into error-recovery loops — a burned turn per call
-	// with the correct answer already in hand; the replay is actionable on
-	// the very next turn and identical on every subsequent call.
-	//
-	// Reads are exempt from the replay: a post-terminal source read can only
-	// sharpen the answer the session already owns, and replaying it starves
-	// a non-adapted host into an empty final (observed: a session holding
-	// the correct file asked to read it twice, received the replay twice,
-	// and exhausted its turns with no answer). The read executes and the
-	// dispatcher attaches the answer-now directive to its result.
-	if s.state == localizationStateAnswerReady && s.digest != nil {
-		if facade == "read" {
-			return nil, false
-		}
-		return localizationEvidenceReplayResult(completion, s.digest), false
-	}
 	message := "localization is complete; return the existing evidence without another Gortex navigation call"
 	switch s.state {
 	case localizationStateNeedsExactRead:
