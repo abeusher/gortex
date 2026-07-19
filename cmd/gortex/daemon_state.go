@@ -365,9 +365,9 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 			registered++
 			for _, spec := range specs {
 				switch spec {
-				case "typescript-language-server":
+				case "typescript-language-server", "tsgo":
 					tsRepos++
-				case "pyright":
+				case "pyright", "pyrefly":
 					pythonRepos++
 				}
 			}

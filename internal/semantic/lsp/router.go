@@ -431,12 +431,25 @@ func (r *Router) For(relPath string) (*Provider, error) {
 // preventing the multi-repo bug where Provider.EnsureClient (which is
 // idempotent) would otherwise leave every workspace pinned to the
 // rootURI of whichever request happened to spawn the server first.
+//
+// When several specs cover the extension the router walks them in
+// priority order and takes the first one its own availability cache
+// reports live — so a preferred server that is missing from PATH or
+// was downgraded by markSpawnFailed falls back to the next candidate
+// (tsgo → typescript-language-server) instead of erroring.
 func (r *Router) ForWorkspace(relPath, workspace string) (*Provider, error) {
-	spec := SpecForPath(relPath)
-	if spec == nil {
+	specs := SpecsForExtension(filepath.Ext(relPath))
+	if len(specs) == 0 {
 		return nil, fmt.Errorf("no LSP server registered for %s", filepath.Ext(relPath))
 	}
-	return r.ForSpecWorkspace(spec, workspace)
+	for _, spec := range specs {
+		if r.specAvailable(spec) {
+			return r.ForSpecWorkspace(spec, workspace)
+		}
+	}
+	// None available: route to the priority winner so the caller gets
+	// the same "not available on PATH" error shape as before.
+	return r.ForSpecWorkspace(specs[0], workspace)
 }
 
 // ForSpec returns the provider for a named spec under the router's

@@ -4,8 +4,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 
 	"github.com/zzet/gortex/internal/semantic"
 )
@@ -179,9 +182,10 @@ type ServerAlt struct {
 // route. Order is meaningful only for the seed config — the runtime
 // router uses the per-extension lookup table.
 //
-// Adding a new server: add the entry here and add its file extensions
-// to extToSpec at init time. The default config picks it up
-// automatically; users override priority / command via .gortex.yaml.
+// Adding a new server: add the entry here and its file extensions are
+// collected into the per-extension table at init time. The default
+// config picks it up automatically; users override priority / command
+// via .gortex.yaml.
 // JdtlsTrustBuildEnv, when set to a truthy value ("1" / "true"), opts jdtls
 // into build-backed resolution (Maven/Gradle import + autobuild) for the
 // indexed repository. OFF by default: import and autobuild RUN the indexed
@@ -278,17 +282,20 @@ var Servers = []ServerSpec{
 			".mjs": "javascript",
 			".cjs": "javascript",
 		},
-		Priority:     5,
+		// Fallback behind tsgo: serves TS/JS wherever the native
+		// compiler's binary is not installed. Raise its priority in
+		// .gortex.yaml to prefer it over tsgo again.
+		Priority:     6,
 		Daemon:       true,
 		MaxParallel:  10,
 		ProjectReady: tsProjectReady,
 	},
 	{
-		// tsgo is the native-Go TypeScript compiler (the
-		// @typescript/native-preview package). Its LSP mode is offered
-		// at a lower precedence than typescript-language-server so the
-		// default routing is unchanged for anyone who has both — a
-		// user opts in by raising its priority in .gortex.yaml.
+		// tsgo is the native-Go TypeScript compiler's LSP mode. It is
+		// the default TS/JS routing winner when its binary is on PATH:
+		// native process, no node/tsserver/typingsInstaller tree, much
+		// faster startup. typescript-language-server serves as the
+		// fallback when tsgo is not installed.
 		Name:      "tsgo",
 		Command:   "tsgo",
 		Args:      []string{"--lsp", "--stdio"},
@@ -307,7 +314,7 @@ var Servers = []ServerSpec{
 			".mjs": "javascript",
 			".cjs": "javascript",
 		},
-		Priority:     6,
+		Priority:     5,
 		Daemon:       true,
 		MaxParallel:  10,
 		ProjectReady: tsProjectReady,
@@ -632,29 +639,30 @@ var Servers = []ServerSpec{
 	},
 }
 
-// extToSpec resolves a file extension (with leading dot, lower case) to
-// its preferred LSP spec. Built once at init from `Servers`.
-var extToSpec map[string]*ServerSpec
+// extToSpecs resolves a file extension (with leading dot, lower case)
+// to every spec covering it, ordered by Priority (registration order
+// breaks ties). Built once at init from `Servers`.
+var extToSpecs map[string][]*ServerSpec
 
 // nameToSpec resolves a server name (e.g. "rust-analyzer") to its spec.
 var nameToSpec map[string]*ServerSpec
 
 func init() {
-	extToSpec = make(map[string]*ServerSpec, 64)
+	extToSpecs = make(map[string][]*ServerSpec, 64)
 	nameToSpec = make(map[string]*ServerSpec, len(Servers))
 	for i := range Servers {
 		spec := &Servers[i]
 		nameToSpec[spec.Name] = spec
 		for _, ext := range spec.Extensions {
 			lower := strings.ToLower(ext)
-			// First registration wins; entries earlier in `Servers`
-			// take precedence when extensions overlap. (Used to keep
-			// gopls authoritative for `.go` even if a future entry
-			// claims it.)
-			if _, exists := extToSpec[lower]; !exists {
-				extToSpec[lower] = spec
-			}
+			extToSpecs[lower] = append(extToSpecs[lower], spec)
 		}
+	}
+	// Priority orders the candidates per extension; the stable sort
+	// keeps registration order among equals (gopls stays authoritative
+	// for `.go` even if a future same-priority entry claims it).
+	for _, specs := range extToSpecs {
+		sort.SliceStable(specs, func(i, j int) bool { return specs[i].Priority < specs[j].Priority })
 	}
 
 	// Contribute every known LSP spec to semantic.DefaultConfig()
@@ -681,16 +689,97 @@ func init() {
 }
 
 // SpecForExtension returns the ServerSpec preferred for the given file
-// extension (with or without leading dot). Returns nil when no spec
-// covers the extension.
+// extension (with or without leading dot): the highest-priority spec
+// whose binary is actually installed. When several specs cover one
+// extension (tsgo / typescript-language-server, pyright / pyrefly) the
+// lower Priority number wins among the installed ones — `.ts` routes
+// to tsgo when its binary is on PATH and falls back to
+// typescript-language-server otherwise. When none of the covering
+// servers is installed the priority winner is returned unchanged, so
+// the spawn path reports the missing binary as before. Returns nil
+// when no spec covers the extension.
 func SpecForExtension(ext string) *ServerSpec {
+	specs := SpecsForExtension(ext)
+	if len(specs) == 0 {
+		return nil
+	}
+	for _, s := range specs {
+		if specCommandAvailable(s) {
+			return s
+		}
+	}
+	return specs[0]
+}
+
+// SpecsForExtension returns every ServerSpec covering the extension in
+// priority order (lower Priority number first), without consulting
+// binary availability. Callers that hold their own availability source
+// (e.g. the Router) walk this list and pick the first live entry.
+func SpecsForExtension(ext string) []*ServerSpec {
 	if ext == "" {
 		return nil
 	}
 	if !strings.HasPrefix(ext, ".") {
 		ext = "." + ext
 	}
-	return extToSpec[strings.ToLower(ext)]
+	return extToSpecs[strings.ToLower(ext)]
+}
+
+// lookPath is swappable in tests so extension-preference cases can
+// simulate which server binaries are installed.
+var lookPath = exec.LookPath
+
+var (
+	cmdAvailMu    sync.Mutex
+	cmdAvailCache map[string]bool
+)
+
+// specCommandAvailable reports whether the spec's command (or one of
+// its alternatives) resolves on PATH. Passive connect specs count as
+// available — they dial instead of spawn. Results are cached for the
+// process lifetime, matching Router.specAvailable: installing a server
+// mid-daemon takes a restart to notice.
+func specCommandAvailable(s *ServerSpec) bool {
+	if s == nil {
+		return false
+	}
+	if s.Connect != nil {
+		return s.Connect.Validate() == nil
+	}
+	if commandOnPath(s.Command) {
+		return true
+	}
+	for _, alt := range s.AlternativeCommands {
+		if commandOnPath(alt.Command) {
+			return true
+		}
+	}
+	return false
+}
+
+func commandOnPath(cmd string) bool {
+	if cmd == "" {
+		return false
+	}
+	cmdAvailMu.Lock()
+	defer cmdAvailMu.Unlock()
+	if v, ok := cmdAvailCache[cmd]; ok {
+		return v
+	}
+	if cmdAvailCache == nil {
+		cmdAvailCache = make(map[string]bool)
+	}
+	_, err := lookPath(cmd)
+	cmdAvailCache[cmd] = err == nil
+	return err == nil
+}
+
+// resetCommandAvailabilityCache clears the per-command PATH cache.
+// Test-only: pairs with swapping lookPath.
+func resetCommandAvailabilityCache() {
+	cmdAvailMu.Lock()
+	cmdAvailCache = nil
+	cmdAvailMu.Unlock()
 }
 
 // SpecForPath returns the ServerSpec covering the file's extension.

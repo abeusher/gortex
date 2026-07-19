@@ -142,8 +142,27 @@ func BuildResolverLSPHelperForRepo(router *lsp.Router, absRoot string, poolSize 
 		specs = append(specs, name)
 	}
 
-	add("typescript-language-server", RepoLikelyHasTypeScriptIntent(absRoot))
-	add("pyright", RepoLikelyHasPythonIntent(absRoot))
+	add(preferredSpecName(router.Available, ".ts"), RepoLikelyHasTypeScriptIntent(absRoot))
+	add(preferredSpecName(router.Available, ".py"), RepoLikelyHasPythonIntent(absRoot))
 
 	return lsp.NewResolverHelperMux(helpers...), specs
+}
+
+// preferredSpecName returns the name of the highest-priority registered
+// spec covering ext that the given availability check reports live, so
+// resolve-time helpers agree with the registry's routing preference
+// (tsgo over typescript-language-server, pyright over pyrefly). Falls
+// back to the priority winner when none is available — the caller
+// re-checks availability and skips registration anyway.
+func preferredSpecName(available func(*lsp.ServerSpec) bool, ext string) string {
+	specs := lsp.SpecsForExtension(ext)
+	for _, spec := range specs {
+		if available(spec) {
+			return spec.Name
+		}
+	}
+	if len(specs) > 0 {
+		return specs[0].Name
+	}
+	return ""
 }
