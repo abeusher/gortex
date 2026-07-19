@@ -16,6 +16,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/zzet/gortex/internal/platform"
 	"github.com/zzet/gortex/internal/procio"
 )
 
@@ -111,6 +112,7 @@ type SpawnTransport struct {
 // or crash backtrace can't flood the daemon's log with raw text.
 func (s *SpawnTransport) Start() (io.WriteCloser, io.Reader, error) {
 	cmd := exec.Command(s.Command, s.Args...)
+	platform.ConfigureBackgroundCommand(cmd)
 	cmd.Dir = s.WorkspaceRoot
 	if len(s.Env) > 0 {
 		cmd.Env = append(os.Environ(), s.Env...)
