@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"go.uber.org/zap"
@@ -37,14 +38,57 @@ type exploreSourceLiteralSearch struct {
 	lookupRepoPrefix string
 }
 
-// exploreHighestInformationQuotedLiteral picks one deterministic source-search
-// key. Quoted terms have already passed the noise filter; rune length is a
-// language-neutral proxy for selectivity and avoids multiplying repository
-// scans when a task contains several literals.
-func exploreHighestInformationQuotedLiteral(terms []string) string {
+// explorePreferredSourceLiteral picks one deterministic source-search key.
+// Quoted terms have already passed the noise filter. Compact alphabetic values
+// (locale/protocol/config keys) are reserved before longer prose because their
+// registration sites are otherwise invisible to symbol metadata. A saturated
+// compact lookup may fall back to the longest remaining term inside the same
+// fixed end-to-end deadline.
+func explorePreferredSourceLiteral(terms []string) string {
+	best := ""
+	bestLen := 0
+	bestCompact := false
+	for _, term := range terms {
+		n := utf8.RuneCountInString(term)
+		compact := exploreCompactSourceLiteral(term, n)
+		if best == "" || compact && !bestCompact || compact == bestCompact && n > bestLen {
+			best, bestLen, bestCompact = term, n, compact
+		}
+	}
+	return best
+}
+
+func exploreCompactSourceLiteral(term string, runeCount int) bool {
+	// Reserve priority only for two-letter alphabetic codes. Three- and
+	// four-letter lowercase values are indistinguishable from common prose
+	// ("test", "file", "true") and must compete by information length. They
+	// remain searchable when they are the only quoted term.
+	if runeCount != 2 {
+		return false
+	}
+	lower := strings.ToLower(term)
+	if _, stop := assistStopWords[lower]; stop {
+		return false
+	}
+	switch lower {
+	case "am", "an", "as", "at", "be", "by", "do", "go", "he", "hi", "if", "in", "is", "it", "me", "my", "no", "of", "oh", "ok", "on", "or", "so", "to", "up", "us", "we":
+		return false
+	}
+	for _, r := range term {
+		if !unicode.IsLetter(r) {
+			return false
+		}
+	}
+	return true
+}
+
+func exploreSourceLiteralFallback(terms []string, primary string) string {
 	best := ""
 	bestLen := 0
 	for _, term := range terms {
+		if strings.EqualFold(term, primary) {
+			continue
+		}
 		if n := utf8.RuneCountInString(term); n > bestLen {
 			best, bestLen = term, n
 		}
@@ -66,63 +110,98 @@ func (s *Server) gatherExploreSourceLiteralRecall(
 	if s == nil || ctx.Err() != nil {
 		return exploreSourceLiteralRecall{}
 	}
-	term := exploreHighestInformationQuotedLiteral(terms)
-	if term == "" {
+	primary := explorePreferredSourceLiteral(terms)
+	if primary == "" {
 		return exploreSourceLiteralRecall{}
 	}
 
+	// Search and symbol mapping historically had one 75 ms phase each. Keep the
+	// same 150 ms end-to-end ceiling while allowing a fast, saturated compact-key
+	// lookup to spend only the remaining time on one more-selective fallback.
 	started := time.Now()
-	searchCtx, cancelSearch := context.WithTimeout(ctx, exploreSourceLiteralRecallBudget)
-	search := s.searchExploreSourceLiteral(searchCtx, term, repoPrefix, scope)
-	searchErr := searchCtx.Err()
-	cancelSearch()
+	boundedCtx, cancelBounded := context.WithTimeout(ctx, 2*exploreSourceLiteralRecallBudget)
+	defer cancelBounded()
+	type literalAttempt struct {
+		term       string
+		search     exploreSourceLiteralSearch
+		recall     exploreSourceLiteralRecall
+		searchErr  error
+		mappingErr error
+	}
+	attempt := func(term string) literalAttempt {
+		result := literalAttempt{term: term}
+		if term == "" || boundedCtx.Err() != nil {
+			return result
+		}
+		searchCtx, cancelSearch := context.WithTimeout(boundedCtx, exploreSourceLiteralRecallBudget)
+		result.search = s.searchExploreSourceLiteral(searchCtx, term, repoPrefix, scope)
+		result.searchErr = searchCtx.Err()
+		cancelSearch()
+		if ctx.Err() != nil {
+			return result
+		}
+		result.recall, result.mappingErr = s.mapDiscoveredExploreSourceLiteralMatches(
+			boundedCtx, term, result.search, scope, result.searchErr,
+		)
+		return result
+	}
+
+	chosen := attempt(primary)
+	fallbackAttempted := false
+	fallback := exploreSourceLiteralFallback(terms, primary)
+	primaryCompact := exploreCompactSourceLiteral(primary, utf8.RuneCountInString(primary))
+	if primaryCompact && fallback != "" && boundedCtx.Err() == nil &&
+		(len(chosen.recall.hits) == 0 || chosen.recall.ambiguous || chosen.search.incomplete) {
+		fallbackAttempted = true
+		candidate := attempt(fallback)
+		// Preserve a useful compact-key result unless the longer term is the only
+		// mapped result or resolves the compact lookup's ambiguity.
+		if len(candidate.recall.hits) > 0 &&
+			(len(chosen.recall.hits) == 0 || !candidate.recall.ambiguous) {
+			chosen = candidate
+		}
+	}
 	if ctx.Err() != nil {
 		return exploreSourceLiteralRecall{}
 	}
 
-	// Discovery and graph mapping have independent bounded phases. A backend
-	// may return useful partial matches as its deadline expires; reusing that
-	// expired context would discard those matches before they can be mapped to
-	// enclosing symbols. The request context remains the parent bound, while
-	// each phase gets the same small local budget.
-	recall, mappingErr := s.mapDiscoveredExploreSourceLiteralMatches(
-		ctx, term, search, scope, searchErr,
-	)
 	if s.logger != nil {
 		contextError := ""
-		if searchErr != nil {
-			contextError = "search: " + searchErr.Error()
+		if chosen.searchErr != nil {
+			contextError = "search: " + chosen.searchErr.Error()
 		}
-		if mappingErr != nil {
+		if chosen.mappingErr != nil {
 			if contextError != "" {
 				contextError += "; "
 			}
-			contextError += "mapping: " + mappingErr.Error()
+			contextError += "mapping: " + chosen.mappingErr.Error()
 		}
 		firstMatchPath := ""
-		if len(search.matches) > 0 {
-			firstMatchPath = search.matches[0].Path
+		if len(chosen.search.matches) > 0 {
+			firstMatchPath = chosen.search.matches[0].Path
 		}
 		fields := []zap.Field{
-			zap.Int("term_runes", utf8.RuneCountInString(term)),
+			zap.Int("term_runes", utf8.RuneCountInString(chosen.term)),
+			zap.Bool("fallback_attempted", fallbackAttempted),
+			zap.Bool("fallback_selected", chosen.term != primary),
 			zap.String("requested_repo_prefix", repoPrefix),
-			zap.String("lookup_repo_prefix", search.lookupRepoPrefix),
+			zap.String("lookup_repo_prefix", chosen.search.lookupRepoPrefix),
 			zap.String("first_match_path", firstMatchPath),
-			zap.String("backend", search.backend),
-			zap.Bool("owned", search.owned),
-			zap.Int("raw_matches", len(search.matches)),
-			zap.Int("mapped_symbols", len(recall.hits)),
-			zap.Bool("incomplete", search.incomplete),
+			zap.String("backend", chosen.search.backend),
+			zap.Bool("owned", chosen.search.owned),
+			zap.Int("raw_matches", len(chosen.search.matches)),
+			zap.Int("mapped_symbols", len(chosen.recall.hits)),
+			zap.Bool("incomplete", chosen.search.incomplete),
 			zap.String("context_error", contextError),
 			zap.Duration("elapsed", time.Since(started)),
 		}
-		if len(recall.hits) == 0 || search.incomplete || contextError != "" {
+		if len(chosen.recall.hits) == 0 || chosen.search.incomplete || contextError != "" {
 			s.logger.Info("mcp: explore source literal recall incomplete", fields...)
 		} else {
 			s.logger.Debug("mcp: explore source literal recall", fields...)
 		}
 	}
-	return recall
+	return chosen.recall
 }
 
 func (s *Server) mapDiscoveredExploreSourceLiteralMatches(

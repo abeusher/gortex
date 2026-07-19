@@ -237,9 +237,24 @@ func TestMapDiscoveredExploreSourceLiteralMatchesPreservesHitsAfterDiscoveryDead
 	require.True(t, recall.ambiguous, "deadline-truncated discovery must remain non-terminal")
 }
 
-func TestExploreHighestInformationQuotedLiteral(t *testing.T) {
-	require.Equal(t, "registration-key", exploreHighestInformationQuotedLiteral([]string{"ku", "日本", "registration-key"}))
-	require.Empty(t, exploreHighestInformationQuotedLiteral(nil))
+func TestExplorePreferredSourceLiteralReservesCompactValue(t *testing.T) {
+	require.Equal(t, "ku", explorePreferredSourceLiteral([]string{"registration-key", "ku", "日本"}))
+	require.Equal(t, "日本", explorePreferredSourceLiteral([]string{"registration-key", "日本"}))
+	require.Empty(t, explorePreferredSourceLiteral(nil))
+}
+
+func TestExplorePreferredSourceLiteralRejectsCompactNoise(t *testing.T) {
+	for _, noise := range []string{"it", "x-1", "test", "file", "true"} {
+		require.Equal(t, "registration-key", explorePreferredSourceLiteral([]string{noise, "registration-key"}), noise)
+	}
+	// A short prose value remains searchable when it is the only literal; it
+	// simply no longer displaces a more selective term.
+	require.Equal(t, "test", explorePreferredSourceLiteral([]string{"test"}))
+}
+
+func TestExploreSourceLiteralFallbackUsesLongestRemainingTerm(t *testing.T) {
+	require.Equal(t, "registration-key", exploreSourceLiteralFallback([]string{"ku", "name", "registration-key"}, "ku"))
+	require.Empty(t, exploreSourceLiteralFallback([]string{"ku", "KU"}, "ku"))
 }
 
 func TestGatherExploreQuotedContentCandidatesMergesSourceLiteralWithExactContentNode(t *testing.T) {
@@ -279,6 +294,36 @@ func TestGatherExploreQuotedContentCandidatesMergesSourceLiteralWithExactContent
 
 	require.NotNil(t, candidateByID(candidates, document.ID), "exact content evidence must be retained")
 	require.NotNil(t, candidateByID(candidates, constructor.ID), "an exact non-source content hit must not suppress bounded source recall")
+}
+
+func TestGatherExploreQuotedContentCandidatesKeepsMissingCompactLiteralBesideExactPeer(t *testing.T) {
+	root := t.TempDir()
+	rel := "src/Registry.cs"
+	path := filepath.Join(root, filepath.FromSlash(rel))
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+	require.NoError(t, os.WriteFile(path, []byte("public sealed class Registry {\n    public void Configure() {\n        Register(\"xy\");\n    }\n}\n"), 0o644))
+
+	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	idx := indexer.New(store, parser.NewRegistry(), config.IndexConfig{}, zap.NewNop())
+	_, err = idx.IndexCtx(context.Background(), root)
+	require.NoError(t, err)
+	idx.SetFileMtimes(map[string]int64{rel: 1})
+
+	exactPeer := sourceLiteralNode("demo/src/VisibleType.cs::VisibleType", "VisibleType", "src/VisibleType.cs", graph.KindType, 1, 2)
+	configure := sourceLiteralNode("demo/src/Registry.cs::Registry.Configure", "Registry.Configure", rel, graph.KindMethod, 2, 4)
+	store.AddBatch([]*graph.Node{exactPeer, configure}, nil)
+	server := &Server{graph: store, indexer: idx, logger: zap.NewNop()}
+
+	candidates := server.gatherExploreQuotedContentCandidates(
+		context.Background(), `locate where "xy" is registered; "VisibleType" is contextual`,
+		[]*rerank.Candidate{{Node: exactPeer, TextRank: 0, VectorRank: -1}}, 20,
+		query.QueryOptions{RepoAllow: map[string]bool{"demo": true}},
+	)
+
+	require.NotNil(t, candidateByID(candidates, configure.ID),
+		"an exact metadata peer for one term must not suppress source recall for another quoted value")
 }
 
 func TestGatherExploreQuotedContentCandidatesSkipsSourceScanForExactOrdinaryCandidate(t *testing.T) {

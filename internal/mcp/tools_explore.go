@@ -2074,50 +2074,130 @@ func exploreNodeWithinQueryScope(n *graph.Node, scope query.QueryOptions) bool {
 // with the query) must not consume the only read while a query-aligned
 // candidate sits lower in the same envelope:
 //
-//	1. verified source-literal evidence
-//	2. explicit path / qualified-symbol / call anchor
-//	3. query-aligned non-generic callable
-//	4. protected concept implementation
-//	5. aligned candidate of any definition kind
-//	6. raw head only when nothing aligned exists
+//  1. explicit path / qualified-symbol / call anchor
+//  2. strongest non-literal semantic coverage across declaration and body
+//  3. smallest actionable callable, then verified literal provenance
+//  4. protected concept implementation and non-generic declaration quality
+//  5. answer-draft rank and raw rank as deterministic final tie-breaks
 func explorePreferredRefinementSymbol(task string, targets []exploreTarget) string {
+	if len(targets) == 0 {
+		return ""
+	}
 	query := shapeExploreQuery(task)
 	if exploreQueryIsConceptTask(query) {
 		query = stripLeadingExploreDirective(query)
 	}
-	queryTerms := exploreTerminalTerms(query)
-	aligned := func(t exploreTarget) bool {
-		overlap, _ := exploreDraftTermOverlap(queryTerms, t.node)
-		return overlap > 0
-	}
-	callable := func(n *graph.Node) bool {
-		return n != nil && (n.Kind == graph.KindFunction || n.Kind == graph.KindMethod)
-	}
-	rungs := []func(exploreTarget) bool{
-		func(t exploreTarget) bool { return t.sourceLiteral },
-		func(t exploreTarget) bool { return exploreLocalizationExplicitAnchor(query, t.node) },
-		func(t exploreTarget) bool {
-			return callable(t.node) && aligned(t) && !exploreDraftGenericCandidate(t.node, t.source)
-		},
-		func(t exploreTarget) bool { return t.conceptImplementation },
-		aligned,
-	}
-	for _, rung := range rungs {
-		for _, target := range targets {
-			if target.node == nil || target.node.ID == "" {
-				continue
-			}
-			if rung(target) {
-				return target.node.ID
-			}
+	semanticTerms := exploreTerminalTerms(query)
+	for _, literal := range exploreQuotedRecallTerms(task) {
+		for term := range exploreTerminalTerms(literal) {
+			delete(semanticTerms, term)
 		}
 	}
-	for _, target := range targets {
-		if target.node != nil && target.node.ID != "" {
-			return target.node.ID
+
+	// The answer-draft order already incorporates rare-term density and generic
+	// declaration demotion. Retain it as the final deterministic tie-break while
+	// comparing all direct targets on their non-literal semantic evidence.
+	draftRank := make(map[string]int, len(targets))
+	for index, entry := range exploreAnswerDraft(task, targets) {
+		if entry.node != nil {
+			draftRank[exploreDraftNodeKey(entry.node)] = index
 		}
 	}
-	return ""
+	type refinementCandidate struct {
+		target            exploreTarget
+		index             int
+		draftRank         int
+		identifierOverlap int
+		bodyOverlap       int
+		longest           int
+		explicit          bool
+		callable          bool
+		generic           bool
+	}
+	candidates := make([]refinementCandidate, 0, len(targets))
+	for index, target := range targets {
+		if target.node == nil || target.node.ID == "" {
+			continue
+		}
+		identifierOverlap, longest := exploreDraftTermOverlap(semanticTerms, target.node)
+		bodyOverlap := exploreDraftTermSetOverlap(semanticTerms, exploreTerminalTerms(target.source))
+		rank, ranked := draftRank[exploreDraftNodeKey(target.node)]
+		if !ranked {
+			rank = len(targets) + index
+		}
+		callable := target.node.Kind == graph.KindFunction || target.node.Kind == graph.KindMethod
+		candidates = append(candidates, refinementCandidate{
+			target:            target,
+			index:             index,
+			draftRank:         rank,
+			identifierOverlap: identifierOverlap,
+			bodyOverlap:       bodyOverlap,
+			longest:           longest,
+			explicit:          exploreLocalizationExplicitAnchor(query, target.node),
+			callable:          callable,
+			generic:           exploreDraftGenericCandidate(target.node, target.source),
+		})
+	}
+	if len(candidates) == 0 {
+		return ""
+	}
+	alignment := func(candidate refinementCandidate) int {
+		body := candidate.bodyOverlap
+		if body > 2 {
+			body = 2
+		}
+		return candidate.identifierOverlap + body
+	}
+	better := func(left, right refinementCandidate) bool {
+		if left.explicit != right.explicit {
+			return left.explicit
+		}
+		leftAlignment, rightAlignment := alignment(left), alignment(right)
+		if leftAlignment != rightAlignment {
+			return leftAlignment > rightAlignment
+		}
+		if left.identifierOverlap != right.identifierOverlap {
+			return left.identifierOverlap > right.identifierOverlap
+		}
+		if left.bodyOverlap != right.bodyOverlap {
+			return left.bodyOverlap > right.bodyOverlap
+		}
+		// With no semantic alignment, verified source provenance is the only
+		// concrete evidence. Do not let an arbitrary callable beat the exact
+		// literal merely because the literal maps to a type or field owner.
+		if leftAlignment == 0 && left.target.sourceLiteral != right.target.sourceLiteral {
+			return left.target.sourceLiteral
+		}
+		// Once both candidates cover task concepts, prefer the smallest
+		// actionable declaration before provenance: a literal mapped to an
+		// enclosing type/file must not outrank an aligned callable.
+		if left.callable != right.callable {
+			return left.callable
+		}
+		if left.target.sourceLiteral != right.target.sourceLiteral {
+			return left.target.sourceLiteral
+		}
+		if left.target.conceptImplementation != right.target.conceptImplementation {
+			return left.target.conceptImplementation
+		}
+		if left.generic != right.generic {
+			return !left.generic
+		}
+		if left.longest != right.longest {
+			return left.longest > right.longest
+		}
+		if left.draftRank != right.draftRank {
+			return left.draftRank < right.draftRank
+		}
+		return left.index < right.index
+	}
+	best := candidates[0]
+	for _, candidate := range candidates[1:] {
+		if better(candidate, best) {
+			best = candidate
+		}
+	}
+	return best.target.node.ID
 }
 
 // localizationEvidenceTargets projects the same bounded answer-draft evidence
@@ -2126,6 +2206,27 @@ func explorePreferredRefinementSymbol(task string, targets []exploreTarget) stri
 // the response cardinality. Direct targets retain their source and neighbors.
 func localizationEvidenceTargets(task, exactID string, targets []exploreTarget) []exploreTarget {
 	return localizationEvidenceTargetsFromDraft(task, exactID, targets, nil)
+}
+
+func prioritizeLocalizationEvidenceTarget(requiredID string, targets []exploreTarget) []exploreTarget {
+	if requiredID == "" || len(targets) < 2 {
+		return targets
+	}
+	requiredIndex := -1
+	for index, target := range targets {
+		if target.node != nil && target.node.ID == requiredID {
+			requiredIndex = index
+			break
+		}
+	}
+	if requiredIndex <= 0 {
+		return targets
+	}
+	ordered := make([]exploreTarget, 0, len(targets))
+	ordered = append(ordered, targets[requiredIndex])
+	ordered = append(ordered, targets[:requiredIndex]...)
+	ordered = append(ordered, targets[requiredIndex+1:]...)
+	return ordered
 }
 
 func localizationEvidenceTargetsFromDraft(task, exactID string, targets []exploreTarget, draft []exploreDraftEntry) []exploreTarget {
@@ -2155,10 +2256,11 @@ func localizationEvidenceTargetsFromDraft(task, exactID string, targets []explor
 	if draft == nil && strings.TrimSpace(task) != "" {
 		draft = exploreAnswerDraft(task, targets)
 	}
+	// Primary retrieval evidence leads exact-read and answer-ready envelopes;
+	// both it and the exact target are contractual under tight budgets. A
+	// needs-refinement caller may move its authorized target ahead afterward,
+	// without changing this stable answer-draft projection.
 	appendTarget(targets[0])
-	// The completion contract names the exact refinement target. Reserve it
-	// before promoted structural neighbors so a tight evidence limit cannot
-	// advertise an exact_symbol that is absent from files/symbols/evidence.
 	if exactID != "" {
 		for _, target := range targets {
 			if target.node != nil && target.node.ID == exactID {
@@ -2244,11 +2346,19 @@ func buildLocalizationExploreResultForTask(completion localizationCompletion, ta
 		draft = exploreAnswerDraft(task, targets)
 	}
 	preferredBodyIDs := explorePreferredFullBodyIDs(task, targets, draft, exploreFullBodyLimit)
+	primarySymbol := ""
+	if len(targets) > 0 && targets[0].node != nil {
+		primarySymbol = targets[0].node.ID
+	}
 	requiredSymbol := completion.ExactSymbol
-	if completion.State == localizationStateNeedsRefinement {
+	refinementFirst := completion.State == localizationStateNeedsRefinement
+	if refinementFirst {
 		requiredSymbol = completion.refinementSymbol
 	}
 	targets = localizationEvidenceTargetsFromDraft(task, requiredSymbol, targets, draft)
+	if refinementFirst {
+		targets = prioritizeLocalizationEvidenceTarget(requiredSymbol, targets)
+	}
 	envelope := localizationExploreEnvelope{
 		Completion: completion,
 		Files:      make([]string, 0),
@@ -2264,9 +2374,15 @@ func buildLocalizationExploreResultForTask(completion localizationCompletion, ta
 	if len(targets) > 0 {
 		mandatoryCount = 1
 	}
-	if requiredSymbol != "" {
+	// Primary retrieval evidence and the authorized exact/refinement symbol are
+	// both mandatory regardless of which one leads the serialized projection.
+	// Packing operates on a prefix, so retain through the later of the two.
+	for _, mandatoryID := range []string{primarySymbol, requiredSymbol} {
+		if mandatoryID == "" {
+			continue
+		}
 		for index, target := range targets {
-			if target.node != nil && target.node.ID == requiredSymbol && index+1 > mandatoryCount {
+			if target.node != nil && target.node.ID == mandatoryID && index+1 > mandatoryCount {
 				mandatoryCount = index + 1
 				break
 			}
@@ -3266,22 +3382,33 @@ func (s *Server) gatherExploreQuotedContentCandidates(
 	if len(order) > 0 {
 		nodes = s.graph.GetNodesByIDs(order)
 	}
-	exactSourceFound := exploreQuotedRecallHasExactSourceCandidate(task, terms, ordinary, scope)
-	if !exactSourceFound {
-		for _, id := range order {
-			if exploreQuotedRecallHasExactSourceNode(task, terms, nodes[id], scope) {
-				exactSourceFound = true
-				break
+	// Decide source coverage per quoted term. An exact metadata hit for one
+	// symbol-like term must not suppress a different compact value whose only
+	// useful evidence is inside a registration body. The selected missing term
+	// still feeds one bounded source scan, so this preserves the fixed I/O cap.
+	sourceRecallTerms := make([]string, 0, len(terms))
+	for _, term := range terms {
+		oneTerm := []string{term}
+		exactSourceFound := exploreQuotedRecallHasExactSourceCandidate(task, oneTerm, ordinary, scope)
+		if !exactSourceFound {
+			for _, id := range order {
+				if exploreQuotedRecallHasExactSourceNode(task, oneTerm, nodes[id], scope) {
+					exactSourceFound = true
+					break
+				}
 			}
+		}
+		if !exactSourceFound {
+			sourceRecallTerms = append(sourceRecallTerms, term)
 		}
 	}
 
 	// content_fts stores content-class nodes rather than ordinary source bodies.
 	// An exact document hit therefore does not prove that the source declaration
-	// containing the literal is represented. Only a miss across both ordinary
-	// retrieval and hydrated content symbols activates the bounded source scan.
-	if ctx.Err() == nil && !exactSourceFound {
-		sourceRecall := s.gatherExploreSourceLiteralRecall(ctx, terms, repoPrefix, scope)
+	// containing the literal is represented. Only a per-term miss across both
+	// ordinary retrieval and hydrated content symbols activates the bounded scan.
+	if ctx.Err() == nil && len(sourceRecallTerms) > 0 {
+		sourceRecall := s.gatherExploreSourceLiteralRecall(ctx, sourceRecallTerms, repoPrefix, scope)
 		missingNodes := make([]string, 0, len(sourceRecall.hits))
 		for _, hit := range sourceRecall.hits {
 			if previous, exists := bestRank[hit.nodeID]; !exists {
