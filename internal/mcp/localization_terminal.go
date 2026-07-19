@@ -23,18 +23,18 @@ const (
 // the server also enforces it for later Gortex navigation calls in the same
 // MCP session.
 type localizationCompletion struct {
-	State            string `json:"state"`
-	Scope            string `json:"scope"`
-	RequiredAction   string `json:"required_action"`
-	AllowedToolCalls int    `json:"allowed_tool_calls"`
-	ExactSymbol      string `json:"exact_symbol,omitempty"`
+	State            string   `json:"state"`
+	Scope            string   `json:"scope"`
+	RequiredAction   string   `json:"required_action"`
+	AllowedToolCalls int      `json:"allowed_tool_calls"`
+	ExactSymbol      string   `json:"exact_symbol,omitempty"`
+	AllowedSymbols   []string `json:"allowed_symbols,omitempty"`
 
-	// Refinement routing is session-only authorization state. Candidate IDs are
-	// already present once in the envelope's symbols field, so they are not
-	// serialized again. The concrete preferred ID remains in required_action;
-	// exact_symbol is reserved for the semantically exact-read state.
+	// Route hops stay session-only, while AllowedSymbols exposes the exact
+	// bounded authorization set carried by the wire contract.
 	refinementSymbol  string
 	refinementSymbols []string
+	refinementRoutes  map[string]localizationRefinementRoute
 
 	// digest is the bounded evidence projection carried session-only through
 	// reservation staging (see localization_digest.go). Post-terminal results
@@ -42,6 +42,13 @@ type localizationCompletion struct {
 	// completion through reservation staging into commitLocalizationLocked,
 	// which covers the direct-arm and facade finishLocalize paths alike.
 	digest *localizationEvidenceDigest
+}
+
+// localizationRefinementRoute is session-only. A zero implementation symbol
+// marks a concrete refinement candidate; a non-empty symbol is the one exact
+// concrete hop prevalidated for a generic forwarder.
+type localizationRefinementRoute struct {
+	implementationSymbol string
 }
 
 func newLocalizationCompletion(answerReady bool, exactSymbol string) localizationCompletion {
@@ -62,19 +69,33 @@ func newLocalizationCompletion(answerReady bool, exactSymbol string) localizatio
 	}
 }
 
+func newLocalizationOpenCompletion() localizationCompletion {
+	return localizationCompletion{
+		State:            localizationStateInactive,
+		Scope:            "localization",
+		RequiredAction:   "continue",
+		AllowedToolCalls: 0,
+	}
+}
+
 // newLocalizationRefinementCompletion keeps uncertain localization successful
 // and bounded. The ranked evidence remains usable, while the server permits
-// exactly one source read of a returned candidate instead of allowing another
-// broad exploration loop.
+// exactly one source read selected from the explicit wire authorization set.
 func newLocalizationRefinementCompletion(preferredSymbol string) localizationCompletion {
+	return newLocalizationRefinementCompletionForSymbols(preferredSymbol, []string{preferredSymbol})
+}
+
+func newLocalizationRefinementCompletionForSymbols(preferredSymbol string, allowedSymbols []string) localizationCompletion {
 	preferredSymbol = strings.TrimSpace(preferredSymbol)
+	allowedSymbols = append([]string(nil), allowedSymbols...)
 	return localizationCompletion{
-		State: localizationStateNeedsRefinement,
-		Scope: "localization",
-		RequiredAction: fmt.Sprintf(localizationRefinementRequiredActionFormat, preferredSymbol) +
-			" The named symbol is recommended; one source read of any returned candidate symbol is permitted.",
-		AllowedToolCalls: 1,
-		refinementSymbol: preferredSymbol,
+		State:             localizationStateNeedsRefinement,
+		Scope:             "localization",
+		RequiredAction:    fmt.Sprintf(localizationRefinementRequiredActionFormat, preferredSymbol),
+		AllowedToolCalls:  1,
+		AllowedSymbols:    allowedSymbols,
+		refinementSymbol:  preferredSymbol,
+		refinementSymbols: append([]string(nil), allowedSymbols...),
 	}
 }
 
@@ -87,10 +108,15 @@ type localizationTerminalState struct {
 	exactSymbol       string
 	refinementSymbol  string
 	refinementSymbols []string
-	taskFingerprint   string
-	generation        uint64
-	nextReservation   uint64
-	reservation       *localizationReservation
+	refinementRoutes  map[string]localizationRefinementRoute
+	// inFlightImplementationSymbol is selected from refinementRoutes when the
+	// actual requested candidate is authorized. It is never inferred from the
+	// read result.
+	inFlightImplementationSymbol string
+	taskFingerprint              string
+	generation                   uint64
+	nextReservation              uint64
+	reservation                  *localizationReservation
 	// digest is the evidence retained for the live contract; nil when the
 	// contract is inactive or predates digest capture. Promotions through
 	// finishReservedRead keep it — the evidence was stashed when the
@@ -120,6 +146,8 @@ func (s *localizationTerminalState) reset() {
 	s.exactSymbol = ""
 	s.refinementSymbol = ""
 	s.refinementSymbols = nil
+	s.refinementRoutes = nil
+	s.inFlightImplementationSymbol = ""
 	s.taskFingerprint = ""
 	s.digest = nil
 	// Keep an in-flight reservation until its owner finishes. Its captured
@@ -157,12 +185,37 @@ func (s *localizationTerminalState) keepOpenForTask(task string) {
 }
 
 func (s *localizationTerminalState) armRefinementForTask(task, preferredSymbol string, symbols []string, digest *localizationEvidenceDigest) {
+	routes := make(map[string]localizationRefinementRoute, len(symbols))
+	for _, symbol := range symbols {
+		symbol = strings.TrimSpace(symbol)
+		if symbol != "" {
+			routes[symbol] = localizationRefinementRoute{}
+		}
+	}
+	s.armRefinementRoutesForTask(task, preferredSymbol, symbols, routes, digest)
+}
+
+func (s *localizationTerminalState) armRefinementRoutesForTask(
+	task, preferredSymbol string,
+	symbols []string,
+	routes map[string]localizationRefinementRoute,
+	digest *localizationEvidenceDigest,
+) {
 	preferredSymbol = strings.TrimSpace(preferredSymbol)
-	seen := make(map[string]struct{}, min(len(symbols), 12))
-	refinementSymbols := make([]string, 0, min(len(symbols), 12))
+	seen := make(map[string]struct{}, min(len(symbols), localizationRefinementAllowedSymbolCap))
+	refinementSymbols := make([]string, 0, min(len(symbols), localizationRefinementAllowedSymbolCap))
+	refinementRoutes := make(map[string]localizationRefinementRoute, min(len(symbols), localizationRefinementAllowedSymbolCap))
 	for _, symbol := range symbols {
 		symbol = strings.TrimSpace(symbol)
 		if symbol == "" {
+			continue
+		}
+		route, authorized := routes[symbol]
+		if !authorized {
+			continue
+		}
+		route.implementationSymbol = strings.TrimSpace(route.implementationSymbol)
+		if route.implementationSymbol == symbol {
 			continue
 		}
 		if _, duplicate := seen[symbol]; duplicate {
@@ -170,7 +223,8 @@ func (s *localizationTerminalState) armRefinementForTask(task, preferredSymbol s
 		}
 		seen[symbol] = struct{}{}
 		refinementSymbols = append(refinementSymbols, symbol)
-		if len(refinementSymbols) == 12 {
+		refinementRoutes[symbol] = route
+		if len(refinementSymbols) == localizationRefinementAllowedSymbolCap {
 			break
 		}
 	}
@@ -179,10 +233,11 @@ func (s *localizationTerminalState) armRefinementForTask(task, preferredSymbol s
 		return
 	}
 	if _, exists := seen[preferredSymbol]; !exists {
-		preferredSymbol = refinementSymbols[0]
+		s.keepOpenForTask(task)
+		return
 	}
-	completion := newLocalizationRefinementCompletion(preferredSymbol)
-	completion.refinementSymbols = refinementSymbols
+	completion := newLocalizationRefinementCompletionForSymbols(preferredSymbol, refinementSymbols)
+	completion.refinementRoutes = refinementRoutes
 	// Stashed now, not at promotion: when the permitted read succeeds,
 	// finishReservedRead flips this contract to answer_ready and the
 	// evidence must already be retained for replay.
@@ -196,9 +251,12 @@ func (s *localizationTerminalState) commitLocalizationLocked(completion localiza
 	s.exactSymbol = completion.ExactSymbol
 	s.refinementSymbol = ""
 	s.refinementSymbols = nil
+	s.refinementRoutes = nil
+	s.inFlightImplementationSymbol = ""
 	if completion.State == localizationStateNeedsRefinement {
 		s.refinementSymbol = completion.refinementSymbol
 		s.refinementSymbols = append([]string(nil), completion.refinementSymbols...)
+		s.refinementRoutes = cloneLocalizationRefinementRoutes(completion.refinementRoutes)
 	}
 	s.taskFingerprint = fingerprint
 	// The digest follows the contract: an inactive commit (keepOpenForTask)
@@ -210,7 +268,8 @@ func (s *localizationTerminalState) completionLocked() localizationCompletion {
 	var completion localizationCompletion
 	switch s.state {
 	case localizationStateNeedsRefinement, localizationStateRefineInFlight:
-		completion = newLocalizationRefinementCompletion(s.refinementSymbol)
+		completion = newLocalizationRefinementCompletionForSymbols(s.refinementSymbol, s.refinementSymbols)
+		completion.refinementRoutes = cloneLocalizationRefinementRoutes(s.refinementRoutes)
 		if s.state == localizationStateRefineInFlight {
 			completion.State = localizationStateRefineInFlight
 			completion.AllowedToolCalls = 0
@@ -220,17 +279,6 @@ func (s *localizationTerminalState) completionLocked() localizationCompletion {
 	default:
 		completion = newLocalizationCompletion(true, "")
 	}
-	completion.digest = s.digest
-	return completion
-}
-
-func (s *localizationTerminalState) answerReadyCompletion() localizationCompletion {
-	completion := newLocalizationCompletion(true, "")
-	if s == nil {
-		return completion
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	completion.digest = s.digest
 	return completion
 }
@@ -254,12 +302,8 @@ func (s *localizationTerminalState) refinementAllowsLocked(symbol string) bool {
 	if symbol == "" {
 		return false
 	}
-	for _, candidate := range s.refinementSymbols {
-		if symbol == candidate {
-			return true
-		}
-	}
-	return false
+	_, authorized := s.refinementRoutes[symbol]
+	return authorized
 }
 
 // beginLocalize reserves the only localization handler slot for this session.
@@ -376,7 +420,9 @@ func (s *localizationTerminalState) authorize(facade, operation string, argument
 		s.state = localizationStateExactReadInFlight
 		return nil, true
 	}
-	if s.state == localizationStateNeedsRefinement && facade == "read" && operation == "source" && s.refinementAllowsLocked(exactLocalizationSymbol(arguments)) {
+	refinementSymbol := exactLocalizationSymbol(arguments)
+	if s.state == localizationStateNeedsRefinement && facade == "read" && operation == "source" && s.refinementAllowsLocked(refinementSymbol) {
+		s.inFlightImplementationSymbol = s.refinementRoutes[refinementSymbol].implementationSymbol
 		s.state = localizationStateRefineInFlight
 		return nil, true
 	}
@@ -404,9 +450,9 @@ func (s *localizationTerminalState) authorize(facade, operation string, argument
 	}), false
 }
 
-func (s *localizationTerminalState) finishReservedRead(success bool) {
+func (s *localizationTerminalState) finishReservedRead(success bool) localizationCompletion {
 	if s == nil {
-		return
+		return newLocalizationCompletion(true, "")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -415,18 +461,40 @@ func (s *localizationTerminalState) finishReservedRead(success bool) {
 		if success {
 			s.state = localizationStateAnswerReady
 			s.exactSymbol = ""
-			return
+			s.inFlightImplementationSymbol = ""
+			return s.completionLocked()
 		}
 		s.state = localizationStateNeedsExactRead
 	case localizationStateRefineInFlight:
 		if success {
-			s.state = localizationStateAnswerReady
+			implementationSymbol := s.inFlightImplementationSymbol
+			s.inFlightImplementationSymbol = ""
 			s.refinementSymbol = ""
 			s.refinementSymbols = nil
-			return
+			s.refinementRoutes = nil
+			if implementationSymbol != "" {
+				s.state = localizationStateNeedsExactRead
+				s.exactSymbol = implementationSymbol
+				return s.completionLocked()
+			}
+			s.state = localizationStateAnswerReady
+			return s.completionLocked()
 		}
+		s.inFlightImplementationSymbol = ""
 		s.state = localizationStateNeedsRefinement
 	}
+	return s.completionLocked()
+}
+
+func cloneLocalizationRefinementRoutes(routes map[string]localizationRefinementRoute) map[string]localizationRefinementRoute {
+	if len(routes) == 0 {
+		return nil
+	}
+	cloned := make(map[string]localizationRefinementRoute, len(routes))
+	for symbol, route := range routes {
+		cloned[symbol] = route
+	}
+	return cloned
 }
 
 // block is retained for direct state checks; production dispatch uses

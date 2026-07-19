@@ -507,7 +507,12 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 	if localizationReadReserved {
 		localizationReadSucceeded = succeeded
 		if succeeded {
-			result = decorateLocalizationReadResult(result, terminal.answerReadyCompletion())
+			// Finalize before decorating so a preclassified generic forwarder can
+			// expose its one exact implementation hop in this same response. The
+			// dispatcher never inspects or reparses the read payload.
+			completion := terminal.finishReservedRead(true)
+			localizationReadReserved = false
+			result = decorateLocalizationReadResult(result, completion)
 		}
 	}
 	if transactionalExploreFlow {

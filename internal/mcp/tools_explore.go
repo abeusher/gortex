@@ -38,13 +38,14 @@ const exploreToolDescription = "Start here for any task, bug report, or " +
 // corpus, query vocabulary, or benchmark. The verb takes arbitrary free
 // text; nothing here is derived from a fixed task set.
 const (
-	exploreDefaultBudgetTokens = 1600
-	exploreMinBudgetTokens     = 1000
-	exploreMaxBudgetTokens     = 24000
-	exploreDefaultMaxSymbols   = 10
-	exploreMaxMaxSymbols       = 30
-	exploreRingCap             = 5 // callers / callees shown per target
-	exploreCharsPerToken       = 4 // coarse token estimate for budgeting
+	exploreDefaultBudgetTokens             = 1600
+	exploreMinBudgetTokens                 = 1000
+	exploreMaxBudgetTokens                 = 24000
+	exploreDefaultMaxSymbols               = 10
+	exploreMaxMaxSymbols                   = 30
+	exploreRingCap                         = 5 // callers / callees shown per target
+	localizationRefinementAllowedSymbolCap = 8 // preferred plus ranked alternates; preserves rank seven
+	exploreCharsPerToken                   = 4 // coarse token estimate for budgeting
 	// Full bodies are the largest repeated-context cost. Candidate headers,
 	// locations, signatures, and graph rings preserve recall for the whole
 	// neighborhood; only the top targets need full source to make the first
@@ -81,6 +82,7 @@ type exploreTarget struct {
 	score                 float64
 	callers               []*graph.Node
 	callees               []*graph.Node
+	directCalleesComplete bool // false when the direct projection was truncated, bounded, or otherwise lower-bound
 	causalCallees         []exploreCausalNeighbor
 	source                string // full body (may be empty for non-source kinds)
 	conceptImplementation bool   // one identifier-backed callable protected from final truncation
@@ -840,6 +842,149 @@ func exploreDraftGenericCandidate(n *graph.Node, source string) bool {
 	hasTailForwarder := hasCall && hasMemberAccess && !strings.Contains(tail, ";") &&
 		!strings.Contains(tail, "{") && !strings.Contains(tail, "}")
 	return hasMemberAccess && (hasOneStepReturn || hasAccessorAssignment || hasExpressionBody || hasTailForwarder)
+}
+
+// exploreLocalizationRefinementRoutes classifies the already-hydrated,
+// bounded localization targets once. Every authorized candidate is a hydrated
+// production callable. A known generic forwarder is authorized only when every
+// plausible direct callable callee resolves to the same hydrated concrete target.
+func exploreLocalizationRefinementRoutes(targets []exploreTarget) map[string]localizationRefinementRoute {
+	byID := make(map[string]exploreTarget, len(targets))
+	for _, target := range targets {
+		if target.node != nil && target.node.ID != "" {
+			byID[target.node.ID] = target
+		}
+	}
+	routes := make(map[string]localizationRefinementRoute, len(byID))
+	for _, target := range targets {
+		if !exploreHydratedProductionCallable(target) {
+			continue
+		}
+		if !exploreDraftGenericCandidate(target.node, target.source) {
+			routes[target.node.ID] = localizationRefinementRoute{}
+			continue
+		}
+		if !target.directCalleesComplete {
+			continue
+		}
+
+		implementationSymbol := ""
+		ambiguous := false
+		for _, callee := range target.callees {
+			if callee == nil || callee.ID == "" || callee.ID == target.node.ID ||
+				exploreDraftIsTestNode(callee) ||
+				(callee.Kind != graph.KindFunction && callee.Kind != graph.KindMethod) {
+				continue
+			}
+			candidate, visible := byID[callee.ID]
+			if !visible || !exploreHydratedProductionCallable(candidate) ||
+				exploreDraftGenericCandidate(candidate.node, candidate.source) {
+				ambiguous = true
+				break
+			}
+			if implementationSymbol == "" {
+				implementationSymbol = candidate.node.ID
+				continue
+			}
+			if implementationSymbol != candidate.node.ID {
+				ambiguous = true
+				break
+			}
+		}
+		if implementationSymbol != "" && !ambiguous {
+			routes[target.node.ID] = localizationRefinementRoute{implementationSymbol: implementationSymbol}
+		}
+	}
+	return routes
+}
+
+func exploreHydratedProductionCallable(target exploreTarget) bool {
+	if target.node == nil || target.node.ID == "" || exploreDraftIsTestNode(target.node) {
+		return false
+	}
+	if target.node.Kind != graph.KindFunction && target.node.Kind != graph.KindMethod {
+		return false
+	}
+	return strings.TrimSpace(target.source) != ""
+}
+
+func explorePreferredRoutedRefinementSymbol(
+	preferred string,
+	targets []exploreTarget,
+	routes map[string]localizationRefinementRoute,
+) string {
+	if route, authorized := routes[preferred]; authorized {
+		if route.implementationSymbol == "" {
+			return preferred
+		}
+		if implementationRoute, implementationAuthorized := routes[route.implementationSymbol]; implementationAuthorized && implementationRoute.implementationSymbol == "" {
+			return route.implementationSymbol
+		}
+	}
+	// The semantic preferred target can be generic, ambiguous, or unhydrated.
+	// Fall back deterministically to the first ranked concrete authorized target;
+	// a generic wrapper is never recommended even when it is a valid alternate.
+	for _, target := range targets {
+		if target.node == nil {
+			continue
+		}
+		if route, authorized := routes[target.node.ID]; authorized && route.implementationSymbol == "" {
+			return target.node.ID
+		}
+	}
+	return ""
+}
+
+// boundedLocalizationRefinementRoutes intersects precomputed routes with the
+// symbols that survived envelope budgeting. A generic route is retained only
+// when its concrete hop is visible in the same envelope.
+func boundedLocalizationRefinementRoutes(
+	symbols []string,
+	routes map[string]localizationRefinementRoute,
+	preferredSymbol string,
+) ([]string, map[string]localizationRefinementRoute) {
+	visible := make(map[string]struct{}, len(symbols))
+	for _, symbol := range symbols {
+		visible[symbol] = struct{}{}
+	}
+	authorized := make([]string, 0, min(len(symbols), localizationRefinementAllowedSymbolCap))
+	bounded := make(map[string]localizationRefinementRoute, min(len(symbols), localizationRefinementAllowedSymbolCap))
+	appendAuthorized := func(symbol string) {
+		if symbol == "" || len(authorized) >= localizationRefinementAllowedSymbolCap {
+			return
+		}
+		if _, duplicate := bounded[symbol]; duplicate {
+			return
+		}
+		route, ok := routes[symbol]
+		if !ok {
+			return
+		}
+		if route.implementationSymbol != "" {
+			if _, implementationVisible := visible[route.implementationSymbol]; !implementationVisible {
+				return
+			}
+		}
+		authorized = append(authorized, symbol)
+		bounded[symbol] = route
+	}
+	// The recommendation must stay visible and authorized even when ranking
+	// places it after the alternate recovery window.
+	appendAuthorized(preferredSymbol)
+	for _, symbol := range symbols {
+		appendAuthorized(symbol)
+	}
+	return authorized, bounded
+}
+
+func exploreLocalizationTargetSymbols(targets []exploreTarget) []string {
+	symbols := make([]string, 0, len(targets))
+	for _, target := range targets {
+		if target.node != nil && target.node.ID != "" {
+			symbols = append(symbols, target.node.ID)
+		}
+	}
+	return symbols
 }
 
 func exploreDraftExactAnchor(query string, n *graph.Node) bool {
@@ -1841,6 +1986,7 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 			causalElapsed += time.Since(started)
 		}
 		if callees != nil {
+			t.directCalleesComplete = !callees.Truncated && !callees.BudgetHit && !callees.LowerBound
 			if expanded {
 				neighbors := minimumExploreCausalHops(n.ID, callees, opts, exploreCausalDepth, ringOpts.Limit)
 				direct := make([]*graph.Node, 0, exploreRingCap)
@@ -1852,12 +1998,18 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 					}
 				}
 				if len(neighbors) > 0 {
-					t.callees = ringNeighbors(direct, n.ID, exploreRingCap)
+					var projectionComplete bool
+					t.callees, projectionComplete = ringNeighborsProjection(direct, n.ID, exploreRingCap)
+					t.directCalleesComplete = t.directCalleesComplete && projectionComplete
 				} else {
-					t.callees = ringNeighbors(callees.Nodes, n.ID, exploreRingCap)
+					var projectionComplete bool
+					t.callees, projectionComplete = ringNeighborsProjection(callees.Nodes, n.ID, exploreRingCap)
+					t.directCalleesComplete = t.directCalleesComplete && projectionComplete
 				}
 			} else {
-				t.callees = ringNeighbors(callees.Nodes, n.ID, exploreRingCap)
+				var projectionComplete bool
+				t.callees, projectionComplete = ringNeighborsProjection(callees.Nodes, n.ID, exploreRingCap)
+				t.directCalleesComplete = t.directCalleesComplete && projectionComplete
 			}
 		}
 		targets = append(targets, t)
@@ -1903,14 +2055,23 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		// exploration, multiplying turns and payloads. Name one concrete ranked
 		// target for the only permitted refinement read; source-literal evidence
 		// wins because it is absent from ordinary symbol metadata.
-		preferredSymbol := explorePreferredRefinementSymbol(task, symbolTargets)
-		completion := newLocalizationRefinementCompletion(preferredSymbol)
-		result, returnedSymbols, digest := buildLocalizationExploreResultForTask(completion, task, targets, budget)
-		// Authorization is derived from the exact serialized projection, not
-		// the larger pre-budget candidate set. The preferred symbol is mandatory
-		// in that projection and is the only candidate accepted by the session
-		// guard, so the instruction and enforcement cannot diverge.
-		s.localizationFor(ctx).armRefinementForTask(task, preferredSymbol, returnedSymbols, digest)
+		routes := exploreLocalizationRefinementRoutes(symbolTargets)
+		preferredSymbol := explorePreferredRoutedRefinementSymbol(
+			explorePreferredRefinementSymbol(task, symbolTargets), symbolTargets, routes,
+		)
+		result, refinement, boundedRoutes, digest := buildLocalizationRefinementResultForTask(
+			preferredSymbol, task, targets, budget, routes,
+		)
+		if refinement.State != localizationStateNeedsRefinement {
+			s.localizationFor(ctx).keepOpenForTask(task)
+			return result, nil
+		}
+		// Wire and server authorization are derived from the same finalized
+		// post-budget set. Known generic wrappers without a visible, unique
+		// concrete hop remain evidence but are never authorized.
+		s.localizationFor(ctx).armRefinementRoutesForTask(
+			task, refinement.refinementSymbol, refinement.AllowedSymbols, boundedRoutes, digest,
+		)
 		return result, nil
 	}
 	completion := newLocalizationCompletion(answerReady, exactSymbol)
@@ -1926,10 +2087,20 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	if answerReady && exactSymbol == "" &&
 		exploreAnswerReadyViaLiteralOnly(task, symbolTargets) &&
 		!exploreResultCitesTaskLiteral(result, task) {
-		preferredSymbol := explorePreferredRefinementSymbol(task, symbolTargets)
-		refinement := newLocalizationRefinementCompletion(preferredSymbol)
-		refined, returnedSymbols, refinedDigest := buildLocalizationExploreResultForTask(refinement, task, targets, budget)
-		s.localizationFor(ctx).armRefinementForTask(task, preferredSymbol, returnedSymbols, refinedDigest)
+		routes := exploreLocalizationRefinementRoutes(symbolTargets)
+		preferredSymbol := explorePreferredRoutedRefinementSymbol(
+			explorePreferredRefinementSymbol(task, symbolTargets), symbolTargets, routes,
+		)
+		refined, refinement, boundedRoutes, refinedDigest := buildLocalizationRefinementResultForTask(
+			preferredSymbol, task, targets, budget, routes,
+		)
+		if refinement.State != localizationStateNeedsRefinement {
+			s.localizationFor(ctx).keepOpenForTask(task)
+			return refined, nil
+		}
+		s.localizationFor(ctx).armRefinementRoutesForTask(
+			task, refinement.refinementSymbol, refinement.AllowedSymbols, boundedRoutes, refinedDigest,
+		)
 		return refined, nil
 	}
 	completion.digest = digest
@@ -1963,12 +2134,7 @@ type localizationEvidence struct {
 }
 
 func (s *Server) completeEmptyLocalization(ctx context.Context, task string, budget int) *mcp.CallToolResult {
-	completion := localizationCompletion{
-		State:            localizationStateInactive,
-		Scope:            "localization",
-		RequiredAction:   "continue",
-		AllowedToolCalls: 0,
-	}
+	completion := newLocalizationOpenCompletion()
 	// An empty result supersedes any previous task contract but must not arm
 	// answer-ready or an exact-read allowance. Stage the open state so facade
 	// dispatch commits it only after the successful response.
@@ -2397,10 +2563,60 @@ func newLocalizationExploreResultForTask(completion localizationCompletion, task
 }
 
 // buildLocalizationExploreResultForTask returns both the result and the exact
+type localizationCompletionFinalizer func([]string) localizationCompletion
+
+func buildLocalizationRefinementResultForTask(
+	preferredSymbol, task string,
+	targets []exploreTarget,
+	budget int,
+	routes map[string]localizationRefinementRoute,
+) (*mcp.CallToolResult, localizationCompletion, map[string]localizationRefinementRoute, *localizationEvidenceDigest) {
+	open := newLocalizationOpenCompletion()
+	candidateSymbols := exploreLocalizationTargetSymbols(targets)
+	preauthorized, prebounded := boundedLocalizationRefinementRoutes(candidateSymbols, routes, preferredSymbol)
+	if preferredSymbol == "" {
+		result, _, digest := buildLocalizationExploreResultForTask(open, task, targets, budget)
+		return result, open, nil, digest
+	}
+	if _, preferredAuthorized := prebounded[preferredSymbol]; !preferredAuthorized {
+		result, _, digest := buildLocalizationExploreResultForTask(open, task, targets, budget)
+		return result, open, nil, digest
+	}
+
+	// Budget against the largest completion this envelope can expose. The final
+	// allowed set is an equal or smaller intersection with serialized symbols,
+	// so replacing this provisional contract cannot invalidate the byte cap.
+	budgetCompletion := newLocalizationRefinementCompletionForSymbols(preferredSymbol, preauthorized)
+	budgetCompletion.refinementRoutes = prebounded
+	finalCompletion := open
+	var finalRoutes map[string]localizationRefinementRoute
+	result, _, digest := buildLocalizationExploreResultForTask(
+		budgetCompletion, task, targets, budget,
+		func(returnedSymbols []string) localizationCompletion {
+			allowedSymbols, bounded := boundedLocalizationRefinementRoutes(returnedSymbols, routes, preferredSymbol)
+			if _, preferredAuthorized := bounded[preferredSymbol]; !preferredAuthorized {
+				finalRoutes = nil
+				return open
+			}
+			finalRoutes = bounded
+			finalCompletion = newLocalizationRefinementCompletionForSymbols(preferredSymbol, allowedSymbols)
+			finalCompletion.refinementRoutes = bounded
+			return finalCompletion
+		},
+	)
+	return result, finalCompletion, finalRoutes, digest
+}
+
 // bounded symbol projection serialized into it. Refinement authorization uses
 // this projection so every authorized ID is visible and every visible evidence
 // target is authorized without a second ranking or budgeting pass.
-func buildLocalizationExploreResultForTask(completion localizationCompletion, task string, targets []exploreTarget, budget int) (*mcp.CallToolResult, []string, *localizationEvidenceDigest) {
+func buildLocalizationExploreResultForTask(
+	completion localizationCompletion,
+	task string,
+	targets []exploreTarget,
+	budget int,
+	finalize ...localizationCompletionFinalizer,
+) (*mcp.CallToolResult, []string, *localizationEvidenceDigest) {
 	var draft []exploreDraftEntry
 	if strings.TrimSpace(task) != "" {
 		draft = exploreAnswerDraft(task, targets)
@@ -2436,8 +2652,14 @@ func buildLocalizationExploreResultForTask(completion localizationCompletion, ta
 	}
 	// Primary retrieval evidence and the authorized exact/refinement symbol are
 	// both mandatory regardless of which one leads the serialized projection.
-	// Packing operates on a prefix, so retain through the later of the two.
-	for _, mandatoryID := range []string{primarySymbol, requiredSymbol} {
+	// A generic preferred candidate also reserves its one prevalidated concrete
+	// hop, because the route is invalid unless both IDs are visible on the wire.
+	mandatoryIDs := []string{primarySymbol, requiredSymbol}
+	if route, routed := completion.refinementRoutes[requiredSymbol]; routed && route.implementationSymbol != "" {
+		mandatoryIDs = append(mandatoryIDs, route.implementationSymbol)
+	}
+	// Packing operates on a prefix, so retain through the latest mandatory ID.
+	for _, mandatoryID := range mandatoryIDs {
 		if mandatoryID == "" {
 			continue
 		}
@@ -2547,6 +2769,9 @@ func buildLocalizationExploreResultForTask(completion localizationCompletion, ta
 		}
 	}
 
+	if len(finalize) > 0 && finalize[0] != nil {
+		envelope.Completion = finalize[0](append([]string(nil), envelope.Symbols...))
+	}
 	body, err := json.Marshal(envelope)
 	if err != nil {
 		return mcp.NewToolResultError("encode localization result: " + err.Error()), nil, nil
@@ -2772,17 +2997,30 @@ func exploreLocalizableKind(k graph.NodeKind) bool {
 // ringNeighbors filters a traversal result's nodes to real neighbors (not
 // the focus node itself, not param/local/import noise), capped.
 func ringNeighbors(nodes []*graph.Node, selfID string, cap int) []*graph.Node {
+	out, _ := ringNeighborsProjection(nodes, selfID, cap)
+	return out
+}
+
+// ringNeighborsProjection also reports whether every eligible neighbor fit in
+// the projection. Callers can reject uniqueness claims made from a saturated
+// ring without issuing another graph query.
+func ringNeighborsProjection(nodes []*graph.Node, selfID string, cap int) ([]*graph.Node, bool) {
+	if cap < 1 {
+		return nil, false
+	}
 	out := make([]*graph.Node, 0, cap)
+	complete := true
 	for _, n := range nodes {
 		if n == nil || n.ID == selfID || !exploreLocalizableKind(n.Kind) {
 			continue
 		}
-		out = append(out, n)
 		if len(out) >= cap {
-			break
+			complete = false
+			continue
 		}
+		out = append(out, n)
 	}
-	return out
+	return out, complete
 }
 
 // joinNeighbors renders a neighbor ring as "name (path:line), name (path:line)".
