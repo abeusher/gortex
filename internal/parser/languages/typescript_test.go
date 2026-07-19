@@ -1065,3 +1065,39 @@ func TestTemplateExprCallMining(t *testing.T) {
 	assert.True(t, callTag, "a tagged-template tag is a call")
 	assert.False(t, fnvalTag, "a tagged-template tag is NOT a function-as-value candidate")
 }
+
+// Curried const-arrow middleware with generics — the store-middleware shape:
+// the const binding extracts as a function with its parameters, exported type
+// aliases extract as types, and a nested const-arrow helper inside the body
+// extracts too. Pinned so selection-layer work can rely on these symbols
+// existing; the historical miss on this shape was emission, not extraction.
+func TestTypeScriptCurriedConstArrowMiddlewareExtraction(t *testing.T) {
+	src := []byte(`export type StoreSetStateWithAction<T> = (state: T, replace?: boolean, action?: string) => void
+
+const middlewareImpl: MiddlewareImpl =
+  (fn, middlewareOptions = {}) =>
+  (set, get, api) => {
+    const setStateTracked: SetStateTracked = (...a) => set(...a)
+    return fn(setStateTracked, get, api)
+  }
+`)
+	e := NewTypeScriptExtractor()
+	result, err := e.Extract("mw/middleware.ts", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := map[string]string{}
+	for _, n := range result.Nodes {
+		ids[n.ID] = string(n.Kind)
+	}
+	for id, kind := range map[string]string{
+		"mw/middleware.ts::StoreSetStateWithAction":              "type",
+		"mw/middleware.ts::middlewareImpl":                       "function",
+		"mw/middleware.ts::middlewareImpl#param:middlewareOptions@1": "param",
+		"mw/middleware.ts::setStateTracked":                      "function",
+	} {
+		if ids[id] != kind {
+			t.Fatalf("%s = %q, want %q (all: %v)", id, ids[id], kind, ids)
+		}
+	}
+}

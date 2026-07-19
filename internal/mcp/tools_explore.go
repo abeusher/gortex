@@ -1862,6 +1862,19 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	// too, whose success promotes to answer_ready with the evidence already
 	// stashed.
 	result, _, digest := buildLocalizationExploreResultForTask(completion, task, targets, budget)
+	// Literal-driven terminality must show its evidence: when the verdict
+	// rests on a quoted-literal match but the budgeted envelope shed the
+	// literal, downgrade to the bounded refinement read instead of telling
+	// the host to answer from evidence it cannot see.
+	if answerReady && exactSymbol == "" &&
+		exploreAnswerReadyViaLiteralOnly(task, symbolTargets) &&
+		!exploreResultCitesTaskLiteral(result, task) {
+		preferredSymbol := explorePreferredRefinementSymbol(task, symbolTargets)
+		refinement := newLocalizationRefinementCompletion(preferredSymbol)
+		refined, returnedSymbols, refinedDigest := buildLocalizationExploreResultForTask(refinement, task, targets, budget)
+		s.localizationFor(ctx).armRefinementForTask(task, preferredSymbol, returnedSymbols, refinedDigest)
+		return refined, nil
+	}
 	completion.digest = digest
 	s.localizationFor(ctx).armForTask(completion, task)
 	return result, nil
