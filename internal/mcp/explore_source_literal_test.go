@@ -164,7 +164,7 @@ func TestMapExploreSourceLiteralMatchesPromotesUniqueDirectCalleeAcrossLanguages
 				Path: path, Line: 3, Text: test.line,
 			}}, query.QueryOptions{RepoAllow: map[string]bool{"demo": true}})
 
-			require.Equal(t, []exploreSourceLiteralHit{{nodeID: callee.ID, rank: 0}}, recall.hits)
+			require.Equal(t, []exploreSourceLiteralHit{{nodeID: callee.ID, rank: 0, callee: true}}, recall.hits)
 			require.Equal(t, callee.FilePath, recall.ownerFiles[callee.ID])
 			require.Zero(t, counting.allNodesCalls, "callee promotion must remain batch- and file-bounded")
 			require.Equal(t, 1, counting.outEdgeBatchCalls)
@@ -782,6 +782,7 @@ func TestGatherExploreSourceLiteralRecallMapsParsedCSharpConstructor(t *testing.
 		node := store.GetNode(hit.nodeID)
 		if node != nil && node.FilePath == rel && node.Name == "RegisterDefaultFormatter" {
 			found = true
+			require.True(t, hit.callee, "unique call-edge promotion must retain strong provenance")
 		}
 	}
 	require.True(t, found, "literal callsite must promote the uniquely resolved invoked method")
@@ -804,10 +805,17 @@ func TestGatherExploreSourceLiteralRecallMapsParsedCSharpConstructor(t *testing.
 	require.NoError(t, json.Unmarshal([]byte(text.Text), &envelope))
 	require.NotEmpty(t, envelope.Evidence)
 	require.Equal(t, "RegisterDefaultFormatter", envelope.Evidence[0].Name, "invoked source evidence must lead the final localization envelope")
-	if envelope.Completion.State == localizationStateNeedsRefinement {
-		require.Contains(t, envelope.Completion.AllowedSymbols, callees[0].ID)
-		require.Contains(t, envelope.Completion.RequiredAction, envelope.Evidence[0].ID)
-	}
+	require.Equal(t, localizationProvenanceSourceLiteralCallee, envelope.Evidence[0].Provenance)
+	require.Equal(t, localizationStateAnswerReady, envelope.Completion.State)
+	require.True(t, envelope.Terminal)
+	require.True(t, envelope.Completion.Enforceable)
+	require.NotNil(t, result.Meta)
+	host, ok := result.Meta.AdditionalFields[localizationHostMetaKey].(localizationHostEnvelope)
+	require.True(t, ok, "initial explore must attach an authoritative host envelope")
+	require.Equal(t, localizationContractFor(envelope.Completion), host.Contract)
+	require.NotNil(t, host.Evidence)
+	require.NotEmpty(t, host.Evidence.Evidence)
+	require.Equal(t, localizationProvenanceSourceLiteralCallee, host.Evidence.Evidence[0].Provenance)
 	require.Zero(t, counting.allNodesCalls, "literal mapping must stay bounded to matched files")
 }
 

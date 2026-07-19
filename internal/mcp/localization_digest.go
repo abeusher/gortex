@@ -38,16 +38,17 @@ type localizationEvidenceDigest struct {
 }
 
 type localizationDigestRow struct {
-	Rank      int      `json:"rank,omitempty"`
-	ID        string   `json:"id,omitempty"`
-	Name      string   `json:"name,omitempty"`
-	QualName  string   `json:"qual_name,omitempty"`
-	Kind      string   `json:"kind,omitempty"`
-	File      string   `json:"file,omitempty"`
-	Line      int      `json:"line,omitempty"`
-	Signature string   `json:"signature,omitempty"`
-	Callers   []string `json:"callers,omitempty"`
-	Callees   []string `json:"callees,omitempty"`
+	Rank       int      `json:"rank,omitempty"`
+	ID         string   `json:"id,omitempty"`
+	Name       string   `json:"name,omitempty"`
+	QualName   string   `json:"qual_name,omitempty"`
+	Kind       string   `json:"kind,omitempty"`
+	File       string   `json:"file,omitempty"`
+	Line       int      `json:"line,omitempty"`
+	Signature  string   `json:"signature,omitempty"`
+	Callers    []string `json:"callers,omitempty"`
+	Callees    []string `json:"callees,omitempty"`
+	Provenance string   `json:"provenance,omitempty"`
 }
 
 // newLocalizationEvidenceDigest retains only concrete ranked evidence rows.
@@ -70,16 +71,17 @@ func newLocalizationEvidenceDigest(envelope localizationExploreEnvelope) *locali
 		}
 		seen[row.ID] = struct{}{}
 		digest.Evidence = append(digest.Evidence, localizationDigestRow{
-			Rank:      row.Rank,
-			ID:        row.ID,
-			Name:      row.Name,
-			QualName:  row.QualName,
-			Kind:      row.Kind,
-			File:      row.File,
-			Line:      row.Line,
-			Signature: row.Signature,
-			Callers:   append([]string(nil), row.Callers...),
-			Callees:   append([]string(nil), row.Callees...),
+			Rank:       row.Rank,
+			ID:         row.ID,
+			Name:       row.Name,
+			QualName:   row.QualName,
+			Kind:       row.Kind,
+			File:       row.File,
+			Line:       row.Line,
+			Signature:  row.Signature,
+			Callers:    append([]string(nil), row.Callers...),
+			Callees:    append([]string(nil), row.Callees...),
+			Provenance: row.Provenance,
 		})
 	}
 	for {
@@ -160,10 +162,9 @@ type localizationHostEnvelope struct {
 	Contract       localizationTerminalContract `json:"contract"`
 }
 
-// TODO(localization-v2): once the explore ranking patch is stable, attach this
-// envelope to the initial explore(localize) result after its final byte-budgeted
-// completion and digest are known. This pass deliberately wires authoritative
-// metadata only for allowed reads and terminal-result helpers.
+// Initial localization and authorized reads call this only after byte-budget
+// packing and evidence-policy finalization, so visible and authoritative host
+// contracts always describe the same completion.
 func attachLocalizationHostEnvelope(result *mcpgo.CallToolResult, completion localizationCompletion, digest *localizationEvidenceDigest) *mcpgo.CallToolResult {
 	if result == nil {
 		return result

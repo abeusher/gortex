@@ -91,6 +91,7 @@ type exploreTarget struct {
 	exactContent          bool   // verified full quoted-literal hit from content_fts
 	exactContentAmbiguous bool   // exact evidence has visible or possibly truncated peers
 	sourceLiteral         bool   // exact source-body hit that must survive final envelope packing
+	sourceLiteralCallee   bool   // exact source callsite uniquely resolved to this invoked callable
 }
 
 type exploreCausalNeighbor struct {
@@ -863,7 +864,9 @@ func exploreLocalizationRefinementRoutes(targets []exploreTarget) map[string]loc
 			continue
 		}
 		if !exploreDraftGenericCandidate(target.node, target.source) {
-			routes[target.node.ID] = localizationRefinementRoute{}
+			routes[target.node.ID] = localizationRefinementRoute{
+				enforceable: localizationStrongSourceLiteralCallee(target),
+			}
 			continue
 		}
 		if !target.directCalleesComplete {
@@ -894,8 +897,33 @@ func exploreLocalizationRefinementRoutes(targets []exploreTarget) map[string]loc
 			}
 		}
 		if implementationSymbol != "" && !ambiguous {
-			routes[target.node.ID] = localizationRefinementRoute{implementationSymbol: implementationSymbol}
+			implementation := byID[implementationSymbol]
+			routes[target.node.ID] = localizationRefinementRoute{
+				implementationSymbol: implementationSymbol,
+				enforceable:          localizationStrongImplementationRoute(target, implementation),
+			}
 		}
+	}
+	// The recommended read is normally the concrete implementation, not its
+	// generic wrapper. Carry the wrapper's proof onto that exact route so the
+	// one-read fast path preserves trust; ordinary concrete hydration remains
+	// advisory. Ranked target order deterministically chooses among equivalent
+	// proven wrappers.
+	for _, target := range targets {
+		if target.node == nil {
+			continue
+		}
+		wrapperRoute, ok := routes[target.node.ID]
+		if !ok || !wrapperRoute.enforceable || wrapperRoute.implementationSymbol == "" {
+			continue
+		}
+		implementationRoute, ok := routes[wrapperRoute.implementationSymbol]
+		if !ok || implementationRoute.implementationSymbol != "" || implementationRoute.proofSymbol != "" {
+			continue
+		}
+		implementationRoute.enforceable = true
+		implementationRoute.proofSymbol = target.node.ID
+		routes[wrapperRoute.implementationSymbol] = implementationRoute
 	}
 	return routes
 }
@@ -964,6 +992,11 @@ func boundedLocalizationRefinementRoutes(
 		}
 		if route.implementationSymbol != "" {
 			if _, implementationVisible := visible[route.implementationSymbol]; !implementationVisible {
+				return
+			}
+		}
+		if route.proofSymbol != "" {
+			if _, proofVisible := visible[route.proofSymbol]; !proofVisible {
 				return
 			}
 		}
@@ -1966,6 +1999,7 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 			t.exactContent = c.Signals[exploreContentRecallExactSignal] > 0
 			t.exactContentAmbiguous = c.Signals[exploreContentRecallAmbiguousSignal] > 0
 			t.sourceLiteral = c.Signals[exploreSourceLiteralSignal] > 0
+			t.sourceLiteralCallee = c.Signals[exploreSourceLiteralCalleeSignal] > 0
 		}
 		t.source = s.manifestSymbolSource(ctx, n)
 		if callers := eng.GetCallers(n.ID, ringOpts); callers != nil {
@@ -2096,13 +2130,13 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	// and is retained for post-terminal replay — for the exact-read contract
 	// too, whose success promotes to answer_ready with the evidence already
 	// stashed.
-	result, _, digest := buildLocalizationExploreResultForTask(completion, task, targets, budget)
+	result, _, digest, completion := buildLocalizationExploreResultForTaskFinalized(completion, task, targets, budget)
 	// Literal-driven terminality must show its evidence: when the verdict
 	// rests on a quoted-literal match but the budgeted envelope shed the
 	// literal, downgrade to the bounded refinement read instead of telling
 	// the host to answer from evidence it cannot see.
 	if answerReady && exactSymbol == "" &&
-		exploreAnswerReadyViaLiteralOnly(task, symbolTargets) &&
+		exploreAnswerReadyViaLiteralOnly(task, symbolTargets) && !completion.Enforceable &&
 		!exploreResultCitesTaskLiteral(result, task) {
 		routes := exploreLocalizationRefinementRoutes(symbolTargets)
 		preferredSymbol := explorePreferredRoutedRefinementSymbol(
@@ -2130,24 +2164,26 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 // human-oriented legacy rendering; localize does not duplicate it.
 type localizationExploreEnvelope struct {
 	Completion localizationCompletion `json:"completion"`
+	Terminal   bool                   `json:"terminal"`
 	Files      []string               `json:"files"`
 	Symbols    []string               `json:"symbols"`
 	Evidence   []localizationEvidence `json:"evidence"`
 }
 
 type localizationEvidence struct {
-	Rank      int      `json:"rank"`
-	ID        string   `json:"id"`
-	Name      string   `json:"name"`
-	QualName  string   `json:"qual_name,omitempty"`
-	Kind      string   `json:"kind"`
-	File      string   `json:"file"`
-	Line      int      `json:"line"`
-	EndLine   int      `json:"end_line,omitempty"`
-	Signature string   `json:"signature,omitempty"`
-	Callers   []string `json:"callers,omitempty"`
-	Callees   []string `json:"callees,omitempty"`
-	Source    string   `json:"source,omitempty"`
+	Rank       int      `json:"rank"`
+	ID         string   `json:"id"`
+	Name       string   `json:"name"`
+	QualName   string   `json:"qual_name,omitempty"`
+	Kind       string   `json:"kind"`
+	File       string   `json:"file"`
+	Line       int      `json:"line"`
+	EndLine    int      `json:"end_line,omitempty"`
+	Signature  string   `json:"signature,omitempty"`
+	Callers    []string `json:"callers,omitempty"`
+	Callees    []string `json:"callees,omitempty"`
+	Provenance string   `json:"provenance,omitempty"`
+	Source     string   `json:"source,omitempty"`
 }
 
 func (s *Server) completeEmptyLocalization(ctx context.Context, task string, budget int) *mcp.CallToolResult {
@@ -2608,8 +2644,23 @@ func newLocalizationExploreResultForTask(completion localizationCompletion, task
 	return result
 }
 
-// buildLocalizationExploreResultForTask returns both the result and the exact
-type localizationCompletionFinalizer func([]string) localizationCompletion
+// buildLocalizationExploreResultForTask returns the packed result and the exact
+// bounded symbol projection serialized into it. Callers that also need the
+// post-budget completion use buildLocalizationExploreResultForTaskFinalized.
+func buildLocalizationExploreResultForTask(
+	completion localizationCompletion,
+	task string,
+	targets []exploreTarget,
+	budget int,
+	finalize ...localizationCompletionFinalizer,
+) (*mcp.CallToolResult, []string, *localizationEvidenceDigest) {
+	result, symbols, digest, _ := buildLocalizationExploreResultForTaskFinalized(
+		completion, task, targets, budget, finalize...,
+	)
+	return result, symbols, digest
+}
+
+type localizationCompletionFinalizer func(localizationExploreEnvelope) localizationCompletion
 
 func buildLocalizationRefinementResultForTask(
 	preferredSymbol, task string,
@@ -2621,11 +2672,11 @@ func buildLocalizationRefinementResultForTask(
 	candidateSymbols := exploreLocalizationTargetSymbols(targets)
 	preauthorized, prebounded := boundedLocalizationRefinementRoutes(candidateSymbols, routes, preferredSymbol)
 	if preferredSymbol == "" {
-		result, _, digest := buildLocalizationExploreResultForTask(open, task, targets, budget)
+		result, _, digest, _ := buildLocalizationExploreResultForTaskFinalized(open, task, targets, budget)
 		return result, open, nil, digest
 	}
 	if _, preferredAuthorized := prebounded[preferredSymbol]; !preferredAuthorized {
-		result, _, digest := buildLocalizationExploreResultForTask(open, task, targets, budget)
+		result, _, digest, _ := buildLocalizationExploreResultForTaskFinalized(open, task, targets, budget)
 		return result, open, nil, digest
 	}
 
@@ -2636,33 +2687,33 @@ func buildLocalizationRefinementResultForTask(
 	budgetCompletion.refinementRoutes = prebounded
 	finalCompletion := open
 	var finalRoutes map[string]localizationRefinementRoute
-	result, _, digest := buildLocalizationExploreResultForTask(
+	result, _, digest, packedCompletion := buildLocalizationExploreResultForTaskFinalized(
 		budgetCompletion, task, targets, budget,
-		func(returnedSymbols []string) localizationCompletion {
-			allowedSymbols, bounded := boundedLocalizationRefinementRoutes(returnedSymbols, routes, preferredSymbol)
+		func(packed localizationExploreEnvelope) localizationCompletion {
+			allowedSymbols, bounded := boundedLocalizationRefinementRoutes(packed.Symbols, routes, preferredSymbol)
 			if _, preferredAuthorized := bounded[preferredSymbol]; !preferredAuthorized {
 				finalRoutes = nil
 				return open
 			}
-			finalRoutes = bounded
+			finalRoutes = localizationBoundRouteEvidence(bounded, packed)
 			finalCompletion = newLocalizationRefinementCompletionForSymbols(preferredSymbol, allowedSymbols)
-			finalCompletion.refinementRoutes = bounded
+			finalCompletion.refinementRoutes = finalRoutes
 			return finalCompletion
 		},
 	)
+	finalCompletion = packedCompletion
 	return result, finalCompletion, finalRoutes, digest
 }
 
-// bounded symbol projection serialized into it. Refinement authorization uses
-// this projection so every authorized ID is visible and every visible evidence
-// target is authorized without a second ranking or budgeting pass.
-func buildLocalizationExploreResultForTask(
+// The finalized variant additionally returns the exact completion used by both
+// visible text and authoritative host metadata after byte-budget packing.
+func buildLocalizationExploreResultForTaskFinalized(
 	completion localizationCompletion,
 	task string,
 	targets []exploreTarget,
 	budget int,
 	finalize ...localizationCompletionFinalizer,
-) (*mcp.CallToolResult, []string, *localizationEvidenceDigest) {
+) (*mcp.CallToolResult, []string, *localizationEvidenceDigest, localizationCompletion) {
 	var draft []exploreDraftEntry
 	if strings.TrimSpace(task) != "" {
 		draft = exploreAnswerDraft(task, targets)
@@ -2681,8 +2732,10 @@ func buildLocalizationExploreResultForTask(
 	if refinementFirst {
 		targets = prioritizeLocalizationEvidenceTarget(requiredSymbol, targets)
 	}
+	contract := localizationContractFor(completion)
 	envelope := localizationExploreEnvelope{
-		Completion: completion,
+		Completion: contract.Completion,
+		Terminal:   contract.Terminal,
 		Files:      make([]string, 0),
 		Symbols:    make([]string, 0),
 		Evidence:   make([]localizationEvidence, 0),
@@ -2706,8 +2759,13 @@ func buildLocalizationExploreResultForTask(
 	// A generic preferred candidate also reserves its one prevalidated concrete
 	// hop, because the route is invalid unless both IDs are visible on the wire.
 	mandatoryIDs := []string{primarySymbol, requiredSymbol}
-	if route, routed := completion.refinementRoutes[requiredSymbol]; routed && route.implementationSymbol != "" {
-		mandatoryIDs = append(mandatoryIDs, route.implementationSymbol)
+	if route, routed := completion.refinementRoutes[requiredSymbol]; routed {
+		if route.implementationSymbol != "" {
+			mandatoryIDs = append(mandatoryIDs, route.implementationSymbol)
+		}
+		if route.proofSymbol != "" {
+			mandatoryIDs = append(mandatoryIDs, route.proofSymbol)
+		}
 	}
 	// Packing operates on a prefix, so retain through the latest mandatory ID.
 	for _, mandatoryID := range mandatoryIDs {
@@ -2742,10 +2800,11 @@ func buildLocalizationExploreResultForTask(
 			Name: compactLocalizationField(n.Name, localizationMaxNameRunes),
 			Kind: string(n.Kind), File: path,
 			Line: n.StartLine, EndLine: n.EndLine,
-			QualName:  compactLocalizationField(retrieval.QualName, localizationMaxQualNameRunes),
-			Signature: compactLocalizationField(retrieval.Signature, localizationMaxSignatureRunes),
-			Callers:   boundedLocalizationNeighborIDs(target.callers, localizationMaxNeighborIDs),
-			Callees:   boundedLocalizationNeighborIDs(target.callees, localizationMaxNeighborIDs),
+			QualName:   compactLocalizationField(retrieval.QualName, localizationMaxQualNameRunes),
+			Signature:  compactLocalizationField(retrieval.Signature, localizationMaxSignatureRunes),
+			Callers:    boundedLocalizationNeighborIDs(target.callers, localizationMaxNeighborIDs),
+			Callees:    boundedLocalizationNeighborIDs(target.callees, localizationMaxNeighborIDs),
+			Provenance: localizationTargetProvenance(completion, target),
 		}
 
 		candidate := envelope
@@ -2821,13 +2880,22 @@ func buildLocalizationExploreResultForTask(
 	}
 
 	if len(finalize) > 0 && finalize[0] != nil {
-		envelope.Completion = finalize[0](append([]string(nil), envelope.Symbols...))
+		envelope.Completion = finalize[0](envelope)
 	}
+	// Strong enforcement is derived only from proof rows that survived final
+	// byte-budget packing. Visible text, retained state, and host metadata then
+	// share this one normalized completion value.
+	envelope.Completion = localizationFinalizeCompletionEvidence(envelope.Completion, acceptedTargets, envelope)
+	contract = localizationContractFor(envelope.Completion)
+	envelope.Completion = contract.Completion
+	envelope.Terminal = contract.Terminal
 	body, err := json.Marshal(envelope)
 	if err != nil {
-		return mcp.NewToolResultError("encode localization result: " + err.Error()), nil, nil
+		return mcp.NewToolResultError("encode localization result: " + err.Error()), nil, nil, envelope.Completion
 	}
-	return mcp.NewToolResultText(string(body)), append([]string(nil), envelope.Symbols...), newLocalizationEvidenceDigest(envelope)
+	digest := newLocalizationEvidenceDigest(envelope)
+	result := attachLocalizationHostEnvelope(mcp.NewToolResultText(string(body)), envelope.Completion, digest)
+	return result, append([]string(nil), envelope.Symbols...), digest, envelope.Completion
 }
 
 func boundedLocalizationNeighborIDs(nodes []*graph.Node, limit int) []string {
@@ -3504,6 +3572,7 @@ const (
 	exploreContentRecallExactSignal     = "explore_content_exact"
 	exploreContentRecallAmbiguousSignal = "explore_content_exact_ambiguous"
 	exploreSourceLiteralSignal          = "explore_source_literal"
+	exploreSourceLiteralCalleeSignal    = "explore_source_literal_callee"
 	exploreSourceLiteralCoverageSignal  = "explore_source_literal_coverage"
 	exploreSourceLiteralReservationMax  = 2
 	exploreQuotedRecallMaxTerms         = 3
@@ -3742,6 +3811,7 @@ func (s *Server) gatherExploreQuotedContentCandidates(
 	sourceLiteralAnchors := make(map[string]map[int]struct{})
 	sourceLiteralAmbiguous := make(map[string]bool)
 	sourceLiteralSettled := make(map[string]bool)
+	sourceLiteralCallee := make(map[string]bool)
 	for _, page := range pages {
 		seenForTerm := make(map[string]struct{}, len(page.hits))
 		exactIDs := make(map[string]struct{})
@@ -3831,6 +3901,9 @@ func (s *Server) gatherExploreQuotedContentCandidates(
 			if sourceRank > sourceLiteralHit[hit.nodeID] {
 				sourceLiteralHit[hit.nodeID] = sourceRank
 			}
+			if hit.callee {
+				sourceLiteralCallee[hit.nodeID] = true
+			}
 			if hit.ambiguous {
 				sourceLiteralAmbiguous[hit.nodeID] = true
 			} else {
@@ -3873,6 +3946,9 @@ func (s *Server) gatherExploreQuotedContentCandidates(
 		if sourceRank := sourceLiteralHit[id]; sourceRank > 0 {
 			signals[exploreSourceLiteralSignal] = sourceRank
 			signals[exploreSourceLiteralCoverageSignal] = float64(len(sourceLiteralAnchors[id]))
+			if sourceLiteralCallee[id] {
+				signals[exploreSourceLiteralCalleeSignal] = 1
+			}
 		}
 		candidates = append(candidates, &rerank.Candidate{
 			Node:       node,
@@ -4067,6 +4143,7 @@ func mergeExploreCandidates(primary, expanded []*rerank.Candidate, expansionRank
 				exploreContentRecallExactSignal,
 				exploreContentRecallAmbiguousSignal,
 				exploreSourceLiteralSignal,
+				exploreSourceLiteralCalleeSignal,
 				exploreSourceLiteralCoverageSignal,
 			} {
 				if clone.Signals == nil || clone.Signals[key] <= current.Signals[key] {

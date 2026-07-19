@@ -57,6 +57,10 @@ type localizationCompletion struct {
 // concrete hop prevalidated for a generic forwarder.
 type localizationRefinementRoute struct {
 	implementationSymbol string
+	// proofSymbol names the generic wrapper that uniquely and completely
+	// resolved to this concrete target. It is empty for ordinary concrete
+	// hydration and for the wrapper side of the same route.
+	proofSymbol string
 	// enforceable is set only by the centralized evidence policy after it has
 	// proved the entire route. A successful read alone never upgrades trust.
 	enforceable bool

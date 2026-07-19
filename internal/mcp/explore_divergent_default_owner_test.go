@@ -417,7 +417,8 @@ func TestHandleExplorePromotesDivergentDefaultOwnerFromSQLitePHPIndex(t *testing
 	req := mcpgo.CallToolRequest{}
 	req.Params.Name = "explore"
 	req.Params.Arguments = map[string]any{"task": task, "localize": true, "max_symbols": 30, "token_budget": 2400}
-	result, err := server.handleExplore(context.Background(), req)
+	ctx := WithSessionID(context.Background(), "php_divergent_default_contract")
+	result, err := server.handleExplore(ctx, req)
 	require.NoError(t, err)
 	require.False(t, result.IsError)
 	body, ok := singleTextContent(result)
@@ -429,6 +430,47 @@ func TestHandleExplorePromotesDivergentDefaultOwnerFromSQLitePHPIndex(t *testing
 	require.Equal(t, childType.ID, envelope.Symbols[1], body)
 	require.NotEmpty(t, envelope.Files)
 	require.True(t, strings.HasSuffix(filepath.ToSlash(envelope.Files[0]), "RotatingFileHandler.php"), body)
+	require.Equal(t, envelope.Completion.State == localizationStateAnswerReady, envelope.Terminal)
+	provenance := make(map[string]string, len(envelope.Evidence))
+	for _, row := range envelope.Evidence {
+		provenance[row.ID] = row.Provenance
+	}
+	require.Equal(t, localizationProvenanceDivergentDefault, provenance[childCtor.ID])
+	require.Equal(t, localizationProvenanceDivergentDefaultType, provenance[childType.ID])
+	requireLocalizationHostContractMatchesVisible(t, result, envelope)
+
+	switch envelope.Completion.State {
+	case localizationStateAnswerReady:
+		require.True(t, envelope.Terminal)
+		require.True(t, envelope.Completion.Enforceable)
+	case localizationStateNeedsExactRead:
+		require.False(t, envelope.Terminal)
+		require.False(t, envelope.Completion.Enforceable)
+		require.Equal(t, childCtor.ID, envelope.Completion.ExactSymbol)
+		readRequest := mcpgo.CallToolRequest{Params: mcpgo.CallToolParams{
+			Name: "read",
+			Arguments: map[string]any{
+				"operation": "source",
+				"target":    map[string]any{"symbol": childCtor.ID},
+			},
+		}}
+		readResult, readErr := server.handleFacade(ctx, "read", readRequest)
+		require.NoError(t, readErr)
+		require.NotNil(t, readResult)
+		require.False(t, readResult.IsError)
+		readBody, readOK := singleTextContent(readResult)
+		require.True(t, readOK)
+		require.Contains(t, readBody, `"state":"answer_ready"`)
+		require.Contains(t, readBody, `"terminal":true`)
+		require.Contains(t, readBody, `"enforceable":true`)
+		require.NotNil(t, readResult.Meta)
+		readHost, readHostOK := readResult.Meta.AdditionalFields[localizationHostMetaKey].(localizationHostEnvelope)
+		require.True(t, readHostOK)
+		require.True(t, readHost.Contract.Terminal)
+		require.True(t, readHost.Contract.Completion.Enforceable)
+	default:
+		t.Fatalf("divergent-default proof returned unexpected completion: %#v", envelope.Completion)
+	}
 }
 
 func newPHPDivergentDefaultServer(t *testing.T) (*Server, graph.Store) {

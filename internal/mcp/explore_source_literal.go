@@ -29,6 +29,7 @@ type exploreSourceLiteralHit struct {
 	rank      int
 	anchor    int
 	ambiguous bool
+	callee    bool
 }
 
 type exploreSourceLiteralDiagnostic struct {
@@ -554,11 +555,12 @@ func (s *Server) mapExploreSourceLiteralMatchesContext(
 		calleeNodes = s.graph.GetNodesByIDs(calleeIDs)
 	}
 
-	seen := make(map[string]struct{}, len(mapped))
+	seen := make(map[string]int, len(mapped))
 	hits := make([]exploreSourceLiteralHit, 0, len(matches))
 	ownerFiles := make(map[string]string, len(matches))
 	for _, item := range mapped {
 		node := item.owner
+		calleeResolved := false
 		if item.callName != "" {
 			resolved := make(map[string]*graph.Node)
 			for _, edge := range ownerEdges[item.owner.ID] {
@@ -574,14 +576,18 @@ func (s *Server) mapExploreSourceLiteralMatchesContext(
 			if len(resolved) == 1 {
 				for _, callee := range resolved {
 					node = callee
+					calleeResolved = true
 				}
 			}
 		}
-		if _, duplicate := seen[node.ID]; duplicate {
+		if existing, duplicate := seen[node.ID]; duplicate {
+			if calleeResolved {
+				hits[existing].callee = true
+			}
 			continue
 		}
-		seen[node.ID] = struct{}{}
-		hits = append(hits, exploreSourceLiteralHit{nodeID: node.ID, rank: item.rank})
+		seen[node.ID] = len(hits)
+		hits = append(hits, exploreSourceLiteralHit{nodeID: node.ID, rank: item.rank, callee: calleeResolved})
 		ownerFiles[node.ID] = node.FilePath
 	}
 	return exploreSourceLiteralRecall{

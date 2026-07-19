@@ -40,8 +40,17 @@ func TestExploreRefinementRoutesPreferConcreteForwardedImplementation(t *testing
 	if got := routes[wrapper.ID].implementationSymbol; got != implementation.ID {
 		t.Fatalf("wrapper implementation route = %q, want %q", got, implementation.ID)
 	}
+	if !routes[wrapper.ID].enforceable {
+		t.Fatal("unique complete wrapper-to-implementation route must retain strong provenance")
+	}
 	if route, ok := routes[implementation.ID]; !ok || route.implementationSymbol != "" {
 		t.Fatalf("concrete implementation route = %#v, present=%v", route, ok)
+	} else if !route.enforceable || route.proofSymbol != wrapper.ID {
+		t.Fatalf("proven concrete route = %#v, want wrapper proof %q", route, wrapper.ID)
+	}
+	ordinary := exploreLocalizationRefinementRoutes([]exploreTarget{targets[1]})
+	if ordinary[implementation.ID].enforceable || ordinary[implementation.ID].proofSymbol != "" {
+		t.Fatalf("ordinary concrete hydration became enforceable: %#v", ordinary[implementation.ID])
 	}
 	if got := explorePreferredRoutedRefinementSymbol(wrapper.ID, targets, routes); got != implementation.ID {
 		t.Fatalf("preferred routed symbol = %q, want concrete %q", got, implementation.ID)
