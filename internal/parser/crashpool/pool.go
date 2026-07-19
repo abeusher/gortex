@@ -13,6 +13,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/zzet/gortex/internal/platform"
 	"github.com/zzet/gortex/internal/procio"
 )
 
@@ -106,6 +107,7 @@ func (p *Pool) Stats() (spawns, crashes int64) {
 func (p *Pool) spawn() (*procWorker, error) {
 	p.spawns.Add(1)
 	cmd := exec.Command(p.cfg.Argv[0], p.cfg.Argv[1:]...) //nolint:gosec // argv is internal, not user-derived
+	platform.ConfigureBackgroundCommand(cmd)
 	if len(p.cfg.Env) > 0 {
 		cmd.Env = append(os.Environ(), p.cfg.Env...)
 	}

@@ -24,6 +24,7 @@ import (
 	"runtime"
 	"sync"
 
+	"github.com/zzet/gortex/internal/platform"
 	"golang.org/x/sync/semaphore"
 )
 
@@ -97,6 +98,7 @@ func Run(ctx context.Context, dir string, args ...string) ([]byte, error) {
 		full = append([]string{"-C", dir}, args...)
 	}
 	cmd := exec.CommandContext(ctx, "git", full...)
+	platform.ConfigureBackgroundCommand(cmd)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
