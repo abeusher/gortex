@@ -187,7 +187,7 @@ func TestLocalizationRefinementAllowsExactlyOneCandidateRead(t *testing.T) {
 	state := newLocalizationTerminalState()
 	candidate := "repo/pkg/file.go::Resolver.Run"
 	other := "repo/pkg/other.go::Other"
-	state.armRefinementForTask("locate resolver behavior", candidate, []string{candidate, other})
+	state.armRefinementForTask("locate resolver behavior", candidate, []string{candidate, other}, nil)
 
 	wrong := map[string]any{"target": map[string]any{"symbol": "repo/pkg/wrong.go::Wrong"}}
 	if blocked, reserved := state.authorize("read", "source", wrong); blocked == nil || reserved {
@@ -234,7 +234,7 @@ func TestHandleFacadeRefinementReadReturnsAnswerReadyCompletion(t *testing.T) {
 	})
 	server := &Server{facades: registry, localization: newLocalizationTerminalState(), sessions: newSessionMap()}
 	ctx := WithSessionID(context.Background(), "refinement-read-completion")
-	server.localizationFor(ctx).armRefinementForTask("locate resolver behavior", candidate, []string{candidate})
+	server.localizationFor(ctx).armRefinementForTask("locate resolver behavior", candidate, []string{candidate}, nil)
 
 	req := mcpgo.CallToolRequest{}
 	req.Params.Name = "read"

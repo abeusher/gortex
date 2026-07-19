@@ -35,6 +35,13 @@ type localizationCompletion struct {
 	// exact_symbol is reserved for the semantically exact-read state.
 	refinementSymbol  string
 	refinementSymbols []string
+
+	// digest is the retained evidence projection for this contract, carried
+	// session-only so a post-terminal navigation call can replay the answer
+	// instead of refusing it (see localization_digest.go). It rides the
+	// completion through reservation staging into commitLocalizationLocked,
+	// which covers the direct-arm and facade finishLocalize paths alike.
+	digest *localizationEvidenceDigest
 }
 
 func newLocalizationCompletion(answerReady bool, exactSymbol string) localizationCompletion {
@@ -83,6 +90,11 @@ type localizationTerminalState struct {
 	generation        uint64
 	nextReservation   uint64
 	reservation       *localizationReservation
+	// digest is the evidence retained for the live contract; nil when the
+	// contract is inactive or predates digest capture. Promotions through
+	// finishReservedRead keep it — the evidence was stashed when the
+	// contract was armed, before the permitted read ran.
+	digest *localizationEvidenceDigest
 }
 
 type localizationReservation struct {
@@ -108,6 +120,7 @@ func (s *localizationTerminalState) reset() {
 	s.refinementSymbol = ""
 	s.refinementSymbols = nil
 	s.taskFingerprint = ""
+	s.digest = nil
 	// Keep an in-flight reservation until its owner finishes. Its captured
 	// generation is now stale, so finishLocalize cannot commit it, while a
 	// second localization cannot race ahead of the still-running handler.
@@ -142,7 +155,7 @@ func (s *localizationTerminalState) keepOpenForTask(task string) {
 	s.armForTask(localizationCompletion{State: localizationStateInactive}, task)
 }
 
-func (s *localizationTerminalState) armRefinementForTask(task, preferredSymbol string, symbols []string) {
+func (s *localizationTerminalState) armRefinementForTask(task, preferredSymbol string, symbols []string, digest *localizationEvidenceDigest) {
 	preferredSymbol = strings.TrimSpace(preferredSymbol)
 	seen := make(map[string]struct{}, min(len(symbols), 12))
 	refinementSymbols := make([]string, 0, min(len(symbols), 12))
@@ -169,6 +182,10 @@ func (s *localizationTerminalState) armRefinementForTask(task, preferredSymbol s
 	}
 	completion := newLocalizationRefinementCompletion(preferredSymbol)
 	completion.refinementSymbols = refinementSymbols
+	// Stashed now, not at promotion: when the permitted read succeeds,
+	// finishReservedRead flips this contract to answer_ready and the
+	// evidence must already be retained for replay.
+	completion.digest = digest
 	s.armForTask(completion, task)
 }
 
@@ -183,6 +200,9 @@ func (s *localizationTerminalState) commitLocalizationLocked(completion localiza
 		s.refinementSymbols = append([]string(nil), completion.refinementSymbols...)
 	}
 	s.taskFingerprint = fingerprint
+	// The digest follows the contract: an inactive commit (keepOpenForTask)
+	// carries nil and clears it; every localize commit replaces it.
+	s.digest = completion.digest
 }
 
 func (s *localizationTerminalState) completionLocked() localizationCompletion {
@@ -233,6 +253,12 @@ func (s *localizationTerminalState) beginLocalize(task string, newUserTask bool)
 	}
 	if s.state != localizationStateInactive && !newUserTask {
 		completion := s.completionLocked()
+		// A repeat localize against a terminal contract gets the same
+		// successful evidence replay as any other post-terminal navigation:
+		// re-localizing hosts want the evidence again, not error recovery.
+		if s.state == localizationStateAnswerReady && s.digest != nil {
+			return 0, localizationEvidenceReplayResult(completion, s.digest)
+		}
 		return 0, NewStructuredErrorResult(StructuredError{
 			ErrorCode: ErrCodeLocalizationComplete,
 			Message:   "this user request already has a localization completion contract; follow it instead of starting another localize call",
@@ -319,6 +345,14 @@ func (s *localizationTerminalState) authorize(facade, operation string, argument
 	}
 
 	completion := s.completionLocked()
+	// Terminal contract with retained evidence: replay the answer as a
+	// SUCCESSFUL idempotent result instead of a refusal. An error here sends
+	// non-adapted hosts into error-recovery loops — a burned turn per call
+	// with the correct answer already in hand; the replay is actionable on
+	// the very next turn and identical on every subsequent call.
+	if s.state == localizationStateAnswerReady && s.digest != nil {
+		return localizationEvidenceReplayResult(completion, s.digest), false
+	}
 	message := "localization is complete; return the existing evidence without another Gortex navigation call"
 	switch s.state {
 	case localizationStateNeedsExactRead:

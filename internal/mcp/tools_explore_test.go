@@ -1152,7 +1152,7 @@ func TestRefinementEnvelopeAuthorizesSerializedEvidenceAndOmitsSource(t *testing
 		{node: buildParallel, source: "fn build_parallel(&self) {}", callees: []*graph.Node{unrelated, buildWithCWD}},
 		{node: &graph.Node{ID: "crates/ignore/src/walk.rs::WalkParallel", Name: "WalkParallel", Kind: graph.KindType, FilePath: "crates/ignore/src/walk.rs"}, source: "struct WalkParallel;"},
 	}
-	result, authorized := buildLocalizationExploreResultForTask(
+	result, authorized, _ := buildLocalizationExploreResultForTask(
 		newLocalizationRefinementCompletion(buildParallel.ID),
 		"nondeterministic WalkBuilder parallel multi-root walk build_parallel",
 		targets,
