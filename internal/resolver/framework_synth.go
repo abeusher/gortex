@@ -187,6 +187,11 @@ type synthFunc struct {
 	name     string
 	fn       func(graph.Store) int
 	scopedFn func(graph.Store, map[string]bool) int
+	// candFn is the shared-stream form: the pass consumes the candidate
+	// buffers the census dispatcher collected instead of re-decoding whole
+	// edge kinds. Used only when a full-census run armed the pass's
+	// collectors; every other invocation keeps fn / scopedFn.
+	candFn func(graph.Store, *frameworkPassCandidates) int
 }
 
 func (s synthFunc) Name() string                 { return s.name }
@@ -264,6 +269,10 @@ type frameworkCandidateSummary struct {
 	// Absence-proof gates (edge census, family/receiver tails) may only
 	// trust counts from a full walk; a partial summary cannot prove absence.
 	fullCensus bool
+	// streams carries the shared-stream candidate buffers the census edge
+	// walks collected for the converted synthesizers. Full-census runs only;
+	// nil on a partial run, where every pass keeps its own scoped scans.
+	streams *frameworkStreamCandidates
 }
 
 // frameworkDistinctNames counts distinct non-empty names, saturating at two.
@@ -326,12 +335,18 @@ type frameworkEdgeCensus struct {
 // frameworkSynthEdgePreflights. Every flag is a necessary condition copied
 // verbatim from the consuming pass's own loop filter, so a missed flag can
 // only keep a pass enabled, never skip one that could land an edge.
-func collectFrameworkEdgeCensus(g graph.Store) frameworkEdgeCensus {
+//
+// The same decoded walk doubles as the shared-stream candidate dispatcher:
+// when streams is non-nil, every edge is also offered to the armed per-pass
+// collectors, and the (smaller) EdgeAnnotated and EdgeReferences kinds are
+// walked once here for their consumers instead of once per pass.
+func collectFrameworkEdgeCensus(g graph.Store, streams *frameworkStreamCandidates) frameworkEdgeCensus {
 	census := frameworkEdgeCensus{valid: true, via: map[string]bool{}}
 	for e := range g.EdgesByKind(graph.EdgeCalls) {
 		if e == nil {
 			continue
 		}
+		streams.collectCalls(e)
 		if isSetStateTarget(e.To) {
 			census.setStateTarget = true
 		}
@@ -365,7 +380,23 @@ func collectFrameworkEdgeCensus(g graph.Store) frameworkEdgeCensus {
 			}
 		}
 	}
-	if !census.temporalVia {
+	if streams.wantsAnnotated() {
+		// The temporal pass consumes the matched annotation edges
+		// themselves, so the presence probe's break-on-first-hit walk
+		// becomes one full collection walk of this small kind — replacing
+		// the pass's own EdgeAnnotated scan.
+		for e := range g.EdgesByKind(graph.EdgeAnnotated) {
+			if e == nil {
+				continue
+			}
+			if role, member := temporalRoleForJavaAnnotation(e.To); role != "" || member != "" {
+				streams.addAnnotated(e)
+			}
+		}
+		if !census.temporalVia {
+			census.temporalAnnotation = streams.annotatedCount() > 0
+		}
+	} else if !census.temporalVia {
 		for e := range g.EdgesByKind(graph.EdgeAnnotated) {
 			if e == nil {
 				continue
@@ -374,6 +405,14 @@ func collectFrameworkEdgeCensus(g graph.Store) frameworkEdgeCensus {
 				census.temporalAnnotation = true
 				break
 			}
+		}
+	}
+	if streams.wantsRefs() {
+		for e := range g.EdgesByKind(graph.EdgeReferences) {
+			if e == nil {
+				continue
+			}
+			streams.collectRefs(e)
 		}
 	}
 	return census
@@ -530,7 +569,17 @@ func summarizeFrameworkCandidatesCensus(
 		}
 	}
 	if fullCensus {
-		summary.edges = collectFrameworkEdgeCensus(g)
+		// Arm the shared-stream collectors with the family / node-marker
+		// verdicts the light walk just produced (the census-derived edge
+		// preflights are decided by the walk below and can only narrow
+		// admission further), then run the census edge walks as the single
+		// candidate dispatcher for every armed pass.
+		present, markers := summary.all, summary.allMarkers
+		if scope != nil {
+			present, markers = summary.scoped, summary.scopedMarkers
+		}
+		summary.streams = newFrameworkStreamCandidates(g, present, markers)
+		summary.edges = collectFrameworkEdgeCensus(g, summary.streams)
 	}
 	return summary
 }
@@ -786,7 +835,25 @@ func shouldRunFrameworkSynthesizer(s FrameworkSynthesizer, scope map[string]bool
 		present = summary.scoped
 		markers = summary.scopedMarkers
 	}
-	if families := frameworkSynthLanguageFamilies[s.Name()]; len(families) > 0 {
+	if !frameworkSynthNodeGatesPass(s.Name(), present, markers) {
+		return false
+	}
+	if summary.edges.valid {
+		if preflight := frameworkSynthEdgePreflights[s.Name()]; preflight != nil && !preflight(summary.edges) {
+			return false
+		}
+	}
+	return true
+}
+
+// frameworkSynthNodeGatesPass evaluates the family / conjunction /
+// node-marker gates for one pass against the chosen census maps — the
+// sub-verdict of shouldRunFrameworkSynthesizer that is already known after
+// the light node walk, before the edge census runs. The shared-stream
+// dispatcher arms a pass's candidate collectors on exactly this verdict, so
+// its armed set is a superset of the passes the full gate will admit.
+func frameworkSynthNodeGatesPass(name string, present, markers map[string]int) bool {
+	if families := frameworkSynthLanguageFamilies[name]; len(families) > 0 {
 		found := false
 		for _, family := range families {
 			if present[family] > 0 {
@@ -798,7 +865,7 @@ func shouldRunFrameworkSynthesizer(s FrameworkSynthesizer, scope map[string]bool
 			return false
 		}
 	}
-	for _, groups := range frameworkSynthFamilyConjunctions[s.Name()] {
+	for _, groups := range frameworkSynthFamilyConjunctions[name] {
 		found := false
 		for _, family := range groups {
 			if present[family] > 0 {
@@ -810,13 +877,8 @@ func shouldRunFrameworkSynthesizer(s FrameworkSynthesizer, scope map[string]bool
 			return false
 		}
 	}
-	for _, marker := range frameworkSynthNodePreflights[s.Name()] {
+	for _, marker := range frameworkSynthNodePreflights[name] {
 		if markers[marker] == 0 {
-			return false
-		}
-	}
-	if summary.edges.valid {
-		if preflight := frameworkSynthEdgePreflights[s.Name()]; preflight != nil && !preflight(summary.edges) {
 			return false
 		}
 	}
@@ -1087,7 +1149,15 @@ func runFrameworkSynthesizersScoped(
 		var n int
 		if shouldRunFrameworkSynthesizer(s, scope, candidates) {
 			if sf, ok := s.(synthFunc); ok {
+				bundle := candidates.streams.passStreams(sf.name)
 				switch {
+				case sf.candFn != nil && bundle != nil:
+					// Shared-stream form. streams exist only on a full-census
+					// run, where the execution store is the raw g for both
+					// the nil-scope and the attested full-coverage shapes.
+					n = runLegacyFrameworkSynth(g, func(store graph.Store) int {
+						return sf.candFn(store, bundle)
+					})
 				case scope == nil:
 					n = runLegacyFrameworkSynth(g, sf.fn)
 				case sf.scopedFn != nil:

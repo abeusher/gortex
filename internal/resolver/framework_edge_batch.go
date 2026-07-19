@@ -85,6 +85,20 @@ func runLegacyFrameworkSynth(store graph.Store, fn func(graph.Store) int) int {
 	return count
 }
 
+// stagedEdgesMatching returns the edges THIS pass has staged so far, in
+// insertion order, filtered by pred — the overlay a fresh kind stream would
+// surface for a pass re-reading its own uncommitted additions. Used by the
+// shared-stream forms, whose candidate slices predate the pass's own adds.
+func (s *frameworkEdgeBatchStore) stagedEdgesMatching(pred func(*graph.Edge) bool) []*graph.Edge {
+	var out []*graph.Edge
+	for _, key := range s.order {
+		if edge := s.staged[key]; edge != nil && pred(edge) {
+			out = append(out, edge)
+		}
+	}
+	return out
+}
+
 func (s *frameworkEdgeBatchStore) GetOutEdges(id string) []*graph.Edge {
 	return s.mergeEdges(s.Store.GetOutEdges(id), func(edge *graph.Edge) bool {
 		return edge.From == id
