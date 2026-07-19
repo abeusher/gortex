@@ -18,13 +18,13 @@ reaper at ten minutes, LRU eviction at six concurrent.
 
 ## Server registry
 
-Sixteen servers ship in the registry today
-(`internal/semantic/lsp/registry.go`):
+The core registry (`internal/semantic/lsp/registry.go`):
 
 | Spec name                    | Command                          | Languages                   | Default priority |
 | ---------------------------- | -------------------------------- | --------------------------- | ---------------- |
 | `gopls`                      | `gopls`                          | go                          | 3                |
-| `typescript-language-server` | `typescript-language-server`     | typescript, javascript      | 5                |
+| `tsgo`                       | `tsgo --lsp`                     | typescript, javascript      | 5                |
+| `typescript-language-server` | `typescript-language-server`     | typescript, javascript      | 6                |
 | `pyright`                    | `pyright-langserver`             | python                      | 5                |
 | `rust-analyzer`              | `rust-analyzer`                  | rust                        | 5                |
 | `clangd`                     | `clangd --background-index`      | c, c++, objc, objc++        | 5                |
@@ -51,6 +51,14 @@ Lower priority numbers win when more than one provider serves the same
 language. `gopls` is `3` so it beats SCIP-based providers (`5`) for Go;
 `jdtls` is `6` so it's lower-priority than the SCIP-java path that
 ships separately.
+
+When several specs cover the same file extension, routing prefers the
+highest-priority spec whose binary is actually installed. `tsgo` — the
+native-Go TypeScript compiler's LSP mode — is the default TS/JS winner
+when its binary is on `PATH` (one native process instead of a
+node + tsserver + typingsInstaller tree); `typescript-language-server`
+serves wherever `tsgo` is missing or fails to spawn. The same rule
+gives `.py` a `pyrefly` fallback when `pyright` is not installed.
 
 `clangd` is the one server that needs a compilation database for full
 enrichment. Point it at a `compile_commands.json` (or a `compile_flags.txt`
@@ -98,8 +106,9 @@ npm install -g pyright            # recommended
 pip install jedi-language-server  # alt
 pip install python-lsp-server     # alt (pylsp)
 
-# TypeScript / JavaScript
-npm install -g typescript typescript-language-server
+# TypeScript / JavaScript (pick one)
+npm install -g @typescript/native-preview          # ships tsgo (preferred)
+npm install -g typescript typescript-language-server  # node-based fallback
 
 # C / C++ / Objective-C
 brew install llvm                 # ships clangd

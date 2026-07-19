@@ -1,22 +1,49 @@
 package lsp
 
 import (
+	"os/exec"
 	"strings"
 	"testing"
 
 	"github.com/zzet/gortex/internal/semantic"
 )
 
+// stubInstalledCommands swaps the registry's PATH lookup so tests can
+// simulate exactly which server binaries are installed. Restores the
+// real lookup (and clears the cache) on cleanup.
+func stubInstalledCommands(t *testing.T, installed ...string) {
+	t.Helper()
+	have := make(map[string]bool, len(installed))
+	for _, c := range installed {
+		have[c] = true
+	}
+	orig := lookPath
+	lookPath = func(cmd string) (string, error) {
+		if have[cmd] {
+			return "/stub/bin/" + cmd, nil
+		}
+		return "", exec.ErrNotFound
+	}
+	resetCommandAvailabilityCache()
+	t.Cleanup(func() {
+		lookPath = orig
+		resetCommandAvailabilityCache()
+	})
+}
+
 // TestSpecForExtension verifies the per-extension lookup table is
 // populated for every claimed extension and that case is normalised.
+// No binaries are "installed", so every extension reports its priority
+// winner.
 func TestSpecForExtension(t *testing.T) {
+	stubInstalledCommands(t)
 	cases := []struct {
 		ext      string
 		wantName string
 	}{
 		{".go", "gopls"},
-		{".ts", "typescript-language-server"},
-		{".tsx", "typescript-language-server"},
+		{".ts", "tsgo"},
+		{".tsx", "tsgo"},
 		{".py", "pyright"},
 		{".pyi", "pyright"},
 		{".rs", "rust-analyzer"},
@@ -137,8 +164,8 @@ func TestExtensionsCoverEverySpec(t *testing.T) {
 }
 
 // TestPyreflyAndTsgoSpecs verifies the pyrefly and tsgo LSP servers are
-// registered as first-class specs without disturbing the default
-// Python / TypeScript routing.
+// registered as first-class specs: tsgo is the default TypeScript
+// routing winner, pyrefly stays a fallback behind pyright.
 func TestPyreflyAndTsgoSpecs(t *testing.T) {
 	pyrefly := SpecByName("pyrefly")
 	if pyrefly == nil {
@@ -159,13 +186,15 @@ func TestPyreflyAndTsgoSpecs(t *testing.T) {
 		t.Errorf("tsgo invocation: %s %v", tsgo.Command, tsgo.Args)
 	}
 
-	// Default extension routing must be unchanged — the incumbents
-	// register earlier in Servers and keep .py / .ts.
-	if s := SpecForExtension(".py"); s == nil || s.Name != "pyright" {
-		t.Errorf(".py should still route to pyright, got %v", s)
+	// tsgo outranks typescript-language-server by default; pyright
+	// keeps outranking pyrefly.
+	tls := SpecByName("typescript-language-server")
+	if tls == nil || tsgo.Priority >= tls.Priority {
+		t.Errorf("tsgo (prio %d) must outrank typescript-language-server (%v)", tsgo.Priority, tls)
 	}
-	if s := SpecForExtension(".ts"); s == nil || s.Name != "typescript-language-server" {
-		t.Errorf(".ts should still route to typescript-language-server, got %v", s)
+	pyright := SpecByName("pyright")
+	if pyright == nil || pyright.Priority >= pyrefly.Priority {
+		t.Errorf("pyright (%v) must outrank pyrefly (prio %d)", pyright, pyrefly.Priority)
 	}
 
 	// Both must be contributed to the default provider list.
@@ -177,6 +206,48 @@ func TestPyreflyAndTsgoSpecs(t *testing.T) {
 	if !have["pyrefly"] || !have["tsgo"] {
 		t.Errorf("pyrefly/tsgo missing from DefaultConfig providers")
 	}
+}
+
+// TestSpecForExtensionPrefersInstalledPriorityWinner pins the
+// multi-spec extension ladder: the highest-priority spec whose binary
+// is installed wins, and the priority winner is reported when none is.
+func TestSpecForExtensionPrefersInstalledPriorityWinner(t *testing.T) {
+	t.Run("both TS servers installed → tsgo", func(t *testing.T) {
+		stubInstalledCommands(t, "tsgo", "typescript-language-server")
+		if s := SpecForExtension(".ts"); s == nil || s.Name != "tsgo" {
+			t.Errorf(".ts with both installed: got %v, want tsgo", s)
+		}
+	})
+	t.Run("only node server installed → fallback", func(t *testing.T) {
+		stubInstalledCommands(t, "typescript-language-server")
+		if s := SpecForExtension(".ts"); s == nil || s.Name != "typescript-language-server" {
+			t.Errorf(".ts without tsgo: got %v, want typescript-language-server", s)
+		}
+	})
+	t.Run("only tsgo installed → tsgo", func(t *testing.T) {
+		stubInstalledCommands(t, "tsgo")
+		if s := SpecForExtension(".tsx"); s == nil || s.Name != "tsgo" {
+			t.Errorf(".tsx with only tsgo: got %v, want tsgo", s)
+		}
+	})
+	t.Run("none installed → priority winner", func(t *testing.T) {
+		stubInstalledCommands(t)
+		if s := SpecForExtension(".ts"); s == nil || s.Name != "tsgo" {
+			t.Errorf(".ts with nothing installed: got %v, want priority winner tsgo", s)
+		}
+	})
+	t.Run("python default unchanged when both installed", func(t *testing.T) {
+		stubInstalledCommands(t, "pyright-langserver", "pyrefly")
+		if s := SpecForExtension(".py"); s == nil || s.Name != "pyright" {
+			t.Errorf(".py with both installed: got %v, want pyright", s)
+		}
+	})
+	t.Run("python falls back to pyrefly when pyright missing", func(t *testing.T) {
+		stubInstalledCommands(t, "pyrefly")
+		if s := SpecForExtension(".py"); s == nil || s.Name != "pyrefly" {
+			t.Errorf(".py with only pyrefly: got %v, want pyrefly", s)
+		}
+	})
 }
 
 // TestSpecWithOverrides verifies .gortex.yaml command / args / env
