@@ -53,7 +53,7 @@ func TestInstallPermissionsMigratesWildcardButPreservesCustomPolicy(t *testing.T
 // a fresh project gets:
 //   - .mcp.json with our server stanza
 //   - .claude/settings.json with MCP permissions
-//   - .claude/settings.local.json with the three hook events
+//   - .claude/settings.local.json with the lifecycle and tool hook events
 //   - CLAUDE.md with the marker-guarded communities block (since
 //     the test env seeds SkillsRouting)
 //   - .claude/skills/generated/<DirName>/SKILL.md (one per
