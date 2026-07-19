@@ -966,19 +966,20 @@ func (e *Engine) searchSubstring(query string, limit int) []*graph.Node {
 		results = append(results, scored{n, 0})
 	}
 
+	// Fold-matching instead of lowering every candidate: ToLower on both the
+	// name and the ID of every node allocated two strings per node per query
+	// — a quarter-million allocations per call on a mid-size graph, on the
+	// degraded-mode path a stale search index falls back to.
 	allNodes := e.g.AllNodes()
 	for _, n := range allNodes {
 		if seen[n.ID] || n.Kind == graph.KindFile || n.Kind == graph.KindImport {
 			continue
 		}
-		nameLower := strings.ToLower(n.Name)
-		idLower := strings.ToLower(n.ID)
-
-		if strings.HasPrefix(nameLower, lower) {
+		if hasPrefixFold(n.Name, lower) {
 			results = append(results, scored{n, 1})
-		} else if strings.Contains(nameLower, lower) {
+		} else if containsFold(n.Name, lower) {
 			results = append(results, scored{n, 2})
-		} else if strings.Contains(idLower, lower) {
+		} else if containsFold(n.ID, lower) {
 			results = append(results, scored{n, 3})
 		} else {
 			continue
@@ -1677,4 +1678,24 @@ func dedup(edges []*graph.Edge) []*graph.Edge {
 		out = append(out, e)
 	}
 	return out
+}
+
+// hasPrefixFold reports whether s begins with prefix under simple case
+// folding, without allocating. prefix is already lowercased by the caller.
+func hasPrefixFold(s, prefix string) bool {
+	return len(s) >= len(prefix) && strings.EqualFold(s[:len(prefix)], prefix)
+}
+
+// containsFold reports whether sub occurs in s under simple case folding,
+// without allocating. sub is already lowercased by the caller.
+func containsFold(s, sub string) bool {
+	if len(sub) == 0 {
+		return true
+	}
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if strings.EqualFold(s[i:i+len(sub)], sub) {
+			return true
+		}
+	}
+	return false
 }
