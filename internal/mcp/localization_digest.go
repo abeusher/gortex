@@ -154,13 +154,18 @@ const localizationAnswerReadyNotice = "Localization is complete. Do not call ano
 // the ordered rows with fallback_format; no prewritten answer or duplicate row
 // string crosses the wire.
 type localizationHostEnvelope struct {
-	Version        int                         `json:"version"`
-	FallbackFormat string                      `json:"fallback_format"`
-	Evidence       *localizationEvidenceDigest `json:"evidence"`
+	Version        int                          `json:"version"`
+	FallbackFormat string                       `json:"fallback_format"`
+	Evidence       *localizationEvidenceDigest  `json:"evidence"`
+	Contract       localizationTerminalContract `json:"contract"`
 }
 
-func attachLocalizationHostEnvelope(result *mcpgo.CallToolResult, digest *localizationEvidenceDigest) *mcpgo.CallToolResult {
-	if result == nil || digest == nil {
+// TODO(localization-v2): once the explore ranking patch is stable, attach this
+// envelope to the initial explore(localize) result after its final byte-budgeted
+// completion and digest are known. This pass deliberately wires authoritative
+// metadata only for allowed reads and terminal-result helpers.
+func attachLocalizationHostEnvelope(result *mcpgo.CallToolResult, completion localizationCompletion, digest *localizationEvidenceDigest) *mcpgo.CallToolResult {
+	if result == nil {
 		return result
 	}
 	if result.Meta == nil {
@@ -173,6 +178,7 @@ func attachLocalizationHostEnvelope(result *mcpgo.CallToolResult, digest *locali
 		Version:        1,
 		FallbackFormat: "{file}:{line} — {id} ({signature})",
 		Evidence:       digest,
+		Contract:       localizationContractFor(completion),
 	}
 	return result
 }
@@ -184,9 +190,10 @@ func attachLocalizationHostEnvelope(result *mcpgo.CallToolResult, digest *locali
 // final answer without supplying a prewritten one.
 func localizationAnswerReadyResult(completion localizationCompletion) *mcpgo.CallToolResult {
 	result := mcpgo.NewToolResultText(localizationAnswerReadyNotice)
+	contract := localizationContractFor(completion)
 	result.StructuredContent = map[string]any{
-		"completion": completion,
-		"terminal":   true,
+		"completion": contract.Completion,
+		"terminal":   contract.Terminal,
 	}
-	return attachLocalizationHostEnvelope(result, completion.digest)
+	return attachLocalizationHostEnvelope(result, completion, completion.digest)
 }

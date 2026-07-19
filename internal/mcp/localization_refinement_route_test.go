@@ -23,9 +23,10 @@ func TestRefinementRouteConcreteReadCompletesInOneCall(t *testing.T) {
 	requireRefinementCompletion(t, completion, localizationStateAnswerReady, "", 0)
 
 	result, reserved := state.authorize("read", "source", refinementSourceArgs(concrete))
-	if reserved || result == nil || result.IsError {
-		t.Fatalf("read after concrete completion = (%+v, %v), want successful terminal interception", result, reserved)
+	if reserved {
+		t.Fatal("read after concrete completion reserved a handler")
 	}
+	requireLocalizationTerminalError(t, result, "read", "source")
 }
 
 func TestRefinementRouteUsesActuallySelectedAlternateGenericCandidate(t *testing.T) {
@@ -54,9 +55,10 @@ func TestRefinementRouteUsesActuallySelectedAlternateGenericCandidate(t *testing
 	requireRefinementCompletion(t, completion, localizationStateAnswerReady, "", 0)
 
 	result, reserved := state.authorize("read", "source", refinementSourceArgs(implementation))
-	if reserved || result == nil || result.IsError {
-		t.Fatalf("third read = (%+v, %v), want successful terminal interception", result, reserved)
+	if reserved {
+		t.Fatal("third read reserved a handler")
 	}
+	requireLocalizationTerminalError(t, result, "read", "source")
 }
 
 func TestRefinementRouteGenericReadFailureRestoresFirstAllowance(t *testing.T) {

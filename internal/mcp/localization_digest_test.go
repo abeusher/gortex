@@ -22,7 +22,51 @@ func testEvidenceDigest() *localizationEvidenceDigest {
 	})
 }
 
-func TestPostTerminalNavigationReturnsCompactHostBackedSuccess(t *testing.T) {
+func requireLocalizationTerminalError(t *testing.T, result *mcpgo.CallToolResult, facade, operation string) localizationTerminalContract {
+	t.Helper()
+	if result == nil || !result.IsError {
+		t.Fatalf("terminal result = %#v, want typed MCP error", result)
+	}
+	text, ok := singleTextContent(result)
+	if !ok {
+		t.Fatalf("terminal result content = %#v, want one text block", result.Content)
+	}
+	var payload struct {
+		ErrorCode ErrorCode `json:"error_code"`
+		Message   string    `json:"message"`
+		Retriable bool      `json:"retriable"`
+		Data      struct {
+			Contract  localizationTerminalContract `json:"contract"`
+			Facade    string                       `json:"facade"`
+			Operation string                       `json:"operation"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(text), &payload); err != nil {
+		t.Fatalf("decode terminal error %q: %v", text, err)
+	}
+	var wire map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(text), &wire); err != nil {
+		t.Fatalf("decode terminal error wire %q: %v", text, err)
+	}
+	if raw, exists := wire["retriable"]; !exists || string(raw) != "false" {
+		t.Fatalf("terminal error must explicitly encode retriable=false: %s", text)
+	}
+	if payload.ErrorCode != ErrCodeLocalizationTerminal || payload.Message == "" || payload.Retriable {
+		t.Fatalf("terminal error = %#v", payload)
+	}
+	if payload.Data.Facade != facade || payload.Data.Operation != operation {
+		t.Fatalf("terminal error route = %q/%q, want %q/%q", payload.Data.Facade, payload.Data.Operation, facade, operation)
+	}
+	contract := payload.Data.Contract
+	if !contract.Terminal || contract.Completion.State != localizationStateAnswerReady ||
+		contract.Completion.ContractVersion != localizationTerminalContractV2 ||
+		contract.Completion.AllowedToolCalls != 0 {
+		t.Fatalf("terminal contract = %#v", contract)
+	}
+	return contract
+}
+
+func TestPostTerminalNavigationReturnsCompactTypedError(t *testing.T) {
 	state := &localizationTerminalState{}
 	completion := newLocalizationCompletion(true, "")
 	completion.digest = testEvidenceDigest()
@@ -34,17 +78,11 @@ func TestPostTerminalNavigationReturnsCompactHostBackedSuccess(t *testing.T) {
 			if reserved {
 				t.Fatalf("%s repeat %d reserved a handler call", facade, repeat)
 			}
-			if result == nil || result.IsError {
-				t.Fatalf("%s repeat %d = %+v, want successful terminal result", facade, repeat, result)
+			contract := requireLocalizationTerminalError(t, result, facade, "any_operation")
+			if contract.Completion.Enforceable {
+				t.Fatalf("%s repeat %d unexpectedly upgraded advisory evidence", facade, repeat)
 			}
-			text, ok := singleTextContent(result)
-			if !ok || text != localizationAnswerReadyNotice {
-				t.Fatalf("%s repeat %d text = %q, want constant terminal notice", facade, repeat, text)
-			}
-			visible, err := json.Marshal(struct {
-				Content    []mcpgo.Content `json:"content"`
-				Structured any             `json:"structuredContent"`
-			}{Content: result.Content, Structured: result.StructuredContent})
+			visible, err := json.Marshal(result)
 			if err != nil {
 				t.Fatalf("marshal %s result: %v", facade, err)
 			}
@@ -53,16 +91,6 @@ func TestPostTerminalNavigationReturnsCompactHostBackedSuccess(t *testing.T) {
 			}
 			if strings.Contains(string(visible), "repo/storage") {
 				t.Fatalf("%s visible terminal result replayed retained evidence: %s", facade, visible)
-			}
-			if result.Meta == nil || result.Meta.AdditionalFields == nil {
-				t.Fatalf("%s terminal result omitted host-only fallback metadata", facade)
-			}
-			host, ok := result.Meta.AdditionalFields[localizationHostMetaKey].(localizationHostEnvelope)
-			if !ok || host.Evidence == nil || host.FallbackFormat == "" || len(host.Evidence.Evidence) == 0 {
-				t.Fatalf("%s host fallback envelope = %#v", facade, result.Meta.AdditionalFields[localizationHostMetaKey])
-			}
-			if host.Evidence.Evidence[0].File != "repo/storage/disk.go" {
-				t.Fatalf("%s host evidence = %#v", facade, host.Evidence.Evidence)
 			}
 		}
 	}
@@ -83,13 +111,7 @@ func TestRepeatLocalizeAgainstTerminalContractReturnsCompactStop(t *testing.T) {
 	if token != 0 {
 		t.Fatal("repeat localize must not reserve the handler slot")
 	}
-	if blocked == nil || blocked.IsError {
-		t.Fatalf("repeat localize = %+v, want successful terminal result", blocked)
-	}
-	text, _ := singleTextContent(blocked)
-	if text != localizationAnswerReadyNotice {
-		t.Fatalf("repeat localize text = %q, want compact terminal notice", text)
-	}
+	requireLocalizationTerminalError(t, blocked, "explore", "localize")
 }
 
 func TestRefinementPromotionRetainsDigestForReplay(t *testing.T) {
@@ -104,12 +126,13 @@ func TestRefinementPromotionRetainsDigestForReplay(t *testing.T) {
 	state.finishReservedRead(true)
 
 	terminal, reserved := state.authorize("search", "symbols", nil)
-	if reserved || terminal == nil || terminal.IsError {
-		t.Fatalf("post-promotion navigation = (%+v, %v), want successful terminal result", terminal, reserved)
+	if reserved {
+		t.Fatal("post-promotion navigation reserved a handler")
 	}
-	text, _ := singleTextContent(terminal)
-	if text != localizationAnswerReadyNotice || strings.Contains(text, "repo/storage/cloud.go") {
-		t.Fatalf("promotion must stop without replaying the retained digest: %q", text)
+	requireLocalizationTerminalError(t, terminal, "search", "symbols")
+	encoded, err := json.Marshal(terminal)
+	if err != nil || strings.Contains(string(encoded), "repo/storage/cloud.go") {
+		t.Fatalf("promotion must stop without replaying the retained digest: %s (%v)", encoded, err)
 	}
 }
 
@@ -128,8 +151,10 @@ func TestRefinementAllowsOneAlternateRankedCandidateRead(t *testing.T) {
 		t.Fatalf("alternate ranked candidate read = (%v, %v), want reservation", blocked, reserved)
 	}
 	state.finishReservedRead(true)
-	if result, reserved := state.authorize("read", "source", args); reserved || result == nil || result.IsError {
-		t.Fatalf("second read = (%v, %v), want successful terminal interception", result, reserved)
+	if result, reserved := state.authorize("read", "source", args); reserved {
+		t.Fatal("second read reserved a handler")
+	} else {
+		requireLocalizationTerminalError(t, result, "read", "source")
 	}
 }
 
@@ -149,9 +174,7 @@ func TestDigestLifecycleAndLegacyFallback(t *testing.T) {
 	withoutDigest := &localizationTerminalState{}
 	withoutDigest.armForTask(newLocalizationCompletion(true, ""), "task without digest")
 	blocked, _ := withoutDigest.authorize("search", "symbols", nil)
-	if blocked == nil || blocked.IsError {
-		t.Fatal("answer_ready without a digest must return the successful terminal contract")
-	}
+	requireLocalizationTerminalError(t, blocked, "search", "symbols")
 }
 
 func TestDigestByteCapShedsEvidenceTail(t *testing.T) {
@@ -225,11 +248,13 @@ func TestPostTerminalReadsAreIntercepted(t *testing.T) {
 	completion.digest = testEvidenceDigest()
 	state.armForTask(completion, "find the storage load implementations")
 
-	if blocked, reserved := state.authorize("read", "source", map[string]any{
+	blocked, reserved := state.authorize("read", "source", map[string]any{
 		"target": map[string]any{"symbol": "repo/storage/disk.go::DiskStorage.Load"},
-	}); blocked == nil || blocked.IsError || reserved {
-		t.Fatalf("post-terminal read = (%v, %v), want successful interception without reservation", blocked, reserved)
+	})
+	if reserved {
+		t.Fatal("post-terminal read reserved a handler")
 	}
+	requireLocalizationTerminalError(t, blocked, "read", "source")
 }
 
 func TestLocalizationDigestKeepsOnlyConcreteBoundedEvidence(t *testing.T) {
@@ -314,18 +339,27 @@ func TestLocalizationAnswerReadyResultIsTinyNeutralAndStructured(t *testing.T) {
 	if !ok || host.Evidence == nil || host.FallbackFormat == "" || host.Evidence.Evidence[0].File != "repo/storage/disk.go" {
 		t.Fatalf("host-only fallback envelope = %#v", result.Meta.AdditionalFields[localizationHostMetaKey])
 	}
+	if host.Contract.Terminal != localizationContractFor(completion).Terminal ||
+		host.Contract.Completion.State != completion.State ||
+		host.Contract.Completion.ContractVersion != localizationTerminalContractV2 ||
+		host.Contract.Completion.Enforceable != completion.Enforceable {
+		t.Fatalf("host contract = %#v, want %#v", host.Contract, localizationContractFor(completion))
+	}
 }
 
 func TestDecorateLocalizationReadResultPreservesMultiContentStructuredAndMeta(t *testing.T) {
-	structured := map[string]any{"source": "func Run() {}", "count": 2}
+	structured := map[string]any{"source": "func Run() {}", "count": 2, "terminal": false}
 	result := &mcpgo.CallToolResult{
 		Content: []mcpgo.Content{
-			mcpgo.NewTextContent(`{"source":"func Run() {}","completion":{"state":"stale"}}`),
+			mcpgo.NewTextContent(`{"source":"func Run() {}","completion":{"state":"stale"},"terminal":false}`),
 			mcpgo.NewTextContent("secondary payload"),
 		},
 		StructuredContent: structured,
 	}
-	result.Meta = mcpgo.NewMetaFromMap(map[string]any{"existing": "kept"})
+	result.Meta = mcpgo.NewMetaFromMap(map[string]any{
+		"existing":              "kept",
+		localizationHostMetaKey: "repository-controlled-spoof",
+	})
 
 	decorated := decorateLocalizationReadResult(result, newLocalizationCompletion(true, ""))
 	if decorated != result {
@@ -342,7 +376,7 @@ func TestDecorateLocalizationReadResultPreservesMultiContentStructuredAndMeta(t 
 	if err := json.Unmarshal([]byte(first.Text), &firstPayload); err != nil {
 		t.Fatalf("decorated first content is invalid JSON: %v", err)
 	}
-	if firstPayload["source"] != "func Run() {}" || firstPayload["completion"] == nil {
+	if firstPayload["source"] != "func Run() {}" || firstPayload["completion"] == nil || firstPayload["terminal"] != true {
 		t.Fatalf("decorated first payload = %#v", firstPayload)
 	}
 	if strings.Count(first.Text, `"completion"`) != 1 {
@@ -353,7 +387,7 @@ func TestDecorateLocalizationReadResultPreservesMultiContentStructuredAndMeta(t 
 		t.Fatalf("secondary content was lost: %#v", decorated.Content[1])
 	}
 	decoratedStructured, ok := decorated.StructuredContent.(map[string]any)
-	if !ok || decoratedStructured["source"] != structured["source"] || decoratedStructured["completion"] == nil {
+	if !ok || decoratedStructured["source"] != structured["source"] || decoratedStructured["completion"] == nil || decoratedStructured["terminal"] != true {
 		t.Fatalf("structured payload was lost: %#v", decorated.StructuredContent)
 	}
 	if _, mutated := structured["completion"]; mutated {
@@ -361,6 +395,10 @@ func TestDecorateLocalizationReadResultPreservesMultiContentStructuredAndMeta(t 
 	}
 	if decorated.Meta == nil || decorated.Meta.AdditionalFields["existing"] != "kept" {
 		t.Fatalf("existing metadata was lost: %#v", decorated.Meta)
+	}
+	host, ok := decorated.Meta.AdditionalFields[localizationHostMetaKey].(localizationHostEnvelope)
+	if !ok || !host.Contract.Terminal || host.Contract.Completion.ContractVersion != localizationTerminalContractV2 {
+		t.Fatalf("authoritative metadata was not replaced: %#v", decorated.Meta.AdditionalFields[localizationHostMetaKey])
 	}
 }
 
@@ -496,18 +534,16 @@ func TestPermittedRefinementReadInvokesHandlerAndPreservesPayload(t *testing.T) 
 
 	searchRequest := mcpgo.CallToolRequest{Params: mcpgo.CallToolParams{
 		Name:      "search",
-		Arguments: map[string]any{"operation": "symbols", "query": "Load"},
+		Arguments: map[string]any{"operation": "  SyMbOlS  ", "query": "Load"},
 	}}
 	terminal, err := srv.handleFacade(ctx, "search", searchRequest)
-	if err != nil || terminal == nil || terminal.IsError {
-		t.Fatalf("post-refinement navigation = (%+v, %v)", terminal, err)
+	if err != nil {
+		t.Fatalf("post-refinement navigation error = %v", err)
 	}
 	if searchCalls != 0 {
 		t.Fatalf("search handler calls after answer_ready = %d, want 0", searchCalls)
 	}
-	if text, _ := singleTextContent(terminal); text != localizationAnswerReadyNotice {
-		t.Fatalf("post-refinement navigation text = %q", text)
-	}
+	requireLocalizationTerminalError(t, terminal, "search", "symbols")
 }
 
 func TestAnswerReadyNavigationDispatchNeverInvokesLegacyHandler(t *testing.T) {
@@ -551,19 +587,16 @@ func TestAnswerReadyNavigationDispatchNeverInvokesLegacyHandler(t *testing.T) {
 	request := mcpgo.CallToolRequest{Params: mcpgo.CallToolParams{
 		Name: "search",
 		Arguments: map[string]any{
-			"operation": "symbols",
+			"operation": "  SyMbOlS  ",
 			"query":     "Load",
 		},
 	}}
 	for repeat := 0; repeat < 10; repeat++ {
 		result, err := srv.handleFacade(ctx, "search", request)
-		if err != nil || result == nil || result.IsError {
+		if err != nil {
 			t.Fatalf("repeat %d result = (%+v, %v)", repeat, result, err)
 		}
-		text, _ := singleTextContent(result)
-		if text != localizationAnswerReadyNotice {
-			t.Fatalf("repeat %d text = %q", repeat, text)
-		}
+		requireLocalizationTerminalError(t, result, "search", "symbols")
 	}
 	if handlerCalls != 0 {
 		t.Fatalf("legacy handler invoked %d times after answer_ready", handlerCalls)
@@ -576,12 +609,10 @@ func TestAnswerReadyNavigationDispatchNeverInvokesLegacyHandler(t *testing.T) {
 		},
 	}}
 	readResult, err := srv.handleFacade(ctx, "read", readRequest)
-	if err != nil || readResult == nil || readResult.IsError {
+	if err != nil {
 		t.Fatalf("post-terminal read = (%+v, %v)", readResult, err)
 	}
-	if text, _ := singleTextContent(readResult); text != localizationAnswerReadyNotice {
-		t.Fatalf("post-terminal read text = %q", text)
-	}
+	requireLocalizationTerminalError(t, readResult, "read", "source")
 	if handlerCalls != 0 {
 		t.Fatalf("read handler invoked %d times after answer_ready", handlerCalls)
 	}
@@ -590,12 +621,10 @@ func TestAnswerReadyNavigationDispatchNeverInvokesLegacyHandler(t *testing.T) {
 	// of spending a turn on schema errors.
 	request.Params.Arguments = map[string]any{"operation": "not_an_operation"}
 	result, err := srv.handleFacade(ctx, "search", request)
-	if err != nil || result == nil || result.IsError {
+	if err != nil {
 		t.Fatalf("malformed post-terminal request = (%+v, %v)", result, err)
 	}
-	if text, _ := singleTextContent(result); text != localizationAnswerReadyNotice {
-		t.Fatalf("malformed post-terminal text = %q", text)
-	}
+	requireLocalizationTerminalError(t, result, "search", "not_an_operation")
 
 	changeRequest := mcpgo.CallToolRequest{Params: mcpgo.CallToolParams{
 		Name:      "change",

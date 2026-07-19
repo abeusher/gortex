@@ -38,12 +38,11 @@ func TestHandleFacadeRejectsLocalizationBypassesWithoutClearingState(t *testing.
 			req.Params.Name = "explore"
 			req.Params.Arguments = request.args
 			result, err := server.handleFacade(ctx, "explore", req)
-			if err != nil || result == nil || result.IsError {
-				t.Fatalf("handleFacade() = (%v, %v), want successful terminal result", result, err)
+			if err != nil {
+				t.Fatalf("handleFacade() transport error = %v", err)
 			}
-			if text, _ := singleTextContent(result); text != localizationAnswerReadyNotice {
-				t.Fatalf("handleFacade() text = %q, want terminal notice", text)
-			}
+			operation, _ := request.args["operation"].(string)
+			requireLocalizationTerminalError(t, result, "explore", normalizeFacadeOperation(operation))
 			if blocked := terminal.block("search", "symbols", nil); blocked == nil {
 				t.Fatal("invalid localization request cleared terminal state")
 			}
@@ -224,13 +223,7 @@ func TestLocalizationTerminalStateInterceptsOnlyNavigation(t *testing.T) {
 	state.arm(newLocalizationCompletion(true, ""))
 	for _, facade := range []string{"explore", "search", "read", "relations", "trace", "analyze"} {
 		blocked := state.block(facade, "anything", nil)
-		if blocked == nil || blocked.IsError {
-			t.Fatalf("%s should return a successful terminal interception", facade)
-		}
-		text, _ := singleTextContent(blocked)
-		if text != localizationAnswerReadyNotice {
-			t.Fatalf("%s returned the wrong terminal notice: %s", facade, text)
-		}
+		requireLocalizationTerminalError(t, blocked, facade, "anything")
 	}
 	for _, facade := range []string{"change", "edit", "refactor", "workspace", "session", "recall", "remember", "capabilities"} {
 		if blocked := state.block(facade, "anything", nil); blocked != nil {
@@ -285,8 +278,10 @@ func TestLocalizationRefinementAllowsExactlyOneCandidateRead(t *testing.T) {
 		t.Fatalf("failed refinement did not restore allowance: blocked=%#v reserved=%v", blocked, reserved)
 	}
 	state.finishReservedRead(true)
-	if blocked, reserved := state.authorize("read", "source", read); blocked == nil || blocked.IsError || reserved {
-		t.Fatalf("second successful refinement read was not terminally intercepted: blocked=%#v reserved=%v", blocked, reserved)
+	if blocked, reserved := state.authorize("read", "source", read); reserved {
+		t.Fatal("second successful refinement read reserved a handler")
+	} else {
+		requireLocalizationTerminalError(t, blocked, "read", "source")
 	}
 }
 
@@ -351,15 +346,9 @@ func TestHandleFacadeRefinementReadReturnsAnswerReadyCompletion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("terminal analyze returned transport error: %v", err)
 	}
-	if blockedAnalyze == nil || blockedAnalyze.IsError {
-		t.Fatalf("terminal analyze did not return a successful interception: %#v", blockedAnalyze)
-	}
+	requireLocalizationTerminalError(t, blockedAnalyze, "analyze", "why")
 	if analyzeCalls != 0 {
 		t.Fatalf("terminal analyze reached its legacy handler %d time(s)", analyzeCalls)
-	}
-	text, _ := singleTextContent(blockedAnalyze)
-	if text != localizationAnswerReadyNotice {
-		t.Fatalf("terminal analyze returned the wrong notice: %s", text)
 	}
 }
 
@@ -405,13 +394,10 @@ func TestHandleFacadeTaskCannotEscapeTerminalState(t *testing.T) {
 		req.Params.Name = "explore"
 		req.Params.Arguments = map[string]any{"operation": "task", "task": task}
 		result, err := server.handleFacade(ctx, "explore", req)
-		if err != nil || result == nil || result.IsError {
+		if err != nil {
 			t.Fatalf("ordinary task escaped terminal state: result=%#v err=%v", result, err)
 		}
-		text, _ := singleTextContent(result)
-		if text != localizationAnswerReadyNotice {
-			t.Fatalf("ordinary task returned wrong terminal notice: %s", text)
-		}
+		requireLocalizationTerminalError(t, result, "explore", "task")
 	}
 	if called {
 		t.Fatal("ordinary explore(task) dispatched after localization completed")
@@ -517,16 +503,15 @@ func TestHandleFacadeExactReadCommitsOnlyOnSuccess(t *testing.T) {
 		t.Fatalf("retry should retain and consume the allowance on success: result=%#v err=%v", second, err)
 	}
 	body, ok := singleTextContent(second)
-	if !ok || !strings.Contains(body, `{"completion":{"state":"answer_ready","scope":"localization","required_action":"respond","allowed_tool_calls":0}}`) {
+	if !ok || !strings.Contains(body, `"state":"answer_ready"`) ||
+		!strings.Contains(body, `"contract_version":2`) || !strings.Contains(body, `"terminal":true`) {
 		t.Fatalf("successful exact read omitted terminal completion: %q", body)
 	}
 	third, err := server.handleFacade(ctx, "read", req)
-	if err != nil || third == nil || third.IsError || calls != 2 {
+	if err != nil || calls != 2 {
 		t.Fatalf("successful exact read must make later navigation terminal: result=%#v err=%v calls=%d", third, err, calls)
 	}
-	if text, _ := singleTextContent(third); text != localizationAnswerReadyNotice {
-		t.Fatalf("third exact read returned wrong terminal notice: %q", text)
-	}
+	requireLocalizationTerminalError(t, third, "read", "source")
 }
 
 func TestHandleFacadeFailedDifferentLocalizePreservesTerminalState(t *testing.T) {
@@ -595,12 +580,10 @@ func TestHandleFacadeExplicitNewUserTaskCommitsOnSuccess(t *testing.T) {
 
 	req.Params.Arguments = map[string]any{"operation": "localize", "task": "Locate Baz"}
 	blocked, err := server.handleFacade(ctx, "explore", req)
-	if err != nil || blocked == nil || blocked.IsError || calls != 1 {
+	if err != nil || calls != 1 {
 		t.Fatalf("later localize without boundary escaped: result=%#v err=%v calls=%d", blocked, err, calls)
 	}
-	if text, _ := singleTextContent(blocked); text != localizationAnswerReadyNotice {
-		t.Fatalf("later localize returned wrong terminal notice: %q", text)
-	}
+	requireLocalizationTerminalError(t, blocked, "explore", "localize")
 }
 
 func TestHandleFacadeNewUserTaskPanicRollsBack(t *testing.T) {
@@ -753,12 +736,10 @@ func TestHandleFacadeExactReadPanicRestoresReservation(t *testing.T) {
 		t.Fatalf("exact read retry = (%v, %v), want success", result, err)
 	}
 	third, err := server.handleFacade(ctx, "read", req)
-	if err != nil || third == nil || third.IsError {
+	if err != nil {
 		t.Fatalf("third exact read = (%v, %v), want terminal block", third, err)
 	}
-	if text, _ := singleTextContent(third); text != localizationAnswerReadyNotice {
-		t.Fatalf("third exact read returned wrong terminal notice: %q", text)
-	}
+	requireLocalizationTerminalError(t, third, "read", "source")
 	if calls != 2 {
 		t.Fatalf("legacy source calls = %d, want 2", calls)
 	}
@@ -785,12 +766,10 @@ func TestHandleFacadeLocalizeBlocksParaphrasesWithoutBoundary(t *testing.T) {
 		req.Params.Name = "explore"
 		req.Params.Arguments = map[string]any{"operation": "localize", "task": task}
 		result, err := server.handleFacade(ctx, "explore", req)
-		if err != nil || result == nil || result.IsError {
+		if err != nil {
 			t.Fatalf("localize(%q) bypassed active contract: result=%#v err=%v", task, result, err)
 		}
-		if text, _ := singleTextContent(result); text != localizationAnswerReadyNotice {
-			t.Fatalf("localize(%q) returned wrong terminal notice: %q", task, text)
-		}
+		requireLocalizationTerminalError(t, result, "explore", "localize")
 	}
 	if calls != 0 {
 		t.Fatalf("blocked localize calls dispatched %d legacy request(s)", calls)

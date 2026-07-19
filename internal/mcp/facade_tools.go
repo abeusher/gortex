@@ -291,9 +291,8 @@ func decorateLocalizationReadResult(result *mcpgo.CallToolResult, completion loc
 	}
 	originalContent := append([]mcpgo.Content(nil), result.Content...)
 	originalStructured := result.StructuredContent
-	contract, err := json.Marshal(struct {
-		Completion localizationCompletion `json:"completion"`
-	}{Completion: completion})
+	terminalContract := localizationContractFor(completion)
+	contract, err := json.Marshal(terminalContract)
 	if err != nil {
 		return result
 	}
@@ -302,9 +301,10 @@ func decorateLocalizationReadResult(result *mcpgo.CallToolResult, completion loc
 		if len(trimmed) >= 2 && trimmed[0] == '{' && trimmed[len(trimmed)-1] == '}' && json.Valid([]byte(trimmed)) {
 			payload := make(map[string]json.RawMessage)
 			if err := json.Unmarshal([]byte(trimmed), &payload); err == nil {
-				encodedCompletion, marshalErr := json.Marshal(completion)
+				encodedCompletion, marshalErr := json.Marshal(terminalContract.Completion)
 				if marshalErr == nil {
 					payload["completion"] = encodedCompletion
+					payload["terminal"], _ = json.Marshal(terminalContract.Terminal)
 					if merged, marshalErr := json.Marshal(payload); marshalErr == nil {
 						return string(merged)
 					}
@@ -331,19 +331,21 @@ func decorateLocalizationReadResult(result *mcpgo.CallToolResult, completion loc
 	case nil:
 		result.StructuredContent = localizationReadStructuredPayload(originalContent, completion)
 	case map[string]any:
-		decorated := make(map[string]any, len(payload)+1)
+		decorated := make(map[string]any, len(payload)+2)
 		for key, value := range payload {
 			decorated[key] = value
 		}
-		decorated["completion"] = completion
+		decorated["completion"] = terminalContract.Completion
+		decorated["terminal"] = terminalContract.Terminal
 		result.StructuredContent = decorated
 	default:
 		result.StructuredContent = map[string]any{
 			"payload":    payload,
-			"completion": completion,
+			"completion": terminalContract.Completion,
+			"terminal":   terminalContract.Terminal,
 		}
 	}
-	return attachLocalizationHostEnvelope(result, completion.digest)
+	return attachLocalizationHostEnvelope(result, completion, completion.digest)
 }
 
 // localizationReadStructuredPayload mirrors a content-only legacy response
@@ -351,7 +353,8 @@ func decorateLocalizationReadResult(result *mcpgo.CallToolResult, completion loc
 // structuredContent whenever it is present, so a completion-only object would
 // otherwise hide the source payload that remains in content.
 func localizationReadStructuredPayload(content []mcpgo.Content, completion localizationCompletion) map[string]any {
-	structured := map[string]any{"completion": completion}
+	contract := localizationContractFor(completion)
+	structured := map[string]any{"completion": contract.Completion, "terminal": contract.Terminal}
 	if len(content) == 0 {
 		return structured
 	}
@@ -361,7 +364,8 @@ func localizationReadStructuredPayload(content []mcpgo.Content, completion local
 			if len(trimmed) >= 2 && trimmed[0] == '{' && trimmed[len(trimmed)-1] == '}' && json.Valid([]byte(trimmed)) {
 				payload := make(map[string]any)
 				if err := json.Unmarshal([]byte(trimmed), &payload); err == nil {
-					payload["completion"] = completion
+					payload["completion"] = contract.Completion
+					payload["terminal"] = contract.Terminal
 					return payload
 				}
 			}
@@ -442,7 +446,7 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 	// overlay construction, and legacy dispatch. Non-navigation facades never
 	// enter this gate.
 	if !newUserExploreFlow {
-		if blocked := terminal.interceptAnswerReady(facade); blocked != nil {
+		if blocked := terminal.interceptAnswerReady(facade, operation); blocked != nil {
 			s.recordFacadeTelemetry(facade, operation, facadeOutcomeBlocked, time.Since(started))
 			return blocked, nil
 		}
