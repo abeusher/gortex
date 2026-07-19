@@ -1,6 +1,7 @@
 package indexer
 
 import (
+	"sort"
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -222,14 +223,170 @@ func synthesizeCapabilityEdges(g graph.Store) (readsEnv, execProc, fieldAccess i
 		}
 	}
 
+	nodes := make([]*graph.Node, 0, len(procNodes))
 	for _, n := range procNodes {
-		g.AddNode(n)
+		nodes = append(nodes, n)
 	}
+	edges := make([]*graph.Edge, 0, len(pending))
 	for _, s := range pending {
-		g.AddEdge(&graph.Edge{
+		edges = append(edges, &graph.Edge{
 			From: s.from, To: s.to, Kind: s.kind,
 			FilePath: s.file, Line: s.line, Origin: s.origin, Meta: s.meta,
 		})
 	}
+	g.AddBatch(nodes, edges)
+	return readsEnv, execProc, fieldAccess
+}
+
+// synthesizeCapabilityEdgesScoped is synthesizeCapabilityEdges restricted to the
+// changed repos in an end-of-batch pass. A nil scope runs the whole-graph pass,
+// so the fresh-index / single-repo path is byte-identical.
+//
+// Correctness: every capability edge is FROM the code symbol that performs the
+// read/write/call, so a changed repo owns exactly the capability edges its
+// reindex dropped; an unchanged repo's are already on disk and are not
+// re-derived. The driving scan therefore walks only the changed repos'
+// out-edges (GetRepoEdges — one backend query per repo) instead of four
+// whole-graph EdgesByKind sweeps. Edge TARGETS may live in any repo (a field or
+// env node an unchanged sibling defines), so target identity is never scoped: a
+// field target outside the changed repos is confirmed by a cached per-id lookup
+// rather than a whole-graph KindField map. Indirect field mutations stay
+// whole-graph — their transitive fixpoint lives in indirectMutationEdges (a
+// file this pass does not own) and re-affirming an unchanged repo's indirect
+// edges is idempotent via the add() dedup.
+func synthesizeCapabilityEdgesScoped(g graph.Store, changedPrefixes map[string]bool, changedFiles ...string) (readsEnv, execProc, fieldAccess int) {
+	if g == nil {
+		return 0, 0, 0
+	}
+	if changedPrefixes == nil && len(changedFiles) == 0 {
+		return synthesizeCapabilityEdges(g)
+	}
+	g.ResolveMutex().Lock()
+	defer g.ResolveMutex().Unlock()
+	if len(changedFiles) > 0 {
+		return synthesizeCapabilityEdgesForFiles(g, changedFiles)
+	}
+
+	type edgeSpec struct {
+		from, to, origin, file string
+		line                   int
+		kind                   graph.EdgeKind
+		meta                   map[string]any
+	}
+	var pending []edgeSpec
+	seen := map[string]bool{}
+	add := func(from, to string, kind graph.EdgeKind, origin, file string, line int, meta map[string]any) bool {
+		key := string(kind) + "\x00" + from + "\x00" + to
+		if v, _ := meta["via"].(string); v != "" {
+			key += "\x00" + v
+		}
+		if seen[key] {
+			return false
+		}
+		seen[key] = true
+		pending = append(pending, edgeSpec{from, to, origin, file, line, kind, meta})
+		return true
+	}
+
+	// Field targets: seed one ID-only projection across all changed repos.
+	// Cross-repo field targets are resolved lazily and cached, so the pass never
+	// materialises full field nodes or the whole-graph KindField map.
+	fieldRepoPrefixes := make([]string, 0, len(changedPrefixes))
+	for prefix := range changedPrefixes {
+		fieldRepoPrefixes = append(fieldRepoPrefixes, prefix)
+	}
+	sort.Strings(fieldRepoPrefixes)
+	fieldIDs := make(map[string]bool)
+	for _, id := range graph.ReadRepoNodeIDsByKinds(g, fieldRepoPrefixes, []graph.NodeKind{graph.KindField}) {
+		fieldIDs[id] = true
+	}
+	baseRows := graph.ReadRepoEdgesByKinds(g, fieldRepoPrefixes, []graph.EdgeKind{
+		graph.EdgeReadsConfig,
+		graph.EdgeReads,
+		graph.EdgeWrites,
+		graph.EdgeCalls,
+	})
+	// A changed source may access a field defined in an unchanged sibling repo.
+	// Collect every such target and confirm the whole set in one point batch,
+	// rather than one GetNode round-trip per distinct target.
+	var crossFieldTargets []string
+	for _, row := range baseRows {
+		e := row.Edge
+		if e == nil || (e.Kind != graph.EdgeReads && e.Kind != graph.EdgeWrites) || fieldIDs[e.To] {
+			continue
+		}
+		crossFieldTargets = append(crossFieldTargets, e.To)
+	}
+	for id, node := range g.GetNodesByIDs(crossFieldTargets) {
+		if node != nil && node.Kind == graph.KindField {
+			fieldIDs[id] = true
+		}
+	}
+
+	procNodes := map[string]*graph.Node{}
+	for _, row := range baseRows {
+		e := row.Edge
+		if e == nil {
+			continue
+		}
+		switch e.Kind {
+		case graph.EdgeReadsConfig:
+			if !strings.Contains(e.To, "cfg::env::") {
+				continue
+			}
+			if add(e.From, e.To, graph.EdgeReadsEnv, graph.OriginASTResolved, e.FilePath, e.Line, nil) {
+				readsEnv++
+			}
+		case graph.EdgeReads:
+			if !fieldIDs[e.To] {
+				continue
+			}
+			if add(e.From, e.To, graph.EdgeAccessesField, graph.OriginASTResolved, e.FilePath, e.Line, map[string]any{"access": "read"}) {
+				fieldAccess++
+			}
+		case graph.EdgeWrites:
+			if !fieldIDs[e.To] {
+				continue
+			}
+			if add(e.From, e.To, graph.EdgeAccessesField, graph.OriginASTResolved, e.FilePath, e.Line, map[string]any{"access": "write"}) {
+				fieldAccess++
+			}
+		case graph.EdgeCalls:
+			mech := processExecMechanism(e.To)
+			if mech == "" {
+				continue
+			}
+			procID := "string::process::" + mech
+			if procNodes[procID] == nil {
+				procNodes[procID] = &graph.Node{
+					ID: procID, Kind: graph.KindString, Name: mech,
+					Meta: map[string]any{"context": "process", "mechanism": mech},
+				}
+			}
+			if add(e.From, procID, graph.EdgeExecutesProcess, graph.OriginASTInferred, e.FilePath, e.Line, nil) {
+				execProc++
+			}
+		}
+	}
+
+	for _, s := range indirectMutationEdges(g) {
+		if add(s.from, s.to, graph.EdgeAccessesField, graph.OriginASTInferred, s.file, s.line,
+			map[string]any{"access": "write", "indirect": true, "via": s.via}) {
+			fieldAccess++
+		}
+	}
+
+	nodes := make([]*graph.Node, 0, len(procNodes))
+	for _, n := range procNodes {
+		nodes = append(nodes, n)
+	}
+	edges := make([]*graph.Edge, 0, len(pending))
+	for _, s := range pending {
+		edges = append(edges, &graph.Edge{
+			From: s.from, To: s.to, Kind: s.kind,
+			FilePath: s.file, Line: s.line, Origin: s.origin, Meta: s.meta,
+		})
+	}
+	g.AddBatch(nodes, edges)
 	return readsEnv, execProc, fieldAccess
 }

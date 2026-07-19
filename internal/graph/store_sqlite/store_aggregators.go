@@ -83,6 +83,10 @@ func (s *Store) InEdgeCountsByKind(kinds []graph.EdgeKind) map[string]int {
 	q := `SELECT to_id, COUNT(*) FROM edges WHERE kind IN (` + inPlaceholders(len(args)) + `) GROUP BY to_id`
 	rows, err := s.db.Query(q, args...)
 	panicOnFatal(err)
+	if rows == nil {
+		// swallowed teardown-race error: read returns empty (see panicOnFatal)
+		return nil
+	}
 	defer rows.Close()
 	out := make(map[string]int)
 	for rows.Next() {
@@ -105,6 +109,10 @@ func (s *Store) NodeIDsByKinds(kinds []graph.NodeKind) []string {
 	q := `SELECT id FROM nodes WHERE kind IN (` + inPlaceholders(len(args)) + `) ORDER BY id`
 	rows, err := s.db.Query(q, args...)
 	panicOnFatal(err)
+	if rows == nil {
+		// swallowed teardown-race error: read returns empty (see panicOnFatal)
+		return nil
+	}
 	defer rows.Close()
 	var out []string
 	for rows.Next() {
@@ -121,6 +129,10 @@ func (s *Store) NodeIDsByKinds(kinds []graph.NodeKind) []string {
 func (s *Store) EdgeKindCounts() map[graph.EdgeKind]int {
 	rows, err := s.db.Query(`SELECT kind, COUNT(*) FROM edges GROUP BY kind`)
 	panicOnFatal(err)
+	if rows == nil {
+		// swallowed teardown-race error: read returns empty (see panicOnFatal)
+		return nil
+	}
 	defer rows.Close()
 	out := make(map[graph.EdgeKind]int)
 	for rows.Next() {
@@ -154,6 +166,10 @@ func (s *Store) NodeDegreeByKinds(kinds []graph.NodeKind, pathPrefix string) []g
 	q += ` ORDER BY n.id`
 	rows, err := s.db.Query(q, args...)
 	panicOnFatal(err)
+	if rows == nil {
+		// swallowed teardown-race error: read returns empty (see panicOnFatal)
+		return nil
+	}
 	defer rows.Close()
 	var out []graph.NodeDegreeRow
 	for rows.Next() {
@@ -165,24 +181,68 @@ func (s *Store) NodeDegreeByKinds(kinds []graph.NodeKind, pathPrefix string) []g
 	return out
 }
 
+// nodesInFilesByKindQuery builds the per-chunk projection SQL. Pure string
+// assembly (no I/O) so the plan-lock test can EXPLAIN the exact query the
+// store executes (store_bfs.go precedent).
+//
+// The kind predicate is written +kind to disqualify nodes_by_kind. A
+// stats-blind planner (any store before its first ANALYZE) costs the two
+// candidate indexes by IN-probe count alone, and the kind list is always
+// shorter than the file list — measured on a 480k-node workspace it served
+// this projection by walking whole kind ranges (~117k index entries, one
+// main-table B-tree seek each) per call instead of ~50-row file probes. The
+// unary + keeps nodes_by_file the only eligible index without INDEXED BY's
+// hard error while a bulk-load window has the droppable indexes off. The
+// former ORDER BY id forced a temp B-tree per chunk; callers get a Go-side
+// sort instead.
+func nodesInFilesByKindQuery(files, kinds int) string {
+	return `SELECT ` + lookupNodeCols + ` FROM nodes WHERE file_path IN (` +
+		inPlaceholders(files) + `) AND +kind IN (` + inPlaceholders(kinds) + `)`
+}
+
 // NodesInFilesByKind returns every node living in one of the supplied
-// files whose kind is in the supplied set.
+// files whose kind is in the supplied set, ID-sorted.
 func (s *Store) NodesInFilesByKind(files []string, kinds []graph.NodeKind) []*graph.Node {
+	var out []*graph.Node
+	for _, nodes := range s.NodesInFilesByKindSeq(files, kinds) {
+		out = append(out, nodes...)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+// NodesInFilesByKindSeq streams the same projection grouped per file, in
+// the caller's (deduped) file order, without materialising the cross-file
+// slice. Each yielded group is ID-sorted; files with no matching node yield
+// nothing, so callers that cache negative results track the yielded set
+// against their request themselves.
+func (s *Store) NodesInFilesByKindSeq(files []string, kinds []graph.NodeKind) iter.Seq2[string, []*graph.Node] {
 	uniqFiles := dedupeNonEmpty(files)
 	_, kindArgs := aggDedupeNodeKinds(kinds)
-	if len(uniqFiles) == 0 || len(kindArgs) == 0 {
-		return nil
+	return func(yield func(string, []*graph.Node) bool) {
+		if len(uniqFiles) == 0 || len(kindArgs) == 0 {
+			return
+		}
+		for i := 0; i < len(uniqFiles); i += lookupChunkSize {
+			end := minInt(i+lookupChunkSize, len(uniqFiles))
+			chunk := uniqFiles[i:end]
+			args := append(toAnyArgs(chunk), kindArgs...)
+			byFile := make(map[string][]*graph.Node, len(chunk))
+			for _, n := range s.queryNodesSQL(nodesInFilesByKindQuery(len(chunk), len(kindArgs)), args...) {
+				byFile[n.FilePath] = append(byFile[n.FilePath], n)
+			}
+			for _, file := range chunk {
+				nodes := byFile[file]
+				if len(nodes) == 0 {
+					continue
+				}
+				sort.Slice(nodes, func(a, b int) bool { return nodes[a].ID < nodes[b].ID })
+				if !yield(file, nodes) {
+					return
+				}
+			}
+		}
 	}
-	var out []*graph.Node
-	for i := 0; i < len(uniqFiles); i += lookupChunkSize {
-		end := minInt(i+lookupChunkSize, len(uniqFiles))
-		chunk := uniqFiles[i:end]
-		args := append(toAnyArgs(chunk), kindArgs...)
-		q := `SELECT ` + lookupNodeCols + ` FROM nodes WHERE file_path IN (` +
-			inPlaceholders(len(chunk)) + `) AND kind IN (` + inPlaceholders(len(kindArgs)) + `) ORDER BY id`
-		out = append(out, s.queryNodesSQL(q, args...)...)
-	}
-	return out
 }
 
 // FileImportCounts returns per-target-file incoming-import counts. A
@@ -227,6 +287,10 @@ func (s *Store) FileImportCounts(scope []string) []graph.FileImportCountRow {
 func aggScanImportCounts(s *Store, q string, args []any, acc map[string]int) {
 	rows, err := s.db.Query(q, args...)
 	panicOnFatal(err)
+	if rows == nil {
+		// swallowed teardown-race error: read returns empty (see panicOnFatal)
+		return
+	}
 	defer rows.Close()
 	for rows.Next() {
 		var path string
@@ -252,6 +316,10 @@ func (s *Store) InDegreeForNodes(ids []string) map[string]int {
 			inPlaceholders(len(chunk)) + `) GROUP BY to_id`
 		rows, err := s.db.Query(q, toAnyArgs(chunk)...)
 		panicOnFatal(err)
+		if rows == nil {
+			// swallowed teardown-race error: read returns empty (see panicOnFatal)
+			return out
+		}
 		for rows.Next() {
 			var id string
 			var n int
@@ -277,6 +345,10 @@ func (s *Store) CrossRepoEdgeCounts() []graph.CrossRepoEdgeRow {
 		GROUP BY e.kind, nf.repo_prefix, nt.repo_prefix`
 	rows, err := s.db.Query(q)
 	panicOnFatal(err)
+	if rows == nil {
+		// swallowed teardown-race error: read returns empty (see panicOnFatal)
+		return nil
+	}
 	defer rows.Close()
 	// Aggregate keyed by the edge's OWN kind (cross_repo_*), NOT the base.
 	// BaseKindForCrossRepo is used only as the recogniser that decides
@@ -322,6 +394,10 @@ func (s *Store) FileImporters(filePath string) []graph.FileImporterRow {
 		ORDER BY nf.file_path`
 	rows, err := s.db.Query(q, string(graph.EdgeImports), filePath, filePath)
 	panicOnFatal(err)
+	if rows == nil {
+		// swallowed teardown-race error: read returns empty (see panicOnFatal)
+		return nil
+	}
 	defer rows.Close()
 	var out []graph.FileImporterRow
 	for rows.Next() {
@@ -353,6 +429,10 @@ func (s *Store) FileSymbolNamesByPaths(paths []string, kinds []graph.NodeKind) [
 			inPlaceholders(len(chunk)) + `) AND kind IN (` + inPlaceholders(len(kindArgs)) + `)`
 		rows, err := s.db.Query(q, args...)
 		panicOnFatal(err)
+		if rows == nil {
+			// swallowed teardown-race error: read returns empty (see panicOnFatal)
+			return out
+		}
 		for rows.Next() {
 			var r graph.FileSymbolNameRow
 			panicOnFatal(rows.Scan(&r.FilePath, &r.Name))
@@ -411,6 +491,34 @@ func (s *Store) ExternalCallCandidateEdges() []*graph.Edge {
 	return s.queryEdgesSQL(q)
 }
 
+// DistinctExternalTargets performs the Go external-attribution discovery as
+// one SQLite aggregate. Only distinct destination IDs cross the driver; full
+// edge payloads (especially Meta) stay disk-resident.
+func (s *Store) DistinctExternalTargets(kinds []graph.EdgeKind) []string {
+	_, args := aggDedupeEdgeKinds(kinds)
+	if len(args) == 0 {
+		return nil
+	}
+	q := `SELECT DISTINCT to_id FROM edges
+		WHERE kind IN (` + inPlaceholders(len(args)) + `) AND ` + externalCallTargetPredicate + `
+		ORDER BY to_id`
+	rows, err := s.db.Query(q, args...)
+	panicOnFatal(err)
+	if rows == nil {
+		return nil
+	}
+	defer rows.Close()
+
+	var targets []string
+	for rows.Next() {
+		var target string
+		panicOnFatal(rows.Scan(&target))
+		targets = append(targets, target)
+	}
+	panicOnFatal(rows.Err())
+	return targets
+}
+
 // NodesByKinds returns every node whose kind is in the supplied set.
 func (s *Store) NodesByKinds(kinds []graph.NodeKind) []*graph.Node {
 	_, args := aggDedupeNodeKinds(kinds)
@@ -444,6 +552,10 @@ func (s *Store) EdgeAdjacencyForKinds(edgeKinds []graph.EdgeKind, nodeKinds []gr
 			AND nt.kind IN (` + inPlaceholders(len(nArgs)) + `)`
 		rows, err := s.db.Query(q, args...)
 		panicOnFatal(err)
+		if rows == nil {
+			// swallowed teardown-race error: read returns empty (see panicOnFatal)
+			return
+		}
 		defer rows.Close()
 		for rows.Next() {
 			var from, to string
@@ -487,6 +599,10 @@ func (s *Store) NodeDegreeCounts(ids []string, usageKinds []graph.EdgeKind) []gr
 		args := append(append([]any(nil), usageInline...), toAnyArgs(chunk)...)
 		rows, err := s.db.Query(q, args...)
 		panicOnFatal(err)
+		if rows == nil {
+			// swallowed teardown-race error: read returns empty (see panicOnFatal)
+			return out
+		}
 		for rows.Next() {
 			var r graph.NodeDegreeRow
 			panicOnFatal(rows.Scan(&r.NodeID, &r.InCount, &r.OutCount, &r.UsageInCount))
@@ -537,6 +653,10 @@ func (s *Store) NodeFanCounts(ids []string, fanInKinds, fanOutKinds []graph.Edge
 		args = append(args, toAnyArgs(chunk)...)
 		rows, err := s.db.Query(q, args...)
 		panicOnFatal(err)
+		if rows == nil {
+			// swallowed teardown-race error: read returns empty (see panicOnFatal)
+			return out
+		}
 		for rows.Next() {
 			var r graph.NodeFanRow
 			panicOnFatal(rows.Scan(&r.NodeID, &r.FanIn, &r.FanOut))
@@ -562,6 +682,10 @@ func (s *Store) CommunityCrossingsByKind(kinds []graph.EdgeKind, nodeToComm map[
 	q := `SELECT from_id, to_id FROM edges WHERE kind IN (` + inPlaceholders(len(args)) + `)`
 	rows, err := s.db.Query(q, args...)
 	panicOnFatal(err)
+	if rows == nil {
+		// swallowed teardown-race error: read returns empty (see panicOnFatal)
+		return nil
+	}
 	defer rows.Close()
 	out := make(map[string]int)
 	for rows.Next() {

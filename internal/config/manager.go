@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"go.uber.org/zap"
 	"gopkg.in/yaml.v3"
@@ -26,7 +28,15 @@ type ConfigManager struct {
 	// still gets gitignore-respecting behaviour.
 	workspacePaths map[string]string
 	mu             sync.RWMutex
-	logger         *zap.Logger
+	// revision is a monotonically increasing epoch for immutable views built
+	// from global and per-repo config. Readers can cache those views and pay
+	// only an atomic load until configuration state actually changes.
+	revision atomic.Uint64
+	logger   *zap.Logger
+	// excludeCache memoizes the per-repo `.gitignore` parse and the layered
+	// exclude list so EffectiveExclude — called on every indexer walk and
+	// per-file reconcile — does not re-read and re-merge on every call.
+	excludeCache *excludeCache
 }
 
 // NewConfigManager creates a ConfigManager by loading the GlobalConfig
@@ -49,6 +59,7 @@ func NewConfigManager(globalPath string) (*ConfigManager, error) {
 		workspace:      make(map[string]*Config),
 		workspacePaths: make(map[string]string),
 		logger:         zap.NewNop(),
+		excludeCache:   newExcludeCache(),
 	}, nil
 }
 
@@ -61,7 +72,20 @@ func (cm *ConfigManager) SetLogger(logger *zap.Logger) {
 
 // Global returns the underlying GlobalConfig.
 func (cm *ConfigManager) Global() *GlobalConfig {
-	return cm.global
+	cm.mu.RLock()
+	global := cm.global
+	cm.mu.RUnlock()
+	return global
+}
+
+// Revision returns the current configuration epoch. It changes after every
+// successful global reload and whenever LoadWorkspaceConfig changes cached
+// per-repo state.
+func (cm *ConfigManager) Revision() uint64 {
+	if cm == nil {
+		return 0
+	}
+	return cm.revision.Load()
 }
 
 // Reload re-reads the GlobalConfig from disk, keeping the same config
@@ -91,6 +115,7 @@ func (cm *ConfigManager) Reload() error {
 	// they'll be reloaded on the next LoadWorkspaceConfig call.
 	cm.workspace = make(map[string]*Config)
 	cm.workspacePaths = make(map[string]string)
+	cm.revision.Add(1)
 	cm.mu.Unlock()
 	return nil
 }
@@ -100,18 +125,11 @@ func (cm *ConfigManager) Reload() error {
 // no entry is cached (global defaults will apply). If the file is
 // malformed, a warning is logged and no entry is cached.
 func (cm *ConfigManager) LoadWorkspaceConfig(repoPrefix, repoPath string) {
-	// Remember the path even when `.gortex.yaml` is absent so the
-	// effective-exclude layer can still find the repo's `.gitignore`.
-	if repoPath != "" {
-		cm.mu.Lock()
-		cm.workspacePaths[repoPrefix] = repoPath
-		cm.mu.Unlock()
-	}
-
 	configPath := filepath.Join(repoPath, ".gortex.yaml")
 
 	data, err := os.ReadFile(configPath)
 	if err != nil {
+		cm.updateWorkspaceConfig(repoPrefix, repoPath, nil)
 		if os.IsNotExist(err) {
 			// No workspace config — global defaults will apply.
 			return
@@ -125,6 +143,7 @@ func (cm *ConfigManager) LoadWorkspaceConfig(repoPrefix, repoPath string) {
 
 	var cfg Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		cm.updateWorkspaceConfig(repoPrefix, repoPath, nil)
 		// Malformed workspace config — log warning, return global defaults.
 		cm.logger.Warn("malformed workspace config, using global defaults",
 			zap.String("repo", repoPrefix),
@@ -133,9 +152,28 @@ func (cm *ConfigManager) LoadWorkspaceConfig(repoPrefix, repoPath string) {
 		return
 	}
 
+	cm.updateWorkspaceConfig(repoPrefix, repoPath, &cfg)
+}
+
+// updateWorkspaceConfig publishes a per-repo state transition and advances
+// revision only when the cached state actually changes. A nil cfg updates the
+// remembered path without replacing an existing parsed config, preserving the
+// prior missing/malformed-file behavior.
+func (cm *ConfigManager) updateWorkspaceConfig(repoPrefix, repoPath string, cfg *Config) {
 	cm.mu.Lock()
-	defer cm.mu.Unlock()
-	cm.workspace[repoPrefix] = &cfg
+	changed := false
+	if repoPath != "" && cm.workspacePaths[repoPrefix] != repoPath {
+		cm.workspacePaths[repoPrefix] = repoPath
+		changed = true
+	}
+	if cfg != nil && !reflect.DeepEqual(cm.workspace[repoPrefix], cfg) {
+		cm.workspace[repoPrefix] = cfg
+		changed = true
+	}
+	if changed {
+		cm.revision.Add(1)
+	}
+	cm.mu.Unlock()
 }
 
 // getWorkspaceConfig returns the cached workspace config for a repo, or nil.
@@ -196,6 +234,18 @@ func (cm *ConfigManager) GetRepoConfig(repoPrefix string) *Config {
 //  4. Matching RepoEntry.Exclude (first match in Repos, then Projects)
 //  5. Workspace .gortex.yaml top-level Exclude
 //  6. Legacy workspace Index.Exclude / Watch.Exclude (deprecated)
+//
+// This runs on a firehose of calls (every indexer walk and per-file
+// reconcile), so the layered result is memoized per repo and returned
+// shared: a steady-state call does one os.Stat of the repo's `.gitignore`
+// and returns the cached slice without re-reading or re-merging. The cache
+// invalidates on config changes (the global and workspace configs are
+// swapped, never mutated in place, so pointer identity is the version) and
+// on a `.gitignore` mtime/size change.
+//
+// The returned slice is SHARED and IMMUTABLE: callers MUST NOT mutate its
+// elements. It is clipped (len == cap), so appending to it is safe —
+// append reallocates rather than writing through the shared backing array.
 func (cm *ConfigManager) EffectiveExclude(repoPrefix string) []string {
 	cm.mu.RLock()
 	gc := cm.global
@@ -203,16 +253,24 @@ func (cm *ConfigManager) EffectiveExclude(repoPrefix string) []string {
 	repoPath := cm.workspacePaths[repoPrefix]
 	cm.mu.RUnlock()
 
+	respect := shouldRespectGitignore(ws)
+	var st gitignoreStat
+	if respect && repoPath != "" {
+		st = statGitignore(repoPath)
+	}
+	if m, ok := cm.excludeCache.lookupMerged(repoPrefix, gc, ws, repoPath, respect, st); ok {
+		return m
+	}
+
 	out := make([]string, 0, 32)
 	out = append(out, excludes.Builtin...)
 
 	// Layer 2: repo `.gitignore`, unless the workspace config explicitly
-	// opts out. Reading happens on every EffectiveExclude call — the
-	// file is tiny and the function isn't on a hot path; refreshing
-	// every read keeps mid-session edits to `.gitignore` picked up
-	// without needing to wire cache invalidation.
-	if shouldRespectGitignore(ws) && repoPath != "" {
-		out = append(out, loadRepoGitignore(repoPath)...)
+	// opts out. The parse is cached per repo path and refreshed only when
+	// the file's mtime/size changes (see excludeCache), so a mid-session
+	// edit is still picked up on the next call.
+	if respect && repoPath != "" {
+		out = append(out, cm.excludeCache.patterns(repoPath, st)...)
 	}
 
 	if gc != nil {
@@ -247,6 +305,12 @@ func (cm *ConfigManager) EffectiveExclude(repoPrefix string) []string {
 			out = append(out, inc)
 		}
 	}
+
+	// Clip to len == cap so a caller that appends to the returned slice is
+	// forced to reallocate and can never write through the shared backing
+	// array the cache hands to every reader.
+	out = out[:len(out):len(out)]
+	cm.excludeCache.storeMerged(repoPrefix, gc, ws, repoPath, respect, st, out)
 	return out
 }
 

@@ -13,6 +13,7 @@ import (
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/progress"
 	"github.com/zzet/gortex/internal/tui"
 )
@@ -81,11 +82,15 @@ func runTrack(cmd *cobra.Command, args []string) error {
 	rawPath := args[0]
 	w := cmd.ErrOrStderr()
 
-	// Resolve to absolute path.
+	// Resolve to absolute path. Normalise the volume (upper-case a Windows
+	// drive letter) for this NEW entry so it converges with os.Getwd's
+	// convention — the volume is never part of a repo basename, so this is
+	// cosmetic and cannot rotate a repo prefix. No-op on POSIX.
 	absPath, err := filepath.Abs(rawPath)
 	if err != nil {
 		return fmt.Errorf("resolving path %s: %w", rawPath, err)
 	}
+	absPath = pathkey.NormalizeVolume(absPath)
 
 	// Validate path exists and is a directory.
 	info, err := os.Stat(absPath)
@@ -106,9 +111,12 @@ func runTrack(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("loading global config: %w", err)
 	}
+	// Heal any pre-existing duplicate case-variant entries so the track
+	// path (and the persisted config) sees a clean list (#270).
+	healDuplicateRepos(gc, nil)
 	already := false
 	for _, existing := range gc.Repos {
-		if existingAbs, _ := filepath.Abs(existing.Path); existingAbs == absPath {
+		if existingAbs, _ := filepath.Abs(existing.Path); pathkey.SamePathIdentity(existingAbs, absPath) {
 			already = true
 			break
 		}
@@ -175,7 +183,7 @@ func runTrack(cmd *cobra.Command, args []string) error {
 // daemon status, or -1 if the daemon has not registered the repo yet.
 func repoNodeCount(st daemon.StatusResponse, absPath string) int {
 	for _, r := range st.TrackedRepos {
-		if ra, err := filepath.Abs(r.Path); err == nil && ra == absPath {
+		if ra, err := filepath.Abs(r.Path); err == nil && pathkey.EqualPaths(ra, absPath) {
 			return r.Nodes
 		}
 	}
@@ -197,9 +205,19 @@ func indexSettled(st daemon.StatusResponse, absPath string, prevNodes int) (sett
 }
 
 // waitForRepoIndexed polls the daemon until the repo at absPath has settled
-// (see indexSettled) or timeout elapses. timeout <= 0 waits forever.
+// (see indexSettled) or timeout elapses. timeout <= 0 waits forever. On a TTY
+// the wait renders as a live step with the node count ticking up; on a pipe
+// (or with --no-progress) it prints one start line, slow heartbeats, and the
+// settle summary.
 func waitForRepoIndexed(w io.Writer, absPath string, timeout time.Duration) error {
-	fmt.Fprintf(w, "  waiting for indexing to settle (--wait)…\n")
+	tr := progress.NewTracker(w)
+	if noProgress {
+		tr = progress.NewTracker(w, progress.WithoutAnimation())
+	}
+	tr.Start("waiting for indexing to settle (--wait)")
+	step := tr.StartStep("indexing " + filepath.Base(absPath))
+	step.SetUnit("nodes")
+
 	var deadline time.Time
 	if timeout > 0 {
 		deadline = time.Now().Add(timeout)
@@ -208,14 +226,20 @@ func waitForRepoIndexed(w io.Writer, absPath string, timeout time.Duration) erro
 	for {
 		if st, err := trackStatusFn(); err == nil {
 			settled, nodes := indexSettled(st, absPath, prevNodes)
+			if nodes > 0 {
+				step.Progress(int64(nodes), 0)
+			}
 			if settled {
-				fmt.Fprintf(w, "  indexed: %d nodes\n", nodes)
+				step.DoneAs("index settled")
+				tr.Done("indexed", humanizeInt(nodes)+" nodes")
 				return nil
 			}
 			prevNodes = nodes
 		}
 		if timeout > 0 && time.Now().After(deadline) {
-			return fmt.Errorf("--wait: timed out after %s waiting for %s to index", timeout, absPath)
+			err := fmt.Errorf("--wait: timed out after %s waiting for %s to index", timeout, absPath)
+			tr.Fail(err)
+			return err
 		}
 		time.Sleep(trackPollInterval)
 	}
@@ -343,6 +367,14 @@ func runUntrack(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("resolving path %s: %w", rawPath, err)
 		}
 		target = abs
+	} else if info, statErr := os.Stat(rawPath); statErr == nil && info.IsDir() {
+		// A relative arg that names an existing directory (e.g. `foo/bar`
+		// from cwd) is a path, not a prefix — absolutise it so it resolves
+		// against the tracked roots. A bare prefix that names no directory
+		// keeps its as-is behaviour.
+		if abs, err := filepath.Abs(rawPath); err == nil {
+			target = abs
+		}
 	}
 
 	emitUntrackBanner(w, target, daemon.IsRunning())

@@ -20,6 +20,7 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
 	gortexmcp "github.com/zzet/gortex/internal/mcp"
+	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/platform"
 	"github.com/zzet/gortex/internal/progress"
 	"github.com/zzet/gortex/internal/semantic/lsp"
@@ -203,8 +204,10 @@ func buildDaemonState(logger *zap.Logger) (*daemonState, error) {
 type warmupTimings struct {
 	parse         time.Duration
 	resolve       time.Duration
+	enrich        time.Duration
 	globalResolve time.Duration
 	endBatch      time.Duration
+	analysis      time.Duration
 	// reposChanged is the number of tracked repos whose reindex actually did
 	// work this warmup (cold track, or a reconcile with stale/deleted files).
 	reposChanged int
@@ -225,6 +228,43 @@ type warmupTimings struct {
 // — so the daemon reports ready as soon as find_usages / get_callers return
 // complete results, not after enrichment finishes. The returned *warmupTimings
 // is never nil — daemon.go uses it to emit a one-line warmup summary.
+// healDuplicateRepos drops tracked-repo entries that name the same
+// directory as an earlier entry under a different path spelling — letter
+// case or Unicode normalisation on a case-insensitive filesystem — logs
+// each drop, and persists the cleaned config. Returns the number of
+// entries removed. It is the startup / load-time repair for configs that
+// accumulated a duplicate before folding was applied (#270): a duplicate
+// reaching the warmup loop would flip the daemon into multi-repo mode and
+// desync the graph. The FIRST (oldest) spelling of each directory is kept.
+func healDuplicateRepos(gc *config.GlobalConfig, logger *zap.Logger) int {
+	if gc == nil {
+		return 0
+	}
+	removed := gc.DedupeRepos()
+	if len(removed) == 0 {
+		return 0
+	}
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+	for _, r := range removed {
+		kept := r.Path
+		for _, k := range gc.Repos {
+			if pathkey.SamePathIdentity(k.Path, r.Path) {
+				kept = k.Path
+				break
+			}
+		}
+		logger.Warn("dropping duplicate tracked-repo entry (same directory, different path spelling)",
+			zap.String("dropped", r.Path),
+			zap.String("kept", kept))
+	}
+	if err := gc.Save(); err != nil {
+		logger.Warn("persisting deduped repo config failed", zap.Error(err))
+	}
+	return len(removed)
+}
+
 func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func()) (*indexer.MultiWatcher, *warmupTimings) {
 	timings := &warmupTimings{}
 	if state.multiIndexer == nil || state.configManager == nil {
@@ -244,7 +284,63 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// batch wrapper, a 100+ repo warmup is O(R · global_size).
 	state.multiIndexer.BeginParallelBatch()
 
+	// Heal any duplicate tracked-repo entries that name the same directory
+	// under a different path spelling (case, or Unicode normalisation)
+	// BEFORE the warmup loop registers them. Two spellings of one directory
+	// would otherwise both reach the indexer and flip the daemon into
+	// multi-repo mode, desyncing the unprefixed graph (#270).
+	healDuplicateRepos(state.configManager.Global(), logger)
+
 	repos := state.configManager.Global().Repos
+
+	// Purge orphaned repo prefixes BEFORE the warmup loop re-registers the
+	// tracked repos, while the store still reflects the prior run's state. A
+	// repo removed from config (or untracked before the sidecar-aware purge
+	// existed) can leave its nodes+edges AND its fifteen repo_prefix-keyed
+	// sidecar tables (file_mtimes, *_enrichment, symbol_fts, content_fts, ...)
+	// behind — a long-lived store then carries thousands of rows for a repo
+	// gone long ago. Key the tracked repos through the same EffectiveRepoPrefix
+	// the warm mtime lookup + LSP-helper registry use (so the comparison
+	// matches what the indexer actually wrote), ask the store for any DISTINCT
+	// prefix outside that set, and PurgeRepo each. '' is never an orphan
+	// (shared global externals / solo data). Capability-probed, so only the
+	// sidecar-bearing on-disk store participates; the in-memory store skips it.
+	if orphaner, ok := state.graph.(interface {
+		OrphanRepoPrefixes(known []string) []string
+	}); ok {
+		if purger, ok := state.graph.(interface{ PurgeRepo(string) error }); ok {
+			known := make([]string, 0, len(repos))
+			for _, entry := range repos {
+				p := strings.TrimPrefix(indexer.EffectiveRepoPrefix(state.configManager, entry), "/")
+				if p != "" {
+					known = append(known, p)
+				}
+			}
+			for _, prefix := range orphaner.OrphanRepoPrefixes(known) {
+				if err := purger.PurgeRepo(prefix); err != nil {
+					logger.Warn("daemon: purging orphaned repo prefix failed",
+						zap.String("prefix", prefix), zap.Error(err))
+					continue
+				}
+				logger.Info("daemon: purged orphaned repo prefix (no tracked repo in config keys under it)",
+					zap.String("prefix", prefix))
+			}
+		}
+	}
+
+	// One-time store compaction, guarded (see daemon_compact.go). Placed HERE
+	// on purpose: after the orphan purge, so the pages it just freed are
+	// measured and reclaimed in the same pass; before the warmup re-index loop
+	// and the resolver/enrichment passes, whose writes would reuse freelist
+	// pages mid-measurement and whose readers would contend with VACUUM's
+	// exclusive lock. The socket is already listening (it opens before this
+	// goroutine by design), but at this point in boot the daemon's own
+	// workload is quiet and a rare early client query either finishes first or
+	// makes the VACUUM fail cleanly at busy_timeout — a skip, not a fault.
+	// Running before the socket opened instead would hold the daemon
+	// unreachable for the whole VACUUM, turning a compacting boot into an
+	// apparent hang.
+	maybeCompactStore(state.graph, logger)
 
 	// Register a per-repo resolver-time LSP helper for every
 	// tracked repo BEFORE the parallel warmup loop fires. The
@@ -333,6 +429,15 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// whole-workspace clone pass runs, degrading toward correctness.
 	var changedPrefixes sync.Map
 	var scopeUnknown atomic.Bool
+	coordinatedBulk, _ := state.graph.(graph.CoordinatedBulkLoader)
+	coordinatedBulkActive := coordinatedBulk != nil && coordinatedBulk.BeginCoordinatedBulkLoad()
+	defer func() {
+		if coordinatedBulkActive {
+			if err := coordinatedBulk.EndCoordinatedBulkLoad(); err != nil {
+				logger.Error("daemon: coordinated cold bulk-load cleanup failed", zap.Error(err))
+			}
+		}
+	}()
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
@@ -479,6 +584,16 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	}
 	close(jobs)
 	wg.Wait()
+	if coordinatedBulkActive {
+		flushStart := time.Now()
+		if err := coordinatedBulk.EndCoordinatedBulkLoad(); err != nil {
+			logger.Error("daemon: coordinated cold bulk-load finalize failed", zap.Error(err))
+		} else {
+			logger.Info("daemon: coordinated cold bulk-load complete",
+				zap.Duration("elapsed", time.Since(flushStart)))
+		}
+		coordinatedBulkActive = false
+	}
 	timings.parse = time.Since(phaseStart)
 	timings.filesReindexed = int(filesReindexed.Load())
 	logger.Info("daemon: warmup phase done",
@@ -529,6 +644,43 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	resolveScope := warmupResolveScope(changed, len(repos), anyChanged,
 		scopeUnknown.Load(), state.snapshotPartial, storeNeedsRebuild(state.graph))
 
+	// Resume enrichment for any repo a prior process left partial / abandoned.
+	// Seeded BEFORE the resolve phase so the overlapped enrichment pool below
+	// covers those repos too. Cheap for a fully-enriched workspace: each
+	// already-complete repo pays only a git rev-parse plus one marker lookup.
+	enrichPending := state.multiIndexer.SeedPendingEnrichAll()
+	if enrichPending > 0 && !anyChanged {
+		logger.Info("daemon: warmup resuming incomplete enrichment on an otherwise-unchanged restart",
+			zap.Int("repos_pending_enrich", enrichPending))
+	}
+
+	// Overlap the enrichment pool with the resolve phase: the pool's COMPUTE
+	// (go/packages loads, tree-sitter parses) reads no graph state, so it
+	// runs on the cores the resolver leaves idle; every provider's graph
+	// APPLY parks on the apply gate until the resolve phase completes, so no
+	// giant apply can starve the resolver on the shared ResolveMutex
+	// (measured: an ungated overlap stretched the resolve compute loop 289s →
+	// 2,193s). GORTEX_ENRICH_OVERLAP=0 restores strictly-sequential ordering.
+	var deferredRun *indexer.DeferredPassesRun
+	openApplyGate := func() {}
+	if (anyChanged || enrichPending > 0) && os.Getenv("GORTEX_ENRICH_OVERLAP") != "0" {
+		applyGate := make(chan struct{})
+		openApplyGate = sync.OnceFunc(func() {
+			// Re-base the deferred window's unresolved-write counter before
+			// any parked apply can run: the resolve phase's own in-window
+			// writes (guard reverts, cross-repo binds) are its own to handle
+			// and must not force the post-enrichment fallback resolve.
+			deferredRun.SnapshotUnresolvedBase()
+			logger.Info("daemon: enrichment apply gate opened")
+			close(applyGate)
+		})
+		// FinishTail joins pool lanes that may be parked on the gate: the
+		// gate MUST open on every path that reaches it, including panics.
+		defer openApplyGate()
+		deferredRun = state.multiIndexer.BeginDeferredPasses(ctx, applyGate)
+		logger.Info("daemon: deferred enrichment pool started ahead of resolve")
+	}
+
 	// Resolve references ahead of the slow enrichment pass so find_usages /
 	// get_callers return complete results as soon as the daemon reports ready
 	// — independent of semantic enrichment. RunPreEnrichResolve materialises
@@ -539,7 +691,17 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	if anyChanged {
 		phaseStart = time.Now()
 		publishReadinessPhase(state, "resolve", false, nil)
-		state.multiIndexer.RunPreEnrichResolve(ctx, resolveScope)
+		// markReady fires at the master resolver's compute-done point — the
+		// earliest moment same-repo references are queryable — instead of
+		// after the refinement tail + cross-repo pass (minutes on a large
+		// workspace; they only refine confidence and bind cross-repo edges,
+		// and keep running here after ready). The apply gate stays closed
+		// for the whole phase: an apply holds the ResolveMutex in
+		// multi-minute stretches, and admitting applies between the master
+		// and cross-repo passes starved cross-repo to a standstill
+		// (measured: 1,049s for a pass that runs in ~38s uncontended). The
+		// gate opens right after this call returns.
+		state.multiIndexer.RunPreEnrichResolve(ctx, resolveScope, markReady)
 		timings.resolve = time.Since(phaseStart)
 		logger.Info("daemon: warmup phase done",
 			zap.String("phase", "resolve"),
@@ -549,6 +711,10 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 		})
 	}
 
+	// The resolve phase is over: parked enrichment applies may now take the
+	// ResolveMutex without contending the warmup resolver.
+	openApplyGate()
+
 	// References are resolved (or unchanged and already resolved on the warm
 	// path): the graph is queryable. Flip ready before the multi-minute
 	// enrichment so clients can start issuing queries immediately. Everything
@@ -557,30 +723,21 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 		markReady()
 	}
 
-	// Resume enrichment for any repo a prior process left partial / abandoned.
-	// pendingEnrich reflects only this run's re-indexing work, so an unchanged
-	// repo whose completion marker is absent (a cut-short pass writes none)
-	// would never re-run its semantic pass. Seeding re-arms the gate from the
-	// persisted marker so the deferred pass below resumes it — and runs that
-	// block even on a warm restart that changed nothing on disk (anyChanged is
-	// false). Cheap for a fully-enriched workspace: each already-complete repo
-	// pays only a git rev-parse plus one marker lookup.
-	enrichPending := state.multiIndexer.SeedPendingEnrichAll()
-	if enrichPending > 0 && !anyChanged {
-		logger.Info("daemon: warmup resuming incomplete enrichment on an otherwise-unchanged restart",
-			zap.Int("repos_pending_enrich", enrichPending))
-	}
-
 	// Drain deferred per-repo passes (semantic enrich / contract
-	// extract+commit) serially across the indexers the parallel loop
-	// populated. These run after ready: enrichment is a precision upgrade on
-	// top of the already-queryable reference graph. RunDeferredPassesAll
-	// re-runs the master resolver at its tail to lift placeholder edges the
-	// enrichment + contract passes add.
+	// extract+commit). These finish after ready: enrichment is a precision
+	// upgrade on top of the already-queryable reference graph. The tail
+	// re-runs the master resolver to lift placeholder edges the enrichment +
+	// contract passes add. When the pool was started ahead of resolve, this
+	// block only joins the surviving lanes and runs the tail.
 	if anyChanged || enrichPending > 0 {
 		phaseStart = time.Now()
 		publishReadinessPhase(state, "deferred_passes_all", true, nil)
-		timings.enrichScheduled = state.multiIndexer.RunDeferredPassesAll(ctx)
+		if deferredRun != nil {
+			timings.enrichScheduled = deferredRun.FinishTail()
+		} else {
+			timings.enrichScheduled = state.multiIndexer.RunDeferredPassesAll(ctx)
+		}
+		timings.enrich = time.Since(phaseStart)
 		logger.Info("daemon: warmup phase done",
 			zap.String("phase", "deferred_passes_all"),
 			zap.Duration("elapsed", time.Since(phaseStart)))
@@ -689,6 +846,16 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// disabled or the set is empty (run every repo, the prior behaviour).
 	if anyChanged && !scopeUnknown.Load() {
 		state.multiIndexer.ArmBatchScope(changed)
+		// Full-coverage attestation: every tracked repository re-indexed in
+		// this warmup (a cold index, or a warm restart that reconciled the
+		// whole workspace). The framework-synthesis admission census may
+		// then read the raw store even though the batch scope is non-nil —
+		// without this, the cold path's all-repos scope silently bypassed
+		// every census gate. Computed here, against the daemon's own repo
+		// registry, never inferred downstream from scope size.
+		if len(changed) == len(repos) {
+			state.multiIndexer.ArmBatchCensusEligible()
+		}
 	}
 
 	phaseStart = time.Now()
@@ -740,6 +907,17 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 		logger.Warn("daemon: multi-watcher start failed", zap.Error(err))
 		return nil, timings
 	}
+	// Attach the live watcher before publishing watcher_started. This makes
+	// readiness truthful: once clients observe the phase, mutation handlers
+	// can already enqueue path-scoped work instead of falling back to a costly
+	// synchronous IndexFile call.
+	if state.mcpServer != nil {
+		state.mcpServer.SetWatcher(mw)
+		srv := state.mcpServer
+		mw.OnDegraded(func(reason string) {
+			srv.PublishReadiness("degraded", true, map[string]any{"watch_degraded": reason})
+		})
+	}
 	logger.Info("daemon: watching", zap.Int("repos", len(watchCfgs)))
 	publishReadinessPhase(state, "watcher_started", true, map[string]any{
 		"watched_repos": len(watchCfgs),
@@ -761,8 +939,10 @@ func logWarmupSummary(logger *zap.Logger, warmup *warmupTimings, queryable, tota
 	logger.Info("daemon: warmup summary",
 		zap.Float64("parse_s", warmup.parse.Seconds()),
 		zap.Float64("resolve_s", warmup.resolve.Seconds()),
+		zap.Float64("enrich_s", warmup.enrich.Seconds()),
 		zap.Float64("global_resolve_s", warmup.globalResolve.Seconds()),
 		zap.Float64("end_batch_s", warmup.endBatch.Seconds()),
+		zap.Float64("analysis_s", warmup.analysis.Seconds()),
 		zap.Float64("queryable_s", queryable.Seconds()),
 		zap.Int("repos_changed", warmup.reposChanged),
 		zap.Int("files_reindexed", warmup.filesReindexed),

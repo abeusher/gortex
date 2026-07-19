@@ -1,5 +1,426 @@
 package store_sqlite
 
+import "database/sql"
+
+// isUnresolvedColumnDDL is the edges.is_unresolved generated column: a
+// VIRTUAL, indexed boolean mirroring graph.IsUnresolvedTarget's two shapes
+// (the bare `unresolved::Name` prefix and the multi-repo COPY-rewrite
+// `<repoPrefix>::unresolved::Name` infix), computed by SQLite itself from
+// to_id — no Go call site has to remember to keep it in sync. VIRTUAL, not
+// STORED: SQLite refuses `ALTER TABLE ADD COLUMN ... STORED` on a non-empty
+// table ("cannot add a STORED column"), which every real installed store is.
+// VIRTUAL has no such restriction and is just as fast here — the read path
+// always goes through the index below, and an index always stores its own
+// materialised key values regardless of whether the underlying column is
+// virtual or stored. Added via ensureEdgeColumns (ALTER TABLE) rather than
+// baked into schemaSQL's CREATE TABLE so one code path handles both a fresh
+// DB (column missing right after CREATE TABLE) and an existing one (column
+// missing from before this was introduced) identically — see
+// ensureNodeColumns for the same pattern on the nodes table.
+//
+// Measured on a real 26-repo store (2.57M edges, 847,684 unresolved, ~33%
+// selectivity): replacing the OR'd `to_id` range/LIKE query with
+// `is_unresolved = 1` cut EdgesWithUnresolvedTarget from 7.96s to 2.95s
+// (2.7x). The prior approach of splitting the OR into two to_id-based
+// queries (one indexed range, one LIKE) was WORSE (13.49s) despite a
+// better-looking EXPLAIN QUERY PLAN: at ~33% selectivity the to_id index's
+// matching rows are ordered by string value, so the mandatory per-row
+// bookmark lookup back into the main table is effectively random I/O. The
+// boolean column's matching rows are all rowid-tie-broken (identical index
+// key), so its bookmark lookups land in ascending rowid order — sequential,
+// not random. Same "SEARCH ... USING INDEX" in EXPLAIN QUERY PLAN either way;
+// only real measurement told them apart.
+const isUnresolvedColumnDDL = `is_unresolved INTEGER GENERATED ALWAYS AS (
+    CASE WHEN (to_id >= 'unresolved::' AND to_id < 'unresolved:;') OR to_id LIKE '%::unresolved::%' THEN 1 ELSE 0 END
+) VIRTUAL`
+
+// memberReceiver* are virtual projections of the final `<file>::<type>`
+// segment carried by a Go member_of edge target. rtrim(X, replace(X, ':',
+// ”)) stops at X's final colon, which gives the final `::` delimiter without
+// a reverse() user function. All graph IDs use colons only as `::`
+// separators, so the two substrings exactly mirror strings.LastIndex(to,
+// "::") in the resolver fallback while remaining indexable by SQLite.
+const (
+	memberReceiverPrefixExpr = `rtrim(to_id, replace(to_id, ':', ''))`
+	memberReceiverFileExpr   = `substr(to_id, 1, length(` + memberReceiverPrefixExpr + `) - 2)`
+	memberReceiverNameExpr   = `substr(to_id, length(` + memberReceiverPrefixExpr + `) + 1)`
+
+	memberReceiverColumnDDL = `member_receiver TEXT GENERATED ALWAYS AS (
+    CASE WHEN kind = 'member_of' AND instr(to_id, '::') > 1
+              AND ` + memberReceiverNameExpr + ` <> ''
+         THEN ` + memberReceiverNameExpr + ` ELSE NULL END
+) VIRTUAL`
+
+	// filepath.Dir for normalized graph paths, expressed with built-in SQLite
+	// string functions so it can back an index on existing databases without
+	// materializing or backfilling another copy of the value.
+	memberReceiverDirColumnDDL = `member_receiver_dir TEXT GENERATED ALWAYS AS (
+    CASE WHEN kind <> 'member_of' OR instr(to_id, '::') <= 1
+              OR ` + memberReceiverNameExpr + ` = '' THEN NULL
+         WHEN instr(` + memberReceiverFileExpr + `, '/') = 0 THEN '.'
+         WHEN rtrim(rtrim(` + memberReceiverFileExpr + `,
+                         replace(` + memberReceiverFileExpr + `, '/', '')), '/') = '' THEN '/'
+         ELSE rtrim(rtrim(` + memberReceiverFileExpr + `,
+                         replace(` + memberReceiverFileExpr + `, '/', '')), '/') END
+) VIRTUAL`
+)
+
+// edgeGeneratedColumns is the set of edges.* generated columns ensureEdgeColumns
+// adds to a table created before they existed — which, since none of them are
+// in schemaSQL's CREATE TABLE, includes a freshly created table too.
+// fromRepoColumnDDL mirrors graph.RepoPrefixOfID exactly: the substring
+// before the first '/' when that slash is past position 1, else '' (bare
+// unresolved sentinels and single-repo-mode ids). Same rationale as
+// isUnresolvedColumnDDL: computed by SQLite from from_id, no Go call site
+// can forget to keep it in sync, and the scoped resolver pushdown can test
+// repo membership as a plain column. Parity is asserted against the Go
+// helper by TestEdgeScopeColumnsMirrorGoHelpers.
+const fromRepoColumnDDL = `from_repo TEXT GENERATED ALWAYS AS (
+    CASE WHEN instr(from_id, '/') > 1 THEN substr(from_id, 1, instr(from_id, '/') - 1) ELSE '' END
+) VIRTUAL`
+
+// toRepoUnresolvedColumnDDL mirrors graph.UnresolvedRepoPrefix exactly for
+// the shapes the pending scan can see (is_unresolved = 1 guarantees one of
+// the two unresolved encodings): '' for the bare `unresolved::` prefix form,
+// the leading `<repo>` for the `<repo>::unresolved::` infix form, NULL for
+// anything else. NULL is deliberately fail-open — a consumer predicate must
+// treat it as "load the row and let the Go filter decide".
+const toRepoUnresolvedColumnDDL = `to_repo_unresolved TEXT GENERATED ALWAYS AS (
+    CASE WHEN to_id >= 'unresolved::' AND to_id < 'unresolved:;' THEN ''
+         WHEN instr(to_id, '::unresolved::') > 1 THEN substr(to_id, 1, instr(to_id, '::unresolved::') - 1)
+         ELSE NULL END
+) VIRTUAL`
+
+var edgeGeneratedColumns = []struct {
+	name string
+	ddl  string
+}{
+	{"is_unresolved", isUnresolvedColumnDDL},
+	{"member_receiver", memberReceiverColumnDDL},
+	{"member_receiver_dir", memberReceiverDirColumnDDL},
+	{"from_repo", fromRepoColumnDDL},
+	{"to_repo_unresolved", toRepoUnresolvedColumnDDL},
+}
+
+// edgePromotedColumns lifts the resolver's resolve_terminal /
+// resolve_terminal_reason keys and semantic_source provenance out of Meta
+// into nullable columns — the edge-side sibling of promotedMetaColumns on
+// nodes (see meta_json.go's "promoted edge columns" section for
+// extractPromotedEdgeMeta/restorePromotedEdgeMeta and why a
+// json_extract-derived generated column was tried first and abandoned:
+// encodeMeta's common case is a custom flat binary codec, not JSON, so
+// json_extract/json_valid against a real store's meta blobs evaluates to
+// NULL for effectively every row). Plain (non-generated) columns, so they
+// share ensureEdgeColumns' table_xinfo scan but are ordinary ALTER TABLE ADD
+// COLUMN statements, not GENERATED ALWAYS AS expressions.
+//
+// Exists to let a future bulk classification query (replacing per-edge
+// Go-side classifyTerminal calls in reconcileTerminalStamps) read the
+// CURRENT terminal state as a plain indexed column instead of decoding
+// Meta, and compare it against a freshly computed value to find only the
+// edges whose state actually changed — reconcileTerminalStamps measured
+// only ~1% of examined edges (9,599 of 833,828) ever change state.
+var edgePromotedColumns = []struct {
+	name string
+	ddl  string
+}{
+	{"resolve_terminal", "resolve_terminal INTEGER"},
+	{"resolve_terminal_reason", "resolve_terminal_reason TEXT"},
+	{"semantic_source", "semantic_source TEXT"},
+}
+
+// ensureEdgeColumns adds edgeGeneratedColumns + edgePromotedColumns to an
+// edges table created before they existed. Mirrors ensureNodeColumns'
+// PRAGMA + conditional ALTER pattern, but queries table_xinfo rather than
+// table_info: table_info silently OMITS generated columns from its result
+// set (verified against the pinned modernc.org/sqlite driver — a reopened
+// store's is_unresolved column is invisible to table_info, so the existence
+// check always came back false and every reopen re-ran the ALTER, failing
+// with "duplicate column name"). table_xinfo lists every column, generated
+// ones included, with an extra hidden column (3 == generated) table_info
+// doesn't have — and works identically for the plain promoted columns too,
+// so one scan serves both lists.
+func ensureEdgeColumns(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA table_xinfo(edges)`)
+	if err != nil {
+		return err
+	}
+	existing := make(map[string]bool)
+	for rows.Next() {
+		var (
+			cid, notnull, pk, hidden int
+			name, ctype              string
+			dflt                     sql.NullString
+		)
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk, &hidden); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		existing[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	_ = rows.Close()
+	for _, c := range edgeGeneratedColumns {
+		if existing[c.name] {
+			continue
+		}
+		if _, err := db.Exec(`ALTER TABLE edges ADD COLUMN ` + c.ddl); err != nil {
+			return err
+		}
+	}
+	for _, c := range edgePromotedColumns {
+		if existing[c.name] {
+			continue
+		}
+		if _, err := db.Exec(`ALTER TABLE edges ADD COLUMN ` + c.ddl); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// isStubColumnDDL is nodes.is_stub: a VIRTUAL generated column mirroring
+// graph.IsStub/StubKind's id-prefix logic (stdlib:: / builtin:: /
+// external_call:: / module::, bare or repo-prefixed as <repo>::<kind>::...).
+// Same rationale as isUnresolvedColumnDDL: computed from the existing id
+// column, no Go call site has to keep it in sync. Exists so a future
+// SQL-side terminal classification (see resolveTerminalColumnDDL) can check
+// "is this candidate a stub" via a plain column instead of a per-row Go
+// IsStub(n.ID) call.
+const isStubColumnDDL = `is_stub INTEGER GENERATED ALWAYS AS (
+    CASE WHEN
+        id LIKE 'stdlib::%' OR id LIKE 'builtin::%' OR id LIKE 'external_call::%' OR id LIKE 'module::%'
+        OR (
+            instr(id, '::') > 0 AND (
+                substr(id, instr(id, '::') + 2) LIKE 'stdlib::%'
+                OR substr(id, instr(id, '::') + 2) LIKE 'builtin::%'
+                OR substr(id, instr(id, '::') + 2) LIKE 'external_call::%'
+                OR substr(id, instr(id, '::') + 2) LIKE 'module::%'
+            )
+        )
+    THEN 1 ELSE 0 END
+) VIRTUAL`
+
+// fileDirColumnDDL promotes filepath.Dir(file_path) into an indexable virtual
+// column. It adds no row payload and is migration-safe on populated stores;
+// the receiver-rebind join uses it to seek directly to Go types/interfaces in
+// the phantom receiver's package instead of loading every type into memory.
+const fileDirColumnDDL = `file_dir TEXT GENERATED ALWAYS AS (
+    CASE WHEN file_path = '' THEN NULL
+         WHEN instr(file_path, '/') = 0 THEN '.'
+         WHEN rtrim(rtrim(file_path, replace(file_path, '/', '')), '/') = '' THEN '/'
+         ELSE rtrim(rtrim(file_path, replace(file_path, '/', '')), '/') END
+) VIRTUAL`
+
+// nodeGeneratedColumns is the nodes-table sibling of edgeGeneratedColumns.
+// Kept as its own list (and ensureNodeGeneratedColumns as its own function,
+// rather than folded into ensureNodeColumns) because ensureNodeColumns
+// checks existence via PRAGMA table_info, which — like the edges case
+// documented on ensureEdgeColumns — silently omits generated columns.
+// Reusing that function's table_info scan for is_stub would hit the exact
+// same "always looks missing, ALTER re-runs, duplicate column name" bug.
+var nodeGeneratedColumns = []struct {
+	name string
+	ddl  string
+}{
+	{"is_stub", isStubColumnDDL},
+	{"file_dir", fileDirColumnDDL},
+}
+
+// ensureNodeGeneratedColumns adds nodeGeneratedColumns to a nodes table
+// created before they existed. See ensureEdgeColumns for the table_xinfo
+// vs table_info rationale this mirrors.
+func ensureNodeGeneratedColumns(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA table_xinfo(nodes)`)
+	if err != nil {
+		return err
+	}
+	existing := make(map[string]bool)
+	for rows.Next() {
+		var (
+			cid, notnull, pk, hidden int
+			name, ctype              string
+			dflt                     sql.NullString
+		)
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk, &hidden); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		existing[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	_ = rows.Close()
+	for _, c := range nodeGeneratedColumns {
+		if existing[c.name] {
+			continue
+		}
+		if _, err := db.Exec(`ALTER TABLE nodes ADD COLUMN ` + c.ddl); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// analysisGenerationSchemaSQL is the normalized, generation-addressed
+// whole-graph analysis cache. Node IDs are copied into generation-local rows:
+// they deliberately do not reference live nodes because incremental reindex
+// deletes and recreates live rows, which would either erase an immutable
+// snapshot or turn a tiny edit into a large FK cascade. Dense CSR and Leiden
+// state remain blobs; point-queryable results use typed rows and compact
+// surrogate node IDs.
+const analysisGenerationSchemaSQL = `
+CREATE TABLE IF NOT EXISTS analysis_generations (
+    generation_id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    format_version              INTEGER NOT NULL,
+    build_revision              INTEGER NOT NULL,
+    created_at_unix             INTEGER NOT NULL,
+    state                       INTEGER NOT NULL CHECK (state IN (0, 1, 2)),
+    node_count                  INTEGER NOT NULL CHECK (node_count >= 0),
+    community_count             INTEGER NOT NULL CHECK (community_count >= 0),
+    process_count               INTEGER NOT NULL CHECK (process_count >= 0),
+    concept_count               INTEGER NOT NULL CHECK (concept_count >= 0),
+    pagerank_max                REAL NOT NULL DEFAULT 0,
+    authority_max               REAL NOT NULL DEFAULT 0,
+    hub_max                     REAL NOT NULL DEFAULT 0,
+    modularity                  REAL NOT NULL DEFAULT 0,
+    processes_truncated         INTEGER NOT NULL DEFAULT 0 CHECK (processes_truncated IN (0, 1)),
+    processes_truncation_reason TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS analysis_generations_by_state
+    ON analysis_generations(state, generation_id DESC);
+
+CREATE TABLE IF NOT EXISTS analysis_active_generation (
+    slot          INTEGER PRIMARY KEY CHECK (slot = 1),
+    generation_id INTEGER NOT NULL UNIQUE
+        REFERENCES analysis_generations(generation_id) ON DELETE RESTRICT
+);
+
+CREATE TABLE IF NOT EXISTS analysis_generation_components (
+    generation_id INTEGER NOT NULL
+        REFERENCES analysis_generations(generation_id) ON DELETE CASCADE,
+    component     TEXT NOT NULL,
+    row_count     INTEGER NOT NULL CHECK (row_count >= 0),
+    sealed_at_unix INTEGER NOT NULL,
+    PRIMARY KEY (generation_id, component)
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS analysis_communities (
+    generation_id INTEGER NOT NULL
+        REFERENCES analysis_generations(generation_id) ON DELETE CASCADE,
+    community_id  TEXT NOT NULL,
+    label         TEXT NOT NULL DEFAULT '',
+    hub            TEXT NOT NULL DEFAULT '',
+    parent_id      TEXT NOT NULL DEFAULT '',
+    size           INTEGER NOT NULL CHECK (size >= 0),
+    cohesion       REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (generation_id, community_id)
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS analysis_community_files (
+    generation_id INTEGER NOT NULL,
+    community_id  TEXT NOT NULL,
+    ordinal       INTEGER NOT NULL CHECK (ordinal >= 0),
+    file_path     TEXT NOT NULL,
+    PRIMARY KEY (generation_id, community_id, ordinal),
+    FOREIGN KEY (generation_id, community_id)
+        REFERENCES analysis_communities(generation_id, community_id) ON DELETE CASCADE
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS analysis_nodes (
+    id            INTEGER PRIMARY KEY,
+    generation_id INTEGER NOT NULL
+        REFERENCES analysis_generations(generation_id) ON DELETE CASCADE,
+    node_id       TEXT NOT NULL,
+    community_id  TEXT,
+    pagerank      REAL NOT NULL DEFAULT 0,
+    authority     REAL NOT NULL DEFAULT 0,
+    hub           REAL NOT NULL DEFAULT 0,
+    UNIQUE (generation_id, node_id),
+    FOREIGN KEY (generation_id, community_id)
+        REFERENCES analysis_communities(generation_id, community_id)
+);
+CREATE INDEX IF NOT EXISTS analysis_nodes_by_pagerank
+    ON analysis_nodes(generation_id, pagerank DESC, id ASC);
+CREATE INDEX IF NOT EXISTS analysis_nodes_by_authority
+    ON analysis_nodes(generation_id, authority DESC, id ASC);
+CREATE INDEX IF NOT EXISTS analysis_nodes_by_hub
+    ON analysis_nodes(generation_id, hub DESC, id ASC);
+CREATE INDEX IF NOT EXISTS analysis_nodes_by_community
+    ON analysis_nodes(generation_id, community_id, node_id);
+
+CREATE TABLE IF NOT EXISTS analysis_processes (
+    generation_id INTEGER NOT NULL
+        REFERENCES analysis_generations(generation_id) ON DELETE CASCADE,
+    process_id     TEXT NOT NULL,
+    name           TEXT NOT NULL DEFAULT '',
+    entry_point    TEXT NOT NULL DEFAULT '',
+    step_count     INTEGER NOT NULL CHECK (step_count >= 0),
+    score          REAL NOT NULL DEFAULT 0,
+    truncated      INTEGER NOT NULL DEFAULT 0 CHECK (truncated IN (0, 1)),
+    PRIMARY KEY (generation_id, process_id)
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS analysis_process_files (
+    generation_id INTEGER NOT NULL,
+    process_id    TEXT NOT NULL,
+    ordinal       INTEGER NOT NULL CHECK (ordinal >= 0),
+    file_path     TEXT NOT NULL,
+    PRIMARY KEY (generation_id, process_id, ordinal),
+    FOREIGN KEY (generation_id, process_id)
+        REFERENCES analysis_processes(generation_id, process_id) ON DELETE CASCADE
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS analysis_process_steps (
+    generation_id INTEGER NOT NULL,
+    process_id    TEXT NOT NULL,
+    ordinal       INTEGER NOT NULL CHECK (ordinal >= 0),
+    node_rowid    INTEGER NOT NULL
+        REFERENCES analysis_nodes(id),
+    depth         INTEGER NOT NULL CHECK (depth >= 0),
+    PRIMARY KEY (generation_id, process_id, ordinal),
+    FOREIGN KEY (generation_id, process_id)
+        REFERENCES analysis_processes(generation_id, process_id) ON DELETE CASCADE
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS analysis_process_steps_by_node
+    ON analysis_process_steps(generation_id, node_rowid, process_id);
+
+CREATE TABLE IF NOT EXISTS analysis_concepts (
+    generation_id INTEGER NOT NULL
+        REFERENCES analysis_generations(generation_id) ON DELETE CASCADE,
+    token         TEXT NOT NULL,
+    in_vocabulary INTEGER NOT NULL CHECK (in_vocabulary IN (0, 1)),
+    PRIMARY KEY (generation_id, token)
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS analysis_concept_relations (
+    generation_id INTEGER NOT NULL,
+    token         TEXT NOT NULL,
+    related_token TEXT NOT NULL,
+    rank          INTEGER NOT NULL CHECK (rank >= 0),
+    PRIMARY KEY (generation_id, token, rank, related_token),
+    FOREIGN KEY (generation_id, token)
+        REFERENCES analysis_concepts(generation_id, token) ON DELETE CASCADE,
+    FOREIGN KEY (generation_id, related_token)
+        REFERENCES analysis_concepts(generation_id, token) ON DELETE CASCADE
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS analysis_concept_relations_by_related
+    ON analysis_concept_relations(generation_id, related_token, rank, token);
+
+CREATE TABLE IF NOT EXISTS analysis_blobs (
+    generation_id INTEGER NOT NULL
+        REFERENCES analysis_generations(generation_id) ON DELETE CASCADE,
+    component     TEXT NOT NULL,
+    payload       BLOB NOT NULL,
+    PRIMARY KEY (generation_id, component)
+) WITHOUT ROWID;
+`
+
 // schemaSQL is the canonical DDL applied on Open. Statements are
 // idempotent (IF NOT EXISTS) so they run cleanly against a fresh DB
 // and against an existing one.
@@ -65,6 +486,7 @@ CREATE TABLE IF NOT EXISTS nodes (
     is_exported   INTEGER,
     updated_at    INTEGER,
     data_class    TEXT,
+    clone_sig     TEXT,
     meta          BLOB
 ) WITHOUT ROWID;
 
@@ -154,8 +576,12 @@ CREATE TABLE IF NOT EXISTS enrichment_state (
 CREATE TABLE IF NOT EXISTS clone_shingles (
     node_id     TEXT PRIMARY KEY,
     repo_prefix TEXT NOT NULL DEFAULT '',
-    shingles    BLOB
+    shingles    BLOB,
+    signature   TEXT,
+    token_count INTEGER NOT NULL DEFAULT 0
 ) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS clone_shingles_by_repo
+    ON clone_shingles(repo_prefix, node_id);
 
 -- constant_values is the per-KindConstant literal-value sidecar: one row
 -- per constant whose RHS is a string / numeric literal, keyed by node_id
@@ -173,6 +599,20 @@ CREATE TABLE IF NOT EXISTS constant_values (
 ) WITHOUT ROWID;
 
 CREATE INDEX IF NOT EXISTS constant_values_by_file ON constant_values(repo_prefix, file_path);
+
+-- semantic_binding_types is the compact compiler-type sidecar consumed by
+-- contract extraction. It replaces retained go/packages programs with one
+-- bare type string per source binding. The composite primary key supports
+-- exact batched joins by repository, graph-scoped file, line, and name;
+-- WITHOUT ROWID makes that primary key the table itself.
+CREATE TABLE IF NOT EXISTS semantic_binding_types (
+    repo_prefix TEXT NOT NULL DEFAULT '',
+    file_path   TEXT NOT NULL,
+    line        INTEGER NOT NULL DEFAULT 0,
+    name        TEXT NOT NULL DEFAULT '',
+    type_name   TEXT NOT NULL,
+    PRIMARY KEY (repo_prefix, file_path, line, name)
+) WITHOUT ROWID;
 
 -- files is the per-file metadata sidecar: one row per indexed file carrying
 -- the BLAKE3 content hash (the Merkle leaf), byte size, extracted node count,
@@ -307,6 +747,10 @@ CREATE TABLE IF NOT EXISTS symbol_fts_rowid (
     repo_prefix TEXT NOT NULL DEFAULT '',
     fts_rowid   INTEGER NOT NULL
 ) WITHOUT ROWID;
+CREATE UNIQUE INDEX IF NOT EXISTS symbol_fts_rowid_by_rowid
+    ON symbol_fts_rowid(fts_rowid);
+CREATE INDEX IF NOT EXISTS symbol_fts_rowid_by_repo
+    ON symbol_fts_rowid(repo_prefix, fts_rowid);
 
 -- content_fts is the FTS5 full-text index over CONTENT (data_class=
 -- "content") section bodies — text / pdf / pptx / xlsx chunks. It is
@@ -316,7 +760,24 @@ CREATE TABLE IF NOT EXISTS symbol_fts_rowid (
 -- section nodes, and streaming their bodies here (per file, on disk)
 -- instead of into symbol_fts + graph nodes keeps the code index and the
 -- graph passes bounded. Only "body" is indexed for matching; node_id /
--- repo_prefix / file_path / ordinal ride UNINDEXED so the per-repo and
--- per-file staleness wipes hit literal columns without a b-tree.
+-- repo_prefix / file_path / ordinal ride UNINDEXED. Staleness deletes never
+-- filter those virtual-table columns directly: content_fts_rowid below maps
+-- their indexed ownership keys to FTS docids, avoiding one virtual-table scan
+-- per streamed file.
 CREATE VIRTUAL TABLE IF NOT EXISTS content_fts USING fts5(node_id UNINDEXED, repo_prefix UNINDEXED, file_path UNINDEXED, ordinal UNINDEXED, body);
-`
+
+-- content_fts_rowid is the ownership index for content FTS docids. A content
+-- file may emit many sections with the same node/ordinal across append calls,
+-- so the FTS docid itself is the primary key; repository/file indexes make
+-- whole-repo, per-file, and end-of-walk stale deletes set-oriented. AppendContent
+-- assigns explicit FTS rowids and writes this sidecar in the same transaction.
+CREATE TABLE IF NOT EXISTS content_fts_rowid (
+    fts_rowid   INTEGER PRIMARY KEY,
+    repo_prefix TEXT NOT NULL DEFAULT '',
+    file_path   TEXT NOT NULL DEFAULT ''
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS content_fts_rowid_by_repo_file
+    ON content_fts_rowid(repo_prefix, file_path, fts_rowid);
+CREATE INDEX IF NOT EXISTS content_fts_rowid_by_file
+    ON content_fts_rowid(file_path, fts_rowid);
+` + analysisGenerationSchemaSQL

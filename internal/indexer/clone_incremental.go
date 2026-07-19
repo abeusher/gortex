@@ -32,6 +32,10 @@ type incrementalCloneIndex struct {
 	shingles map[string][]uint64 // node id -> raw shingle set (cache)
 	corpus   int
 	built    bool
+	// pending is true when an edit touched clone-capable functions while
+	// the in-memory index was unbuilt. It is observable and stays true
+	// until an explicit global/clone-consuming rebuild completes.
+	pending bool
 }
 
 // newIncrementalCloneIndex returns an empty, un-built index. built stays
@@ -101,15 +105,13 @@ func cloneFuncNodes(nodes []*graph.Node) []*graph.Node {
 // decodable clone_sig (survivors). This makes Rebuild's CMS/corpus
 // byte-match what the batch finalise produced.
 //
-// Repo-scoped: it walks AllNodes filtered to n.RepoPrefix == repoPrefix so
-// each per-repo index's corpus counts only that repo's bodies — matching
-// its repo-scoped LoadCloneShingles seed. An unfiltered AllNodes walk would
-// count every repo's bodies into a single repo's corpus and skew its
-// threshold. (GetRepoNodes can't be used here: in single-repo / in-memory
-// mode repoPrefix is "" and nodes with an empty RepoPrefix are not tracked
-// in the byRepo buckets GetRepoNodes reads, so GetRepoNodes("") is always
-// empty — the AllNodes+filter form is the one that works for both regimes,
-// since "" == "" matches every node.)
+// Repo-scoped: it walks the repo's nodes (via cloneRepoNodes) filtered to
+// n.RepoPrefix == repoPrefix so each per-repo index's corpus counts only that
+// repo's bodies — matching its repo-scoped LoadCloneShingles seed. An
+// unfiltered walk would count every repo's bodies into a single repo's corpus
+// and skew its threshold. cloneRepoNodes always uses the exact repo projection;
+// for the empty-prefix single-repo case Graph scans its shard maps directly
+// without maintaining a duplicate byRepo bucket or taking a global snapshot.
 //
 // Tolerant of a missing/partial sidecar: a body with a clone_sig but no
 // persisted shingle row still enters the LSH index (so its edges are
@@ -126,6 +128,53 @@ func (ci *incrementalCloneIndex) Rebuild(g graph.Store, repoPrefix string) {
 	ci.lsh = clones.NewStratifiedIndex()
 	ci.shingles = make(map[string][]uint64)
 	ci.corpus = 0
+	if pager, ok := g.(graph.CloneCorpusPager); ok {
+		after := ""
+		loaded := false
+		pageFailed := false
+		for {
+			page, err := pager.CloneCorpusPage(repoPrefix, after, cloneCorpusFinalizeBatch)
+			if err != nil {
+				pageFailed = true
+				break
+			}
+			if len(page) == 0 {
+				break
+			}
+			loaded = true
+			for _, row := range page {
+				if len(row.Shingles) > 0 {
+					for _, shingle := range row.Shingles {
+						ci.cms.Add(shingle)
+					}
+					ci.shingles[row.NodeID] = row.Shingles
+				}
+				ci.corpus++
+				if !row.Finalized || row.Signature == "" {
+					continue
+				}
+				sig, ok := clones.DecodeSignature(row.Signature)
+				if ok {
+					ci.lsh.Add(clones.Item{ID: row.NodeID, Sig: sig, TokenCount: row.TokenCount})
+				}
+			}
+			after = page[len(page)-1].NodeID
+			if len(page) < cloneCorpusFinalizeBatch {
+				break
+			}
+		}
+		if loaded && !pageFailed {
+			ci.built = true
+			ci.pending = false
+			return
+		}
+		// Compatibility/error fallback starts from a clean state before the
+		// legacy scoped node projection below.
+		ci.cms = clones.NewCMS(65536, 4)
+		ci.lsh = clones.NewStratifiedIndex()
+		ci.shingles = make(map[string][]uint64)
+		ci.corpus = 0
+	}
 
 	var load map[string][]uint64
 	if r, ok := g.(graph.CloneShingleReader); ok {
@@ -134,7 +183,7 @@ func (ci *incrementalCloneIndex) Rebuild(g graph.Store, repoPrefix string) {
 		}
 	}
 
-	for _, n := range g.AllNodes() {
+	for _, n := range cloneRepoNodes(g, repoPrefix) {
 		if n == nil {
 			continue
 		}
@@ -171,6 +220,45 @@ func (ci *incrementalCloneIndex) Rebuild(g graph.Store, repoPrefix string) {
 		ci.lsh.Add(clones.Item{ID: n.ID, Sig: sig, TokenCount: tokensFromMeta(n)})
 	}
 	ci.built = true
+	ci.pending = false
+}
+
+// Ready reports whether one-file clone maintenance can run without a
+// graph-wide seed.
+func (ci *incrementalCloneIndex) Ready() bool {
+	if ci == nil {
+		return false
+	}
+	ci.mu.Lock()
+	defer ci.mu.Unlock()
+	return ci.built
+}
+
+// MarkPending records that clone edges may be incomplete after a bounded
+// edit. It intentionally schedules no background work: an automatic rebuild
+// would merely move whole-graph starvation off the watcher goroutine.
+func (ci *incrementalCloneIndex) MarkPending() {
+	if ci == nil {
+		return
+	}
+	ci.mu.Lock()
+	ci.pending = true
+	ci.mu.Unlock()
+}
+
+func (ci *incrementalCloneIndex) Pending() bool {
+	if ci == nil {
+		return false
+	}
+	ci.mu.Lock()
+	defer ci.mu.Unlock()
+	return ci.pending
+}
+
+// CloneIndexPending reports whether clone-derived edges are awaiting an
+// explicit global/clone-consuming rebuild.
+func (idx *Indexer) CloneIndexPending() bool {
+	return idx != nil && idx.cloneIndex != nil && idx.cloneIndex.Pending()
 }
 
 // EvictFuncs removes a set of function/method nodes from the index: it
@@ -230,7 +318,6 @@ func (ci *incrementalCloneIndex) UpdateFuncs(g graph.Store, repoPrefix string, f
 	// Phase 1: fold every new body into the CMS + cache + sidecar and
 	// bump the corpus count, so the boilerplate gate below sees the same
 	// corpus the batch finalise would.
-	rows := make(map[string][]uint64)
 	type pending struct {
 		node     *graph.Node
 		shingles []uint64
@@ -252,11 +339,7 @@ func (ci *incrementalCloneIndex) UpdateFuncs(g graph.Store, repoPrefix string, f
 		}
 		ci.shingles[n.ID] = sh
 		ci.corpus++
-		rows[n.ID] = sh
 		todo = append(todo, pending{node: n, shingles: sh})
-	}
-	if w, ok := g.(graph.CloneShingleWriter); ok && len(rows) > 0 {
-		_ = w.BulkSetCloneShingles(repoPrefix, rows)
 	}
 
 	// Corpus-based gate, matching finaliseCloneSignatures exactly.
@@ -274,35 +357,57 @@ func (ci *incrementalCloneIndex) UpdateFuncs(g graph.Store, repoPrefix string, f
 	// every new body is in the index. clone_shingles is removed from Meta
 	// (the sidecar holds the durable copy) — mirrors finalise.
 	added := make([]clones.Item, 0, len(todo))
+	projection := make([]graph.CloneCorpusRow, 0, len(todo))
 	for _, p := range todo {
 		n := p.node
 		sig, ok := computeCloneSigFromShingles(ci.cms, thr, useFilter, p.shingles)
 		delete(n.Meta, cloneShinglesMetaKey)
+		row := graph.CloneCorpusRow{
+			NodeID: n.ID, RepoPrefix: n.RepoPrefix, Shingles: p.shingles,
+			TokenCount: tokensFromMeta(n), Finalized: true,
+		}
 		if !ok {
 			delete(n.Meta, cloneSigMetaKey)
+			projection = append(projection, row)
 			continue
 		}
-		n.Meta[cloneSigMetaKey] = clones.EncodeSignature(sig)
-		item := clones.Item{ID: n.ID, Sig: sig, TokenCount: tokensFromMeta(n)}
+		row.Signature = clones.EncodeSignature(sig)
+		n.Meta[cloneSigMetaKey] = row.Signature
+		item := clones.Item{ID: n.ID, Sig: sig, TokenCount: row.TokenCount}
 		ci.lsh.Add(item)
 		added = append(added, item)
+		projection = append(projection, row)
+	}
+	if writer, ok := g.(graph.CloneCorpusWriter); ok && len(projection) > 0 {
+		_ = writer.BulkSetCloneCorpus(repoPrefix, projection)
+	} else if writer, ok := g.(graph.CloneShingleWriter); ok && len(projection) > 0 {
+		rows := make(map[string][]uint64, len(projection))
+		for _, row := range projection {
+			rows[row.NodeID] = row.Shingles
+		}
+		_ = writer.BulkSetCloneShingles(repoPrefix, rows)
 	}
 
-	// Emit edges for every clone pair touching a newly-added body. Both
-	// endpoints are looked up and a symmetric EdgeSimilarTo pair is
-	// emitted, mirroring detectClonesAndEmitEdgesCtx's emit. AddEdge
-	// dedupes by edge key, so a pair surfaced from both of its endpoints
-	// (when two new bodies in the same file are clones of each other)
-	// collapses to one symmetric pair.
+	// Gather clone pairs touching newly-added bodies into one bounded staging
+	// slice at a time, then materialise each slice through the same endpoint-
+	// prefetch + AddBatch path as the cold pass. QueryPairs can surface a pair
+	// from both newly-added endpoints; the persistent seen set dedupes it across
+	// flushes without retaining every Pair payload for a large edited file.
+	pairs := make([]clones.Pair, 0, clonePairBatchSize)
+	seen := make(map[[2]string]struct{})
+	flush := func() {
+		materializeClonePairs(g, pairs, graph.EdgeSimilarTo, seen)
+		pairs = pairs[:0]
+	}
 	for _, item := range added {
-		for _, p := range ci.lsh.QueryPairs(item, threshold) {
-			from := g.GetNode(p.A)
-			to := g.GetNode(p.B)
-			if from == nil || to == nil {
-				continue
+		for _, pair := range ci.lsh.QueryPairs(item, threshold) {
+			pairs = append(pairs, pair)
+			if len(pairs) == clonePairBatchSize {
+				flush()
 			}
-			emitSimilarEdge(g, from, to, p.Similarity)
-			emitSimilarEdge(g, to, from, p.Similarity)
 		}
+	}
+	if len(pairs) > 0 {
+		flush()
 	}
 }

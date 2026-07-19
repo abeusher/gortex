@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/zzet/gortex/internal/profiles"
 	"github.com/zzet/gortex/internal/toolref"
 )
 
@@ -36,10 +37,18 @@ var userPromptProbe grepProbeFn = probeViaDaemon
 // polluted, and no warning is emitted (SessionStart already warns once when the
 // daemon is down; doing so every turn would be noise).
 func runUserPromptSubmit(data []byte) {
+	started := time.Now()
 	var input UserPromptSubmitInput
 	if err := json.Unmarshal(data, &input); err != nil {
 		return
 	}
+	if input.HookEventName != "UserPromptSubmit" {
+		return
+	}
+	emitted := false
+	defer func() {
+		logHookEffectiveness("UserPromptSubmit", emitted, daemonReachableFn(), 0, time.Since(started))
+	}()
 	block := buildUserPromptSubmitContext(input.HookEventName, input.Prompt)
 	if block == "" {
 		return
@@ -53,6 +62,7 @@ func runUserPromptSubmit(data []byte) {
 	if err != nil {
 		return
 	}
+	emitted = true
 	fmt.Print(string(out))
 }
 
@@ -92,17 +102,28 @@ func promptQuery(prompt string) string {
 	return ""
 }
 
+// maxInjectedHitsLean is the per-turn cap under the lean hook tier —
+// the block keeps its cues but stops paying for marginal hits.
+const maxInjectedHitsLean = 3
+
 // buildPromptInjection renders the additionalContext block from search hits.
 func buildPromptInjection(hits []grepSymbolHit) string {
 	if len(hits) == 0 {
 		return ""
 	}
-	if len(hits) > maxInjectedHits {
-		hits = hits[:maxInjectedHits]
+	lean := activeHookTier() == profiles.HookTierLean
+	limit := maxInjectedHits
+	if lean {
+		limit = maxInjectedHitsLean
+	}
+	if len(hits) > limit {
+		hits = hits[:limit]
 	}
 	var sb strings.Builder
 	sb.WriteString("## Gortex — relevant indexed symbols for your request\n\n")
-	sb.WriteString("Before reaching for grep/Read, these graph symbols look relevant to what you just asked:\n\n")
+	if !lean {
+		sb.WriteString("Before reaching for grep/Read, these graph symbols look relevant to what you just asked:\n\n")
+	}
 	for _, h := range hits {
 		kind := h.Kind
 		if kind == "" {
@@ -114,8 +135,15 @@ func buildPromptInjection(hits []grepSymbolHit) string {
 			fmt.Fprintf(&sb, "- `%s` (%s) — %s\n", h.Name, kind, h.FilePath)
 		}
 	}
-	sb.WriteString("\nRead any of them with `get_symbol_source`, trace with `find_usages` / `get_callers`, " +
-		"or call `smart_context` for the full working set. These are indexed graph facts — prefer them over grep/Read. " +
-		"Shell only (no MCP tools)? Reach any with `gortex call <tool> --arg k=v` (e.g. `" + toolref.CLIFallback("get_symbol_source") + "`).\n")
+	if lean {
+		sb.WriteString("\nLeads, not the full picture — call `explore` with the request text for the ranked neighborhood " +
+			"in one call; use `read(operation:\"source\")` for one symbol. Prefer these graph facts over grep/Read.\n")
+	} else {
+		sb.WriteString("\nThese are leads, not the full picture — call `explore` with the request text to get the ranked " +
+			"neighborhood (these symbols and their siblings, WITH source + call paths + the files to change) in one call, " +
+			"then answer or edit directly from it. Use `read(operation:\"source\")` for one symbol or operation `symbols` for a batch; " +
+			"use `relations(operation:\"usages\")` for references or operation `callers` for callers. Prefer these graph facts over grep/Read.\n")
+	}
+	sb.WriteString(toolref.MCPRequiredLine())
 	return sb.String()
 }

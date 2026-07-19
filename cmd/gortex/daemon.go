@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jedib0t/go-pretty/v6/table"
@@ -23,6 +24,7 @@ import (
 	"github.com/zzet/gortex/internal/llm/conversationlog"
 	"github.com/zzet/gortex/internal/platform"
 	"github.com/zzet/gortex/internal/progress"
+	"github.com/zzet/gortex/internal/runtimeactivity"
 	"github.com/zzet/gortex/internal/server"
 	"github.com/zzet/gortex/internal/server/hub"
 	"github.com/zzet/gortex/internal/tui"
@@ -208,6 +210,16 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return fmt.Errorf("build daemon state: %w", err)
 	}
+
+	// Install the standing soft memory limit now — logging and config are
+	// up and no warmup / indexing has allocated yet, so the cold-index
+	// window's temporary override restores to this value rather than to
+	// "no limit" (see applyStandingMemoryLimit).
+	var daemonMemLimit string
+	if gc := state.configManager.Global(); gc != nil {
+		daemonMemLimit = gc.Daemon.MemoryLimit
+	}
+	applyStandingMemoryLimit(logger, daemonMemLimit)
 
 	controller := &realController{
 		graph:         state.graph,
@@ -428,6 +440,9 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		stateCapture := state
 		controllerCapture := controller
 		state.mcpServer.AttachHealthSnapshot(func() map[string]any {
+			runtimeactivity.Begin("health_snapshot")
+			defer runtimeactivity.End("health_snapshot")
+
 			out := map[string]any{
 				"uptime_seconds": int64(time.Since(daemonStart).Seconds()),
 				"ready":          controllerCapture.IsReady(),
@@ -440,12 +455,22 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 				out["alloc_bytes"] = st.Runtime.Alloc
 				out["sys_bytes"] = st.Runtime.Sys
 				out["heap_inuse_bytes"] = st.Runtime.HeapInuse
+				out["heap_idle_bytes"] = st.Runtime.HeapIdle
+				out["heap_released_bytes"] = st.Runtime.HeapReleased
+				out["stack_inuse_bytes"] = st.Runtime.StackInuse
 				out["num_goroutine"] = st.Runtime.NumGoroutine
 				out["num_gc"] = st.Runtime.NumGC
 				if st.LSPRouter != nil {
 					out["lsp_alive"] = len(st.LSPRouter.ActiveProviders)
 					out["lsp_specs_registered"] = len(st.LSPRouter.EnabledSpecs)
 				}
+			}
+			activity := runtimeactivity.Current()
+			out["activity_active"] = activity.Active
+			out["activity_epoch"] = activity.Epoch
+			out["activity_quiet_ms"] = activity.QuietFor(time.Now()).Milliseconds()
+			if len(activity.ByKind) > 0 {
+				out["activity_by_kind"] = activity.ByKind
 			}
 			if sessions := srvCapture.Sessions(); sessions != nil {
 				out["sessions"] = sessions.Count()
@@ -533,14 +558,23 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 	// buildDaemonState — they just won't reflect files that changed
 	// since the snapshot was written until warmup gets to that repo.
 	go func() {
+		runtimeactivity.Begin("warmup")
+		defer func() {
+			runtimeactivity.End("warmup")
+			releaseMemoryToOS(logger, "warmup_complete")
+		}()
+
 		start := time.Now()
 		logger.Info("daemon: warmup starting")
 		// markReady fires once references are resolved and the graph is
 		// queryable — ahead of the slow enrichment pass — so clients can
 		// start issuing find_usages / get_callers immediately. Enrichment
 		// continues in this goroutine afterward and finishes at MarkEnriched.
+		// Once-guarded: the warmup fires it from inside the master resolver
+		// (at compute-done, the earliest queryable point) AND from its
+		// unconditional post-resolve fallback, whichever comes first.
 		var queryableElapsed time.Duration
-		markReady := func() {
+		markReady := sync.OnceFunc(func() {
 			elapsed := time.Since(start)
 			queryableElapsed = elapsed
 			controller.MarkReady(elapsed)
@@ -550,24 +584,9 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 				"warmup_seconds": int64(elapsed.Seconds()),
 				"warmup_ms":      elapsed.Milliseconds(),
 			})
-		}
+		})
 		mw, warmup := warmupDaemonState(state, logger, markReady)
 		controller.AttachWatcher(mw)
-		// Wire the daemon's MultiWatcher into the per-server history
-		// surface so `get_recent_changes` and `get_symbol_history` see
-		// real events under the daemon. Without this the tools always
-		// reported "watch mode is not active" even though MultiWatcher
-		// was actively re-indexing changed files.
-		if state.mcpServer != nil && mw != nil {
-			state.mcpServer.SetWatcher(mw)
-			// Push a one-time degraded notice on the readiness channel when a
-			// watcher exhausts inotify watches / file descriptors, so a
-			// subscribed agent learns the index may be frozen without polling.
-			srv := state.mcpServer
-			mw.OnDegraded(func(reason string) {
-				srv.PublishReadiness("degraded", true, map[string]any{"watch_degraded": reason})
-			})
-		}
 		// Drive the /v1/events SSE stream from the MultiWatcher. The hub is
 		// the only consumer of mw.Events() (SetWatcher reads History(), not
 		// the channel), so this can't starve any other reader. No-op when
@@ -582,7 +601,13 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		// loaded graph instead of returning "run index_repository
 		// first" against a fully populated state.
 		if state.mcpServer != nil {
+			analysisStart := time.Now()
+			publishReadinessPhase(state, "analysis", true, nil)
 			state.mcpServer.RunAnalysis()
+			warmup.analysis = time.Since(analysisStart)
+			publishReadinessPhase(state, "analysis_done", true, map[string]any{
+				"elapsed_ms": warmup.analysis.Milliseconds(),
+			})
 			// Co-change pre-warm: fire the git-history mine in the
 			// background so the first user-visible
 			// find_co_changing_symbols / search-rerank call sees a
@@ -657,11 +682,29 @@ func startReconcileJanitor(mi *indexer.MultiIndexer, interval time.Duration, log
 		for {
 			select {
 			case <-t.C:
-				if gced := mi.GCVanishedWorktrees(); len(gced) > 0 {
-					logger.Info("janitor: pruned vanished worktrees",
-						zap.Int("count", len(gced)))
+				gcedCount, reconciled := func() (int, int) {
+					runtimeactivity.Begin("reconcile")
+					defer runtimeactivity.End("reconcile")
+
+					gced := mi.GCVanishedWorktrees()
+					if len(gced) > 0 {
+						logger.Info("janitor: pruned vanished worktrees",
+							zap.Int("count", len(gced)))
+					}
+					results := mi.ReconcileAll()
+					reconciled := 0
+					for _, r := range results {
+						if r != nil {
+							reconciled += r.StaleFileCount + r.DeletedFileCount
+						}
+					}
+					return len(gced), reconciled
+				}()
+				// Only a tick that changed the graph schedules reclamation. The
+				// process-wide quiet gate postpones it if another subsystem is busy.
+				if reconciled > 0 || gcedCount > 0 {
+					releaseMemoryToOS(logger, "reconcile_janitor")
 				}
-				mi.ReconcileAll()
 			case <-stop:
 				return
 			}
@@ -687,7 +730,12 @@ func startPeriodicSnapshots(g *graph.Graph, mi *indexer.MultiIndexer, version st
 					logger.Debug("snapshot: skipped tick — daemon still warming up")
 					continue
 				}
-				saveSnapshot(g, collectSnapshotRepos(mi), collectSnapshotContracts(mi), collectSnapshotVector(mi), version, logger)
+				func() {
+					runtimeactivity.Begin("snapshot")
+					defer runtimeactivity.End("snapshot")
+					saveSnapshot(g, collectSnapshotRepos(mi), collectSnapshotContracts(mi), collectSnapshotVector(mi), version, logger)
+				}()
+				releaseMemoryToOS(logger, "periodic_snapshot")
 			case <-stop:
 				return
 			}
@@ -842,9 +890,9 @@ func emitDaemonStartSummary(w io.Writer, pid int, elapsed time.Duration) {
 	fmt.Fprintln(w, "     "+progress.Row("log", daemon.LogFilePath(), 8))
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "     "+progress.Heading("next"))
-	fmt.Fprintln(w, "     "+progress.Step(1, "track a repo:    gortex track <path>"))
-	fmt.Fprintln(w, "     "+progress.Step(2, "watch status:    gortex daemon status --watch"))
-	fmt.Fprintln(w, "     "+progress.Step(3, "shut down:       gortex daemon stop"))
+	fmt.Fprintln(w, "     "+progress.NumberedStep(1, "track a repo:    gortex track <path>"))
+	fmt.Fprintln(w, "     "+progress.NumberedStep(2, "watch status:    gortex daemon status --watch"))
+	fmt.Fprintln(w, "     "+progress.NumberedStep(3, "shut down:       gortex daemon stop"))
 	fmt.Fprintln(w)
 }
 

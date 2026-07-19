@@ -32,8 +32,8 @@ func hasNodeColumn(t *testing.T, db *sql.DB, col string) bool {
 }
 
 // TestOpenUpgradesPreDataClassStore is the backward-compatibility proof for the
-// promoted data_class column: an existing v1 store written before the column
-// existed must Open cleanly (ensureNodeColumns ALTERs the column in before the
+// promoted data_class column: under the historical v2 plan, an existing v1
+// store written before the column existed must open cleanly (ensureNodeColumns ALTERs the column in before the
 // node statements are prepared), keep its rows, and immediately get the working
 // SQL-level content filter — all WITHOUT a schema_version bump or a reindex.
 //
@@ -46,7 +46,8 @@ func TestOpenUpgradesPreDataClassStore(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "store.sqlite")
 
 	// 1. Create a current store and seed a row, then close. A fresh store is
-	//    stamped at the v1 baseline (currentSchemaVersion == 1).
+	//    stamped at the current schema version; step 2 knocks it back to the v1
+	//    baseline to simulate a store written before data_class existed.
 	s, err := Open(path)
 	require.NoError(t, err)
 	s.AddNode(&graph.Node{ID: "old1", Kind: graph.KindFunction, Name: "Legacy", FilePath: "f.go", RepoPrefix: "r"})
@@ -59,14 +60,21 @@ func TestOpenUpgradesPreDataClassStore(t *testing.T) {
 		require.NoError(t, err, "simulate a pre-data_class store")
 		require.False(t, hasNodeColumn(t, db, "data_class"), "data_class must be absent before the upgrade")
 
+		// A fresh Open stamps the current schema version; knock it back to the v1
+		// baseline so this genuinely simulates a pre-data_class store and the
+		// reopen exercises the in-place upgrade arm rather than a no-op.
+		_, err = db.Exec(`PRAGMA user_version = 1`)
+		require.NoError(t, err, "reset to the v1 baseline")
+
 		var v int
 		require.NoError(t, db.QueryRow(`PRAGMA user_version`).Scan(&v))
 		require.Equal(t, 1, v, "the simulated old store must sit at the v1 baseline")
 	})
 
-	// 3. Reopen with the current binary. ensureNodeColumns must re-add the
-	//    column before prepare() references it, so Open succeeds without a wipe.
-	s2, err := Open(path)
+	// 3. Reopen under the historical v2 plan. ensureNodeColumns must re-add the
+	//    column before prepare() references it, so open succeeds without a wipe.
+	//    Shipped v3 deliberately rebuilds every older topology cache.
+	s2, err := openWith(path, 2, schemaMigrations[:1], false)
 	require.NoError(t, err, "Open must upgrade a pre-data_class store in place, not fail on the missing column")
 	t.Cleanup(func() { _ = s2.Close() })
 

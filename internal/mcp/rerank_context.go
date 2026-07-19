@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 
+	"github.com/zzet/gortex/internal/embedding"
 	"github.com/zzet/gortex/internal/search/rerank"
 )
 
@@ -19,14 +20,11 @@ import (
 func (s *Server) buildRerankContext(ctx context.Context, query string) *rerank.Context {
 	repo, project := s.sessionLocality(ctx)
 	rctx := &rerank.Context{
-		Graph:      s.graph,
-		RepoPrefix: repo,
-		ProjectID:  project,
-	}
-
-	if cr := s.getCommunities(); cr != nil && cr.NodeToComm != nil {
-		nodeToComm := cr.NodeToComm
-		rctx.CommunityOf = func(id string) string { return nodeToComm[id] }
+		Graph:             s.graph,
+		RepoPrefix:        repo,
+		ProjectID:         project,
+		AnalysisMetricsOf: s.rerankAnalysisMetrics,
+		BatchedCentrality: s.rerankBoundedCentrality,
 	}
 
 	if s.combo != nil {
@@ -76,44 +74,31 @@ func (s *Server) buildRerankContext(ctx context.Context, query string) *rerank.C
 		}
 	}
 
-	// HITS authority / hub scores feed the authority rerank signal.
-	// Both closures normalise against the graph maxima so the signal
-	// receives values already in [0, 1].
-	if h := s.getHITS(); h != nil {
-		hits := h
-		maxAuth, maxHub := hits.MaxAuth, hits.MaxHub
-		rctx.AuthorityOf = func(id string) float64 {
-			if maxAuth <= 0 {
-				return 0
-			}
-			return hits.AuthorityOf(id) / maxAuth
-		}
-		rctx.HubOf = func(id string) float64 {
-			if maxHub <= 0 {
-				return 0
-			}
-			return hits.HubOf(id) / maxHub
-		}
-	}
-
-	// Centrality: a per-query Random-Walk-with-Restart (Personalized
-	// PageRank) over the call/reference graph, seeded from the query's
-	// strongest candidate matches, feeds ProximitySignal — the graph-
-	// centrality spine of retrieval. The walk runs against the
-	// immutable adjacency snapshot built by RunAnalysis; nil until then
-	// (the signal then sits at 0). The actual walk fires once per
-	// Rerank inside Context.prepare, after the seeds are chosen.
-	if snap := s.getAdjacency(); snap != nil {
-		rctx.Centrality = func(seeds []string) map[string]float64 {
-			return s.personalizedPageRank(snap, seeds)
-		}
-	}
+	// Centrality is built from a capped candidate-seeded neighborhood when
+	// Prepare knows the complete result batch. This avoids restoring the
+	// whole-graph CSR for every interactive search.
 
 	// Co-change feeds the rerank pipeline once the git-history mine
 	// has run (lazily, on the first find_co_changing_symbols call, or
 	// from an enriched snapshot). Until then the signal sits at 0.
 	if s.hasCoChangeData() {
 		rctx.CoChangeOf = s.coChangeScores
+	}
+
+	// Semantic-cosine channel: the in-process static code-embedding
+	// model (with the baked GloVe word vectors as offline fallback)
+	// re-scores the BM25 top-N against the query with no ANN index and
+	// no index-time vector build. Wired unconditionally — the per-class
+	// weight table damps it hard on identifier / path queries so it
+	// earns its keep only on natural-language intent queries, where
+	// BM25 alone cannot bridge "decode bson body" to BindBody. An empty
+	// query vector leaves the signal at 0, so a pure-identifier query
+	// is unaffected even before the class damping.
+	if emb := embedding.SharedCodeEmbedder(); emb != nil {
+		rctx.EmbedText = embedding.EmbedTextFunc(emb)
+		if qv, err := emb.Embed(ctx, query); err == nil {
+			rctx.QueryVec = qv
+		}
 	}
 
 	return rctx

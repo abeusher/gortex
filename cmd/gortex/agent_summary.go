@@ -73,7 +73,7 @@ func emitAgentSummary(w io.Writer, results []*agents.Result, opts agents.ApplyOp
 	if len(nextSteps) > 0 {
 		fmt.Fprintln(w, "  "+progress.Heading("next steps"))
 		for i, s := range nextSteps {
-			fmt.Fprintln(w, "   "+progress.Step(i+1, s))
+			fmt.Fprintln(w, "   "+progress.NumberedStep(i+1, s))
 		}
 		fmt.Fprintln(w)
 	}

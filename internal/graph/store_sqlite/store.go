@@ -22,10 +22,12 @@
 package store_sqlite
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"iter"
+	"log"
 	"runtime"
 	"strings"
 	"sync"
@@ -39,18 +41,39 @@ import (
 
 // Store is the SQLite-backed graph.Store implementation.
 type Store struct {
-	db *sql.DB
+	// db is the bounded, logically read-dedicated pool for on-disk stores.
+	// writerDB is a separate read-write pool capped at one physical connection. In-memory
+	// stores use the same max-one handle for both because independent
+	// :memory: handles would address different databases.
+	db       *sql.DB
+	writerDB *sql.DB
+
+	// busyRetryTimeout is the whole-transaction contention budget. The zero
+	// value selects defaultSQLiteBusyRetryTimeout; tests shorten it to exercise
+	// persistent-lock exhaustion deterministically.
+	busyRetryTimeout   time.Duration
+	busyRetries        atomic.Uint64
+	busyRetryExhausted atomic.Uint64
 
 	// dbPath is the on-disk SQLite file path, retained for size
 	// telemetry — the WAL high-water mark surfaces in daemon_health so a
 	// runaway -wal is observable rather than silently filling the disk.
 	dbPath string
 
+	// builtinSeen records ::builtin:: sentinel targets already materialised
+	// as KindBuiltin stub nodes (see graph.BuiltinStubNodes), so warm
+	// re-indexes don't re-upsert identical stubs on every batch.
+	builtinSeen sync.Map
+
 	// writeMu serialises every mutation. SQLite serialises writers
 	// internally; doing the same on the Go side turns SQLITE_BUSY
 	// contention into clean lock-wait and keeps the conformance
 	// concurrency test predictable.
-	writeMu sync.Mutex
+	writeMu sqliteWriteGate
+
+	// mutationReceipts is guarded only by writeMu, making Begin/End atomic
+	// with every durable graph write without another lock-ordering edge.
+	mutationReceipts sqliteMutationReceiptState
 
 	// resolveMu is the resolver-coordination mutex returned by
 	// ResolveMutex. Held by cross-repo / temporal / external resolver
@@ -60,6 +83,17 @@ type Store struct {
 	resolveMu sync.Mutex
 
 	edgeIdentityRevs atomic.Int64
+	// edgeMutationRevision is a coarse monotonic generation for every durable
+	// edge payload/topology mutation, including same-key replacements. Resolver
+	// liveness snapshots use it to reject stale work after watcher interleaves.
+	edgeMutationRevision atomic.Uint64
+
+	// analysisMutationRevision closes the in-process race between loading or
+	// computing a persisted whole-graph analysis and a concurrent graph write.
+	// analysisGenerationPresent is guarded by writeMu and avoids a redundant cache
+	// DELETE on every row after the first fail-closed invalidation.
+	analysisMutationRevision  atomic.Uint64
+	analysisGenerationPresent bool
 
 	// wiped records that Open dropped an incompatible on-disk DB and
 	// recreated it empty (a schema-version mismatch that an in-place ALTER
@@ -107,10 +141,31 @@ type Store struct {
 	// connection (bulkConn) carrying synchronous=OFF + an enlarged page
 	// cache and routes every bulk write through it; bulkPrevSync /
 	// bulkPrevCacheSize hold the values FlushBulk restores before the
-	// connection returns to the pool. All three are guarded by writeMu.
-	bulkConn          *sql.Conn
-	bulkPrevSync      int64
-	bulkPrevCacheSize int64
+	// connection returns to the pool. coordinatedBulkLoad is true while a
+	// multi-repository cold parse owns the outer load window; nested per-repo
+	// BeginBulkLoad/FlushBulk calls then leave that window open so indexes are
+	// rebuilt only after the final repository drains. All fields are guarded by
+	// writeMu.
+	bulkConn            *sql.Conn
+	bulkPrevSync        int64
+	bulkPrevCacheSize   int64
+	coordinatedBulkLoad bool
+	// These flags mean "bounded FTS maintenance requested" during a
+	// coordinated cold load. The historical names are retained to keep the
+	// cancellation/Close path stable; normal cold finalization never runs a
+	// full optimize.
+	deferredFTSOptimize bool
+	deferredContentFTS  bool
+
+	// batchVariableLimit is the runtime SQLITE_LIMIT_VARIABLE_NUMBER observed
+	// on the active writer connection, capped by the bounded statement policy.
+	// It is guarded by writeMu. A variable-limit execution failure lowers the
+	// cached value so later batches do not repeat an oversized prepare.
+	batchVariableLimit int
+
+	// bulkFinalizeObserver is a package-private test/diagnostic hook. It runs
+	// synchronously under writeMu and therefore must not call back into Store.
+	bulkFinalizeObserver func(bulkFinalizeEvent)
 
 	// Prepared statements (compiled once in Open, closed in Close).
 	stmtInsertNode         *sql.Stmt
@@ -133,6 +188,7 @@ type Store struct {
 	stmtStatsByLanguage    *sql.Stmt
 
 	stmtInsertEdge       *sql.Stmt
+	unresolvedInserts    atomic.Uint64
 	stmtOutEdges         *sql.Stmt
 	stmtOutEdgesLight    *sql.Stmt
 	stmtInEdges          *sql.Stmt
@@ -145,11 +201,6 @@ type Store struct {
 	stmtSelectEdgeOrigin *sql.Stmt
 	stmtDeleteEdgeByKey  *sql.Stmt
 	stmtEdgeExists       *sql.Stmt
-
-	stmtSelectFileNodeIDs *sql.Stmt
-	stmtSelectRepoNodeIDs *sql.Stmt
-	stmtDeleteNodeByFile  *sql.Stmt
-	stmtDeleteNodeByRepo  *sql.Stmt
 }
 
 // Compile-time assertion: *Store satisfies graph.Store.
@@ -220,6 +271,26 @@ var ErrSchemaRebuildRequired = errors.New("store_sqlite: on-disk schema is incom
 // registry, and rebuild permission so tests can drive the baseline / in-place
 // / rebuild arms without mutating package globals. Open passes the package
 // defaults (currentSchemaVersion, schemaMigrations) and the WithRebuild flag.
+const (
+	// Each modernc SQLite connection can map up to sqliteMmapSizeBytes and
+	// grow a separate page cache. Bounding the pool prevents a read burst on
+	// a high-core machine from multiplying clean file mappings into several
+	// GiB of resident address space. Four readers retained full-scan
+	// throughput in the pool benchmark while cutting the 16-reader peak by
+	// roughly 75%.
+	sqliteMaxOpenConns = 4
+	sqliteMaxIdleConns = 1
+)
+
+func configureConnectionPool(db *sql.DB) {
+	maxOpen := runtime.NumCPU()
+	if maxOpen > sqliteMaxOpenConns {
+		maxOpen = sqliteMaxOpenConns
+	}
+	db.SetMaxOpenConns(maxOpen)
+	db.SetMaxIdleConns(sqliteMaxIdleConns)
+}
+
 func openWith(path string, current int, migrations []schemaMigration, allowRebuild bool) (*Store, error) {
 	// Pragmas: WAL + synchronous=NORMAL is the standard write-heavy
 	// embedded tradeoff. cache_size(-32768) gives each pooled connection a
@@ -235,23 +306,16 @@ func openWith(path string, current int, migrations []schemaMigration, allowRebui
 	// it), which is how a 535 MB DB ends up with an 11 GB -wal. This bounds
 	// the file even between the explicit TRUNCATE checkpoints runCheckpointLoop
 	// issues, and even if that loop is not running.
-	dsn := path + "?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(OFF)&_pragma=cache_size(-32768)&_pragma=temp_store(MEMORY)&_pragma=mmap_size(268435456)&_pragma=journal_size_limit(67108864)"
-	db, err := sql.Open("sqlite", dsn)
+	writerDSN := sqliteWriterDSN(path)
+	db, err := sql.Open("sqlite", writerDSN)
 	if err != nil {
 		return nil, fmt.Errorf("sqlite open: %w", err)
 	}
-	// Pool up to NumCPU connections so the resolver's parallel
-	// worker fan-out (NumCPU goroutines doing FindNodesByName /
-	// GetNode / GetOutEdges concurrently) doesn't serialise through
-	// a single connection — the dominant gap between the SQLite and
-	// bbolt backends on the bench's resolver stage was exactly that.
-	// SQLite's WAL mode allows concurrent readers across multiple
-	// connections; writes still serialise via writeMu on the Go
-	// side, then via SQLite's internal write lock. Every connection
-	// the pool opens picks up the journal-mode / synchronous /
-	// busy-timeout pragmas from the DSN above, so we don't need to
-	// pin one connection to "remember" them.
-	db.SetMaxOpenConns(runtime.NumCPU())
+	// The canonical initialization/runtime writer handle owns exactly one
+	// physical connection. This matches SQLite's single-writer model and keeps
+	// a writer slot available even when every query-pool connection is busy.
+	// A separate bounded query pool is opened after schema reconciliation.
+	configureWriterPool(db)
 
 	// Reconcile the on-disk schema version before applying schemaSQL. The graph
 	// store is a rebuildable cache, so an incompatible (older needing a rebuild
@@ -264,6 +328,22 @@ func openWith(path string, current int, migrations []schemaMigration, allowRebui
 		return nil, fmt.Errorf("sqlite read schema version: %w", err)
 	}
 	plan := planSchemaMigrationWith(stored, current, migrations)
+	// A rebuild migration applies to an existing pre-versioning database, but
+	// not to the brand-new empty file sql.Open just created. Distinguish those
+	// two user_version=0 cases before requiring destructive-rebuild authority.
+	// An existing nodes/edges schema may already contain derived topology and
+	// must take the conservative rebuild path even when its current row count is
+	// zero; absence of both tables is the only safe fresh-store proof.
+	if stored == 0 && plan.wipe && !isMemoryPath(path) {
+		existing, probeErr := hasGraphStoreTables(db)
+		if probeErr != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("sqlite probe existing graph schema: %w", probeErr)
+		}
+		if !existing {
+			plan = schemaPlan{stamp: true}
+		}
+	}
 	didWipe := false
 	if plan.wipe && !isMemoryPath(path) {
 		// Refuse the destructive rebuild unless the caller proved it holds
@@ -279,11 +359,11 @@ func openWith(path string, current int, migrations []schemaMigration, allowRebui
 		if err := removeStoreFiles(path); err != nil {
 			return nil, fmt.Errorf("sqlite rebuild: %w", err)
 		}
-		db, err = sql.Open("sqlite", dsn)
+		db, err = sql.Open("sqlite", writerDSN)
 		if err != nil {
 			return nil, fmt.Errorf("sqlite reopen for rebuild: %w", err)
 		}
-		db.SetMaxOpenConns(runtime.NumCPU())
+		configureWriterPool(db)
 		didWipe = true
 	}
 
@@ -299,6 +379,27 @@ func openWith(path string, current int, migrations []schemaMigration, allowRebui
 	if err := ensureNodeColumns(db); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("sqlite node columns: %w", err)
+	}
+	// clone_shingles gained the compact finalized signature/token projection
+	// in schema v5. CREATE TABLE IF NOT EXISTS cannot add those columns to a
+	// dirty pre-release v5 store, so reconcile them explicitly before any
+	// prepared statement or clone pass can touch the sidecar.
+	if err := ensureCloneCorpusColumns(db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("sqlite clone corpus columns: %w", err)
+	}
+	// nodes.is_stub generated column — see ensureNodeGeneratedColumns for why
+	// this is a separate function from ensureNodeColumns above.
+	if err := ensureNodeGeneratedColumns(db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("sqlite node generated columns: %w", err)
+	}
+	// Same treatment for the edges table's is_unresolved generated column —
+	// must run before the droppable-index loop below, which creates an index
+	// over it.
+	if err := ensureEdgeColumns(db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("sqlite edge columns: %w", err)
 	}
 	// Create the droppable secondary indexes from the shared set so their
 	// initial-creation DDL is byte-identical to the DDL the bulk-load fast
@@ -329,10 +430,20 @@ func openWith(path string, current int, migrations []schemaMigration, allowRebui
 		_ = db.Close()
 		return nil, fmt.Errorf("sqlite fts rowid backfill: %w", err)
 	}
+	// Same one-time compatibility bridge for content rows written before the
+	// indexed ownership sidecar existed. Steady-state opens observe a non-empty
+	// map and skip the virtual-table scan.
+	if err := backfillContentFTSRowidMap(db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("sqlite content fts rowid backfill: %w", err)
+	}
 
-	// Apply any in-place migration steps (none on a fresh, baseline, or wiped
-	// DB), then stamp the current schema version. After a wipe the store is
-	// empty and the daemon's normal indexing repopulates it.
+	// Apply any in-place migration steps, then stamp the current schema version.
+	// Fresh and pre-versioning (stored==0) stores run the in-place steps too —
+	// they are idempotent and no-op on an empty or already-clean store — so the
+	// first in-place migration ships without forcing every non-daemon Open to
+	// pass WithRebuild. A wipe plan carries no in-place steps, and after a wipe
+	// the store is empty and the daemon's normal indexing repopulates it.
 	if plan.stamp {
 		if err := applyInPlaceMigrations(db, plan.inPlace); err != nil {
 			_ = db.Close()
@@ -343,21 +454,46 @@ func openWith(path string, current int, migrations []schemaMigration, allowRebui
 			return nil, fmt.Errorf("sqlite stamp schema version: %w", err)
 		}
 	}
+	// A schema transition invalidates any generation produced against the old
+	// graph shape. The v4 migration also drops the unreleased blob-only table.
+	if stored != current {
+		if _, err := db.Exec(`UPDATE analysis_generations SET state = ? WHERE generation_id IN (SELECT generation_id FROM analysis_active_generation)`, analysisGenerationStale); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("sqlite stale analysis generation after migration: %w", err)
+		}
+		if _, err := db.Exec(`DELETE FROM analysis_active_generation`); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("sqlite clear active analysis generation after migration: %w", err)
+		}
+	}
 
-	s := &Store{db: db, dbPath: path, wiped: didWipe}
+	readDB := db
+	if !isMemoryPath(path) {
+		readDB, err = openSQLiteReadPool(path)
+		if err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("sqlite open read pool: %w", err)
+		}
+	}
+
+	s := &Store{db: readDB, writerDB: db, dbPath: path, wiped: didWipe}
 	// Initialise the bundle cache at construction so its pointer is
 	// never written after Open — concurrent SearchSymbolBundles reads
 	// and SetBundleFingerprints writes then race only on the cache's
 	// own mutex-guarded maps, not on the Store field. The cache stays
 	// inert (every lookup a miss) until the daemon supplies fingerprints.
-	s.bundles = &bundleCache{
-		fingerprints: map[string]uint64{},
-		entries:      map[string]*bundleCacheEntry{},
+	s.bundles = newBundleCache()
+	if err := s.initAnalysisGenerationState(); err != nil {
+		_ = closeSQLitePools(readDB, db)
+		return nil, fmt.Errorf("sqlite analysis generation state: %w", err)
 	}
 	if err := s.prepare(); err != nil {
-		_ = db.Close()
+		_ = closeSQLitePools(readDB, db)
 		return nil, fmt.Errorf("sqlite prepare: %w", err)
 	}
+	// A populated store opened without planner statistics would plan blind
+	// until its next cold bulk load; backfill sqlite_stat1 once here.
+	healPlannerStats(db)
 	// In-memory databases have no WAL file to drain, so the periodic
 	// checkpoint is pointless there (and would leak a goroutine per
 	// short-lived test store). Only run it for on-disk stores.
@@ -369,16 +505,43 @@ func openWith(path string, current int, migrations []schemaMigration, allowRebui
 	return s, nil
 }
 
-// walCheckpointInterval is how often runCheckpointLoop drains the WAL into
-// the main DB and truncates the -wal file. Five minutes keeps the file
-// bounded under steady writes without making the checkpoint itself a hot
-// path; journal_size_limit in the DSN bounds growth between ticks.
-const walCheckpointInterval = 5 * time.Minute
+func hasGraphStoreTables(db *sql.DB) (bool, error) {
+	var count int
+	err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('nodes','edges')`).Scan(&count)
+	return count > 0, err
+}
 
-// runCheckpointLoop issues a TRUNCATE checkpoint every interval until Close
-// stops it. Best-effort: a checkpoint that can't fully complete because a
-// reader or writer holds the WAL just truncates what it can and retries on
-// the next tick.
+// walCheckpointInterval is how often runCheckpointLoop passively drains WAL
+// frames into the main database. PASSIVE never waits for long readers and does
+// not shrink the file; explicit/final checkpoints use TRUNCATE instead.
+const (
+	walCheckpointInterval = 5 * time.Minute
+	// walCheckpointTimeout bounds explicit/final pool acquisition, contention
+	// retry, and SQLite execution. A caller gets an error instead of an
+	// unbounded shutdown or operator-command wait.
+	walCheckpointTimeout = 10 * time.Second
+	// The periodic path is best-effort and one-shot. Its gate acquisition is a
+	// non-blocking TryLock; this context only protects an unexpected writer-pool
+	// wait or a slow driver call.
+	walPassiveCheckpointTimeout = 1 * time.Second
+)
+
+var errWALCheckpointDeferredBulk = errors.New("store_sqlite: WAL checkpoint deferred while bulk writer is pinned")
+
+type walCheckpointResult struct {
+	Busy               int
+	WALFrames          int
+	CheckpointedFrames int
+}
+
+func (r walCheckpointResult) incomplete() bool {
+	return r.Busy != 0 || r.CheckpointedFrames < r.WALFrames
+}
+
+// runCheckpointLoop attempts one non-blocking PASSIVE checkpoint per interval.
+// It never queues behind graph mutation or a pinned bulk writer. An incomplete
+// reader-limited checkpoint is logged with SQLite's counters and retried at the
+// next interval; it is never reported as a completed drain.
 func (s *Store) runCheckpointLoop(interval time.Duration) {
 	defer close(s.checkpointDone)
 	ticker := time.NewTicker(interval)
@@ -388,22 +551,88 @@ func (s *Store) runCheckpointLoop(interval time.Duration) {
 		case <-s.stopCheckpoint:
 			return
 		case <-ticker.C:
-			_ = s.CheckpointWAL()
+			s.checkpointWALPassive()
 		}
+	}
+}
+
+func (s *Store) checkpointWALPassive() {
+	if !s.writeMu.TryLock() {
+		log.Printf("store_sqlite: wal checkpoint deferred mode=PASSIVE reason=writer_gate")
+		return
+	}
+	defer s.writeMu.Unlock()
+	if s.bulkConn != nil {
+		log.Printf("store_sqlite: wal checkpoint deferred mode=PASSIVE reason=bulk_writer")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), walPassiveCheckpointTimeout)
+	defer cancel()
+	result, err := s.checkpointWALOnce(ctx, "PASSIVE")
+	if err != nil {
+		log.Printf("store_sqlite: wal checkpoint incomplete mode=PASSIVE busy=%d wal_frames=%d checkpointed_frames=%d error=%q", result.Busy, result.WALFrames, result.CheckpointedFrames, err)
 	}
 }
 
 // CheckpointWAL runs `PRAGMA wal_checkpoint(TRUNCATE)`: it flushes the
 // write-ahead log into the main database file and shrinks the -wal back to
-// zero. A passive checkpoint (SQLite's default) only reuses the WAL in
-// place and never reclaims the space; TRUNCATE is the mode that does.
-// Exposed so a daemon shutdown path or an operator command can force a
-// drain; the background loop calls it on a timer. Not held under writeMu —
-// SQLite coordinates checkpoints against writers internally, and blocking
-// steady-state writes on a maintenance op is the wrong tradeoff.
+// zero. It is the explicit/final maintenance boundary; the timer uses PASSIVE.
+// Acquisition and incomplete-checkpoint retries are context bounded and
+// serialized with the sole SQLite writer.
 func (s *Store) CheckpointWAL() error {
-	_, err := s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+	ctx, cancel := context.WithTimeout(context.Background(), walCheckpointTimeout)
+	defer cancel()
+	return s.checkpointWALWithContext(ctx)
+}
+
+func (s *Store) checkpointWALWithContext(ctx context.Context) error {
+	_, err := s.checkpointWALWithContextResult(ctx)
 	return err
+}
+
+func (s *Store) checkpointWALWithContextResult(ctx context.Context) (walCheckpointResult, error) {
+	if err := s.writeMu.LockContext(ctx); err != nil {
+		return walCheckpointResult{}, err
+	}
+	defer s.writeMu.Unlock()
+	if s.bulkConn != nil {
+		return walCheckpointResult{}, errWALCheckpointDeferredBulk
+	}
+	return s.checkpointWALResult(ctx)
+}
+
+// checkpointWAL is retained as the error-only core used by focused tests. The
+// caller holds writeMu; checkpointWALWithContextResult is the public-path gate.
+func (s *Store) checkpointWAL(ctx context.Context) error {
+	_, err := s.checkpointWALResult(ctx)
+	return err
+}
+
+func (s *Store) checkpointWALResult(ctx context.Context) (walCheckpointResult, error) {
+	var result walCheckpointResult
+	err := s.withSQLiteBusyRetry(ctx, "wal_checkpoint_truncate", func(attemptCtx context.Context) error {
+		var err error
+		result, err = s.checkpointWALOnce(attemptCtx, "TRUNCATE")
+		return err
+	})
+	return result, err
+}
+
+func (s *Store) checkpointWALOnce(ctx context.Context, mode string) (walCheckpointResult, error) {
+	var result walCheckpointResult
+	err := s.writerDB.QueryRowContext(ctx, "PRAGMA wal_checkpoint("+mode+")").Scan(
+		&result.Busy,
+		&result.WALFrames,
+		&result.CheckpointedFrames,
+	)
+	if err != nil {
+		return result, err
+	}
+	if result.incomplete() {
+		return result, fmt.Errorf("%w: mode=%s busy=%d wal_frames=%d checkpointed_frames=%d", errSQLiteCheckpointIncomplete, mode, result.Busy, result.WALFrames, result.CheckpointedFrames)
+	}
+	return result, nil
 }
 
 // stopCheckpointLoop signals the background loop to exit and waits for it,
@@ -424,8 +653,34 @@ func (s *Store) stopCheckpointLoop() {
 // rather than lingering at its high-water mark until the next open.
 func (s *Store) Close() error {
 	s.stopCheckpointLoop()
+	// A caller normally ends an outer cold-load window explicitly, but Close is
+	// also the last durability boundary on cancellation or startup failure.
+	// Flush while the database and pinned connection are still live so a
+	// coordinated load can never be silently discarded.
+	s.writeMu.Lock()
+	var bulkErr error
+	hadBulk := s.bulkConn != nil
+	if hadBulk {
+		if s.deferredFTSOptimize {
+			_, _ = s.execActiveWriteLocked(context.Background(), `INSERT INTO symbol_fts(symbol_fts, rank) VALUES('merge', ?)`, coldFTSMergePages)
+		}
+		if s.deferredContentFTS {
+			_, _ = s.execActiveWriteLocked(context.Background(), `INSERT INTO content_fts(content_fts, rank) VALUES('merge', ?)`, coldFTSMergePages)
+		}
+		s.deferredFTSOptimize = false
+		s.deferredContentFTS = false
+		s.coordinatedBulkLoad = false
+		bulkErr = s.flushBulkLocked()
+	}
+	s.writeMu.Unlock()
+
+	var checkpointErr error
 	if s.checkpointDone != nil { // on-disk store: drain the WAL one last time
-		_ = s.CheckpointWAL()
+		if hadBulk {
+			checkpointErr = s.checkpointBulkWAL()
+		} else {
+			checkpointErr = s.CheckpointWAL()
+		}
 	}
 	stmts := []*sql.Stmt{
 		s.stmtInsertNode, s.stmtGetNode, s.stmtGetNodeByQual,
@@ -441,36 +696,42 @@ func (s *Store) Close() error {
 		s.stmtAllEdges, s.stmtEdgeCount, s.stmtRemoveEdge,
 		s.stmtUpdateEdgeOrigin, s.stmtUpdateEdgeAttrs, s.stmtSelectEdgeOrigin, s.stmtDeleteEdgeByKey,
 		s.stmtEdgeExists,
-		s.stmtSelectFileNodeIDs, s.stmtSelectRepoNodeIDs,
-		s.stmtDeleteNodeByFile, s.stmtDeleteNodeByRepo,
 	}
 	for _, st := range stmts {
 		if st != nil {
 			_ = st.Close()
 		}
 	}
-	return s.db.Close()
+	return errors.Join(bulkErr, checkpointErr, closeSQLitePools(s.db, s.writerDB))
 }
 
 func (s *Store) prepare() error {
 	var err error
-	prep := func(out **sql.Stmt, q string) {
+	prepOn := func(db *sql.DB, out **sql.Stmt, q string) {
 		if err != nil {
 			return
 		}
 		var st *sql.Stmt
-		st, err = s.db.Prepare(q)
+		st, err = db.Prepare(q)
 		if err != nil {
 			err = fmt.Errorf("prepare %q: %w", q, err)
 			return
 		}
 		*out = st
 	}
+	prep := func(out **sql.Stmt, q string) { prepOn(s.db, out, q) }
+	prepWrite := func(out **sql.Stmt, q string) { prepOn(s.writerDB, out, q) }
 
-	const nodeCols = lookupNodeCols
+	const nodeCols = nodeInsertColumns
 
-	prep(&s.stmtInsertNode,
-		`INSERT OR REPLACE INTO nodes (`+nodeCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+	// Never use INSERT OR REPLACE here. SQLite implements REPLACE as
+	// DELETE+INSERT; the DELETE fires the nodes->edges ON DELETE CASCADE and
+	// silently erases every incident edge when a caller only intends to update
+	// node metadata (reach.Lookup does exactly that when publishing its cache).
+	// A true UPSERT updates the existing row in place and therefore preserves
+	// graph topology.
+	prepWrite(&s.stmtInsertNode,
+		`INSERT INTO nodes (`+nodeCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`+nodeUpsertClause)
 	prep(&s.stmtGetNode,
 		`SELECT `+nodeCols+` FROM nodes WHERE id = ?`)
 	prep(&s.stmtGetNodeByQual,
@@ -519,21 +780,21 @@ func (s *Store) prepare() error {
 	prep(&s.stmtStatsByLanguage,
 		`SELECT language, COUNT(*) FROM nodes GROUP BY language`)
 
-	const edgeCols = `from_id, to_id, kind, file_path, line, confidence, confidence_label, origin, tier, cross_repo, meta`
+	const edgeCols = edgeInsertColumns
 
-	prep(&s.stmtInsertEdge,
-		`INSERT OR IGNORE INTO edges (`+edgeCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+	prepWrite(&s.stmtInsertEdge,
+		`INSERT OR IGNORE INTO edges (`+edgeCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
 	prep(&s.stmtOutEdges,
 		`SELECT `+edgeCols+` FROM edges WHERE from_id = ?`)
-	const edgeColsLight = `from_id, to_id, kind, file_path, line, confidence, confidence_label, origin, tier, cross_repo`
+	// edgeColsLight is the package-level meta-less projection (store_light_edges.go),
+	// shared with AllEdgesLight so this prepared statement and the whole-graph scan
+	// can never drift apart.
 	prep(&s.stmtOutEdgesLight,
 		`SELECT `+edgeColsLight+` FROM edges WHERE from_id = ?`)
 	prep(&s.stmtInEdges,
 		`SELECT `+edgeCols+` FROM edges WHERE to_id = ?`)
 	prep(&s.stmtRepoEdges,
-		`SELECT e.from_id, e.to_id, e.kind, e.file_path, e.line,
-		        e.confidence, e.confidence_label, e.origin, e.tier,
-		        e.cross_repo, e.meta
+		`SELECT `+lookupQualifiedEdgeCols+`
 		   FROM edges e
 		   JOIN nodes n ON n.id = e.from_id
 		  WHERE n.repo_prefix = ?`)
@@ -541,28 +802,19 @@ func (s *Store) prepare() error {
 		`SELECT `+edgeCols+` FROM edges`)
 	prep(&s.stmtEdgeCount,
 		`SELECT COUNT(*) FROM edges`)
-	prep(&s.stmtRemoveEdge,
+	prepWrite(&s.stmtRemoveEdge,
 		`DELETE FROM edges WHERE from_id = ? AND to_id = ? AND kind = ?`)
 
 	prep(&s.stmtSelectEdgeOrigin,
 		`SELECT origin FROM edges WHERE from_id = ? AND to_id = ? AND kind = ? AND file_path = ? AND line = ?`)
-	prep(&s.stmtUpdateEdgeOrigin,
+	prepWrite(&s.stmtUpdateEdgeOrigin,
 		`UPDATE edges SET origin = ?, tier = ? WHERE from_id = ? AND to_id = ? AND kind = ? AND file_path = ? AND line = ?`)
-	prep(&s.stmtUpdateEdgeAttrs,
-		`UPDATE edges SET confidence = ?, confidence_label = ?, origin = ?, tier = ?, meta = ? WHERE from_id = ? AND to_id = ? AND kind = ? AND file_path = ? AND line = ?`)
-	prep(&s.stmtDeleteEdgeByKey,
+	prepWrite(&s.stmtUpdateEdgeAttrs,
+		`UPDATE edges SET confidence = ?, confidence_label = ?, origin = ?, tier = ?, meta = ?, resolve_terminal = ?, resolve_terminal_reason = ?, semantic_source = ? WHERE from_id = ? AND to_id = ? AND kind = ? AND file_path = ? AND line = ?`)
+	prepWrite(&s.stmtDeleteEdgeByKey,
 		`DELETE FROM edges WHERE from_id = ? AND to_id = ? AND kind = ? AND file_path = ? AND line = ?`)
 	prep(&s.stmtEdgeExists,
 		`SELECT 1 FROM edges WHERE from_id = ? AND to_id = ? AND kind = ? AND file_path = ? AND line = ? LIMIT 1`)
-
-	prep(&s.stmtSelectFileNodeIDs,
-		`SELECT id FROM nodes WHERE file_path = ?`)
-	prep(&s.stmtSelectRepoNodeIDs,
-		`SELECT id FROM nodes WHERE repo_prefix = ?`)
-	prep(&s.stmtDeleteNodeByFile,
-		`DELETE FROM nodes WHERE file_path = ?`)
-	prep(&s.stmtDeleteNodeByRepo,
-		`DELETE FROM nodes WHERE repo_prefix = ?`)
 
 	return err
 }
@@ -586,7 +838,9 @@ func scanNode(scanner interface {
 		&n.RepoPrefix, &n.WorkspaceID, &n.ProjectID,
 		&p.sig, &p.vis, &p.doc, &p.external, &p.returnType,
 		&p.isAsync, &p.isStatic, &p.isAbstract, &p.isExported, &p.updatedAt,
-		&p.dataClass, &p.semanticType, &p.semanticSource, &metaBlob,
+		&p.dataClass, &p.semanticType, &p.semanticSource, &p.cloneSig,
+		&p.entryPoint, &p.entryPointKind, &metaBlob,
+		&p.searchSig, &p.searchQualName, &p.searchDoc, &p.searchSuppressed, &p.sectionText,
 	)
 	if err != nil {
 		return nil, err
@@ -625,12 +879,33 @@ func scanNodeLight(scanner interface {
 		&n.RepoPrefix, &n.WorkspaceID, &n.ProjectID,
 		&p.sig, &p.vis, &p.doc, &p.external, &p.returnType,
 		&p.isAsync, &p.isStatic, &p.isAbstract, &p.isExported, &p.updatedAt,
-		&p.dataClass, &p.semanticType, &p.semanticSource,
+		&p.dataClass, &p.semanticType, &p.semanticSource, &p.cloneSig,
+		&p.entryPoint, &p.entryPointKind,
 	)
 	if err != nil {
 		return nil, err
 	}
 	restorePromotedMeta(&n, p)
+	return &n, nil
+}
+
+// scanNodeSummary scans the identity/location projection used by whole-graph
+// algorithms. It deliberately leaves Meta nil: even promoted docs and
+// signatures are unnecessary for adjacency, centrality, communities, and
+// concept-name mining, and allocating them once per node dominates large
+// SQLite scans.
+func scanNodeSummary(scanner interface {
+	Scan(...any) error
+}) (*graph.Node, error) {
+	var n graph.Node
+	err := scanner.Scan(
+		&n.ID, &n.Kind, &n.Name, &n.QualName, &n.FilePath,
+		&n.StartLine, &n.EndLine, &n.StartColumn, &n.EndColumn, &n.Language,
+		&n.RepoPrefix, &n.WorkspaceID, &n.ProjectID,
+	)
+	if err != nil {
+		return nil, err
+	}
 	return &n, nil
 }
 
@@ -641,11 +916,12 @@ func scanEdge(scanner interface {
 		e         graph.Edge
 		metaBlob  []byte
 		crossRepo int64
+		p         promotedEdgeMeta
 	)
 	err := scanner.Scan(
 		&e.From, &e.To, &e.Kind, &e.FilePath, &e.Line,
 		&e.Confidence, &e.ConfidenceLabel, &e.Origin, &e.Tier,
-		&crossRepo, &metaBlob,
+		&crossRepo, &metaBlob, &p.resolveTerminal, &p.resolveTerminalReason, &p.semanticSource,
 	)
 	if err != nil {
 		return nil, err
@@ -658,7 +934,40 @@ func scanEdge(scanner interface {
 		}
 		e.Meta = m
 	}
+	// Restore the promoted columns into Meta. They are authoritative for
+	// rows written after the promotion; a NULL column (pre-promotion rows)
+	// is left alone so any blob-carried value survives.
+	restorePromotedEdgeMeta(&e, p)
+	if graph.StructuralEdgeTargetInvalid(e.Kind, e.To) {
+		noteStructuralReadDrop()
+		return nil, nil
+	}
 	return &e, nil
+}
+
+// structuralReadDrops counts structurally invalid rows healed on read from
+// stores written before the write-funnel backstop existed. Every read path
+// dropping such a row means the on-disk store carries pre-gate corruption:
+// the first occurrence logs an engineer-facing signal (the feedback loop for
+// "something impossible reached disk"), and the audit battery reads the
+// counter. New stores must never increment it — the write backstop drops the
+// shape before it lands.
+var (
+	structuralReadDrops     atomic.Int64
+	structuralReadDropsOnce sync.Once
+)
+
+func noteStructuralReadDrop() {
+	structuralReadDrops.Add(1)
+	structuralReadDropsOnce.Do(func() {
+		log.Printf("store_sqlite: store contains structurally invalid edges (pre-backstop corruption); healing on read — rebuild or audit the store (see store_audit.sql A1)")
+	})
+}
+
+// StructuralReadDrops reports how many structurally invalid edge rows read
+// paths have healed since process start.
+func StructuralReadDrops() int64 {
+	return structuralReadDrops.Load()
 }
 
 // scanEdgeLight scans an edge WITHOUT decoding its meta blob -- for hot
@@ -682,14 +991,18 @@ func scanEdgeLight(scanner interface {
 		return nil, err
 	}
 	e.CrossRepo = crossRepo != 0
+	if graph.StructuralEdgeTargetInvalid(e.Kind, e.To) {
+		noteStructuralReadDrop()
+		return nil, nil
+	}
 	return &e, nil
 }
 
 // -- writes ---------------------------------------------------------------
 
-// AddNode inserts or replaces a node. Idempotent on the id column --
-// re-adding the same id with new content does a last-write-wins
-// update, matching the in-memory store's behaviour.
+// AddNode inserts or updates a node in place. Idempotent on the id column --
+// re-adding the same id with new content does a last-write-wins update while
+// preserving incident edge rows, matching the in-memory store's behaviour.
 func (s *Store) AddNode(n *graph.Node) {
 	if n == nil || n.ID == "" {
 		return
@@ -702,32 +1015,32 @@ func (s *Store) AddNode(n *graph.Node) {
 	if graph.IsProxyNode(n) {
 		return
 	}
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	if err := s.insertNodeLocked(s.stmtInsertNode, n); err != nil {
-		// graph.Store.AddNode has no error channel; the in-memory
-		// store can't fail either. We swallow the error here for API
-		// parity; surface as a panic only on a clearly catastrophic
-		// failure (closed DB), not on a transient busy.
-		panicOnFatal(err)
-	}
+	// Keep the single-node API on the same transaction path as AddBatch so a
+	// parser-stamped clone_shingles payload and its node can never diverge.
+	s.AddBatch([]*graph.Node{n}, nil)
 }
 
-func (s *Store) insertNodeLocked(stmt *sql.Stmt, n *graph.Node) error {
-	p, blobMeta := extractPromotedMeta(n.Meta)
+func (s *Store) insertNodeLocked(stmt *sql.Stmt, n *graph.Node) (bool, error) {
+	p, blobMeta := extractPromotedMeta(stripCloneShingles(n.Meta))
 	metaBlob, err := encodeMeta(blobMeta)
 	if err != nil {
-		return err
+		return false, err
 	}
-	_, err = stmt.Exec(
+	res, err := stmt.Exec(
 		n.ID, string(n.Kind), n.Name, n.QualName, n.FilePath,
 		n.StartLine, n.EndLine, n.StartColumn, n.EndColumn, n.Language,
 		n.RepoPrefix, n.WorkspaceID, n.ProjectID,
 		p.sig, p.vis, p.doc, p.external, p.returnType,
 		p.isAsync, p.isStatic, p.isAbstract, p.isExported, p.updatedAt,
-		p.dataClass, p.semanticType, p.semanticSource, metaBlob,
+		p.dataClass, p.semanticType, p.semanticSource, p.cloneSig,
+		p.entryPoint, p.entryPointKind, metaBlob,
+		p.searchSig, p.searchQualName, p.searchDoc, p.searchSuppressed, p.sectionText,
 	)
-	return err
+	if err != nil {
+		return false, err
+	}
+	changed, err := res.RowsAffected()
+	return changed > 0, err
 }
 
 // AddEdge inserts an edge. Idempotent on the logical edge key (from,
@@ -740,98 +1053,53 @@ func (s *Store) insertNodeLocked(stmt *sql.Stmt, n *graph.Node) error {
 // replacement, and the in-memory store also routes provenance
 // upgrades through SetEdgeProvenance).
 func (s *Store) AddEdge(e *graph.Edge) {
-	if e == nil {
+	if e == nil || graph.IsProxyID(e.From) || graph.IsProxyID(e.To) {
 		return
 	}
-	// An edge to/from a cross-daemon proxy node is volatile and never
-	// persisted (the proxy node itself is dropped at AddNode).
-	if graph.IsProxyID(e.From) || graph.IsProxyID(e.To) {
-		return
-	}
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	if err := s.insertEdgeLocked(s.stmtInsertEdge, e); err != nil {
-		panicOnFatal(err)
-	}
+	// Route through the set-oriented writer. During a coordinated cold load the
+	// single writer connection is pinned; using a prepared statement through
+	// database/sql here would wait for a second writer slot. AddBatch reuses the
+	// active writer and preserves INSERT OR IGNORE/idempotency semantics.
+	s.AddBatch(nil, []*graph.Edge{e})
 }
 
-func (s *Store) insertEdgeLocked(stmt *sql.Stmt, e *graph.Edge) error {
-	metaBlob, err := encodeMeta(e.Meta)
+// UnresolvedEdgeInsertions implements graph.UnresolvedInsertionCounter.
+func (s *Store) UnresolvedEdgeInsertions() uint64 {
+	return s.unresolvedInserts.Load()
+}
+
+func (s *Store) insertEdgeLocked(stmt *sql.Stmt, e *graph.Edge) (bool, error) {
+	if graph.IsUnresolvedTarget(e.To) {
+		s.unresolvedInserts.Add(1)
+	}
+	p, blobMeta := extractPromotedEdgeMeta(e.Meta)
+	metaBlob, err := encodeMeta(blobMeta)
 	if err != nil {
-		return err
+		return false, err
 	}
 	var crossRepo int64
 	if e.CrossRepo {
 		crossRepo = 1
 	}
-	_, err = stmt.Exec(
+	res, err := stmt.Exec(
 		e.From, e.To, string(e.Kind), e.FilePath, e.Line,
 		e.Confidence, e.ConfidenceLabel, e.Origin, e.Tier,
-		crossRepo, metaBlob,
+		crossRepo, metaBlob, p.resolveTerminal, p.resolveTerminalReason, p.semanticSource,
 	)
-	return err
+	if err != nil {
+		return false, err
+	}
+	changed, err := res.RowsAffected()
+	return changed > 0, err
 }
 
-// AddBatch inserts nodes and edges in a single transaction -- the
-// 10-100x speedup vs per-statement commits at indexing scale.
+// AddBatch inserts nodes and edges in one transaction using bounded multi-row
+// statements. This preserves single-row UPSERT/IGNORE semantics while avoiding
+// one SQLite execution per corpus row.
 func (s *Store) AddBatch(nodes []*graph.Node, edges []*graph.Edge) {
-	if len(nodes) == 0 && len(edges) == 0 {
-		return
-	}
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-
-	tx, err := s.beginWrite()
-	if err != nil {
+	if _, err := s.addBatchSetOriented(nodes, edges); err != nil {
 		panicOnFatal(err)
-		return
 	}
-	commit := false
-	defer func() {
-		if !commit {
-			_ = tx.Rollback()
-		}
-	}()
-
-	insertNode := tx.Stmt(s.stmtInsertNode)
-	defer insertNode.Close()
-	insertEdge := tx.Stmt(s.stmtInsertEdge)
-	defer insertEdge.Close()
-
-	for _, n := range nodes {
-		if n == nil || n.ID == "" {
-			continue
-		}
-		// Cross-daemon proxy nodes never reach disk.
-		if graph.IsProxyNode(n) {
-			continue
-		}
-		if err := s.insertNodeLocked(insertNode, n); err != nil {
-			panicOnFatal(err)
-			return
-		}
-	}
-	for _, e := range edges {
-		if e == nil {
-			continue
-		}
-		// An edge to or from a proxy node is volatile remote-derived
-		// state too; never persist it (it would dangle on reload since
-		// the proxy node itself is dropped).
-		if graph.IsProxyID(e.From) || graph.IsProxyID(e.To) {
-			continue
-		}
-		if err := s.insertEdgeLocked(insertEdge, e); err != nil {
-			panicOnFatal(err)
-			return
-		}
-	}
-
-	if err := tx.Commit(); err != nil {
-		panicOnFatal(err)
-		return
-	}
-	commit = true
 }
 
 // SetEdgeProvenance mutates an existing edge's origin in-place and
@@ -860,11 +1128,17 @@ func (s *Store) SetEdgeProvenance(e *graph.Edge, newOrigin string) bool {
 	if storedOrigin == newOrigin {
 		return false
 	}
+	if !s.invalidateAnalysisBeforeMutationLocked() {
+		return false
+	}
 	newTier := e.Tier
 	if newTier != "" {
 		newTier = graph.ResolvedBy(newOrigin)
 	}
-	if _, err := s.stmtUpdateEdgeOrigin.Exec(newOrigin, newTier, e.From, e.To, string(e.Kind), e.FilePath, e.Line); err != nil {
+	if _, err := s.execActiveWriteLocked(context.Background(),
+		`UPDATE edges SET origin = ?, tier = ? WHERE from_id = ? AND to_id = ? AND kind = ? AND file_path = ? AND line = ?`,
+		newOrigin, newTier, e.From, e.To, string(e.Kind), e.FilePath, e.Line,
+	); err != nil {
 		panicOnFatal(err)
 		return false
 	}
@@ -875,6 +1149,7 @@ func (s *Store) SetEdgeProvenance(e *graph.Edge, newOrigin string) bool {
 		e.Tier = newTier
 	}
 	s.edgeIdentityRevs.Add(1)
+	s.finishAnalysisMutationLocked(true)
 	return true
 }
 
@@ -889,19 +1164,33 @@ func (s *Store) PersistEdgeAttributes(e *graph.Edge) {
 	if e == nil {
 		return
 	}
-	metaBlob, err := encodeMeta(e.Meta)
+	p, blobMeta := extractPromotedEdgeMeta(e.Meta)
+	metaBlob, err := encodeMeta(blobMeta)
 	if err != nil {
 		panicOnFatal(err)
 		return
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	if _, err := s.stmtUpdateEdgeAttrs.Exec(
-		e.Confidence, e.ConfidenceLabel, e.Origin, e.Tier, metaBlob,
-		e.From, e.To, string(e.Kind), e.FilePath, e.Line,
-	); err != nil {
-		panicOnFatal(err)
+	if !s.invalidateAnalysisBeforeMutationLocked() {
+		return
 	}
+	res, err := s.execActiveWriteLocked(context.Background(),
+		`UPDATE edges SET confidence = ?, confidence_label = ?, origin = ?, tier = ?, meta = ?, resolve_terminal = ?, resolve_terminal_reason = ?, semantic_source = ? WHERE from_id = ? AND to_id = ? AND kind = ? AND file_path = ? AND line = ?`,
+		e.Confidence, e.ConfidenceLabel, e.Origin, e.Tier, metaBlob,
+		p.resolveTerminal, p.resolveTerminalReason, p.semanticSource,
+		e.From, e.To, string(e.Kind), e.FilePath, e.Line,
+	)
+	if err != nil {
+		panicOnFatal(err)
+		return
+	}
+	changed, err := res.RowsAffected()
+	if err != nil {
+		panicOnFatal(err)
+		return
+	}
+	s.finishAnalysisMutationLocked(changed > 0)
 }
 
 // Compile-time assertion: *Store satisfies the batched meta persister.
@@ -909,50 +1198,166 @@ var _ graph.EdgeMetaBatchPersister = (*Store)(nil)
 
 // PersistEdgeAttributesBatch is the batched form of PersistEdgeAttributes:
 // it rewrites the mutable attribute columns (confidence, confidence_label,
-// origin, tier, meta) for every edge in the batch, chunking the writes into
-// reindexChunkSize-row transactions re-using one prepared statement. The
-// resolver's terminal-skip stamping calls it to persist a Meta flag across a
-// large slice of edges without paying a BEGIN/COMMIT per edge. A row with no
-// matching key is a silent no-op (UPDATE ... WHERE matches nothing).
+// origin, tier, meta) for every edge in the batch. Each transaction covers up
+// to reindexChunkSize input rows, while each SQL statement updates up to
+// edgeAttributeUpdateChunkSize logical edges through one VALUES relation. A
+// row with no matching key is a silent no-op (UPDATE ... WHERE matches
+// nothing).
 func (s *Store) PersistEdgeAttributesBatch(edges []*graph.Edge) {
+	if _, err := s.persistEdgeAttributesBatch(edges); err != nil {
+		panicOnFatal(err)
+	}
+}
+
+// Thirteen bound values are carried per logical edge. Seventy-five rows use 975 host
+// parameters, leaving headroom below SQLite's conservative 999-variable
+// limit while collapsing the former one-UPDATE-per-edge loop.
+const (
+	edgeAttributeUpdateParamsPerRow = 13
+	edgeAttributeUpdateChunkSize    = 75
+)
+
+type edgeAttributeKey struct {
+	from, to, kind, filePath string
+	line                     int
+}
+
+// persistEdgeAttributesBatch returns the number of set-oriented UPDATE
+// statements executed. The count is intentionally internal: focused tests use
+// it to lock in the no-N+1 contract without exposing instrumentation through
+// graph.Store.
+func (s *Store) persistEdgeAttributesBatch(edges []*graph.Edge) (statements int, err error) {
 	if len(edges) == 0 {
-		return
+		return 0, nil
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+
 	for i := 0; i < len(edges); i += reindexChunkSize {
 		end := minInt(i+reindexChunkSize, len(edges))
-		chunk := edges[i:end]
-		tx, err := s.db.Begin()
+		tx, err := s.beginWrite()
 		if err != nil {
-			panicOnFatal(err)
-			return
+			return statements, err
 		}
-		updStmt := tx.Stmt(s.stmtUpdateEdgeAttrs)
-		for _, e := range chunk {
-			if e == nil {
-				continue
-			}
-			metaBlob, err := encodeMeta(e.Meta)
+		chunkChanged := false
+		for j := i; j < end; j += edgeAttributeUpdateChunkSize {
+			batchEnd := minInt(j+edgeAttributeUpdateChunkSize, end)
+			query, args, err := edgeAttributeUpdateStatement(edges[j:batchEnd])
 			if err != nil {
 				_ = tx.Rollback()
-				panicOnFatal(err)
-				return
+				return statements, err
 			}
-			if _, err := updStmt.Exec(
-				e.Confidence, e.ConfidenceLabel, e.Origin, e.Tier, metaBlob,
-				e.From, e.To, string(e.Kind), e.FilePath, e.Line,
-			); err != nil {
+			if len(args) == 0 {
+				continue
+			}
+			res, err := tx.Exec(query, args...)
+			statements++
+			if err != nil {
 				_ = tx.Rollback()
-				panicOnFatal(err)
-				return
+				return statements, err
 			}
+			if changed, rowsErr := res.RowsAffected(); rowsErr == nil && changed > 0 {
+				chunkChanged = true
+			}
+		}
+
+		// Attribute updates and durable analysis invalidation commit together.
+		// Difference-only UPDATE predicates make RowsAffected an actual-change
+		// signal, so an idempotent warm pass keeps its active generation.
+		invalidatedAnalysis := false
+		if chunkChanged && s.analysisGenerationPresent {
+			if err := invalidateAnalysisGenerationTx(tx); err != nil {
+				_ = tx.Rollback()
+				return statements, err
+			}
+			invalidatedAnalysis = true
 		}
 		if err := tx.Commit(); err != nil {
-			panicOnFatal(err)
-			return
+			return statements, err
 		}
+		if invalidatedAnalysis {
+			s.analysisGenerationPresent = false
+		}
+		s.finishAnalysisMutationLocked(chunkChanged)
 	}
+	return statements, nil
+}
+
+// edgeAttributeUpdateStatement builds one set-oriented UPDATE. Duplicate
+// logical keys within a chunk retain their last value, matching the former
+// ordered per-edge loop; duplicates across chunks are naturally overwritten
+// by the later statement.
+func edgeAttributeUpdateStatement(edges []*graph.Edge) (string, []any, error) {
+	updates := make([]*graph.Edge, 0, len(edges))
+	positions := make(map[edgeAttributeKey]int, len(edges))
+	for _, edge := range edges {
+		if edge == nil {
+			continue
+		}
+		key := edgeAttributeKey{
+			from: edge.From, to: edge.To, kind: string(edge.Kind),
+			filePath: edge.FilePath, line: edge.Line,
+		}
+		if pos, ok := positions[key]; ok {
+			updates[pos] = edge
+			continue
+		}
+		positions[key] = len(updates)
+		updates = append(updates, edge)
+	}
+	if len(updates) == 0 {
+		return "", nil, nil
+	}
+
+	var values strings.Builder
+	values.Grow(len(updates) * len("(?,?,?,?,?,?,?,?,?,?,?,?,?),"))
+	args := make([]any, 0, len(updates)*edgeAttributeUpdateParamsPerRow)
+	for i, edge := range updates {
+		if i > 0 {
+			values.WriteByte(',')
+		}
+		values.WriteString("(?,?,?,?,?,?,?,?,?,?,?,?,?)")
+		promoted, blobMeta := extractPromotedEdgeMeta(edge.Meta)
+		metaBlob, err := encodeMeta(blobMeta)
+		if err != nil {
+			return "", nil, err
+		}
+		args = append(args,
+			edge.Confidence, edge.ConfidenceLabel, edge.Origin, edge.Tier, metaBlob,
+			promoted.resolveTerminal, promoted.resolveTerminalReason, promoted.semanticSource,
+			edge.From, edge.To, string(edge.Kind), edge.FilePath, edge.Line,
+		)
+	}
+
+	query := `WITH updates(
+		confidence, confidence_label, origin, tier, meta,
+		resolve_terminal, resolve_terminal_reason, semantic_source,
+		from_id, to_id, kind, file_path, line
+	) AS (VALUES ` + values.String() + `)
+	UPDATE edges AS e
+	SET confidence = u.confidence,
+		confidence_label = u.confidence_label,
+		origin = u.origin,
+		tier = u.tier,
+		meta = u.meta,
+		resolve_terminal = u.resolve_terminal,
+		resolve_terminal_reason = u.resolve_terminal_reason,
+		semantic_source = u.semantic_source
+	FROM updates AS u
+	WHERE e.from_id = u.from_id
+		AND e.to_id = u.to_id
+		AND e.kind = u.kind
+		AND e.file_path = u.file_path
+		AND e.line = u.line
+		AND (e.confidence IS NOT u.confidence
+			OR e.confidence_label IS NOT u.confidence_label
+			OR e.origin IS NOT u.origin
+			OR e.tier IS NOT u.tier
+			OR e.meta IS NOT u.meta
+			OR e.resolve_terminal IS NOT u.resolve_terminal
+			OR e.resolve_terminal_reason IS NOT u.resolve_terminal_reason
+			OR e.semantic_source IS NOT u.semantic_source)`
+	return query, args, nil
 }
 
 // ReindexEdge updates the stored row after e.To has been mutated from
@@ -968,14 +1373,56 @@ func (s *Store) ReindexEdge(e *graph.Edge, oldTo string) {
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	if !s.invalidateAnalysisBeforeMutationLocked() {
+		return
+	}
 
-	if _, err := s.stmtDeleteEdgeByKey.Exec(e.From, oldTo, string(e.Kind), e.FilePath, e.Line); err != nil {
+	// Delete and reinsert are one topology change. Keeping them in one
+	// transaction prevents an encoding/insert failure from committing only the
+	// delete while both analysis and mutation receipts still describe the old
+	// graph as current.
+	tx, err := s.beginWrite()
+	if err != nil {
 		panicOnFatal(err)
 		return
 	}
-	if err := s.insertEdgeLocked(s.stmtInsertEdge, e); err != nil {
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	receipt := s.prepareSQLiteReindexReceiptTx(tx, []graph.EdgeReindex{{Edge: e, OldTo: oldTo}})
+	deleteStmt := tx.Stmt(s.stmtDeleteEdgeByKey)
+	defer deleteStmt.Close()
+	insertStmt := tx.Stmt(s.stmtInsertEdge)
+	defer insertStmt.Close()
+
+	res, err := deleteStmt.Exec(e.From, oldTo, string(e.Kind), e.FilePath, e.Line)
+	if err != nil {
 		panicOnFatal(err)
 		return
+	}
+	deleted, err := res.RowsAffected()
+	if err != nil {
+		panicOnFatal(err)
+		return
+	}
+	inserted, err := s.insertEdgeLocked(insertStmt, e)
+	if err != nil {
+		panicOnFatal(err)
+		return
+	}
+	receipt.recordInserted(e, inserted)
+	if err := tx.Commit(); err != nil {
+		panicOnFatal(err)
+		return
+	}
+	committed = true
+	changed := deleted > 0 || inserted
+	s.finishAnalysisMutationLocked(changed)
+	if changed {
+		s.publishSQLiteReindexReceiptLocked(receipt)
 	}
 }
 
@@ -986,112 +1433,29 @@ func (s *Store) ReindexEdge(e *graph.Edge, oldTo string) {
 // mutations.
 const reindexChunkSize = 5000
 
-// ReindexEdges chunks the batch into reindexChunkSize-mutation
-// transactions and runs each through prepared statements re-used
-// across the chunk. Per-edge ReindexEdge was the resolver hot path
-// (10k+ calls = 10k+ BEGIN/COMMIT pairs); this collapses them to two.
+// ReindexEdges applies resolver re-binds through bounded VALUES relations.
+// Each bounded transaction prefetches only the relevant identities through
+// variable-safe VALUES relations, simulates the prior ordered DELETE + INSERT
+// OR IGNORE semantics, and persists only the net final-state differences.
 func (s *Store) ReindexEdges(batch []graph.EdgeReindex) {
-	if len(batch) == 0 {
-		return
+	for _, r := range batch {
+		if r.Edge != nil && graph.IsUnresolvedTarget(r.Edge.To) {
+			s.unresolvedInserts.Add(1)
+		}
 	}
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	for i := 0; i < len(batch); i += reindexChunkSize {
-		end := minInt(i+reindexChunkSize, len(batch))
-		chunk := batch[i:end]
-		tx, err := s.db.Begin()
-		if err != nil {
-			panicOnFatal(err)
-			return
-		}
-		delStmt := tx.Stmt(s.stmtDeleteEdgeByKey)
-		insStmt := tx.Stmt(s.stmtInsertEdge)
-		for _, r := range chunk {
-			if r.Edge == nil || r.OldTo == r.Edge.To {
-				continue
-			}
-			if _, err := delStmt.Exec(r.Edge.From, r.OldTo, string(r.Edge.Kind), r.Edge.FilePath, r.Edge.Line); err != nil {
-				_ = tx.Rollback()
-				panicOnFatal(err)
-				return
-			}
-			if err := s.insertEdgeLocked(insStmt, r.Edge); err != nil {
-				_ = tx.Rollback()
-				panicOnFatal(err)
-				return
-			}
-		}
-		if err := tx.Commit(); err != nil {
-			panicOnFatal(err)
-			return
-		}
+	if _, err := s.reindexEdgesSetOriented(batch); err != nil {
+		panicOnFatal(err)
 	}
 }
 
-// SetEdgeProvenanceBatch chunks origin promotions into one BEGIN/
-// COMMIT per chunk and bumps the in-process revision counter once
-// per actual change, matching the per-edge SetEdgeProvenance's
-// semantics. Returns the total number of edges whose Origin changed.
+// SetEdgeProvenanceBatch applies origin promotions through bounded VALUES
+// joins and preserves ordered duplicate/change-count semantics.
 func (s *Store) SetEdgeProvenanceBatch(batch []graph.EdgeProvenanceUpdate) int {
-	if len(batch) == 0 {
-		return 0
+	changed, _, err := s.setEdgeProvenanceBatchSetOriented(batch)
+	if err != nil {
+		panicOnFatal(err)
 	}
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	totalChanged := 0
-	for i := 0; i < len(batch); i += reindexChunkSize {
-		end := minInt(i+reindexChunkSize, len(batch))
-		chunk := batch[i:end]
-		tx, err := s.db.Begin()
-		if err != nil {
-			panicOnFatal(err)
-			return totalChanged
-		}
-		selStmt := tx.Stmt(s.stmtSelectEdgeOrigin)
-		updStmt := tx.Stmt(s.stmtUpdateEdgeOrigin)
-		chunkChanged := 0
-		for _, u := range chunk {
-			if u.Edge == nil {
-				continue
-			}
-			var storedOrigin string
-			row := selStmt.QueryRow(u.Edge.From, u.Edge.To, string(u.Edge.Kind), u.Edge.FilePath, u.Edge.Line)
-			if err := row.Scan(&storedOrigin); err != nil {
-				if errors.Is(err, sql.ErrNoRows) {
-					continue
-				}
-				_ = tx.Rollback()
-				panicOnFatal(err)
-				return totalChanged
-			}
-			if storedOrigin == u.NewOrigin {
-				continue
-			}
-			newTier := u.Edge.Tier
-			if newTier != "" {
-				newTier = graph.ResolvedBy(u.NewOrigin)
-			}
-			if _, err := updStmt.Exec(u.NewOrigin, newTier, u.Edge.From, u.Edge.To, string(u.Edge.Kind), u.Edge.FilePath, u.Edge.Line); err != nil {
-				_ = tx.Rollback()
-				panicOnFatal(err)
-				return totalChanged
-			}
-			u.Edge.Origin = u.NewOrigin
-			if u.Edge.Tier != "" {
-				u.Edge.Tier = newTier
-			}
-			chunkChanged++
-		}
-		if err := tx.Commit(); err != nil {
-			panicOnFatal(err)
-			return totalChanged
-		}
-		if chunkChanged > 0 {
-			s.edgeIdentityRevs.Add(int64(chunkChanged))
-		}
-		totalChanged += chunkChanged
-	}
-	return totalChanged
+	return changed
 }
 
 func minInt(a, b int) int {
@@ -1106,7 +1470,13 @@ func minInt(a, b int) int {
 func (s *Store) RemoveEdge(from, to string, kind graph.EdgeKind) bool {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	res, err := s.stmtRemoveEdge.Exec(from, to, string(kind))
+	if !s.invalidateAnalysisBeforeMutationLocked() {
+		return false
+	}
+	res, err := s.execActiveWriteLocked(context.Background(),
+		`DELETE FROM edges WHERE from_id = ? AND to_id = ? AND kind = ?`,
+		from, to, string(kind),
+	)
 	if err != nil {
 		panicOnFatal(err)
 		return false
@@ -1116,94 +1486,31 @@ func (s *Store) RemoveEdge(from, to string, kind graph.EdgeKind) bool {
 		panicOnFatal(err)
 		return false
 	}
-	return n > 0
+	changed := n > 0
+	s.finishAnalysisMutationLocked(changed)
+	if changed {
+		s.markMutationReceiptsIncompleteLocked()
+	}
+	return changed
 }
 
 // EvictFile removes every node anchored to filePath and every edge
 // that touches one of those nodes. Returns (nodesRemoved,
 // edgesRemoved).
 func (s *Store) EvictFile(filePath string) (nodesRemoved, edgesRemoved int) {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	return s.evictByScopeLocked(s.stmtSelectFileNodeIDs, s.stmtDeleteNodeByFile, filePath)
+	return s.evictByPredicate(evictFilePredicate, filePath)
 }
 
 // EvictRepo removes every node in repoPrefix and every edge that
 // touches one. Returns (nodesRemoved, edgesRemoved).
 func (s *Store) EvictRepo(repoPrefix string) (nodesRemoved, edgesRemoved int) {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	return s.evictByScopeLocked(s.stmtSelectRepoNodeIDs, s.stmtDeleteNodeByRepo, repoPrefix)
-}
-
-// evictByScopeLocked is the shared body of EvictFile / EvictRepo --
-// collect the affected node IDs, delete every edge touching one of
-// them, then delete the nodes themselves.
-func (s *Store) evictByScopeLocked(selectIDs, deleteNodes *sql.Stmt, scope string) (int, int) {
-	rows, err := selectIDs.Query(scope)
-	if err != nil {
-		panicOnFatal(err)
-		return 0, 0
+	predicate := evictRepoPredicate
+	if repoPrefix != "" {
+		// Make the partial nodes_by_repo predicate explicit so SQLite can use
+		// that compact index for ordinary named repositories.
+		predicate = evictNonEmptyRepoPredicate
 	}
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			_ = rows.Close()
-			panicOnFatal(err)
-			return 0, 0
-		}
-		ids = append(ids, id)
-	}
-	if err := rows.Err(); err != nil {
-		_ = rows.Close()
-		panicOnFatal(err)
-		return 0, 0
-	}
-	_ = rows.Close()
-	if len(ids) == 0 {
-		return 0, 0
-	}
-
-	// Delete every edge touching one of these nodes. A DELETE-per-node
-	// (… WHERE from_id = ? OR to_id = ?) is one statement round-trip and
-	// WAL commit per node — hundreds of them when evicting a large file on
-	// the per-edit reindex path. Instead delete in chunked IN batches
-	// keyed on from_id then to_id, so each chunk is one index-driven
-	// DELETE; the chunk size stays under SQLite's bound-variable limit.
-	var edgesRemoved int
-	const evictEdgeChunk = 900
-	for _, col := range []string{"from_id", "to_id"} {
-		for start := 0; start < len(ids); start += evictEdgeChunk {
-			end := minInt(start+evictEdgeChunk, len(ids))
-			chunk := ids[start:end]
-			placeholders := strings.TrimSuffix(strings.Repeat("?,", len(chunk)), ",")
-			args := make([]any, len(chunk))
-			for i, id := range chunk {
-				args[i] = id
-			}
-			res, err := s.db.Exec(`DELETE FROM edges WHERE `+col+` IN (`+placeholders+`)`, args...)
-			if err != nil {
-				panicOnFatal(err)
-				return 0, edgesRemoved
-			}
-			if n, err := res.RowsAffected(); err == nil {
-				edgesRemoved += int(n)
-			}
-		}
-	}
-
-	res, err := deleteNodes.Exec(scope)
-	if err != nil {
-		panicOnFatal(err)
-		return 0, edgesRemoved
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		panicOnFatal(err)
-		return 0, edgesRemoved
-	}
-	return int(n), edgesRemoved
+	return s.evictByPredicate(predicate, repoPrefix)
 }
 
 // -- reads ---------------------------------------------------------------
@@ -1246,11 +1553,28 @@ func (s *Store) FindNodesByNameInRepo(name, repoPrefix string) []*graph.Node {
 }
 
 func (s *Store) GetFileNodes(filePath string) []*graph.Node {
-	return s.queryNodes(s.stmtFileNodes, filePath)
+	return s.GetFileNodesContext(context.Background(), filePath)
+}
+
+// GetFileNodesContext is the deadline-aware file lookup used by bounded MCP
+// localization. QueryContext covers both pool acquisition and SQLite execution,
+// so a busy store cannot extend a request beyond its context budget.
+func (s *Store) GetFileNodesContext(ctx context.Context, filePath string) []*graph.Node {
+	return s.queryNodesContext(ctx, s.stmtFileNodes, filePath)
 }
 
 func (s *Store) GetRepoNodes(repoPrefix string) []*graph.Node {
 	return s.queryNodes(s.stmtRepoNodes, repoPrefix)
+}
+
+func (s *Store) GetRepoNodesByLanguage(repoPrefix, language string) []*graph.Node {
+	if language == "" {
+		return nil
+	}
+	return s.queryNodesSQL(
+		`SELECT `+lookupNodeCols+` FROM nodes WHERE repo_prefix = ? AND language = ? ORDER BY id`,
+		repoPrefix, language,
+	)
 }
 
 func (s *Store) AllNodes() []*graph.Node {
@@ -1258,8 +1582,15 @@ func (s *Store) AllNodes() []*graph.Node {
 }
 
 func (s *Store) queryNodes(stmt *sql.Stmt, args ...any) []*graph.Node {
-	rows, err := stmt.Query(args...)
+	return s.queryNodesContext(context.Background(), stmt, args...)
+}
+
+func (s *Store) queryNodesContext(ctx context.Context, stmt *sql.Stmt, args ...any) []*graph.Node {
+	rows, err := stmt.QueryContext(ctx, args...)
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
 		panicOnFatal(err)
 		return nil
 	}
@@ -1268,10 +1599,16 @@ func (s *Store) queryNodes(stmt *sql.Stmt, args ...any) []*graph.Node {
 	for rows.Next() {
 		n, err := scanNode(rows)
 		if err != nil {
+			if ctx.Err() != nil {
+				return out
+			}
 			panicOnFatal(err)
 			return out
 		}
 		out = append(out, n)
+	}
+	if err := rows.Err(); err != nil && ctx.Err() == nil {
+		panicOnFatal(err)
 	}
 	return out
 }
@@ -1293,11 +1630,34 @@ func (s *Store) GetRepoNonContentNodes(repoPrefix string) []*graph.Node {
 	return s.scanNodeQuery(`SELECT `+lookupNodeCols+` FROM nodes WHERE repo_prefix = ? AND `+filter, repoPrefix)
 }
 
-// GetRepoNodesLight is the graph.LightNodeReader fast path: repo_prefix
-// still uses the nodes_by_repo index, but the meta column is left out of
-// the projection entirely, so a repo's already-enriched majority never
-// crosses the driver boundary as a blob to decode. See LightNodeReader's
-// doc for the read-only-use invariant this projection depends on.
+// AllNodesLight implements graph.NodeLightScanner with the identity/location
+// projection only. Whole-graph analyses avoid both the opaque metadata blob and
+// promoted docs/signatures, so returned nodes always have nil Meta.
+func (s *Store) AllNodesLight() []*graph.Node {
+	rows, err := s.db.Query(`SELECT ` + lookupNodeSummaryCols + ` FROM nodes`)
+	if err != nil {
+		panicOnFatal(err)
+		return nil
+	}
+	defer rows.Close()
+	var out []*graph.Node
+	for rows.Next() {
+		n, err := scanNodeSummary(rows)
+		if err != nil {
+			panicOnFatal(err)
+			return out
+		}
+		out = append(out, n)
+	}
+	if err := rows.Err(); err != nil {
+		panicOnFatal(err)
+	}
+	return out
+}
+
+// GetRepoNodesLight omits the opaque meta column for repo-scoped callers that
+// only need promoted structural fields. This keeps an already-enriched repo's
+// metadata blobs out of the driver and decoder hot path.
 func (s *Store) GetRepoNodesLight(repoPrefix string) []*graph.Node {
 	rows, err := s.db.Query(`SELECT `+lookupNodeColsLight+` FROM nodes WHERE repo_prefix = ?`, repoPrefix)
 	if err != nil {
@@ -1445,6 +1805,9 @@ func (s *Store) queryEdges(stmt *sql.Stmt, args ...any) []*graph.Edge {
 			panicOnFatal(err)
 			return out
 		}
+		if e == nil {
+			continue
+		}
 		out = append(out, e)
 	}
 	return out
@@ -1466,6 +1829,9 @@ func (s *Store) queryEdgesLight(stmt *sql.Stmt, args ...any) []*graph.Edge {
 		if err != nil {
 			panicOnFatal(err)
 			return out
+		}
+		if e == nil {
+			continue
 		}
 		out = append(out, e)
 	}
@@ -1728,6 +2094,14 @@ func (s *Store) AllRepoMemoryEstimates() map[string]graph.RepoMemoryEstimate {
 // callers stay quiet. The graph.Store interface deliberately does not
 // surface errors -- it mirrors the in-memory store's "everything
 // succeeds" contract -- so a fatal storage failure cannot be ignored.
+//
+// Caller contract: on a teardown-race error panicOnFatal RETURNS rather than
+// panicking, so a caller that keeps using the query result after it returns
+// MUST nil-check first. `rows, err := db.Query(...); panicOnFatal(err)` leaves
+// rows == nil on a swallowed error, and the subsequent rows.Close() /
+// rows.Next() would SIGSEGV — the aggregator reads early-return their empty
+// value on nil rows for exactly this reason. In one line: fatal panics; a
+// teardown-race read returns empty.
 func panicOnFatal(err error) {
 	if err == nil {
 		return
@@ -1783,8 +2157,7 @@ func isStoreClosedErr(err error) bool {
 // EdgesByKind: indexed SELECT on the (kind) column.
 func (s *Store) EdgesByKind(kind graph.EdgeKind) iter.Seq[*graph.Edge] {
 	return func(yield func(*graph.Edge) bool) {
-		out := s.queryEdgesSQL(`
-SELECT from_id, to_id, kind, file_path, line, confidence, confidence_label, origin, tier, cross_repo, meta
+		out := s.queryEdgesSQL(`SELECT `+lookupEdgeCols+`
 FROM edges WHERE kind = ?`, string(kind))
 		for _, e := range out {
 			if !yield(e) {
@@ -1806,21 +2179,42 @@ func (s *Store) NodesByKind(kind graph.NodeKind) iter.Seq[*graph.Node] {
 	}
 }
 
-// EdgesWithUnresolvedTarget yields edges whose target is an unresolved
-// stub in EITHER form: the bare `unresolved::X` (a half-open range scan
-// that seeks directly to the contiguous slice via the to_id b-tree) or
-// the multi-repo `<repo>::unresolved::X` rewrite (an infix LIKE — the
-// unresolved set is small, so the scan is cheap). Mirrors
-// graph.IsUnresolvedTarget over both shapes.
+// EdgesWithUnresolvedTarget yields edges whose target is an unresolved stub
+// in either form graph.IsUnresolvedTarget recognises. Filters on the
+// is_unresolved generated column (see isUnresolvedColumnDDL) rather than
+// re-deriving the to_id pattern match in SQL: measured 2.7x faster than the
+// equivalent to_id-based OR query on a real 26-repo store (7.96s -> 2.95s for
+// the same 847,684-row result) because the boolean index's bookmark lookups
+// land in ascending rowid order, unlike a to_id-ordered index's.
+//
+// Gate-owned fn-value placeholders (graph.FnValuePlaceholderMarker,
+// `unresolved::fnvalue::<name>`) are excluded on top of is_unresolved: the
+// master resolver can never bind them, so they are pure pending-set bloat here
+// (a live store held millions). The bare form is dropped by the range predicate
+// — which rides edges_by_to(to_id) — using the ':;' range end from
+// isUnresolvedColumnDDL's idiom (';' == ':'+1); the multi-repo COPY-rewrite form
+// is dropped by the NOT LIKE, matching IsFnValuePlaceholder's infix shape.
 func (s *Store) EdgesWithUnresolvedTarget() iter.Seq[*graph.Edge] {
 	return func(yield func(*graph.Edge) bool) {
-		out := s.queryEdgesSQL(`
-SELECT from_id, to_id, kind, file_path, line, confidence, confidence_label, origin, tier, cross_repo, meta
-FROM edges WHERE (to_id >= 'unresolved::' AND to_id < 'unresolved:;') OR to_id LIKE '%::unresolved::%'`)
-		for _, e := range out {
-			if !yield(e) {
+		scan, err := s.BeginUnresolvedEdgeScan()
+		if err != nil {
+			return
+		}
+		var afterID int64
+		for {
+			page, err := s.ReadUnresolvedEdgePage(scan, afterID, 2048, 16<<20)
+			if err != nil {
 				return
 			}
+			for _, e := range page.Edges {
+				if !yield(e) {
+					return
+				}
+			}
+			if page.Exhausted || page.NextID <= afterID {
+				return
+			}
+			afterID = page.NextID
 		}
 	}
 }

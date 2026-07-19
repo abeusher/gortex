@@ -176,7 +176,7 @@ func TestPatchGraphModify_ParseFailureKeepsPriorNodes(t *testing.T) {
 	ext.setFail(false)
 	ext.setFuncs("Alpha")
 	writeFile(t, path, "alpha body")
-	w.patchGraph(path, ChangeCreated)
+	require.NoError(t, w.patchGraph(path, ChangeCreated))
 
 	funcID := "main.fk::Alpha"
 	require.NotNil(t, idx.graph.GetNode(funcID), "Alpha must be indexed via the create patch")
@@ -185,9 +185,11 @@ func TestPatchGraphModify_ParseFailureKeepsPriorNodes(t *testing.T) {
 	require.Equal(t, 2, nodesBefore, "file node + Alpha")
 
 	// A transiently-unparseable save arrives as a Modify on the live path.
+	// patchGraph must surface the parse failure to its caller — while the
+	// assertions below pin that the graph kept the prior nodes.
 	ext.setFail(true)
 	writeFile(t, path, "this no longer parses")
-	w.patchGraph(path, ChangeModified)
+	require.Error(t, w.patchGraph(path, ChangeModified))
 
 	assert.Equal(t, nodesBefore, len(idx.graph.GetFileNodes("main.fk")),
 		"a failed modify through the live watcher path must not zero the file's nodes")
@@ -198,7 +200,7 @@ func TestPatchGraphModify_ParseFailureKeepsPriorNodes(t *testing.T) {
 	ext.setFail(false)
 	ext.setFuncs("Beta")
 	writeFile(t, path, "beta body")
-	w.patchGraph(path, ChangeModified)
+	_ = w.patchGraph(path, ChangeModified)
 	assert.Nil(t, idx.graph.GetNode(funcID), "a clean live modify evicts Alpha")
 	assert.NotNil(t, idx.graph.GetNode("main.fk::Beta"), "a clean live modify indexes Beta")
 }
@@ -450,7 +452,12 @@ func TestWatcher_NewSubdirScanIndexesPreWatchFile(t *testing.T) {
 	require.NoError(t, os.MkdirAll(subdir, 0o755))
 	ext.setFuncs("Buried")
 	writeFile(t, filepath.Join(subdir, "buried.fk"), "buried body")
-	require.Empty(t, g.GetFileNodes("pkg/buried.fk"),
+	// The graph keys file nodes under OS-native separators (see
+	// graphRelKey), so build the expected key with filepath.Join instead
+	// of a hard-coded "pkg/buried.fk" — the slash form only matches on
+	// POSIX and would spuriously fail this test on Windows.
+	buriedKey := filepath.Join("pkg", "buried.fk")
+	require.Empty(t, g.GetFileNodes(buriedKey),
 		"the pre-watch file must be absent before the directory scan")
 
 	w.handleEvent(fswatcher.WatchEvent{
@@ -459,7 +466,7 @@ func TestWatcher_NewSubdirScanIndexesPreWatchFile(t *testing.T) {
 	})
 
 	require.Eventually(t, func() bool {
-		return len(g.GetFileNodes("pkg/buried.fk")) > 0
+		return len(g.GetFileNodes(buriedKey)) > 0
 	}, 5*time.Second, 10*time.Millisecond,
 		"the new-directory create must trigger a scoped scan that indexes the pre-watch file")
 }

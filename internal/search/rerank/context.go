@@ -2,10 +2,31 @@ package rerank
 
 import (
 	"math"
+	"strings"
 	"time"
 
 	"github.com/zzet/gortex/internal/graph"
 )
+
+// AnalysisMetric is the bounded per-candidate analysis state consumed by rerank.
+// Values are already normalized where appropriate so callers can load one batch
+// without exposing or retaining whole-graph analysis maps.
+type AnalysisMetric struct {
+	CommunityID string
+	Authority   float64
+	Hub         float64
+}
+
+// CentralityResult carries scores plus the bounded-walk receipt. Truncated
+// results are lower bounds and are confidence-damped before scoring.
+type CentralityResult struct {
+	Scores      map[string]float64
+	NodeCount   int
+	EdgeCount   int
+	NodeBatches int
+	EdgeBatches int
+	Truncated   bool
+}
 
 // Context bundles the read-only data signals need at scoring time.
 // All fields are optional; signals must gracefully degrade when a
@@ -54,6 +75,12 @@ type Context struct {
 	// nil, the community signal contributes 0.
 	CommunityOf func(nodeID string) string
 
+	// AnalysisMetricsOf loads community and normalized HITS values for the
+	// current candidate batch. prepare calls it exactly once per distinct
+	// candidate slice; it replaces whole-graph materialization on bounded
+	// search paths. Missing rows fall back to CommunityOf/AuthorityOf/HubOf.
+	AnalysisMetricsOf func(nodeIDs []string) map[string]AnalysisMetric
+
 	// RepoPrefix and ProjectID name the session's home repo and
 	// project. Used by the community signal to score candidates by
 	// locality. Both empty disables the locality side of the signal.
@@ -88,6 +115,23 @@ type Context struct {
 	// treated as 1.0 everywhere.
 	ComboBoostOf func(nodeID string) float64
 
+	// EmbedText returns a normalised embedding vector for arbitrary
+	// text, or nil when it cannot embed. It is the substrate for the
+	// on-the-fly SemanticCosineSignal: the signal assembles a compact
+	// text for each candidate (name + qualname + path + signature) and
+	// embeds it here, then cosines the result against QueryVec. Wired by
+	// the MCP server to the always-available in-process static provider;
+	// nil disables the semantic-cosine channel (it then sits at 0). The
+	// closure must be safe for concurrent use.
+	EmbedText func(text string) []float32
+
+	// QueryVec is the pre-computed embedding of the raw query, produced
+	// once per request with the same provider EmbedText wraps. Empty
+	// disables the semantic-cosine channel. Kept on the Context so the
+	// per-candidate signal pays only for one candidate embed + one dot
+	// product, never a second query embed.
+	QueryVec []float32
+
 	// Centrality runs a Random-Walk-with-Restart (Personalized
 	// PageRank) from the given seed node IDs and returns each reachable
 	// node's proximity score. It is the data source for ProximitySignal.
@@ -96,6 +140,11 @@ type Context struct {
 	// returned scores need not be pre-normalised — prepare() rescales
 	// them to [0,1] against the batch maximum.
 	Centrality func(seeds []string) map[string]float64
+
+	// BatchedCentrality is the bounded interactive variant. It receives the
+	// complete candidate IDs so callers can build a capped neighborhood in a
+	// fixed number of batch reads. When set it takes precedence over Centrality.
+	BatchedCentrality func(seeds, candidateIDs []string) CentralityResult
 
 	// CentralitySeedCount caps how many top candidates seed the RWR
 	// walk. 0 means use defaultCentralitySeeds.
@@ -121,7 +170,12 @@ type Context struct {
 	// proximity to the query seeds, normalised to [0,1] against the
 	// batch maximum. Populated by prepare() when Centrality is wired;
 	// read by ProximitySignal. Nil when no centrality provider is set.
-	centralityScores map[string]float64
+	centralityScores  map[string]float64
+	centralityReceipt CentralityResult
+
+	// analysisMetrics is request-scoped state loaded in one batch by
+	// AnalysisMetricsOf. It is reset for each Prepare call.
+	analysisMetrics map[string]AnalysisMetric
 
 	// communityCount maps community ID → number of candidates in that
 	// community. Used by the community signal to detect topic clusters.
@@ -142,6 +196,13 @@ type Context struct {
 	// MinHash uses it to only count similarity edges that point to
 	// other candidates in the same batch (cluster-cohesion signal).
 	candidateIDs map[string]struct{}
+
+	// nameGroupCount maps a lowercased candidate name → how many
+	// candidates in the batch share it. OverloadProminenceSignal reads
+	// it to fire only on a genuine same-name collision (an ambiguous
+	// query where several symbols answer to the same identifier), so
+	// non-colliding candidates are never perturbed.
+	nameGroupCount map[string]int
 
 	// fileGroups maps each file path → candidates from that file in
 	// batch order. The file-coherence signal reads this to detect
@@ -255,6 +316,9 @@ func (c *Context) SeedEdgeCaches(inEdges, outEdges map[string][]*graph.Edge, pre
 // in its debug log without grepping internal state.
 func (c *Context) CachePreSeeded() bool { return c.cachePreSeeded }
 
+// CentralityTelemetry returns the receipt from the most recent Prepare call.
+func (c *Context) CentralityTelemetry() CentralityResult { return c.centralityReceipt }
+
 // InheritEdgeCacheFrom shares the source context's edge caches +
 // cachePreSeeded flag onto c. Used by the engine to give per-call
 // inner reranks access to the handler-built bundle cache without
@@ -327,6 +391,7 @@ func (c *Context) prepare(cands []*Candidate) {
 	c.communityCount = make(map[string]int, len(cands))
 	c.maxCommunityCount = 0
 	c.candidateIDs = make(map[string]struct{}, len(cands))
+	c.nameGroupCount = make(map[string]int, len(cands))
 	c.fanInMax = 0
 	c.fanOutMax = 0
 	c.churnMax = 0
@@ -343,8 +408,8 @@ func (c *Context) prepare(cands []*Candidate) {
 		c.inEdgeCache = nil
 	}
 
-	// First pass: collect candidate IDs (the input to the batched edge
-	// fetch) and populate the non-edge scratch fields.
+	// Collect candidate IDs before scoring so analysis-backed signals can load
+	// their rows in one bounded query instead of one lookup per candidate.
 	ids := make([]string, 0, len(cands))
 	for _, cand := range cands {
 		if cand == nil || cand.Node == nil {
@@ -352,14 +417,25 @@ func (c *Context) prepare(cands []*Candidate) {
 		}
 		c.candidateIDs[cand.Node.ID] = struct{}{}
 		ids = append(ids, cand.Node.ID)
+	}
+	c.analysisMetrics = nil
+	if c.AnalysisMetricsOf != nil && len(ids) > 0 {
+		c.analysisMetrics = c.AnalysisMetricsOf(ids)
+	}
 
-		if c.CommunityOf != nil {
-			com := c.CommunityOf(cand.Node.ID)
-			if com != "" {
-				c.communityCount[com]++
-				if c.communityCount[com] > c.maxCommunityCount {
-					c.maxCommunityCount = c.communityCount[com]
-				}
+	// Populate the non-edge scratch fields from the candidate batch.
+	for _, cand := range cands {
+		if cand == nil || cand.Node == nil {
+			continue
+		}
+		if nm := strings.ToLower(cand.Node.Name); nm != "" {
+			c.nameGroupCount[nm]++
+		}
+
+		if com := c.communityFor(cand.Node.ID); com != "" {
+			c.communityCount[com]++
+			if c.communityCount[com] > c.maxCommunityCount {
+				c.maxCommunityCount = c.communityCount[com]
 			}
 		}
 
@@ -440,19 +516,63 @@ func (c *Context) prepare(cands []*Candidate) {
 	c.computeCentrality(cands)
 }
 
+func (c *Context) communityFor(nodeID string) string {
+	if metric, ok := c.analysisMetrics[nodeID]; ok && metric.CommunityID != "" {
+		return metric.CommunityID
+	}
+	if c.CommunityOf != nil {
+		return c.CommunityOf(nodeID)
+	}
+	return ""
+}
+
+func (c *Context) authorityFor(nodeID string) (float64, bool) {
+	if metric, ok := c.analysisMetrics[nodeID]; ok {
+		return metric.Authority, true
+	}
+	if c.AuthorityOf != nil {
+		return c.AuthorityOf(nodeID), true
+	}
+	return 0, false
+}
+
+func (c *Context) hubFor(nodeID string) (float64, bool) {
+	if metric, ok := c.analysisMetrics[nodeID]; ok {
+		return metric.Hub, true
+	}
+	if c.HubOf != nil {
+		return c.HubOf(nodeID), true
+	}
+	return 0, false
+}
+
 // computeCentrality runs the RWR walk from the batch's strongest seeds
 // and stores per-candidate proximity normalised to [0,1]. No-op when
 // Centrality is nil or the walk returns nothing.
 func (c *Context) computeCentrality(cands []*Candidate) {
 	c.centralityScores = nil
-	if c.Centrality == nil || len(cands) == 0 {
+	c.centralityReceipt = CentralityResult{}
+	if (c.BatchedCentrality == nil && c.Centrality == nil) || len(cands) == 0 {
 		return
 	}
 	seeds := selectCentralitySeeds(cands, c.CentralitySeedCount)
 	if len(seeds) == 0 {
 		return
 	}
-	raw := c.Centrality(seeds)
+	var raw map[string]float64
+	if c.BatchedCentrality != nil {
+		candidateIDs := make([]string, 0, len(cands))
+		for _, cand := range cands {
+			if cand != nil && cand.Node != nil {
+				candidateIDs = append(candidateIDs, cand.Node.ID)
+			}
+		}
+		c.centralityReceipt = c.BatchedCentrality(seeds, candidateIDs)
+		raw = c.centralityReceipt.Scores
+		c.centralityReceipt.Scores = nil
+	} else {
+		raw = c.Centrality(seeds)
+	}
 	if len(raw) == 0 {
 		return
 	}

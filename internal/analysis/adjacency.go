@@ -75,17 +75,15 @@ func BuildAdjacencySnapshot(g graph.Store) *AdjacencySnapshot {
 		return snap
 	}
 
-	nodes := g.AllNodes()
-	if len(nodes) == 0 {
-		return snap
-	}
-
-	ids := make([]string, 0, len(nodes))
-	for _, n := range nodes {
+	ids := make([]string, 0, g.NodeCount())
+	for n := range graph.NodesLightSeq(g) {
 		if n == nil || n.ID == "" {
 			continue
 		}
 		ids = append(ids, n.ID)
+	}
+	if len(ids) == 0 {
+		return snap
 	}
 	sort.Strings(ids)
 	index := make(map[string]int, len(ids))
@@ -101,7 +99,9 @@ func BuildAdjacencySnapshot(g graph.Store) *AdjacencySnapshot {
 		w  float64
 	}
 	adj := make([][]link, len(ids))
-	for _, e := range g.AllEdges() {
+	// Meta-less kind-scoped scan (see LightEdgeScanner): the CSR build reads only
+	// e.Kind, endpoints, and graph.ProvenanceWeight.
+	for e := range graph.EdgesLightSeq(g, graph.EdgeCalls, graph.EdgeReferences) {
 		if e == nil {
 			continue
 		}

@@ -2,6 +2,7 @@ package resolver
 
 import (
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -61,6 +62,19 @@ import (
 // own attributed symbols.
 const externalCallPrefix = "external-call::"
 
+// externalCallMutationChunk caps every point-lookup map and write batch in
+// this optional pass. The SQLite scoped projection pages independently; this
+// smaller boundary also keeps the in-memory fallback from retaining an entire
+// changed repository's candidates while it synthesizes terminals.
+const externalCallMutationChunk = 512
+
+type externalCallCandidate struct {
+	edge   *graph.Edge
+	source *graph.Node
+}
+
+type externalCallCandidateSeq func(yield func(externalCallCandidate) bool)
+
 // SynthesizeExternalCalls materialises a synthetic placeholder node for
 // every call edge that lands on an un-indexed external package / sibling
 // service and retargets the edge onto it, so call-chain traversals keep
@@ -71,7 +85,7 @@ func SynthesizeExternalCalls(g graph.Store, enabled bool) int {
 	if g == nil || !enabled {
 		return 0
 	}
-	return synthesizeExternalCalls(g, func() []*graph.Edge { return externalCallCandidateEdges(g) })
+	return synthesizeExternalCalls(g, externalCallCandidateEdges(g))
 }
 
 // SynthesizeExternalCallsForFiles is the incremental counterpart of
@@ -87,7 +101,23 @@ func SynthesizeExternalCallsForFiles(g graph.Store, enabled bool, files []string
 	if g == nil || !enabled || len(files) == 0 {
 		return 0
 	}
-	return synthesizeExternalCalls(g, func() []*graph.Edge { return externalCallCandidateEdgesForFiles(g, files) })
+	return synthesizeExternalCalls(g, externalCallCandidateEdgesForFiles(g, files))
+}
+
+// SynthesizeExternalCallsForRepos is the repo-scoped counterpart used by the
+// end-of-batch global passes when only some repos re-indexed: it materialises
+// external-call nodes for the out-edges of the changed repos' symbols only, so
+// the janitor pays O(changed-repo edges) instead of a whole-graph recompute. An
+// external terminal always originates in the repo that made the call, so an
+// unchanged repo's synthesised edges (already on disk, never dropped) need no
+// re-work. The shared per-package nodes are deterministic, so a call into an
+// already-materialised package dedups onto the existing node. A no-op when
+// disabled or when no repo is in scope.
+func SynthesizeExternalCallsForRepos(g graph.Store, enabled bool, prefixes map[string]bool) int {
+	if g == nil || !enabled || len(prefixes) == 0 {
+		return 0
+	}
+	return synthesizeExternalCalls(g, externalCallCandidateEdgesForRepos(g, prefixes))
 }
 
 // synthesizeExternalCalls is the shared materialisation core. collect runs
@@ -96,10 +126,10 @@ func SynthesizeExternalCallsForFiles(g graph.Store, enabled bool, files []string
 // edges, so the returned count stays "edges terminating on a synthetic
 // node after the pass"). Each genuine external terminal gets a shared
 // per-(ecosystem, import path) node and the edge is retargeted onto it.
-func synthesizeExternalCalls(g graph.Store, collect func() []*graph.Edge) int {
+func synthesizeExternalCalls(g graph.Store, collect externalCallCandidateSeq) int {
 	// Serialise against the other graph-wide passes that mutate the
 	// graph (markTestSymbolsAndEmitEdges, ResolveTemporalCalls,
-	// reach.BuildIndex). This pass calls AddNode and ReindexEdge; a
+	// reach.BuildIndex). This pass calls AddBatch and ReindexEdges; a
 	// concurrent reader walking AllNodes / AllEdges would otherwise
 	// trip the runtime's concurrent map access check.
 	mu := g.ResolveMutex()
@@ -107,80 +137,122 @@ func synthesizeExternalCalls(g graph.Store, collect func() []*graph.Edge) int {
 	defer mu.Unlock()
 
 	synthesized := 0
-	var reindexBatch []graph.EdgeReindex
-	type candidate struct {
-		edge                  *graph.Edge
-		ecosystem, importPath string
+	type parsedCandidate struct {
+		externalCallCandidate
+		ecosystem, importPath, nodeID string
 	}
-	var candidates []candidate
-	fromIDSet := map[string]struct{}{}
-	for _, e := range collect() {
+	pending := make([]parsedCandidate, 0, externalCallMutationChunk)
+	flush := func() {
+		if len(pending) == 0 {
+			return
+		}
+
+		// Caller and synthetic-target existence checks share one deduped,
+		// bounded point lookup. Scoped SQLite rows already carry Source, so
+		// callers only enter this lookup for the global/fallback path.
+		lookupSeen := make(map[string]struct{}, len(pending)*2)
+		lookupIDs := make([]string, 0, len(pending)*2)
+		rememberLookup := func(id string) {
+			if id == "" {
+				return
+			}
+			if _, seen := lookupSeen[id]; seen {
+				return
+			}
+			lookupSeen[id] = struct{}{}
+			lookupIDs = append(lookupIDs, id)
+		}
+		for _, c := range pending {
+			if c.source == nil {
+				rememberLookup(c.edge.From)
+			}
+			rememberLookup(c.nodeID)
+		}
+		knownNodes := g.GetNodesByIDs(lookupIDs)
+
+		nodeSeen := make(map[string]struct{}, len(pending))
+		nodes := make([]*graph.Node, 0, len(pending))
+		reindexes := make([]graph.EdgeReindex, 0, len(pending))
+		for _, c := range pending {
+			e := c.edge
+			caller := c.source
+			if caller == nil {
+				caller = knownNodes[e.From]
+			}
+			callerLang := ""
+			if caller != nil && caller.Language != "" {
+				callerLang = caller.Language
+			} else {
+				callerLang = langFamilyFromExt(e.FilePath)
+			}
+			if isLanguageStdlib(callerLang, c.importPath) {
+				// Language built-in / standard library — noise. Leave the
+				// edge on its bookkeeping-string terminal.
+				continue
+			}
+
+			if knownNodes[c.nodeID] == nil {
+				if _, seen := nodeSeen[c.nodeID]; !seen {
+					nodeSeen[c.nodeID] = struct{}{}
+					nodes = append(nodes, newExternalCallNode(
+						c.nodeID, c.ecosystem, c.importPath, callerLang,
+					))
+				}
+			}
+
+			oldTo := e.To
+			e.To = c.nodeID
+			// The edge now lands on a real (synthetic) node. It is an
+			// inferred, name-only-grade binding — the import path tells us
+			// which package, never the specific callee symbol, and the
+			// synthetic node is per-package — so it rides at the weakest
+			// tier.
+			e.Origin = graph.OriginTextMatched
+			e.Confidence = 0.5
+			e.ConfidenceLabel = graph.ConfidenceLabelFor(e.Kind, e.Confidence)
+			if e.Meta == nil {
+				e.Meta = map[string]any{}
+			}
+			e.Meta["external_call"] = true
+			reindexes = append(reindexes, graph.EdgeReindex{Edge: e, OldTo: oldTo})
+		}
+		if len(nodes) > 0 {
+			g.AddBatch(nodes, nil)
+		}
+		if len(reindexes) > 0 {
+			g.ReindexEdges(reindexes)
+			synthesized += len(reindexes)
+		}
+		pending = pending[:0]
+	}
+
+	collect(func(row externalCallCandidate) bool {
+		e := row.edge
 		if e == nil {
-			continue
+			return true
 		}
 		// Already pointing at a synthetic node — a prior run landed it.
-		// Count it (the return value is "call edges terminating on a
-		// synthetic node after the pass") and leave it untouched, so
-		// re-running is a stable no-op.
+		// Count it and leave it untouched, so re-running is a stable no-op.
 		if strings.HasPrefix(e.To, externalCallPrefix) {
 			synthesized++
-			continue
+			return true
 		}
 		ecosystem, importPath, ok := parseExternalCallTarget(e.To)
 		if !ok {
-			continue
+			return true
 		}
-		candidates = append(candidates, candidate{edge: e, ecosystem: ecosystem, importPath: importPath})
-		if e.From != "" {
-			fromIDSet[e.From] = struct{}{}
+		pending = append(pending, parsedCandidate{
+			externalCallCandidate: row,
+			ecosystem:             ecosystem,
+			importPath:            importPath,
+			nodeID:                externalCallNodeID(ecosystem, importPath),
+		})
+		if len(pending) == externalCallMutationChunk {
+			flush()
 		}
-	}
-	fromList := make([]string, 0, len(fromIDSet))
-	for id := range fromIDSet {
-		fromList = append(fromList, id)
-	}
-	callerNodes := g.GetNodesByIDs(fromList)
-
-	for _, c := range candidates {
-		e := c.edge
-		callerLang := ""
-		if from := callerNodes[e.From]; from != nil && from.Language != "" {
-			callerLang = from.Language
-		} else {
-			callerLang = langFamilyFromExt(e.FilePath)
-		}
-		if isLanguageStdlib(callerLang, c.importPath) {
-			// Language built-in / standard library — noise. Leave the
-			// edge on its bookkeeping-string terminal; a stdlib hop is
-			// not a cross-system call worth a call-chain node.
-			continue
-		}
-
-		nodeID := externalCallNodeID(c.ecosystem, c.importPath)
-		if g.GetNode(nodeID) == nil {
-			g.AddNode(newExternalCallNode(nodeID, c.ecosystem, c.importPath, callerLang))
-		}
-
-		oldTo := e.To
-		e.To = nodeID
-		// The edge now lands on a real (synthetic) node. It is an
-		// inferred, name-only-grade binding — the import path tells us
-		// which package, never the specific callee symbol, and the
-		// synthetic node is per-package — so it rides at the weakest
-		// tier.
-		e.Origin = graph.OriginTextMatched
-		e.Confidence = 0.5
-		e.ConfidenceLabel = graph.ConfidenceLabelFor(e.Kind, e.Confidence)
-		if e.Meta == nil {
-			e.Meta = map[string]any{}
-		}
-		e.Meta["external_call"] = true
-		reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: e, OldTo: oldTo})
-		synthesized++
-	}
-	if len(reindexBatch) > 0 {
-		g.ReindexEdges(reindexBatch)
-	}
+		return true
+	})
+	flush()
 	return synthesized
 }
 
@@ -192,56 +264,71 @@ func synthesizeExternalCalls(g graph.Store, collect func() []*graph.Edge) int {
 // it — the disk backend then selects exactly these rows instead of
 // marshaling every call edge in the graph and filtering Go-side — and
 // falls back to the EdgesByKinds scan + prefix filter otherwise.
-func externalCallCandidateEdges(g graph.Store) []*graph.Edge {
-	if cap, ok := g.(graph.ExternalCallCandidates); ok {
-		return cap.ExternalCallCandidateEdges()
-	}
-	var out []*graph.Edge
-	for e := range edgesByKinds(g, []graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences}) {
-		if e != nil && isExternalCandidateTarget(e.To) {
-			out = append(out, e)
+func externalCallCandidateEdges(g graph.Store) externalCallCandidateSeq {
+	return func(yield func(externalCallCandidate) bool) {
+		if cap, ok := g.(graph.ExternalCallCandidates); ok {
+			for _, e := range cap.ExternalCallCandidateEdges() {
+				if e != nil && isExternalCandidateTarget(e.To) &&
+					!yield(externalCallCandidate{edge: e}) {
+					return
+				}
+			}
+			return
+		}
+		for e := range edgesByKinds(g, []graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences}) {
+			if e != nil && isExternalCandidateTarget(e.To) &&
+				!yield(externalCallCandidate{edge: e}) {
+				return
+			}
 		}
 	}
-	return out
 }
 
 // externalCallCandidateEdgesForFiles returns the external-terminal call /
 // reference out-edges originating in the given files only — the O(edited
 // files) input for incremental synthesis. Edges are gathered from the
 // out-edges of every symbol the files define.
-func externalCallCandidateEdgesForFiles(g graph.Store, files []string) []*graph.Edge {
-	idSet := make(map[string]struct{})
-	var ids []string
-	for _, f := range files {
-		for _, n := range g.GetFileNodes(f) {
-			if n == nil {
-				continue
-			}
-			if _, seen := idSet[n.ID]; seen {
-				continue
-			}
-			idSet[n.ID] = struct{}{}
-			ids = append(ids, n.ID)
+func externalCallCandidateEdgesForFiles(g graph.Store, files []string) externalCallCandidateSeq {
+	return externalCallCandidateEdgesInScope(g, nil, files)
+}
+
+// externalCallCandidateEdgesForRepos returns the external-terminal call /
+// reference out-edges originating in the given changed repos — the O(changed
+// repo) input for the end-of-batch scoped synthesis. All prefixes enter one
+// repository/kind projection, so repository count never becomes query count.
+func externalCallCandidateEdgesForRepos(g graph.Store, prefixes map[string]bool) externalCallCandidateSeq {
+	repos := make([]string, 0, len(prefixes))
+	for prefix := range prefixes {
+		if prefix != "" {
+			repos = append(repos, prefix)
 		}
 	}
-	if len(ids) == 0 {
-		return nil
-	}
-	var out []*graph.Edge
-	for _, edges := range g.GetOutEdgesByNodeIDs(ids) {
-		for _, e := range edges {
-			if e == nil {
+	sort.Strings(repos)
+	return externalCallCandidateEdgesInScope(g, repos, nil)
+}
+
+// externalCallCandidateEdgesInScope delegates file/repository ownership and
+// edge-kind predicates to the shared store projection. SQLite keyset-pages the
+// result and joins the source node; adapter stores perform one
+// GetFileNodesByPaths or one repo/kind projection, never a per-file/per-repo
+// query loop.
+func externalCallCandidateEdgesInScope(
+	g graph.Store,
+	repos, files []string,
+) externalCallCandidateSeq {
+	return func(yield func(externalCallCandidate) bool) {
+		for row := range graph.EdgesInScopeSeq(
+			g, repos, files, graph.EdgeCalls, graph.EdgeReferences,
+		) {
+			e := row.Edge
+			if e == nil || !isExternalCandidateTarget(e.To) {
 				continue
 			}
-			if e.Kind != graph.EdgeCalls && e.Kind != graph.EdgeReferences {
-				continue
-			}
-			if isExternalCandidateTarget(e.To) {
-				out = append(out, e)
+			if !yield(externalCallCandidate{edge: e, source: row.Source}) {
+				return
 			}
 		}
 	}
-	return out
 }
 
 // isExternalCandidateTarget reports whether a target string is one that

@@ -7,6 +7,29 @@ import (
 	"github.com/zzet/gortex/internal/persistence"
 )
 
+// feedbackMaxEntries bounds the in-memory feedback log. Aggregation
+// scans every entry and the store is reloaded in full on startup, so an
+// unbounded log grows the daemon's heap and slows every AggregatedStats
+// call for the life of the repo. The disk store is separately capped in
+// persistence.SaveFeedback, but that trim only runs when a cache dir is
+// configured; this cap also holds for the dir-less (embedded) manager
+// and defends against an oversized store loaded from disk. Aggregation
+// degrades gracefully — recent feedback dominates the signal, so the
+// oldest entries age out first.
+const feedbackMaxEntries = 4096
+
+// trimFeedbackEntries keeps only the newest feedbackMaxEntries entries,
+// copying into a fresh slice so the trimmed history is released rather
+// than pinned by a shared backing array.
+func trimFeedbackEntries(entries []persistence.FeedbackEntry) []persistence.FeedbackEntry {
+	if len(entries) <= feedbackMaxEntries {
+		return entries
+	}
+	trimmed := make([]persistence.FeedbackEntry, feedbackMaxEntries)
+	copy(trimmed, entries[len(entries)-feedbackMaxEntries:])
+	return trimmed
+}
+
 // feedbackManager provides thread-safe access to agent feedback data
 // and handles persistence across server restarts.
 type feedbackManager struct {
@@ -27,6 +50,7 @@ func newFeedbackManager(cacheDir, repoPath string) *feedbackManager {
 	loaded, err := persistence.LoadFeedback(dir)
 	if err == nil && loaded != nil {
 		fm.store = *loaded
+		fm.store.Entries = trimFeedbackEntries(fm.store.Entries)
 	}
 	return fm
 }
@@ -43,6 +67,7 @@ func (fm *feedbackManager) Record(entry persistence.FeedbackEntry) error {
 		entry.Keywords = keywordTokens(entry.Task)
 	}
 	fm.store.Entries = append(fm.store.Entries, entry)
+	fm.store.Entries = trimFeedbackEntries(fm.store.Entries)
 
 	if fm.dir == "" {
 		return nil

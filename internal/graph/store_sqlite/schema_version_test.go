@@ -46,10 +46,11 @@ func TestOpenStampsFreshDB(t *testing.T) {
 	}
 }
 
-// TestOpenBaselineStampsOldDBWithoutWipe: a pre-versioning store (user_version
-// 0, reconcilable to current by schemaSQL + ensureNodeColumns) is stamped in
-// place — its data must survive, not be wiped.
-func TestOpenBaselineStampsOldDBWithoutWipe(t *testing.T) {
+// TestOpenPreVersionStoreRequiresRebuild: once a rebuild boundary ships, an
+// existing user_version=0 graph cannot be confused with a brand-new empty DB.
+// The default open preserves it and returns ErrSchemaRebuildRequired; the
+// exclusive daemon path wipes it and reports NeedsRebuild.
+func TestOpenPreVersionStoreRequiresRebuild(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "store.sqlite")
 
 	// Create the store, then simulate a pre-versioning DB: a row + user_version 0.
@@ -69,16 +70,25 @@ func TestOpenBaselineStampsOldDBWithoutWipe(t *testing.T) {
 		}
 	})
 
-	s2, err := Open(path)
+	if _, err := Open(path); !errors.Is(err, ErrSchemaRebuildRequired) {
+		t.Fatalf("reopen old DB error = %v, want ErrSchemaRebuildRequired", err)
+	}
+	withRawDB(t, path, func(db *sql.DB) {
+		if n := nodeCount(t, db); n != 1 {
+			t.Fatalf("refused rebuild changed node count to %d, want 1", n)
+		}
+	})
+
+	s2, err := Open(path, WithRebuild())
 	if err != nil {
-		t.Fatalf("reopen old DB: %v", err)
+		t.Fatalf("exclusive rebuild: %v", err)
 	}
 	defer s2.Close()
-	if v, _ := readUserVersion(s2.db); v != currentSchemaVersion {
-		t.Fatalf("user_version after baseline = %d, want %d", v, currentSchemaVersion)
+	if !s2.NeedsRebuild() {
+		t.Fatal("rebuilt pre-version store did not report NeedsRebuild")
 	}
-	if n := nodeCount(t, s2.db); n != 1 {
-		t.Fatalf("node count after baseline = %d, want 1 (data must NOT be wiped)", n)
+	if n := nodeCount(t, s2.db); n != 0 {
+		t.Fatalf("node count after integrity rebuild = %d, want 0", n)
 	}
 }
 
@@ -129,7 +139,7 @@ func TestOpenRefusesWipeWithoutOptIn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first open: %v", err)
 	}
-	if _, err := s.db.Exec(`INSERT INTO nodes (id, kind, name, file_path) VALUES ('n1','func','Foo','f.go')`); err != nil {
+	if _, err := s.writerDB.Exec(`INSERT INTO nodes (id, kind, name, file_path) VALUES ('n1','func','Foo','f.go')`); err != nil {
 		t.Fatalf("seed node: %v", err)
 	}
 	if err := s.Close(); err != nil {
@@ -175,7 +185,8 @@ func TestPlanSchemaMigration(t *testing.T) {
 		{"up to date", 1, 1, nil, false, false, 0},
 		{"fresh at v1 baseline-stamps", 0, 1, nil, false, true, 0},
 		{"newer DB rebuilds", 2, 1, nil, true, true, 0},
-		{"v0 skipping a later migration rebuilds", 0, 2, []schemaMigration{inPlace}, true, true, 0},
+		{"v0 with only in-place pending upgrades in place, no wipe", 0, 2, []schemaMigration{inPlace}, false, true, 1},
+		{"v0 with a pending rebuild wipes", 0, 2, []schemaMigration{rebuild}, true, true, 0},
 		{"v1->v2 in-place", 1, 2, []schemaMigration{inPlace}, false, true, 1},
 		{"v1->v2 rebuild", 1, 2, []schemaMigration{rebuild}, true, true, 0},
 	}
@@ -187,6 +198,52 @@ func TestPlanSchemaMigration(t *testing.T) {
 					c.stored, c.current, got.wipe, got.stamp, len(got.inPlace), c.wantWipe, c.wantStamp, c.wantInPlace)
 			}
 		})
+	}
+}
+
+func TestOpenV2RequiresTopologyIntegrityRebuild(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.sqlite")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("first open: %v", err)
+	}
+	if _, err := s.writerDB.Exec(`INSERT INTO nodes (id, kind, name, file_path) VALUES ('n1','func','Foo','f.go')`); err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	withRawDB(t, path, func(db *sql.DB) {
+		if _, err := db.Exec(`PRAGMA user_version = 2`); err != nil {
+			t.Fatalf("set v2: %v", err)
+		}
+	})
+
+	if _, err := Open(path); !errors.Is(err, ErrSchemaRebuildRequired) {
+		t.Fatalf("default v2 open error = %v, want ErrSchemaRebuildRequired", err)
+	}
+	withRawDB(t, path, func(db *sql.DB) {
+		if v, err := readUserVersion(db); err != nil || v != 2 {
+			t.Fatalf("refused v2 version = %d (err %v), want 2", v, err)
+		}
+		if n := nodeCount(t, db); n != 1 {
+			t.Fatalf("refused v2 rebuild changed node count to %d, want 1", n)
+		}
+	})
+
+	rebuilt, err := Open(path, WithRebuild())
+	if err != nil {
+		t.Fatalf("exclusive v2 rebuild: %v", err)
+	}
+	defer rebuilt.Close()
+	if !rebuilt.NeedsRebuild() {
+		t.Fatal("v2 integrity rebuild did not report NeedsRebuild")
+	}
+	if v, err := readUserVersion(rebuilt.db); err != nil || v != currentSchemaVersion {
+		t.Fatalf("rebuilt version = %d (err %v), want %d", v, err, currentSchemaVersion)
+	}
+	if n := nodeCount(t, rebuilt.db); n != 0 {
+		t.Fatalf("rebuilt v2 node count = %d, want 0", n)
 	}
 }
 
@@ -262,7 +319,7 @@ func TestOpenAtCurrentVersionIsNoOp(t *testing.T) {
 			t.Fatalf("seed node: %v", err)
 		}
 	}
-	withRawSeed(s.db)
+	withRawSeed(s.writerDB)
 	if err := s.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
@@ -291,17 +348,24 @@ func TestOpenAtCurrentVersionIsNoOp(t *testing.T) {
 func TestOpenWithInPlaceMigration(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "store.sqlite")
 
-	// Create a v1 store with a row, then close.
+	// Create a store with a row, then knock it back to the v1 baseline so the
+	// openWith below drives the v1->v2 in-place arm (a fresh Open now stamps the
+	// current version, which is >= 2).
 	s, err := Open(path)
 	if err != nil {
 		t.Fatalf("first open: %v", err)
 	}
-	if _, err := s.db.Exec(`INSERT INTO nodes (id, kind, name, file_path) VALUES ('n1','func','Foo','f.go')`); err != nil {
+	if _, err := s.writerDB.Exec(`INSERT INTO nodes (id, kind, name, file_path) VALUES ('n1','func','Foo','f.go')`); err != nil {
 		t.Fatalf("seed node: %v", err)
 	}
 	if err := s.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
+	withRawDB(t, path, func(db *sql.DB) {
+		if _, err := db.Exec(`PRAGMA user_version = 1`); err != nil {
+			t.Fatalf("reset to v1 baseline: %v", err)
+		}
+	})
 
 	// An in-place v2 step that depends on the base schema (an index on a
 	// nodes column) — proving it runs after schemaSQL/ensureNodeColumns.
@@ -340,13 +404,20 @@ func TestOpenWithInPlaceMigration(t *testing.T) {
 // retries the upgrade rather than treating it as done.
 func TestOpenWithInPlaceFailureDoesNotStamp(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "store.sqlite")
-	s, err := Open(path) // v1 store
+	s, err := Open(path)
 	if err != nil {
 		t.Fatalf("first open: %v", err)
 	}
 	if err := s.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
+	// A fresh Open now stamps the current version (>= 2); knock it back to the
+	// v1 baseline so openWith drives the v1->v2 arm and the failing step runs.
+	withRawDB(t, path, func(db *sql.DB) {
+		if _, err := db.Exec(`PRAGMA user_version = 1`); err != nil {
+			t.Fatalf("reset to v1 baseline: %v", err)
+		}
+	})
 
 	boom := schemaMigration{version: 2, name: "boom", inPlace: func(*sql.Tx) error {
 		return sql.ErrConnDone
@@ -437,5 +508,312 @@ func TestSchemaMigrationsWellFormed(t *testing.T) {
 		if err := validateSchemaMigrations(c.current, c.migs); err == nil {
 			t.Errorf("%s: expected a validation error, got nil", c.name)
 		}
+	}
+}
+
+func TestOpenV5CompactsResolverEdgeIndexesInPlace(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "resolver-index-v5.sqlite")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("create current store: %v", err)
+	}
+	if _, err := s.writerDB.Exec(`INSERT INTO nodes (id, kind, name, file_path) VALUES
+		('source', 'function', 'source', 'a.go'),
+		('target', 'function', 'target', 'b.go')`); err != nil {
+		t.Fatalf("seed nodes: %v", err)
+	}
+	if _, err := s.writerDB.Exec(`INSERT INTO edges (from_id, to_id, kind, file_path, line) VALUES
+		('source', 'unresolved::target', 'calls', 'a.go', 1),
+		('source', 'target', 'calls', 'a.go', 2)`); err != nil {
+		t.Fatalf("seed edges: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close seed store: %v", err)
+	}
+
+	// Recreate the v5 shapes: one dense Boolean frontier index plus the
+	// one-shot global Go receiver index. The v6 migration must replace/drop
+	// them without wiping graph rows.
+	withRawDB(t, path, func(db *sql.DB) {
+		if _, err := db.Exec(`DROP INDEX IF EXISTS edges_by_unresolved`); err != nil {
+			t.Fatalf("drop current unresolved index: %v", err)
+		}
+		if _, err := db.Exec(`CREATE INDEX edges_by_unresolved ON edges(is_unresolved)`); err != nil {
+			t.Fatalf("create v5 dense unresolved index: %v", err)
+		}
+		if _, err := db.Exec(`CREATE INDEX edges_go_member_receiver ON edges(member_receiver_dir, member_receiver, from_id, to_id, id) WHERE kind = 'member_of' AND member_receiver IS NOT NULL AND member_receiver_dir IS NOT NULL`); err != nil {
+			t.Fatalf("create v5 receiver index: %v", err)
+		}
+		if _, err := db.Exec(`PRAGMA user_version = 5`); err != nil {
+			t.Fatalf("stamp v5: %v", err)
+		}
+	})
+
+	assertCompacted := func(store *Store) {
+		t.Helper()
+		if store.NeedsRebuild() {
+			t.Fatal("mechanical v5 index migration unexpectedly requested a rebuild")
+		}
+		var partial int
+		if err := store.db.QueryRow(`SELECT partial FROM pragma_index_list('edges') WHERE name = 'edges_by_unresolved'`).Scan(&partial); err != nil || partial != 1 {
+			t.Fatalf("edges_by_unresolved partial=%d err=%v, want 1,nil", partial, err)
+		}
+		var ddl string
+		if err := store.db.QueryRow(`SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'edges_by_unresolved'`).Scan(&ddl); err != nil {
+			t.Fatalf("read unresolved index DDL: %v", err)
+		}
+		if !strings.Contains(strings.ToLower(ddl), "where is_unresolved = 1") {
+			t.Fatalf("unresolved index is not frontier-partial: %s", ddl)
+		}
+		var obsolete, edges int
+		if err := store.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'edges_go_member_receiver'`).Scan(&obsolete); err != nil || obsolete != 0 {
+			t.Fatalf("obsolete receiver index count=%d err=%v, want 0,nil", obsolete, err)
+		}
+		if err := store.db.QueryRow(`SELECT COUNT(*) FROM edges`).Scan(&edges); err != nil || edges != 2 {
+			t.Fatalf("edge count after in-place migration=%d err=%v, want 2,nil", edges, err)
+		}
+		plan := strings.ToLower(queryPlan(t, store, `SELECT id FROM edges WHERE id > ? AND is_unresolved = 1 ORDER BY id`, 0))
+		if !strings.Contains(plan, "edges_by_unresolved") || strings.Contains(plan, "scan edges") {
+			t.Fatalf("partial unresolved query plan is not indexed:\n%s", plan)
+		}
+	}
+
+	s, err = Open(path)
+	if err != nil {
+		t.Fatalf("migrate v5 store: %v", err)
+	}
+	assertCompacted(s)
+	if v, err := readUserVersion(s.db); err != nil || v != currentSchemaVersion {
+		t.Fatalf("migrated user_version=%d err=%v, want %d,nil", v, err, currentSchemaVersion)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close migrated store: %v", err)
+	}
+
+	// A normal warm reopen must preserve the compact shape and data without
+	// repeating or undoing the migration.
+	s, err = Open(path)
+	if err != nil {
+		t.Fatalf("warm reopen migrated store: %v", err)
+	}
+	defer s.Close()
+	assertCompacted(s)
+}
+
+func TestOpenBackfillsSyntheticNodeRepoPrefixes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.sqlite")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("first open: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	withRawDB(t, path, func(db *sql.DB) {
+		rows := []string{
+			"repo-a::module::go:net/http",
+			"repo-a::stdlib::net/http::Get",
+			"repo-b::builtin::len",
+			"repo-b::external_call::example.com/pkg::Run",
+			"dep::example.com/shared::Run",
+			"external::example.com/shared::Run",
+			"module::go:shared",
+			"ordinary::node",
+		}
+		for _, id := range rows {
+			if _, err := db.Exec(`INSERT INTO nodes (id, kind, name, file_path, repo_prefix) VALUES (?, 'function', ?, '', '')`, id, id); err != nil {
+				t.Fatalf("seed %q: %v", id, err)
+			}
+		}
+		if _, err := db.Exec(`PRAGMA user_version = 4`); err != nil {
+			t.Fatalf("reset user_version: %v", err)
+		}
+	})
+
+	s, err = Open(path)
+	if err != nil {
+		t.Fatalf("open v4 store: %v", err)
+	}
+	defer s.Close()
+
+	want := map[string]string{
+		"repo-a::module::go:net/http":                 "repo-a",
+		"repo-a::stdlib::net/http::Get":               "repo-a",
+		"repo-b::builtin::len":                        "repo-b",
+		"repo-b::external_call::example.com/pkg::Run": "repo-b",
+		"dep::example.com/shared::Run":                "",
+		"external::example.com/shared::Run":           "",
+		"module::go:shared":                           "",
+		"ordinary::node":                              "",
+	}
+	rows, err := s.db.Query(`SELECT id, repo_prefix FROM nodes`)
+	if err != nil {
+		t.Fatalf("query migrated rows: %v", err)
+	}
+	defer rows.Close()
+	seen := make(map[string]string, len(want))
+	for rows.Next() {
+		var id, repo string
+		if err := rows.Scan(&id, &repo); err != nil {
+			t.Fatalf("scan migrated row: %v", err)
+		}
+		seen[id] = repo
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate migrated rows: %v", err)
+	}
+	for id, wantRepo := range want {
+		if got := seen[id]; got != wantRepo {
+			t.Errorf("repo_prefix for %q = %q, want %q", id, got, wantRepo)
+		}
+	}
+	if v, err := readUserVersion(s.db); err != nil || v != currentSchemaVersion {
+		t.Fatalf("user_version = %d (err %v), want %d", v, err, currentSchemaVersion)
+	}
+}
+
+func TestOpenV4AddsCloneCorpusProjectionInPlace(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.sqlite")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatalf("first open: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	withRawDB(t, path, func(db *sql.DB) {
+		if _, err := db.Exec(`DROP INDEX IF EXISTS clone_shingles_by_repo`); err != nil {
+			t.Fatalf("drop clone index: %v", err)
+		}
+		if _, err := db.Exec(`DROP TABLE clone_shingles`); err != nil {
+			t.Fatalf("drop clone table: %v", err)
+		}
+		if _, err := db.Exec(`CREATE TABLE clone_shingles (
+node_id TEXT PRIMARY KEY, repo_prefix TEXT NOT NULL DEFAULT '', shingles BLOB
+) WITHOUT ROWID`); err != nil {
+			t.Fatalf("create v4 clone table: %v", err)
+		}
+		if _, err := db.Exec(`INSERT INTO clone_shingles(node_id, repo_prefix, shingles) VALUES ('repo::f', 'repo', X'0100000000000000')`); err != nil {
+			t.Fatalf("seed v4 clone row: %v", err)
+		}
+		if _, err := db.Exec(`PRAGMA user_version = 4`); err != nil {
+			t.Fatalf("set v4: %v", err)
+		}
+	})
+
+	store, err = Open(path)
+	if err != nil {
+		t.Fatalf("open v4 store: %v", err)
+	}
+	defer store.Close()
+	page, err := store.CloneCorpusPage("repo", "", 10)
+	if err != nil {
+		t.Fatalf("read migrated clone projection: %v", err)
+	}
+	if len(page) != 1 || page[0].NodeID != "repo::f" || len(page[0].Shingles) != 1 || page[0].Shingles[0] != 1 {
+		t.Fatalf("migrated clone row = %#v, want preserved v4 shingle row", page)
+	}
+	if page[0].Finalized || page[0].TokenCount != 0 {
+		t.Fatalf("migrated clone defaults = finalized:%v tokens:%d, want pending/0", page[0].Finalized, page[0].TokenCount)
+	}
+	var indexCount int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='clone_shingles_by_repo'`).Scan(&indexCount); err != nil {
+		t.Fatalf("query clone repo index: %v", err)
+	}
+	if indexCount != 1 {
+		t.Fatalf("clone repo index count = %d, want 1", indexCount)
+	}
+}
+
+// TestOpenDedupesFnValuePlaceholders drives the shipped v2 migration through the
+// real Open composition: a store knocked back to the v1 baseline with duplicate
+// fn-value placeholder edges is deduped in place on reopen — one survivor per
+// (from_id, to_id), the MIN(id) row kept — while a distinct placeholder, a
+// resolved edge, and an ordinary unresolved stub are untouched, and the version
+// stamps to current. Covers both the bare and the multi-repo COPY-rewrite form.
+func TestOpenDedupesFnValuePlaceholders(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.sqlite")
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("first open: %v", err)
+	}
+	// Seed edges by explicit id so the MIN(id) survivors are predictable. The
+	// is_unresolved column is generated, so it is omitted from the INSERT.
+	ins := `INSERT INTO edges (id, from_id, to_id, kind, file_path, line) VALUES (?,?,?,?,?,?)`
+	seed := []struct {
+		id       int
+		from, to string
+		kind     string
+		line     int
+	}{
+		// Duplicate bare placeholders: same (from,to), distinct lines. Keep id 1.
+		{1, "a", "unresolved::fnvalue::handler", "references", 10},
+		{2, "a", "unresolved::fnvalue::handler", "references", 20},
+		{3, "a", "unresolved::fnvalue::handler", "references", 30},
+		// A distinct placeholder (different name) — must survive untouched.
+		{4, "a", "unresolved::fnvalue::other", "references", 10},
+		// Duplicate multi-repo COPY-rewrite placeholders — exercises the
+		// is_unresolved infix branch of the migration. Keep id 5.
+		{5, "b", "r::unresolved::fnvalue::handler", "references", 10},
+		{6, "b", "r::unresolved::fnvalue::handler", "references", 20},
+		// A resolved edge and an ordinary unresolved stub — never touched.
+		{7, "a", "b", "calls", 1},
+		{8, "a", "unresolved::Foo", "calls", 1},
+	}
+	for _, r := range seed {
+		if _, err := s.writerDB.Exec(ins, r.id, r.from, r.to, r.kind, "f.go", r.line); err != nil {
+			t.Fatalf("seed edge %d: %v", r.id, err)
+		}
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	// Knock the store back to the v1 baseline so the reopen runs the v2 dedup.
+	withRawDB(t, path, func(db *sql.DB) {
+		if _, err := db.Exec(`PRAGMA user_version = 1`); err != nil {
+			t.Fatalf("reset to v1 baseline: %v", err)
+		}
+	})
+
+	// Exercise the historical v1->v2 in-place migration in isolation. The
+	// shipped v3 boundary intentionally rebuilds every v2-or-older graph.
+	s2, err := openWith(path, 2, schemaMigrations[:1], false)
+	if err != nil {
+		t.Fatalf("reopen for dedup: %v", err)
+	}
+	defer s2.Close()
+
+	if v, _ := readUserVersion(s2.db); v != 2 {
+		t.Fatalf("user_version after dedup = %d, want 2", v)
+	}
+
+	present := func(id int) bool {
+		var n int
+		if err := s2.db.QueryRow(`SELECT COUNT(*) FROM edges WHERE id = ?`, id).Scan(&n); err != nil {
+			t.Fatalf("count id %d: %v", id, err)
+		}
+		return n == 1
+	}
+	// Bare-form dedup keeps the MIN(id) survivor and drops the rest.
+	if !present(1) || present(2) || present(3) {
+		t.Fatalf("bare dedup wrong: want keep 1 / drop 2,3; got 1=%v 2=%v 3=%v", present(1), present(2), present(3))
+	}
+	// A distinct placeholder pair survives.
+	if !present(4) {
+		t.Fatal("distinct fn-value placeholder (id 4) was wrongly deleted")
+	}
+	// Multi-repo infix dedup keeps the MIN(id) survivor and drops the rest.
+	if !present(5) || present(6) {
+		t.Fatalf("multi-repo dedup wrong: want keep 5 / drop 6; got 5=%v 6=%v", present(5), present(6))
+	}
+	// A resolved edge and an ordinary unresolved stub must be untouched.
+	if !present(7) {
+		t.Fatal("resolved edge (id 7) must survive the placeholder dedup")
+	}
+	if !present(8) {
+		t.Fatal("ordinary unresolved stub (id 8) must survive the placeholder dedup")
 	}
 }

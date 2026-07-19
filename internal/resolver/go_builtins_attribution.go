@@ -1,6 +1,7 @@
 package resolver
 
 import (
+	"sort"
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -37,6 +38,24 @@ var goBuiltinConsts = map[string]struct{}{
 	"true": {}, "false": {}, "iota": {}, "nil": {},
 }
 
+// goBuiltinUnresolvedTargets is the finite target set this pass can ever
+// rewrite. Keeping it sorted makes resolution and tests deterministic while
+// allowing disk stores to answer the whole pass through one indexed IN query.
+var goBuiltinUnresolvedTargets = func() []string {
+	targets := make([]string, 0, len(goBuiltinFuncs)+len(goBuiltinTypes)+len(goBuiltinConsts))
+	for name := range goBuiltinFuncs {
+		targets = append(targets, "unresolved::"+name)
+	}
+	for name := range goBuiltinTypes {
+		targets = append(targets, "unresolved::"+name)
+	}
+	for name := range goBuiltinConsts {
+		targets = append(targets, "unresolved::"+name)
+	}
+	sort.Strings(targets)
+	return targets
+}()
+
 // attributeGoBuiltins rewrites `unresolved::<name>` edges whose name
 // is a Go language intrinsic onto the canonical `builtin::go::*` ID,
 // and materialises a single KindBuiltin node per unique builtin so
@@ -58,39 +77,38 @@ var goBuiltinConsts = map[string]struct{}{
 // biggest and the shorter ID is what most downstream `find_usages`
 // queries will type.
 func (r *Resolver) attributeGoBuiltins() {
-	// Go-only pass: skip the multi-kind edge scan entirely when the graph
-	// has no Go nodes (e.g. a TS/Python repo).
+	// Go-only pass: skip the scan entirely when the graph has no Go nodes
+	// (e.g. a TS/Python repo).
 	if !r.graphHasLanguage("go") {
 		return
 	}
-	materialised := map[string]struct{}{}
-	var batch []graph.EdgeReindex
+	var candidates []*graph.Edge
 
-	// Every edge kind a builtin can be the target of. Type-system
-	// edges (typed_as / returns) carry type references; call /
-	// arg-of / value-flow carry function or const references.
-	for _, k := range []graph.EdgeKind{
-		graph.EdgeCalls,
-		graph.EdgeReferences,
-		graph.EdgeReads,
-		graph.EdgeArgOf,
-		graph.EdgeValueFlow,
-		graph.EdgeReturnsTo,
-		graph.EdgeTypedAs,
-		graph.EdgeReturns,
-		graph.EdgeInstantiates,
-		graph.EdgeCaptures,
-		graph.EdgeThrows,
-	} {
-		for e := range r.graph.EdgesByKind(k) {
-			if old := r.tryAttributeGoBuiltin(e, materialised); old != "" {
-				batch = append(batch, graph.EdgeReindex{Edge: e, OldTo: old})
-			}
-		}
+	// The pass can only act on the finite bare builtin target set. Batch those
+	// exact target IDs through the store's to_id index instead of decoding the
+	// graph's entire unresolved slice and discarding nearly every row.
+	byTarget := r.graph.GetInEdgesByNodeIDs(goBuiltinUnresolvedTargets)
+	for _, target := range goBuiltinUnresolvedTargets {
+		candidates = append(candidates, byTarget[target]...)
 	}
-	if len(batch) > 0 {
-		r.graph.ReindexEdges(batch)
-	}
+	r.attributeGoBuiltinCandidates(candidates)
+}
+
+// attributeGoBuiltinCandidateKinds is every edge kind a builtin can be the
+// target of. Type-system edges (typed_as / returns) carry type references;
+// call / arg-of / value-flow carry function or const references.
+var attributeGoBuiltinCandidateKinds = map[graph.EdgeKind]struct{}{
+	graph.EdgeCalls:        {},
+	graph.EdgeReferences:   {},
+	graph.EdgeReads:        {},
+	graph.EdgeArgOf:        {},
+	graph.EdgeValueFlow:    {},
+	graph.EdgeReturnsTo:    {},
+	graph.EdgeTypedAs:      {},
+	graph.EdgeReturns:      {},
+	graph.EdgeInstantiates: {},
+	graph.EdgeCaptures:     {},
+	graph.EdgeThrows:       {},
 }
 
 // attributeGoBuiltinsForFile is the single-file scope of attributeGoBuiltins:
@@ -102,12 +120,49 @@ func (r *Resolver) attributeGoBuiltinsForFile(filePath string) {
 	if !r.graphHasLanguage("go") {
 		return
 	}
-	materialised := map[string]struct{}{}
-	var batch []graph.EdgeReindex
-	for _, e := range r.fileOutEdges(filePath) {
-		if old := r.tryAttributeGoBuiltin(e, materialised); old != "" {
+	r.attributeGoBuiltinCandidates(r.fileOutEdges(filePath))
+}
+
+// attributeGoBuiltinCandidates resolves a set of possible builtin edges with
+// one batched source-node read, one batched node write, and one batched edge
+// rewrite. The source batch includes enclosing owners for IDs whose path does
+// not directly reveal the language, avoiding a node lookup per edge when the
+// resolver cache has not been warmed on cold or partial paths.
+func (r *Resolver) attributeGoBuiltinCandidates(candidates []*graph.Edge) {
+	if len(candidates) == 0 {
+		return
+	}
+	ids := make(map[string]struct{}, len(candidates)*2)
+	for _, e := range candidates {
+		if e == nil {
+			continue
+		}
+		if e.From != "" {
+			ids[e.From] = struct{}{}
+		}
+		if owner := enclosingFunctionForBinding(e.From); owner != "" {
+			ids[owner] = struct{}{}
+		}
+	}
+	idList := make([]string, 0, len(ids))
+	for id := range ids {
+		idList = append(idList, id)
+	}
+	sourceNodes := r.graph.GetNodesByIDs(idList)
+
+	materialised := make(map[string]*graph.Node)
+	batch := make([]graph.EdgeReindex, 0, len(candidates))
+	for _, e := range candidates {
+		if old := tryAttributeGoBuiltin(e, sourceNodes, materialised); old != "" {
 			batch = append(batch, graph.EdgeReindex{Edge: e, OldTo: old})
 		}
+	}
+	if len(materialised) > 0 {
+		nodes := make([]*graph.Node, 0, len(materialised))
+		for _, n := range materialised {
+			nodes = append(nodes, n)
+		}
+		r.graph.AddBatch(nodes, nil)
 	}
 	if len(batch) > 0 {
 		r.graph.ReindexEdges(batch)
@@ -120,12 +175,24 @@ func (r *Resolver) attributeGoBuiltinsForFile(filePath string) {
 // the target node (once per unique ID), rewrites e.To, and returns
 // the old To value for the batched reindex. Returns "" when the edge
 // is left alone.
-func (r *Resolver) tryAttributeGoBuiltin(e *graph.Edge, materialised map[string]struct{}) string {
+func tryAttributeGoBuiltin(e *graph.Edge, sourceNodes map[string]*graph.Node, materialised map[string]*graph.Node) string {
 	if e == nil || !strings.HasPrefix(e.To, "unresolved::") {
+		return ""
+	}
+	if _, ok := attributeGoBuiltinCandidateKinds[e.Kind]; !ok {
 		return ""
 	}
 	name := strings.TrimPrefix(e.To, "unresolved::")
 	if name == "" || strings.ContainsAny(name, ".*:#") {
+		return ""
+	}
+	// Cheap membership check first: three small map lookups, no graph
+	// access. Only ~2% of candidate names are ever a Go builtin in
+	// practice, so rejecting the rest here — before the language-origin
+	// check and the repo-prefix lookup below, both of which can fall back
+	// to a graph node lookup — avoids paying for either on the ~98% that
+	// were always going to return "" anyway.
+	if !isGoBuiltinName(name) {
 		return ""
 	}
 	// Only attribute when the source is Go. Without this guard a
@@ -136,32 +203,57 @@ func (r *Resolver) tryAttributeGoBuiltin(e *graph.Edge, materialised map[string]
 	// extension: a `.go` file's `append` / `make` / `len` argument is the Go
 	// builtin regardless of whether the argument side ever bound to a node.
 	// (langFromFilePath only classifies js/ts/py, so a `.go` suffix test is
-	// the right check here.)
-	if !r.fromIsGo(e.From) && !strings.HasSuffix(e.FilePath, ".go") {
+	// the right check here.) e.FilePath is a free struct-field read while
+	// fromIsGo's fallback path can hit a node lookup, so try FilePath
+	// first — De Morgan's / && being commutative means this is the exact
+	// same condition, just evaluated in the cheaper order.
+	if !strings.HasSuffix(e.FilePath, ".go") && !sourceIsGo(e.From, sourceNodes) {
 		return ""
 	}
-	newID, kind, builtinKind := goBuiltinTarget(r.callerRepoPrefix(e), name)
+	repoPrefix := ""
+	if fromNode := sourceNodes[e.From]; fromNode != nil {
+		repoPrefix = fromNode.RepoPrefix
+	} else if owner := sourceNodes[enclosingFunctionForBinding(e.From)]; owner != nil {
+		repoPrefix = owner.RepoPrefix
+	}
+	newID, kind, builtinKind := goBuiltinTarget(repoPrefix, name)
 	if newID == "" {
 		return ""
 	}
 	if _, ok := materialised[newID]; !ok {
-		// AddNode is idempotent on ID, so even a second
-		// concurrent pass would not duplicate the row.
-		r.graph.AddNode(&graph.Node{
-			ID:       newID,
-			Kind:     kind,
-			Name:     name,
-			Language: "go",
+		materialised[newID] = &graph.Node{
+			ID:         newID,
+			Kind:       kind,
+			Name:       name,
+			Language:   "go",
+			RepoPrefix: repoPrefix,
 			Meta: map[string]any{
 				"builtin":      true,
 				"builtin_kind": builtinKind,
 			},
-		})
-		materialised[newID] = struct{}{}
+		}
 	}
 	oldTo := e.To
 	e.To = newID
 	return oldTo
+}
+
+// isGoBuiltinName reports whether name is in any of the three builtin
+// namespaces, without needing a repo prefix — the cheap pre-check
+// tryAttributeGoBuiltin runs before the (potentially graph-lookup-backed)
+// language-origin check and repo-prefix resolution. Mirrors goBuiltinTarget's
+// own membership tests exactly; kept as a separate, repo-prefix-free
+// function so the common "not a builtin" case never has to compute
+// anything else first.
+func isGoBuiltinName(name string) bool {
+	if _, ok := goBuiltinFuncs[name]; ok {
+		return true
+	}
+	if _, ok := goBuiltinTypes[name]; ok {
+		return true
+	}
+	_, ok := goBuiltinConsts[name]
+	return ok
 }
 
 // goBuiltinTarget classifies a bare identifier as one of Go's
@@ -172,7 +264,9 @@ func (r *Resolver) tryAttributeGoBuiltin(e *graph.Edge, materialised map[string]
 // recording which subspace (func / type / const) it belongs to.
 // Returns ("", "", "") when the name is not a Go builtin.
 // repoPrefix is the owning repo's RepoPrefix (empty in
-// single-repo / legacy callers).
+// single-repo / legacy callers). Callers on the tryAttributeGoBuiltin path
+// have already confirmed isGoBuiltinName(name) before calling this, so the
+// repeated map lookups here run only on the small matching subset.
 func goBuiltinTarget(repoPrefix, name string) (id string, kind graph.NodeKind, builtinKind string) {
 	if _, ok := goBuiltinFuncs[name]; ok {
 		return graph.StubID(repoPrefix, graph.StubKindBuiltin, "go", name), graph.KindBuiltin, "func"
@@ -191,7 +285,7 @@ func goBuiltinTarget(repoPrefix, name string) (id string, kind graph.NodeKind, b
 // suffix-stripping helper bare-name binding uses) — Go is the only
 // language whose IDs follow the `file.go::Func` convention with a
 // `.go` extension, so a path-based check is both cheap and reliable.
-func (r *Resolver) fromIsGo(fromID string) bool {
+func sourceIsGo(fromID string, sourceNodes map[string]*graph.Node) bool {
 	owner := enclosingFunctionForBinding(fromID)
 	if owner == "" {
 		return false
@@ -206,7 +300,7 @@ func (r *Resolver) fromIsGo(fromID string) bool {
 	// Fall back to looking up the owner node and checking its
 	// Language. More expensive but covers edge cases where the ID
 	// doesn't follow the `.go::Func` pattern.
-	if n := r.cachedGetNode(owner); n != nil && n.Language == "go" {
+	if n := sourceNodes[owner]; n != nil && n.Language == "go" {
 		return true
 	}
 	return false

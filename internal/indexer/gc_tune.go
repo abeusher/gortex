@@ -1,13 +1,18 @@
 package indexer
 
 import (
+	"math"
 	"os"
+	"runtime"
 	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"go.uber.org/zap"
+
+	"github.com/zzet/gortex/internal/runtimeactivity"
 )
 
 // Cold-index GC tuning.
@@ -103,6 +108,21 @@ func indexMemoryBudget(hostRAM, cgroupLimit uint64) int64 {
 		return 0
 	}
 	return budget
+}
+
+// boundedIndexMemoryBudget prevents the cold-index window from weakening an
+// already-lower process memory limit (the daemon standing limit or GOMEMLIMIT).
+// A non-positive calculated budget means "leave the runtime untouched". The
+// runtime's default effectively-unbounded MaxInt64 value naturally selects the
+// calculated budget, while a configured lower ceiling is preserved exactly.
+func boundedIndexMemoryBudget(calculated, current int64) int64 {
+	if calculated <= 0 {
+		return 0
+	}
+	if current > 0 && current < calculated {
+		return current
+	}
+	return calculated
 }
 
 // cgroupMemoryLimit returns the active cgroup memory ceiling in bytes, or 0
@@ -288,8 +308,27 @@ var (
 	gcTuneMu      sync.Mutex
 	gcTuneDepth   int
 	gcTunePrevPct int
+	gcTunePctSet  bool
 	gcTunePrevLim int64
 )
+
+// shouldRaiseGCPercent decides whether the cold-index window may relax the
+// GC percent (fewer, larger cycles). Relaxed pacing is only safe when the
+// effective memory limit gives the window its own calculated budget: under a
+// clamped ceiling (an operator GOMEMLIMIT or standing limit below the window
+// budget) a raised percent hands pacing to the soft limit, and the burst
+// degrades into back-to-back assist/mark storms at the ceiling. calculated<=0
+// means no sane budget could be derived — treat the limit as authoritative
+// only when one is actually installed.
+func shouldRaiseGCPercent(calculated, installed int64) bool {
+	if installed <= 0 {
+		return true
+	}
+	if calculated <= 0 {
+		return false
+	}
+	return installed >= calculated
+}
 
 // applyIndexGCTuning installs the cold-index GC knobs and returns a closure
 // that restores the prior settings. Defer the returned closure; it reverts at
@@ -309,17 +348,32 @@ func applyIndexGCTuning(logger *zap.Logger) func() {
 
 	gcTuneMu.Lock()
 	if gcTuneDepth == 0 {
-		// SetGCPercent returns the prior percent; SetMemoryLimit(-1) reads the
-		// current limit without changing it. Capture both before mutating so
-		// the restore is exact.
-		gcTunePrevPct = debug.SetGCPercent(gcPct)
+		// SetMemoryLimit(-1) reads the current limit without changing it.
+		// Capture it before mutating so the restore is exact.
+		calculated := budget
 		gcTunePrevLim = debug.SetMemoryLimit(-1)
+		if ColdIndexMemoryLimitRaiseAllowed() {
+			budget = raisedIndexMemoryBudget(budget, gcTunePrevLim)
+		} else {
+			budget = boundedIndexMemoryBudget(budget, gcTunePrevLim)
+		}
+		installed := gcTunePrevLim
 		if budget > 0 {
 			debug.SetMemoryLimit(budget)
+			installed = budget
+		}
+		// Relax the GC percent only when the window got its own budget: with
+		// the limit clamped below it, the runtime's default percent keeps
+		// live-heap pacing meaningful under the ceiling instead of letting
+		// the soft limit drive continuous assist storms.
+		gcTunePctSet = shouldRaiseGCPercent(calculated, installed)
+		if gcTunePctSet {
+			gcTunePrevPct = debug.SetGCPercent(gcPct)
 		}
 		if logger != nil {
 			logger.Debug("indexer: cold-index GC tuning applied",
 				zap.Int("gc_percent", gcPct),
+				zap.Bool("gc_percent_applied", gcTunePctSet),
 				zap.Int("prev_gc_percent", gcTunePrevPct),
 				zap.Int64("mem_limit_bytes", budget),
 				zap.Int64("prev_mem_limit_bytes", gcTunePrevLim),
@@ -334,11 +388,85 @@ func applyIndexGCTuning(logger *zap.Logger) func() {
 		once.Do(func() {
 			gcTuneMu.Lock()
 			gcTuneDepth--
-			if gcTuneDepth == 0 {
-				debug.SetGCPercent(gcTunePrevPct)
+			closed := gcTuneDepth == 0
+			if closed {
+				if gcTunePctSet {
+					debug.SetGCPercent(gcTunePrevPct)
+					gcTunePctSet = false
+				}
 				debug.SetMemoryLimit(gcTunePrevLim)
 			}
 			gcTuneMu.Unlock()
+			// Scavenge the cold-index burst's heap high-water once the
+			// window is fully closed — outside the lock, since FreeOSMemory
+			// is a full GC cycle that must not serialise sibling index
+			// calls waiting on gcTuneMu.
+			if closed {
+				freeOSMemoryAfterColdIndex(logger)
+			}
 		})
 	}
+}
+
+// memReleaseEnabled reports whether post-burst heap release is active. On by
+// default; GORTEX_DAEMON_MEMRELEASE=0 (or "false") disables it. The check is
+// duplicated here (rather than shared) because the canonical release helper
+// lives in the cmd layer, which this package must not import.
+func memReleaseEnabled() bool {
+	v := os.Getenv("GORTEX_DAEMON_MEMRELEASE")
+	return v != "0" && !strings.EqualFold(v, "false")
+}
+
+// freeOSMemoryAfterColdIndex returns the cold-index burst's heap high-water
+// to the OS once the tuning window has fully closed. A cold index churns
+// multi-GB of parse / node / edge allocation; debug.FreeOSMemory forces a GC
+// + scavenge so that peak does not stay resident on the daemon's footprint
+// until some later collection happens to reclaim it.
+func freeOSMemoryAfterColdIndex(logger *zap.Logger) {
+	if !memReleaseEnabled() {
+		return
+	}
+	start := time.Now()
+	ran, _ := runtimeactivity.RunIfQuiet(0, debug.FreeOSMemory)
+	forced := false
+	if !ran {
+		// Not quiet — but leaving the burst's high-water heap in place is
+		// only safe when the ceiling has room. Back-to-back index bursts
+		// (a batch of tracks, a bench, an agent loop) never go quiet, and
+		// each burst then starts at the previous one's high-water inside a
+		// clamped limit — the collector ends up pacing against the ceiling
+		// for the whole next burst. Under pressure, pay the one forced
+		// release now.
+		var ms runtime.MemStats
+		runtime.ReadMemStats(&ms)
+		if forcedHeapReleaseNeeded(int64(ms.HeapInuse), debug.SetMemoryLimit(-1)) {
+			debug.FreeOSMemory()
+			ran, forced = true, true
+		}
+	}
+	if logger == nil {
+		return
+	}
+	if !ran {
+		snapshot := runtimeactivity.Current()
+		logger.Debug("indexer: deferred cold-index heap release until process idle",
+			zap.Int64("active_work", snapshot.Active),
+			zap.Any("active_by_kind", snapshot.ByKind))
+		return
+	}
+	logger.Debug("indexer: released heap to OS after cold index",
+		zap.Bool("forced_by_pressure", forced),
+		zap.Duration("elapsed", time.Since(start)))
+}
+
+// forcedHeapReleaseNeeded reports whether the post-burst release must run
+// even though the process is not quiet: the heap high-water occupies more
+// than half of an installed finite memory limit. Below that share, deferring
+// to the idle scheduler is fine; above it, the next burst would start inside
+// the limit-pacing regime the release exists to prevent.
+func forcedHeapReleaseNeeded(heapInuse, limit int64) bool {
+	if limit <= 0 || limit == math.MaxInt64 {
+		return false
+	}
+	return heapInuse > limit/2
 }

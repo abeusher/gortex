@@ -94,6 +94,12 @@ func presetsContaining(name string) []string {
 	if toolSetContains(navPresetTools, name) {
 		presets = append(presets, "nav")
 	}
+	if toolSetContains(localizationPresetTools, name) {
+		presets = append(presets, "localization")
+	}
+	if toolSetContains(facadePresetTools, name) {
+		presets = append(presets, FacadeSurfaceVersion)
+	}
 	if !daemon.IsMutating(name) {
 		presets = append(presets, "readonly")
 	}

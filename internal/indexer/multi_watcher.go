@@ -1,6 +1,7 @@
 package indexer
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"sort"
@@ -105,6 +106,9 @@ func (mw *MultiWatcher) createWatcher(prefix string, cfg config.WatchConfig) err
 	if err != nil {
 		return fmt.Errorf("creating watcher for %s: %w", prefix, err)
 	}
+	w.batchReindex = func(paths []string) (*IndexResult, error) {
+		return mw.multi.IncrementalReindexRepo(prefix, paths)
+	}
 
 	mw.watchers[prefix] = w
 	return nil
@@ -175,6 +179,11 @@ func (mw *MultiWatcher) Start() error {
 			// worktrees, tarball checkouts) simply skip it.
 			if idx := mw.multi.GetIndexer(prefix); idx != nil {
 				gw, err := NewGitWatcher(rootPath, idx, mw.logger.With(zap.String("repo", prefix)))
+				if err == nil {
+					gw.batchReindex = func(paths []string) (*IndexResult, error) {
+						return mw.multi.IncrementalReindexRepo(prefix, paths)
+					}
+				}
 				if err != nil {
 					mw.logger.Debug("git-watcher: init failed",
 						zap.String("prefix", prefix), zap.Error(err))
@@ -359,6 +368,34 @@ func (mw *MultiWatcher) OnDegraded(cb func(reason string)) {
 	for _, w := range watchers {
 		w.OnDegraded(cb)
 	}
+}
+
+// EnqueueFileMutation routes a committed file mutation to the active watcher
+// that owns the path. Routing is path-scoped: an unrelated degraded watcher
+// cannot force a synchronous fallback, and a watcher that failed to start is
+// never reported as accepting work.
+func (mw *MultiWatcher) EnqueueFileMutation(ctx context.Context, filePath string) (*MutationTicket, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	prefix := mw.multi.RepoForFile(filePath)
+	mw.mu.Lock()
+	w := mw.watchers[prefix]
+	started := mw.started[prefix]
+	// A single-repo MultiIndexer may intentionally use the empty prefix;
+	// when RepoForFile cannot distinguish it from "not covered", let the
+	// per-repo watcher perform the authoritative containment check.
+	if w == nil && prefix == "" && len(mw.watchers) == 1 {
+		for candidatePrefix, candidate := range mw.watchers {
+			w = candidate
+			started = mw.started[candidatePrefix]
+		}
+	}
+	mw.mu.Unlock()
+	if w == nil || !started {
+		return nil, nil
+	}
+	return w.EnqueueFileMutation(ctx, filePath)
 }
 
 // DegradedReason returns the first non-empty per-repo degraded reason, prefixed

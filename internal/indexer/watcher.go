@@ -35,14 +35,31 @@ const (
 
 // GraphChangeEvent is emitted after a successful graph patch.
 type GraphChangeEvent struct {
-	FilePath     string     `json:"file_path"`
-	Kind         ChangeKind `json:"kind"`
-	NodesAdded   int        `json:"nodes_added"`
-	NodesRemoved int        `json:"nodes_removed"`
-	EdgesAdded   int        `json:"edges_added"`
-	EdgesRemoved int        `json:"edges_removed"`
-	Timestamp    time.Time  `json:"timestamp"`
-	DurationMs   int64      `json:"duration_ms"`
+	FilePath       string     `json:"file_path"`
+	Kind           ChangeKind `json:"kind"`
+	Classification string     `json:"classification,omitempty"`
+	NodesAdded     int        `json:"nodes_added"`
+	NodesRemoved   int        `json:"nodes_removed"`
+	EdgesAdded     int        `json:"edges_added"`
+	EdgesRemoved   int        `json:"edges_removed"`
+	Timestamp      time.Time  `json:"timestamp"`
+	DurationMs     int64      `json:"duration_ms"`
+}
+
+// MutationTicket identifies one admitted file mutation and resolves when the
+// graph has applied this generation or a newer coalesced generation.
+type MutationTicket struct {
+	Path       string
+	Generation uint64
+	Done       <-chan MutationResult
+}
+
+// MutationResult is the terminal graph-freshness result for a ticket.
+type MutationResult struct {
+	RequestedGeneration uint64
+	AppliedGeneration   uint64
+	Reindexed           bool
+	Err                 error
 }
 
 // SymbolChangeCallback is called when symbols change during file re-indexing.
@@ -64,7 +81,12 @@ type Watcher struct {
 	history            []GraphChangeEvent
 	historyMu          sync.Mutex
 	pending            map[string]*time.Timer
+	pendingGeneration  map[string]uint64
+	mutationWaiters    map[string]map[uint64]chan MutationResult
+	nextGeneration     uint64
 	mu                 sync.Mutex
+	stopping           bool
+	asyncWork          sync.WaitGroup
 	// patchMu serialises per-path patchGraph invocations so the
 	// post-patch reach rebuild (which scans every Node.Meta) cannot
 	// race with another debounced patch's IndexFile / EvictFile /
@@ -75,6 +97,7 @@ type Watcher struct {
 	logger           *zap.Logger
 	done             chan struct{}
 	stopped          chan struct{}
+	stoppedOnce      sync.Once
 	symbolChangeCb   SymbolChangeCallback
 	symbolChangeCbMu sync.RWMutex
 
@@ -93,15 +116,34 @@ type Watcher struct {
 	// the inotify watch is active) to a chan that handleEvent closes when
 	// the probe's event arrives. Empty after Start returns.
 	probeWaiters sync.Map
+	// initialReplayProbeWritten is a test seam fired after the Darwin startup
+	// barrier creates a marker inside a watched root. nil in production.
+	initialReplayProbeWritten func(string)
+	// initialReplayDrainStarted and initialReplayMarkerCreating are test seams
+	// for writes at the two Darwin startup ordering boundaries. nil in
+	// production.
+	initialReplayDrainStarted   func()
+	initialReplayMarkerCreating func(string)
+	// mutationBeforeAdmission and pointMutationClaimed expose the two point
+	// mutation lifecycle boundaries to deterministic shutdown tests.
+	mutationBeforeAdmission  func()
+	pointMutationClaimed     func(string)
+	stopAdmissionClosed      func()
+	startFailureBeforeSignal func()
 
 	// Storm-mode state. Guarded by stormMu so the hot per-file
 	// debounce path (mu) doesn't contend with rate-tracking.
-	stormMu      sync.Mutex
-	eventTimes   []time.Time           // sliding window of recent event timestamps
-	stormBatch   map[string]ChangeKind // dirty set during an event storm
-	stormTimer   *time.Timer           // fires after the quiet period
-	stormActive  bool                  // true while waiting to drain
-	stormDrained func(int)             // test hook: batch drained; batch size arg
+	stormMu          sync.Mutex
+	eventTimes       []time.Time           // sliding window of recent event timestamps
+	stormBatch       map[string]ChangeKind // dirty set during an event storm
+	stormGenerations map[string]uint64     // newest debounced generation adopted per path
+	stormTimer       *time.Timer           // fires after the quiet period
+	stormActive      bool                  // true while waiting to drain
+	stormStopped     bool                  // Stop has closed storm admission
+	stormWork        sync.WaitGroup        // scheduled/running timer callbacks
+	stormDrained     func(int)             // test hook: batch drained; batch size arg
+	stormBeforeLock  func()                // test hook: immediately before patchMu acquisition
+	batchReindex     watcherBatchReindex   // one bounded batch; MultiWatcher installs shared catch-up
 
 	// poller is the adaptive-interval fallback that re-checks git
 	// HEAD movement and tracked-file mtimes on a timer, catching the
@@ -146,6 +188,12 @@ type Watcher struct {
 
 const maxHistory = 1000
 
+var (
+	errMutationSuperseded   = errors.New("mutation generation superseded")
+	errMutationPatchAborted = errors.New("mutation patch aborted")
+	errWatcherStopped       = errors.New("watcher stopped before mutation completed")
+)
+
 // probeMarker is the substring embedded in handshake-probe filenames
 // (see confirmWatchActive) and used by handleEvent to absorb their
 // create/remove events without touching the indexer.
@@ -184,15 +232,17 @@ func NewWatcher(idx *Indexer, cfg config.WatchConfig, logger *zap.Logger) (*Watc
 	}
 
 	return &Watcher{
-		indexer:    idx,
-		config:     cfg,
-		excludes:   excludes.New(patterns),
-		events:     make(chan GraphChangeEvent, 64),
-		pending:    make(map[string]*time.Timer),
-		stormBatch: make(map[string]ChangeKind),
-		logger:     logger,
-		done:       make(chan struct{}),
-		stopped:    make(chan struct{}),
+		indexer:           idx,
+		config:            cfg,
+		excludes:          excludes.New(patterns),
+		events:            make(chan GraphChangeEvent, 64),
+		pending:           make(map[string]*time.Timer),
+		pendingGeneration: make(map[string]uint64),
+		stormBatch:        make(map[string]ChangeKind),
+		stormGenerations:  make(map[string]uint64),
+		logger:            logger,
+		done:              make(chan struct{}),
+		stopped:           make(chan struct{}),
 	}, nil
 }
 
@@ -201,7 +251,17 @@ func NewWatcher(idx *Indexer, cfg config.WatchConfig, logger *zap.Logger) (*Watc
 // constant FD cost) and inotify on Linux (one watch per directory in
 // the tree). On the inotify path the per-user `max_user_watches` cap
 // applies; bump that sysctl if a multi-repo install grows beyond it.
-func (w *Watcher) Start(paths []string) error {
+func (w *Watcher) Start(paths []string) (retErr error) {
+	loopLaunched := false
+	defer func() {
+		if retErr == nil || loopLaunched {
+			return
+		}
+		if w.startFailureBeforeSignal != nil {
+			w.startFailureBeforeSignal()
+		}
+		w.signalStopped()
+	}()
 	if len(paths) == 0 {
 		return errors.New("watcher: no paths to watch")
 	}
@@ -312,18 +372,25 @@ func (w *Watcher) Start(paths []string) error {
 		cancel()
 		return errors.New("watcher: backend did not become ready within 5s")
 	}
-	// FSEvents reports its stream as "started" the instant the C call
-	// returns, but immediately fires synthetic "this file exists"
-	// events for every pre-existing file under the watched root. The
-	// flags on those events are indistinguishable from real changes
-	// (Create + Modified are set), so we'd re-index every file on
-	// every daemon start. Drain everything that lands in the events
-	// buffer within a short grace window before starting the real
-	// loop — anything genuinely happening to a file during that
-	// window will fire again as new events.
+	// FSEvents reports its stream as "started" before its startup replay has
+	// drained. Synthetic exists events and genuine writes are indistinguishable,
+	// so collect (never discard) the quiet-window prefix, then merge it with the
+	// ordered marker tail. Persisted file receipts remove unchanged replay paths
+	// in one batch query; genuine writes are reconciled before Start returns.
 	if runtime.GOOS == "darwin" {
-		w.drainInitialReplay(150 * time.Millisecond)
+		initialReplay, err := w.drainInitialReplay(150 * time.Millisecond)
+		if err == nil {
+			err = w.reconcileInitialReplayThroughMarkers(absPaths, 5*time.Second, initialReplay)
+		}
+		if err != nil {
+			cancel()
+			if w.fsw != nil {
+				w.fsw.Close()
+			}
+			return err
+		}
 	}
+	loopLaunched = true
 	go w.loop()
 	// On Linux, fswatcher closes its ready channel as soon as the
 	// inotify FD is allocated, but it registers initial paths in
@@ -398,31 +465,425 @@ func (w *Watcher) confirmWatchActive(root string, timeout time.Duration) error {
 // streams emit a burst of synthetic "exists" events at startup; this
 // burst is bounded by the per-stream latency (~50 ms). The first call
 // blocks at least one window so early events have a chance to arrive.
-func (w *Watcher) drainInitialReplay(window time.Duration) {
+func (w *Watcher) drainInitialReplay(window time.Duration) (map[string]fswatcher.WatchEvent, error) {
 	if w.fsw == nil {
-		return
+		return nil, nil
 	}
+	deferred := make(map[string]fswatcher.WatchEvent)
 	eventsCh := w.fsw.Events()
+	droppedCh := w.fsw.Dropped()
+	if w.initialReplayDrainStarted != nil {
+		w.initialReplayDrainStarted()
+	}
 	t := time.NewTimer(window)
 	defer t.Stop()
 	for {
 		select {
-		case <-eventsCh:
+		case event, ok := <-eventsCh:
+			if !ok {
+				return nil, errors.New("watcher: event stream closed during startup replay drain")
+			}
+			if err := w.mergeInitialReplayEvent(deferred, event); err != nil {
+				return nil, err
+			}
+			if !t.Stop() {
+				select {
+				case <-t.C:
+				default:
+				}
+			}
 			t.Reset(window)
+		case _, ok := <-droppedCh:
+			if !ok {
+				droppedCh = nil
+				continue
+			}
+			return nil, errors.New("watcher: event dropped during startup replay drain")
 		case <-t.C:
-			return
+			return deferred, nil
 		}
 	}
 }
 
+func (w *Watcher) mergeInitialReplayEvent(events map[string]fswatcher.WatchEvent, event fswatcher.WatchEvent) error {
+	for _, eventType := range event.Types {
+		if eventType == fswatcher.EventOverflow {
+			return errors.New("watcher: event stream overflowed during startup replay barrier")
+		}
+	}
+	path := filepath.Clean(normalizeEventPath(event.Path, w.indexer.rootPath))
+	if path == "." || strings.Contains(filepath.Base(path), probeMarker) {
+		return nil
+	}
+	event.Path = path
+	if prior, exists := events[path]; exists {
+		seen := make(map[fswatcher.EventType]struct{}, len(prior.Types)+len(event.Types))
+		merged := make([]fswatcher.EventType, 0, len(prior.Types)+len(event.Types))
+		for _, eventType := range append(prior.Types, event.Types...) {
+			if _, duplicate := seen[eventType]; duplicate {
+				continue
+			}
+			seen[eventType] = struct{}{}
+			merged = append(merged, eventType)
+		}
+		event.Types = merged
+	}
+	events[path] = event
+	return nil
+}
+
+// reconcileInitialReplayThroughMarkers closes the Darwin FSEvents startup
+// ordering gap without scanning the repository. Each watched root gets one
+// ignored marker after the quiet drain. FSEvents preserves order within a
+// root stream, so observing that marker proves every earlier replay event for
+// the root has reached this channel. Only paths actually observed in that tail
+// are deduplicated and reconciled before Start returns.
+func (w *Watcher) reconcileInitialReplayThroughMarkers(
+	roots []string,
+	timeout time.Duration,
+	initialSets ...map[string]fswatcher.WatchEvent,
+) error {
+	if w.fsw == nil || len(roots) == 0 {
+		return nil
+	}
+	markers := make(map[string]struct{}, len(roots))
+	markerPaths := make([]string, 0, len(roots))
+	initialSize := 0
+	if len(initialSets) > 0 {
+		initialSize = len(initialSets[0])
+	}
+	deferred := make(map[string]fswatcher.WatchEvent, initialSize)
+	if len(initialSets) > 0 {
+		for path, event := range initialSets[0] {
+			deferred[path] = event
+		}
+	}
+	defer func() {
+		for _, marker := range markerPaths {
+			_ = os.Remove(marker)
+		}
+	}()
+
+	for i, root := range roots {
+		markerDirs := make([]string, 0, 2)
+		if info, err := os.Stat(filepath.Join(root, ".git")); err == nil && info.IsDir() {
+			// Keep the transient barrier out of git status in normal worktrees.
+			// A linked worktree has a .git file, so it falls back to the root
+			// but is unlinked immediately after publication below.
+			markerDirs = append(markerDirs, filepath.Join(root, ".git"))
+		}
+		markerDirs = append(markerDirs, root)
+		markerBase := fmt.Sprintf("%s%d-%d-%d", probeMarker, os.Getpid(), time.Now().UnixNano(), i)
+		var marker string
+		var f *os.File
+		var markerErr error
+		for _, markerDir := range markerDirs {
+			marker = filepath.Join(markerDir, markerBase)
+			if w.initialReplayMarkerCreating != nil {
+				w.initialReplayMarkerCreating(marker)
+			}
+			f, markerErr = os.OpenFile(marker, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+			if markerErr == nil {
+				break
+			}
+			if !errors.Is(markerErr, os.ErrPermission) && !errors.Is(markerErr, syscall.EROFS) {
+				return fmt.Errorf("watcher: create startup stream marker in %s: %w", root, markerErr)
+			}
+		}
+		if f == nil {
+			if errors.Is(markerErr, syscall.EROFS) {
+				readOnly, statErr := filesystemReadOnly(root)
+				if statErr != nil {
+					return fmt.Errorf("watcher: verify read-only startup root %s: %w", root, statErr)
+				}
+				if readOnly {
+					if w.logger != nil {
+						w.logger.Info("watcher: startup marker skipped on read-only filesystem",
+							zap.String("root", root))
+					}
+					continue
+				}
+			}
+			return fmt.Errorf("watcher: create startup stream marker in %s: %w", root, markerErr)
+		}
+		if err := f.Close(); err != nil {
+			_ = os.Remove(marker)
+			return fmt.Errorf("watcher: close startup stream marker in %s: %w", root, err)
+		}
+		marker = filepath.Clean(marker)
+		markerPaths = append(markerPaths, marker)
+		markers[marker] = struct{}{}
+		if w.initialReplayProbeWritten != nil {
+			w.initialReplayProbeWritten(marker)
+		}
+		// FSEvents retains the create/remove record after unlink. Remove now,
+		// rather than after the barrier wait, so the marker cannot survive a
+		// slow stream or appear in post-Start repository state. The defer is
+		// still the panic/error safety net.
+		if err := os.Remove(marker); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("watcher: remove startup stream marker in %s: %w", root, err)
+		}
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	eventsCh := w.fsw.Events()
+	droppedCh := w.fsw.Dropped()
+	for len(markers) > 0 {
+		select {
+		case event, ok := <-eventsCh:
+			if !ok {
+				return errors.New("watcher: event stream closed during startup marker barrier")
+			}
+			path := filepath.Clean(normalizeEventPath(event.Path, w.indexer.rootPath))
+			if _, marker := markers[path]; marker {
+				delete(markers, path)
+				continue
+			}
+			if strings.Contains(filepath.Base(path), probeMarker) {
+				continue
+			}
+			if err := w.mergeInitialReplayEvent(deferred, event); err != nil {
+				return err
+			}
+		case _, ok := <-droppedCh:
+			if !ok {
+				droppedCh = nil
+				continue
+			}
+			return errors.New("watcher: event dropped during startup marker barrier")
+		case <-timer.C:
+			return fmt.Errorf("watcher: startup marker barrier did not complete within %s", timeout)
+		}
+	}
+
+	if err := w.reconcileInitialReplayEvents(deferred); err != nil {
+		return err
+	}
+	w.mu.Lock()
+	idle := len(w.pending) == 0 && len(w.pendingGeneration) == 0
+	w.mu.Unlock()
+	if !idle {
+		return errors.New("watcher: startup marker barrier left queued mutations")
+	}
+	return nil
+}
+
+func (w *Watcher) reconcileInitialReplayEvents(events map[string]fswatcher.WatchEvent) error {
+	if len(events) == 0 {
+		return nil
+	}
+	paths := make([]string, 0, len(events))
+	for path := range events {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	unchanged, indexed, err := w.matchingInitialReplayReceipts(events, paths)
+	if err != nil {
+		return err
+	}
+	dirs := make(map[string]struct{})
+	for _, path := range paths {
+		event := events[path]
+		if isGortexAtomicTemp(path) || w.isExcluded(path) {
+			continue
+		}
+		kind := pickKind(event.Types)
+		if kind == "" {
+			continue
+		}
+		// FSEvents can label a write to a pre-existing file as Create+Mod. The
+		// persisted receipt proves it was already indexed, so use the replace
+		// path that evicts stale definitions instead of treating it as additive.
+		if kind == ChangeCreated {
+			if _, existed := indexed[path]; existed {
+				kind = ChangeModified
+			}
+		}
+		if kind == ChangeCreated || kind == ChangeModified {
+			if info, err := os.Stat(path); err == nil && info.IsDir() {
+				if hasEventType(event.Types, fswatcher.EventCreate) {
+					dirs[path] = struct{}{}
+				}
+				continue
+			}
+		}
+		if _, ok := w.indexer.effectiveLanguage(path, nil); !ok && kind != ChangeDeleted && kind != ChangeRenamed {
+			continue
+		}
+		if _, replay := unchanged[path]; replay {
+			continue
+		}
+		err := w.patchGraphAfterReceiptCheck(path, kind)
+		if errors.Is(err, errFileVersionChanged) {
+			// One bounded retry catches a second write that landed during the
+			// first parse/commit. Continuous writers fail Start explicitly.
+			err = w.patchGraphAfterReceiptCheck(path, kind)
+		}
+		if err != nil {
+			return fmt.Errorf("watcher: reconcile startup event for %s: %w", path, err)
+		}
+	}
+	if len(dirs) > 0 {
+		w.runDirScan(dirs, nil)
+	}
+	return nil
+}
+
+type initialReplayReceiptCandidate struct {
+	path              string
+	relPath           string
+	graphPath         string
+	mtimeKey          string
+	before            os.FileInfo
+	receiptComparable bool
+}
+
+// matchingInitialReplayReceipts removes Darwin's synthetic startup replay
+// without a per-file SQL loop. Existing source paths are fetched in one set
+// query; equal-mtime paths then have their source read/transformed/hashed
+// sequentially to keep memory bounded. Any missing receipt, changed mtime, or
+// unstable read is a real reconciliation candidate.
+func (w *Watcher) matchingInitialReplayReceipts(
+	events map[string]fswatcher.WatchEvent,
+	paths []string,
+) (map[string]struct{}, map[string]struct{}, error) {
+	reader, ok := w.indexer.graph.(graph.FileMetaPathReader)
+	if !ok {
+		return nil, nil, nil
+	}
+	candidates := make([]initialReplayReceiptCandidate, 0, len(paths))
+	for _, path := range paths {
+		if isGortexAtomicTemp(path) || w.isExcluded(path) {
+			continue
+		}
+		kind := pickKind(events[path].Types)
+		if kind != ChangeCreated && kind != ChangeModified {
+			continue
+		}
+		before, err := os.Stat(path)
+		if err != nil || before.IsDir() {
+			continue
+		}
+		if _, supported := w.indexer.effectiveLanguage(path, nil); !supported {
+			continue
+		}
+		relPath := w.indexer.graphRelKey(path)
+		candidates = append(candidates, initialReplayReceiptCandidate{
+			path:      path,
+			relPath:   relPath,
+			graphPath: w.indexer.prefixPath(relPath),
+			mtimeKey:  w.indexer.relKey(path),
+			before:    before,
+		})
+	}
+
+	// The in-memory mtime map is only the fast hash gate. Every existing replay
+	// path participates in the one set query so Create+Mod can still be routed
+	// through replacement semantics when its mtime really changed.
+	w.indexer.mtimeMu.RLock()
+	for i := range candidates {
+		candidate := &candidates[i]
+		mtime, tracked := w.indexer.fileMtimes[candidate.mtimeKey]
+		if tracked && mtime == candidate.before.ModTime().UnixNano() {
+			candidate.receiptComparable = true
+		}
+	}
+	w.indexer.mtimeMu.RUnlock()
+	if len(candidates) == 0 {
+		return nil, nil, nil
+	}
+
+	graphPaths := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		graphPaths = append(graphPaths, candidate.graphPath)
+	}
+	rows, err := reader.FileMetasByPaths(w.indexer.repoPrefix, graphPaths)
+	if err != nil {
+		return nil, nil, fmt.Errorf("watcher: read startup replay receipts: %w", err)
+	}
+	unchanged := make(map[string]struct{}, len(candidates))
+	indexed := make(map[string]struct{}, len(candidates))
+	for _, candidate := range candidates {
+		row, exists := rows[candidate.graphPath]
+		if !exists {
+			continue
+		}
+		indexed[candidate.path] = struct{}{}
+		if !candidate.receiptComparable || row.ContentHash == "" {
+			continue
+		}
+		src, err := os.ReadFile(candidate.path)
+		if err != nil {
+			continue
+		}
+		after, err := os.Stat(candidate.path)
+		if err != nil || !sameFileVersion(candidate.before, after) {
+			continue
+		}
+		src = w.indexer.transforms.run(candidate.relPath, src)
+		if len(src) == row.Size && contentHashForSource(src) == row.ContentHash {
+			unchanged[candidate.path] = struct{}{}
+		}
+	}
+	return unchanged, indexed, nil
+}
+
 // Stop halts the watcher and cleans up resources.
 func (w *Watcher) Stop() error {
-	// Stop the adaptive poller first so a poll cycle in flight can't
-	// dispatch a patch into a half-torn-down watcher.
+	// Close global admission first. Every point timer and auxiliary reconcile
+	// drainer takes an asyncWork token while holding this same gate, so no Add
+	// can race the Wait below. A timer whose Stop succeeds hands its token back
+	// here; a callback that is already runnable retains ownership until return.
+	w.mu.Lock()
+	w.stopping = true
+	for _, timer := range w.pending {
+		if timer.Stop() {
+			w.asyncWork.Done()
+		}
+	}
+	w.pending = make(map[string]*time.Timer)
+	w.pendingGeneration = make(map[string]uint64)
+	w.mu.Unlock()
+	if w.stopAdmissionClosed != nil {
+		w.stopAdmissionClosed()
+	}
+
+	// Close storm admission and detach queued work before teardown. Every
+	// published quiet timer owns one stormWork token: a successful Stop hands
+	// that token back here; otherwise the callback is already runnable and its
+	// defer owns it. No Add can occur after stormStopped while this lock orders
+	// recordInStorm against Wait below.
+	w.stormMu.Lock()
+	w.stormStopped = true
+	w.stopStormTimerLocked()
+	w.stormBatch = make(map[string]ChangeKind)
+	w.stormGenerations = make(map[string]uint64)
+	w.eventTimes = nil
+	w.stormActive = false
+	w.stormMu.Unlock()
+
+	close(w.done)
+	// Stop the adaptive poller so a poll cycle in flight can't dispatch a
+	// point patch into a half-torn-down watcher.
 	if w.poller != nil {
 		w.poller.Stop()
 	}
-	close(w.done)
+	// Queued directory and forced-resolve work has not entered the graph yet.
+	// Drop it after admission closes; an already-running drainer is counted and
+	// will observe the empty set before returning.
+	w.reconcileMu.Lock()
+	w.pendingScanDirs = nil
+	w.pendingReresolve = nil
+	w.reconcileMu.Unlock()
+	w.failMutationWaiters(errWatcherStopped)
+
+	// Never hold stormMu, reconcileMu, mu, patchMu, or the reach topology gate
+	// while joining. Already-claimed point patches, directory scans, forced
+	// resolves, overflow reconciles, and storm drains may finish, but all must
+	// be completely out of graph/SQLite work before backend teardown.
+	w.asyncWork.Wait()
+	w.stormWork.Wait()
 	if w.fsCancel != nil {
 		w.fsCancel()
 	}
@@ -539,7 +1000,7 @@ func (w *Watcher) noteWatchDegraded(err error) bool {
 }
 
 func (w *Watcher) loop() {
-	defer close(w.stopped)
+	defer w.signalStopped()
 	if w.fsw == nil {
 		// Test path: handleEvent is being driven directly without
 		// having called Start. Block until Stop closes w.done.
@@ -572,6 +1033,10 @@ func (w *Watcher) loop() {
 	}
 }
 
+func (w *Watcher) signalStopped() {
+	w.stoppedOnce.Do(func() { close(w.stopped) })
+}
+
 // guardWatcherPanic recovers a panic in a watcher background goroutine —
 // a debounced patch, a storm drain, an overflow reconcile, or a
 // new-directory scan. Those goroutines call into the graph store, and
@@ -592,6 +1057,24 @@ func (w *Watcher) guardWatcherPanic(op string) {
 	}
 }
 
+// beginReconcileWork atomically admits one auxiliary background unit and
+// returns with reconcileMu held. Holding the admission gate until the queue or
+// active bit can be published ensures Stop's later queue clear observes every
+// pre-shutdown admission; once stopping is set no WaitGroup Add can race Wait.
+// The caller must unlock reconcileMu and either call Done or transfer the token
+// to the goroutine it publishes.
+func (w *Watcher) beginReconcileWork() bool {
+	w.mu.Lock()
+	if w.stopping {
+		w.mu.Unlock()
+		return false
+	}
+	w.asyncWork.Add(1)
+	w.reconcileMu.Lock()
+	w.mu.Unlock()
+	return true
+}
+
 // triggerOverflowReconcile schedules a single coalesced full-tree
 // reconcile in response to a lost-event signal (a kernel inotify queue
 // overflow or a backpressure-dropped event). A burst of signals
@@ -600,9 +1083,12 @@ func (w *Watcher) guardWatcherPanic(op string) {
 // callers observe the flag and return immediately. Best-effort and
 // logged — the event loop is never blocked.
 func (w *Watcher) triggerOverflowReconcile(reason string) {
-	w.reconcileMu.Lock()
+	if !w.beginReconcileWork() {
+		return
+	}
 	if w.reconcilePending {
 		w.reconcileMu.Unlock()
+		w.asyncWork.Done()
 		return
 	}
 	w.reconcilePending = true
@@ -616,6 +1102,7 @@ func (w *Watcher) triggerOverflowReconcile(reason string) {
 	}
 
 	go func() {
+		defer w.asyncWork.Done()
 		defer func() {
 			w.reconcileMu.Lock()
 			w.reconcilePending = false
@@ -652,19 +1139,23 @@ const dirScanEscalateCap = 64
 // so a directory enqueued while a scan is in flight is still picked up;
 // nothing is lost and there is no debounce-timing race.
 func (w *Watcher) enqueueDirScan(dir string) {
-	w.reconcileMu.Lock()
+	if !w.beginReconcileWork() {
+		return
+	}
 	if w.pendingScanDirs == nil {
 		w.pendingScanDirs = make(map[string]struct{})
 	}
 	w.pendingScanDirs[dir] = struct{}{}
 	if w.dirScanActive {
 		w.reconcileMu.Unlock()
+		w.asyncWork.Done()
 		return
 	}
 	w.dirScanActive = true
 	w.reconcileMu.Unlock()
 
 	go func() {
+		defer w.asyncWork.Done()
 		for {
 			w.reconcileMu.Lock()
 			dirs := w.pendingScanDirs
@@ -684,8 +1175,8 @@ func (w *Watcher) enqueueDirScan(dir string) {
 	}()
 }
 
-// runDirScan re-indexes the accumulated new directories. A large burst
-// escalates to one full-tree reconcile (dirScanEscalateCap); otherwise
+// runDirScan discovers files in the accumulated new directories. A large burst
+// escalates to one full-tree additive discovery (dirScanEscalateCap); otherwise
 // the scoped subtrees are walked in a single IncrementalReindexPaths
 // call, which IsStale-gates each file so already-current files cost only
 // a stat. fn is the test seam.
@@ -696,11 +1187,11 @@ func (w *Watcher) runDirScan(dirs map[string]struct{}, fn func(map[string]struct
 	}
 	if len(dirs) > dirScanEscalateCap {
 		if w.logger != nil {
-			w.logger.Info("watcher: large new-directory burst — full-tree reconcile",
+			w.logger.Info("watcher: large new-directory burst — full-tree discovery",
 				zap.Int("dirs", len(dirs)), zap.String("root", w.indexer.rootPath))
 		}
-		if _, err := w.indexer.IncrementalReindex(w.indexer.rootPath); err != nil && w.logger != nil {
-			w.logger.Warn("watcher: new-directory reconcile failed", zap.Error(err))
+		if _, err := w.indexer.incrementalDiscoverPaths(w.indexer.rootPath, nil); err != nil && w.logger != nil {
+			w.logger.Warn("watcher: new-directory discovery failed", zap.Error(err))
 		}
 		return
 	}
@@ -708,7 +1199,7 @@ func (w *Watcher) runDirScan(dirs map[string]struct{}, fn func(map[string]struct
 	for d := range dirs {
 		paths = append(paths, d)
 	}
-	if _, err := w.indexer.IncrementalReindexPaths(w.indexer.rootPath, paths); err != nil && w.logger != nil {
+	if _, err := w.indexer.incrementalDiscoverPaths(w.indexer.rootPath, paths); err != nil && w.logger != nil {
 		w.logger.Warn("watcher: new-directory scan failed",
 			zap.Strings("dirs", paths), zap.Error(err))
 	}
@@ -722,6 +1213,29 @@ func hasEventType(types []fswatcher.EventType, want fswatcher.EventType) bool {
 		}
 	}
 	return false
+}
+
+func isGortexAtomicTemp(path string) bool {
+	// filepath.Base only recognizes the host separator. Watcher tests and
+	// forwarded events can contain either slash, so split both explicitly.
+	if idx := strings.LastIndexAny(path, `/\\`); idx >= 0 {
+		path = path[idx+1:]
+	}
+	const marker = ".gortex.tmp-"
+	idx := strings.LastIndex(path, marker)
+	if idx < 0 {
+		return false
+	}
+	suffix := path[idx+len(marker):]
+	if suffix == "" {
+		return false
+	}
+	for _, ch := range suffix {
+		if ch < '0' || ch > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func (w *Watcher) handleEvent(event fswatcher.WatchEvent) {
@@ -741,6 +1255,12 @@ func (w *Watcher) handleEvent(event fswatcher.WatchEvent) {
 	}
 
 	path := normalizeEventPath(event.Path, w.indexer.rootPath)
+	// Guarded edits use atomic temp files in the watched directory. They are
+	// implementation artifacts, not source changes; indexing them duplicates
+	// the subsequent target-file patch and can monopolize the serialized queue.
+	if isGortexAtomicTemp(path) {
+		return
+	}
 
 	// Probe artifacts: sentinel files Start writes to confirm the
 	// OS-level watch is actually active. Their create event signals
@@ -808,24 +1328,184 @@ func (w *Watcher) handleEvent(event fswatcher.WatchEvent) {
 		return
 	}
 
-	// Debounce: reset or start timer for this file.
-	w.mu.Lock()
-	if timer, exists := w.pending[path]; exists {
-		timer.Stop()
+	w.scheduleFileMutation(path, kind)
+}
+
+// EnqueueFileMutation hands a committed filesystem mutation directly to the
+// watcher's debounced generation queue. It does not depend on fsnotify delivery,
+// so daemon-backed MCP edits remain reliable even when native watch delivery is
+// degraded. The request context governs admission only; the returned ticket
+// resolves when this generation or a newer coalesced generation reaches a
+// terminal graph state.
+func (w *Watcher) EnqueueFileMutation(ctx context.Context, filePath string) (*MutationTicket, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
+	absPath, err := filepath.Abs(filePath)
+	if err != nil {
+		return nil, err
+	}
+	root := w.indexer.RootPath()
+	if root == "" {
+		return nil, nil
+	}
+	rel, err := filepath.Rel(root, absPath)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return nil, nil
+	}
+	if w.isExcluded(absPath) {
+		return nil, nil
+	}
+	if _, ok := w.indexer.effectiveLanguage(absPath, nil); !ok {
+		return nil, nil
+	}
+	select {
+	case <-w.done:
+		return nil, errWatcherStopped
+	default:
+	}
+	if w.mutationBeforeAdmission != nil {
+		w.mutationBeforeAdmission()
+	}
+	ticket := w.scheduleFileMutation(absPath, ChangeModified)
+	if ticket == nil {
+		return nil, errWatcherStopped
+	}
+	return ticket, nil
+}
+
+// scheduleFileMutation is the single admission point for native events and
+// direct daemon mutations. A later admission supersedes every queued callback
+// for the same path; every earlier ticket stays attached until the newest patch
+// produces a terminal graph event.
+func (w *Watcher) scheduleFileMutation(path string, kind ChangeKind) *MutationTicket {
+	w.mu.Lock()
+	if w.stopping {
+		w.mu.Unlock()
+		return nil
+	}
+	if timer, exists := w.pending[path]; exists {
+		if timer.Stop() {
+			w.asyncWork.Done()
+		}
+	}
+	w.nextGeneration++
+	generation := w.nextGeneration
+	if w.pendingGeneration == nil {
+		w.pendingGeneration = make(map[string]uint64)
+	}
+	if w.mutationWaiters == nil {
+		w.mutationWaiters = make(map[string]map[uint64]chan MutationResult)
+	}
+	if w.mutationWaiters[path] == nil {
+		w.mutationWaiters[path] = make(map[uint64]chan MutationResult)
+	}
+	done := make(chan MutationResult, 1)
+	w.mutationWaiters[path][generation] = done
+	w.pendingGeneration[path] = generation
 	debounce := time.Duration(w.config.DebounceMs) * time.Millisecond
-	w.pending[path] = time.AfterFunc(debounce, func() {
-		// Clean up the pending entry even if the patch panics, then
-		// recover so a fatal store error can't crash the daemon.
-		defer func() {
-			w.mu.Lock()
-			delete(w.pending, path)
-			w.mu.Unlock()
-		}()
+	var timer *time.Timer
+	w.asyncWork.Add(1)
+	timer = time.AfterFunc(debounce, func() {
+		defer w.asyncWork.Done()
+		// Timer.Stop can lose a race with a callback that is already queued.
+		// Only the newest timer may consume the pending entry.
+		if !w.claimPendingTimer(path, &timer) {
+			return
+		}
+		if w.pointMutationClaimed != nil {
+			w.pointMutationClaimed(path)
+		}
+		patchErr := errMutationPatchAborted
+		superseded := false
 		defer w.guardWatcherPanic("patch " + path)
-		w.patchGraph(path, kind)
+		defer func() {
+			if !superseded {
+				w.completeMutationWaiters(path, generation, patchErr)
+			}
+		}()
+		patchErr = w.patchGraph(path, kind, generation)
+		if w.mutationAdmissionStopped() {
+			patchErr = errWatcherStopped
+		} else if w.mutationGenerationSuperseded(path, generation) {
+			patchErr = errMutationSuperseded
+			superseded = true
+			return
+		}
 	})
+	w.pending[path] = timer
 	w.mu.Unlock()
+	return &MutationTicket{Path: path, Generation: generation, Done: done}
+}
+
+func (w *Watcher) mutationAdmissionStopped() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.stopping
+}
+
+func (w *Watcher) completeMutationWaiters(path string, appliedGeneration uint64, err error) {
+	type completion struct {
+		requested uint64
+		done      chan MutationResult
+	}
+	w.mu.Lock()
+	var completions []completion
+	for generation, done := range w.mutationWaiters[path] {
+		if generation <= appliedGeneration {
+			completions = append(completions, completion{requested: generation, done: done})
+			delete(w.mutationWaiters[path], generation)
+		}
+	}
+	if len(w.mutationWaiters[path]) == 0 {
+		delete(w.mutationWaiters, path)
+	}
+	w.mu.Unlock()
+
+	for _, completion := range completions {
+		completion.done <- MutationResult{
+			RequestedGeneration: completion.requested,
+			AppliedGeneration:   appliedGeneration,
+			Reindexed:           err == nil,
+			Err:                 err,
+		}
+		close(completion.done)
+	}
+}
+
+func (w *Watcher) failMutationWaiters(err error) {
+	w.mu.Lock()
+	waiters := w.mutationWaiters
+	w.mutationWaiters = nil
+	w.mu.Unlock()
+	for _, byGeneration := range waiters {
+		for generation, done := range byGeneration {
+			done <- MutationResult{RequestedGeneration: generation, Err: err}
+			close(done)
+		}
+	}
+}
+
+func (w *Watcher) mutationGenerationSuperseded(path string, generation uint64) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	current, pending := w.pendingGeneration[path]
+	return pending && current != generation
+}
+
+// claimPendingTimer atomically consumes timer only when it is still the
+// newest debounce timer for path. time.Timer.Stop may return false after a
+// callback has been queued; without this identity check that stale callback
+// can delete a newer timer's pending entry and let later saves fan out into
+// redundant concurrent callbacks.
+func (w *Watcher) claimPendingTimer(path string, timerRef **time.Timer) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.pending[path] != *timerRef {
+		return false
+	}
+	delete(w.pending, path)
+	return true
 }
 
 // shouldEnterStorm records the current event in the rate window and
@@ -843,6 +1523,9 @@ func (w *Watcher) shouldEnterStorm() bool {
 
 	w.stormMu.Lock()
 	defer w.stormMu.Unlock()
+	if w.stormStopped {
+		return false
+	}
 	// Already batching — stay in storm until the drain completes.
 	if w.stormActive {
 		return true
@@ -872,72 +1555,216 @@ func (w *Watcher) shouldEnterStorm() bool {
 func (w *Watcher) recordInStorm(path string, kind ChangeKind) {
 	w.stormMu.Lock()
 	defer w.stormMu.Unlock()
+	if w.stormStopped {
+		return
+	}
 	w.stormActive = true
 	// Cancel any pending per-file timers for this path — storm mode
 	// takes over.
 	w.mu.Lock()
 	if timer, exists := w.pending[path]; exists {
-		timer.Stop()
+		if timer.Stop() {
+			w.asyncWork.Done()
+		}
 		delete(w.pending, path)
+		// The stopped callback can no longer complete its tickets: its
+		// claimPendingTimer identity check will fail after the delete above.
+		// Transfer the newest generation to the batch; completing through it
+		// also completes every earlier coalesced waiter for this path.
+		if generation := w.pendingGeneration[path]; generation != 0 {
+			if w.stormGenerations == nil {
+				w.stormGenerations = make(map[string]uint64)
+			}
+			w.stormGenerations[path] = generation
+		}
 	}
 	w.mu.Unlock()
 	w.stormBatch[path] = kind
 
 	quiet := time.Duration(w.config.StormQuietPeriodMs) * time.Millisecond
-	if w.stormTimer != nil {
-		w.stormTimer.Stop()
-	}
-	w.stormTimer = time.AfterFunc(quiet, w.drainStorm)
+	w.stopStormTimerLocked()
+	w.stormWork.Add(1)
+	w.stormTimer = time.AfterFunc(quiet, func() {
+		defer w.stormWork.Done()
+		w.drainStorm()
+	})
 }
 
-// drainStorm processes every path accumulated during the storm as a
-// single batch: per-path evict/index with the resolver stage skipped,
-// then one global ResolveAll at the end. Cuts a 500-file checkout
-// from "resolver runs 500 times" to "resolver runs once."
+// stopStormTimerLocked cancels the currently published quiet timer. A timer
+// owns one stormWork token from publication until either its callback returns
+// or Stop succeeds here; Timer.Stop false means the callback alone must Done.
+// stormMu must be held, which also prevents Add racing a shutdown Wait.
+func (w *Watcher) stopStormTimerLocked() {
+	if w.stormTimer == nil {
+		return
+	}
+	if w.stormTimer.Stop() {
+		w.stormWork.Done()
+	}
+	w.stormTimer = nil
+}
+
+// drainStorm processes every accumulated path through one bounded multi-file
+// parse/evict pipeline. The batch runner performs one receipt-scoped resolver
+// pass and one derived catch-up; no per-file transaction or graph-wide tail is
+// paid for a checkout-sized event burst.
 func (w *Watcher) drainStorm() {
 	defer w.guardWatcherPanic("storm-drain")
 	w.stormMu.Lock()
+	stopped := w.stormStopped
 	batch := w.stormBatch
+	generations := w.stormGenerations
 	w.stormBatch = make(map[string]ChangeKind)
+	w.stormGenerations = make(map[string]uint64)
 	w.eventTimes = nil
 	w.stormActive = false
 	drained := w.stormDrained
 	w.stormMu.Unlock()
 
-	if len(batch) == 0 {
+	if stopped {
+		w.completeStormMutationWaiters(generations, nil, errWatcherStopped)
 		return
 	}
-	start := time.Now()
-	w.logger.Info("watcher: storm drain starting", zap.Int("paths", len(batch)))
-
-	for path, kind := range batch {
-		w.patchGraphNoResolve(path, kind)
+	if len(batch) == 0 {
+		w.completeStormMutationWaiters(generations, nil, errMutationPatchAborted)
+		return
 	}
-	w.indexer.ResolveAll()
+	// A pending point patch may already have left the debounce queue when storm
+	// mode took over, and the adaptive poller enters patchGraph directly. Keep
+	// the batch's snapshot/mutation boundary serialized with both producers.
+	if w.stormBeforeLock != nil {
+		w.stormBeforeLock()
+	}
+	w.patchMu.Lock()
+	defer w.patchMu.Unlock()
+	var result *IndexResult
+	completionErr := errMutationPatchAborted
+	defer func() {
+		w.completeStormMutationWaiters(generations, result, completionErr)
+	}()
+	paths := make([]string, 0, len(batch))
+	for path := range batch {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
 
+	start := time.Now()
+	w.logger.Info("watcher: storm drain starting", zap.Int("paths", len(paths)))
+	finishTopologyMutation := reach.BeginTopologyMutation(w.indexer.graph)
+	mutationFinished := false
+	defer func() {
+		if !mutationFinished {
+			// The batch is non-empty and may have partially applied before a
+			// panic. Invalidate conservatively before unblocking readers.
+			finishTopologyMutation(true)
+		}
+	}()
+
+	var err error
+	result, err = w.reindexStormPaths(paths)
+	completionErr = err
+	// A batch-level error can arrive after sibling files committed. Invalidate
+	// conservatively and report it without retrying every path one-by-one.
+	finishTopologyMutation(true)
+	mutationFinished = true
+
+	reindexed, deleted, failed := 0, 0, 0
+	if result != nil {
+		reindexed = result.StaleFileCount
+		deleted = result.DeletedFileCount
+		failed = len(result.FailedFiles)
+	}
+	if err != nil {
+		w.logger.Warn("watcher: storm drain failed",
+			zap.Int("paths", len(paths)), zap.Error(err))
+	}
 	w.logger.Info("watcher: storm drain complete",
-		zap.Int("paths", len(batch)),
+		zap.Int("paths", len(paths)),
+		zap.Int("reindexed", reindexed),
+		zap.Int("deleted", deleted),
+		zap.Int("failed", failed),
 		zap.Duration("elapsed", time.Since(start)))
 	if drained != nil {
 		drained(len(batch))
 	}
 }
 
-// patchGraphNoResolve is patchGraph for the batched path: same evict
-// / index dispatch, but without per-file resolver work. The caller is
-// responsible for running indexer.ResolveAll() after the batch.
-func (w *Watcher) patchGraphNoResolve(path string, kind ChangeKind) {
-	// Same disk-truth reconciliation as patchGraph: a storm-batched
-	// replace must not be evicted as a delete when the file is present.
-	kind = w.reconcileKindWithDisk(path, kind)
-	switch kind {
-	case ChangeCreated, ChangeModified:
-		if err := w.indexer.IndexFileNoResolve(path); err != nil {
-			w.logger.Warn("storm: index file failed",
-				zap.String("path", path), zap.Error(err))
+// completeStormMutationWaiters publishes a storm batch's terminal outcome to
+// every direct-mutation ticket whose debounce timer the batch adopted. Waiters
+// are detached in one critical section and notified after the lock is released,
+// so a thousand-path storm does not pay one lock handoff per ticket and Stop can
+// never race this path into a double close.
+func (w *Watcher) completeStormMutationWaiters(
+	generations map[string]uint64,
+	result *IndexResult,
+	batchErr error,
+) {
+	if len(generations) == 0 {
+		return
+	}
+	failed := make(map[string]struct{})
+	if result != nil {
+		failed = make(map[string]struct{}, len(result.FailedFiles))
+		for _, path := range result.FailedFiles {
+			failed[filepath.Clean(path)] = struct{}{}
 		}
-	case ChangeDeleted, ChangeRenamed:
-		w.indexer.EvictFile(path)
+	}
+	type completion struct {
+		done   chan MutationResult
+		result MutationResult
+	}
+	completions := make([]completion, 0, len(generations))
+
+	w.mu.Lock()
+	for path, appliedGeneration := range generations {
+		pathErr := batchErr
+		if pathErr == nil && result == nil {
+			pathErr = errors.New("storm mutation batch completed without a result")
+		}
+		if pathErr == nil {
+			if _, pathFailed := failed[filepath.Clean(path)]; pathFailed {
+				pathErr = fmt.Errorf("storm mutation batch failed to index %s", path)
+			}
+		}
+		if w.pendingGeneration[path] == appliedGeneration {
+			delete(w.pendingGeneration, path)
+		}
+		for requestedGeneration, done := range w.mutationWaiters[path] {
+			if requestedGeneration > appliedGeneration {
+				continue
+			}
+			completions = append(completions, completion{
+				done: done,
+				result: MutationResult{
+					RequestedGeneration: requestedGeneration,
+					AppliedGeneration:   appliedGeneration,
+					Reindexed:           pathErr == nil,
+					Err:                 pathErr,
+				},
+			})
+			delete(w.mutationWaiters[path], requestedGeneration)
+		}
+		if len(w.mutationWaiters[path]) == 0 {
+			delete(w.mutationWaiters, path)
+		}
+	}
+	w.mu.Unlock()
+
+	for _, completion := range completions {
+		completion.done <- completion.result
+		close(completion.done)
+	}
+}
+
+// patchGraphNoResolve is retained as a compatibility seam for focused watcher
+// tests and older in-package callers. It no longer performs point mutations:
+// even a single path goes through the same batch runner used by drainStorm.
+func (w *Watcher) patchGraphNoResolve(path string, kind ChangeKind) {
+	kind = w.reconcileKindWithDisk(path, kind)
+	_ = kind // disk truth is consumed by IncrementalReindexPaths.
+	if _, err := w.reindexStormPaths([]string{path}); err != nil {
+		w.logger.Warn("storm: batched index failed",
+			zap.String("path", path), zap.Error(err))
 	}
 }
 
@@ -970,9 +1797,72 @@ func (w *Watcher) reconcileKindWithDisk(path string, kind ChangeKind) ChangeKind
 	return kind
 }
 
-func (w *Watcher) patchGraph(path string, kind ChangeKind) {
+// forgetDeletedFileMtime drops a just-evicted file's recorded mtime from
+// both the in-memory map and the store's FileMtime sidecar. EvictFile
+// removes the file's nodes but leaves its mtime behind, so without this the
+// persisted mtime row outlives the file: the next warm restart reads it
+// back, finds the path gone from disk, and treats it as a phantom deletion
+// — re-running a scoped reconcile for a file that is already correct on
+// every boot. Mirrors IncrementalReindex's deletion handling: prune the
+// in-memory map first (pruneDeletedFileMtimes documents that its caller has
+// already done so, and a later snapshot persist would otherwise resurrect
+// the row from the stale in-memory entry), then the store, which self-skips
+// on a backend without the FileMtimeDeleter capability. relPath must be the
+// canonical relKey the mtime map and store are keyed on — the same key
+// EvictFile evicted the file's nodes under.
+func (w *Watcher) forgetDeletedFileMtime(relPath string) {
+	w.indexer.mtimeMu.Lock()
+	delete(w.indexer.fileMtimes, relPath)
+	w.indexer.mtimeMu.Unlock()
+	w.indexer.pruneDeletedFileMtimes([]string{relPath})
+}
+
+func (w *Watcher) generationCurrent(path string, generation uint64) bool {
+	if generation == 0 {
+		return true
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.pendingGeneration[path] == generation
+}
+
+func (w *Watcher) finishGeneration(path string, generation uint64) {
+	if generation == 0 {
+		return
+	}
+	w.mu.Lock()
+	if w.pendingGeneration[path] == generation {
+		delete(w.pendingGeneration, path)
+	}
+	w.mu.Unlock()
+}
+
+func (w *Watcher) patchGraph(path string, kind ChangeKind, generations ...uint64) error {
+	var generation uint64
+	if len(generations) > 0 {
+		generation = generations[0]
+	}
+	return w.patchGraphWithReceiptState(path, kind, generation, false)
+}
+
+// patchGraphAfterReceiptCheck is used only by the Darwin startup barrier,
+// whose set-oriented receipt pass has already decided that this path is not an
+// unchanged replay. It prevents ChangeModified from repeating that SQL lookup
+// one path at a time inside the ordinary point-mutation path.
+func (w *Watcher) patchGraphAfterReceiptCheck(path string, kind ChangeKind) error {
+	return w.patchGraphWithReceiptState(path, kind, 0, true)
+}
+
+func (w *Watcher) patchGraphWithReceiptState(path string, kind ChangeKind, generation uint64, receiptChecked bool) error {
+	if !w.generationCurrent(path, generation) {
+		return errMutationSuperseded
+	}
+	defer w.finishGeneration(path, generation)
 	w.patchMu.Lock()
 	defer w.patchMu.Unlock()
+	if !w.generationCurrent(path, generation) {
+		return errMutationSuperseded
+	}
 	// A replace/revert (rename-over or unlink+recreate) reaches us as a
 	// delete/rename even though a file is right back at the same path;
 	// reconcile against disk so it takes the parse-then-swap + incoming-
@@ -980,28 +1870,60 @@ func (w *Watcher) patchGraph(path string, kind ChangeKind) {
 	// the definition's callers. A vanished create/modify becomes a delete.
 	kind = w.reconcileKindWithDisk(path, kind)
 	start := time.Now()
+	classification := "structural"
 	var nodesAdded, nodesRemoved, edgesAdded, edgesRemoved int
+	var finishTopologyMutation func(bool)
+	topologyChanged := false
+	// Keep a panic/error-safe release so no lookup can remain parked behind the
+	// reach topology gate if an incremental path exits early.
+	defer func() {
+		if finishTopologyMutation != nil {
+			finishTopologyMutation(topologyChanged)
+		}
+	}()
+	beginTopologyMutation := func() {
+		finishTopologyMutation = reach.BeginTopologyMutation(w.indexer.graph)
+		// Conservatively invalidate after every structural reindex attempt. Most
+		// parse failures leave the old graph untouched, but treating that as a
+		// cache miss is safer than trusting count-based telemetry to prove no
+		// resolver edge was retargeted.
+		topologyChanged = true
+	}
+	endTopologyMutation := func() {
+		if finishTopologyMutation == nil {
+			return
+		}
+		finishTopologyMutation(topologyChanged)
+		finishTopologyMutation = nil
+	}
 
-	// Compute the relative path for snapshotting old symbols. RelKey
-	// folds it to the canonical key (slash form, Unicode NFC) so the
-	// GetFileNodes / snapshotSymbols lookups below hit the same graph
-	// key the indexer stored — a watcher event for a non-ASCII-named
-	// file arrives in the filesystem's Unicode form (NFD on macOS),
-	// which would otherwise miss an NFC-keyed node.
+	// Two keys for this file. relPath (RelKey: slash form + NFC) is the
+	// mtime-forget / change-callback key. graphKey (graphRelKey:
+	// OS-native separators + NFC, repo-prefixed) is what the graph
+	// stores the file's nodes under, so the GetFileNodes /
+	// snapshotSymbols lookups below MUST use it — a slash-form key
+	// misses the backslash-keyed nodes on Windows and would report every
+	// symbol as added/removed. Both fold an NFD (macOS) event path to
+	// NFC so a non-ASCII name still hits the indexed node. On POSIX the
+	// two keys coincide.
 	relPath := path
+	graphKey := path
 	if w.indexer.rootPath != "" {
 		relPath = w.indexer.RelKey(path)
+		graphKey = w.indexer.prefixPath(w.indexer.graphRelKey(path))
 	}
 
 	switch kind {
 	case ChangeCreated:
+		beginTopologyMutation()
 		if err := w.indexer.IndexFile(path); err != nil {
 			w.logger.Warn("index file failed", zap.String("path", path), zap.Error(err))
-			return
+			return err
 		}
-		newSymbols := w.indexer.graph.GetFileNodes(relPath)
+		newSymbols := w.indexer.graph.GetFileNodes(graphKey)
 		nodesAdded = len(newSymbols)
 		edgesAdded = w.countFileEdges(newSymbols)
+		endTopologyMutation()
 
 		// Notify callback: no old symbols, only new symbols.
 		w.symbolChangeCbMu.RLock()
@@ -1012,45 +1934,104 @@ func (w *Watcher) patchGraph(path string, kind ChangeKind) {
 		}
 
 	case ChangeModified:
-		// Snapshot old symbols before eviction.
-		oldSymbols := w.snapshotSymbols(relPath)
+		// Native backends and the adaptive poller deliberately overlap. A late
+		// startup replay or duplicate report can therefore arrive after the file
+		// is already committed. Mtime is only the fast receipt gate: equal values
+		// are confirmed against the persisted content hash, so a timestamp-
+		// preserving real edit still enters the normal mutation lifecycle.
+		if !receiptChecked && w.indexer.fileMtimeMatches(path) {
+			return nil
+		}
+		// Read the prior file state once. It supplies the callback snapshot,
+		// gross change telemetry and the durable raw-extraction fingerprint;
+		// repeating GetFileNodes here is particularly costly when SQLite is
+		// under analysis load.
+		snapshotStarted := time.Now()
+		priorNodes := w.indexer.graph.GetFileNodes(graphKey)
+		oldSymbols := make([]*graph.Node, 0, len(priorNodes))
+		for _, n := range priorNodes {
+			if n == nil || n.Kind == graph.KindFile || n.Kind == graph.KindImport {
+				continue
+			}
+			cp := &graph.Node{ID: n.ID, Kind: n.Kind, Name: n.Name, QualName: n.QualName, FilePath: n.FilePath}
+			if sig, ok := n.Meta["signature"]; ok {
+				cp.Meta = map[string]any{"signature": sig}
+			}
+			oldSymbols = append(oldSymbols, cp)
+		}
+		snapshotDuration := time.Since(snapshotStarted)
 
-		// Content-aware skip: if the saved file's structural symbols
-		// are byte-for-byte identical to the ones already in the
-		// graph, the change touched no Function / Type / Method /
-		// etc. — a comment-only edit, a whitespace reflow, a doc
-		// change, or a config / JSON value save. Re-indexing it would
-		// evict and rebuild every node for no graph-level effect, so
-		// skip the structural reindex entirely. The probe is
-		// read-only; only on a proven match do we take the cheap
-		// path. A probe that can't run (unknown language, over-cap
-		// file, parser quarantine) returns ok == false and falls
-		// through to the normal reindex.
-		if newSymbols, ok := w.indexer.StructuralSymbols(path); ok &&
-			structuralFingerprint(newSymbols) == structuralFingerprint(oldSymbols) {
-			w.recordInertModify(path, relPath, oldSymbols, start)
-			return
+		// Parse once and compare the complete post-coverage extraction, not
+		// only declarations. A changed call target, doc, TODO, location,
+		// metadata field or edge changes this fingerprint and must patch the
+		// graph. Only a byte-for-byte-equivalent graph output is inert. The
+		// prepared extraction is consumed by IndexFile below, avoiding the old
+		// double parse on structural edits.
+		probe, probeOK := w.indexer.prepareFileDelta(path)
+		if !w.generationCurrent(path, generation) {
+			w.indexer.discardPreparedExtraction(path)
+			return errMutationSuperseded
+		}
+		stored := storedExtractionGraphFingerprints(priorNodes)
+		classification := "structural"
+		if probeOK && stored.semantic != "" {
+			switch {
+			case probe.fingerprints.semantic == stored.semantic && probe.fingerprints.metadata == stored.metadata:
+				w.indexer.discardPreparedExtraction(path)
+				w.logger.Info("watcher: inert delta phases",
+					zap.String("file", path), zap.String("delta_class", "inert"),
+					zap.Duration("snapshot", snapshotDuration), zap.Duration("read", probe.read),
+					zap.Duration("extract", probe.extract), zap.Duration("coverage", probe.coverage),
+					zap.Duration("fingerprint", probe.fingerprintTime))
+				fresh := w.recordInertModify(path, relPath, oldSymbols, start, probe.readVersion)
+				if !fresh {
+					return errFileVersionChanged
+				}
+				return nil
+			case probe.fingerprints.semantic == stored.semantic:
+				var refreshed []*graph.Node
+				var applied, fresh bool
+				if generation == 0 {
+					refreshed, applied, fresh = w.indexer.applyPreparedMetadataRefresh(path, priorNodes)
+				} else {
+					// Serialise generation validation with the bounded commit. A newer
+					// event cannot register between the byte check and fingerprint/mtime write.
+					w.mu.Lock()
+					if w.pendingGeneration[path] == generation {
+						refreshed, applied, fresh = w.indexer.applyPreparedMetadataRefresh(path, priorNodes)
+					}
+					w.mu.Unlock()
+				}
+				if applied {
+					w.logger.Info("watcher: metadata-only delta phases",
+						zap.String("file", path), zap.String("delta_class", "metadata_only"),
+						zap.Duration("snapshot", snapshotDuration), zap.Duration("read", probe.read),
+						zap.Duration("extract", probe.extract), zap.Duration("coverage", probe.coverage),
+						zap.Duration("fingerprint", probe.fingerprintTime))
+					w.recordMetadataModify(path, relPath, oldSymbols, refreshed, start)
+					if !fresh {
+						return errFileVersionChanged
+					}
+					return nil
+				}
+			case stored.core != "" && probe.fingerprints.core == stored.core:
+				classification = "artifact_only"
+			}
 		}
 
-		// Do NOT pre-evict. IndexFile parse-then-swaps internally: it
-		// evicts the file's prior nodes and re-adds the new ones only on a
-		// successful parse, and leaves the prior nodes intact on a parse
-		// failure. Pre-evicting here was the node-loss bug — a transiently
-		// unparseable save (mid-edit) dropped the file's symbols from the
-		// graph until the next clean save. Capture the file's prior node
-		// count first (still present pre-swap) so removed/added telemetry
-		// stays gross: a rename removes one node and adds one even though
-		// the net node delta is zero.
-		priorNodes := w.indexer.graph.GetFileNodes(relPath)
+		// Do NOT pre-evict. IndexFile parse-then-swaps internally and consumes
+		// the prepared extraction when its transformed bytes still match.
+		reindexStarted := time.Now()
 		fileEdgesBefore := w.countFileEdges(priorNodes)
 		resolvedBefore := w.countResolvedFileEdges(priorNodes)
 		incomingBeforeByID := w.resolvedIncomingByNode(priorNodes)
+		beginTopologyMutation()
 		if err := w.indexer.IndexFile(path); err != nil {
 			w.logger.Warn("reindex file failed", zap.String("path", path), zap.Error(err))
-			return
+			return err
 		}
 		nodesRemoved = len(priorNodes)
-		newSymbols := w.indexer.graph.GetFileNodes(relPath)
+		newSymbols := w.indexer.graph.GetFileNodes(graphKey)
 		nodesAdded = len(newSymbols)
 		// Edge churn scoped to this file's nodes. A graph-wide
 		// EdgeCount delta would also pick up edges landed by whatever
@@ -1068,6 +2049,18 @@ func (w *Watcher) patchGraph(path string, kind ChangeKind) {
 		// self-heals instead of persisting the degraded shape.
 		incomingBefore, incomingAfter := w.incomingRegressionForSurvivors(incomingBeforeByID, newSymbols)
 		w.guardResolvedEdgeRegression(path, len(priorNodes), len(newSymbols), resolvedBefore, w.countResolvedFileEdges(newSymbols), incomingBefore, incomingAfter)
+		endTopologyMutation()
+		w.logger.Info("watcher: structural delta phases",
+			zap.String("file", path),
+			zap.String("delta_class", classification),
+			zap.Duration("snapshot", snapshotDuration),
+			zap.Duration("read", probe.read),
+			zap.Duration("extract", probe.extract),
+			zap.Duration("coverage", probe.coverage),
+			zap.Duration("fingerprint", probe.fingerprintTime),
+			zap.Duration("reindex", time.Since(reindexStarted)),
+			zap.Bool("probe_complete", probeOK),
+			zap.Bool("clone_pending", w.indexer.CloneIndexPending()))
 
 		// Notify callback with old and new symbols.
 		w.symbolChangeCbMu.RLock()
@@ -1079,11 +2072,31 @@ func (w *Watcher) patchGraph(path string, kind ChangeKind) {
 
 	case ChangeDeleted, ChangeRenamed:
 		// Snapshot old symbols before eviction.
-		oldSymbols := w.snapshotSymbols(relPath)
+		oldSymbols := w.snapshotSymbols(graphKey)
 
+		beginTopologyMutation()
 		nr, er := w.indexer.EvictFile(path)
 		nodesRemoved = nr
 		edgesRemoved = er
+		topologyChanged = nr > 0 || er > 0
+		endTopologyMutation()
+
+		// The file is genuinely gone from disk here — reconcileKindWithDisk
+		// already downgraded a replace/revert (path still present) to
+		// ChangeModified. Drop its now-orphaned mtime so a warm restart does
+		// not re-discover the vanished path as a phantom deletion. relPath is
+		// the canonical relKey EvictFile evicted under.
+		w.forgetDeletedFileMtime(relPath)
+		// fsnotify and the adaptive poller are deliberately redundant. They
+		// may both report the same deletion, but only the producer that
+		// actually removed graph topology represents a semantic change. Do
+		// not publish a second empty callback/history/event: consumers would
+		// otherwise lose the pre-delete symbol snapshot or repeat downstream
+		// invalidation work. EvictFile's zero delta is authoritative even for
+		// source files that contain no symbols of their own.
+		if nr == 0 && er == 0 {
+			return nil
+		}
 
 		// Notify callback: old symbols removed, no new symbols.
 		w.symbolChangeCbMu.RLock()
@@ -1095,29 +2108,22 @@ func (w *Watcher) patchGraph(path string, kind ChangeKind) {
 	}
 
 	ev := GraphChangeEvent{
-		FilePath:     path,
-		Kind:         kind,
-		NodesAdded:   nodesAdded,
-		NodesRemoved: nodesRemoved,
-		EdgesAdded:   edgesAdded,
-		EdgesRemoved: edgesRemoved,
-		Timestamp:    time.Now(),
-		DurationMs:   time.Since(start).Milliseconds(),
+		FilePath:       path,
+		Kind:           kind,
+		Classification: classification,
+		NodesAdded:     nodesAdded,
+		NodesRemoved:   nodesRemoved,
+		EdgesAdded:     edgesAdded,
+		EdgesRemoved:   edgesRemoved,
+		Timestamp:      time.Now(),
+		DurationMs:     time.Since(start).Milliseconds(),
 	}
 
-	// Rebuild the reachability index so AnalyzeImpact /
-	// explain_change_impact stay correct against the patched topology.
-	// Lazy reach: instead of eagerly recomputing every seed's reach
-	// after a watcher-driven patch (the old reach.BuildIndex call
-	// here paid the full O(seeds) cost on every file edit), we just
-	// invalidate the build counter so subsequent AnalyzeImpact calls
-	// recompute on demand against the fresh graph. No-op patches
-	// (nodesAdded == 0 && nodesRemoved == 0 && edgesAdded == 0 &&
-	// edgesRemoved == 0) leave the counter alone so existing caches
-	// stay valid.
-	if nodesAdded+nodesRemoved+edgesAdded+edgesRemoved > 0 {
-		reach.InvalidateIndex()
-	}
+	// Reach invalidation is published by endTopologyMutation before any
+	// callbacks or events can observe the new graph. The topology gate spans
+	// IndexFile's parse-then-swap and nested resolver work without taking the
+	// resolver's non-reentrant mutex twice; impact readers therefore see the
+	// complete old graph or the complete new graph, never the eviction gap.
 
 	w.historyMu.Lock()
 	w.history = append(w.history, ev)
@@ -1141,6 +2147,7 @@ func (w *Watcher) patchGraph(path string, kind ChangeKind) {
 		zap.Int("edges-", edgesRemoved),
 		zap.Int64("ms", ev.DurationMs),
 	)
+	return nil
 }
 
 // countFileEdges counts the edges incident to the given file nodes:
@@ -1309,19 +2316,23 @@ func (w *Watcher) incomingRegressionForSurvivors(before map[string]int, after []
 // runs at most one drainer goroutine and only ever O(file) scoped re-resolves
 // (never a whole-graph pass). reresolveFn is a test seam.
 func (w *Watcher) enqueueReresolve(path string) {
-	w.reconcileMu.Lock()
+	if !w.beginReconcileWork() {
+		return
+	}
 	if w.pendingReresolve == nil {
 		w.pendingReresolve = make(map[string]struct{})
 	}
 	w.pendingReresolve[path] = struct{}{}
 	if w.reresolveActive {
 		w.reconcileMu.Unlock()
+		w.asyncWork.Done()
 		return
 	}
 	w.reresolveActive = true
 	w.reconcileMu.Unlock()
 
 	go func() {
+		defer w.asyncWork.Done()
 		for {
 			w.reconcileMu.Lock()
 			files := w.pendingReresolve
@@ -1367,47 +2378,55 @@ func (w *Watcher) enqueueReresolve(path string) {
 //
 // The reachability index is intentionally not rebuilt — the topology
 // did not change, so the existing reach stamps stay valid.
-func (w *Watcher) recordInertModify(path, relPath string, symbols []*graph.Node, start time.Time) {
-	// Advance the recorded mtime past this save so the poller does
-	// not treat the (untouched) file as perpetually stale.
-	w.indexer.RefreshFileMtime(path)
+func (w *Watcher) recordInertModify(path, relPath string, symbols []*graph.Node, start time.Time, version fileReadVersion) bool {
+	// Claim only the exact byte version whose fingerprints were compared. A
+	// later write must stay dirty for the next poll/native event even though the
+	// earlier, real save still owns this inert event and callback.
+	fresh := w.indexer.recordFileReadVersion(relPath, path, version)
+	w.recordNonStructuralModify(path, relPath, symbols, symbols, "inert", start)
+	return fresh
+}
 
-	ev := GraphChangeEvent{
-		FilePath:   path,
-		Kind:       ChangeModified,
-		Timestamp:  time.Now(),
-		DurationMs: time.Since(start).Milliseconds(),
+func (w *Watcher) recordMetadataModify(path, relPath string, oldSymbols, refreshed []*graph.Node, start time.Time) {
+	newSymbols := make([]*graph.Node, 0, len(refreshed))
+	for _, node := range refreshed {
+		if node == nil || node.Kind == graph.KindFile || node.Kind == graph.KindImport {
+			continue
+		}
+		newSymbols = append(newSymbols, node)
 	}
+	w.recordNonStructuralModify(path, relPath, oldSymbols, newSymbols, "metadata_only", start)
+}
 
+func (w *Watcher) recordNonStructuralModify(path, relPath string, oldSymbols, newSymbols []*graph.Node, classification string, start time.Time) {
+	ev := GraphChangeEvent{
+		FilePath: path, Kind: ChangeModified, Classification: classification,
+		Timestamp: time.Now(), DurationMs: time.Since(start).Milliseconds(),
+	}
 	w.historyMu.Lock()
 	w.history = append(w.history, ev)
 	if len(w.history) > maxHistory {
 		w.history = w.history[len(w.history)-maxHistory:]
 	}
 	w.historyMu.Unlock()
-
 	select {
 	case w.events <- ev:
 	default:
 	}
-
 	w.symbolChangeCbMu.RLock()
 	cb := w.symbolChangeCb
 	w.symbolChangeCbMu.RUnlock()
 	if cb != nil {
-		cb(relPath, symbols, symbols)
+		cb(relPath, oldSymbols, newSymbols)
 	}
-
-	w.logger.Info("graph patch skipped: structurally inert change",
-		zap.String("file", path),
-		zap.Int64("ms", ev.DurationMs),
-	)
+	w.logger.Info("graph patch: non-structural change",
+		zap.String("file", path), zap.String("delta_class", classification), zap.Int64("ms", ev.DurationMs))
 }
 
 // snapshotSymbols returns a deep copy of the symbols for a file, preserving
 // their signatures in Meta so they can be compared after re-indexing.
-func (w *Watcher) snapshotSymbols(relPath string) []*graph.Node {
-	nodes := w.indexer.graph.GetFileNodes(relPath)
+func (w *Watcher) snapshotSymbols(graphKey string) []*graph.Node {
+	nodes := w.indexer.graph.GetFileNodes(graphKey)
 	snapshot := make([]*graph.Node, 0, len(nodes))
 	for _, n := range nodes {
 		// Skip file and import nodes — we only track code symbols.
@@ -1427,34 +2446,6 @@ func (w *Watcher) snapshotSymbols(relPath string) []*graph.Node {
 		snapshot = append(snapshot, cp)
 	}
 	return snapshot
-}
-
-// structuralFingerprint reduces a set of symbols to an order-independent
-// string identity built only from each structural symbol's kind, name,
-// qualified name, and signature — never its line range. Two snapshots
-// of the same file taken before and after an edit produce an equal
-// fingerprint exactly when the edit changed no structural symbol: a
-// comment-only change, a whitespace reflow, or a doc / config-value
-// edit shifts line numbers but leaves every (kind, name, sig) tuple
-// intact, while renaming a function, changing a signature, or
-// adding / removing a declaration changes the fingerprint.
-//
-// Non-structural nodes (file, import, params, closures, coverage-domain
-// kinds) are skipped so a change confined to them is still treated as
-// inert — they carry no structural graph shape.
-func structuralFingerprint(symbols []*graph.Node) string {
-	lines := make([]string, 0, len(symbols))
-	for _, n := range symbols {
-		if !isStructuralKind(n.Kind) {
-			continue
-		}
-		sig, _ := n.Meta["signature"].(string)
-		// NUL separates fields so a value containing the field
-		// delimiter can't forge a collision across two symbols.
-		lines = append(lines, string(n.Kind)+"\x00"+n.Name+"\x00"+n.QualName+"\x00"+sig)
-	}
-	sort.Strings(lines)
-	return strings.Join(lines, "\n")
 }
 
 // normalizeEventPath aligns an event path emitted by the OS-level

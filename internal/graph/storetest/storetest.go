@@ -67,9 +67,14 @@ func RunConformance(t *testing.T, factory Factory) {
 	t.Run("EdgesByKind", func(t *testing.T) { testEdgesByKind(t, factory) })
 	t.Run("NodesByKind", func(t *testing.T) { testNodesByKind(t, factory) })
 	t.Run("EdgesWithUnresolvedTarget", func(t *testing.T) { testEdgesWithUnresolvedTarget(t, factory) })
+	t.Run("FnValuePlaceholderEdges", func(t *testing.T) { testFnValuePlaceholderEdges(t, factory) })
+	t.Run("NodeLightScanner", func(t *testing.T) { testNodeLightScanner(t, factory) })
+	t.Run("LightEdgeScanner", func(t *testing.T) { testLightEdgeScanner(t, factory) })
 	t.Run("GetNodesByIDs", func(t *testing.T) { testGetNodesByIDs(t, factory) })
 	t.Run("FindNodesByNames", func(t *testing.T) { testFindNodesByNames(t, factory) })
 	t.Run("GetEdgesByNodeIDs", func(t *testing.T) { testGetEdgesByNodeIDs(t, factory) })
+	t.Run("GetRepoNodesByLanguage", func(t *testing.T) { testGetRepoNodesByLanguage(t, factory) })
+	t.Run("DistinctExternalTargets", func(t *testing.T) { testDistinctExternalTargets(t, factory) })
 	t.Run("SymbolBundleSearcher", func(t *testing.T) { testSymbolBundleSearcher(t, factory) })
 	t.Run("DeadCodeCandidator", func(t *testing.T) { testDeadCodeCandidator(t, factory) })
 	t.Run("IfaceImplementsScanner", func(t *testing.T) { testIfaceImplementsScanner(t, factory) })
@@ -654,6 +659,26 @@ func testReindexEdges(t *testing.T, factory Factory) {
 		t.Fatalf("GetOutEdges(a) after batch reindex = %d, want 3", got)
 	}
 
+	// Full-identity refresh updates source location/meta while preserving the
+	// resolver-selected target and adjacency.
+	oldLine := e1.Line
+	refreshed := *e1
+	refreshed.Line = 41
+	refreshed.Meta = map[string]any{"doc": "shifted"}
+	s.ReindexEdges([]graph.EdgeReindex{{
+		Edge: &refreshed, OldTo: e1.To, OldFilePath: e1.FilePath,
+		OldLine: oldLine, RefreshIdentity: true,
+	}})
+	var found *graph.Edge
+	for _, edge := range s.GetOutEdges("a") {
+		if edge.To == "z" && edge.Line == 41 {
+			found = edge
+		}
+	}
+	if found == nil {
+		t.Fatal("full-identity refresh did not move edge line while preserving target")
+	}
+
 	// Empty batch is a no-op.
 	s.ReindexEdges(nil)
 	s.ReindexEdges([]graph.EdgeReindex{})
@@ -944,23 +969,38 @@ func testEdgesWithUnresolvedTarget(t *testing.T, factory Factory) {
 	// the canonical matcher for both encodings.
 	e5 := mkEdge("a", "gortex::unresolved::Baz", graph.EdgeCalls)
 	e5.Line = 5
+	// Gate-owned fn-value placeholders: a captured function value parks at
+	// `unresolved::fnvalue::<name>` (bare and multi-repo forms) until the
+	// callback gate binds it. is_unresolved is 1 for them (they live in the
+	// unresolved space), but the master resolver can never bind them, so the
+	// pending scan MUST exclude both forms — otherwise they are pure bloat on
+	// the set the resolver reconciles every pass.
+	e6 := mkEdge("a", "unresolved::fnvalue::handler", graph.EdgeReferences)
+	e6.Line = 6
+	e7 := mkEdge("a", "gortex::unresolved::fnvalue::handler", graph.EdgeReferences)
+	e7.Line = 7
 	s.AddEdge(e1)
 	s.AddEdge(e2)
 	s.AddEdge(e3)
 	s.AddEdge(e4)
 	s.AddEdge(e5)
+	s.AddEdge(e6)
+	s.AddEdge(e7)
 
 	var unres []*graph.Edge
 	for e := range s.EdgesWithUnresolvedTarget() {
 		unres = append(unres, e)
 	}
 	if len(unres) != 3 {
-		t.Fatalf("EdgesWithUnresolvedTarget yielded %d, want 3 (unresolved::Foo, unresolved::Bar, gortex::unresolved::Baz)", len(unres))
+		t.Fatalf("EdgesWithUnresolvedTarget yielded %d, want 3 (unresolved::Foo, unresolved::Bar, gortex::unresolved::Baz); fn-value placeholders must be excluded", len(unres))
 	}
 	gotPrefixed := false
 	for _, e := range unres {
 		if !graph.IsUnresolvedTarget(e.To) {
 			t.Fatalf("yielded edge has non-unresolved To: %s", e.To)
+		}
+		if graph.IsFnValuePlaceholder(e.To) {
+			t.Fatalf("EdgesWithUnresolvedTarget yielded a gate-owned fn-value placeholder %q: the resolver pending scan must exclude both the bare and multi-repo forms", e.To)
 		}
 		if e.To == "gortex::unresolved::Baz" {
 			gotPrefixed = true
@@ -968,6 +1008,159 @@ func testEdgesWithUnresolvedTarget(t *testing.T, factory Factory) {
 	}
 	if !gotPrefixed {
 		t.Fatalf("EdgesWithUnresolvedTarget did not yield the multi-repo prefixed stub gortex::unresolved::Baz")
+	}
+}
+
+// testFnValuePlaceholderEdges pins graph.FnValuePlaceholderScanner: the scan
+// must return EXACTLY the fn-value gate placeholders (both the bare and the
+// multi-repo COPY-rewrite forms) and nothing else — not real references, not
+// non-fnvalue unresolved stubs, not resolved edges. It is the mirror image of
+// testEdgesWithUnresolvedTarget's exclusion.
+func testFnValuePlaceholderEdges(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	sc, ok := s.(graph.FnValuePlaceholderScanner)
+	if !ok {
+		t.Skip("backend does not implement FnValuePlaceholderScanner")
+	}
+	s.AddNode(mkNode("a", "A", "x.go", graph.KindFunction))
+	s.AddEdge(mkEdge("a", "b", graph.EdgeReferences))          // real reference — not a placeholder
+	s.AddEdge(mkEdge("a", "unresolved::Foo", graph.EdgeCalls)) // unresolved, but not fn-value
+	s.AddEdge(mkEdge("a", "resolved", graph.EdgeReferences))   // resolved
+	ph1 := mkEdge("a", "unresolved::fnvalue::handler", graph.EdgeReferences)
+	ph1.Line = 6
+	ph2 := mkEdge("a", "gortex::unresolved::fnvalue::handler", graph.EdgeReferences)
+	ph2.Line = 7
+	s.AddEdge(ph1)
+	s.AddEdge(ph2)
+
+	seen := map[string]bool{}
+	for e := range sc.FnValuePlaceholderEdges() {
+		if !graph.IsFnValuePlaceholder(e.To) {
+			t.Fatalf("FnValuePlaceholderEdges yielded a non-placeholder To: %s", e.To)
+		}
+		seen[e.To] = true
+	}
+	if len(seen) != 2 {
+		t.Fatalf("FnValuePlaceholderEdges yielded %d distinct placeholders, want 2 (bare + multi-repo forms only); got %v", len(seen), seen)
+	}
+	if !seen["unresolved::fnvalue::handler"] {
+		t.Fatalf("FnValuePlaceholderEdges missed the bare form; got %v", seen)
+	}
+	if !seen["gortex::unresolved::fnvalue::handler"] {
+		t.Fatalf("FnValuePlaceholderEdges missed the multi-repo COPY-rewrite form; got %v", seen)
+	}
+}
+
+// testNodeLightScanner proves a whole-graph summary projection preserves the
+// identity/location fields its analysis callers consume while omitting all
+// Meta, including promoted docs and signatures.
+func testNodeLightScanner(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	sc, ok := s.(graph.NodeLightScanner)
+	if !ok {
+		t.Skip("backend does not implement NodeLightScanner")
+	}
+
+	a := mkNode("repo/pkg/a.go::A", "A", "pkg/a.go", graph.KindFunction)
+	a.RepoPrefix = "repo"
+	a.Language = "go"
+	a.QualName = "repo.pkg.A"
+	a.StartLine = 11
+	a.EndLine = 19
+	a.StartColumn = 2
+	a.EndColumn = 8
+	a.WorkspaceID = "workspace"
+	a.ProjectID = "project"
+	a.Meta = map[string]any{
+		"signature": "func A()",
+		"doc":       "large promoted documentation",
+		"blob_only": "large opaque payload",
+	}
+	b := mkNode("repo/pkg/b.go::B", "B", "pkg/b.go", graph.KindType)
+	b.RepoPrefix = "repo"
+	b.Language = "go"
+	for _, n := range []*graph.Node{a, b} {
+		s.AddNode(n)
+	}
+
+	got := sc.AllNodesLight()
+	if ids := sortNodeIDs(got); fmt.Sprint(ids) != fmt.Sprint([]string{a.ID, b.ID}) {
+		t.Fatalf("AllNodesLight IDs = %v, want [%s %s]", ids, a.ID, b.ID)
+	}
+	var lightA *graph.Node
+	for _, n := range got {
+		if n.ID == a.ID {
+			lightA = n
+			break
+		}
+	}
+	if lightA == nil {
+		t.Fatal("AllNodesLight did not return A")
+	}
+	if lightA.Kind != a.Kind || lightA.Name != a.Name || lightA.QualName != a.QualName ||
+		lightA.FilePath != a.FilePath || lightA.StartLine != a.StartLine || lightA.EndLine != a.EndLine ||
+		lightA.StartColumn != a.StartColumn || lightA.EndColumn != a.EndColumn ||
+		lightA.Language != a.Language || lightA.RepoPrefix != a.RepoPrefix ||
+		lightA.WorkspaceID != a.WorkspaceID || lightA.ProjectID != a.ProjectID {
+		t.Fatalf("AllNodesLight altered identity/location fields: got %#v", lightA)
+	}
+	if lightA.Meta != nil {
+		t.Fatalf("AllNodesLight materialized metadata: %#v", lightA.Meta)
+	}
+}
+
+// testLightEdgeScanner pins graph.LightEdgeScanner: the kind filter must scope
+// to the requested kinds (empty means all), and every promoted field must
+// survive the meta-less scan intact and equal the values written. (The
+// backend-specific Meta-is-nil guarantee is asserted where it holds — the disk
+// backend's own test — since the in-memory backend legitimately keeps Meta.)
+func testLightEdgeScanner(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	sc, ok := s.(graph.LightEdgeScanner)
+	if !ok {
+		t.Skip("backend does not implement LightEdgeScanner")
+	}
+	s.AddNode(mkNode("a", "A", "x.go", graph.KindFunction))
+	s.AddNode(mkNode("b", "B", "x.go", graph.KindFunction))
+	call := mkEdge("a", "b", graph.EdgeCalls)
+	call.Line, call.Confidence, call.Origin, call.Tier, call.CrossRepo = 11, 0.75, graph.OriginLSPResolved, "lsp", true
+	call.Meta = map[string]any{"via": "direct", "blob_only": "x"}
+	ref := mkEdge("a", "b", graph.EdgeReferences)
+	ref.Line = 22
+	imp := mkEdge("a", "b", graph.EdgeImports)
+	imp.Line = 33
+	s.AddEdge(call)
+	s.AddEdge(ref)
+	s.AddEdge(imp)
+
+	// Kind filter: calls + references, imports excluded.
+	got := sc.AllEdgesLight(graph.EdgeCalls, graph.EdgeReferences)
+	kinds := map[graph.EdgeKind]int{}
+	var lightCall *graph.Edge
+	for _, e := range got {
+		kinds[e.Kind]++
+		if e.Kind == graph.EdgeCalls {
+			lightCall = e
+		}
+	}
+	if len(got) != 2 || kinds[graph.EdgeCalls] != 1 || kinds[graph.EdgeReferences] != 1 || kinds[graph.EdgeImports] != 0 {
+		t.Fatalf("AllEdgesLight(calls,references) kind filter wrong: got %d edges %v, want {calls:1, references:1}", len(got), kinds)
+	}
+	// Empty kinds means every edge.
+	if all := sc.AllEdgesLight(); len(all) != 3 {
+		t.Fatalf("AllEdgesLight() with no kinds = %d, want 3 (all edges)", len(all))
+	}
+	// Promoted fields survive the meta-less scan.
+	if lightCall == nil {
+		t.Fatal("AllEdgesLight did not return the call edge")
+	}
+	if lightCall.Line != 11 || lightCall.Confidence != 0.75 || lightCall.Origin != graph.OriginLSPResolved ||
+		lightCall.Tier != "lsp" || !lightCall.CrossRepo {
+		t.Fatalf("AllEdgesLight dropped/altered a promoted field: line=%d conf=%v origin=%q tier=%q crossRepo=%v",
+			lightCall.Line, lightCall.Confidence, lightCall.Origin, lightCall.Tier, lightCall.CrossRepo)
 	}
 }
 
@@ -1931,6 +2124,65 @@ func testEdgesByKindsScanner(t *testing.T, factory Factory) {
 	}
 	if stopped != 1 {
 		t.Fatalf("early stop yielded %d before break, want 1", stopped)
+	}
+}
+
+func testGetRepoNodesByLanguage(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+
+	nodes := []*graph.Node{
+		{ID: "empty-go", Name: "empty-go", Kind: graph.KindFunction, FilePath: "a.go", Language: "go"},
+		{ID: "empty-py", Name: "empty-py", Kind: graph.KindFunction, FilePath: "a.py", Language: "python"},
+		{ID: "repo-go", Name: "repo-go", Kind: graph.KindFunction, FilePath: "repo/a.go", Language: "go", RepoPrefix: "repo"},
+		{ID: "repo-py", Name: "repo-py", Kind: graph.KindFunction, FilePath: "repo/a.py", Language: "python", RepoPrefix: "repo"},
+	}
+	for _, n := range nodes {
+		s.AddNode(n)
+	}
+
+	if got := s.GetRepoNodesByLanguage("", "go"); len(got) != 1 || got[0].ID != "empty-go" {
+		t.Fatalf("GetRepoNodesByLanguage(empty, go) = %#v, want empty-go", got)
+	}
+	if got := s.GetRepoNodesByLanguage("repo", "go"); len(got) != 1 || got[0].ID != "repo-go" {
+		t.Fatalf("GetRepoNodesByLanguage(repo, go) = %#v, want repo-go", got)
+	}
+	if got := s.GetRepoNodesByLanguage("repo", ""); len(got) != 0 {
+		t.Fatalf("GetRepoNodesByLanguage(repo, empty) yielded %d nodes, want 0", len(got))
+	}
+}
+
+func testDistinctExternalTargets(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	add := func(to string, kind graph.EdgeKind, line int) {
+		s.AddEdge(&graph.Edge{From: "caller", To: to, Kind: kind, FilePath: "a.go", Line: line})
+	}
+
+	add("dep::example.com/pkg::Call", graph.EdgeCalls, 1)
+	add("dep::example.com/pkg::Call", graph.EdgeReferences, 2) // duplicate target
+	add("stdlib::fmt::Sprintf", graph.EdgeReferences, 3)
+	add("repo::stdlib::net/http::Get", graph.EdgeReads, 4)
+	add("external::service/api", graph.EdgeCalls, 5)
+	add("external-call::dep::example.com/old", graph.EdgeCalls, 6)
+	add("local.go::resolved", graph.EdgeCalls, 7)
+	add("dep::wrong-kind::Call", graph.EdgeTests, 8)
+
+	got := s.DistinctExternalTargets([]graph.EdgeKind{
+		graph.EdgeCalls, graph.EdgeReferences, graph.EdgeReads, graph.EdgeCalls,
+	})
+	want := []string{
+		"dep::example.com/pkg::Call",
+		"external-call::dep::example.com/old",
+		"external::service/api",
+		"repo::stdlib::net/http::Get",
+		"stdlib::fmt::Sprintf",
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("DistinctExternalTargets = %v, want %v", got, want)
+	}
+	if got := s.DistinctExternalTargets(nil); len(got) != 0 {
+		t.Fatalf("DistinctExternalTargets(nil) yielded %d targets, want 0", len(got))
 	}
 }
 

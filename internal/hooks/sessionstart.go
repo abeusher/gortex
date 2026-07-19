@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/zzet/gortex/internal/daemon"
+	"github.com/zzet/gortex/internal/pathkey"
+	"github.com/zzet/gortex/internal/profiles"
 	"github.com/zzet/gortex/internal/toolref"
 )
 
@@ -35,6 +37,7 @@ type SessionStartInput struct {
 // hook still emits a block — but its content tells the user that
 // enforcement is disabled and how to fix it.
 func runSessionStart(data []byte) {
+	started := time.Now()
 	var input SessionStartInput
 	if err := json.Unmarshal(data, &input); err != nil {
 		return
@@ -42,6 +45,10 @@ func runSessionStart(data []byte) {
 	if input.HookEventName != "SessionStart" {
 		return
 	}
+	emitted := false
+	defer func() {
+		logHookEffectiveness("SessionStart", emitted, daemonReachableFn(), 0, time.Since(started))
+	}()
 
 	ctx := buildSessionStartBriefing(input.CWD)
 	if ctx == "" {
@@ -58,6 +65,7 @@ func runSessionStart(data []byte) {
 	if err != nil {
 		return
 	}
+	emitted = true
 	fmt.Print(string(out))
 }
 
@@ -109,8 +117,7 @@ func buildSessionStartBriefing(cwd string) string {
 	status, err := sessionStartStatusFn()
 	switch {
 	case errors.Is(err, errDaemonUnreachable):
-		sb.WriteString("⚠️  **Gortex daemon is not running.** Code-operation enforcement is disabled for this session: Read/Grep/Glob/Bash on indexed source files will not be redirected to graph tools.\n\n")
-		sb.WriteString("Start it with: `gortex daemon start --detach`\n\n")
+		sb.WriteString("⚠️  **Gortex graph transport is unreachable.** Required native MCP tools and code-operation enforcement cannot be assumed healthy. Treat this as an MCP integration failure: stop indexed code operations and report it; do not start a daemon manually or switch to a CLI fallback.\n\n")
 		sb.WriteString(rulePreamble())
 		return sb.String()
 	case err != nil:
@@ -120,12 +127,56 @@ func buildSessionStartBriefing(cwd string) string {
 		return sb.String()
 	}
 
-	// Happy path: daemon is reachable.
-	sb.WriteString(renderDaemonReadiness(status))
-	sb.WriteString(renderCwdCoverage(cwd, status))
+	// Happy path: daemon is reachable. The lean hook tier (set by the
+	// active instruction profile) compresses the status prose to one
+	// line; the rule preamble — the positioning cues — survives every
+	// tier, and so does the actionable not-covered warning.
+	if activeHookTier() == profiles.HookTierLean {
+		sb.WriteString(renderLeanReadiness(cwd, status))
+	} else {
+		sb.WriteString(renderDaemonReadiness(status))
+		sb.WriteString(renderCwdCoverage(cwd, status))
+	}
 	sb.WriteString("\n")
 	sb.WriteString(rulePreamble())
 	return sb.String()
+}
+
+// activeHookTier reads the machine's hook-verbosity tier from the
+// active instruction profile. Package var so tests pin a tier without
+// touching machine state.
+var activeHookTier = profiles.ActiveHookTier
+
+// renderLeanReadiness is the one-line status the lean tier emits when
+// the cwd is a tracked repo. The workspace-root and not-covered cases
+// keep their full explanations in every tier — those are actionable
+// warnings, not status prose.
+func renderLeanReadiness(cwd string, s *daemon.StatusResponse) string {
+	var totalNodes int
+	for _, r := range s.TrackedRepos {
+		totalNodes += r.Nodes
+	}
+	state := "ready"
+	if !s.Ready {
+		state = "warming up — enforcement partial"
+	}
+	line := fmt.Sprintf("✓ Gortex %s (v%s): %d repo(s), %d nodes.",
+		state, strings.TrimPrefix(s.Version, "v"), len(s.TrackedRepos), totalNodes)
+
+	abs := cwd
+	if cwd != "" {
+		if a, err := filepath.Abs(cwd); err == nil {
+			abs = a
+		}
+	}
+	if abs != "" {
+		if exact, _ := classifyCwd(abs, s.TrackedRepos); exact != nil {
+			return fmt.Sprintf("%s cwd tracked as `%s` — enforcement active.\n", line, exact.Name)
+		}
+		// Workspace-root and not-covered explanations stay verbatim.
+		return line + "\n\n" + renderCwdCoverage(cwd, s)
+	}
+	return line + "\n"
 }
 
 // renderDaemonReadiness summarises the daemon's overall state in one
@@ -213,7 +264,7 @@ func classifyCwd(cwd string, repos []daemon.TrackedRepoStatus) (exact *daemon.Tr
 	for i := range repos {
 		repo := repos[i]
 		repoPath := filepath.Clean(repo.Path)
-		if repoPath == cwd {
+		if pathkey.EqualPaths(repoPath, cwd) {
 			exact = &repos[i]
 			continue
 		}
@@ -224,18 +275,13 @@ func classifyCwd(cwd string, repos []daemon.TrackedRepoStatus) (exact *daemon.Tr
 	return exact, contained
 }
 
-// hasPathPrefix reports whether path is rooted at prefix. Filepath
-// equality alone is wrong (`/foo/barbaz` would match `/foo/bar`) so
-// we require either equality or that the next char after prefix is
-// a separator.
+// hasPathPrefix reports whether path is rooted at prefix. It delegates to
+// pathkey.HasPathPrefix, which handles component boundaries (`/foo/barbaz`
+// must not match `/foo/bar`), the separator-root edge, and — on a
+// case-insensitive filesystem — case-only differences between the cwd and
+// a tracked root (#277).
 func hasPathPrefix(path, prefix string) bool {
-	if path == prefix {
-		return true
-	}
-	if !strings.HasPrefix(path, prefix) {
-		return false
-	}
-	return len(path) > len(prefix) && (path[len(prefix)] == filepath.Separator || prefix == string(filepath.Separator))
+	return pathkey.HasPathPrefix(path, prefix)
 }
 
 // rulePreamble is the short, always-present rule restatement. The
@@ -243,13 +289,10 @@ func hasPathPrefix(path, prefix string) bool {
 // — this is just enough that an agent in the very first turn knows
 // to reach for graph tools first.
 func rulePreamble() string {
-	return "**Rule:** Use Gortex MCP tools for code operations in this repo. Prefer:\n" +
-		"- `search_symbols` / `find_usages` / `get_callers` over `grep` / `Grep`\n" +
-		"- `get_symbol_source` / `get_file_summary` / `get_editing_context` over `Read`\n" +
-		"- `smart_context` over multiple Read/Grep calls when starting a task\n" +
-		"- `edit_symbol` / `edit_file` / `rename_symbol` over `Edit` / `Write` for indexed source\n\n" +
-		"Pre-tool hooks will deny attempts to Read/Grep/Glob indexed source files; the deny message names the right tool.\n" +
-		"Shell only (no MCP tools)? Reach any tool with `gortex call <tool> --arg k=v` (e.g. `" + toolref.CLIFallback("get_symbol_source") + "`) — there is no bare `gortex <tool>` verb.\n"
+	return "**Rule:** Call `explore` first for every code task. Inspect indexed code with `search`, `read`, `relations`, or `trace`. Use native read, search, or edit tools only when Gortex performance or integration is bad. " +
+		"Before mutation call `change(operation:\"impact\")`; for a signature change also call `change(operation:\"verify\")` with the proposed signature. Mutate with `edit` or `refactor`. After mutation call `change(operation:\"detect\")`; use the returned symbol IDs with `change` operations `tests`, `guards`, and `contract`. " +
+		"Call `capabilities` only when exact operation fields are unknown.\n" +
+		toolref.MCPRequiredLine()
 }
 
 // formatDuration renders a number of seconds as "1h7m" or "45s".

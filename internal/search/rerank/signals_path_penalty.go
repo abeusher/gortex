@@ -9,7 +9,7 @@ import (
 )
 
 // PathPenaltySignal applies a multiplicative penalty to candidates
-// whose file path falls into one of six "supporting cast" buckets —
+// whose file path falls into one of seven "supporting cast" buckets —
 // test files, compatibility shims, examples, type declarations,
 // re-export barrels, and generated files that shadow a real
 // implementation. The intuition: when an agent asks for the
@@ -34,8 +34,10 @@ import (
 //   - Examples         → 0.5 (demo code; useful but never the truth)
 //   - Type declarations → 0.7 (`.d.ts`, `.pyi`, `.h` headers — the
 //     interface, not the implementation)
-//   - Re-export barrels → 0.7 (`index.ts`, `__init__.py`, `mod.rs`,
-//     `lib.rs` — a forwarding hop, not the source)
+//   - Re-export barrels → 0.7 (`index.js`, `__init__.py` — normally a
+//     forwarding hop, not the source)
+//   - Module entries    → 0.9 (`index.ts[x]`, `mod.rs`, `lib.rs` — often
+//     both a public API surface and real implementation)
 //   - Generated files  → 0.4 (`foo.pb.go`, `mock_x.go`, `x_pb2.py` —
 //     ONLY when a real same-named hand-written peer exists in the
 //     graph; a generated file that is the sole definition is left at
@@ -113,9 +115,10 @@ const (
 	PathPenaltyGenerated = 0.4
 	PathPenaltyCompat    = 0.5
 	PathPenaltyExamples  = 0.5
-	PathPenaltyTypeDecl  = 0.7
-	PathPenaltyReexport  = 0.7
-	PathPenaltyUncatched = 1.0
+	PathPenaltyTypeDecl    = 0.7
+	PathPenaltyReexport    = 0.7
+	PathPenaltyModuleEntry = 0.9
+	PathPenaltyUncatched   = 1.0
 )
 
 // Pre-compiled patterns. Built at package init so the rubric stays
@@ -182,20 +185,75 @@ var (
 	// in include/ or directly named like a type-only declaration.
 	pathRETypeDecl = regexp.MustCompile(`(?i)\.(d\.ts|d\.cts|d\.mts|pyi|hpp|hxx|hh)$|(^|/)include/.*\.h$`)
 
-	// Re-export filenames — barrels that just forward symbols from
-	// other modules. The canonical names across ecosystems.
-	reexportNames = map[string]struct{}{
-		"index.js":  {},
-		"index.jsx": {},
+	// Module-entry filenames are commonly both implementation surfaces and
+	// re-export hubs. Keep a mild tie-breaker so canonical leaf definitions
+	// still win, but do not bury Rust crate/module roots or TypeScript barrels.
+	moduleEntryNames = map[string]struct{}{
 		"index.ts":  {},
 		"index.tsx": {},
-		"index.mjs": {},
-		"index.cjs": {},
+		"mod.rs":    {},
+		"lib.rs":    {},
+	}
+
+	// Generic re-export filenames — barrels that normally only forward
+	// symbols from other modules. These retain the stronger demotion.
+	reexportNames = map[string]struct{}{
+		"index.js":    {},
+		"index.jsx":   {},
+		"index.mjs":   {},
+		"index.cjs":   {},
 		"__init__.py": {},
-		"mod.rs": {},
-		"lib.rs": {},
 	}
 )
+
+// supportDemoteTest is the multiplicative factor applied to a test-file
+// candidate's final rerank score. The additive PathPenaltySignal is only
+// a gentle tie-breaker (~0.12 score points); it cannot demote a test
+// file that out-BM25s the real implementation on shared vocabulary —
+// common for intent queries, where a test name echoes the feature it
+// exercises ("test_urlencoded_data" for "urlencode form body payload").
+// Multiplying the whole score reliably pushes such a test below the
+// implementation. Only test files are demoted this hard; the lighter
+// supporting-cast buckets keep the gentle additive signal.
+const supportDemoteTest = 0.5
+
+// supportFileDemotion returns the multiplicative score factor for a
+// candidate's file — supportDemoteTest for a test file, 1.0 otherwise.
+// It reuses the per-Rerank path-penalty cache the additive signal
+// already populated, falling back to the classifier only when the cache
+// is cold, so the regex rubric runs at most once per file per Rerank.
+func supportFileDemotion(c *Candidate, ctx *Context) float64 {
+	if c == nil || c.Node == nil || c.Node.FilePath == "" {
+		return 1.0
+	}
+	// Only concept / degraded-identifier queries are demoted. An
+	// identifier, path, or signature query carries an exact-token match
+	// that already puts the right symbol on top; perturbing that order
+	// to demote a test can only cost a name-level hit, and a user who
+	// types a literal test name wants the test. Test pollution is a
+	// natural-language-intent problem, so the demotion is scoped to it.
+	if ctx != nil {
+		switch ctx.QueryClass {
+		case QueryClassSymbol, QueryClassPath, QueryClassSignature:
+			return 1.0
+		}
+	}
+	fp := c.Node.FilePath
+	var pen float64
+	if ctx != nil && ctx.pathPenaltyCache != nil {
+		if cached, ok := ctx.pathPenaltyCache[fp]; ok {
+			pen = cached
+		} else {
+			pen = classifyPathPenalty(fp)
+		}
+	} else {
+		pen = classifyPathPenalty(fp)
+	}
+	if pen == PathPenaltyTest {
+		return supportDemoteTest
+	}
+	return 1.0
+}
 
 // classifyPathPenalty applies the rubric in priority order — most
 // aggressive penalty wins on overlap. Exported indirectly via the
@@ -215,8 +273,11 @@ func classifyPathPenalty(fp string) float64 {
 	if pathRETypeDecl.MatchString(norm) {
 		return PathPenaltyTypeDecl
 	}
-	base := path.Base(norm)
-	if _, ok := reexportNames[strings.ToLower(base)]; ok {
+	base := strings.ToLower(path.Base(norm))
+	if _, ok := moduleEntryNames[base]; ok {
+		return PathPenaltyModuleEntry
+	}
+	if _, ok := reexportNames[base]; ok {
 		return PathPenaltyReexport
 	}
 	return PathPenaltyUncatched

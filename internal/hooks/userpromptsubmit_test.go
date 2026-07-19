@@ -46,7 +46,10 @@ func TestBuildPromptInjection(t *testing.T) {
 	require.Contains(t, block, "relevant indexed symbols")
 	require.Contains(t, block, "`ValidateToken` (function) — internal/auth/token.go:42")
 	require.Contains(t, block, "`AuthMiddleware` (type) — internal/auth/mw.go")
-	require.Contains(t, block, "smart_context")
+	// The follow-up routing points at the one-shot localization verb first,
+	// with the granular readers as the single-symbol fallback.
+	require.Contains(t, block, "`explore`")
+	require.Contains(t, block, `read(operation:"source")`)
 }
 
 func TestBuildPromptInjectionCapsHits(t *testing.T) {

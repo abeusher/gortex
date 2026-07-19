@@ -333,28 +333,44 @@ func TestIdleTicker_StopIsIdempotent(t *testing.T) {
 
 func TestIdleTTLFromEnv(t *testing.T) {
 	cases := []struct {
-		val  string
-		set  bool
+		name string
+		val  string // GORTEX_LLM_IDLE_TTL value
+		set  bool   // whether the env var is set at all
+		cfg  string // llm.local.idle_ttl config fallback
 		want time.Duration
 	}{
-		{set: false, want: defaultIdleTTL},
-		{val: "", set: true, want: defaultIdleTTL},
-		{val: "5m", set: true, want: 5 * time.Minute},
-		{val: "30s", set: true, want: 30 * time.Second},
-		{val: "0", set: true, want: 0},
-		{val: "off", set: true, want: 0},
-		{val: "none", set: true, want: 0},
-		{val: "garbage", set: true, want: defaultIdleTTL},
+		// Env-only (no config): the original behaviour is preserved.
+		{name: "env unset, no config", set: false, want: defaultIdleTTL},
+		{name: "env empty, no config", val: "", set: true, want: defaultIdleTTL},
+		{name: "env 5m", val: "5m", set: true, want: 5 * time.Minute},
+		{name: "env 30s", val: "30s", set: true, want: 30 * time.Second},
+		{name: "env 0 disables", val: "0", set: true, want: 0},
+		{name: "env off disables", val: "off", set: true, want: 0},
+		{name: "env none disables", val: "none", set: true, want: 0},
+		{name: "env garbage -> default", val: "garbage", set: true, want: defaultIdleTTL},
+		// Config fallback: consulted only when the env var is unset.
+		{name: "config 15m, env unset", set: false, cfg: "15m", want: 15 * time.Minute},
+		{name: "config off, env unset", set: false, cfg: "off", want: 0},
+		{name: "config garbage, env unset", set: false, cfg: "garbage", want: defaultIdleTTL},
+		{name: "config empty, env unset", set: false, cfg: "", want: defaultIdleTTL},
+		// Precedence: a set env var wins over any config value.
+		{name: "env 5m beats config 15m", val: "5m", set: true, cfg: "15m", want: 5 * time.Minute},
+		{name: "env off beats config 15m", val: "off", set: true, cfg: "15m", want: 0},
+		// An explicitly-empty env var does NOT count as set, so config wins.
+		{name: "env empty falls through to config", val: "", set: true, cfg: "15m", want: 15 * time.Minute},
 	}
 	for _, tc := range cases {
-		if tc.set {
-			t.Setenv("GORTEX_LLM_IDLE_TTL", tc.val)
-		} else {
-			_ = os.Unsetenv("GORTEX_LLM_IDLE_TTL")
-		}
-		if got := idleTTLFromEnv(); got != tc.want {
-			t.Errorf("idleTTLFromEnv(%q,set=%v) = %s, want %s", tc.val, tc.set, got, tc.want)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.set {
+				t.Setenv("GORTEX_LLM_IDLE_TTL", tc.val)
+			} else {
+				_ = os.Unsetenv("GORTEX_LLM_IDLE_TTL")
+			}
+			if got := idleTTLFromEnv(tc.cfg); got != tc.want {
+				t.Errorf("idleTTLFromEnv(cfg=%q) with env(%q,set=%v) = %s, want %s",
+					tc.cfg, tc.val, tc.set, got, tc.want)
+			}
+		})
 	}
 }
 

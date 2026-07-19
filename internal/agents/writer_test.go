@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // TestWriteIfNotExistsCreatesAndSkips covers both the create and
@@ -283,4 +284,98 @@ func names(as []Adapter) []string {
 		out = append(out, a.Name())
 	}
 	return out
+}
+
+// TestAtomicWriteFileCreatesAndOverwrites guards the core write path every
+// MCP file tool funnels through (write_file, edit_file, move, ...): a
+// fresh write lands the content and a second write atomically replaces it,
+// leaving no stray *.gortex.tmp-* file behind. This is also the
+// no-contention happy path for renameWithRetry — its retry loop must be
+// transparent when the rename succeeds first try.
+func TestAtomicWriteFileCreatesAndOverwrites(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sub", "file.txt")
+
+	if err := AtomicWriteFile(path, []byte("first"), 0o644); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if got, _ := os.ReadFile(path); string(got) != "first" {
+		t.Fatalf("content: got %q want %q", got, "first")
+	}
+
+	// Overwrite must replace, not append or corrupt.
+	if err := AtomicWriteFile(path, []byte("second"), 0o644); err != nil {
+		t.Fatalf("overwrite: %v", err)
+	}
+	if got, _ := os.ReadFile(path); string(got) != "second" {
+		t.Fatalf("overwrite content: got %q want %q", got, "second")
+	}
+
+	// Success must not leave the sibling temp file behind.
+	if leftovers, _ := filepath.Glob(filepath.Join(filepath.Dir(path), "*.gortex.tmp-*")); len(leftovers) != 0 {
+		t.Fatalf("leftover temp files: %v", leftovers)
+	}
+}
+
+// TestRenameWithRetryReturnsNonRetryableErr checks that a rename failure
+// which isn't a transient sharing violation (here: a missing source) is
+// surfaced immediately rather than retried — the retry budget is reserved
+// for the Windows lock race, not for masking genuine errors. On every
+// platform ERROR_FILE_NOT_FOUND / ENOENT is non-retryable, so this holds
+// cross-platform.
+func TestRenameWithRetryReturnsNonRetryableErr(t *testing.T) {
+	dir := t.TempDir()
+	if err := renameWithRetry(filepath.Join(dir, "does-not-exist"), filepath.Join(dir, "dest")); err == nil {
+		t.Fatal("expected an error renaming a missing source, got nil")
+	}
+}
+
+// TestAtomicWriteFileReapsStaleTempOrphans guards the cleanup of temp
+// files a crashed write orphaned ("not cleared"): a *.gortex.tmp-*
+// stranded when a process died between CreateTemp and the rename must be
+// reaped by a later AtomicWriteFile — but a temp still in flight (fresh
+// mtime) and any unrelated file must be left untouched.
+func TestAtomicWriteFileReapsStaleTempOrphans(t *testing.T) {
+	dir := t.TempDir()
+
+	// A stale orphan from a write that crashed long ago.
+	stale := filepath.Join(dir, "config.json"+tempInfix+"123456")
+	if err := os.WriteFile(stale, []byte("half-written"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-2 * staleTempAge)
+	if err := os.Chtimes(stale, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	// A temp another write is still filling in — fresh mtime, must survive.
+	fresh := filepath.Join(dir, "other.json"+tempInfix+"987654")
+	if err := os.WriteFile(fresh, []byte("in flight"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// A real, unrelated file must never be swept.
+	keep := filepath.Join(dir, "keep.txt")
+	if err := os.WriteFile(keep, []byte("keep me"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Any AtomicWriteFile into the directory sweeps it first.
+	target := filepath.Join(dir, "config.json")
+	if err := AtomicWriteFile(target, []byte("new content"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Errorf("stale temp orphan must be reaped (stat err=%v)", err)
+	}
+	if _, err := os.Stat(fresh); err != nil {
+		t.Errorf("in-flight temp (fresh mtime) must be preserved: %v", err)
+	}
+	if _, err := os.Stat(keep); err != nil {
+		t.Errorf("unrelated file must be untouched: %v", err)
+	}
+	if got, _ := os.ReadFile(target); string(got) != "new content" {
+		t.Errorf("target content: got %q want %q", got, "new content")
+	}
 }

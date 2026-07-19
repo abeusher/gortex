@@ -904,7 +904,7 @@ func (s *Server) registerCoreTools() {
 
 	s.addTool(
 		mcp.NewTool("search_symbols",
-			mcp.WithDescription("Use instead of Grep to find symbols across the whole codebase. Supports natural language queries with camelCase-aware tokenization and BM25 ranking — 'validate token auth' finds validateToken, AuthMiddleware, parseJWT. For the concrete types that implement an interface, or the methods that override a method, use find_implementations / find_overrides — a name search alone can't tell an implementor from an unrelated same-named symbol."),
+			mcp.WithDescription("Use instead of Grep to find symbols across the whole codebase. Supports natural language queries with camelCase-aware tokenization and BM25 ranking — 'validate token auth' finds validateToken, AuthMiddleware, parseJWT. Localizing a whole task or bug report (not one symbol)? explore returns the ranked neighborhood with source + call paths in one call. For the concrete types that implement an interface, or the methods that override a method, use find_implementations / find_overrides — a name search alone can't tell an implementor from an unrelated same-named symbol."),
 			mcp.WithString("query", mcp.Required(), mcp.Description("Search query — symbol name, concept, or keywords. Also accepts inline field-qualified clauses: `kind:function lang:go path:internal/ repo:gortex project:web validateToken` — recognised fields are kind, flavor, lang (aliases ts/js/py/rs/…), path, repo, project; everything else is free text. A field-qualified query that matches nothing retries on the free text alone (response carries `filters_relaxed: true`).")),
 			mcp.WithNumber("limit", mcp.Description("Max results (default: 20)")),
 			mcp.WithString("cursor", mcp.Description("Opaque pagination cursor returned in `next_cursor` from a previous call. Pass it back to fetch the next page. Omit for the first page.")),
@@ -1502,6 +1502,18 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 		// in/out edge pair through the bundle phase. Tighten to
 		// +5 so the post-filter slack still leaves a full page.
 		fetchLimit = offset + limit + 5
+	} else {
+		// Concept / degraded-identifier query with no LLM assist: the
+		// always-on semantic-cosine rerank still runs, so widen the BM25
+		// head to a full rerank pool. A natural-language intent query
+		// ("decode bson request body") often has its target sitting past
+		// the default +10 over-fetch; the semantic channel can only lift
+		// a candidate it actually sees, so this pool is what turns a
+		// BM25-rank-15 file hit into a top-5 result. Cheap: ~40 extra
+		// FTS rows and their edge pairs, well inside the latency budget.
+		if want := offset + limit + semanticRerankPool; want > fetchLimit {
+			fetchLimit = want
+		}
 	}
 
 	// Expansion terms feeding the BM25 OR-merge: LLM-derived synonyms

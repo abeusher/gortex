@@ -4,8 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 
 	"go.uber.org/zap"
@@ -13,6 +14,7 @@ import (
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/indexer"
 	gortexmcp "github.com/zzet/gortex/internal/mcp"
+	"github.com/zzet/gortex/internal/pathkey"
 )
 
 // mcpDispatcher routes MCP JSON-RPC frames from daemon sessions to the
@@ -34,6 +36,10 @@ type mcpDispatcher struct {
 	// decision is the shared peek→route→outcome helper; it reads the
 	// router through the atomic accessor so a live swap is reflected.
 	decision *daemon.ProxyDecision
+	// loggedUntracked records session IDs for which the "cwd not covered"
+	// diagnostic has already been emitted, so it fires once per session
+	// rather than on every frame. Cleared in SessionEnded.
+	loggedUntracked sync.Map
 }
 
 func newMCPDispatcher(srv *gortexmcp.Server, mi *indexer.MultiIndexer, logger *zap.Logger) *mcpDispatcher {
@@ -87,7 +93,10 @@ func (d *mcpDispatcher) Dispatch(ctx context.Context, sess *daemon.Session, fram
 	// connection-poisoning errored initialize. Only tools/call is refused (with
 	// the structured not-tracked error the agent can act on).
 	untracked := sess.CWD != "" && !d.cwdReachable(sess.CWD)
-	if untracked && peekFrameMethod(frame) == "tools/call" {
+	if untracked {
+		d.logUncoveredCWDOnce(sess)
+	}
+	if untracked && peekFrameMethod(frame) == "tools/call" && !untrackedBootstrapCall(frame) {
 		return d.notTrackedError(sess, frame), nil
 	}
 
@@ -137,14 +146,17 @@ func (d *mcpDispatcher) Dispatch(ctx context.Context, sess *daemon.Session, fram
 	// tools_search promotes them. A direct call by name (the CLI's `gortex call`
 	// and the curated `gortex` verbs reach the daemon this way) promotes it
 	// first, so a known tool name is reachable without a discovery round-trip.
-	// tools_search stays the discovery path; a hide-mode tool is never deferred,
-	// so this never bypasses the hide gate.
+	// tools_search stays the discovery path. Check the effective session surface
+	// before touching the process-global lazy registry: otherwise a facade-v1
+	// client hard-calling a hidden legacy name could promote it (and emit
+	// list_changed) before the MCP surface filter rejected the call.
 	if name := peekFrameToolName(frame); name != "" {
-		newly := d.srv.EnsureToolPromoted(name)
-		// Record a call to a deferred/learned tool so the per-workspace
-		// learned surface promotes it into the cold list next session (and a
-		// stale promotion's demotion clock resets on continued use).
-		d.srv.NoteToolUse(name, sess.CWD, newly)
+		if d.srv.IsToolEnabledForSession(ctx, name) {
+			newly := d.srv.EnsureToolPromotedForSession(ctx, name)
+			// Record only permitted calls to deferred/learned tools so a rejected
+			// hidden call cannot refresh learned-surface state.
+			d.srv.NoteToolUse(name, sess.CWD, newly)
+		}
 	}
 
 	// HandleMessage returns either a JSONRPCResponse, a JSONRPCError, or
@@ -165,7 +177,7 @@ func (d *mcpDispatcher) Dispatch(ctx context.Context, sess *daemon.Session, fram
 	// response into its inactive variant: the agent gets the actionable
 	// "run gortex track" instructions and an empty track-only tool list.
 	if untracked {
-		out = rewriteUntrackedResponse(peekFrameMethod(frame), out, sess.CWD)
+		out = rewriteUntrackedResponse(peekFrameMethod(frame), out, sess.CWD, d.trackedRoots())
 	}
 	return out, nil
 }
@@ -196,13 +208,30 @@ func peekFrameToolName(frame []byte) string {
 	return peek.Params.Name
 }
 
-// rewriteUntrackedResponse swaps a successful initialize / tools/list response
-// for its untracked-cwd variant: initialize carries the inactive instructions
-// (with the cwd-specific `gortex track` affordance) and tools/list is emptied,
-// so the handshake completes gracefully instead of erroring. Non-initialize /
-// non-tools/list frames, error responses, and unparseable bodies pass through
-// unchanged.
-func rewriteUntrackedResponse(method string, out []byte, cwd string) []byte {
+// untrackedBootstrapCall permits only the two facade calls that can explain or
+// repair an uncovered cwd. Every graph-backed call remains fail-closed.
+func untrackedBootstrapCall(frame []byte) bool {
+	var peek struct {
+		Method string `json:"method"`
+		Params struct {
+			Name      string         `json:"name"`
+			Arguments map[string]any `json:"arguments"`
+		} `json:"params"`
+	}
+	if json.Unmarshal(frame, &peek) != nil || peek.Method != "tools/call" {
+		return false
+	}
+	if peek.Params.Name == "capabilities" {
+		return true
+	}
+	return peek.Params.Name == "workspace_admin" && strings.EqualFold(strings.TrimSpace(fmt.Sprint(peek.Params.Arguments["operation"])), "track")
+}
+
+// rewriteUntrackedResponse swaps a successful initialize response for its
+// untracked-cwd variant. tools/list is deliberately preserved so facade clients
+// can discover capabilities and workspace_admin.track without reconnecting;
+// every other tools/call remains blocked by Dispatch until tracking succeeds.
+func rewriteUntrackedResponse(method string, out []byte, cwd string, roots []string) []byte {
 	if len(out) == 0 {
 		return out
 	}
@@ -214,14 +243,10 @@ func rewriteUntrackedResponse(method string, out []byte, cwd string) []byte {
 	if !ok {
 		return out // an error response or non-object result — leave it
 	}
-	switch method {
-	case "initialize":
-		result["instructions"] = gortexmcp.ServerInstructionsUntracked(cwd)
-	case "tools/list":
-		result["tools"] = []any{}
-	default:
+	if method != "initialize" {
 		return out
 	}
+	result["instructions"] = gortexmcp.ServerInstructionsUntracked(cwd, roots...)
 	resp["result"] = result
 	if rewritten, mErr := json.Marshal(resp); mErr == nil {
 		return rewritten
@@ -250,10 +275,14 @@ func (d *mcpDispatcher) SessionStarted(sess *daemon.Session, write func([]byte) 
 // from the MCP server's session map so idle per-session state doesn't
 // accumulate for the daemon's lifetime.
 func (d *mcpDispatcher) SessionEnded(sess *daemon.Session) {
-	if d.srv != nil && sess != nil {
+	if sess == nil {
+		return
+	}
+	if d.srv != nil {
 		d.srv.DisconnectSession(sess.ID)
 		d.srv.ReleaseSession(sess.ID)
 	}
+	d.loggedUntracked.Delete(sess.ID)
 }
 
 // cwdReachable reports whether a session cwd has any chance of
@@ -308,17 +337,52 @@ func (d *mcpDispatcher) isCWDTracked(cwd string) bool {
 	if d.multiIndexer == nil {
 		return true
 	}
-	cwd = filepath.Clean(cwd)
+	// Fold-aware containment: on a case-insensitive filesystem (macOS,
+	// Windows) the cwd the editor hands us can differ from the stored
+	// root only in letter case or drive-letter case (e.g. VS Code's
+	// `c:\repo` vs the config's `C:\repo`). A byte compare would reject
+	// it and publish zero tools; HasPathPrefix folds both first (#277).
 	for _, meta := range d.multiIndexer.AllMetadata() {
-		root := filepath.Clean(meta.RootPath)
-		if cwd == root {
-			return true
-		}
-		if strings.HasPrefix(cwd, root+string(filepath.Separator)) {
+		if pathkey.HasPathPrefix(cwd, meta.RootPath) {
 			return true
 		}
 	}
 	return false
+}
+
+// logUncoveredCWDOnce emits, at most once per session, a diagnostic that
+// names the session cwd and every tracked repo root — so an operator
+// looking at an INACTIVE session (zero tools published) can immediately
+// see the cwd the daemon was handed and the roots it was compared
+// against. The mismatch is most often a path-case or drive-letter
+// difference (#277).
+func (d *mcpDispatcher) logUncoveredCWDOnce(sess *daemon.Session) {
+	if sess == nil || sess.ID == "" {
+		return
+	}
+	if _, loaded := d.loggedUntracked.LoadOrStore(sess.ID, struct{}{}); loaded {
+		return
+	}
+	d.logger.Info("mcp session cwd is not covered by any tracked repo",
+		zap.String("session_id", sess.ID),
+		zap.String("cwd", sess.CWD),
+		zap.Strings("tracked_roots", d.trackedRoots()))
+}
+
+// trackedRoots returns the sorted absolute root of every locally tracked
+// repo, for the INACTIVE diagnostics.
+func (d *mcpDispatcher) trackedRoots() []string {
+	if d.multiIndexer == nil {
+		return nil
+	}
+	var roots []string
+	for _, meta := range d.multiIndexer.AllMetadata() {
+		if meta != nil && meta.RootPath != "" {
+			roots = append(roots, meta.RootPath)
+		}
+	}
+	sort.Strings(roots)
+	return roots
 }
 
 // tryProxyToolCall inspects a JSON-RPC frame and, if it's a

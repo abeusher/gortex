@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 )
 
 // writer.go centralises every write `gortex init` performs. Going
@@ -111,15 +112,22 @@ func WriteOwnedFile(w io.Writer, path, content string, opts ApplyOpts) (FileActi
 // either sees the old file or the fully-written new file — never a
 // half-written state.
 //
-// The temp file uses a deterministic prefix so a crash leaves
-// "<name>.gortex.tmp-<pid>.<rand>" files that are easy to identify
-// and clean up manually.
+// The temp file carries a distinctive ".gortex.tmp-" infix, so a crash
+// between CreateTemp and the rename leaves an identifiable
+// "<name>.gortex.tmp-<rand>" orphan. Those orphans are not left to
+// accumulate: every AtomicWriteFile first sweeps its target directory
+// for stale ones via cleanStaleTempFiles.
 func AtomicWriteFile(path string, data []byte, perm os.FileMode) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("mkdir %s: %w", dir, err)
 	}
-	f, err := os.CreateTemp(dir, filepath.Base(path)+".gortex.tmp-*")
+	// Reap temp files an earlier write orphaned here before adding our
+	// own: a crash (or kill) between CreateTemp and the rename below
+	// strands the temp on disk, and the success path only ever consumes
+	// THIS write's temp, so without an opportunistic sweep they pile up.
+	cleanStaleTempFiles(dir)
+	f, err := os.CreateTemp(dir, filepath.Base(path)+tempInfix+"*")
 	if err != nil {
 		return fmt.Errorf("create temp in %s: %w", dir, err)
 	}
@@ -144,11 +152,84 @@ func AtomicWriteFile(path string, data []byte, perm os.FileMode) error {
 		cleanup()
 		return fmt.Errorf("close %s: %w", tmpPath, err)
 	}
-	if err := os.Rename(tmpPath, path); err != nil {
+	if err := renameWithRetry(tmpPath, path); err != nil {
 		cleanup()
 		return fmt.Errorf("rename %s -> %s: %w", tmpPath, path, err)
 	}
 	return nil
+}
+
+// tempInfix is the distinctive, Gortex-branded marker in every temp
+// file AtomicWriteFile writes: os.CreateTemp expands the pattern
+// "<base>.gortex.tmp-*" into "<base>.gortex.tmp-<random>". Sharing one
+// const between the writer and the reaper keeps the sweep from ever
+// drifting out of sync with the names it is meant to match.
+const tempInfix = ".gortex.tmp-"
+
+// staleTempAge is how long an orphaned temp must sit untouched before a
+// later write reaps it. It only has to exceed the lifetime of one
+// in-flight AtomicWriteFile — a data write plus renameWithRetry's
+// ~225ms worst-case backoff — so an hour is orders of magnitude of
+// headroom and guarantees a concurrent write's fresh temp is never
+// mistaken for debris.
+const staleTempAge = time.Hour
+
+// cleanStaleTempFiles best-effort removes temp files an earlier
+// AtomicWriteFile orphaned in dir when its process died between
+// CreateTemp and the rename. Only files that carry our own tempInfix
+// AND have gone untouched for longer than staleTempAge are removed, so
+// a temp another writer is still filling in (or about to rename) is
+// never disturbed. Every error is swallowed: this is directory hygiene,
+// not a load-bearing step — a write must never fail because a leftover
+// could not be reaped, and a dir we cannot read simply has nothing to
+// sweep from this caller's point of view.
+func cleanStaleTempFiles(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-staleTempAge)
+	for _, e := range entries {
+		if e.IsDir() || !strings.Contains(e.Name(), tempInfix) {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil || !info.ModTime().Before(cutoff) {
+			continue
+		}
+		_ = os.Remove(filepath.Join(dir, e.Name()))
+	}
+}
+
+// renameWithRetry renames oldPath onto newPath, retrying briefly when the
+// failure is a transient, Windows-specific sharing violation (see
+// isRetryableRenameErr). On POSIX the predicate is always false, so this
+// collapses to a single os.Rename with no added latency.
+//
+// os.Rename maps to MoveFileEx(MOVEFILE_REPLACE_EXISTING) on Windows,
+// which fails with ERROR_SHARING_VIOLATION / ERROR_ACCESS_DENIED when
+// another process still holds the destination open without
+// FILE_SHARE_DELETE — an editor's language server, antivirus, a search
+// indexer, or Gortex's own file watcher re-indexing the file we just
+// wrote. Those holders release the handle within milliseconds, so a
+// short bounded retry turns a spurious "file is being used by another
+// process" error into the atomic replace the caller asked for. Worst
+// case is ~225ms of backoff, imperceptible for an interactive write.
+func renameWithRetry(oldPath, newPath string) error {
+	const attempts = 10
+	var err error
+	for attempt := range attempts {
+		if err = os.Rename(oldPath, newPath); err == nil {
+			return nil
+		}
+		if !isRetryableRenameErr(err) {
+			return err
+		}
+		if attempt < attempts-1 {
+			time.Sleep(time.Duration(attempt+1) * 5 * time.Millisecond)
+		}
+	}
+	return err
 }
 
 // MergeJSON reads path (if present), parses it as a JSON object,

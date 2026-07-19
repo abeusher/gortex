@@ -15,23 +15,30 @@ func TestSpinnerDisabledModePrintsPlainText(t *testing.T) {
 	sp.Start("Indexing repository")
 	sp.Report("walking files", 0, 0)
 	sp.Report("walking files", 50, 100) // same stage, must not re-emit
-	sp.Report("parsing", 0, 0)          // new stage, must emit
+	sp.Report("parsing", 0, 0)          // new stage: finishes the previous, starts its own
 	sp.Done()
 
 	out := buf.String()
 	wants := []string{
 		"Indexing repository",
-		"walking files",
-		"parsing",
-		"✓ Indexing repository", // ✓
+		"walking files ...",     // stage start
+		"✓ walking files · 50",  // stage finish with final counter
+		"parsing ...",           // next stage start
+		"✓ parsing",             // finished by Done
+		"✓ Indexing repository", // overall summary
 	}
 	for _, w := range wants {
 		if !strings.Contains(out, w) {
 			t.Errorf("output missing %q\n--- got ---\n%s", w, out)
 		}
 	}
-	if got := strings.Count(out, "walking files"); got != 1 {
-		t.Errorf("expected stage 'walking files' to print exactly once, got %d", got)
+	// Each stage prints exactly twice — one start line, one finish line —
+	// regardless of how many progress ticks arrive in between.
+	if got := strings.Count(out, "walking files"); got != 2 {
+		t.Errorf("expected stage 'walking files' to print exactly twice (start+finish), got %d\n--- got ---\n%s", got, out)
+	}
+	if idx := strings.Index(out, "parsing ..."); idx < strings.Index(out, "✓ walking files") {
+		t.Errorf("stage finish line must precede the next stage start\n--- got ---\n%s", out)
 	}
 }
 
@@ -59,7 +66,7 @@ func TestSpinnerDoneIsIdempotent(t *testing.T) {
 
 	sp.Start("Indexing")
 	sp.Done()
-	sp.Done() // must not double-print or panic
+	sp.Done()                   // must not double-print or panic
 	sp.Fail(errors.New("late")) // must be a no-op after Done
 
 	if got := strings.Count(buf.String(), "✓"); got != 1 {
