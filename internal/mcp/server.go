@@ -529,13 +529,6 @@ type sessionState struct {
 	// toolSpec / clientName is (re)recorded.
 	resolvedToolPolicy *toolPolicy
 	toolPolicyResolved bool
-	// wireFormats is the client's self-declared gortex/wire capability
-	// (initialize.capabilities["gortex/wire"]) — the
-	// compact wire formats its decoder supports, in preference order.
-	// When set it wins over the clientName allowlist in
-	// resolveSessionFormat, so new clients don't need a server-side
-	// allowlist entry.
-	wireFormats []string
 	// lastSearch captures the most recent search_symbols call so that a
 	// subsequent get_symbol_source / get_editing_context on one of its
 	// results can be attributed back to the query — this is the raw input
@@ -817,26 +810,6 @@ func (ss *sessionState) snapshotClientName() string {
 	return ss.clientName
 }
 
-// recordWireFormats captures the client's gortex/wire capability from
-// the `initialize` frame. Empty input is ignored so a re-init without
-// the capability can't clobber a prior declaration.
-func (ss *sessionState) recordWireFormats(formats []string) {
-	if len(formats) == 0 {
-		return
-	}
-	ss.mu.Lock()
-	defer ss.mu.Unlock()
-	ss.wireFormats = append([]string(nil), formats...)
-}
-
-// snapshotWireFormats returns the declared gortex/wire capability under
-// the session lock; nil when the client declared none.
-func (ss *sessionState) snapshotWireFormats() []string {
-	ss.mu.Lock()
-	defer ss.mu.Unlock()
-	return ss.wireFormats
-}
-
 // NoteSessionClient is called by the daemon dispatcher after it
 // snoops the MCP `initialize.clientInfo.name` value, so the per-
 // session sessionState can default tool wire-format based on the
@@ -893,24 +866,6 @@ func (s *Server) NoteSessionToolPolicy(sessionID, spec, mode string) {
 	s.sessions.get(sessionID).session.recordToolPolicy(spec, mode)
 }
 
-// NoteSessionWireFormats is called by the daemon dispatcher after it
-// snoops the MCP initialize capabilities["gortex/wire"]
-// declaration, so format resolution can honour a client's self-declared
-// decoder capability without a client-name allowlist entry.
-func (s *Server) NoteSessionWireFormats(sessionID string, formats []string) {
-	if s == nil || sessionID == "" || len(formats) == 0 {
-		return
-	}
-	if s.sessions == nil {
-		// Embedded mode — single shared session.
-		if s.session != nil {
-			s.session.recordWireFormats(formats)
-		}
-		return
-	}
-	s.sessions.get(sessionID).session.recordWireFormats(formats)
-}
-
 // defaultFormatForClient returns the most-compressed wire format the
 // named MCP client is known to decode. Resolution order is gcx >
 // toon > json:
@@ -927,10 +882,6 @@ func (s *Server) NoteSessionWireFormats(sessionID string, formats []string) {
 //
 // Lower-cased client name is matched. Unknown clients are not a
 // failure — they just keep the JSON default until they're added.
-//
-// This allowlist is the legacy fallback: a client that declares the
-// gortex/wire capability in its initialize request (see
-// formatFromWireCapability) never needs an entry here.
 func defaultFormatForClient(name string) string {
 	if isKnownAgentClient(name) {
 		return "gcx"
@@ -962,23 +913,6 @@ func isKnownAgentClient(name string) bool {
 	return knownAgentClients[strings.ToLower(strings.TrimSpace(name))]
 }
 
-// formatFromWireCapability maps a client's self-declared gortex/wire
-// capability (initialize.capabilities["gortex/wire"], in
-// the client's preference order) to the first format this server can
-// emit. Unknown names are skipped so a future client can declare a
-// newer format ahead of an older fallback.
-func formatFromWireCapability(formats []string) string {
-	for _, f := range formats {
-		switch strings.ToLower(strings.TrimSpace(f)) {
-		case "gcx":
-			return "gcx"
-		case "toon":
-			return "toon"
-		}
-	}
-	return ""
-}
-
 // resolveSessionFormat returns the format the current session prefers
 // when a tool's `format` arg is absent. Pure read — used by isGCX /
 // isTOON when the caller didn't pin a format explicitly.
@@ -989,9 +923,6 @@ func (s *Server) resolveSessionFormat(ctx context.Context) string {
 	sess := s.sessionFor(ctx)
 	if sess == nil {
 		return ""
-	}
-	if f := formatFromWireCapability(sess.snapshotWireFormats()); f != "" {
-		return f
 	}
 	return defaultFormatForClient(sess.snapshotClientName())
 }

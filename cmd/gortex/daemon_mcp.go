@@ -412,9 +412,6 @@ func (d *mcpDispatcher) maybeSnoopInitialize(sess *daemon.Session, frame []byte)
 				Name    string `json:"name"`
 				Version string `json:"version"`
 			} `json:"clientInfo"`
-			Capabilities struct {
-				WireFormats []string `json:"gortex/wire"`
-			} `json:"capabilities"`
 		} `json:"params"`
 	}
 	if err := json.Unmarshal(frame, &peek); err != nil {
@@ -422,12 +419,6 @@ func (d *mcpDispatcher) maybeSnoopInitialize(sess *daemon.Session, frame []byte)
 	}
 	if peek.Method != "initialize" {
 		return
-	}
-	// A gortex/wire capability self-declares the client's compact-format
-	// decoders; session format resolution prefers it over the built-in
-	// client-name allowlist, so new clients need no server-side entry.
-	if formats := peek.Params.Capabilities.WireFormats; len(formats) > 0 && d.srv != nil {
-		d.srv.NoteSessionWireFormats(sess.ID, formats)
 	}
 	if peek.Params.ClientInfo.Name == "" && peek.Params.ClientInfo.Version == "" {
 		return
