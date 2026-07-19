@@ -993,6 +993,12 @@ type FrameworkSynthReport struct {
 	// here with every synthesizer gated to zero — the census, not the
 	// synthesizers, owned the pass. It must never be silent again.
 	CensusMillis int64 `json:"census_ms,omitempty"`
+	// ScopeMillis times the scoped-store view construction between the
+	// census and the loop — the last untimed sliver of the pass. A measured
+	// run on a swap-crushed host showed ~437s of pass wall the timed
+	// sections could not account for; every section now reports, so a
+	// recurrence names its owner.
+	ScopeMillis int64 `json:"scope_ms,omitempty"`
 }
 
 // scopedSynthesizer is the optional capability a FrameworkSynthesizer exposes
@@ -1061,10 +1067,12 @@ func runFrameworkSynthesizersScoped(
 	censusStart := time.Now()
 	candidates := summarizeFrameworkCandidatesCensus(g, scope, filePaths, censusEligible)
 	rep.CensusMillis = time.Since(censusStart).Milliseconds()
+	scopeStart := time.Now()
 	var genericScope graph.Store
 	if scope != nil {
 		genericScope = newFrameworkScopedStore(g, scope, filePaths)
 	}
+	rep.ScopeMillis = time.Since(scopeStart).Milliseconds()
 	for _, s := range defaultFrameworkSynthesizers() {
 		start := time.Now()
 		var n int

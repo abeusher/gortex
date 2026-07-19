@@ -1434,18 +1434,25 @@ func (mi *MultiIndexer) RunGlobalGraphPasses(ctx context.Context) {
 	// edge.
 	reporter.Report("framework dispatch synthesis (global)", 0, 0)
 	passStart("framework_synthesis")
-	fwStart := time.Now()
-	// A full-coverage batch (cold index / whole-workspace reconciliation)
+	// A full-coverage batch (cold index / full-workspace reconciliation)
 	// carries the daemon's one-shot census attestation: admission censuses
 	// read the raw store while synthesizer execution keeps the scoped view.
-	fwRep := resolver.RunFrameworkSynthesizersScopedWithCensus(mi.graph, changedPrefixes, mi.takeBatchCensusEligible())
+	// Taken OUTSIDE the pass timer: it contends on mi.mu, and a stall there
+	// must read as its own number, not as unattributable synthesis wall.
+	censusTakeStart := time.Now()
+	batchCensusEligible := mi.takeBatchCensusEligible()
+	censusTakeWait := time.Since(censusTakeStart)
+	fwStart := time.Now()
+	fwRep := resolver.RunFrameworkSynthesizersScopedWithCensus(mi.graph, changedPrefixes, batchCensusEligible)
 	mi.logger.Info("global pass: framework dispatch synthesis",
 		zap.Int("edges", fwRep.Total),
 		zap.Any("per_synthesizer", fwRep.Per),
 		zap.Int64("census_ms", fwRep.CensusMillis),
+		zap.Int64("scope_ms", fwRep.ScopeMillis),
 		zap.Int64("gate_ms", fwRep.GateMillis),
 		zap.Int64("claim_ms", fwRep.ClaimMillis),
 		zap.Int64("demote_ms", fwRep.DemoteMillis),
+		zap.Duration("census_take_wait", censusTakeWait),
 		zap.Duration("elapsed", time.Since(fwStart)))
 	// External-call placeholder synthesis (opt-in). Runs after the
 	// stub passes so only genuinely un-indexed external targets are
