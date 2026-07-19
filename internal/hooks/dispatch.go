@@ -126,6 +126,10 @@ func Run(port int, mode Mode) {
 		runSessionStart(data)
 	case "UserPromptSubmit":
 		runUserPromptSubmit(data)
+	case "SubagentStart":
+		runSubagentStart(data)
+	case "SubagentStop":
+		runSubagentStop(data)
 	}
 }
 

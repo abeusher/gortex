@@ -21,10 +21,18 @@ type HookInput struct {
 	HookEventName string         `json:"hook_event_name"`
 	ToolName      string         `json:"tool_name"`
 	ToolInput     map[string]any `json:"tool_input"`
+	ToolUseID     string         `json:"tool_use_id"`
 	CWD           string         `json:"cwd"`
 	// SessionID identifies the Claude Code session. Used to key the
 	// per-session state store (consult-unlock marker, nudge streak).
 	SessionID string `json:"session_id"`
+	// PromptID is accepted when a host supplies it. Current Claude Code hook
+	// schemas guarantee tool_use_id instead, so terminal state primarily uses
+	// the per-turn token correlated through that field.
+	PromptID string `json:"prompt_id"`
+	// AgentID is present inside subagents and isolates their terminal state from
+	// the parent agent sharing the same Claude session.
+	AgentID string `json:"agent_id"`
 	// PermissionMode is the host's active permission posture
 	// ("default" / "acceptEdits" / "plan" / "bypassPermissions" / "auto").
 	// Drives the auto-approve branch for Gortex's own MCP tools.
@@ -91,12 +99,41 @@ func runPreToolUse(data []byte, gortexPort int, mode Mode) {
 	if input.HookEventName != "PreToolUse" {
 		return
 	}
+
+	// Terminal enforcement is deliberately the first policy branch. It is a
+	// local marker lookup, so it neither waits for the daemon nor gets bypassed
+	// by permissive permission modes. A new user prompt clears the marker.
+	terminalIdentity, terminalTurnReady := currentLocalizationTurn(input.SessionID, input.PromptID, input.AgentID, input.CWD)
+	if terminalTurnReady && hasLocalizationTerminal(terminalIdentity) {
+		emitPreToolUse(HookOutput{HookSpecificOutput: &HookSpecificOutput{
+			HookEventName:            "PreToolUse",
+			PermissionDecision:       "deny",
+			PermissionDecisionReason: localizationTerminalDenyReason,
+		}})
+		localizationTerminalTelemetry("denied", true, started)
+		return
+	}
+	if terminalTurnReady {
+		// Correlate the current turn with this exact tool invocation. PostToolUse
+		// consumes the snapshot, so a delayed result from a previous turn cannot
+		// arm the new turn's marker.
+		_ = snapshotLocalizationToolUse(input, terminalIdentity)
+	}
+
+	// The installed matcher is deliberately broad so terminal state can stop
+	// any tool. With no marker, tools outside the historical access-policy
+	// matcher must be an immediate no-op: no daemon probe, classification,
+	// enrichment, or telemetry I/O.
+	if !preToolUsePolicyTool(input.ToolName) {
+		return
+	}
+
 	emitted := false
 	defer func() {
 		logHookEffectiveness("PreToolUse", emitted, daemonReachableFn(), hookAlternationSegmentCount(input), time.Since(started))
 	}()
 
-	isGortexMCP := strings.HasPrefix(input.ToolName, gortexMCPToolPrefix)
+	isGortexMCP := isGortexMCPToolName(input.ToolName)
 
 	// Auto-approve: under a permissive permission mode the host has
 	// already granted blanket approval, so Gortex's own MCP tools

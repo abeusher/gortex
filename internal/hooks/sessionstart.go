@@ -45,9 +45,13 @@ func runSessionStart(data []byte) {
 	if input.HookEventName != "SessionStart" {
 		return
 	}
+	clearedTerminal := clearLocalizationTerminalFromHook(data)
 	emitted := false
 	defer func() {
 		logHookEffectiveness("SessionStart", emitted, daemonReachableFn(), 0, time.Since(started))
+		if clearedTerminal {
+			localizationTerminalTelemetry("cleared_session", true, started)
+		}
 	}()
 
 	ctx := buildSessionStartBriefing(input.CWD)
