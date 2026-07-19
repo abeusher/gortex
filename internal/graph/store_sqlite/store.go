@@ -734,8 +734,13 @@ func (s *Store) prepare() error {
 		`INSERT INTO nodes (`+nodeCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`+nodeUpsertClause)
 	prep(&s.stmtGetNode,
 		`SELECT `+nodeCols+` FROM nodes WHERE id = ?`)
+	// The literal qual_name <> '' conjunct is what makes the partial
+	// nodes_by_qual index usable: SQLite cannot prove a bound parameter is
+	// non-empty, so without it this statement is a full node scan per call
+	// on resolver hot paths (measured against a production store). Every
+	// reader of a partial index must restate its predicate literally.
 	prep(&s.stmtGetNodeByQual,
-		`SELECT `+nodeCols+` FROM nodes WHERE qual_name = ? LIMIT 1`)
+		`SELECT `+nodeCols+` FROM nodes WHERE qual_name = ? AND qual_name <> '' LIMIT 1`)
 	prep(&s.stmtFindByName,
 		`SELECT `+nodeCols+` FROM nodes WHERE name = ?`)
 	prep(&s.stmtFindByNameInRepo,
