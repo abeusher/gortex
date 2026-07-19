@@ -104,6 +104,15 @@ var bulkDroppableIndexes = []bulkDroppableIndex{
 	// remains small enough to rebuild cheaply at the end of a cold bulk load.
 	{"nodes_repo_files", `CREATE INDEX IF NOT EXISTS nodes_repo_files ON nodes(repo_prefix, workspace_id, language, file_path, id) WHERE kind = 'file'`},
 	{"edges_by_from", `CREATE INDEX IF NOT EXISTS edges_by_from ON edges(from_id, kind)`},
+	// Site-shaped candidate probes (guard rehydration, resolve-job liveness,
+	// edge identity lookups) constrain (from_id, line). Without a line-bearing
+	// index the planner satisfies them through the covering WITHOUT-ROWID
+	// primary key probed on from_id alone, re-reading the caller's whole
+	// out-edge row set per site — hub callers (11k+ out-edges) turn a µs seek
+	// into tens of milliseconds, and the cross-package guard alone paid ~980s
+	// of a 28-repo cold index that way. With the index the full candidate
+	// path measured ~30 → ~116k sites/s on a production store copy.
+	{"edges_by_from_line", `CREATE INDEX IF NOT EXISTS edges_by_from_line ON edges(from_id, line)`},
 	{"edges_by_to", `CREATE INDEX IF NOT EXISTS edges_by_to ON edges(to_id, kind)`},
 	{"edges_by_kind", `CREATE INDEX IF NOT EXISTS edges_by_kind ON edges(kind)`},
 	// Exact changed-file frontiers (watcher and partial indexing) must not

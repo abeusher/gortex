@@ -66,17 +66,23 @@ func TestHotQueryPlansLocked(t *testing.T) {
 			forbid: []string{"SCAN e", "USE TEMP B-TREE"},
 		},
 		{
+			// Site probes must constrain BOTH from_id and line in the index
+			// probe. A from_id-only probe (the covering primary key, or
+			// edges_by_from without line) re-reads a hub caller's whole
+			// out-edge row set once per site — the production misplan that
+			// cost the cross-package guard ~980s of a cold index before
+			// edges_by_from_line existed. Lock the property, not the name.
 			name:   "edge_candidates_exact_site",
 			query:  edgeCandidatesExactSiteQuery(3),
 			args:   9,
-			want:   []string{"USING INDEX edges_by_from"},
+			want:   []string{"SEARCH e USING INDEX", "from_id=? AND line=?"},
 			forbid: []string{"SCAN e"},
 		},
 		{
 			name:   "edge_candidates_any_site",
 			query:  edgeCandidatesAnySiteQuery(3),
 			args:   6,
-			want:   []string{"USING INDEX edges_by_from"},
+			want:   []string{"SEARCH e USING INDEX", "from_id=? AND line=?"},
 			forbid: []string{"SCAN e"},
 		},
 		{
