@@ -1846,7 +1846,7 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		// exploration, multiplying turns and payloads. Name one concrete ranked
 		// target for the only permitted refinement read; source-literal evidence
 		// wins because it is absent from ordinary symbol metadata.
-		preferredSymbol := explorePreferredRefinementSymbol(symbolTargets)
+		preferredSymbol := explorePreferredRefinementSymbol(task, symbolTargets)
 		completion := newLocalizationRefinementCompletion(preferredSymbol)
 		result, returnedSymbols, digest := buildLocalizationExploreResultForTask(completion, task, targets, budget)
 		// Authorization is derived from the exact serialized projection, not
@@ -2049,10 +2049,48 @@ func exploreNodeWithinQueryScope(n *graph.Node, scope query.QueryOptions) bool {
 // one concrete, bounded follow-up. Exact source-literal evidence wins because
 // ordinary symbol metadata cannot represent it; otherwise the ranked head is
 // the deterministic refinement target.
-func explorePreferredRefinementSymbol(targets []exploreTarget) string {
-	for _, target := range targets {
-		if target.sourceLiteral && target.node != nil && target.node.ID != "" {
-			return target.node.ID
+// explorePreferredRefinementSymbol picks the single permitted refinement
+// read with the same preference ladder the answer draft uses, instead of the
+// raw rank-one symbol. A generic head (a builder type that shares no term
+// with the query) must not consume the only read while a query-aligned
+// candidate sits lower in the same envelope:
+//
+//	1. verified source-literal evidence
+//	2. explicit path / qualified-symbol / call anchor
+//	3. query-aligned non-generic callable
+//	4. protected concept implementation
+//	5. aligned candidate of any definition kind
+//	6. raw head only when nothing aligned exists
+func explorePreferredRefinementSymbol(task string, targets []exploreTarget) string {
+	query := shapeExploreQuery(task)
+	if exploreQueryIsConceptTask(query) {
+		query = stripLeadingExploreDirective(query)
+	}
+	queryTerms := exploreTerminalTerms(query)
+	aligned := func(t exploreTarget) bool {
+		overlap, _ := exploreDraftTermOverlap(queryTerms, t.node)
+		return overlap > 0
+	}
+	callable := func(n *graph.Node) bool {
+		return n != nil && (n.Kind == graph.KindFunction || n.Kind == graph.KindMethod)
+	}
+	rungs := []func(exploreTarget) bool{
+		func(t exploreTarget) bool { return t.sourceLiteral },
+		func(t exploreTarget) bool { return exploreLocalizationExplicitAnchor(query, t.node) },
+		func(t exploreTarget) bool {
+			return callable(t.node) && aligned(t) && !exploreDraftGenericCandidate(t.node, t.source)
+		},
+		func(t exploreTarget) bool { return t.conceptImplementation },
+		aligned,
+	}
+	for _, rung := range rungs {
+		for _, target := range targets {
+			if target.node == nil || target.node.ID == "" {
+				continue
+			}
+			if rung(target) {
+				return target.node.ID
+			}
 		}
 	}
 	for _, target := range targets {

@@ -321,8 +321,8 @@ func TestExplorePreferredRefinementSymbolPrefersSourceLiteral(t *testing.T) {
 	source := &graph.Node{ID: "repo/source.go::source"}
 	targets := []exploreTarget{{node: ordinary}, {node: source, sourceLiteral: true}}
 
-	require.Equal(t, source.ID, explorePreferredRefinementSymbol(targets))
-	require.Equal(t, ordinary.ID, explorePreferredRefinementSymbol(targets[:1]))
+	require.Equal(t, source.ID, explorePreferredRefinementSymbol("locate the helper", targets))
+	require.Equal(t, ordinary.ID, explorePreferredRefinementSymbol("locate the helper", targets[:1]))
 }
 
 func TestGatherExploreSourceLiteralRecallMapsParsedCSharpConstructor(t *testing.T) {
