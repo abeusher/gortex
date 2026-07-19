@@ -98,6 +98,20 @@ type SessionEndedHook interface {
 	SessionEnded(sess *Session)
 }
 
+// SessionStartedHook is an optional extension that MCPDispatcher
+// implementations can satisfy to receive a connect callback for each
+// ModeMCP session, fired after the handshake ack and before the first
+// frame is dispatched. write delivers one server-initiated JSON-RPC
+// frame (without trailing newline) to the client; it is safe for
+// concurrent use with the reply path — the daemon serialises all
+// writes to the connection — and returns an error once the connection
+// is gone. This is how server-initiated MCP notifications
+// (tools/list_changed, graph_invalidated, ...) reach socket clients;
+// the matching SessionEnded fires on teardown.
+type SessionStartedHook interface {
+	SessionStarted(sess *Session, write func([]byte) error)
+}
+
 // Controller implements the daemon's control surface. Separated from
 // MCPDispatcher so the two can evolve independently and so control-only
 // tests don't need a full MCP stack.
@@ -487,7 +501,14 @@ func (s *Server) serveMCP(conn net.Conn, reader *bufio.Reader, sess *Session) {
 		return
 	}
 
-	serveMCPConnection(conn, reader, s.mcpToolCallTimeout(), func(ctx context.Context, line []byte) ([]byte, error) {
+	hooks := &mcpConnectionHooks{
+		onReady: func(write func([]byte) error) {
+			if hook, ok := s.MCPDispatcher.(SessionStartedHook); ok && hook != nil {
+				hook.SessionStarted(sess, write)
+			}
+		},
+	}
+	serveMCPConnectionWithHooks(conn, reader, s.mcpToolCallTimeout(), func(ctx context.Context, line []byte) ([]byte, error) {
 		reply, _, err := sess.dispatchMCPOnceContext(ctx, line, func() ([]byte, error) {
 			reply, err := s.MCPDispatcher.Dispatch(ctx, sess, line)
 			if ctxErr := ctx.Err(); ctxErr != nil {
@@ -512,7 +533,7 @@ func (s *Server) serveMCP(conn net.Conn, reader *bufio.Reader, sess *Session) {
 			}
 		}
 		return reply, err
-	})
+	}, hooks)
 }
 
 // serveControl drains ControlRequest messages, invokes the Controller,

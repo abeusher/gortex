@@ -282,6 +282,12 @@ func serveMCPConnection(conn net.Conn, reader *bufio.Reader, timeout time.Durati
 type mcpConnectionHooks struct {
 	beforeResponse func(json.RawMessage)
 	dispatchSlots  chan struct{}
+	// onReady, if set, is invoked once — before the read loop starts —
+	// with a function that pushes one server-initiated JSON-RPC frame
+	// through the same serialised writer the request/notification
+	// replies use. This is how a SessionStartedHook implementation gets
+	// a write path that is safe for concurrent use with reply delivery.
+	onReady func(write func([]byte) error)
 }
 
 func serveMCPConnectionWithHooks(conn net.Conn, reader *bufio.Reader, timeout time.Duration, dispatch mcpFrameDispatch, hooks *mcpConnectionHooks) {
@@ -294,6 +300,9 @@ func serveMCPConnectionWithHooks(conn net.Conn, reader *bufio.Reader, timeout ti
 	}
 	registry := &mcpRequestRegistry{}
 	writer := &mcpResponseWriter{conn: conn}
+	if hooks != nil && hooks.onReady != nil {
+		hooks.onReady(writer.write)
+	}
 	var requests sync.WaitGroup
 	var initializeDone <-chan struct{}
 	defer func() {

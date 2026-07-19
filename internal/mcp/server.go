@@ -127,7 +127,12 @@ func (sh *symbolHistory) All() map[string][]SymbolModification {
 
 // Server wraps the MCP server with Gortex-specific tools.
 type Server struct {
-	mcpServer     *server.MCPServer
+	mcpServer *server.MCPServer
+	// connSessions tracks daemon-socket connections registered as live
+	// mcp-go client sessions so server-initiated notifications reach
+	// them (ConnectSession / DisconnectSession / WithClientSession in
+	// conn_session.go). Keyed by daemon session id.
+	connSessions  sync.Map
 	engine        *query.Engine
 	graph         graph.Store
 	indexer       *indexer.Indexer
