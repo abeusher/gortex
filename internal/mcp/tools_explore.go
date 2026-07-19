@@ -1826,6 +1826,12 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	if exploreImplementationIntent(task) {
 		symbolTargets = s.expandImplementationTargets(ctx, symbolTargets)
 		targets = append(targets[:len(artifactTargets):len(artifactTargets)], symbolTargets...)
+	} else if queryClass == rerank.QueryClassConcept {
+		// Concept answers prefer the owning type when several of its members
+		// rank together; implementation-intent queries are exempt because
+		// they ask for exactly those members.
+		symbolTargets = s.foldMemberOwners(ctx, symbolTargets)
+		targets = append(targets[:len(artifactTargets):len(artifactTargets)], symbolTargets...)
 	}
 	answerReady := exploreAnswerReady(task, symbolTargets) || artifactLane.ready
 	if answerReady && !artifactLane.ready {
