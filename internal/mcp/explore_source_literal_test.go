@@ -370,6 +370,236 @@ func TestExplorePreferredRefinementSymbolPrefersSourceLiteral(t *testing.T) {
 	require.Equal(t, ordinary.ID, explorePreferredRefinementSymbol("locate the helper", targets[:1]))
 }
 
+func TestRetainExploreSourceLiteralOwnersDiversifiesFilesWithinCaps(t *testing.T) {
+	recall := exploreSourceLiteralRecall{
+		hits: []exploreSourceLiteralHit{
+			{nodeID: "first-a", rank: 0},
+			{nodeID: "first-b", rank: 1},
+			{nodeID: "second", rank: 2},
+			{nodeID: "third", rank: 3},
+		},
+		ownerFiles: map[string]string{
+			"first-a": "src/first.go",
+			"first-b": "src/first.go",
+			"second":  "src/second.go",
+			"third":   "src/third.go",
+		},
+	}
+
+	hits, files, reason := retainExploreSourceLiteralOwners(recall)
+
+	require.Equal(t, []string{"first-a", "second", "first-b"}, []string{
+		hits[0].nodeID, hits[1].nodeID, hits[2].nodeID,
+	})
+	require.Equal(t, exploreSourceLiteralRecallMaxFilesPerTerm, files)
+	require.Equal(t, "file_cap", reason)
+}
+
+func TestGatherExploreSourceLiteralRecallAggregatesCompactAnchorsAcrossLanguages(t *testing.T) {
+	fixtures := []struct {
+		name     string
+		language string
+		ext      string
+		first    string
+		second   string
+	}{
+		{
+			name: "csharp", language: "csharp", ext: ".cs",
+			first:  "public void First() {\n    Register(\"aa\");\n}\n",
+			second: "public void Second() {\n    Register(\"aa\");\n    Register(\"bb\");\n}\n",
+		},
+		{
+			name: "rust", language: "rust", ext: ".rs",
+			first:  "fn first() {\n    register(\"aa\");\n}\n",
+			second: "fn second() {\n    register(\"aa\");\n    register(\"bb\");\n}\n",
+		},
+		{
+			name: "typescript", language: "typescript", ext: ".ts",
+			first:  "function first() {\n    register(\"aa\");\n}\n",
+			second: "function second() {\n    register(\"aa\");\n    register(\"bb\");\n}\n",
+		},
+	}
+	for _, fixture := range fixtures {
+		t.Run(fixture.name, func(t *testing.T) {
+			root := t.TempDir()
+			firstRel := "src/first" + fixture.ext
+			secondRel := "src/second" + fixture.ext
+			for rel, source := range map[string]string{firstRel: fixture.first, secondRel: fixture.second} {
+				path := filepath.Join(root, filepath.FromSlash(rel))
+				require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+				require.NoError(t, os.WriteFile(path, []byte(source), 0o644))
+			}
+
+			store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, store.Close()) })
+			idx := indexer.New(store, parser.NewRegistry(), config.IndexConfig{}, zap.NewNop())
+			_, err = idx.IndexCtx(context.Background(), root)
+			require.NoError(t, err)
+			idx.SetFileMtimes(map[string]int64{firstRel: 1, secondRel: 1})
+
+			first := sourceLiteralNode("demo/first::owner", "first", firstRel, graph.KindFunction, 1, 3)
+			second := sourceLiteralNode("demo/second::owner", "second", secondRel, graph.KindFunction, 1, 4)
+			first.Language = fixture.language
+			second.Language = fixture.language
+			store.AddBatch([]*graph.Node{first, second}, nil)
+			counting := &exploreSourceLiteralCountingStore{Store: store}
+			server := &Server{graph: counting, indexer: idx, logger: zap.NewNop()}
+
+			recall := server.gatherExploreSourceLiteralRecall(
+				context.Background(), []string{"aa", "bb"}, "", query.QueryOptions{},
+			)
+			coverage := make(map[string]map[int]struct{})
+			for _, hit := range recall.hits {
+				if coverage[hit.nodeID] == nil {
+					coverage[hit.nodeID] = make(map[int]struct{})
+				}
+				coverage[hit.nodeID][hit.anchor] = struct{}{}
+			}
+			require.Len(t, coverage[first.ID], 1)
+			require.Len(t, coverage[second.ID], 2)
+			require.Len(t, recall.diagnostics, 2)
+			require.Equal(t, []string{"aa", "bb"}, []string{
+				recall.diagnostics[0].literal, recall.diagnostics[1].literal,
+			})
+			require.Equal(t, 2, recall.diagnostics[0].rawHits)
+			require.Equal(t, 2, recall.diagnostics[0].mappedOwners)
+			require.Equal(t, 2, recall.diagnostics[0].retainedOwners)
+			require.Equal(t, 2, recall.diagnostics[0].retainedFiles)
+			require.Empty(t, recall.diagnostics[0].reason)
+			require.Equal(t, 1, recall.diagnostics[1].rawHits)
+			require.Equal(t, 1, recall.diagnostics[1].mappedOwners)
+			require.Equal(t, 1, recall.diagnostics[1].retainedOwners)
+			require.Equal(t, 1, recall.diagnostics[1].retainedFiles)
+			require.Empty(t, recall.diagnostics[1].reason)
+			require.Zero(t, counting.allNodesCalls, "anchor aggregation must remain file-bounded")
+
+			candidates := server.gatherExploreQuotedContentCandidates(
+				context.Background(), `locate registrations for "aa" and "bb"`, nil, 20,
+				query.QueryOptions{RepoAllow: map[string]bool{"demo": true}},
+			)
+			firstCandidate := candidateByID(candidates, first.ID)
+			secondCandidate := candidateByID(candidates, second.ID)
+			require.NotNil(t, firstCandidate)
+			require.NotNil(t, secondCandidate)
+			require.Equal(t, float64(1), firstCandidate.Signals[exploreSourceLiteralCoverageSignal])
+			require.Equal(t, float64(2), secondCandidate.Signals[exploreSourceLiteralCoverageSignal])
+			require.Positive(t, firstCandidate.Signals[exploreContentRecallAmbiguousSignal])
+			require.Zero(t, secondCandidate.Signals[exploreContentRecallAmbiguousSignal])
+		})
+	}
+}
+
+func TestGatherExploreSourceLiteralRecallKeepsMultiAnchorOwnerUnderNearCapCompetitors(t *testing.T) {
+	root := t.TempDir()
+	competitorRel := "src/00_CompetingDefaults.cs"
+	targetRel := "src/99_FormatterRegistry.cs"
+	competitorSource := "public sealed class CompetingDefaults {\n"
+	nodes := make([]*graph.Node, 0, 45)
+	line := 2
+	for i := 0; i < 44; i++ {
+		term := "pl"
+		if i%2 == 1 {
+			term = "ku"
+		}
+		name := fmt.Sprintf("Candidate%02d", i)
+		competitorSource += fmt.Sprintf("    public void %s() {\n        Register(\"%s\");\n    }\n", name, term)
+		node := sourceLiteralNode("demo/competitors::"+name, name, competitorRel, graph.KindMethod, line, line+2)
+		node.Language = "csharp"
+		nodes = append(nodes, node)
+		line += 3
+	}
+	competitorSource += "}\n"
+	targetSource := "public sealed class FormatterRegistry {\n" +
+		"    public void RegisterDefaultFormatter() {\n" +
+		"        Register(\"pl\");\n" +
+		"        Register(\"ku\");\n" +
+		"    }\n" +
+		"}\n"
+	target := sourceLiteralNode(
+		"demo/formatter::RegisterDefaultFormatter", "RegisterDefaultFormatter",
+		targetRel, graph.KindMethod, 2, 5,
+	)
+	target.Language = "csharp"
+	nodes = append(nodes, target)
+	for rel, source := range map[string]string{
+		competitorRel: competitorSource,
+		targetRel:     targetSource,
+	} {
+		path := filepath.Join(root, filepath.FromSlash(rel))
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+		require.NoError(t, os.WriteFile(path, []byte(source), 0o644))
+	}
+
+	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	idx := indexer.New(store, parser.NewRegistry(), config.IndexConfig{}, zap.NewNop())
+	_, err = idx.IndexCtx(context.Background(), root)
+	require.NoError(t, err)
+	idx.SetFileMtimes(map[string]int64{competitorRel: 1, targetRel: 1})
+	store.AddBatch(nodes, nil)
+	counting := &exploreSourceLiteralCountingStore{Store: store}
+	server := &Server{graph: counting, indexer: idx, logger: zap.NewNop()}
+	scope := query.QueryOptions{RepoAllow: map[string]bool{"demo": true}}
+
+	started := time.Now()
+	recall := server.gatherExploreSourceLiteralRecall(context.Background(), []string{"pl", "ku"}, "", scope)
+	require.Less(t, time.Since(started), 500*time.Millisecond, "near-cap two-anchor recall must honor the shared deadline")
+	require.Len(t, recall.diagnostics, 2)
+	for _, diagnostic := range recall.diagnostics {
+		// Bounded grep collapses repeated lines to one hit per file. The large
+		// competitor body still exercises production parsing and both per-anchor
+		// deadlines without multiplying retained owners.
+		require.Equal(t, 2, diagnostic.rawHits)
+		require.Equal(t, 2, diagnostic.mappedOwners)
+		require.Equal(t, 2, diagnostic.retainedOwners)
+		require.Equal(t, 2, diagnostic.retainedFiles)
+		require.Empty(t, diagnostic.reason)
+	}
+	coverage := make(map[int]struct{})
+	for _, hit := range recall.hits {
+		if hit.nodeID == target.ID {
+			coverage[hit.anchor] = struct{}{}
+		}
+	}
+	require.Len(t, coverage, 2, "the second-file owner must survive both collision-heavy anchor pages")
+	require.Zero(t, counting.allNodesCalls, "near-cap recall must remain file-bounded")
+
+	sourceCandidates := server.gatherExploreQuotedContentCandidates(
+		context.Background(), `locate default formatter registrations for "pl" and "ku"`, nil, 20, scope,
+	)
+	targetCandidate := candidateByID(sourceCandidates, target.ID)
+	require.NotNil(t, targetCandidate)
+	require.Equal(t, float64(2), targetCandidate.Signals[exploreSourceLiteralCoverageSignal])
+	require.Positive(t, targetCandidate.Signals[exploreContentRecallAmbiguousSignal])
+	ordinary := []*rerank.Candidate{
+		sourcePreservationCandidate("semantic-0", 0, 0),
+		sourcePreservationCandidate("semantic-1", 1, 0),
+		sourcePreservationCandidate("semantic-2", 2, 0),
+	}
+	selected := selectFinalExploreCandidates(
+		mergeExploreCandidates(ordinary, sourceCandidates, len(ordinary)), nil, 3,
+	)
+	require.NotNil(t, candidateByID(selected, target.ID), "multi-anchor owner must survive global pruning")
+	require.NotNil(t, candidateByID(selected, "semantic-0"))
+	require.NotNil(t, candidateByID(selected, "semantic-1"), "ambiguous single-anchor competitors must not consume the second reserve slot")
+}
+
+func TestGatherExploreSourceLiteralRecallRecordsTermCapDiagnostic(t *testing.T) {
+	server := &Server{logger: zap.NewNop()}
+	recall := server.gatherExploreSourceLiteralRecall(
+		context.Background(), []string{"aa", "bb", "cc"}, "demo", query.QueryOptions{},
+	)
+
+	require.Len(t, recall.diagnostics, 3)
+	byLiteral := make(map[string]exploreSourceLiteralDiagnostic, len(recall.diagnostics))
+	for _, diagnostic := range recall.diagnostics {
+		byLiteral[diagnostic.literal] = diagnostic
+	}
+	require.Equal(t, "term_cap", byLiteral["cc"].reason)
+}
+
 func TestGatherExploreSourceLiteralRecallMapsParsedCSharpConstructor(t *testing.T) {
 	root := t.TempDir()
 	rel := "src/Humanizer/Configuration/FormatterRegistry.cs"

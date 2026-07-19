@@ -1,0 +1,610 @@
+package mcp
+
+import (
+	"context"
+	"strings"
+	"unicode"
+	"unicode/utf8"
+
+	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/query"
+	"github.com/zzet/gortex/internal/search/rerank"
+)
+
+const (
+	exploreSyntacticAnchorMaxTerms = 3
+	exploreSyntacticAnchorFetch    = 10
+)
+
+// exploreSyntacticAnchor is a bounded, implementation-shaped clue copied
+// directly from the task. CLI flags and identifier-shaped tokens survive
+// prose query shaping poorly, but often name the missing implementation more
+// precisely than the surrounding natural language.
+type exploreSyntacticAnchor struct {
+	query   string
+	source  string
+	terms   []string
+	compact string
+}
+
+// exploreSyntacticAnchors extracts only syntactically strong, unquoted clues.
+// Flags lead because they are explicit user-facing identifiers; snake/camel/
+// qualified identifiers follow in first-seen order. Prefix-equivalent forms
+// collapse into one anchor, so --replace, replace_all, and Replacer consume a
+// single bounded retrieval lane rather than three.
+func exploreSyntacticAnchors(task string) []exploreSyntacticAnchor {
+	out := make([]exploreSyntacticAnchor, 0, exploreSyntacticAnchorMaxTerms)
+	tokens := exploreUnquotedCodeTokens(task)
+	add := func(raw string) {
+		anchor, ok := newExploreSyntacticAnchor(raw)
+		if !ok {
+			return
+		}
+		for _, existing := range out {
+			if exploreSyntacticAnchorEquivalent(existing, anchor) {
+				return
+			}
+		}
+		out = append(out, anchor)
+	}
+
+	for _, token := range tokens {
+		if !strings.HasPrefix(token, "--") || len(token) <= 2 {
+			continue
+		}
+		add(strings.TrimLeft(token, "-"))
+		if len(out) == exploreSyntacticAnchorMaxTerms {
+			return out
+		}
+	}
+
+	for _, token := range tokens {
+		if strings.HasPrefix(token, "--") {
+			continue
+		}
+		if !exploreCodeShapedToken(token) {
+			continue
+		}
+		add(token)
+		if len(out) == exploreSyntacticAnchorMaxTerms {
+			break
+		}
+	}
+	return out
+}
+
+func newExploreSyntacticAnchor(raw string) (exploreSyntacticAnchor, bool) {
+	raw = strings.Trim(raw, " \t\r\n()[]{}<>,.;:'\"")
+	if raw == "" {
+		return exploreSyntacticAnchor{}, false
+	}
+	seen := make(map[string]struct{})
+	terms := make([]string, 0, 4)
+	for _, token := range rerank.Tokenize(raw) {
+		term := strings.ToLower(strings.TrimSpace(token))
+		if len(term) < 3 {
+			continue
+		}
+		if _, duplicate := seen[term]; duplicate {
+			continue
+		}
+		seen[term] = struct{}{}
+		terms = append(terms, term)
+	}
+	if len(terms) == 0 {
+		return exploreSyntacticAnchor{}, false
+	}
+	compact := strings.Join(terms, "")
+	if len(compact) < 4 || exploreSyntacticAnchorNoise(compact) {
+		return exploreSyntacticAnchor{}, false
+	}
+	queryTerms := append([]string(nil), terms...)
+	if len(terms) > 1 {
+		queryTerms = append(queryTerms, strings.Join(terms, "_"), compact)
+	}
+	return exploreSyntacticAnchor{
+		query:   strings.Join(queryTerms, " "),
+		source:  strings.ToLower(raw),
+		terms:   terms,
+		compact: compact,
+	}, true
+}
+
+func exploreSyntacticAnchorNoise(compact string) bool {
+	switch compact {
+	case "csharp", "debug", "default", "dotnet", "example", "file", "files", "github", "gitlab", "golang", "help", "javascript", "kotlin", "linux", "macos", "option", "options", "path", "python", "rust", "test", "tests", "typescript", "verbose", "version", "windows":
+		return true
+	default:
+		return false
+	}
+}
+
+func exploreSyntacticAnchorEquivalent(left, right exploreSyntacticAnchor) bool {
+	if left.compact == right.compact {
+		return true
+	}
+	shorter, longer := left.compact, right.compact
+	if len(shorter) > len(longer) {
+		shorter, longer = longer, shorter
+	}
+	return len(shorter) >= 5 && strings.HasPrefix(longer, shorter)
+}
+
+func exploreUnquotedCodeTokens(task string) []string {
+	var masked strings.Builder
+	masked.Grow(len(task))
+	var quote rune
+	escaped := false
+	for _, r := range task {
+		if quote != 0 {
+			if escaped {
+				escaped = false
+				masked.WriteRune(' ')
+				continue
+			}
+			if r == '\\' && quote == '"' {
+				escaped = true
+				masked.WriteRune(' ')
+				continue
+			}
+			if r == quote {
+				quote = 0
+			}
+			masked.WriteRune(' ')
+			continue
+		}
+		if r == '"' || r == '`' {
+			quote = r
+			masked.WriteRune(' ')
+			continue
+		}
+		masked.WriteRune(r)
+	}
+	return strings.FieldsFunc(masked.String(), func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '_' && r != '.' && r != ':' && r != '-'
+	})
+}
+
+func exploreCodeShapedToken(token string) bool {
+	token = strings.Trim(token, "-_.:")
+	first, _ := utf8.DecodeRuneInString(token)
+	if token == "" || len(token) > 128 || (!unicode.IsLetter(first) && first != '_') {
+		return false
+	}
+	lower := strings.ToLower(token)
+	for _, suffix := range []string{".ai", ".com", ".dev", ".io", ".net", ".org"} {
+		if strings.HasSuffix(lower, suffix) {
+			return false
+		}
+	}
+	if strings.Contains(token, "_") || strings.Contains(token, "::") || strings.Contains(token, ".") {
+		return true
+	}
+	var previous rune
+	for _, r := range token {
+		if previous != 0 && (unicode.IsLower(previous) || unicode.IsDigit(previous)) && unicode.IsUpper(r) {
+			return true
+		}
+		previous = r
+	}
+	return false
+}
+
+func exploreSyntacticAnchorMatchesNode(anchor exploreSyntacticAnchor, node *graph.Node) bool {
+	if node == nil {
+		return false
+	}
+	return exploreSyntacticAnchorMatchesIdentifier(anchor, node.Name) ||
+		exploreSyntacticAnchorMatchesIdentifier(anchor, node.QualName)
+}
+
+func exploreSyntacticAnchorMatchesIdentifier(anchor exploreSyntacticAnchor, identifier string) bool {
+	identifierTerms := rerank.Tokenize(identifier)
+	if len(identifierTerms) == 0 {
+		return false
+	}
+	compact := strings.ToLower(strings.Join(identifierTerms, ""))
+	if strings.HasPrefix(compact, anchor.compact) ||
+		(len(compact) >= 5 && strings.HasPrefix(anchor.compact, compact)) {
+		return true
+	}
+	for _, anchorTerm := range anchor.terms {
+		matched := false
+		for _, identifierTerm := range identifierTerms {
+			identifierTerm = strings.ToLower(identifierTerm)
+			if strings.HasPrefix(identifierTerm, anchorTerm) ||
+				(len(identifierTerm) >= 4 && strings.HasPrefix(anchorTerm, identifierTerm)) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
+	return true
+}
+
+func exploreSyntacticAnchorEligibleNode(node *graph.Node) bool {
+	if node == nil {
+		return false
+	}
+	if isTest, _ := node.Meta["is_test"].(bool); isTest {
+		return false
+	}
+	switch node.Kind {
+	case graph.KindFunction, graph.KindMethod, graph.KindType, graph.KindMacro:
+		return true
+	default:
+		return false
+	}
+}
+
+func exploreSyntacticAnchorNodeStrength(anchor exploreSyntacticAnchor, node *graph.Node) int {
+	if !exploreSyntacticAnchorEligibleNode(node) || !exploreSyntacticAnchorMatchesNode(anchor, node) {
+		return 0
+	}
+	identifierTerms := rerank.Tokenize(node.Name)
+	strength := 0
+	for _, anchorTerm := range anchor.terms {
+		best := 0
+		for _, rawIdentifierTerm := range identifierTerms {
+			identifierTerm := strings.ToLower(rawIdentifierTerm)
+			switch {
+			case identifierTerm == anchorTerm:
+				best = max(best, 3)
+			case strings.HasPrefix(identifierTerm, anchorTerm):
+				suffix := strings.TrimPrefix(identifierTerm, anchorTerm)
+				if suffix == "r" || suffix == "er" || suffix == "or" || suffix == "impl" {
+					best = max(best, 2)
+				} else {
+					best = max(best, 1)
+				}
+			case len(identifierTerm) >= 4 && strings.HasPrefix(anchorTerm, identifierTerm):
+				best = max(best, 1)
+			}
+		}
+		strength += best
+	}
+	switch node.Kind {
+	case graph.KindFunction, graph.KindMethod:
+		strength += 3
+	case graph.KindMacro:
+		strength += 2
+	case graph.KindType:
+		strength++
+	}
+	if len(identifierTerms) > 1 {
+		strength++
+	}
+	return strength
+}
+
+func exploreSyntacticAnchorCandidate(
+	anchor exploreSyntacticAnchor,
+	candidates []*rerank.Candidate,
+	scope query.QueryOptions,
+	usedIDs, usedFiles map[string]struct{},
+) *rerank.Candidate {
+	var best *rerank.Candidate
+	bestStrength := 0
+	bestDiverse := false
+	for _, candidate := range candidates {
+		if candidate == nil || !exploreSyntacticAnchorEligibleNode(candidate.Node) ||
+			!scope.ScopeAllows(candidate.Node) || !exploreSyntacticAnchorMatchesNode(anchor, candidate.Node) {
+			continue
+		}
+		if _, used := usedIDs[candidate.Node.ID]; used {
+			continue
+		}
+		strength := exploreSyntacticAnchorNodeStrength(anchor, candidate.Node)
+		_, repeatedFile := usedFiles[candidate.Node.FilePath]
+		diverse := !repeatedFile
+		if best == nil || strength > bestStrength || (strength == bestStrength && diverse && !bestDiverse) {
+			best = candidate
+			bestStrength = strength
+			bestDiverse = diverse
+		}
+	}
+	return best
+}
+
+func exploreSyntacticAnchorReusesProtected(
+	anchor exploreSyntacticAnchor,
+	candidates []*rerank.Candidate,
+	usedIDs map[string]struct{},
+) string {
+	for _, candidate := range candidates {
+		if candidate == nil || candidate.Node == nil {
+			continue
+		}
+		if _, used := usedIDs[candidate.Node.ID]; used && exploreSyntacticAnchorMatchesNode(anchor, candidate.Node) {
+			return candidate.Node.ID
+		}
+	}
+	return ""
+}
+
+// gatherExploreSyntacticAnchorCandidates performs a tiny lexical retrieval for
+// each anchor not represented by the ordinary over-fetch pool. Only after that
+// identifier lane misses do we invoke the existing request-local source scan.
+// One diverse node per anchor is retained; no source body is persisted.
+func (s *Server) gatherExploreSyntacticAnchorCandidates(
+	ctx context.Context,
+	task string,
+	ordinary []*rerank.Candidate,
+	eng *query.Engine,
+	scope query.QueryOptions,
+	rctx *rerank.Context,
+) ([]*rerank.Candidate, map[int]string) {
+	anchors := exploreSyntacticAnchors(task)
+	if s == nil || s.graph == nil || eng == nil || len(anchors) == 0 || ctx.Err() != nil {
+		return nil, nil
+	}
+
+	protected := make(map[int]string, len(anchors))
+	usedIDs := make(map[string]struct{}, len(anchors))
+	usedFiles := make(map[string]struct{}, len(anchors))
+	addProtected := func(index int, candidate *rerank.Candidate) {
+		protected[index] = candidate.Node.ID
+		usedIDs[candidate.Node.ID] = struct{}{}
+		if candidate.Node.FilePath != "" {
+			usedFiles[candidate.Node.FilePath] = struct{}{}
+		}
+	}
+
+	additions := make([]*rerank.Candidate, 0, len(anchors))
+	missed := make([]int, 0, len(anchors))
+	anchorOpts := scope
+	anchorOpts.SkipInnerRerank = true
+	anchorOpts.SkipVectorChannel = true
+	for index, anchor := range anchors {
+		if ctx.Err() != nil {
+			break
+		}
+		reused := exploreSyntacticAnchorReusesProtected(anchor, ordinary, usedIDs)
+		if reused == "" {
+			reused = exploreSyntacticAnchorReusesProtected(anchor, additions, usedIDs)
+		}
+		if reused != "" {
+			protected[index] = reused
+			continue
+		}
+		ordinaryCandidate := exploreSyntacticAnchorCandidate(anchor, ordinary, scope, usedIDs, usedFiles)
+		if ordinaryCandidate != nil && exploreSyntacticAnchorNodeStrength(anchor, ordinaryCandidate.Node) >= 4 {
+			addProtected(index, ordinaryCandidate)
+			continue
+		}
+		rows := eng.GatherSymbolCandidates(anchor.query, exploreSyntacticAnchorFetch, anchorOpts, rctx)
+		combined := rows
+		if ordinaryCandidate != nil {
+			combined = append([]*rerank.Candidate{ordinaryCandidate}, rows...)
+		}
+		candidate := exploreSyntacticAnchorCandidate(anchor, combined, scope, usedIDs, usedFiles)
+		if candidate == nil {
+			missed = append(missed, index)
+			continue
+		}
+		alreadyOrdinary := false
+		for _, existing := range ordinary {
+			if existing != nil && existing.Node != nil && existing.Node.ID == candidate.Node.ID {
+				alreadyOrdinary = true
+				break
+			}
+		}
+		if !alreadyOrdinary {
+			additions = append(additions, candidate)
+		}
+		addProtected(index, candidate)
+	}
+	if len(missed) == 0 || ctx.Err() != nil {
+		return additions, protected
+	}
+
+	repoPrefix := ""
+	if len(scope.RepoAllow) == 1 {
+		for prefix, allowed := range scope.RepoAllow {
+			if allowed {
+				repoPrefix = prefix
+			}
+		}
+	}
+	if repoPrefix == "" {
+		repoPrefix, _ = s.sessionLocality(ctx)
+	}
+	sourceTerms := make([]string, 0, len(missed))
+	for _, index := range missed {
+		anchor := anchors[index]
+		sourceTerms = append(sourceTerms, anchor.source)
+	}
+	recall := s.gatherExploreSourceLiteralRecall(ctx, sourceTerms, repoPrefix, scope)
+	if len(recall.hits) == 0 {
+		return additions, protected
+	}
+	ids := make([]string, 0, len(recall.hits))
+	for _, hit := range recall.hits {
+		ids = append(ids, hit.nodeID)
+	}
+	nodes := s.graph.GetNodesByIDs(ids)
+	for localIndex, anchorIndex := range missed {
+		var fallback *graph.Node
+		var selected *graph.Node
+		selectedRank := 0
+		for _, hit := range recall.hits {
+			if hit.anchor != localIndex {
+				continue
+			}
+			node := nodes[hit.nodeID]
+			if !exploreSyntacticAnchorEligibleNode(node) || !scope.ScopeAllows(node) {
+				continue
+			}
+			if _, used := usedIDs[node.ID]; used {
+				continue
+			}
+			if fallback == nil {
+				fallback = node
+				selectedRank = hit.rank
+			}
+			if _, repeatedFile := usedFiles[node.FilePath]; !repeatedFile {
+				selected = node
+				selectedRank = hit.rank
+				break
+			}
+		}
+		if selected == nil {
+			selected = fallback
+		}
+		if selected == nil {
+			continue
+		}
+		sourceRank := 1.0
+		if selectedRank > 0 {
+			sourceRank = 1 / float64(selectedRank+1)
+		}
+		candidate := &rerank.Candidate{
+			Node: selected, TextRank: selectedRank, VectorRank: -1,
+			Signals: map[string]float64{
+				exploreSourceLiteralSignal:         sourceRank,
+				exploreSourceLiteralCoverageSignal: 1,
+			},
+		}
+		additions = append(additions, candidate)
+		addProtected(anchorIndex, candidate)
+	}
+	return additions, protected
+}
+
+// reserveExploreSyntacticAnchorCandidates keeps every discovered anchor owner
+// inside the final window while preserving the semantic head and the relative
+// order of all candidates that do not need promotion.
+func reserveExploreSyntacticAnchorCandidates(
+	task string,
+	candidates []*rerank.Candidate,
+	protected map[int]string,
+	maxSymbols int,
+) []*rerank.Candidate {
+	anchors := exploreSyntacticAnchors(task)
+	if len(anchors) == 0 || len(candidates) == 0 || maxSymbols <= 0 {
+		return candidates
+	}
+	if maxSymbols > len(candidates) {
+		maxSymbols = len(candidates)
+	}
+
+	usedIDs := make(map[string]struct{}, len(anchors))
+	usedFiles := make(map[string]struct{}, len(anchors))
+	reservationIDs := make([]string, 0, len(anchors))
+	for index, anchor := range anchors {
+		id := protected[index]
+		if id == "" {
+			if candidate := exploreSyntacticAnchorCandidate(anchor, candidates, query.QueryOptions{}, usedIDs, usedFiles); candidate != nil {
+				id = candidate.Node.ID
+			}
+		}
+		if id == "" {
+			continue
+		}
+		for _, candidate := range candidates {
+			if candidate == nil || candidate.Node == nil || candidate.Node.ID != id {
+				continue
+			}
+			usedIDs[id] = struct{}{}
+			usedFiles[candidate.Node.FilePath] = struct{}{}
+			reservationIDs = append(reservationIDs, id)
+			break
+		}
+	}
+	if len(reservationIDs) == 0 {
+		return candidates
+	}
+
+	// Rebuild only the order, never the candidate objects: semantic head first,
+	// then one owner per anchor, then every unreserved row in original order.
+	// This is simpler and safer than repeated in-place moves, where promoting a
+	// later anchor can shift an earlier reservation back outside the window.
+	result := make([]*rerank.Candidate, 0, len(candidates))
+	admitted := make(map[string]struct{}, len(reservationIDs)+1)
+	appendCandidate := func(candidate *rerank.Candidate) {
+		if candidate == nil || candidate.Node == nil {
+			return
+		}
+		if _, duplicate := admitted[candidate.Node.ID]; duplicate {
+			return
+		}
+		admitted[candidate.Node.ID] = struct{}{}
+		result = append(result, candidate)
+	}
+	appendCandidate(candidates[0])
+	for _, id := range reservationIDs {
+		if len(result) >= maxSymbols {
+			break
+		}
+		for _, candidate := range candidates {
+			if candidate != nil && candidate.Node != nil && candidate.Node.ID == id {
+				appendCandidate(candidate)
+				break
+			}
+		}
+	}
+	for _, candidate := range candidates {
+		appendCandidate(candidate)
+	}
+	return result
+}
+
+func exploreSyntacticAnchorMatchesTargetSource(anchor exploreSyntacticAnchor, target exploreTarget, lowerSource string) bool {
+	if exploreSyntacticAnchorMatchesNode(anchor, target.node) {
+		return true
+	}
+	for _, term := range anchor.terms {
+		if !strings.Contains(lowerSource, term) {
+			return false
+		}
+	}
+	return true
+}
+
+// exploreSyntacticAnchorEvidenceReady prevents a broad semantic neighbor from
+// terminating localization while a distinctive implementation clue is absent.
+// Every retained anchor needs one production declaration with hydrated source;
+// fields, tests, abstract declarations, and metadata-only hits cannot prove it.
+func exploreSyntacticAnchorEvidenceReady(task string, targets []exploreTarget) bool {
+	anchors := exploreSyntacticAnchors(task)
+	covered := make([]bool, len(anchors))
+	remaining := len(anchors)
+	for _, target := range targets {
+		if !exploreSyntacticAnchorEligibleNode(target.node) || strings.TrimSpace(target.source) == "" {
+			continue
+		}
+		declaration := strings.ToLower(target.source)
+		for index, anchor := range anchors {
+			if covered[index] || !exploreSyntacticAnchorMatchesTargetSource(anchor, target, declaration) {
+				continue
+			}
+			if target.node.Kind == graph.KindType &&
+				(strings.Contains(declaration, "interface ") || strings.Contains(declaration, "trait ") || strings.Contains(declaration, "protocol ")) {
+				continue
+			}
+			covered[index] = true
+			remaining--
+		}
+		if remaining == 0 {
+			return true
+		}
+	}
+	return remaining == 0
+}
+
+func exploreSyntacticAnchorTargetMatchesAnchors(anchors []exploreSyntacticAnchor, target exploreTarget) int {
+	if !exploreSyntacticAnchorEligibleNode(target.node) || strings.TrimSpace(target.source) == "" {
+		return 0
+	}
+	lowerSource := strings.ToLower(target.source)
+	matched := 0
+	for _, anchor := range anchors {
+		if exploreSyntacticAnchorMatchesTargetSource(anchor, target, lowerSource) {
+			matched++
+		}
+	}
+	return matched
+}

@@ -37,6 +37,70 @@ func TestLimitExploreCandidatesPreservingSourceLiteralReservesOneFullCapSlot(t *
 	require.NotNil(t, candidateByID(bounded, "source"))
 }
 
+func TestLimitExploreCandidatesPreservingSourceLiteralPrefersMultiAnchorOwner(t *testing.T) {
+	multi := sourcePreservationCandidate("multi-anchor", 90, 0.25)
+	multi.Signals[exploreSourceLiteralCoverageSignal] = 2
+	single := sourcePreservationCandidate("single-anchor", 80, 1)
+	single.Signals[exploreSourceLiteralCoverageSignal] = 1
+	candidates := []*rerank.Candidate{
+		sourcePreservationCandidate("primary-0", 0, 0),
+		sourcePreservationCandidate("primary-1", 1, 0),
+		single,
+		multi,
+	}
+
+	bounded := limitExploreCandidatesPreservingSourceLiteral(candidates, 2)
+
+	require.Len(t, bounded, 2)
+	require.NotNil(t, candidateByID(bounded, multi.Node.ID))
+	require.Nil(t, candidateByID(bounded, single.Node.ID), "a two-slot window preserves its semantic head plus the multi-anchor owner")
+}
+
+func TestSelectFinalExploreCandidatesReservesOnlyOneAmbiguousSingleAnchorOwner(t *testing.T) {
+	first := sourcePreservationCandidate("ambiguous-a", 80, 1)
+	first.Signals[exploreSourceLiteralCoverageSignal] = 1
+	first.Signals[exploreContentRecallAmbiguousSignal] = 1
+	second := sourcePreservationCandidate("ambiguous-b", 90, 0.5)
+	second.Signals[exploreSourceLiteralCoverageSignal] = 1
+	second.Signals[exploreContentRecallAmbiguousSignal] = 1
+	prod := []*rerank.Candidate{
+		sourcePreservationCandidate("primary-0", 0, 0),
+		sourcePreservationCandidate("primary-1", 1, 0),
+		sourcePreservationCandidate("primary-2", 2, 0),
+		first,
+		second,
+	}
+
+	selected := selectFinalExploreCandidates(prod, nil, 3)
+
+	require.Len(t, selected, 3)
+	require.Equal(t, "primary-0", selected[0].Node.ID)
+	require.NotNil(t, candidateByID(selected, first.Node.ID))
+	require.Nil(t, candidateByID(selected, second.Node.ID))
+	require.NotNil(t, candidateByID(selected, "primary-1"), "ambiguous collision evidence must not consume both reserve slots")
+}
+
+func TestSelectFinalExploreCandidatesReservesTwoSourceOwnersWhenCapacityAllows(t *testing.T) {
+	multi := sourcePreservationCandidate("multi-anchor", 90, 0.25)
+	multi.Signals[exploreSourceLiteralCoverageSignal] = 2
+	single := sourcePreservationCandidate("single-anchor", 80, 1)
+	single.Signals[exploreSourceLiteralCoverageSignal] = 1
+	prod := []*rerank.Candidate{
+		sourcePreservationCandidate("primary-0", 0, 0),
+		sourcePreservationCandidate("primary-1", 1, 0),
+		sourcePreservationCandidate("primary-2", 2, 0),
+		single,
+		multi,
+	}
+
+	selected := selectFinalExploreCandidates(prod, nil, 3)
+
+	require.Len(t, selected, 3)
+	require.Equal(t, multi.Node.ID, selected[0].Node.ID)
+	require.NotNil(t, candidateByID(selected, single.Node.ID))
+	require.NotNil(t, candidateByID(selected, "primary-0"), "bounded reservation must retain the semantic head")
+}
+
 func TestSelectFinalExploreCandidatesPreservesSourceLiteralAfterRerank(t *testing.T) {
 	prod := []*rerank.Candidate{
 		sourcePreservationCandidate("primary-0", 0, 0),
@@ -108,13 +172,17 @@ func TestMergeExploreCandidatesPreservesSourceLiteralSignalThroughDedupe(t *test
 	primarySignals := map[string]float64{"ordinary": 1}
 	merged := mergeExploreCandidates(
 		[]*rerank.Candidate{{Node: node, TextRank: 0, VectorRank: -1, Signals: primarySignals}},
-		[]*rerank.Candidate{{Node: node, TextRank: 9, VectorRank: -1, Signals: map[string]float64{exploreSourceLiteralSignal: 0.5}}},
+		[]*rerank.Candidate{{Node: node, TextRank: 9, VectorRank: -1, Signals: map[string]float64{
+			exploreSourceLiteralSignal: 0.5, exploreSourceLiteralCoverageSignal: 2,
+		}}},
 		20,
 	)
 
 	require.Len(t, merged, 1)
 	require.Equal(t, 0.5, merged[0].Signals[exploreSourceLiteralSignal])
+	require.Equal(t, float64(2), merged[0].Signals[exploreSourceLiteralCoverageSignal])
 	require.Zero(t, primarySignals[exploreSourceLiteralSignal], "request-local evidence must not mutate an input candidate")
+	require.Zero(t, primarySignals[exploreSourceLiteralCoverageSignal], "coverage evidence must remain request-local")
 }
 
 func TestExploreAnswerReadyKeepsQuotedNonExactConceptNonTerminal(t *testing.T) {

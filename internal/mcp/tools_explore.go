@@ -817,11 +817,29 @@ func exploreDraftGenericCandidate(n *graph.Node, source string) bool {
 		}
 	}
 	// Receiver syntax varies, but trivial implementations consistently contain
-	// a member access plus either one return/call or one field assignment.
-	hasMemberAccess := strings.Contains(code, ".")
-	hasOneStepReturn := strings.Contains(code, " return ") && strings.Contains(code, "(")
-	hasAccessorAssignment := strings.Contains(code, "=")
-	return hasMemberAccess && (hasOneStepReturn || hasAccessorAssignment)
+	// a member access plus one return/call or one field assignment. Inspect the
+	// body separately so Rust tail expressions and C#/Kotlin expression bodies
+	// are recognized even though they omit an explicit return keyword.
+	body := code
+	if open := strings.IndexByte(body, '{'); open >= 0 {
+		body = body[open+1:]
+		if close := strings.LastIndexByte(body, '}'); close >= 0 {
+			body = body[:close]
+		}
+	}
+	body = strings.TrimSpace(body)
+	hasMemberAccess := strings.Contains(body, ".") || strings.Contains(body, "::")
+	hasCall := strings.Contains(body, "(") && strings.Contains(body, ")")
+	hasOneStepReturn := strings.Contains(" "+body+" ", " return ") && hasCall
+	hasAccessorAssignment := strings.Contains(body, "=")
+	hasExpressionBody := strings.Contains(body, "=>") && hasCall
+	// A tail forwarder is one member call with no statement-level work around
+	// it. One optional trailing semicolon covers Rust and expression-bodied
+	// languages without classifying small control-flow implementations as shims.
+	tail := strings.TrimSpace(strings.TrimSuffix(body, ";"))
+	hasTailForwarder := hasCall && hasMemberAccess && !strings.Contains(tail, ";") &&
+		!strings.Contains(tail, "{") && !strings.Contains(tail, "}")
+	return hasMemberAccess && (hasOneStepReturn || hasAccessorAssignment || hasExpressionBody || hasTailForwarder)
 }
 
 func exploreDraftExactAnchor(query string, n *graph.Node) bool {
@@ -914,6 +932,10 @@ func exploreAnswerReady(task string, targets []exploreTarget) bool {
 	matchedNode := func(node *graph.Node) int { return matchedNodeFor(node, queryTerms) }
 	head := targets[0]
 	headMatches := matchedNode(head.node)
+	if class == rerank.QueryClassConcept && !exploreLocalizationExplicitAnchor(query, head.node) &&
+		!exploreSyntacticAnchorEvidenceReady(task, targets) {
+		return false
+	}
 
 	// Paths, signatures, and identifier-shaped queries carry explicit anchors.
 	// A shared token is not enough: the ranked head must cover the complete
@@ -983,11 +1005,13 @@ func exploreAnswerReady(task string, targets []exploreTarget) bool {
 	// declarations remain useful evidence, but cannot terminate navigation.
 	var implementation *exploreTarget
 	if class == rerank.QueryClassConcept {
+		hasSyntacticAnchors := len(exploreSyntacticAnchors(task)) > 0
 		for i := range targets {
 			target := &targets[i]
 			callable := target.node != nil &&
 				(target.node.Kind == graph.KindFunction || target.node.Kind == graph.KindMethod)
-			if target.conceptImplementation && callable && strings.TrimSpace(target.source) != "" {
+			if target.conceptImplementation && callable && strings.TrimSpace(target.source) != "" &&
+				(!hasSyntacticAnchors || !exploreDraftGenericCandidate(target.node, target.source)) {
 				implementation = target
 				break
 			}
@@ -1656,6 +1680,21 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 			ranked = limitExploreCandidatesPreservingSourceLiteral(ranked, fetch*2)
 		}
 	}
+	// Distinctive CLI and identifier-shaped anchors get one bounded lexical
+	// owner each. This runs after the ordinary ranking pass so it only spends
+	// work on uncovered anchors and cannot perturb the semantic channel. The
+	// existing source scanner is the final fallback, never a persistent body
+	// index.
+	var protectedSyntacticAnchors map[int]string
+	if queryClass == rerank.QueryClassConcept {
+		anchorCandidates, protected := s.gatherExploreSyntacticAnchorCandidates(
+			ctx, task, ranked, eng, opts, rctx,
+		)
+		protectedSyntacticAnchors = protected
+		if len(anchorCandidates) > 0 {
+			ranked = mergeExploreCandidates(ranked, anchorCandidates, fetch)
+		}
+	}
 	// Resilience ladder: a warm-restarted daemon can transiently return an
 	// empty scoped ranked result (workspace stamps not yet backfilled, or
 	// search bundles served before their node payloads re-materialise)
@@ -1721,6 +1760,18 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	}
 	prod, protectedImplementationID := reserveExploreConceptImplementation(searchQuery, queryClass, prod, maxSymbols)
 	cands := selectFinalExploreCandidates(prod, test, maxSymbols)
+	if len(protectedSyntacticAnchors) > 0 {
+		// Source-literal selection owns its own final-slot guarantees. Re-union
+		// that selected window with production candidates, then enforce anchor
+		// reservations against the actual final pool while retaining the selected
+		// order for every remaining slot.
+		anchorPool := mergeExploreCandidates(cands, prod, 0)
+		anchorPool = reserveExploreSyntacticAnchorCandidates(task, anchorPool, protectedSyntacticAnchors, maxSymbols)
+		if len(anchorPool) > maxSymbols {
+			anchorPool = anchorPool[:maxSymbols]
+		}
+		cands = anchorPool
+	}
 	if len(cands) == 0 && len(artifactLane.targets) == 0 {
 		if req.GetBool("localize", false) {
 			return s.completeEmptyLocalization(ctx, task, budget), nil
@@ -2084,6 +2135,7 @@ func explorePreferredRefinementSymbol(task string, targets []exploreTarget) stri
 		return ""
 	}
 	query := shapeExploreQuery(task)
+	syntacticAnchors := exploreSyntacticAnchors(task)
 	if exploreQueryIsConceptTask(query) {
 		query = stripLeadingExploreDirective(query)
 	}
@@ -2110,6 +2162,7 @@ func explorePreferredRefinementSymbol(task string, targets []exploreTarget) stri
 		identifierOverlap int
 		bodyOverlap       int
 		longest           int
+		anchorMatches     int
 		explicit          bool
 		callable          bool
 		generic           bool
@@ -2133,6 +2186,7 @@ func explorePreferredRefinementSymbol(task string, targets []exploreTarget) stri
 			identifierOverlap: identifierOverlap,
 			bodyOverlap:       bodyOverlap,
 			longest:           longest,
+			anchorMatches:     exploreSyntacticAnchorTargetMatchesAnchors(syntacticAnchors, target),
 			explicit:          exploreLocalizationExplicitAnchor(query, target.node),
 			callable:          callable,
 			generic:           exploreDraftGenericCandidate(target.node, target.source),
@@ -2151,6 +2205,12 @@ func explorePreferredRefinementSymbol(task string, targets []exploreTarget) stri
 	better := func(left, right refinementCandidate) bool {
 		if left.explicit != right.explicit {
 			return left.explicit
+		}
+		if left.anchorMatches != right.anchorMatches {
+			return left.anchorMatches > right.anchorMatches
+		}
+		if left.anchorMatches > 0 && left.generic != right.generic {
+			return !left.generic
 		}
 		leftAlignment, rightAlignment := alignment(left), alignment(right)
 		if leftAlignment != rightAlignment {
@@ -3155,6 +3215,8 @@ const (
 	exploreContentRecallExactSignal     = "explore_content_exact"
 	exploreContentRecallAmbiguousSignal = "explore_content_exact_ambiguous"
 	exploreSourceLiteralSignal          = "explore_source_literal"
+	exploreSourceLiteralCoverageSignal  = "explore_source_literal_coverage"
+	exploreSourceLiteralReservationMax  = 2
 	exploreQuotedRecallMaxTerms         = 3
 	exploreQuotedRecallMaxPerTerm       = 12
 	exploreQuotedRecallRetryMaxRows     = 24
@@ -3346,6 +3408,9 @@ func (s *Server) gatherExploreQuotedContentCandidates(
 	uniqueExact := make(map[string]bool, len(pages)*perTerm)
 	ambiguousExact := make(map[string]bool, len(pages)*perTerm)
 	sourceLiteralHit := make(map[string]float64)
+	sourceLiteralAnchors := make(map[string]map[int]struct{})
+	sourceLiteralAmbiguous := make(map[string]bool)
+	sourceLiteralSettled := make(map[string]bool)
 	for _, page := range pages {
 		seenForTerm := make(map[string]struct{}, len(page.hits))
 		exactIDs := make(map[string]struct{})
@@ -3418,8 +3483,14 @@ func (s *Server) gatherExploreQuotedContentCandidates(
 			} else if hit.rank < previous {
 				bestRank[hit.nodeID] = hit.rank
 			}
-			if termCount[hit.nodeID] == 0 {
-				termCount[hit.nodeID] = 1
+			anchors := sourceLiteralAnchors[hit.nodeID]
+			if anchors == nil {
+				anchors = make(map[int]struct{}, exploreSourceLiteralRecallMaxTerms)
+				sourceLiteralAnchors[hit.nodeID] = anchors
+			}
+			anchors[hit.anchor] = struct{}{}
+			if termCount[hit.nodeID] < len(anchors) {
+				termCount[hit.nodeID] = len(anchors)
 			}
 			exactHit[hit.nodeID] = true
 			sourceRank := 1.0
@@ -3429,10 +3500,17 @@ func (s *Server) gatherExploreQuotedContentCandidates(
 			if sourceRank > sourceLiteralHit[hit.nodeID] {
 				sourceLiteralHit[hit.nodeID] = sourceRank
 			}
-			if sourceRecall.ambiguous {
-				ambiguousExact[hit.nodeID] = true
+			if hit.ambiguous {
+				sourceLiteralAmbiguous[hit.nodeID] = true
 			} else {
-				uniqueExact[hit.nodeID] = true
+				sourceLiteralSettled[hit.nodeID] = true
+			}
+		}
+		for id := range sourceLiteralAnchors {
+			if sourceLiteralAmbiguous[id] && !sourceLiteralSettled[id] {
+				ambiguousExact[id] = true
+			} else {
+				uniqueExact[id] = true
 			}
 		}
 		if len(missingNodes) > 0 {
@@ -3463,6 +3541,7 @@ func (s *Server) gatherExploreQuotedContentCandidates(
 		}
 		if sourceRank := sourceLiteralHit[id]; sourceRank > 0 {
 			signals[exploreSourceLiteralSignal] = sourceRank
+			signals[exploreSourceLiteralCoverageSignal] = float64(len(sourceLiteralAnchors[id]))
 		}
 		candidates = append(candidates, &rerank.Candidate{
 			Node:       node,
@@ -3657,6 +3736,7 @@ func mergeExploreCandidates(primary, expanded []*rerank.Candidate, expansionRank
 				exploreContentRecallExactSignal,
 				exploreContentRecallAmbiguousSignal,
 				exploreSourceLiteralSignal,
+				exploreSourceLiteralCoverageSignal,
 			} {
 				if clone.Signals == nil || clone.Signals[key] <= current.Signals[key] {
 					continue
@@ -3737,9 +3817,10 @@ func limitExploreCandidates(candidates []*rerank.Candidate, limit int) []*rerank
 }
 
 // limitExploreCandidatesPreservingSourceLiteral reserves one slot for the best
-// request-local raw-source literal hit after the ordinary retrieval union is
-// full. The reservation replaces the weakest bounded candidate; it never grows
-// the candidate set or performs another graph lookup.
+// request-local raw-source literal owners after the ordinary retrieval union is
+// full. The bounded reservation prefers multi-anchor owners, preserves one
+// semantic candidate, and never grows the candidate set or performs another
+// graph lookup.
 func limitExploreCandidatesPreservingSourceLiteral(candidates []*rerank.Candidate, limit int) []*rerank.Candidate {
 	bounded := limitExploreCandidates(candidates, limit)
 	if limit <= 0 || len(candidates) <= limit || len(bounded) == 0 {
@@ -3748,35 +3829,93 @@ func limitExploreCandidatesPreservingSourceLiteral(candidates []*rerank.Candidat
 	return reserveExploreSourceLiteralCandidate(candidates, bounded)
 }
 
-// reserveExploreSourceLiteralCandidate inserts the strongest source-literal
-// candidate into an already-selected window. It deliberately leaves the
-// window's established order untouched unless a replacement is required.
+// reserveExploreSourceLiteralCandidate inserts up to two bounded source-literal
+// owners into an already-selected window, preferring owners that cover multiple
+// anchors while preserving at least one semantic candidate. It leaves the
+// established order untouched unless replacement is required.
 func reserveExploreSourceLiteralCandidate(candidates, bounded []*rerank.Candidate) []*rerank.Candidate {
 	if len(bounded) == 0 || len(candidates) <= len(bounded) {
 		return bounded
 	}
-	var best *rerank.Candidate
-	bestSignal := 0.0
-	for _, candidate := range candidates {
-		if candidate == nil || candidate.Node == nil || candidate.Signals == nil {
-			continue
-		}
-		if signal := candidate.Signals[exploreSourceLiteralSignal]; signal > bestSignal {
-			best = candidate
-			bestSignal = signal
-		}
-	}
-	if best == nil {
+	// A source-body fallback may occupy at most the slots after the ranked
+	// semantic head. This remains true even for a one-slot response.
+	reservationLimit := min(exploreSourceLiteralReservationMax, len(bounded)-1)
+	if reservationLimit <= 0 {
 		return bounded
 	}
-	for _, candidate := range bounded {
-		if candidate != nil && candidate.Node != nil && candidate.Node.ID == best.Node.ID {
-			return bounded
+
+	sources := make([]*rerank.Candidate, 0, exploreSourceLiteralReservationMax)
+	for _, candidate := range candidates {
+		if candidate == nil || candidate.Node == nil || candidate.Signals == nil ||
+			candidate.Signals[exploreSourceLiteralSignal] <= 0 {
+			continue
+		}
+		sources = append(sources, candidate)
+	}
+	sort.SliceStable(sources, func(i, j int) bool {
+		leftCoverage := sources[i].Signals[exploreSourceLiteralCoverageSignal]
+		rightCoverage := sources[j].Signals[exploreSourceLiteralCoverageSignal]
+		if leftCoverage != rightCoverage {
+			return leftCoverage > rightCoverage
+		}
+		return sources[i].Signals[exploreSourceLiteralSignal] > sources[j].Signals[exploreSourceLiteralSignal]
+	})
+	selectedSources := sources[:0]
+	for _, source := range sources {
+		coverage := source.Signals[exploreSourceLiteralCoverageSignal]
+		settled := source.Signals[exploreContentRecallAmbiguousSignal] <= 0
+		// One ambiguous single-anchor owner may preserve recall, but allowing a
+		// second would spend most of a three-slot answer on collision evidence.
+		// Multi-anchor corroboration is strong enough to keep despite ambiguity.
+		if len(selectedSources) > 0 && coverage < 2 && !settled {
+			continue
+		}
+		selectedSources = append(selectedSources, source)
+		if len(selectedSources) == reservationLimit {
+			break
 		}
 	}
+	sources = selectedSources
+	if len(sources) == 0 {
+		return bounded
+	}
 
+	desired := make(map[string]struct{}, len(sources))
+	present := make(map[string]struct{}, len(bounded))
+	for _, candidate := range sources {
+		desired[candidate.Node.ID] = struct{}{}
+	}
+	for _, candidate := range bounded {
+		if candidate != nil && candidate.Node != nil {
+			present[candidate.Node.ID] = struct{}{}
+		}
+	}
 	reserved := append([]*rerank.Candidate(nil), bounded...)
-	reserved[len(reserved)-1] = best
+	for _, source := range sources {
+		if _, exists := present[source.Node.ID]; exists {
+			continue
+		}
+		replace := -1
+		for index := len(reserved) - 1; index >= 1; index-- {
+			candidate := reserved[index]
+			if candidate == nil || candidate.Node == nil {
+				replace = index
+				break
+			}
+			if _, protected := desired[candidate.Node.ID]; !protected {
+				replace = index
+				break
+			}
+		}
+		if replace < 0 {
+			break
+		}
+		if previous := reserved[replace]; previous != nil && previous.Node != nil {
+			delete(present, previous.Node.ID)
+		}
+		reserved[replace] = source
+		present[source.Node.ID] = struct{}{}
+	}
 	return reserved
 }
 
@@ -3786,14 +3925,18 @@ func reserveExploreSourceLiteralCandidate(candidates, bounded []*rerank.Candidat
 // the ordinary retrieval head.
 func promoteExploreSourceLiteralCandidate(candidates []*rerank.Candidate) []*rerank.Candidate {
 	bestIndex := -1
+	bestCoverage := 0.0
 	bestSignal := 0.0
 	for index, candidate := range candidates {
 		if candidate == nil || candidate.Node == nil || candidate.Signals == nil ||
 			candidate.Signals[exploreContentRecallAmbiguousSignal] > 0 {
 			continue
 		}
-		if signal := candidate.Signals[exploreSourceLiteralSignal]; signal > bestSignal {
+		coverage := candidate.Signals[exploreSourceLiteralCoverageSignal]
+		signal := candidate.Signals[exploreSourceLiteralSignal]
+		if signal > 0 && (coverage > bestCoverage || coverage == bestCoverage && signal > bestSignal) {
 			bestIndex = index
+			bestCoverage = coverage
 			bestSignal = signal
 		}
 	}
