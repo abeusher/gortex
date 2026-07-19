@@ -54,3 +54,35 @@ func TestFrameworkCensusProbe(t *testing.T) {
 	t.Logf("summarizeFrameworkCandidatesCensus(full): %s (markers=%d, fullCensus=%v)",
 		time.Since(t3), len(summary.allMarkers), summary.fullCensus)
 }
+
+// TestFrameworkSynthesisScopedProbe reproduces the daemon's full-coverage
+// batch shape — a scope naming every repository plus the census attestation —
+// which is NOT the same code path as a nil scope: gates, claiming resolvers,
+// and the demote tail all take their scoped forms. A certification run showed
+// ~337s of pass wall outside every timed section on exactly this shape.
+func TestFrameworkSynthesisScopedProbe(t *testing.T) {
+	path := os.Getenv("GORTEX_BENCH_STORE")
+	if path == "" {
+		t.Skip("set GORTEX_BENCH_STORE to a copied store.sqlite to run")
+	}
+	s, err := store_sqlite.Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	scope := map[string]bool{}
+	for _, prefix := range s.RepoPrefixes() {
+		scope[prefix] = true
+	}
+	t.Logf("scope: %d prefixes", len(scope))
+	t0 := time.Now()
+	rep := RunFrameworkSynthesizersScopedWithCensus(s, scope, true)
+	t.Logf("full scoped synthesis: %s (census=%dms scope=%dms gate=%dms claim=%dms demote=%dms edges=%d)",
+		time.Since(t0), rep.CensusMillis, rep.ScopeMillis, rep.GateMillis, rep.ClaimMillis, rep.DemoteMillis, rep.Total)
+	var loopMs int64
+	for _, p := range rep.Per {
+		loopMs += p.Millis
+	}
+	t.Logf("loop total: %dms across %d entries", loopMs, len(rep.Per))
+}

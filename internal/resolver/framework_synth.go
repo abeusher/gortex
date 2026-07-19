@@ -1070,7 +1070,16 @@ func runFrameworkSynthesizersScoped(
 	scopeStart := time.Now()
 	var genericScope graph.Store
 	if scope != nil {
-		genericScope = newFrameworkScopedStore(g, scope, filePaths)
+		if censusEligible && len(filePaths) == 0 {
+			// Full-coverage attestation: the scoped view of every tracked
+			// repository IS the store. The wrapper exists to bound a partial
+			// run's reads (per-row scope checks, incident retention, frontier
+			// seeding); on a cold / full-reconciliation batch it is pure
+			// per-row overhead paid by every legacy synthesizer stream.
+			genericScope = g
+		} else {
+			genericScope = newFrameworkScopedStore(g, scope, filePaths)
+		}
 	}
 	rep.ScopeMillis = time.Since(scopeStart).Milliseconds()
 	for _, s := range defaultFrameworkSynthesizers() {
