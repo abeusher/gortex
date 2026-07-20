@@ -37,10 +37,10 @@ func TestHookEffectivenessRecordsSkippedDenominatorAndAlternation(t *testing.T) 
 	if json.Unmarshal([]byte(lines[0]), &first) != nil || json.Unmarshal([]byte(lines[1]), &second) != nil {
 		t.Fatalf("invalid effectiveness JSONL: %s", data)
 	}
-	if first.Event != "PreToolUse" || !first.EmittedContext || !first.DaemonReachable || first.AlternationSegments != 3 {
+	if first.Event != "PreToolUse" || !first.EmittedContext || first.DaemonReachable == nil || !*first.DaemonReachable || first.AlternationSegments != 3 {
 		t.Fatalf("first record=%+v", first)
 	}
-	if second.Event != "PreToolUse" || second.EmittedContext || !second.DaemonReachable || second.AlternationSegments != 0 {
+	if second.Event != "PreToolUse" || second.EmittedContext || second.DaemonReachable == nil || !*second.DaemonReachable || second.AlternationSegments != 0 {
 		t.Fatalf("second record=%+v", second)
 	}
 }
@@ -61,7 +61,7 @@ func TestHookEffectivenessRejectsUnknownEventsAndCapsSegments(t *testing.T) {
 	if json.Unmarshal([]byte(strings.TrimSpace(string(data))), &record) != nil {
 		t.Fatalf("invalid record: %s", data)
 	}
-	if record.AlternationSegments != maxAlternationProbes+1 || record.DaemonReachable {
+	if record.AlternationSegments != maxAlternationProbes+1 || record.DaemonReachable == nil || *record.DaemonReachable {
 		t.Fatalf("record=%+v", record)
 	}
 }

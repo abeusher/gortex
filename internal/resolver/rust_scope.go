@@ -60,6 +60,15 @@ import (
 // Returns the number of Rust module-import, supertrait, override, and call
 // edges this pass landed on concrete nodes.
 func ResolveRustScopeCalls(g graph.Store) int {
+	return resolveRustScopeCalls(g, nil)
+}
+
+// resolveRustScopeCalls is the census-multiplexed form: cands, when
+// non-nil, supplies the pre-matched unresolved-call candidates and the
+// shared node snapshot for the scope index's method / function / param
+// sweeps. The module-import, trait-override, alias, and field scans keep
+// their own streams — their kinds are not part of the shared walks.
+func resolveRustScopeCalls(g graph.Store, cands *frameworkPassCandidates) int {
 	if g == nil {
 		return 0
 	}
@@ -69,7 +78,11 @@ func ResolveRustScopeCalls(g graph.Store) int {
 	// graph has no unresolved Rust call edges.
 	bound := resolveRustModuleImports(g)
 
-	idx, extendsResolved := buildRustScopeIndex(g)
+	var snap *frameworkNodeSnapshot
+	if cands != nil {
+		snap = cands.nodes
+	}
+	idx, extendsResolved := buildRustScopeIndex(g, snap)
 	bound += extendsResolved
 	if idx == nil {
 		return bound
@@ -86,9 +99,13 @@ func ResolveRustScopeCalls(g graph.Store) int {
 	type candEdge struct {
 		edge *graph.Edge
 	}
-	var cands []candEdge
+	var callCands []candEdge
 	fromIDs := make(map[string]struct{})
-	for e := range g.EdgesByKind(graph.EdgeCalls) {
+	callStream := g.EdgesByKind(graph.EdgeCalls)
+	if cands != nil {
+		callStream = frameworkEdgeSeq(refetchFrameworkCandidates(g, cands.calls))
+	}
+	for e := range callStream {
 		if e == nil {
 			continue
 		}
@@ -98,12 +115,12 @@ func ResolveRustScopeCalls(g graph.Store) int {
 		if !rustScopeEdgeCandidate(e) {
 			continue
 		}
-		cands = append(cands, candEdge{edge: e})
+		callCands = append(callCands, candEdge{edge: e})
 		if e.From != "" {
 			fromIDs[e.From] = struct{}{}
 		}
 	}
-	if len(cands) == 0 {
+	if len(callCands) == 0 {
 		return bound + resolved
 	}
 
@@ -113,7 +130,7 @@ func ResolveRustScopeCalls(g graph.Store) int {
 	}
 	callerNodes := g.GetNodesByIDs(fromList)
 
-	for _, c := range cands {
+	for _, c := range callCands {
 		e := c.edge
 		caller := callerNodes[e.From]
 		if caller == nil || caller.Language != "rust" {
@@ -286,8 +303,10 @@ type rustFieldKey struct {
 // buildRustScopeIndex walks the graph once and indexes Rust method
 // owners, free functions, and caller params. Supertrait edges are resolved
 // before the method/function early-out; the returned count includes those
-// rewrites even when the graph contains marker traits only.
-func buildRustScopeIndex(g graph.Store) (*rustScopeIndex, int) {
+// rewrites even when the graph contains marker traits only. A non-nil snap
+// feeds the method / function / param sweeps from the run-wide shared node
+// snapshot instead of this pass's own kind scans.
+func buildRustScopeIndex(g graph.Store, snap *frameworkNodeSnapshot) (*rustScopeIndex, int) {
 	typeAliases := newRustTypeAliasIndex(g)
 	traitTargets := newRustTraitTargetIndex(g)
 	extendsResolved := resolveRustTraitExtendsWithIndex(g, traitTargets, typeAliases)
@@ -301,7 +320,7 @@ func buildRustScopeIndex(g graph.Store) (*rustScopeIndex, int) {
 		fieldTypesByOwner: map[rustFieldKey]string{},
 	}
 	any := false
-	for n := range g.NodesByKind(graph.KindMethod) {
+	for _, n := range frameworkKindNodes(g, snap, graph.KindMethod) {
 		if n == nil || n.Language != "rust" {
 			continue
 		}
@@ -336,7 +355,7 @@ func buildRustScopeIndex(g graph.Store) (*rustScopeIndex, int) {
 		}
 		any = true
 	}
-	for n := range g.NodesByKind(graph.KindFunction) {
+	for _, n := range frameworkKindNodes(g, snap, graph.KindFunction) {
 		if n == nil || n.Language != "rust" {
 			continue
 		}
@@ -349,7 +368,7 @@ func buildRustScopeIndex(g graph.Store) (*rustScopeIndex, int) {
 	}
 	// Params are read lazily-but-once: index every Rust param by its
 	// enclosing function/method ID for the shadow check.
-	for n := range g.NodesByKind(graph.KindParam) {
+	for _, n := range frameworkKindNodes(g, snap, graph.KindParam) {
 		if n == nil || n.Language != "rust" {
 			continue
 		}

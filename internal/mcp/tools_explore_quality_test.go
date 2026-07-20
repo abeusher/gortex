@@ -32,6 +32,15 @@ func TestExploreQuotedRecallTermsPreservesShortSignalAndDropsPatterns(t *testing
 	}
 }
 
+func TestExploreQuotedRecallTermsGatesTwoLetterAnchorsByIntent(t *testing.T) {
+	require.Equal(t, []string{"ku"}, exploreQuotedRecallTerms(`find where culture "ku" is registered`))
+	require.Equal(t, []string{"go"}, exploreQuotedRecallTerms(`find the language code "go" fallback`))
+	require.Empty(t, exploreQuotedRecallTerms(`fix wording around "ku" in this comment`))
+	require.Empty(t, exploreQuotedRecallTerms(`find a mention of "it"`))
+	require.Equal(t, []string{"tenant-code"}, exploreQuotedRecallTerms(`find "tenant-code"`),
+		"longer explicit literals must remain independent of the short-anchor gate")
+}
+
 func TestRerankExploreConceptCoveragePromotesConjunctiveImplementation(t *testing.T) {
 	generic := &rerank.Candidate{
 		Node:     &graph.Node{ID: "generic", Name: "validate", Kind: graph.KindVariable, FilePath: "config.go"},
@@ -49,6 +58,129 @@ func TestRerankExploreConceptCoveragePromotesConjunctiveImplementation(t *testin
 	if got[0] != implementation {
 		t.Fatalf("multi-term implementation must outrank one rare identifier: got %s", got[0].Node.ID)
 	}
+}
+
+func TestRerankExploreConceptCoverageCrossesGenericVectorPathCollision(t *testing.T) {
+	pathSetter := &rerank.Candidate{
+		Node: &graph.Node{
+			ID: "builder-path", Name: "path", QualName: "StandardBuilder.path",
+			Kind: graph.KindMethod, FilePath: "src/builder.rs",
+			Meta: map[string]any{"signature": "fn path(&mut self, path: &Path)"},
+		},
+		TextRank: 0, VectorRank: 0, Score: 9,
+	}
+	matchedIgnore := &rerank.Candidate{
+		Node: &graph.Node{
+			ID: "matched-ignore", Name: "matched_ignore", QualName: "Ignore.matched_ignore",
+			Kind: graph.KindMethod, FilePath: "src/dir.rs",
+			Meta: map[string]any{"signature": "fn matched_ignore(&self, path: &Path)"},
+		},
+		TextRank: 9, VectorRank: 7, Score: 1,
+	}
+	got := rerankExploreConceptCoverage(shapeExploreQuery(exploreLongIgnoreTask), []*rerank.Candidate{pathSetter, matchedIgnore})
+	require.Same(t, matchedIgnore, got[0], "two-concept callable must cross a generic one-token vector collision")
+}
+
+func TestExploreConceptTermPresentUsesBoundedInflections(t *testing.T) {
+	require.True(t, exploreConceptTermPresent("ignore.matched_ignore", "matching"),
+		"query prose and declaration tense should align")
+	require.True(t, exploreConceptTermPresent("matcher matching rules", "matched"),
+		"the inverse tense should align as well")
+	require.False(t, exploreConceptTermPresent("tree.Builder", "building"),
+		"a raw grammatical stem must not match a longer unrelated identifier")
+}
+
+func TestDiversifyRepeatedExploreNamesPreservesLegitimateShortCallables(t *testing.T) {
+	readA := &rerank.Candidate{Node: &graph.Node{ID: "reader-a", Name: "read", Kind: graph.KindMethod}}
+	readB := &rerank.Candidate{Node: &graph.Node{ID: "reader-b", Name: "read", Kind: graph.KindMethod}}
+	emitA := &rerank.Candidate{Node: &graph.Node{ID: "emitter-a", Name: "emit", Kind: graph.KindMethod}}
+	emitB := &rerank.Candidate{Node: &graph.Node{ID: "emitter-b", Name: "emit", Kind: graph.KindMethod}}
+	other := &rerank.Candidate{Node: &graph.Node{ID: "other", Name: "dispatch", Kind: graph.KindMethod}}
+	input := []*rerank.Candidate{readA, readB, emitA, emitB, other}
+
+	got := diversifyRepeatedExploreNames(append([]*rerank.Candidate(nil), input...), rerank.QueryClassConcept)
+	require.Equal(t, input, got, "identifier length alone must not demote valid overload or receiver families")
+}
+
+func TestStrongSourceLiteralPromotionPreservesDivergentDefaultProof(t *testing.T) {
+	owner := exploreTarget{
+		node:                  &graph.Node{ID: "child.cs::.ctor", Name: ".ctor", Kind: graph.KindMethod, FilePath: "child.cs"},
+		source:                "Child() { mode = Disabled; }",
+		divergentDefaultOwner: true,
+	}
+	typeEvidence := exploreTarget{
+		node:                 &graph.Node{ID: "child.cs::Child", Name: "Child", Kind: graph.KindType, FilePath: "child.cs"},
+		divergentDefaultType: true,
+	}
+	literal := exploreTarget{
+		node:                &graph.Node{ID: "registry.cs::Register", Name: "Register", Kind: graph.KindMethod, FilePath: "registry.cs"},
+		source:              "void Register() { Add(\"value\"); }",
+		exactContent:        true,
+		sourceLiteral:       true,
+		sourceLiteralCallee: true,
+	}
+	input := []exploreTarget{owner, typeEvidence, literal}
+
+	got := promoteExploreStrongSourceLiteralTarget(input)
+	require.Equal(t, input, got, "a literal consumer must not displace a proven divergent-default cause")
+}
+
+func TestRerankExploreConceptCoverageDropsTermsPresentInMoreThanOneThird(t *testing.T) {
+	decoy := &rerank.Candidate{
+		Node: &graph.Node{
+			ID: "path-dispatch", Name: "path_dispatch", Kind: graph.KindMethod,
+			Meta: map[string]any{"doc": "Dispatch ownership for a path."},
+		},
+		TextRank: 0, VectorRank: 0, Score: 9,
+	}
+	implementation := &rerank.Candidate{
+		Node: &graph.Node{
+			ID: "matched-rule", Name: "matched_rule", Kind: graph.KindMethod,
+			Meta: map[string]any{
+				"signature": "fn matched_rule(path: &Path)",
+				"doc":       "Match ancestor ownership rules.",
+			},
+		},
+		TextRank: 7, VectorRank: 7, Score: 1,
+	}
+	fillerA := &rerank.Candidate{Node: &graph.Node{ID: "cache", Name: "cache", Kind: graph.KindType}, TextRank: 8, VectorRank: 8}
+	fillerB := &rerank.Candidate{Node: &graph.Node{ID: "clock", Name: "clock", Kind: graph.KindType}, TextRank: 9, VectorRank: 9}
+
+	got := rerankExploreConceptCoverage(
+		"where does the path matching ancestor rule ownership behavior live",
+		[]*rerank.Candidate{decoy, implementation, fillerA, fillerB},
+	)
+	require.Same(t, implementation, got[0], "a term present in two of four candidates must not manufacture a second decoy concept")
+}
+
+func TestRerankExploreConceptCoverageRespectsSemanticBarriers(t *testing.T) {
+	weak := &rerank.Candidate{
+		Node:     &graph.Node{ID: "weak", Name: "request", Kind: graph.KindVariable},
+		TextRank: 0, VectorRank: 0,
+	}
+	medium := &rerank.Candidate{
+		Node:     &graph.Node{ID: "medium", Name: "DispatchRouting", Kind: graph.KindType},
+		TextRank: 1, VectorRank: 1,
+	}
+	strong := &rerank.Candidate{
+		Node: &graph.Node{
+			ID: "strong", Name: "routeRequest", Kind: graph.KindMethod,
+			Meta: map[string]any{"doc": "Dispatch and route each request."},
+		},
+		TextRank: 2, VectorRank: 2,
+	}
+	fillerA := &rerank.Candidate{Node: &graph.Node{ID: "clock", Name: "clock", Kind: graph.KindType}, TextRank: 3, VectorRank: 3}
+	fillerB := &rerank.Candidate{Node: &graph.Node{ID: "cache", Name: "cache", Kind: graph.KindType}, TextRank: 4, VectorRank: 4}
+	fillerC := &rerank.Candidate{Node: &graph.Node{ID: "queue", Name: "queue", Kind: graph.KindType}, TextRank: 5, VectorRank: 5}
+	query := "where does the request dispatch routing behavior happen in code"
+
+	barrier := rerankExploreConceptCoverage(query, []*rerank.Candidate{weak, medium, strong, fillerA, fillerB, fillerC})
+	require.Equal(t, []*rerank.Candidate{weak, medium, strong}, barrier[:3],
+		"a conjunctive callable must not cross a multi-concept semantic peer")
+
+	adjacent := rerankExploreConceptCoverage(query, []*rerank.Candidate{medium, weak, strong, fillerA, fillerB, fillerC})
+	require.Equal(t, []*rerank.Candidate{medium, strong, weak}, adjacent[:3],
+		"a conjunctive callable may cross an adjacent one-concept collision")
 }
 
 func TestRerankExploreConceptCoveragePromotesBoundedBodyLiteral(t *testing.T) {
@@ -215,14 +347,15 @@ func TestHandleExploreRecallsExactQuotedLiteralFromSQLiteContentFTS(t *testing.T
 	require.True(t, api < 0 || registry < api, "exact body-literal candidate must lead ordinary metadata: %s", text)
 }
 
-func TestHandleExploreLocalizeKeepsEmptyResultNonTerminal(t *testing.T) {
+func TestHandleExploreLocalizeTerminatesEmptyResultAdvisory(t *testing.T) {
 	server := newExploreQualityServer(t)
 	result, text := callExploreQuality(t, server, "find request validation and message routing behavior", true)
 	require.False(t, result.IsError, text)
-	require.Contains(t, text, `"state":""`)
-	require.Contains(t, text, `"required_action":"continue"`)
+	require.Contains(t, text, `"state":"answer_ready"`)
+	require.Contains(t, text, `"required_action":"respond"`)
+	require.Contains(t, text, `"terminal":true`)
 	require.Contains(t, text, `"evidence":[]`)
-	require.Nil(t, server.localization.block("search", "symbols", map[string]any{"query": "better anchor"}))
+	require.NotNil(t, server.localization.block("search", "symbols", map[string]any{"query": "better anchor"}))
 }
 
 func TestHandleExploreLocalizeReturnsBoundedEvidenceWhenConfidenceIsLow(t *testing.T) {
@@ -235,37 +368,38 @@ func TestHandleExploreLocalizeReturnsBoundedEvidenceWhenConfidenceIsLow(t *testi
 	}}))
 	require.NoError(t, store.BuildContentIndex())
 
-	result, text := callExploreQuality(t, server, `find "ku" behavior`, true)
+	result, text := callExploreQuality(t, server, `find culture "ku" behavior`, true)
 
 	require.False(t, result.IsError, text)
 	var envelope localizationExploreEnvelope
 	require.NoError(t, json.Unmarshal([]byte(text), &envelope))
-	require.Equal(t, localizationStateNeedsRefinement, envelope.Completion.State)
+	require.Equal(t, localizationStateNeedsRecovery, envelope.Completion.State)
 	require.Empty(t, envelope.Completion.ExactSymbol)
-	require.NotContains(t, envelope.Completion.RequiredAction, "<candidate.id>")
+	require.Equal(t, "recover_once", envelope.Completion.RequiredAction)
 	require.Equal(t, 1, envelope.Completion.AllowedToolCalls)
+	require.Equal(t, localizationRecoveryOperations, envelope.Completion.AllowedOperations)
+	require.Empty(t, envelope.Completion.AllowedSymbols)
+	require.False(t, envelope.Terminal)
 	require.NotEmpty(t, envelope.Evidence)
 	require.NotEmpty(t, envelope.Symbols)
-	for _, evidence := range envelope.Evidence {
-		require.Empty(t, evidence.Source, "refinement evidence must not duplicate the authorized source read")
-	}
 
 	terminal := server.localizationFor(context.Background())
 	terminal.mu.Lock()
+	state := terminal.state
 	preferred := terminal.refinementSymbol
 	authorized := append([]string(nil), terminal.refinementSymbols...)
 	terminal.mu.Unlock()
-	require.NotEmpty(t, preferred)
-	require.Contains(t, envelope.Symbols, preferred)
-	require.Contains(t, envelope.Completion.RequiredAction, preferred)
-	require.Equal(t, envelope.Symbols, authorized, "only serialized evidence IDs may be refined")
-	require.NotNil(t, terminal.block("search", "symbols", map[string]any{"query": "locale formatter"}))
-	candidateRead := map[string]any{"target": map[string]any{"symbol": preferred}}
-	blocked, reserved := terminal.authorize("read", "source", candidateRead)
+	require.Equal(t, localizationStateNeedsRecovery, state)
+	require.Empty(t, preferred)
+	require.Empty(t, authorized)
+	blocked, reserved := terminal.authorize("search", "symbols", map[string]any{"query": "culture route"})
 	require.Nil(t, blocked)
 	require.True(t, reserved)
-	terminal.finishReservedRead(true)
-	require.NotNil(t, terminal.block("search", "symbols", map[string]any{"query": "another search"}))
+	require.Equal(t, localizationStateAnswerReady, terminal.finishReservedRead(true).State)
+	candidateRead := map[string]any{"target": map[string]any{"symbol": envelope.Symbols[0]}}
+	blocked, reserved = terminal.authorize("read", "source", candidateRead)
+	require.NotNil(t, blocked)
+	require.False(t, reserved)
 }
 
 func TestHandleExploreLocalizeAcceptsVerifiedLiteralAndExplicitSymbol(t *testing.T) {

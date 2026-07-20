@@ -154,10 +154,11 @@ type Store interface {
 
 	// GetNodesByQualNames returns a map qualName→*Node (first match per
 	// qual_name) for the whole batch — the qual-name twin of
-	// FindNodesByNames. It pre-warms the resolver's import resolution:
-	// qual_name is unindexed on the disk backend, so the per-edge
-	// GetNodeByQualName in resolveImport is a full node scan per import
-	// edge; one batched IN-scan collapses that to a single query.
+	// FindNodesByNames. It pre-warms the resolver's import resolution so
+	// per-edge point lookups become one batched probe; both the batch and
+	// the point lookup ride the partial nodes_by_qual index (their SQL
+	// restates the index predicate literally, which is what makes a
+	// partial index usable against bound parameters).
 	GetNodesByQualNames(qualNames []string) map[string]*Node
 
 	// --- Name + scope queries --------------------------------------

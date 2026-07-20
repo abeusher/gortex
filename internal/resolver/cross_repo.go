@@ -93,10 +93,10 @@ type CrossRepoResolver struct {
 	// placeholder_sources.go). Reset at pass start.
 	placeholderSrcIdx placeholderSourceIndex
 	nodesByName       map[string][]*graph.Node
-	nodesByNameRepo map[string]map[string][]*graph.Node
-	nodesByQualName map[string]*graph.Node
-	dirIndex        map[string][]*graph.Node
-	lastDirIndex    map[string][]*graph.Node
+	nodesByNameRepo   map[string]map[string][]*graph.Node
+	nodesByQualName   map[string]*graph.Node
+	dirIndex          map[string][]*graph.Node
+	lastDirIndex      map[string][]*graph.Node
 	// reachableReposByFile maps a caller file's ID to the set of repo
 	// prefixes that file imports (derived from resolved EdgeImports
 	// edges). It is the import-reachability evidence gate: a name-only
@@ -335,7 +335,7 @@ func (cr *CrossRepoResolver) ResolveAll() *CrossRepoStats {
 	defer cr.clearReachableReposIndex()
 
 	if resolveHotCacheEnabled() {
-		cr.hotCache = newResolveHotCache(resolveHotCacheBudgetBytes())
+		cr.hotCache = newResolveHotCache(resolveHotCacheBudgetBytes(), len(pending))
 		defer func() {
 			if c := cr.hotCache; c != nil {
 				cr.logger.Info("cross-repo resolve: hot cache stats",

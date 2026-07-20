@@ -69,8 +69,9 @@ const pluginMCPJSON = `{
 `
 
 // pluginHooksJSON is the hooks/hooks.json content for the
-// marketplace plugin. Four event bindings (PreToolUse, PreCompact,
-// Stop, SessionStart) all dispatch through ${CLAUDE_PLUGIN_ROOT}/hooks-handlers/gortex-hook.sh
+// marketplace plugin. Seven event bindings (PreToolUse, UserPromptSubmit,
+// SubagentStart, SubagentStop, PreCompact, Stop, SessionStart) all dispatch
+// through ${CLAUDE_PLUGIN_ROOT}/hooks-handlers/gortex-hook.sh
 // — a thin wrapper that locates the gortex binary and invokes
 // `gortex hook`. The wrapper's job is:
 //
@@ -84,7 +85,7 @@ const pluginMCPJSON = `{
 // The %s is filled with CurrentPreToolUseMatcher at emit time so the
 // marketplace plugin and the `gortex init` settings.json never drift.
 const pluginHooksJSON = `{
-  "description": "Gortex graph-aware hooks: PreToolUse routing, PreCompact orientation, post-task diagnostics, SessionStart cold briefing.",
+  "description": "Gortex graph-aware hooks: parent and subagent turn state, PreToolUse routing, PreCompact orientation, post-task diagnostics, SessionStart cold briefing.",
   "hooks": {
     "PreToolUse": [
       {
@@ -95,6 +96,42 @@ const pluginHooksJSON = `{
             "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks-handlers/gortex-hook.sh\"",
             "timeout": 3000,
             "statusMessage": "Enforcing Gortex graph access policy..."
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks-handlers/gortex-hook.sh\"",
+            "timeout": 3000,
+            "statusMessage": "Starting a fresh Gortex turn..."
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks-handlers/gortex-hook.sh\"",
+            "timeout": 3000,
+            "statusMessage": "Starting an isolated Gortex subagent turn..."
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks-handlers/gortex-hook.sh\"",
+            "timeout": 3000,
+            "statusMessage": "Clearing Gortex subagent turn state..."
           }
         ]
       }
@@ -189,7 +226,7 @@ installs to ` + "`~/.local/bin`" + ` (or ` + "`/usr/local/bin`" + `), and runs `
 | **MCP server** | 21 tools over stdio via ` + "`gortex mcp`" + `: begin with ` + "`explore`" + `, inspect with ` + "`search`" + ` / ` + "`read`" + ` / ` + "`relations`" + ` / ` + "`trace`" + `, assess with ` + "`analyze`" + ` / ` + "`change`" + ` / ` + "`review`" + `, and mutate with ` + "`edit`" + ` / ` + "`refactor`" + `. ` + "`capabilities`" + ` returns an operation's exact schema on demand. |
 | **Slash commands** | Discovery: ` + "`/gortex-guide`" + `, ` + "`/gortex-explore`" + `, ` + "`/gortex-debug`" + `, ` + "`/gortex-impact`" + `, ` + "`/gortex-dataflow-trace`" + `, ` + "`/gortex-cross-repo-usage`" + `, ` + "`/gortex-co-change`" + `, ` + "`/gortex-onboarding`" + ` · Edit & refactor: ` + "`/gortex-refactor`" + `, ` + "`/gortex-safe-edit`" + `, ` + "`/gortex-rename`" + `, ` + "`/gortex-extract-function`" + `, ` + "`/gortex-fix-all`" + `, ` + "`/gortex-add-test`" + ` · Review & operate: ` + "`/gortex-pr-review`" + `, ` + "`/gortex-pr-review-agent`" + `, ` + "`/gortex-architecture-review`" + `, ` + "`/gortex-quality-audit`" + `, ` + "`/gortex-incident-investigation`" + `, ` + "`/gortex-episode-replay`" + ` |
 | **Skills** | Twenty model-invoked, task-shaped workflows require callable native MCP, start with ` + "`explore`" + `, gate mutations with ` + "`change`" + `, write through ` + "`edit`" + ` / ` + "`refactor`" + `, and verify the result. The separate CLI skill mirrors those names through ` + "`gortex call`" + ` only for a harness with no MCP transport by design. |
-| **Hooks** | PreToolUse graph routing, PreCompact orientation, Stop post-task diagnostics, and SessionStart briefing. Hook guidance uses the same public MCP tool names. |
+| **Hooks** | UserPromptSubmit parent-turn isolation, SubagentStart/SubagentStop agent isolation, PreToolUse graph routing, PreCompact orientation, Stop post-task diagnostics, and SessionStart briefing. Hook guidance uses the same public MCP tool names. |
 
 ## First run
 
@@ -325,7 +362,11 @@ func EmitPluginBundle(spec PluginBundleSpec) ([]string, error) {
 	}
 
 	// 8. hooks/hooks.json + hooks-handlers/gortex-hook.sh
-	if err := write("hooks/hooks.json", fmt.Appendf(nil, pluginHooksJSON, CurrentPreToolUseMatcher), 0o644); err != nil {
+	pluginHooks, err := pluginHooksWithLocalizationTerminality(fmt.Appendf(nil, pluginHooksJSON, CurrentPreToolUseMatcher))
+	if err != nil {
+		return nil, err
+	}
+	if err := write("hooks/hooks.json", pluginHooks, 0o644); err != nil {
 		return nil, err
 	}
 	if err := write("hooks-handlers/gortex-hook.sh", []byte(pluginHookHandler), 0o755); err != nil {

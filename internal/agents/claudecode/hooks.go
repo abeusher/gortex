@@ -20,9 +20,10 @@ import (
 // upgradeGortexMatcher rewrites those in place. Edit and Write are
 // included so the hook can redirect whole-file rewrites of indexed
 // source to the Gortex MCP edit tools (gated by GORTEX_HOOK_BLOCK_EDIT
-// in the hook itself). The compact mcp__gortex__read tool is included so the
-// hook can also enforce read shaping after the client has entered Gortex.
-const CurrentPreToolUseMatcher = "Read|Grep|Glob|Task|Bash|Edit|Write|mcp__gortex__read"
+// in the hook itself). The native "*" match-all sentinel lets a local,
+// constant-time terminal marker stop any tool after answer_ready without the
+// host evaluating a regular expression for every call.
+const CurrentPreToolUseMatcher = "*"
 
 // v060PreToolUseMatcher fingerprints the exact matcher shipped by gortex
 // v0.60.0. The concrete retirement gate is documented in docs/versioning.md.
@@ -172,7 +173,7 @@ func HookCommandPathIsEphemeral(cmd string) bool {
 // entries whose path is healthy are also left alone.
 func healStaleHookCommands(hooks map[string]any, newCommand string) int {
 	healed := 0
-	for _, event := range []string{"PreToolUse", "PreCompact", "Stop", "SessionStart", "UserPromptSubmit"} {
+	for _, event := range []string{"PreToolUse", "PreCompact", "Stop", "SessionStart", "UserPromptSubmit", "SubagentStart", "SubagentStop"} {
 		list, ok := hooks[event].([]any)
 		if !ok {
 			continue
@@ -180,6 +181,9 @@ func healStaleHookCommands(hooks map[string]any, newCommand string) int {
 		for _, h := range list {
 			hm, ok := h.(map[string]any)
 			if !ok {
+				continue
+			}
+			if (event == "PreToolUse" || event == "PostToolUse") && !managedGortexHookGroup(hm, event) {
 				continue
 			}
 			inner, ok := hm["hooks"].([]any)
@@ -224,6 +228,7 @@ func upgradeGortexMatcher(hooks map[string]any) bool {
 		return false
 	}
 	supersededMatchers := map[string]bool{
+		".*":                                  true,
 		"Read|Grep":                           true,
 		"Read|Grep|Glob":                      true,
 		"Read|Grep|Glob|Task":                 true,
@@ -235,6 +240,9 @@ func upgradeGortexMatcher(hooks map[string]any) bool {
 	for _, h := range pre {
 		hm, ok := h.(map[string]any)
 		if !ok {
+			continue
+		}
+		if !managedGortexHookGroup(hm, "PreToolUse") {
 			continue
 		}
 		matcher, _ := hm["matcher"].(string)
@@ -328,7 +336,7 @@ func commandInvokesGortexHook(cmd string) bool {
 // rewritten entries.
 func rewriteGortexHookMode(hooks map[string]any, newCommand string) int {
 	rewritten := 0
-	for _, event := range []string{"PreToolUse", "PostToolUse", "PreCompact", "Stop", "SessionStart", "UserPromptSubmit"} {
+	for _, event := range []string{"PreToolUse", "PostToolUse", "PreCompact", "Stop", "SessionStart", "UserPromptSubmit", "SubagentStart", "SubagentStop"} {
 		list, ok := hooks[event].([]any)
 		if !ok {
 			continue
@@ -336,6 +344,9 @@ func rewriteGortexHookMode(hooks map[string]any, newCommand string) int {
 		for _, h := range list {
 			hm, ok := h.(map[string]any)
 			if !ok {
+				continue
+			}
+			if (event == "PreToolUse" || event == "PostToolUse") && !managedGortexHookGroup(hm, event) {
 				continue
 			}
 			inner, ok := hm["hooks"].([]any)
@@ -381,6 +392,9 @@ func rewriteGortexPreToolUseStatus(hooks map[string]any, mode string) int {
 	for _, h := range list {
 		hm, ok := h.(map[string]any)
 		if !ok {
+			continue
+		}
+		if !managedGortexHookGroup(hm, "PreToolUse") {
 			continue
 		}
 		inner, ok := hm["hooks"].([]any)
@@ -472,7 +486,8 @@ func hasGortexHookEntry(hooks map[string]any, event string) bool {
 // match the current Gortex config" operation. It reads the file,
 // heals stale commands, upgrades old matchers, dedupes repeat
 // entries, then installs any missing Gortex hooks (PreToolUse,
-// PreCompact, Stop, SessionStart, and — in enrich mode — PostToolUse).
+// PreCompact, Stop, SessionStart, UserPromptSubmit, SubagentStart,
+// SubagentStop, and PostToolUse).
 // Writes back atomically via the shared helper.
 //
 // This function intentionally accepts a plain filesystem path
@@ -485,13 +500,11 @@ func InstallHook(w io.Writer, settingsPath string, opts agents.ApplyOpts) (agent
 	return InstallHookWithMode(w, settingsPath, HookModeDeny, opts)
 }
 
-// InstallHookWithMode is the mode-aware variant. mode is one of
-// HookModeDeny (default — install PreToolUse with deny behavior, no
-// PostToolUse) or HookModeEnrich (install PreToolUse in soft-context
-// mode plus a PostToolUse entry that augments tool output with graph
-// context). Switching modes between installs rewrites the existing
-// Gortex hook command in place and adds or removes the PostToolUse
-// entry to match.
+// InstallHookWithMode is the mode-aware variant. HookModeDeny installs the
+// blocking access posture; HookModeEnrich installs soft context. Both retain
+// the PostToolUse terminal observer, while enrich additionally observes native
+// read-shaped tools for graph augmentation. Switching modes rewrites only
+// installer-owned groups in place.
 func InstallHookWithMode(w io.Writer, settingsPath string, mode string, opts agents.ApplyOpts) (agents.FileAction, error) {
 	mode = normalizeHookMode(mode)
 	var settings map[string]any
@@ -517,33 +530,35 @@ func InstallHookWithMode(w io.Writer, settingsPath string, mode string, opts age
 
 	healedCount := healStaleHookCommands(hooks, hookCommand)
 	matcherUpgraded := upgradeGortexMatcher(hooks)
+	preToolMatcherRewriteCount := rewriteGortexEventMatcher(hooks, "PreToolUse", localizationPreToolUseMatcher)
 	modeRewriteCount := rewriteGortexHookMode(hooks, hookCommand)
 	statusRewriteCount := rewriteGortexPreToolUseStatus(hooks, mode)
-	dedupedCount := dedupGortexEntries(hooks, "PreToolUse") +
+	dedupedCount := dedupManagedGortexEntries(hooks, "PreToolUse") +
 		dedupGortexEntries(hooks, "PreCompact") +
-		dedupGortexEntries(hooks, "PostToolUse") +
+		dedupManagedGortexEntries(hooks, "PostToolUse") +
 		dedupGortexEntries(hooks, "Stop") +
 		dedupGortexEntries(hooks, "SessionStart") +
-		dedupGortexEntries(hooks, "UserPromptSubmit")
+		dedupGortexEntries(hooks, "UserPromptSubmit") +
+		dedupGortexEntries(hooks, "SubagentStart") +
+		dedupGortexEntries(hooks, "SubagentStop")
 
-	// PostToolUse is only present when mode=enrich. Removing it on a
-	// switch to any other posture keeps settings.json clean — agents
-	// won't fire a no-op hook on every Read/Grep response.
-	postToolUseRemoved := 0
-	if mode != HookModeEnrich {
-		postToolUseRemoved = removeGortexHookEntries(hooks, "PostToolUse")
-	}
+	// PostToolUse is always present for the terminal-contract observer. In
+	// enrich mode it additionally retains the native Read/Grep/Glob matchers.
+	postToolMatcherRewriteCount := rewriteGortexEventMatcher(hooks, "PostToolUse", desiredPostToolUseMatcher(mode))
+	postToolStatusRewriteCount := rewriteGortexPostToolUseStatus(hooks, mode)
 
-	preToolUseInstalled := hasGortexHookEntry(hooks, "PreToolUse")
+	preToolUseInstalled := hasManagedGortexHookEntry(hooks, "PreToolUse")
 	preCompactInstalled := hasGortexHookEntry(hooks, "PreCompact")
 	stopInstalled := hasGortexHookEntry(hooks, "Stop")
 	sessionStartInstalled := hasGortexHookEntry(hooks, "SessionStart")
 	userPromptSubmitInstalled := hasGortexHookEntry(hooks, "UserPromptSubmit")
-	postToolUseInstalled := hasGortexHookEntry(hooks, "PostToolUse")
+	subagentStartInstalled := hasGortexHookEntry(hooks, "SubagentStart")
+	subagentStopInstalled := hasGortexHookEntry(hooks, "SubagentStop")
+	postToolUseInstalled := hasManagedGortexHookEntry(hooks, "PostToolUse")
 
 	if !preToolUseInstalled {
 		appendHookEntry(hooks, "PreToolUse", map[string]any{
-			"matcher": CurrentPreToolUseMatcher,
+			"matcher": localizationPreToolUseMatcher,
 			"hooks": []any{
 				map[string]any{
 					"type":          "command",
@@ -610,20 +625,43 @@ func InstallHookWithMode(w io.Writer, settingsPath string, mode string, opts age
 			},
 		})
 	}
-	// PostToolUse is only installed in enrich mode. It augments
-	// Grep / Glob / Read responses with graph context (enclosing
-	// symbols, file footprints) so the agent sees the graph value
-	// adjacent to the raw output instead of via a deny redirect.
-	postToolUseAdded := false
-	if mode == HookModeEnrich && !postToolUseInstalled {
-		appendHookEntry(hooks, "PostToolUse", map[string]any{
-			"matcher": CurrentPostToolUseMatcher,
+	if !subagentStartInstalled {
+		appendHookEntry(hooks, "SubagentStart", map[string]any{
 			"hooks": []any{
 				map[string]any{
 					"type":          "command",
 					"command":       hookCommand,
 					"timeout":       3000,
-					"statusMessage": "Layering Gortex graph context onto tool output...",
+					"statusMessage": "Starting an isolated Gortex subagent turn...",
+				},
+			},
+		})
+	}
+	if !subagentStopInstalled {
+		appendHookEntry(hooks, "SubagentStop", map[string]any{
+			"hooks": []any{
+				map[string]any{
+					"type":          "command",
+					"command":       hookCommand,
+					"timeout":       3000,
+					"statusMessage": "Clearing Gortex subagent turn state...",
+				},
+			},
+		})
+	}
+	// PostToolUse always watches Gortex navigation results for the exact
+	// enforceable localization terminal contract. Enrich mode also augments
+	// native Grep / Glob / Read responses with graph context.
+	postToolUseAdded := false
+	if !postToolUseInstalled {
+		appendHookEntry(hooks, "PostToolUse", map[string]any{
+			"matcher": desiredPostToolUseMatcher(mode),
+			"hooks": []any{
+				map[string]any{
+					"type":          "command",
+					"command":       hookCommand,
+					"timeout":       3000,
+					"statusMessage": desiredPostToolUseStatus(mode),
 				},
 			},
 		})
@@ -631,9 +669,10 @@ func InstallHookWithMode(w io.Writer, settingsPath string, mode string, opts age
 	}
 
 	allPresent := preToolUseInstalled && preCompactInstalled && stopInstalled && sessionStartInstalled &&
-		userPromptSubmitInstalled && (mode != HookModeEnrich || postToolUseInstalled)
+		userPromptSubmitInstalled && subagentStartInstalled && subagentStopInstalled && postToolUseInstalled
 	noChanges := allPresent && !matcherUpgraded && dedupedCount == 0 && healedCount == 0 &&
-		modeRewriteCount == 0 && statusRewriteCount == 0 && postToolUseRemoved == 0 && !postToolUseAdded
+		modeRewriteCount == 0 && statusRewriteCount == 0 && preToolMatcherRewriteCount == 0 &&
+		postToolMatcherRewriteCount == 0 && postToolStatusRewriteCount == 0 && !postToolUseAdded
 	if noChanges {
 		if w != nil {
 			fmt.Fprintf(w, "[gortex init] all hooks already present in %s\n", settingsPath)
@@ -663,6 +702,15 @@ func InstallHookWithMode(w io.Writer, settingsPath string, mode string, opts age
 	if matcherUpgraded {
 		changes = append(changes, "upgraded PreToolUse matcher")
 	}
+	if preToolMatcherRewriteCount > 0 {
+		changes = append(changes, "enabled all-tool terminal gate")
+	}
+	if postToolMatcherRewriteCount > 0 {
+		changes = append(changes, "updated PostToolUse terminal observer")
+	}
+	if postToolStatusRewriteCount > 0 {
+		changes = append(changes, "updated PostToolUse status")
+	}
 	if dedupedCount > 0 {
 		changes = append(changes, fmt.Sprintf("removed %d duplicate entries", dedupedCount))
 	}
@@ -684,11 +732,14 @@ func InstallHookWithMode(w io.Writer, settingsPath string, mode string, opts age
 	if !userPromptSubmitInstalled {
 		changes = append(changes, "installed UserPromptSubmit")
 	}
-	if postToolUseAdded {
-		changes = append(changes, "installed PostToolUse (enrich mode)")
+	if !subagentStartInstalled {
+		changes = append(changes, "installed SubagentStart")
 	}
-	if postToolUseRemoved > 0 {
-		changes = append(changes, fmt.Sprintf("removed PostToolUse (switched to %s mode)", mode))
+	if !subagentStopInstalled {
+		changes = append(changes, "installed SubagentStop")
+	}
+	if postToolUseAdded {
+		changes = append(changes, "installed PostToolUse terminal observer")
 	}
 	if modeRewriteCount > 0 {
 		changes = append(changes, fmt.Sprintf("rewrote %d hook command(s) for mode=%s", modeRewriteCount, mode))

@@ -38,21 +38,25 @@ type hookEffectiveness struct {
 	Timestamp           string `json:"ts"`
 	Event               string `json:"event"`
 	EmittedContext      bool   `json:"emitted_context"`
-	DaemonReachable     bool   `json:"daemon_reachable"`
+	DaemonReachable     *bool  `json:"daemon_reachable,omitempty"`
 	AlternationSegments int    `json:"alternation_segments"`
 	DurationMS          int64  `json:"duration_ms"`
 }
 
 var hookEffectivenessEvents = map[string]bool{
-	"PostToolUse":      true,
-	"PreToolUse":       true,
-	"SessionStart":     true,
-	"UserPromptSubmit": true,
-	"PreCompact":       true,
-	"PostCompact":      true,
-	"Stop":             true,
-	"SubagentStart":    true,
-	"SubagentStop":     true,
+	"PostToolUse":                          true,
+	"PreToolUse":                           true,
+	"SessionStart":                         true,
+	"UserPromptSubmit":                     true,
+	"PreCompact":                           true,
+	"PostCompact":                          true,
+	"Stop":                                 true,
+	"SubagentStart":                        true,
+	"SubagentStop":                         true,
+	"LocalizationTerminal.observed":        true,
+	"LocalizationTerminal.denied":          true,
+	"LocalizationTerminal.cleared_prompt":  true,
+	"LocalizationTerminal.cleared_session": true,
 }
 
 // hookDecisionsPath returns the telemetry file path. Respects GORTEX_HOOK_LOG
@@ -106,6 +110,17 @@ func logHookDecision(tool, _ string, decision DecisionKind, hits int, dur time.D
 // capped to prevent an adversarial regex from becoming a high-cardinality
 // metric; values above the probe ceiling share the same overflow bucket.
 func logHookEffectiveness(event string, emitted, reachable bool, alternationSegments int, dur time.Duration) {
+	logHookEffectivenessReachability(event, emitted, &reachable, alternationSegments, dur)
+}
+
+// logHookEffectivenessUnknown records hooks that deliberately perform no
+// daemon I/O. Omitting reachability avoids turning local lifecycle/terminal
+// decisions into false daemon-down samples.
+func logHookEffectivenessUnknown(event string, emitted bool, alternationSegments int, dur time.Duration) {
+	logHookEffectivenessReachability(event, emitted, nil, alternationSegments, dur)
+}
+
+func logHookEffectivenessReachability(event string, emitted bool, reachable *bool, alternationSegments int, dur time.Duration) {
 	if !hookEffectivenessEvents[event] {
 		return
 	}

@@ -51,8 +51,23 @@ const grpcStubPrefix = unresolvedPrefix + "grpc::"
 // Returns the number of grpc.stub edges pointing at a resolved handler
 // after the pass.
 func ResolveGRPCStubCalls(g graph.Store) int {
+	return resolveGRPCStubCalls(g, nil)
+}
+
+// resolveGRPCStubCalls is the census-multiplexed form: cands, when non-nil,
+// carries the pass's pre-matched EdgeCalls candidates (stubs AND
+// registration carriers) from the shared full-census walk, replacing both
+// of this pass's own whole-stream decodes.
+func resolveGRPCStubCalls(g graph.Store, cands *frameworkPassCandidates) int {
 	if g == nil {
 		return 0
+	}
+
+	callsStream := g.EdgesByKind(graph.EdgeCalls)
+	var sharedCalls []*graph.Edge
+	if cands != nil {
+		sharedCalls = refetchFrameworkCandidates(g, cands.calls)
+		callsStream = frameworkEdgeSeq(sharedCalls)
 	}
 
 	resolved := 0
@@ -71,7 +86,7 @@ func ResolveGRPCStubCalls(g graph.Store) int {
 	}
 	var stubs []stubEdge
 	fromIDs := make(map[string]struct{})
-	for e := range g.EdgesByKind(graph.EdgeCalls) {
+	for e := range callsStream {
 		if e == nil || e.Meta == nil {
 			continue
 		}
@@ -96,7 +111,7 @@ func ResolveGRPCStubCalls(g graph.Store) int {
 		fromList = append(fromList, id)
 	}
 	callerNodes := g.GetNodesByIDs(fromList)
-	idx := buildGRPCHandlerIndex(g)
+	idx := buildGRPCHandlerIndex(g, cands != nil, sharedCalls)
 
 	for _, s := range stubs {
 		e := s.edge
@@ -172,8 +187,10 @@ func (idx *grpcHandlerIndex) lookup(service, method, callerRepo string) (id, ori
 }
 
 // buildGRPCHandlerIndex walks the graph once and indexes server-side
-// gRPC handler methods by service, via both discovery signals.
-func buildGRPCHandlerIndex(g graph.Store) *grpcHandlerIndex {
+// gRPC handler methods by service, via both discovery signals. When shared
+// is set, sharedCalls carries the registration-carrier candidates from the
+// census dispatcher and the index's own EdgeCalls decode is skipped.
+func buildGRPCHandlerIndex(g graph.Store, shared bool, sharedCalls []*graph.Edge) *grpcHandlerIndex {
 	typesByName := map[string][]*graph.Node{}
 	ifacesByName := map[string][]*graph.Node{}
 	typeAndIfaceNodes := nodesByKindsOrAll(g, graph.KindType, graph.KindInterface)
@@ -217,7 +234,11 @@ func buildGRPCHandlerIndex(g graph.Store) *grpcHandlerIndex {
 		}
 		implementorsByIface[e.To] = append(implementorsByIface[e.To], e.From)
 	}
-	for e := range g.EdgesByKind(graph.EdgeCalls) {
+	registrationStream := g.EdgesByKind(graph.EdgeCalls)
+	if shared {
+		registrationStream = frameworkEdgeSeq(sharedCalls)
+	}
+	for e := range registrationStream {
 		if e == nil || e.Meta == nil {
 			continue
 		}

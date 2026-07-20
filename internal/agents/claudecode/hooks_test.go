@@ -334,7 +334,7 @@ func TestRemoveGortexHookEntries_NoOpOnMissingEvent(t *testing.T) {
 // rewriteGortexHookMode — switches mode without touching user fields
 // ---------------------------------------------------------------------------
 
-func TestRewriteGortexHookMode_UpdatesCommandPreservingMeta(t *testing.T) {
+func TestRewriteGortexHookMode_PreservesCustomGortexGroup(t *testing.T) {
 	hooks := map[string]any{
 		"PreToolUse": []any{
 			map[string]any{
@@ -351,12 +351,12 @@ func TestRewriteGortexHookMode_UpdatesCommandPreservingMeta(t *testing.T) {
 		},
 	}
 	rewritten := rewriteGortexHookMode(hooks, "/opt/gortex hook --mode=enrich")
-	assert.Equal(t, 1, rewritten)
+	assert.Equal(t, 0, rewritten)
 	list := hooks["PreToolUse"].([]any)
 	em := list[0].(map[string]any)["hooks"].([]any)[0].(map[string]any)
-	assert.Equal(t, "/opt/gortex hook --mode=enrich", em["command"])
+	assert.Equal(t, "/opt/gortex hook", em["command"])
 	assert.Equal(t, "custom user-set message", em["statusMessage"],
-		"rewrite must preserve user-added fields like statusMessage")
+		"installer must not claim ownership of a custom Gortex hook group")
 }
 
 func TestRewriteGortexHookMode_NoOpOnIdenticalCommand(t *testing.T) {
@@ -382,19 +382,18 @@ func TestRewriteGortexHookMode_IgnoresNonGortexEntries(t *testing.T) {
 // nudge starts firing without the user touching settings.json.
 func TestUpgradeGortexMatcher_RewritesPreviousCurrent(t *testing.T) {
 	hooks := map[string]any{
-		"PreToolUse": []any{makeHookEntry("Read|Grep|Glob|Task|Bash|Edit|Write", "/opt/gortex hook")},
+		"PreToolUse": []any{managedTestHookEntry("Read|Grep|Glob|Task|Bash|Edit|Write", "/opt/gortex hook", preToolUseStatusDeny)},
 	}
 	assert.True(t, upgradeGortexMatcher(hooks), "previous-current matcher should upgrade")
 	got := hooks["PreToolUse"].([]any)[0].(map[string]any)["matcher"].(string)
 	assert.Equal(t, CurrentPreToolUseMatcher, got)
-	assert.Contains(t, got, "mcp__gortex__read",
-		"upgraded matcher must include the compact gortex read tool")
-	assert.NotContains(t, got, "mcp__gortex__read_file")
+	assert.Equal(t, "*", got,
+		"the terminal gate must observe every tool without enumerating host-specific names")
 }
 
 func TestUpgradeGortexMatcher_RewritesV060MCPReadMatcher(t *testing.T) {
 	hooks := map[string]any{
-		"PreToolUse": []any{makeHookEntry(v060PreToolUseMatcher, "/opt/gortex hook")},
+		"PreToolUse": []any{managedTestHookEntry(v060PreToolUseMatcher, "/opt/gortex hook", preToolUseStatusDeny)},
 	}
 	assert.True(t, upgradeGortexMatcher(hooks))
 	got := hooks["PreToolUse"].([]any)[0].(map[string]any)["matcher"].(string)
@@ -428,14 +427,18 @@ func TestInstallHookWithMode_DenyMode(t *testing.T) {
 	require.NoError(t, err)
 
 	hooks := readSettingsHooks(t, settingsPath)
-	assert.NotContains(t, hooks, "PostToolUse",
-		"deny mode must NOT install a PostToolUse entry")
+	require.Contains(t, hooks, "PostToolUse",
+		"terminal observation is independent of the source-access mode")
+	post := hooks["PostToolUse"].([]any)[0].(map[string]any)
+	assert.Equal(t, localizationPostToolUseMatcher, post["matcher"])
 	cmd := extractCmd(t, hooks, "PreToolUse", 0)
 	assert.Equal(t, "gortex hook", cmd,
 		"deny mode keeps the bare command — no --mode flag")
+	pre := hooks["PreToolUse"].([]any)[0].(map[string]any)
+	assert.Equal(t, localizationPreToolUseMatcher, pre["matcher"])
 }
 
-func TestInstallHook_InstallsUserPromptSubmit(t *testing.T) {
+func TestInstallHook_InstallsTurnLifecycleHooks(t *testing.T) {
 	dir := t.TempDir()
 	settingsPath := filepath.Join(dir, "settings.local.json")
 	t.Setenv("PATH", t.TempDir()) // force fallback to bare "gortex hook"
@@ -444,10 +447,10 @@ func TestInstallHook_InstallsUserPromptSubmit(t *testing.T) {
 	require.NoError(t, err)
 
 	hooks := readSettingsHooks(t, settingsPath)
-	require.Contains(t, hooks, "UserPromptSubmit",
-		"UserPromptSubmit hook must be installed for per-turn context injection")
-	cmd := extractCmd(t, hooks, "UserPromptSubmit", 0)
-	assert.Equal(t, "gortex hook", cmd)
+	for _, event := range []string{"UserPromptSubmit", "SubagentStart", "SubagentStop"} {
+		require.Contains(t, hooks, event, "%s hook must be installed for turn isolation", event)
+		assert.Equal(t, "gortex hook", extractCmd(t, hooks, event, 0))
+	}
 }
 
 func TestInstallHookWithMode_EnrichMode(t *testing.T) {
@@ -467,9 +470,10 @@ func TestInstallHookWithMode_EnrichMode(t *testing.T) {
 	assert.Equal(t, "gortex hook --mode=enrich", preCmd,
 		"PreToolUse must use the same --mode=enrich command so it falls back to soft-context")
 
-	// PostToolUse uses the matcher restricted to read-shaped tools.
+	// Enrich keeps the native read-shaped tools and adds the six terminal
+	// contract producers.
 	post := hooks["PostToolUse"].([]any)[0].(map[string]any)
-	assert.Equal(t, CurrentPostToolUseMatcher, post["matcher"])
+	assert.Equal(t, desiredPostToolUseMatcher(HookModeEnrich), post["matcher"])
 }
 
 func TestInstallHookWithMode_DenyToEnrichRoundTrip(t *testing.T) {
@@ -481,7 +485,9 @@ func TestInstallHookWithMode_DenyToEnrichRoundTrip(t *testing.T) {
 	_, err := InstallHookWithMode(io.Discard, settingsPath, HookModeDeny, agentsApplyOptsZero())
 	require.NoError(t, err)
 	hooks := readSettingsHooks(t, settingsPath)
-	require.NotContains(t, hooks, "PostToolUse")
+	require.Contains(t, hooks, "PostToolUse")
+	assert.Equal(t, localizationPostToolUseMatcher,
+		hooks["PostToolUse"].([]any)[0].(map[string]any)["matcher"])
 	assert.Equal(t, "gortex hook", extractCmd(t, hooks, "PreToolUse", 0))
 
 	// Switch to enrich.
@@ -493,13 +499,18 @@ func TestInstallHookWithMode_DenyToEnrichRoundTrip(t *testing.T) {
 		"PreToolUse command must be rewritten on mode switch")
 	assert.Equal(t, "gortex hook --mode=enrich", extractCmd(t, hooks, "PostToolUse", 0))
 
-	// Switch back to deny — PostToolUse must be removed, PreToolUse rewritten.
+	// Switch back to deny — terminal observation remains, while native
+	// post-read enrichment is removed and commands return to deny mode.
 	_, err = InstallHookWithMode(io.Discard, settingsPath, HookModeDeny, agentsApplyOptsZero())
 	require.NoError(t, err)
 	hooks = readSettingsHooks(t, settingsPath)
-	assert.NotContains(t, hooks, "PostToolUse", "switch back to deny must drop PostToolUse")
+	require.Contains(t, hooks, "PostToolUse")
+	assert.Equal(t, localizationPostToolUseMatcher,
+		hooks["PostToolUse"].([]any)[0].(map[string]any)["matcher"])
 	assert.Equal(t, "gortex hook", extractCmd(t, hooks, "PreToolUse", 0),
 		"switch back to deny must restore bare command on PreToolUse")
+	assert.Equal(t, "gortex hook", extractCmd(t, hooks, "PostToolUse", 0),
+		"switch back to deny must restore bare command on PostToolUse")
 }
 
 func TestInstallHookWithMode_EnrichIdempotent(t *testing.T) {
@@ -518,7 +529,8 @@ func TestInstallHookWithMode_EnrichIdempotent(t *testing.T) {
 	assert.Len(t, post, 1, "repeated install must not duplicate the PostToolUse entry")
 }
 
-// InstallHook (the back-compat wrapper) must default to deny mode.
+// InstallHook (the back-compat wrapper) defaults to deny mode while retaining
+// the mode-independent terminal observer.
 func TestInstallHook_DefaultsToDeny(t *testing.T) {
 	dir := t.TempDir()
 	settingsPath := filepath.Join(dir, "settings.local.json")
@@ -527,6 +539,7 @@ func TestInstallHook_DefaultsToDeny(t *testing.T) {
 	_, err := InstallHook(io.Discard, settingsPath, agentsApplyOptsZero())
 	require.NoError(t, err)
 	hooks := readSettingsHooks(t, settingsPath)
-	assert.NotContains(t, hooks, "PostToolUse",
-		"InstallHook (no mode) must behave as deny — no PostToolUse entry")
+	require.Contains(t, hooks, "PostToolUse")
+	post := hooks["PostToolUse"].([]any)[0].(map[string]any)
+	assert.Equal(t, localizationPostToolUseMatcher, post["matcher"])
 }

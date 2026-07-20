@@ -45,9 +45,16 @@ func runUserPromptSubmit(data []byte) {
 	if input.HookEventName != "UserPromptSubmit" {
 		return
 	}
+	// The user prompt is the authoritative turn boundary. Clear terminal
+	// enforcement before any daemon-backed enrichment so a down daemon cannot
+	// leave the previous turn's marker active.
+	clearedTerminal := clearLocalizationTerminalFromHook(data)
 	emitted := false
 	defer func() {
 		logHookEffectiveness("UserPromptSubmit", emitted, daemonReachableFn(), 0, time.Since(started))
+		if clearedTerminal {
+			localizationTerminalTelemetry("cleared_prompt", true, started)
+		}
 	}()
 	block := buildUserPromptSubmitContext(input.HookEventName, input.Prompt)
 	if block == "" {

@@ -20,7 +20,7 @@ func hotCacheTestNode(id, name, repo string) *graph.Node {
 
 func TestResolveHotCacheRotationBoundsBytes(t *testing.T) {
 	budget := int64(64 << 10) // tiny budget forces rotation
-	c := newResolveHotCache(budget)
+	c := newResolveHotCache(budget, 4096)
 	for i := 0; i < 4096; i++ {
 		c.putNode(hotCacheTestNode(fmt.Sprintf("repo::fn::%05d", i), fmt.Sprintf("fn%05d", i), "repo"))
 	}
@@ -37,7 +37,7 @@ func TestResolveHotCacheRotationBoundsBytes(t *testing.T) {
 }
 
 func TestResolveHotCacheNegativeNameGroupsAreCached(t *testing.T) {
-	c := newResolveHotCache(1 << 20)
+	c := newResolveHotCache(1<<20, 1)
 	key := hotNameKey("repo", "language:go", "definitelyMissing")
 	if _, ok := c.getNames(key); ok {
 		t.Fatal("unexpected hit before put")
@@ -52,6 +52,23 @@ func TestResolveHotCacheNegativeNameGroupsAreCached(t *testing.T) {
 	}
 }
 
+func TestResolveHotCacheStartsWithOneFrontierSizedGeneration(t *testing.T) {
+	c := newResolveHotCache(1<<20, 2)
+	if c.cur == nil {
+		t.Fatal("current generation is nil")
+	}
+	if c.prev != nil {
+		t.Fatal("unused previous generation was allocated eagerly")
+	}
+	if len(c.cur.nodes) != 0 || len(c.cur.names) != 0 {
+		t.Fatal("new cache generation is not empty")
+	}
+	c.flush()
+	if c.prev != nil {
+		t.Fatal("flush allocated an unused previous generation")
+	}
+}
+
 func TestCachedParallelGetNodesByIDsServesRepeatsFromCache(t *testing.T) {
 	g := graph.New()
 	n1 := hotCacheTestNode("repo::fn::a", "a", "repo")
@@ -59,8 +76,8 @@ func TestCachedParallelGetNodesByIDsServesRepeatsFromCache(t *testing.T) {
 	g.AddNode(n1)
 	g.AddNode(n2)
 
-	r := &Resolver{graph: g, hotCache: newResolveHotCache(1 << 20)}
 	ids := []string{"repo::fn::a", "repo::fn::b", "repo::fn::missing"}
+	r := &Resolver{graph: g, hotCache: newResolveHotCache(1<<20, len(ids))}
 
 	first := r.cachedParallelGetNodesByIDs(ids)
 	if first["repo::fn::a"] == nil || first["repo::fn::b"] == nil {
@@ -99,7 +116,7 @@ func TestWarmRepoLanguageNameCacheReusesHotGroupsAcrossPages(t *testing.T) {
 		Kind: graph.EdgeCalls,
 	}}
 
-	r := &Resolver{graph: g, hotCache: newResolveHotCache(1 << 20)}
+	r := &Resolver{graph: g, hotCache: newResolveHotCache(1<<20, len(page))}
 	// Production order: warmLookupCacheWithSources installs the source-node
 	// ID cache before the name warm derives repo/language scopes from it.
 	r.nodeByID = map[string]*graph.Node{src.ID: src}

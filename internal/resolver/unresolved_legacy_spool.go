@@ -4,10 +4,19 @@ import (
 	"bufio"
 	"encoding/gob"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 
 	"github.com/zzet/gortex/internal/graph"
+)
+
+const (
+	// Keep at most one compact replay page in memory. Larger legacy frontiers
+	// spill behind the same identity boundary instead of paying temp-file and
+	// gob setup for every small in-memory graph.
+	resolveSpoolBufferBytes = 256 << 10
+	resolveSpoolInlineBytes = 256 << 10
 )
 
 type unresolvedEdgeRecord struct {
@@ -21,9 +30,13 @@ type unresolvedEdgeRecord struct {
 // unresolvedLegacySpool gives stores without a native high-water pager the
 // same stable pass boundary without a pointer snapshot. The initial predicate
 // iterator is drained into compact identities before mutations begin; replay
-// rehydrates each bounded page with one batched site lookup.
+// rehydrates each bounded page with one batched site lookup. One bounded page
+// stays inline; larger frontiers spill to disk before resolution starts.
 type unresolvedLegacySpool struct {
 	store   graph.Store
+	records []unresolvedEdgeRecord
+	readAt  int
+	bytes   int
 	file    *os.File
 	writer  *bufio.Writer
 	encoder *gob.Encoder
@@ -32,14 +45,7 @@ type unresolvedLegacySpool struct {
 }
 
 func newUnresolvedLegacySpool(store graph.Store) (*unresolvedLegacySpool, error) {
-	file, err := os.CreateTemp("", "gortex-unresolved-*")
-	if err != nil {
-		return nil, err
-	}
-	writer := bufio.NewWriterSize(file, 256<<10)
-	spool := &unresolvedLegacySpool{
-		store: store, file: file, writer: writer, encoder: gob.NewEncoder(writer),
-	}
+	spool := &unresolvedLegacySpool{store: store}
 	for edge := range store.EdgesWithUnresolvedTarget() {
 		if edge == nil {
 			continue
@@ -48,33 +54,87 @@ func newUnresolvedLegacySpool(store graph.Store) (*unresolvedLegacySpool, error)
 			From: edge.From, To: edge.To, Kind: edge.Kind,
 			FilePath: edge.FilePath, Line: edge.Line,
 		}
-		if err := spool.encoder.Encode(&record); err != nil {
+		if err := spool.append(record); err != nil {
 			spool.close()
 			return nil, err
 		}
-		spool.count++
 	}
-	if err := spool.writer.Flush(); err != nil {
-		spool.close()
-		return nil, err
+	if spool.file != nil {
+		if err := spool.beginRead(); err != nil {
+			spool.close()
+			return nil, err
+		}
 	}
-	if _, err := spool.file.Seek(0, io.SeekStart); err != nil {
-		spool.close()
-		return nil, err
-	}
-	spool.decoder = gob.NewDecoder(bufio.NewReaderSize(spool.file, 256<<10))
 	return spool, nil
 }
 
+func unresolvedEdgeRecordSize(record unresolvedEdgeRecord) int {
+	return 96 + len(record.From) + len(record.To) + len(record.Kind) + len(record.FilePath)
+}
+
+func (s *unresolvedLegacySpool) append(record unresolvedEdgeRecord) error {
+	recordBytes := unresolvedEdgeRecordSize(record)
+	if s.file == nil && len(s.records) < resolvePendingPageRows && s.bytes+recordBytes <= resolveSpoolInlineBytes {
+		s.records = append(s.records, record)
+		s.bytes += recordBytes
+		s.count++
+		return nil
+	}
+	if s.file == nil {
+		if err := s.spill(); err != nil {
+			return err
+		}
+	}
+	if err := s.encoder.Encode(&record); err != nil {
+		return err
+	}
+	s.count++
+	return nil
+}
+
+func (s *unresolvedLegacySpool) spill() error {
+	file, err := os.CreateTemp("", "gortex-unresolved-*")
+	if err != nil {
+		return err
+	}
+	s.file = file
+	s.writer = bufio.NewWriterSize(file, resolveSpoolBufferBytes)
+	s.encoder = gob.NewEncoder(s.writer)
+	for i := range s.records {
+		if err := s.encoder.Encode(&s.records[i]); err != nil {
+			return err
+		}
+	}
+	s.records = nil
+	s.bytes = 0
+	return nil
+}
+
+func (s *unresolvedLegacySpool) beginRead() error {
+	if err := s.writer.Flush(); err != nil {
+		return err
+	}
+	if _, err := s.file.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	s.decoder = gob.NewDecoder(bufio.NewReaderSize(s.file, resolveSpoolBufferBytes))
+	return nil
+}
+
 func (s *unresolvedLegacySpool) close() {
-	if s == nil || s.file == nil {
+	if s == nil {
 		return
 	}
-	_ = s.writer.Flush()
-	name := s.file.Name()
-	_ = s.file.Close()
-	_ = os.Remove(name)
-	s.file = nil
+	s.records = nil
+	if s.file != nil {
+		if s.writer != nil {
+			_ = s.writer.Flush()
+		}
+		name := s.file.Name()
+		_ = s.file.Close()
+		_ = os.Remove(name)
+		s.file = nil
+	}
 }
 
 func (s *unresolvedLegacySpool) nextPage(maxRows, maxBytes int) ([]*graph.Edge, bool, error) {
@@ -84,24 +144,38 @@ func (s *unresolvedLegacySpool) nextPage(maxRows, maxBytes int) ([]*graph.Edge, 
 	if maxBytes <= 0 {
 		maxBytes = resolvePendingPageBytes
 	}
-	records := make([]unresolvedEdgeRecord, 0, maxRows)
+	if s.readAt >= s.count {
+		return nil, true, nil
+	}
+	if s.file == nil {
+		start := s.readAt
+		bytesUsed := 0
+		for s.readAt < len(s.records) && s.readAt-start < maxRows && (s.readAt == start || bytesUsed < maxBytes) {
+			bytesUsed += unresolvedEdgeRecordSize(s.records[s.readAt])
+			s.readAt++
+		}
+		return s.rehydrate(s.records[start:s.readAt]), s.readAt == s.count, nil
+	}
+	remaining := s.count - s.readAt
+	targetRows := min(maxRows, remaining)
+	records := make([]unresolvedEdgeRecord, 0, targetRows)
 	bytesUsed := 0
-	exhausted := false
-	for len(records) < maxRows && bytesUsed < maxBytes {
+	for len(records) < targetRows && bytesUsed < maxBytes {
 		var record unresolvedEdgeRecord
 		if err := s.decoder.Decode(&record); err != nil {
 			if errors.Is(err, io.EOF) {
-				exhausted = true
-				break
+				return nil, false, fmt.Errorf("unresolved edge spool ended after %d of %d records: %w", s.readAt+len(records), s.count, io.ErrUnexpectedEOF)
 			}
 			return nil, false, err
 		}
 		records = append(records, record)
-		bytesUsed += 96 + len(record.From) + len(record.To) + len(record.Kind) + len(record.FilePath)
+		bytesUsed += unresolvedEdgeRecordSize(record)
 	}
-	if len(records) == 0 {
-		return nil, exhausted, nil
-	}
+	s.readAt += len(records)
+	return s.rehydrate(records), s.readAt == s.count, nil
+}
+
+func (s *unresolvedLegacySpool) rehydrate(records []unresolvedEdgeRecord) []*graph.Edge {
 	sites := make([]graph.EdgeSite, 0, len(records))
 	for _, record := range records {
 		sites = append(sites, graph.EdgeSite{From: record.From, Line: record.Line, Kind: record.Kind})
@@ -116,5 +190,5 @@ func (s *unresolvedLegacySpool) nextPage(maxRows, maxBytes int) ([]*graph.Edge, 
 			}
 		}
 	}
-	return edges, exhausted, nil
+	return edges
 }

@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -35,6 +36,133 @@ func TestLimitExploreCandidatesPreservingSourceLiteralReservesOneFullCapSlot(t *
 	bounded := limitExploreCandidatesPreservingSourceLiteral(candidates, 4)
 	require.Len(t, bounded, 4)
 	require.NotNil(t, candidateByID(bounded, "source"))
+}
+
+func TestLimitExploreCandidatesPreservingSourceLiteralPrefersMultiAnchorOwner(t *testing.T) {
+	multi := sourcePreservationCandidate("multi-anchor", 90, 0.25)
+	multi.Signals[exploreSourceLiteralCoverageSignal] = 2
+	single := sourcePreservationCandidate("single-anchor", 80, 1)
+	single.Signals[exploreSourceLiteralCoverageSignal] = 1
+	candidates := []*rerank.Candidate{
+		sourcePreservationCandidate("primary-0", 0, 0),
+		sourcePreservationCandidate("primary-1", 1, 0),
+		single,
+		multi,
+	}
+
+	bounded := limitExploreCandidatesPreservingSourceLiteral(candidates, 2)
+
+	require.Len(t, bounded, 2)
+	require.NotNil(t, candidateByID(bounded, multi.Node.ID))
+	require.Nil(t, candidateByID(bounded, single.Node.ID), "a two-slot window preserves its semantic head plus the multi-anchor owner")
+}
+
+func TestSelectFinalExploreCandidatesReservesOnlyOneAmbiguousSingleAnchorOwner(t *testing.T) {
+	first := sourcePreservationCandidate("ambiguous-a", 80, 1)
+	first.Signals[exploreSourceLiteralCoverageSignal] = 1
+	first.Signals[exploreContentRecallAmbiguousSignal] = 1
+	second := sourcePreservationCandidate("ambiguous-b", 90, 0.5)
+	second.Signals[exploreSourceLiteralCoverageSignal] = 1
+	second.Signals[exploreContentRecallAmbiguousSignal] = 1
+	prod := []*rerank.Candidate{
+		sourcePreservationCandidate("primary-0", 0, 0),
+		sourcePreservationCandidate("primary-1", 1, 0),
+		sourcePreservationCandidate("primary-2", 2, 0),
+		first,
+		second,
+	}
+
+	selected := selectFinalExploreCandidates(prod, nil, 3)
+
+	require.Len(t, selected, 3)
+	require.Equal(t, "primary-0", selected[0].Node.ID)
+	require.NotNil(t, candidateByID(selected, first.Node.ID))
+	require.Nil(t, candidateByID(selected, second.Node.ID))
+	require.NotNil(t, candidateByID(selected, "primary-1"), "ambiguous collision evidence must not consume both reserve slots")
+}
+
+func TestSelectFinalExploreCandidatesPrefersTaskAlignedAmbiguousCallee(t *testing.T) {
+	generic := sourcePreservationCandidate("generic-register", 10, 1)
+	generic.Node.Name = "Register"
+	generic.Signals[exploreSourceLiteralCoverageSignal] = 1
+	generic.Signals[exploreContentRecallAmbiguousSignal] = 1
+	generic.Signals[exploreSourceLiteralCalleeSignal] = 1
+	specific := sourcePreservationCandidate("specific-register", 20, 0.5)
+	specific.Node.Name = "RegisterDefaultFormatter"
+	specific.Node.Language = "rust"
+	specific.Node.FilePath = "src/registry.rs"
+	specific.Signals[exploreSourceLiteralCoverageSignal] = 1
+	specific.Signals[exploreContentRecallAmbiguousSignal] = 1
+	specific.Signals[exploreSourceLiteralCalleeSignal] = 1
+	specific.Signals[exploreSourceLiteralTaskAlignSignal] = 1
+	third := sourcePreservationCandidate("third-register", 30, 0.25)
+	third.Signals[exploreSourceLiteralCoverageSignal] = 1
+	third.Signals[exploreContentRecallAmbiguousSignal] = 1
+	third.Signals[exploreSourceLiteralCalleeSignal] = 1
+	prod := []*rerank.Candidate{
+		sourcePreservationCandidate("primary-0", 0, 0),
+		sourcePreservationCandidate("primary-1", 1, 0),
+		sourcePreservationCandidate("primary-2", 2, 0),
+		generic,
+		specific,
+		third,
+	}
+
+	selected := selectFinalExploreCandidates(prod, nil, 3)
+
+	require.Len(t, selected, 3)
+	require.Equal(t, "primary-0", selected[0].Node.ID, "source reservation must preserve the semantic head")
+	require.NotNil(t, candidateByID(selected, specific.Node.ID))
+	require.Nil(t, candidateByID(selected, generic.Node.ID), "one compact collision may reserve only one owner")
+	require.Nil(t, candidateByID(selected, third.Node.ID), "three-way collision noise must stay outside the bounded answer")
+}
+
+func TestSelectFinalExploreCandidatesDeduplicatesSourceOwnersAndHonorsSmallLimits(t *testing.T) {
+	head := sourcePreservationCandidate("head", 0, 0)
+	source := sourcePreservationCandidate("aligned-source", 8, 0.5)
+	source.Signals[exploreSourceLiteralCoverageSignal] = 1
+	source.Signals[exploreContentRecallAmbiguousSignal] = 1
+	source.Signals[exploreSourceLiteralCalleeSignal] = 1
+	source.Signals[exploreSourceLiteralTaskAlignSignal] = 1
+	duplicate := *source
+	duplicate.Signals = map[string]float64{
+		exploreSourceLiteralSignal:          0.5,
+		exploreSourceLiteralCoverageSignal:  1,
+		exploreContentRecallAmbiguousSignal: 1,
+		exploreSourceLiteralCalleeSignal:    1,
+		exploreSourceLiteralTaskAlignSignal: 1,
+	}
+	prod := []*rerank.Candidate{head, sourcePreservationCandidate("tail", 1, 0), source, &duplicate}
+
+	require.Nil(t, selectFinalExploreCandidates(prod, nil, 0))
+	one := selectFinalExploreCandidates(prod, nil, 1)
+	require.Len(t, one, 1)
+	require.Equal(t, "head", one[0].Node.ID)
+	two := selectFinalExploreCandidates(prod, nil, 2)
+	require.Len(t, two, 2)
+	require.Equal(t, "head", two[0].Node.ID)
+	require.Equal(t, "aligned-source", two[1].Node.ID)
+}
+
+func TestSelectFinalExploreCandidatesReservesTwoSourceOwnersWhenCapacityAllows(t *testing.T) {
+	multi := sourcePreservationCandidate("multi-anchor", 90, 0.25)
+	multi.Signals[exploreSourceLiteralCoverageSignal] = 2
+	single := sourcePreservationCandidate("single-anchor", 80, 1)
+	single.Signals[exploreSourceLiteralCoverageSignal] = 1
+	prod := []*rerank.Candidate{
+		sourcePreservationCandidate("primary-0", 0, 0),
+		sourcePreservationCandidate("primary-1", 1, 0),
+		sourcePreservationCandidate("primary-2", 2, 0),
+		single,
+		multi,
+	}
+
+	selected := selectFinalExploreCandidates(prod, nil, 3)
+
+	require.Len(t, selected, 3)
+	require.Equal(t, multi.Node.ID, selected[0].Node.ID)
+	require.NotNil(t, candidateByID(selected, single.Node.ID))
+	require.NotNil(t, candidateByID(selected, "primary-0"), "bounded reservation must retain the semantic head")
 }
 
 func TestSelectFinalExploreCandidatesPreservesSourceLiteralAfterRerank(t *testing.T) {
@@ -108,13 +236,50 @@ func TestMergeExploreCandidatesPreservesSourceLiteralSignalThroughDedupe(t *test
 	primarySignals := map[string]float64{"ordinary": 1}
 	merged := mergeExploreCandidates(
 		[]*rerank.Candidate{{Node: node, TextRank: 0, VectorRank: -1, Signals: primarySignals}},
-		[]*rerank.Candidate{{Node: node, TextRank: 9, VectorRank: -1, Signals: map[string]float64{exploreSourceLiteralSignal: 0.5}}},
+		[]*rerank.Candidate{{Node: node, TextRank: 9, VectorRank: -1, Signals: map[string]float64{
+			exploreSourceLiteralSignal: 0.5, exploreSourceLiteralCoverageSignal: 2,
+		}}},
 		20,
 	)
 
 	require.Len(t, merged, 1)
 	require.Equal(t, 0.5, merged[0].Signals[exploreSourceLiteralSignal])
+	require.Equal(t, float64(2), merged[0].Signals[exploreSourceLiteralCoverageSignal])
 	require.Zero(t, primarySignals[exploreSourceLiteralSignal], "request-local evidence must not mutate an input candidate")
+	require.Zero(t, primarySignals[exploreSourceLiteralCoverageSignal], "coverage evidence must remain request-local")
+}
+
+func TestReserveExploreConceptImplementationHandlesMoreThanInlineTermCapacity(t *testing.T) {
+	terms := make([]string, 65)
+	for i := range terms {
+		terms[i] = fmt.Sprintf("term%c%c", 'a'+rune(i/26), 'a'+rune(i%26))
+	}
+	primary := sourcePreservationCandidate("primary", 0, 0)
+	targetName := terms[0] + "_" + terms[1]
+	target := &rerank.Candidate{Node: &graph.Node{
+		ID:       "demo/worker.go::" + targetName,
+		Name:     targetName,
+		QualName: "demo." + targetName,
+		Kind:     graph.KindFunction,
+		FilePath: "demo/worker.go",
+	}}
+	candidates := []*rerank.Candidate{
+		primary,
+		sourcePreservationCandidate("secondary", 1, 0),
+		target,
+	}
+
+	got, protected := reserveExploreConceptImplementation(
+		strings.Join(terms, " "),
+		rerank.QueryClassConcept,
+		candidates,
+		2,
+	)
+
+	require.Len(t, got, len(candidates))
+	require.Same(t, primary, got[0], "reservation must preserve the semantic head")
+	require.Same(t, target, got[1], "the callable matching long-query terms must be reserved")
+	require.Equal(t, target.Node.ID, protected)
 }
 
 func TestExploreAnswerReadyKeepsQuotedNonExactConceptNonTerminal(t *testing.T) {

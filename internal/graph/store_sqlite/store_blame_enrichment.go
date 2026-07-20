@@ -109,7 +109,7 @@ func (s *Store) BlameRows(repoPrefix string) []graph.BlameEnrichment {
 	if repoPrefix == "" {
 		rows, err = s.db.Query(`SELECT ` + blameCols + ` FROM blame_enrichment`)
 	} else {
-		rows, err = s.db.Query(`SELECT `+blameCols+` FROM blame_enrichment WHERE repo_prefix = ?`, repoPrefix)
+		rows, err = s.db.Query(`SELECT `+blameCols+` FROM blame_enrichment WHERE repo_prefix = ? AND repo_prefix <> ''`, repoPrefix)
 	}
 	if err != nil {
 		return nil

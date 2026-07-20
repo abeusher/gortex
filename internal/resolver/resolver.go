@@ -602,7 +602,7 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 	// down with the pass; see resolve_hot_cache.go for the immutability and
 	// flush rules that make this safe.
 	if resolveHotCacheEnabled() {
-		r.hotCache = newResolveHotCache(resolveHotCacheBudgetBytes())
+		r.hotCache = newResolveHotCache(resolveHotCacheBudgetBytes(), len(pending))
 		defer func() {
 			if c := r.hotCache; c != nil {
 				r.logger.Info("resolver: hot cache stats",

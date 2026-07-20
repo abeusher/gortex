@@ -73,11 +73,11 @@ func gortexReadNudge(toolName string, toolInput map[string]any) string {
 func normalizeGortexReadInput(toolName string, input map[string]any) (path string, options, output map[string]any, wholeFile bool) {
 	options = map[string]any{}
 	output = map[string]any{}
-	switch strings.TrimSpace(toolName) {
-	case gortexReadFileTool, gortexEditingContextTool, "read_file", "get_editing_context":
+	switch shortGortexToolName(strings.TrimSpace(toolName)) {
+	case "read_file", "get_editing_context":
 		path, _ = input["path"].(string)
 		return path, input, output, true
-	case gortexCompactReadTool, "read":
+	case "read":
 		operation, _ := input["operation"].(string)
 		operation = strings.ReplaceAll(strings.ToLower(strings.TrimSpace(operation)), "-", "_")
 		target, _ := input["target"].(map[string]any)
@@ -128,10 +128,12 @@ func gortexReadAdvisory(toolName, path string) string {
 	return b.String()
 }
 
-// shortGortexToolName strips the mcp__gortex__ namespace so the advisory
-// reads "read_file" rather than the fully-qualified tool name.
+// shortGortexToolName strips either Claude Code namespace: direct MCP config
+// uses mcp__gortex__, while marketplace plugins use
+// mcp__plugin_gortex_gortex__. The advisory should display only the operation.
 func shortGortexToolName(toolName string) string {
-	return strings.TrimPrefix(toolName, gortexMCPToolPrefix)
+	toolName = strings.TrimPrefix(toolName, gortexMCPToolPrefix)
+	return strings.TrimPrefix(toolName, gortexPluginMCPToolPrefix)
 }
 
 // hasReadSizeCap reports whether the read already bounds its output via a

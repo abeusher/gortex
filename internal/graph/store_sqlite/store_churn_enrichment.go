@@ -132,7 +132,7 @@ func (s *Store) ChurnRows(repoPrefix string) []graph.ChurnEnrichment {
 	if repoPrefix == "" {
 		rows, err = s.db.Query(`SELECT ` + churnCols + ` FROM churn_enrichment`)
 	} else {
-		rows, err = s.db.Query(`SELECT `+churnCols+` FROM churn_enrichment WHERE repo_prefix = ?`, repoPrefix)
+		rows, err = s.db.Query(`SELECT `+churnCols+` FROM churn_enrichment WHERE repo_prefix = ? AND repo_prefix <> ''`, repoPrefix)
 	}
 	if err != nil {
 		return nil

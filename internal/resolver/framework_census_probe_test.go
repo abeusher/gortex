@@ -46,7 +46,7 @@ func TestFrameworkCensusProbe(t *testing.T) {
 	t.Logf("EdgesByKind(calls) full stream: %d rows (%d with meta) in %s", calls, withMeta, time.Since(t1))
 
 	t2 := time.Now()
-	census := collectFrameworkEdgeCensus(s)
+	census := collectFrameworkEdgeCensus(s, nil)
 	t.Logf("collectFrameworkEdgeCensus: %s (via markers=%d)", time.Since(t2), len(census.via))
 
 	t3 := time.Now()
@@ -85,4 +85,7 @@ func TestFrameworkSynthesisScopedProbe(t *testing.T) {
 		loopMs += p.Millis
 	}
 	t.Logf("loop total: %dms across %d entries", loopMs, len(rep.Per))
+	for _, p := range rep.Per {
+		t.Logf("per: %-24s edges=%-8d ms=%d", p.Name, p.Edges, p.Millis)
+	}
 }

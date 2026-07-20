@@ -175,9 +175,9 @@ func TestEmitPluginBundle_HooksShape(t *testing.T) {
 		t.Fatalf("hooks.json: missing top-level 'hooks' object: %v", doc)
 	}
 
-	// All four event kinds must be present; each must reference the
+	// All seven lifecycle/tool event kinds must be present; each must reference the
 	// hooks-handlers script via ${CLAUDE_PLUGIN_ROOT}.
-	for _, event := range []string{"PreToolUse", "PreCompact", "Stop", "SessionStart"} {
+	for _, event := range []string{"PreToolUse", "UserPromptSubmit", "SubagentStart", "SubagentStop", "PreCompact", "Stop", "SessionStart"} {
 		entries, ok := hooks[event].([]any)
 		if !ok || len(entries) == 0 {
 			t.Errorf("hooks.json: event %s missing or empty", event)
@@ -204,6 +204,13 @@ func TestEmitPluginBundle_HooksShape(t *testing.T) {
 	matcher, _ := pre[0].(map[string]any)["matcher"].(string)
 	if matcher != CurrentPreToolUseMatcher {
 		t.Errorf("hooks.json: PreToolUse matcher = %q, want %q", matcher, CurrentPreToolUseMatcher)
+	}
+	post := hooks["PostToolUse"].([]any)
+	postMatcher, _ := post[0].(map[string]any)["matcher"].(string)
+	for _, want := range []string{"mcp__gortex__explore", "mcp__plugin_gortex_gortex__explore"} {
+		if !strings.Contains(postMatcher, want) {
+			t.Errorf("hooks.json: PostToolUse matcher %q missing %q", postMatcher, want)
+		}
 	}
 }
 

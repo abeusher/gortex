@@ -98,6 +98,13 @@ const (
 	// already produced its terminal evidence. The caller must respond, or make
 	// the one exact read named by data.completion when that state is returned.
 	ErrCodeLocalizationComplete ErrorCode = "localization_complete"
+
+	// ErrCodeLocalizationTerminal — a localization contract is already in its
+	// terminal answer_ready state. The original successful response contains
+	// the evidence; retrying navigation cannot add evidence and is not
+	// retriable. This is distinct from LocalizationComplete, which also covers
+	// non-terminal refinement and in-flight states.
+	ErrCodeLocalizationTerminal ErrorCode = "localization_terminal"
 )
 
 // StructuredError is the JSON shape encoded into the TextContent
@@ -116,13 +123,38 @@ type StructuredError struct {
 // Use this from any MCP handler that wants to surface a typed
 // failure instead of a free-form string.
 func NewStructuredErrorResult(err StructuredError) *mcp.CallToolResult {
+	return newStructuredErrorResult(err, false)
+}
+
+// newStructuredErrorResult preserves the exported constructor's historical
+// wire shape while allowing protocol contracts that require an explicit
+// retriable boolean to opt in locally.
+func newStructuredErrorResult(err StructuredError, explicitRetriable bool) *mcp.CallToolResult {
 	if err.ErrorCode == "" {
 		err.ErrorCode = ErrCodeInvalidArgument
 	}
 	if err.Message == "" {
 		err.Message = string(err.ErrorCode)
 	}
-	body, mErr := json.Marshal(err)
+	var (
+		body []byte
+		mErr error
+	)
+	if explicitRetriable {
+		body, mErr = json.Marshal(struct {
+			ErrorCode ErrorCode      `json:"error_code"`
+			Message   string         `json:"message"`
+			Retriable bool           `json:"retriable"`
+			Data      map[string]any `json:"data,omitempty"`
+		}{
+			ErrorCode: err.ErrorCode,
+			Message:   err.Message,
+			Retriable: err.Retriable,
+			Data:      err.Data,
+		})
+	} else {
+		body, mErr = json.Marshal(err)
+	}
 	if mErr != nil {
 		// Fallback to plain text — never let a marshal failure mask
 		// the actual error.

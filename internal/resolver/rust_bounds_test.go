@@ -202,7 +202,7 @@ func TestRustInheritedMethodsKeepQualifiedOwnerAliases(t *testing.T) {
 			{From: bChild.ID, To: bParent.ID, Kind: graph.EdgeExtends},
 		},
 	)
-	idx, changed := buildRustScopeIndex(g)
+	idx, changed := buildRustScopeIndex(g, nil)
 	if changed != 0 || idx == nil {
 		t.Fatalf("buildRustScopeIndex() = (%v, %d), want non-nil, 0", idx, changed)
 	}

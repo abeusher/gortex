@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/gob"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"sort"
@@ -13,10 +14,10 @@ import (
 )
 
 // resolveGuardRecord is the compact, pointer-free subset of reindexJob needed
-// by the post-pass cross-package guard. Records are spooled to a temporary
-// file so even a pathological pass where every pending edge changes keeps
-// cross-page state out of the Go heap. Live edges are recovered later through
-// one batched source-site query per page.
+// by the post-pass cross-package guard. One bounded page stays inline; larger
+// corpora spill to a temporary file so a pathological pass where every pending
+// edge changes still keeps cross-page state out of the Go heap. Live edges are
+// recovered later through one batched source-site query per page.
 type resolveGuardRecord struct {
 	From       string
 	CurrentTo  string
@@ -31,6 +32,9 @@ type resolveGuardRecord struct {
 }
 
 type resolveGuardSpool struct {
+	records []resolveGuardRecord
+	readAt  int
+	bytes   int
 	file    *os.File
 	writer  *bufio.Writer
 	encoder *gob.Encoder
@@ -38,23 +42,30 @@ type resolveGuardSpool struct {
 	count   int
 }
 
+// A resolveGuardRecord occupies 280 bytes on 64-bit Go before the bytes
+// referenced by its strings and Meta slice. Keep additional per-record
+// headroom so the inline byte limit remains conservative across allocator
+// alignment and small representation changes.
+const resolveGuardRecordFixedBytes = 320
+
 func newResolveGuardSpool() (*resolveGuardSpool, error) {
-	file, err := os.CreateTemp("", "gortex-resolve-guard-*")
-	if err != nil {
-		return nil, err
-	}
-	writer := bufio.NewWriterSize(file, 256<<10)
-	return &resolveGuardSpool{file: file, writer: writer, encoder: gob.NewEncoder(writer)}, nil
+	return &resolveGuardSpool{}, nil
 }
 
 func (s *resolveGuardSpool) close() {
-	if s == nil || s.file == nil {
+	if s == nil {
 		return
 	}
-	_ = s.writer.Flush()
-	name := s.file.Name()
-	_ = s.file.Close()
-	_ = os.Remove(name)
+	s.records = nil
+	if s.file != nil {
+		if s.writer != nil {
+			_ = s.writer.Flush()
+		}
+		name := s.file.Name()
+		_ = s.file.Close()
+		_ = os.Remove(name)
+		s.file = nil
+	}
 }
 
 func (s *resolveGuardSpool) appendJobs(groups [][]reindexJob) error {
@@ -71,12 +82,57 @@ func (s *resolveGuardSpool) appendJobs(groups [][]reindexJob) error {
 				CrossRepo: job.crossRepo, Confidence: job.confidence, Origin: job.origin,
 				Payload: payload,
 			}
-			if err := s.encoder.Encode(&record); err != nil {
+			if err := s.append(record); err != nil {
 				return err
 			}
-			s.count++
 		}
 	}
+	return nil
+}
+
+func resolveGuardRecordSize(record resolveGuardRecord) int {
+	payload := record.Payload
+	return resolveGuardRecordFixedBytes + len(record.From) + len(record.CurrentTo) + len(record.OldTo) +
+		len(record.Kind) + len(record.FilePath) + len(record.Origin) +
+		len(payload.From) + len(payload.To) + len(payload.Kind) + len(payload.FilePath) +
+		len(payload.ConfidenceLabel) + len(payload.Origin) + len(payload.Tier) + len(payload.Meta)
+}
+
+func (s *resolveGuardSpool) append(record resolveGuardRecord) error {
+	recordBytes := resolveGuardRecordSize(record)
+	if s.file == nil && len(s.records) < resolvePendingPageRows && s.bytes+recordBytes <= resolveSpoolInlineBytes {
+		s.records = append(s.records, record)
+		s.bytes += recordBytes
+		s.count++
+		return nil
+	}
+	if s.file == nil {
+		if err := s.spill(); err != nil {
+			return err
+		}
+	}
+	if err := s.encoder.Encode(&record); err != nil {
+		return err
+	}
+	s.count++
+	return nil
+}
+
+func (s *resolveGuardSpool) spill() error {
+	file, err := os.CreateTemp("", "gortex-resolve-guard-*")
+	if err != nil {
+		return err
+	}
+	s.file = file
+	s.writer = bufio.NewWriterSize(file, resolveSpoolBufferBytes)
+	s.encoder = gob.NewEncoder(s.writer)
+	for i := range s.records {
+		if err := s.encoder.Encode(&s.records[i]); err != nil {
+			return err
+		}
+	}
+	s.records = nil
+	s.bytes = 0
 	return nil
 }
 
@@ -92,18 +148,21 @@ func guardCandidateJob(job *reindexJob) bool {
 }
 
 func (s *resolveGuardSpool) beginRead() error {
+	if s.file == nil {
+		return nil
+	}
 	if err := s.writer.Flush(); err != nil {
 		return err
 	}
 	if _, err := s.file.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
-	s.decoder = gob.NewDecoder(bufio.NewReaderSize(s.file, 256<<10))
+	s.decoder = gob.NewDecoder(bufio.NewReaderSize(s.file, resolveSpoolBufferBytes))
 	return nil
 }
 
 func (s *resolveGuardSpool) nextPage(limit int) ([]resolveGuardRecord, bool, error) {
-	if s.decoder == nil {
+	if s.file != nil && s.decoder == nil {
 		if err := s.beginRead(); err != nil {
 			return nil, false, err
 		}
@@ -111,18 +170,29 @@ func (s *resolveGuardSpool) nextPage(limit int) ([]resolveGuardRecord, bool, err
 	if limit <= 0 {
 		limit = resolvePendingPageRows
 	}
-	records := make([]resolveGuardRecord, 0, limit)
-	for len(records) < limit {
+	if s.readAt >= s.count {
+		return nil, true, nil
+	}
+	if s.file == nil {
+		start := s.readAt
+		s.readAt = min(s.readAt+limit, len(s.records))
+		return s.records[start:s.readAt], s.readAt == s.count, nil
+	}
+	remaining := s.count - s.readAt
+	targetRows := min(limit, remaining)
+	records := make([]resolveGuardRecord, 0, targetRows)
+	for len(records) < targetRows {
 		var record resolveGuardRecord
 		if err := s.decoder.Decode(&record); err != nil {
 			if errors.Is(err, io.EOF) {
-				return records, true, nil
+				return nil, false, fmt.Errorf("resolve guard spool ended after %d of %d records: %w", s.readAt+len(records), s.count, io.ErrUnexpectedEOF)
 			}
 			return nil, false, err
 		}
 		records = append(records, record)
 	}
-	return records, false, nil
+	s.readAt += len(records)
+	return records, s.readAt == s.count, nil
 }
 
 func guardJobsFromRecords(store graph.Store, records []resolveGuardRecord) []reindexJob {

@@ -5,28 +5,47 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"go.uber.org/zap"
 
+	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/search/trigram"
 )
 
 const (
-	exploreSourceLiteralRecallMaxHits  = 24
-	exploreSourceLiteralRecallMaxFiles = 0
-	exploreSourceLiteralRecallBudget   = 75 * time.Millisecond
+	exploreSourceLiteralRecallMaxHits          = 24
+	exploreSourceLiteralRecallMaxFiles         = 0
+	exploreSourceLiteralRecallBudget           = 75 * time.Millisecond
+	exploreSourceLiteralRecallMaxTerms         = 2
+	exploreSourceLiteralRecallMaxOwnersPerTerm = 3
+	exploreSourceLiteralRecallMaxFilesPerTerm  = 2
 )
 
 type exploreSourceLiteralHit struct {
-	nodeID string
-	rank   int
+	nodeID    string
+	rank      int
+	anchor    int
+	ambiguous bool
+	callee    bool
+}
+
+type exploreSourceLiteralDiagnostic struct {
+	literal        string
+	rawHits        int
+	mappedOwners   int
+	retainedOwners int
+	retainedFiles  int
+	reason         string
 }
 
 type exploreSourceLiteralRecall struct {
-	hits      []exploreSourceLiteralHit
-	ambiguous bool
+	hits        []exploreSourceLiteralHit
+	ambiguous   bool
+	ownerFiles  map[string]string
+	diagnostics []exploreSourceLiteralDiagnostic
 }
 
 type exploreSourceLiteralSearch struct {
@@ -37,14 +56,57 @@ type exploreSourceLiteralSearch struct {
 	lookupRepoPrefix string
 }
 
-// exploreHighestInformationQuotedLiteral picks one deterministic source-search
-// key. Quoted terms have already passed the noise filter; rune length is a
-// language-neutral proxy for selectivity and avoids multiplying repository
-// scans when a task contains several literals.
-func exploreHighestInformationQuotedLiteral(terms []string) string {
+// explorePreferredSourceLiteral picks one deterministic source-search key.
+// Quoted terms have already passed the noise filter. Compact alphabetic values
+// (locale/protocol/config keys) are reserved before longer prose because their
+// registration sites are otherwise invisible to symbol metadata. A saturated
+// compact lookup may fall back to the longest remaining term inside the same
+// fixed end-to-end deadline.
+func explorePreferredSourceLiteral(terms []string) string {
+	best := ""
+	bestLen := 0
+	bestCompact := false
+	for _, term := range terms {
+		n := utf8.RuneCountInString(term)
+		compact := exploreCompactSourceLiteral(term, n)
+		if best == "" || compact && !bestCompact || compact == bestCompact && n > bestLen {
+			best, bestLen, bestCompact = term, n, compact
+		}
+	}
+	return best
+}
+
+func exploreCompactSourceLiteral(term string, runeCount int) bool {
+	// Reserve priority only for two-letter alphabetic codes. Three- and
+	// four-letter lowercase values are indistinguishable from common prose
+	// ("test", "file", "true") and must compete by information length. They
+	// remain searchable when they are the only quoted term.
+	if runeCount != 2 {
+		return false
+	}
+	lower := strings.ToLower(term)
+	if _, stop := assistStopWords[lower]; stop {
+		return false
+	}
+	switch lower {
+	case "am", "an", "as", "at", "be", "by", "do", "go", "he", "hi", "if", "in", "is", "it", "me", "my", "no", "of", "oh", "ok", "on", "or", "so", "to", "up", "us", "we":
+		return false
+	}
+	for _, r := range term {
+		if !unicode.IsLetter(r) {
+			return false
+		}
+	}
+	return true
+}
+
+func exploreSourceLiteralFallback(terms []string, primary string) string {
 	best := ""
 	bestLen := 0
 	for _, term := range terms {
+		if strings.EqualFold(term, primary) {
+			continue
+		}
 		if n := utf8.RuneCountInString(term); n > bestLen {
 			best, bestLen = term, n
 		}
@@ -52,11 +114,101 @@ func exploreHighestInformationQuotedLiteral(terms []string) string {
 	return best
 }
 
+func exploreCompactSourceLiteralTerms(terms []string) []string {
+	out := make([]string, 0, min(len(terms), exploreSourceLiteralRecallMaxTerms))
+	seen := make(map[string]struct{}, len(terms))
+	for _, term := range terms {
+		if !exploreCompactSourceLiteral(term, utf8.RuneCountInString(term)) {
+			continue
+		}
+		key := strings.ToLower(term)
+		if _, duplicate := seen[key]; duplicate {
+			continue
+		}
+		seen[key] = struct{}{}
+		if len(out) < exploreSourceLiteralRecallMaxTerms {
+			out = append(out, term)
+		}
+	}
+	return out
+}
+
+// retainExploreSourceLiteralOwners keeps file diversity before filling the
+// remaining declaration slots. This prevents the first file's sibling methods
+// from evicting an equally exact owner in a second file while retaining fixed
+// per-term work and response bounds.
+func retainExploreSourceLiteralOwners(recall exploreSourceLiteralRecall) (hits []exploreSourceLiteralHit, files int, reason string) {
+	if len(recall.hits) == 0 {
+		return nil, 0, "no_mapped_owner"
+	}
+	seenOwners := make(map[string]struct{}, min(len(recall.hits), exploreSourceLiteralRecallMaxOwnersPerTerm))
+	seenFiles := make(map[string]struct{}, exploreSourceLiteralRecallMaxFilesPerTerm)
+	selected := make([]bool, len(recall.hits))
+	add := func(index int) {
+		hit := recall.hits[index]
+		if _, duplicate := seenOwners[hit.nodeID]; duplicate {
+			return
+		}
+		seenOwners[hit.nodeID] = struct{}{}
+		if file := recall.ownerFiles[hit.nodeID]; file != "" {
+			seenFiles[file] = struct{}{}
+		}
+		selected[index] = true
+		hits = append(hits, hit)
+	}
+
+	// First pass: one declaration from each distinct file.
+	for index, hit := range recall.hits {
+		if len(hits) >= exploreSourceLiteralRecallMaxOwnersPerTerm || len(seenFiles) >= exploreSourceLiteralRecallMaxFilesPerTerm {
+			break
+		}
+		file := recall.ownerFiles[hit.nodeID]
+		if file == "" {
+			continue
+		}
+		if _, exists := seenFiles[file]; exists {
+			continue
+		}
+		add(index)
+	}
+	// Second pass: fill remaining owner slots from already-admitted files.
+	for index, hit := range recall.hits {
+		if len(hits) >= exploreSourceLiteralRecallMaxOwnersPerTerm {
+			break
+		}
+		if selected[index] {
+			continue
+		}
+		file := recall.ownerFiles[hit.nodeID]
+		if file != "" {
+			if _, admitted := seenFiles[file]; !admitted && len(seenFiles) >= exploreSourceLiteralRecallMaxFilesPerTerm {
+				continue
+			}
+		}
+		add(index)
+	}
+
+	if len(hits) < len(recall.hits) {
+		mappedFiles := make(map[string]struct{}, len(recall.hits))
+		for _, hit := range recall.hits {
+			if file := recall.ownerFiles[hit.nodeID]; file != "" {
+				mappedFiles[file] = struct{}{}
+			}
+		}
+		if len(mappedFiles) > exploreSourceLiteralRecallMaxFilesPerTerm {
+			reason = "file_cap"
+		} else {
+			reason = "owner_cap"
+		}
+	}
+	return hits, len(seenFiles), reason
+}
+
 // gatherExploreSourceLiteralRecall reuses the bounded raw-text path behind
 // search(operation:"text") only when content_fts could not produce an exact
-// symbol candidate. It searches one repository and one literal, maps each
-// 1-based line hit to the smallest enclosing code symbol, and returns IDs for
-// the caller's existing single batch graph hydration.
+// symbol candidates. It searches one repository and at most two compact
+// literals, maps 1-based hits to their smallest enclosing declarations, and
+// returns a file-diverse owner set for the caller's existing batch hydration.
 func (s *Server) gatherExploreSourceLiteralRecall(
 	ctx context.Context,
 	terms []string,
@@ -66,63 +218,200 @@ func (s *Server) gatherExploreSourceLiteralRecall(
 	if s == nil || ctx.Err() != nil {
 		return exploreSourceLiteralRecall{}
 	}
-	term := exploreHighestInformationQuotedLiteral(terms)
-	if term == "" {
+	attemptTerms := exploreCompactSourceLiteralTerms(terms)
+	if len(attemptTerms) == 0 {
+		if primary := explorePreferredSourceLiteral(terms); primary != "" {
+			attemptTerms = append(attemptTerms, primary)
+		}
+	}
+	if len(attemptTerms) == 0 {
 		return exploreSourceLiteralRecall{}
 	}
 
 	started := time.Now()
-	searchCtx, cancelSearch := context.WithTimeout(ctx, exploreSourceLiteralRecallBudget)
-	search := s.searchExploreSourceLiteral(searchCtx, term, repoPrefix, scope)
-	searchErr := searchCtx.Err()
-	cancelSearch()
+	boundedCtx, cancelBounded := context.WithTimeout(ctx, 2*exploreSourceLiteralRecallBudget)
+	defer cancelBounded()
+	type literalAttempt struct {
+		term       string
+		search     exploreSourceLiteralSearch
+		recall     exploreSourceLiteralRecall
+		searchErr  error
+		mappingErr error
+	}
+	attempt := func(term string, budget time.Duration) literalAttempt {
+		result := literalAttempt{term: term}
+		if term == "" || boundedCtx.Err() != nil {
+			return result
+		}
+		attemptCtx, cancelAttempt := context.WithTimeout(boundedCtx, budget)
+		defer cancelAttempt()
+		searchBudget := exploreSourceLiteralRecallBudget
+		if budget < searchBudget {
+			searchBudget = budget
+		}
+		// Two-anchor recall gives each discovery the full per-anchor slice.
+		// Mapping still shares attemptCtx, so the two attempts remain inside the
+		// fixed 150ms request budget without silently halving grep time again.
+		searchCtx, cancelSearch := context.WithTimeout(attemptCtx, searchBudget)
+		result.search = s.searchExploreSourceLiteral(searchCtx, term, repoPrefix, scope)
+		result.searchErr = searchCtx.Err()
+		cancelSearch()
+		if ctx.Err() != nil {
+			return result
+		}
+		result.recall, result.mappingErr = s.mapDiscoveredExploreSourceLiteralMatches(
+			attemptCtx, term, result.search, scope, result.searchErr,
+		)
+		return result
+	}
+
+	aggregate := exploreSourceLiteralRecall{ownerFiles: make(map[string]string)}
+	attempted := make(map[string]struct{}, len(attemptTerms)+1)
+	results := make([]literalAttempt, 0, len(attemptTerms)+1)
+	run := func(term string, anchor int, budget time.Duration) literalAttempt {
+		result := attempt(term, budget)
+		attempted[strings.ToLower(term)] = struct{}{}
+		retained, retainedFiles, capReason := retainExploreSourceLiteralOwners(result.recall)
+		reason := capReason
+		switch {
+		case result.searchErr != nil:
+			reason = "search_deadline"
+		case result.mappingErr != nil:
+			reason = "mapping_deadline"
+		case result.search.backend == "none" || !result.search.owned && len(result.search.matches) == 0:
+			reason = "backend_unavailable"
+		case len(result.search.matches) == 0:
+			reason = "no_match"
+		case len(result.recall.hits) == 0:
+			reason = "no_mapped_owner"
+		case reason == "" && result.search.incomplete:
+			reason = "search_cap"
+		}
+		aggregate.diagnostics = append(aggregate.diagnostics, exploreSourceLiteralDiagnostic{
+			literal:        term,
+			rawHits:        len(result.search.matches),
+			mappedOwners:   len(result.recall.hits),
+			retainedOwners: len(retained),
+			retainedFiles:  retainedFiles,
+			reason:         reason,
+		})
+		for _, hit := range retained {
+			hit.anchor = anchor
+			hit.ambiguous = result.recall.ambiguous
+			aggregate.hits = append(aggregate.hits, hit)
+			if file := result.recall.ownerFiles[hit.nodeID]; file != "" {
+				aggregate.ownerFiles[hit.nodeID] = file
+			}
+		}
+		aggregate.ambiguous = aggregate.ambiguous || result.recall.ambiguous
+		results = append(results, result)
+		return result
+	}
+
+	attemptBudget := 2 * exploreSourceLiteralRecallBudget
+	if len(attemptTerms) > 1 {
+		attemptBudget = exploreSourceLiteralRecallBudget
+	}
+	for index, term := range attemptTerms {
+		if boundedCtx.Err() != nil {
+			break
+		}
+		run(term, index, attemptBudget)
+	}
+	// Preserve the existing selective fallback when there is only one compact
+	// anchor and it produces no settled owner. Two compact anchors already spend
+	// the entire bounded term budget and are aggregated directly.
+	if len(attemptTerms) == 1 && len(results) == 1 && boundedCtx.Err() == nil {
+		primary := results[0]
+		if fallback := exploreSourceLiteralFallback(terms, primary.term); fallback != "" &&
+			(len(primary.recall.hits) == 0 || primary.recall.ambiguous || primary.search.incomplete) {
+			run(fallback, 1, exploreSourceLiteralRecallBudget)
+		}
+	}
+	for _, term := range terms {
+		if _, ok := attempted[strings.ToLower(term)]; ok {
+			continue
+		}
+		reason := "not_compact"
+		if exploreCompactSourceLiteral(term, utf8.RuneCountInString(term)) {
+			reason = "term_cap"
+			if boundedCtx.Err() != nil {
+				reason = "request_deadline"
+			}
+		}
+		aggregate.diagnostics = append(aggregate.diagnostics, exploreSourceLiteralDiagnostic{
+			literal: term,
+			reason:  reason,
+		})
+	}
 	if ctx.Err() != nil {
 		return exploreSourceLiteralRecall{}
 	}
 
-	// Discovery and graph mapping have independent bounded phases. A backend
-	// may return useful partial matches as its deadline expires; reusing that
-	// expired context would discard those matches before they can be mapped to
-	// enclosing symbols. The request context remains the parent bound, while
-	// each phase gets the same small local budget.
-	recall, mappingErr := s.mapDiscoveredExploreSourceLiteralMatches(
-		ctx, term, search, scope, searchErr,
-	)
 	if s.logger != nil {
-		contextError := ""
-		if searchErr != nil {
-			contextError = "search: " + searchErr.Error()
-		}
-		if mappingErr != nil {
-			if contextError != "" {
-				contextError += "; "
+		rawHits, mappedOwners, retainedOwners := 0, 0, 0
+		reasons := make(map[string]struct{})
+		for _, diagnostic := range aggregate.diagnostics {
+			rawHits += diagnostic.rawHits
+			mappedOwners += diagnostic.mappedOwners
+			retainedOwners += diagnostic.retainedOwners
+			if diagnostic.reason != "" {
+				reasons[diagnostic.reason] = struct{}{}
 			}
-			contextError += "mapping: " + mappingErr.Error()
 		}
+		reasonKeys := make([]string, 0, len(reasons))
+		for reason := range reasons {
+			reasonKeys = append(reasonKeys, reason)
+		}
+		sort.Strings(reasonKeys)
+		termRunes := 0
+		backend := "none"
+		owned := false
+		lookupRepoPrefix := ""
 		firstMatchPath := ""
-		if len(search.matches) > 0 {
-			firstMatchPath = search.matches[0].Path
+		contextError := ""
+		if len(results) > 0 {
+			termRunes = utf8.RuneCountInString(results[0].term)
+			backend = results[0].search.backend
+			owned = results[0].search.owned
+			lookupRepoPrefix = results[0].search.lookupRepoPrefix
+			if len(results[0].search.matches) > 0 {
+				firstMatchPath = results[0].search.matches[0].Path
+			}
+			if results[0].searchErr != nil {
+				contextError = "search: " + results[0].searchErr.Error()
+			}
+			if results[0].mappingErr != nil {
+				if contextError != "" {
+					contextError += "; "
+				}
+				contextError += "mapping: " + results[0].mappingErr.Error()
+			}
 		}
 		fields := []zap.Field{
-			zap.Int("term_runes", utf8.RuneCountInString(term)),
+			zap.Int("term_runes", termRunes),
+			zap.Int("attempted_terms", len(results)),
+			zap.Int("diagnostic_terms", len(aggregate.diagnostics)),
+			zap.String("reasons", strings.Join(reasonKeys, ",")),
 			zap.String("requested_repo_prefix", repoPrefix),
-			zap.String("lookup_repo_prefix", search.lookupRepoPrefix),
+			zap.String("lookup_repo_prefix", lookupRepoPrefix),
 			zap.String("first_match_path", firstMatchPath),
-			zap.String("backend", search.backend),
-			zap.Bool("owned", search.owned),
-			zap.Int("raw_matches", len(search.matches)),
-			zap.Int("mapped_symbols", len(recall.hits)),
-			zap.Bool("incomplete", search.incomplete),
+			zap.String("backend", backend),
+			zap.Bool("owned", owned),
+			zap.Int("raw_matches", rawHits),
+			zap.Int("mapped_symbols", mappedOwners),
+			zap.Int("retained_symbols", retainedOwners),
+			zap.Bool("incomplete", aggregate.ambiguous),
 			zap.String("context_error", contextError),
 			zap.Duration("elapsed", time.Since(started)),
 		}
-		if len(recall.hits) == 0 || search.incomplete || contextError != "" {
+		if len(aggregate.hits) == 0 || aggregate.ambiguous || contextError != "" {
 			s.logger.Info("mcp: explore source literal recall incomplete", fields...)
 		} else {
 			s.logger.Debug("mcp: explore source literal recall", fields...)
 		}
 	}
-	return recall
+	return aggregate
 }
 
 func (s *Server) mapDiscoveredExploreSourceLiteralMatches(
@@ -199,8 +488,24 @@ func (s *Server) mapExploreSourceLiteralMatchesContext(
 		}
 	}
 	indexes := s.buildFileSymbolIndexForOrderedPathsContext(ctx, orderedPaths)
-	seen := make(map[string]struct{}, len(matches))
-	hits := make([]exploreSourceLiteralHit, 0, len(matches))
+	type mappedLiteralOwner struct {
+		owner    *graph.Node
+		match    trigram.Match
+		rank     int
+		callName string
+	}
+	mapped := make([]mappedLiteralOwner, 0, len(matches))
+	ownerIDs := make([]string, 0, len(matches))
+	seenOwners := make(map[string]struct{}, len(matches))
+	calleeIDs := make([]string, 0, len(matches))
+	seenCallees := make(map[string]struct{}, len(matches))
+	ownerEdges := make(map[string][]*graph.Edge)
+
+	// First map each exact line to its smallest enclosing declaration. When
+	// the literal is syntactically inside one call on that line, retain the
+	// call name as a conservative hint; graph edges remain authoritative.
+	// This parser is deliberately line-bounded, so multiline or otherwise
+	// uncertain shapes keep the enclosing declaration instead of guessing.
 	for rank, match := range matches {
 		if !exploreTextHasExactLiteral(match.Text, term) {
 			continue
@@ -212,20 +517,230 @@ func (s *Server) mapExploreSourceLiteralMatchesContext(
 		if index == nil {
 			continue
 		}
-		node := index.smallestEnclosing(match.Line)
-		if node == nil || node.ID == "" || !scope.ScopeAllows(node) {
+		owner := index.smallestEnclosing(match.Line)
+		if owner == nil || owner.ID == "" || !scope.ScopeAllows(owner) {
 			continue
 		}
-		if _, duplicate := seen[node.ID]; duplicate {
+		callName, _ := exploreSourceLiteralCallName(match.Text, term)
+		mapped = append(mapped, mappedLiteralOwner{owner: owner, match: match, rank: rank, callName: callName})
+		if callName != "" {
+			if _, duplicate := seenOwners[owner.ID]; duplicate {
+				continue
+			}
+			seenOwners[owner.ID] = struct{}{}
+			ownerIDs = append(ownerIDs, owner.ID)
+		}
+	}
+
+	if len(ownerIDs) > 0 {
+		ownerEdges = s.graph.GetOutEdgesByNodeIDs(ownerIDs)
+		for _, item := range mapped {
+			if item.callName == "" {
+				continue
+			}
+			for _, edge := range ownerEdges[item.owner.ID] {
+				if edge == nil || edge.Kind != graph.EdgeCalls || edge.Line != item.match.Line || edge.To == "" {
+					continue
+				}
+				if _, duplicate := seenCallees[edge.To]; duplicate {
+					continue
+				}
+				seenCallees[edge.To] = struct{}{}
+				calleeIDs = append(calleeIDs, edge.To)
+			}
+		}
+	}
+	calleeNodes := map[string]*graph.Node{}
+	if len(calleeIDs) > 0 {
+		calleeNodes = s.graph.GetNodesByIDs(calleeIDs)
+	}
+
+	seen := make(map[string]int, len(mapped))
+	hits := make([]exploreSourceLiteralHit, 0, len(matches))
+	ownerFiles := make(map[string]string, len(matches))
+	for _, item := range mapped {
+		node := item.owner
+		calleeResolved := false
+		if item.callName != "" {
+			resolved := make(map[string]*graph.Node)
+			for _, edge := range ownerEdges[item.owner.ID] {
+				if edge == nil || edge.Kind != graph.EdgeCalls || edge.Line != item.match.Line {
+					continue
+				}
+				callee := calleeNodes[edge.To]
+				if !exploreSourceLiteralLocalCallee(item.owner, callee, item.callName, scope) {
+					continue
+				}
+				resolved[callee.ID] = callee
+			}
+			if len(resolved) == 1 {
+				for _, callee := range resolved {
+					node = callee
+					calleeResolved = true
+				}
+			}
+		}
+		if existing, duplicate := seen[node.ID]; duplicate {
+			if calleeResolved {
+				hits[existing].callee = true
+			}
 			continue
 		}
-		seen[node.ID] = struct{}{}
-		hits = append(hits, exploreSourceLiteralHit{nodeID: node.ID, rank: rank})
+		seen[node.ID] = len(hits)
+		hits = append(hits, exploreSourceLiteralHit{nodeID: node.ID, rank: item.rank, callee: calleeResolved})
+		ownerFiles[node.ID] = node.FilePath
 	}
 	return exploreSourceLiteralRecall{
-		hits:      hits,
-		ambiguous: saturated || len(hits) > 1,
+		hits:       hits,
+		ambiguous:  saturated || len(hits) > 1,
+		ownerFiles: ownerFiles,
 	}
+}
+
+type exploreSourceLiteralSpan struct {
+	start int
+	end   int
+}
+
+// exploreSourceLiteralCallName returns the one direct call containing every
+// exact quoted occurrence of term on a source line. It intentionally declines
+// multiline calls, assignments, control-flow parentheses, and lines where the
+// literal participates in multiple calls. Those shapes retain the enclosing
+// callable and never receive callee promotion.
+func exploreSourceLiteralCallName(line, term string) (string, bool) {
+	spans := exploreSourceLiteralQuotedSpans(line, term)
+	if len(spans) == 0 {
+		return "", false
+	}
+	pairs := exploreSourceLiteralParenPairs(line)
+	names := make(map[string]string, len(spans))
+	for _, span := range spans {
+		bestOpen := -1
+		for _, pair := range pairs {
+			if pair.start < span.start && pair.end > span.end && pair.start > bestOpen {
+				bestOpen = pair.start
+			}
+		}
+		if bestOpen < 0 {
+			return "", false
+		}
+		name := exploreSourceLiteralIdentifierBefore(line, bestOpen)
+		if name == "" || exploreSourceLiteralControlWord(name) {
+			return "", false
+		}
+		names[strings.ToLower(name)] = name
+	}
+	if len(names) != 1 {
+		return "", false
+	}
+	for _, name := range names {
+		return name, true
+	}
+	return "", false
+}
+
+func exploreSourceLiteralQuotedSpans(line, term string) []exploreSourceLiteralSpan {
+	spans := make([]exploreSourceLiteralSpan, 0, 1)
+	for index := 0; index < len(line); {
+		quote := line[index]
+		if quote != '\'' && quote != '"' && quote != '`' {
+			index++
+			continue
+		}
+		start := index
+		index++
+		contentStart := index
+		for index < len(line) {
+			if line[index] == '\\' {
+				index += 2
+				continue
+			}
+			if line[index] == quote {
+				if line[contentStart:index] == term {
+					spans = append(spans, exploreSourceLiteralSpan{start: start, end: index})
+				}
+				index++
+				break
+			}
+			index++
+		}
+	}
+	return spans
+}
+
+func exploreSourceLiteralParenPairs(line string) []exploreSourceLiteralSpan {
+	stack := make([]int, 0, 4)
+	pairs := make([]exploreSourceLiteralSpan, 0, 4)
+	for index := 0; index < len(line); index++ {
+		switch line[index] {
+		case '\'', '"', '`':
+			quote := line[index]
+			for index++; index < len(line); index++ {
+				if line[index] == '\\' {
+					index++
+					continue
+				}
+				if line[index] == quote {
+					break
+				}
+			}
+		case '(':
+			stack = append(stack, index)
+		case ')':
+			if len(stack) == 0 {
+				continue
+			}
+			open := stack[len(stack)-1]
+			stack = stack[:len(stack)-1]
+			pairs = append(pairs, exploreSourceLiteralSpan{start: open, end: index})
+		}
+	}
+	return pairs
+}
+
+func exploreSourceLiteralIdentifierBefore(line string, end int) string {
+	for end > 0 {
+		r, size := utf8.DecodeLastRuneInString(line[:end])
+		if !unicode.IsSpace(r) {
+			break
+		}
+		end -= size
+	}
+	start := end
+	for start > 0 {
+		r, size := utf8.DecodeLastRuneInString(line[:start])
+		if !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '_' && r != '$' {
+			break
+		}
+		start -= size
+	}
+	return line[start:end]
+}
+
+func exploreSourceLiteralControlWord(name string) bool {
+	switch strings.ToLower(name) {
+	case "catch", "do", "for", "foreach", "if", "match", "new", "return", "sizeof", "switch", "typeof", "while", "with":
+		return true
+	default:
+		return false
+	}
+}
+
+func exploreSourceLiteralLocalCallee(owner, callee *graph.Node, callName string, scope query.QueryOptions) bool {
+	if owner == nil || callee == nil || callee.ID == "" || callee.ID == owner.ID || callee.FilePath == "" || !scope.ScopeAllows(callee) {
+		return false
+	}
+	if callee.Kind != graph.KindFunction && callee.Kind != graph.KindMethod {
+		return false
+	}
+	if callee.RepoPrefix != owner.RepoPrefix {
+		return false
+	}
+	name := callee.Name
+	if separator := strings.LastIndexAny(name, ".:#/"); separator >= 0 {
+		name = name[separator+1:]
+	}
+	return strings.EqualFold(name, callName)
 }
 
 func exploreSourceLiteralSingleRepoPrefix(scope query.QueryOptions) string {

@@ -54,9 +54,21 @@ func runPostToolUse(data []byte) {
 		return
 	}
 	emitted := false
+	terminalObserved := false
 	defer func() {
+		if terminalObserved {
+			localizationTerminalTelemetry("observed", emitted, started)
+			return
+		}
 		logHookEffectiveness("PostToolUse", emitted, daemonReachableFn(), 0, time.Since(started))
 	}()
+
+	if _, observed := observeLocalizationTerminal(data); observed {
+		terminalObserved = true
+		emitted = true
+		emitPostToolContext(localizationTerminalContext, false)
+		return
+	}
 
 	ctx := postToolContext(input)
 	if ctx == "" {

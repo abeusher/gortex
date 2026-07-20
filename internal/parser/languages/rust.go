@@ -246,6 +246,7 @@ func (e *RustExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 			})
 		}
 	})
+	rebindRustLocalGenericMemberOwners(filePath, result)
 
 	// Stamp trait method names onto trait nodes' Meta["methods"]. Some
 	// trait nodes were emitted before their function_signature_item
@@ -519,6 +520,53 @@ func (e *RustExtractor) emitFunction(m parser.QueryResult, filePath, fileID stri
 	emitRustAnnotationEdges(rustCollectAttributes(def.Node), id, filePath, src, result, annotationSeen)
 	emitRustThrowsEdges(def.Node, src, id, filePath, startLine1, result)
 	emitRustFunctionShape(id, def.Node, src, filePath, startLine1, result)
+}
+
+// rebindRustLocalGenericMemberOwners repairs generic inherent/trait impl
+// ownership only when the extractor can prove the bare declaration exists in
+// this file. Method IDs and receiver metadata retain the instantiated spelling
+// (`Replacer<M>.replace_all`), while member_of targets the declaration node
+// (`Replacer`). Qualified targets such as `std::vec::Vec<T>` and cross-module
+// impls remain unresolved: stripping their qualifier could falsely attach them
+// to an unrelated same-file type with the same basename.
+func rebindRustLocalGenericMemberOwners(filePath string, result *parser.ExtractionResult) {
+	if result == nil {
+		return
+	}
+	prefix := filePath + "::"
+	localTypes := make(map[string]struct{})
+	methods := make(map[string]struct{})
+	for _, node := range result.Nodes {
+		if node == nil {
+			continue
+		}
+		if node.Kind == graph.KindMethod {
+			methods[node.ID] = struct{}{}
+		}
+		if node.FilePath == filePath && (node.Kind == graph.KindType || node.Kind == graph.KindInterface) {
+			localTypes[node.ID] = struct{}{}
+		}
+	}
+	for _, edge := range result.Edges {
+		if edge == nil || edge.Kind != graph.EdgeMemberOf {
+			continue
+		}
+		if _, method := methods[edge.From]; !method || !strings.HasPrefix(edge.To, prefix) {
+			continue
+		}
+		owner := strings.TrimPrefix(edge.To, prefix)
+		if !strings.Contains(owner, "<") || strings.Contains(owner, "::") {
+			continue
+		}
+		base := rustTraitPathBaseName(owner)
+		if base == "" {
+			continue
+		}
+		target := prefix + base
+		if _, local := localTypes[target]; local {
+			edge.To = target
+		}
+	}
 }
 
 // rustTypeParams reads the `type_parameters` child of a Rust item

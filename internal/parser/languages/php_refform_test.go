@@ -67,8 +67,8 @@ class Svc {
 }
 
 // TestPHPRefForm_Inheritance verifies `class X extends Base implements I, J`
-// emits one EdgeReferences (ref_context "inherit") per base / interface name,
-// attributed to the declaring class node.
+// emits typed structural edges per base / interface name, attributed to the
+// declaring class node, without a duplicate generic reference edge.
 func TestPHPRefForm_Inheritance(t *testing.T) {
 	src := []byte(`<?php
 class Derived extends BaseSvc implements HandlerInterface, Countable {
@@ -80,11 +80,99 @@ class Derived extends BaseSvc implements HandlerInterface, Countable {
 	}
 	const typeID = "p/Derived.php::Derived"
 
-	for _, tgt := range []string{"BaseSvc", "HandlerInterface", "Countable"} {
-		if !hasPHPRefEdge(result.Edges, typeID, tgt, graph.EdgeReferences, graph.RefContextInherit) {
-			t.Errorf("expected EdgeReferences (inherit) %s -> %s", typeID, tgt)
+	if !hasPHPRefEdge(result.Edges, typeID, "BaseSvc", graph.EdgeExtends, graph.RefContextInherit) {
+		t.Errorf("expected EdgeExtends (inherit) %s -> BaseSvc", typeID)
+	}
+	for _, tgt := range []string{"HandlerInterface", "Countable"} {
+		if !hasPHPRefEdge(result.Edges, typeID, tgt, graph.EdgeImplements, graph.RefContextInherit) {
+			t.Errorf("expected EdgeImplements (inherit) %s -> %s", typeID, tgt)
 		}
 	}
+	for _, edge := range result.Edges {
+		if edge.From == typeID && edge.Kind == graph.EdgeReferences && edge.Meta["ref_context"] == graph.RefContextInherit {
+			t.Errorf("inheritance must not retain duplicate generic reference edge: %#v", edge)
+		}
+	}
+}
+
+// TestPHPRefForm_InheritanceParserSpellings covers only extractor spelling:
+// fully-qualified names reduce to their leaf while an imported alias remains
+// the alias token. Import-aware target resolution is a separate resolver step.
+func TestPHPRefForm_InheritanceParserSpellings(t *testing.T) {
+	src := []byte(`<?php
+namespace App;
+use Vendor\Framework\BaseService as ParentService;
+class Qualified extends \Vendor\Framework\BaseService implements \Vendor\Contracts\Handler {}
+class Aliased extends ParentService {}
+`)
+	result, err := NewPHPExtractor().Extract("p/Qualified.php", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasPHPRefEdge(result.Edges, "p/Qualified.php::Qualified", "BaseService", graph.EdgeExtends, graph.RefContextInherit) {
+		t.Error("fully-qualified base must emit EdgeExtends to the extractor's canonical leaf")
+	}
+	if !hasPHPRefEdge(result.Edges, "p/Qualified.php::Qualified", "Handler", graph.EdgeImplements, graph.RefContextInherit) {
+		t.Error("fully-qualified interface must emit EdgeImplements to canonical leaf")
+	}
+	if !hasPHPRefEdge(result.Edges, "p/Qualified.php::Aliased", "ParentService", graph.EdgeExtends, graph.RefContextInherit) {
+		t.Error("alias must remain in its parsed spelling for later resolver processing")
+	}
+}
+
+func TestPHPRefForm_InterfaceExtendsUsesTypedStructuralEdges(t *testing.T) {
+	src := []byte(`<?php
+interface ChildHandler extends ParentHandler, Countable {}
+`)
+	result, err := NewPHPExtractor().Extract("p/ChildHandler.php", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const typeID = "p/ChildHandler.php::ChildHandler"
+	for _, target := range []string{"ParentHandler", "Countable"} {
+		if !hasPHPRefEdge(result.Edges, typeID, target, graph.EdgeExtends, graph.RefContextInherit) {
+			t.Errorf("expected interface EdgeExtends %s -> %s", typeID, target)
+		}
+	}
+}
+
+func TestPHPRefForm_EnumImplementsUsesTypedStructuralEdges(t *testing.T) {
+	src := []byte(`<?php
+enum Status implements JsonSerializable, Stringable {
+    case Ready;
+}
+`)
+	result, err := NewPHPExtractor().Extract("p/Status.php", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const typeID = "p/Status.php::Status"
+	for _, target := range []string{"JsonSerializable", "Stringable"} {
+		if !hasPHPRefEdge(result.Edges, typeID, target, graph.EdgeImplements, graph.RefContextInherit) {
+			t.Errorf("expected enum EdgeImplements %s -> %s", typeID, target)
+		}
+	}
+}
+
+func TestPHPRefForm_TraitUseRemainsCompositionExtendsEdge(t *testing.T) {
+	src := []byte(`<?php
+trait LogsFailures {}
+class Handler {
+    use LogsFailures;
+}
+`)
+	result, err := NewPHPExtractor().Extract("p/Handler.php", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const typeID = "p/Handler.php::Handler"
+	for _, edge := range result.Edges {
+		if edge != nil && edge.From == typeID && edge.To == "unresolved::LogsFailures" &&
+			edge.Kind == graph.EdgeExtends && edge.Meta["via"] == "trait" {
+			return
+		}
+	}
+	t.Fatal("trait use must retain EdgeExtends with via=trait")
 }
 
 // TestPHPRefForm_Instanceof verifies `$x instanceof Foo` emits an
@@ -167,8 +255,8 @@ class Svc {
 
 // TestPHPRefForm_OriginASTResolved verifies every reference-form edge rides
 // OriginASTResolved — the load-bearing tier that keeps the cross-package
-// guard from reverting the structural EdgeReferences edges to their
-// unresolved placeholder.
+// guard from reverting typed structural and reference-form edges to generic
+// unresolved placeholders.
 func TestPHPRefForm_OriginASTResolved(t *testing.T) {
 	src := []byte(`<?php
 class Svc extends BaseSvc {
@@ -191,7 +279,7 @@ class Svc extends BaseSvc {
 		kind     graph.EdgeKind
 		refctx   string
 	}{
-		{typeID, "BaseSvc", graph.EdgeReferences, graph.RefContextInherit},
+		{typeID, "BaseSvc", graph.EdgeExtends, graph.RefContextInherit},
 		{methodID, "RestClient", graph.EdgeInstantiates, ""},
 		{methodID, "Response", graph.EdgeReferences, graph.RefContextCast},
 		{methodID, "Status", graph.EdgeReferences, graph.RefContextStaticAccess},

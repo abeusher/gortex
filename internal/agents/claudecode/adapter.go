@@ -487,7 +487,7 @@ func removeGlobalHooks(w io.Writer, settingsPath string, opts agents.ApplyOpts) 
 			return false, nil
 		}
 		removed := 0
-		for _, event := range []string{"PreToolUse", "PreCompact", "PostToolUse", "Stop", "SessionStart", "UserPromptSubmit"} {
+		for _, event := range []string{"PreToolUse", "PreCompact", "PostToolUse", "Stop", "SessionStart", "UserPromptSubmit", "SubagentStart", "SubagentStop"} {
 			removed += removeGortexHookEntries(hooks, event)
 		}
 		if removed == 0 {

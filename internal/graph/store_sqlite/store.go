@@ -65,6 +65,11 @@ type Store struct {
 	// re-indexes don't re-upsert identical stubs on every batch.
 	builtinSeen sync.Map
 
+	// preparedSQL registers every statement prepared at Open so the plan
+	// fence can EXPLAIN the entire prepared surface against a fixture and
+	// reject big-table scans mechanically.
+	preparedSQL []string
+
 	// writeMu serialises every mutation. SQLite serialises writers
 	// internally; doing the same on the Go side turns SQLITE_BUSY
 	// contention into clean lock-wait and keeps the conformance
@@ -719,8 +724,20 @@ func (s *Store) prepare() error {
 		}
 		*out = st
 	}
-	prep := func(out **sql.Stmt, q string) { prepOn(s.db, out, q) }
-	prepWrite := func(out **sql.Stmt, q string) { prepOn(s.writerDB, out, q) }
+	// Every prepared statement is also recorded so the plan fence
+	// (TestPreparedStatementPlansNeverScanBigTables) can EXPLAIN the whole
+	// prepared surface mechanically. Partial-index misuse against bound
+	// parameters slipped through review three independent times as a
+	// "convention"; the registry turns the convention into a gate that
+	// covers every future statement automatically.
+	prep := func(out **sql.Stmt, q string) {
+		s.preparedSQL = append(s.preparedSQL, q)
+		prepOn(s.db, out, q)
+	}
+	prepWrite := func(out **sql.Stmt, q string) {
+		s.preparedSQL = append(s.preparedSQL, q)
+		prepOn(s.writerDB, out, q)
+	}
 
 	const nodeCols = nodeInsertColumns
 
@@ -734,8 +751,13 @@ func (s *Store) prepare() error {
 		`INSERT INTO nodes (`+nodeCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`+nodeUpsertClause)
 	prep(&s.stmtGetNode,
 		`SELECT `+nodeCols+` FROM nodes WHERE id = ?`)
+	// The literal qual_name <> '' conjunct is what makes the partial
+	// nodes_by_qual index usable: SQLite cannot prove a bound parameter is
+	// non-empty, so without it this statement is a full node scan per call
+	// on resolver hot paths (measured against a production store). Every
+	// reader of a partial index must restate its predicate literally.
 	prep(&s.stmtGetNodeByQual,
-		`SELECT `+nodeCols+` FROM nodes WHERE qual_name = ? LIMIT 1`)
+		`SELECT `+nodeCols+` FROM nodes WHERE qual_name = ? AND qual_name <> '' LIMIT 1`)
 	prep(&s.stmtFindByName,
 		`SELECT `+nodeCols+` FROM nodes WHERE name = ?`)
 	prep(&s.stmtFindByNameInRepo,

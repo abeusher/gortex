@@ -38,13 +38,14 @@ const exploreToolDescription = "Start here for any task, bug report, or " +
 // corpus, query vocabulary, or benchmark. The verb takes arbitrary free
 // text; nothing here is derived from a fixed task set.
 const (
-	exploreDefaultBudgetTokens = 1600
-	exploreMinBudgetTokens     = 1000
-	exploreMaxBudgetTokens     = 24000
-	exploreDefaultMaxSymbols   = 10
-	exploreMaxMaxSymbols       = 30
-	exploreRingCap             = 5 // callers / callees shown per target
-	exploreCharsPerToken       = 4 // coarse token estimate for budgeting
+	exploreDefaultBudgetTokens             = 1600
+	exploreMinBudgetTokens                 = 1000
+	exploreMaxBudgetTokens                 = 24000
+	exploreDefaultMaxSymbols               = 10
+	exploreMaxMaxSymbols                   = 30
+	exploreRingCap                         = 5 // callers / callees shown per target
+	localizationRefinementAllowedSymbolCap = 8 // preferred plus ranked alternates; preserves rank seven
+	exploreCharsPerToken                   = 4 // coarse token estimate for budgeting
 	// Full bodies are the largest repeated-context cost. Candidate headers,
 	// locations, signatures, and graph rings preserve recall for the whole
 	// neighborhood; only the top targets need full source to make the first
@@ -81,12 +82,19 @@ type exploreTarget struct {
 	score                 float64
 	callers               []*graph.Node
 	callees               []*graph.Node
+	directCalleesComplete bool // false when the direct projection was truncated, bounded, or otherwise lower-bound
 	causalCallees         []exploreCausalNeighbor
 	source                string // full body (may be empty for non-source kinds)
+	divergentDefaultOwner bool   // unique child constructor whose concrete default causes the queried behavior
+	divergentDefaultType  bool   // owning type paired with divergentDefaultOwner for coherent file/symbol output
 	conceptImplementation bool   // one identifier-backed callable protected from final truncation
 	exactContent          bool   // verified full quoted-literal hit from content_fts
 	exactContentAmbiguous bool   // exact evidence has visible or possibly truncated peers
 	sourceLiteral         bool   // exact source-body hit that must survive final envelope packing
+	sourceLiteralCallee   bool   // exact source callsite uniquely resolved to this invoked callable
+	sourceLiteralAligned  bool   // source-literal callee that instantiates the task's value; strongest literal owner
+	typedAnchorProjection bool   // bounded field-owner-call proof promoted from a task-aligned typed field
+	foldedOwner           bool   // synthetic owner inserted by concept member folding
 }
 
 type exploreCausalNeighbor struct {
@@ -96,7 +104,7 @@ type exploreCausalNeighbor struct {
 
 const (
 	exploreCausalSeedLimit       = 3
-	exploreCausalDepth           = 4
+	exploreCausalDepth           = 2
 	exploreCausalAdmissionBudget = 10 * time.Millisecond
 	exploreDraftPrimaryLimit     = 3
 	exploreDraftTotalLimit       = 5
@@ -191,6 +199,18 @@ func exploreQueryIsConceptTask(query string) bool {
 	return plain >= 6 && plain*2 >= len(fields) && codeShaped*2 < len(fields)
 }
 
+// exploreQueryClass applies the prose-aware concept decision consistently.
+// The generic classifier intentionally treats compact parentheses and paths as
+// signatures/lookups; long issue paraphrases may contain those shapes as small
+// embedded examples and must remain concept localization everywhere.
+func exploreQueryClass(query string) rerank.QueryClass {
+	class := rerank.ClassifyQuery(query)
+	if class != rerank.QueryClassConcept && exploreQueryIsConceptTask(query) {
+		return rerank.QueryClassConcept
+	}
+	return class
+}
+
 func exploreQueryHasCallAnchor(query, name string) bool {
 	name = strings.TrimSpace(name)
 	if name == "" {
@@ -247,10 +267,6 @@ func exploreQueryHasPathSymbolAnchor(query string, n *graph.Node) bool {
 	return false
 }
 
-func exploreAdmitCausalSeed(conceptTask, explicit, strong bool, admitted int, elapsed time.Duration) bool {
-	return conceptTask && !explicit && strong && admitted < exploreCausalSeedLimit && elapsed < exploreCausalAdmissionBudget
-}
-
 func exploreStrongCausalSeed(query string, target exploreTarget) bool {
 	n := target.node
 	if n == nil || (n.Kind != graph.KindFunction && n.Kind != graph.KindMethod) || exploreDraftIsTestNode(n) || exploreIdentifierSegmentCount(n.Name) < 2 {
@@ -260,6 +276,98 @@ func exploreStrongCausalSeed(query string, target exploreTarget) bool {
 	overlap, longest := exploreDraftTermOverlap(queryTerms, n)
 	bodyOverlap := exploreDraftTermSetOverlap(queryTerms, exploreTerminalTerms(target.source))
 	return overlap >= 2 || bodyOverlap >= 2 || (overlap == 1 && longest >= 5)
+}
+
+type exploreCausalSeedMetric struct {
+	index             int
+	crossFileCallees  int
+	callableCallees   int
+	identifierOverlap int
+	bodyOverlap       int
+	longest           int
+	generic           bool
+}
+
+// selectExploreCausalSeeds spends the fixed depth-2 budget only after every
+// final candidate has received the same source and depth-1 hydration. Selection
+// is therefore evidence-based rather than arrival-order based: task-aligned
+// production callables that cross a file boundary lead, while leaf accessors
+// and configuration gates remain eligible only when stronger routes are absent.
+func selectExploreCausalSeeds(query string, targets []exploreTarget, conceptTask, explicit bool) []int {
+	if !conceptTask || explicit || len(targets) == 0 {
+		return nil
+	}
+	queryTerms := exploreTerminalTerms(query)
+	metrics := make([]exploreCausalSeedMetric, 0, len(targets))
+	for index, target := range targets {
+		if !exploreHydratedProductionCallable(target) || !exploreStrongCausalSeed(query, target) {
+			continue
+		}
+		identifierOverlap, longest := exploreDraftTermOverlap(queryTerms, target.node)
+		metric := exploreCausalSeedMetric{
+			index:             index,
+			identifierOverlap: identifierOverlap,
+			bodyOverlap:       exploreDraftTermSetOverlap(queryTerms, exploreTerminalTerms(target.source)),
+			longest:           longest,
+			generic:           exploreDraftGenericCandidate(target.node, target.source),
+		}
+		seedPath := exploreNormalizedPath(nodeDisplayPath(target.node))
+		for _, callee := range target.callees {
+			if callee == nil || callee.ID == "" || exploreDraftIsTestNode(callee) ||
+				(callee.Kind != graph.KindFunction && callee.Kind != graph.KindMethod) {
+				continue
+			}
+			metric.callableCallees++
+			calleePath := exploreNormalizedPath(nodeDisplayPath(callee))
+			if seedPath != "" && calleePath != "" && calleePath != seedPath {
+				metric.crossFileCallees++
+			}
+		}
+		metrics = append(metrics, metric)
+	}
+	if len(metrics) == 0 {
+		return nil
+	}
+	alignment := func(metric exploreCausalSeedMetric) int {
+		body := metric.bodyOverlap
+		if body > 2 {
+			body = 2
+		}
+		return metric.identifierOverlap + body
+	}
+	sort.SliceStable(metrics, func(i, j int) bool {
+		a, b := metrics[i], metrics[j]
+		if (a.crossFileCallees > 0) != (b.crossFileCallees > 0) {
+			return a.crossFileCallees > 0
+		}
+		if a.crossFileCallees != b.crossFileCallees {
+			return a.crossFileCallees > b.crossFileCallees
+		}
+		if (a.callableCallees > 0) != (b.callableCallees > 0) {
+			return a.callableCallees > 0
+		}
+		if a.generic != b.generic {
+			return !a.generic
+		}
+		if alignment(a) != alignment(b) {
+			return alignment(a) > alignment(b)
+		}
+		if a.identifierOverlap != b.identifierOverlap {
+			return a.identifierOverlap > b.identifierOverlap
+		}
+		if a.longest != b.longest {
+			return a.longest > b.longest
+		}
+		return a.index < b.index
+	})
+	if len(metrics) > exploreCausalSeedLimit {
+		metrics = metrics[:exploreCausalSeedLimit]
+	}
+	selected := make([]int, len(metrics))
+	for index, metric := range metrics {
+		selected[index] = metric.index
+	}
+	return selected
 }
 
 // minimumExploreCausalHops derives a deterministic, bounded reachable set from
@@ -723,6 +831,18 @@ func exploreDraftIsTestNode(n *graph.Node) bool {
 			return true
 		}
 	}
+	// .NET/JVM test assemblies name their directory with a dotted token, e.g.
+	// `Humanizer.Tests.Shared` — a real path segment that the slash-delimited
+	// check above cannot see. Treat a dot-delimited test/spec token inside any
+	// segment as test code so test metadata never suppresses production recall.
+	for _, segment := range strings.Split(strings.Trim(path, "/"), "/") {
+		for _, token := range strings.Split(segment, ".") {
+			switch token {
+			case "test", "tests", "spec", "specs":
+				return true
+			}
+		}
+	}
 	base := path
 	if slash := strings.LastIndex(base, "/"); slash >= 0 {
 		base = base[slash+1:]
@@ -776,7 +896,7 @@ func exploreDraftGenericCandidate(n *graph.Node, source string) bool {
 	nameTerms := rerank.Tokenize(n.Name)
 	if len(nameTerms) > 0 && len(nameTerms) <= 3 {
 		switch strings.ToLower(nameTerms[0]) {
-		case "get", "set", "is", "has":
+		case "get", "set", "is", "has", "no":
 			return true
 		}
 	}
@@ -817,11 +937,204 @@ func exploreDraftGenericCandidate(n *graph.Node, source string) bool {
 		}
 	}
 	// Receiver syntax varies, but trivial implementations consistently contain
-	// a member access plus either one return/call or one field assignment.
-	hasMemberAccess := strings.Contains(code, ".")
-	hasOneStepReturn := strings.Contains(code, " return ") && strings.Contains(code, "(")
-	hasAccessorAssignment := strings.Contains(code, "=")
-	return hasMemberAccess && (hasOneStepReturn || hasAccessorAssignment)
+	// a member access plus one return/call or one field assignment. Inspect the
+	// body separately so Rust tail expressions and C#/Kotlin expression bodies
+	// are recognized even though they omit an explicit return keyword.
+	body := code
+	if open := strings.IndexByte(body, '{'); open >= 0 {
+		body = body[open+1:]
+		if close := strings.LastIndexByte(body, '}'); close >= 0 {
+			body = body[:close]
+		}
+	}
+	body = strings.TrimSpace(body)
+	hasMemberAccess := strings.Contains(body, ".") || strings.Contains(body, "::")
+	hasCall := strings.Contains(body, "(") && strings.Contains(body, ")")
+	hasOneStepReturn := strings.Contains(" "+body+" ", " return ") && hasCall
+	hasAccessorAssignment := strings.Contains(body, "=")
+	hasExpressionBody := strings.Contains(body, "=>") && hasCall
+	// A tail forwarder is one member call with no statement-level work around
+	// it. One optional trailing semicolon covers Rust and expression-bodied
+	// languages without classifying small control-flow implementations as shims.
+	tail := strings.TrimSpace(strings.TrimSuffix(body, ";"))
+	hasTailForwarder := hasCall && hasMemberAccess && !strings.Contains(tail, ";") &&
+		!strings.Contains(tail, "{") && !strings.Contains(tail, "}")
+	return hasMemberAccess && (hasOneStepReturn || hasAccessorAssignment || hasExpressionBody || hasTailForwarder)
+}
+
+// exploreLocalizationRefinementRoutes classifies the already-hydrated,
+// bounded localization targets once. Every authorized candidate is a hydrated
+// production callable. A known generic forwarder is authorized only when every
+// plausible direct callable callee resolves to the same hydrated concrete target.
+func exploreLocalizationRefinementRoutes(targets []exploreTarget) map[string]localizationRefinementRoute {
+	byID := make(map[string]exploreTarget, len(targets))
+	for _, target := range targets {
+		if target.node != nil && target.node.ID != "" {
+			byID[target.node.ID] = target
+		}
+	}
+	routes := make(map[string]localizationRefinementRoute, len(byID))
+	for _, target := range targets {
+		if !exploreHydratedProductionCallable(target) {
+			continue
+		}
+		if !exploreDraftGenericCandidate(target.node, target.source) {
+			routes[target.node.ID] = localizationRefinementRoute{
+				enforceable: localizationStrongSourceLiteralCallee(target),
+			}
+			continue
+		}
+		if !target.directCalleesComplete {
+			continue
+		}
+
+		implementationSymbol := ""
+		ambiguous := false
+		for _, callee := range target.callees {
+			if callee == nil || callee.ID == "" || callee.ID == target.node.ID ||
+				exploreDraftIsTestNode(callee) ||
+				(callee.Kind != graph.KindFunction && callee.Kind != graph.KindMethod) {
+				continue
+			}
+			candidate, visible := byID[callee.ID]
+			if !visible || !exploreHydratedProductionCallable(candidate) ||
+				exploreDraftGenericCandidate(candidate.node, candidate.source) {
+				ambiguous = true
+				break
+			}
+			if implementationSymbol == "" {
+				implementationSymbol = candidate.node.ID
+				continue
+			}
+			if implementationSymbol != candidate.node.ID {
+				ambiguous = true
+				break
+			}
+		}
+		if implementationSymbol != "" && !ambiguous {
+			implementation := byID[implementationSymbol]
+			routes[target.node.ID] = localizationRefinementRoute{
+				implementationSymbol: implementationSymbol,
+				enforceable:          localizationStrongImplementationRoute(target, implementation),
+			}
+		}
+	}
+	// The recommended read is normally the concrete implementation, not its
+	// generic wrapper. Carry the wrapper's proof onto that exact route so the
+	// one-read fast path preserves trust; ordinary concrete hydration remains
+	// advisory. Ranked target order deterministically chooses among equivalent
+	// proven wrappers.
+	for _, target := range targets {
+		if target.node == nil {
+			continue
+		}
+		wrapperRoute, ok := routes[target.node.ID]
+		if !ok || !wrapperRoute.enforceable || wrapperRoute.implementationSymbol == "" {
+			continue
+		}
+		implementationRoute, ok := routes[wrapperRoute.implementationSymbol]
+		if !ok || implementationRoute.implementationSymbol != "" || implementationRoute.proofSymbol != "" {
+			continue
+		}
+		implementationRoute.enforceable = true
+		implementationRoute.proofSymbol = target.node.ID
+		routes[wrapperRoute.implementationSymbol] = implementationRoute
+	}
+	return routes
+}
+
+func exploreHydratedProductionCallable(target exploreTarget) bool {
+	if target.node == nil || target.node.ID == "" || exploreDraftIsTestNode(target.node) {
+		return false
+	}
+	if target.node.Kind != graph.KindFunction && target.node.Kind != graph.KindMethod {
+		return false
+	}
+	return strings.TrimSpace(target.source) != ""
+}
+
+func explorePreferredRoutedRefinementSymbol(
+	preferred string,
+	targets []exploreTarget,
+	routes map[string]localizationRefinementRoute,
+) string {
+	if route, authorized := routes[preferred]; authorized {
+		if route.implementationSymbol == "" {
+			return preferred
+		}
+		if implementationRoute, implementationAuthorized := routes[route.implementationSymbol]; implementationAuthorized && implementationRoute.implementationSymbol == "" {
+			return route.implementationSymbol
+		}
+	}
+	// The semantic preferred target can be generic, ambiguous, or unhydrated.
+	// Fall back deterministically to the first ranked concrete authorized target;
+	// a generic wrapper is never recommended even when it is a valid alternate.
+	for _, target := range targets {
+		if target.node == nil {
+			continue
+		}
+		if route, authorized := routes[target.node.ID]; authorized && route.implementationSymbol == "" {
+			return target.node.ID
+		}
+	}
+	return ""
+}
+
+// boundedLocalizationRefinementRoutes intersects precomputed routes with the
+// symbols that survived envelope budgeting. A generic route is retained only
+// when its concrete hop is visible in the same envelope.
+func boundedLocalizationRefinementRoutes(
+	symbols []string,
+	routes map[string]localizationRefinementRoute,
+	preferredSymbol string,
+) ([]string, map[string]localizationRefinementRoute) {
+	visible := make(map[string]struct{}, len(symbols))
+	for _, symbol := range symbols {
+		visible[symbol] = struct{}{}
+	}
+	authorized := make([]string, 0, min(len(symbols), localizationRefinementAllowedSymbolCap))
+	bounded := make(map[string]localizationRefinementRoute, min(len(symbols), localizationRefinementAllowedSymbolCap))
+	appendAuthorized := func(symbol string) {
+		if symbol == "" || len(authorized) >= localizationRefinementAllowedSymbolCap {
+			return
+		}
+		if _, duplicate := bounded[symbol]; duplicate {
+			return
+		}
+		route, ok := routes[symbol]
+		if !ok {
+			return
+		}
+		if route.implementationSymbol != "" {
+			if _, implementationVisible := visible[route.implementationSymbol]; !implementationVisible {
+				return
+			}
+		}
+		if route.proofSymbol != "" {
+			if _, proofVisible := visible[route.proofSymbol]; !proofVisible {
+				return
+			}
+		}
+		authorized = append(authorized, symbol)
+		bounded[symbol] = route
+	}
+	// The recommendation must stay visible and authorized even when ranking
+	// places it after the alternate recovery window.
+	appendAuthorized(preferredSymbol)
+	for _, symbol := range symbols {
+		appendAuthorized(symbol)
+	}
+	return authorized, bounded
+}
+
+func exploreLocalizationTargetSymbols(targets []exploreTarget) []string {
+	symbols := make([]string, 0, len(targets))
+	for _, target := range targets {
+		if target.node != nil && target.node.ID != "" {
+			symbols = append(symbols, target.node.ID)
+		}
+	}
+	return symbols
 }
 
 func exploreDraftExactAnchor(query string, n *graph.Node) bool {
@@ -889,7 +1202,7 @@ func exploreAnswerReady(task string, targets []exploreTarget) bool {
 		return false
 	}
 	query := shapeExploreQuery(task)
-	class := rerank.ClassifyQuery(query)
+	class := exploreQueryClass(query)
 	if class == rerank.QueryClassConcept {
 		query = stripLeadingExploreDirective(query)
 	}
@@ -914,6 +1227,11 @@ func exploreAnswerReady(task string, targets []exploreTarget) bool {
 	matchedNode := func(node *graph.Node) int { return matchedNodeFor(node, queryTerms) }
 	head := targets[0]
 	headMatches := matchedNode(head.node)
+	strongSourceLiteral := head.sourceLiteral && head.sourceLiteralCallee && !head.exactContentAmbiguous
+	if class == rerank.QueryClassConcept && !exploreLocalizationExplicitAnchor(query, head.node) &&
+		!exploreSyntacticAnchorEvidenceReady(task, targets) && !strongSourceLiteral {
+		return false
+	}
 
 	// Paths, signatures, and identifier-shaped queries carry explicit anchors.
 	// A shared token is not enough: the ranked head must cover the complete
@@ -983,11 +1301,13 @@ func exploreAnswerReady(task string, targets []exploreTarget) bool {
 	// declarations remain useful evidence, but cannot terminate navigation.
 	var implementation *exploreTarget
 	if class == rerank.QueryClassConcept {
+		hasSyntacticAnchors := len(exploreSyntacticAnchors(task)) > 0
 		for i := range targets {
 			target := &targets[i]
 			callable := target.node != nil &&
 				(target.node.Kind == graph.KindFunction || target.node.Kind == graph.KindMethod)
-			if target.conceptImplementation && callable && strings.TrimSpace(target.source) != "" {
+			if target.conceptImplementation && callable && strings.TrimSpace(target.source) != "" &&
+				(!hasSyntacticAnchors || !exploreDraftGenericCandidate(target.node, target.source)) {
 				implementation = target
 				break
 			}
@@ -1129,7 +1449,7 @@ func exploreLocalizationExplicitAnchor(query string, n *graph.Node) bool {
 		return true
 	}
 
-	class := rerank.ClassifyQuery(query)
+	class := exploreQueryClass(query)
 	if class == rerank.QueryClassSignature {
 		signature := exploreNormalizedAnchor(retrieval.Signature)
 		return signature != "" && strings.Contains(normalizedQuery, " "+signature+" ")
@@ -1145,7 +1465,7 @@ func exploreLocalizationExplicitAnchor(query string, n *graph.Node) bool {
 // allowed post-localization source read.
 func exploreLocalizationExplicitTarget(task string, targets []exploreTarget) string {
 	query := shapeExploreQuery(task)
-	if rerank.ClassifyQuery(query) == rerank.QueryClassConcept {
+	if exploreQueryClass(query) == rerank.QueryClassConcept {
 		query = stripLeadingExploreDirective(query)
 	}
 	for _, target := range targets {
@@ -1166,7 +1486,7 @@ func exploreLocalizationExplicitTarget(task string, targets []exploreTarget) str
 // stable final tie-breaker.
 func exploreLocalizationExactTarget(task string, targets []exploreTarget) string {
 	query := shapeExploreQuery(task)
-	class := rerank.ClassifyQuery(query)
+	class := exploreQueryClass(query)
 	if class == rerank.QueryClassConcept {
 		query = stripLeadingExploreDirective(query)
 	}
@@ -1310,8 +1630,10 @@ func reserveExploreConceptImplementation(
 		queryTerms = append(queryTerms, term)
 	}
 	var frequencyStorage [64]int
-	frequency := frequencyStorage[:len(queryTerms)]
-	if len(queryTerms) > len(frequencyStorage) {
+	var frequency []int
+	if len(queryTerms) <= len(frequencyStorage) {
+		frequency = frequencyStorage[:len(queryTerms)]
+	} else {
 		frequency = make([]int, len(queryTerms))
 	}
 	var metricStorage [80]exploreConceptImplementationMetric
@@ -1599,7 +1921,7 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	// untouched. The original task is still shown in the header so the agent
 	// sees what it asked.
 	searchQuery := shapeExploreQuery(task)
-	queryClass := rerank.ClassifyQuery(searchQuery)
+	queryClass := exploreQueryClass(searchQuery)
 	if queryClass == rerank.QueryClassConcept {
 		searchQuery = stripLeadingExploreDirective(searchQuery)
 	}
@@ -1654,6 +1976,21 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		if content := s.gatherExploreQuotedContentCandidates(ctx, task, ranked, fetch, opts); len(content) > 0 {
 			ranked = mergeExploreCandidates(ranked, content, 0)
 			ranked = limitExploreCandidatesPreservingSourceLiteral(ranked, fetch*2)
+		}
+	}
+	// Distinctive CLI and identifier-shaped anchors get one bounded lexical
+	// owner each. This runs after the ordinary ranking pass so it only spends
+	// work on uncovered anchors and cannot perturb the semantic channel. The
+	// existing source scanner is the final fallback, never a persistent body
+	// index.
+	var protectedSyntacticAnchors map[int]string
+	if queryClass == rerank.QueryClassConcept {
+		anchorCandidates, protected := s.gatherExploreSyntacticAnchorCandidates(
+			ctx, task, ranked, eng, opts, rctx,
+		)
+		protectedSyntacticAnchors = protected
+		if len(anchorCandidates) > 0 {
+			ranked = mergeExploreCandidates(ranked, anchorCandidates, fetch)
 		}
 	}
 	// Resilience ladder: a warm-restarted daemon can transiently return an
@@ -1721,6 +2058,32 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	}
 	prod, protectedImplementationID := reserveExploreConceptImplementation(searchQuery, queryClass, prod, maxSymbols)
 	cands := selectFinalExploreCandidates(prod, test, maxSymbols)
+	if len(protectedSyntacticAnchors) > 0 {
+		// Source-literal selection owns its own final-slot guarantees. Re-union
+		// that selected window with production candidates, then enforce anchor
+		// reservations against the actual final pool while retaining the selected
+		// order for every remaining slot.
+		anchorPool := mergeExploreCandidates(cands, prod, 0)
+		anchorPool = reserveExploreSyntacticAnchorCandidates(task, anchorPool, protectedSyntacticAnchors, maxSymbols)
+		if len(anchorPool) > maxSymbols {
+			anchorPool = anchorPool[:maxSymbols]
+		}
+		cands = anchorPool
+	}
+	if queryClass == rerank.QueryClassConcept && len(protectedSyntacticAnchors) > 0 {
+		// A protected anchor can leave a matching typed field in the final window
+		// without its behavioral owner. Admit one graph-proven field-owner
+		// consumer and its anchor-aligned typed member before source hydration.
+		// The projection uses a fixed batch pipeline with deterministic fanout
+		// bounds and is a no-op unless every structural link is resolved.
+		cands = projectExploreTypedAnchorCandidates(
+			ctx, task, cands, eng.Reader(), opts, maxSymbols,
+			protectedSyntacticAnchors, protectedImplementationID,
+		)
+	}
+	protectedFinalCandidateIDs := exploreTypedAnchorReservedCandidateIDs(
+		cands, protectedSyntacticAnchors, protectedImplementationID,
+	)
 	if len(cands) == 0 && len(artifactLane.targets) == 0 {
 		if req.GetBool("localize", false) {
 			return s.completeEmptyLocalization(ctx, task, budget), nil
@@ -1746,8 +2109,6 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 			}
 		}
 	}
-	causalAdmitted := 0
-	var causalElapsed time.Duration
 	artifactTargets := artifactLane.targets
 	targets := make([]exploreTarget, 0, len(artifactTargets)+len(cands))
 	// Artifact evidence leads only when the strong classifier activated its
@@ -1766,50 +2127,67 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 			t.exactContent = c.Signals[exploreContentRecallExactSignal] > 0
 			t.exactContentAmbiguous = c.Signals[exploreContentRecallAmbiguousSignal] > 0
 			t.sourceLiteral = c.Signals[exploreSourceLiteralSignal] > 0
+			t.sourceLiteralCallee = c.Signals[exploreSourceLiteralCalleeSignal] > 0
+			t.sourceLiteralAligned = c.Signals[exploreSourceLiteralTaskAlignSignal] > 0
+			t.typedAnchorProjection = c.Signals[exploreTypedAnchorProjectionSignal] > 0
 		}
 		t.source = s.manifestSymbolSource(ctx, n)
 		if callers := eng.GetCallers(n.ID, ringOpts); callers != nil {
 			t.callers = ringNeighbors(callers.Nodes, n.ID, exploreRingCap)
 		}
 
-		calleeOpts := ringOpts
-		expanded := exploreAdmitCausalSeed(
-			queryClass == rerank.QueryClassConcept,
-			explicitTarget,
-			exploreStrongCausalSeed(searchQuery, t),
-			causalAdmitted,
-			causalElapsed,
-		)
-		if expanded {
-			calleeOpts.Depth = exploreCausalDepth
-			causalAdmitted++
-		}
-		started := time.Now()
-		callees := eng.GetCallChain(n.ID, calleeOpts)
-		if expanded {
-			causalElapsed += time.Since(started)
-		}
+		callees := eng.GetCallChain(n.ID, ringOpts)
 		if callees != nil {
-			if expanded {
-				neighbors := minimumExploreCausalHops(n.ID, callees, opts, exploreCausalDepth, ringOpts.Limit)
-				direct := make([]*graph.Node, 0, exploreRingCap)
-				for _, neighbor := range neighbors {
-					if neighbor.hop == 1 {
-						direct = append(direct, neighbor.node)
-					} else {
-						t.causalCallees = append(t.causalCallees, neighbor)
-					}
-				}
-				if len(neighbors) > 0 {
-					t.callees = ringNeighbors(direct, n.ID, exploreRingCap)
-				} else {
-					t.callees = ringNeighbors(callees.Nodes, n.ID, exploreRingCap)
-				}
-			} else {
-				t.callees = ringNeighbors(callees.Nodes, n.ID, exploreRingCap)
-			}
+			t.directCalleesComplete = !callees.Truncated && !callees.BudgetHit && !callees.LowerBound
+			var projectionComplete bool
+			t.callees, projectionComplete = ringNeighborsProjection(callees.Nodes, n.ID, exploreRingCap)
+			t.directCalleesComplete = t.directCalleesComplete && projectionComplete
 		}
 		targets = append(targets, t)
+	}
+
+	// Every final symbol now has equally-bounded depth-1 evidence. Spend the
+	// deeper budget in a second pass so a strong route ranked fourth cannot be
+	// starved by three earlier leaf/accessor collisions.
+	symbolTargets := targets[len(artifactTargets):]
+	var causalElapsed time.Duration
+	for _, index := range selectExploreCausalSeeds(
+		searchQuery, symbolTargets, queryClass == rerank.QueryClassConcept, explicitTarget,
+	) {
+		if causalElapsed >= exploreCausalAdmissionBudget {
+			break
+		}
+		target := &symbolTargets[index]
+		calleeOpts := ringOpts
+		calleeOpts.Depth = exploreCausalDepth
+		started := time.Now()
+		callees := eng.GetCallChain(target.node.ID, calleeOpts)
+		causalElapsed += time.Since(started)
+		if callees == nil {
+			continue
+		}
+		target.directCalleesComplete = !callees.Truncated && !callees.BudgetHit && !callees.LowerBound
+		neighbors := minimumExploreCausalHops(target.node.ID, callees, opts, exploreCausalDepth, ringOpts.Limit)
+		direct := make([]*graph.Node, 0, exploreRingCap)
+		target.causalCallees = target.causalCallees[:0]
+		for _, neighbor := range neighbors {
+			if neighbor.hop == 1 {
+				direct = append(direct, neighbor.node)
+			} else {
+				target.causalCallees = append(target.causalCallees, neighbor)
+			}
+		}
+		if len(neighbors) > 0 {
+			var projectionComplete bool
+			target.callees, projectionComplete = ringNeighborsProjection(direct, target.node.ID, exploreRingCap)
+			target.directCalleesComplete = target.directCalleesComplete && projectionComplete
+		}
+	}
+	if exploreQueryIsConceptTask(task) && len(targets) > len(artifactTargets) {
+		symbolTargets := promoteExploreDivergentDefaultOwner(task, targets[len(artifactTargets):], s.graph, maxSymbols, func(node *graph.Node) string {
+			return s.manifestSymbolSource(ctx, node)
+		})
+		targets = append(targets[:len(artifactTargets):len(artifactTargets)], symbolTargets...)
 	}
 	// Direct retrieval owns the ranked head. Once graph promotion has selected
 	// a cross-file boundary, materialize exactly that one node so both text and
@@ -1819,30 +2197,109 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	if !req.GetBool("localize", false) {
 		return mcp.NewToolResultText(s.renderExplore(task, targets, budget)), nil
 	}
-	symbolTargets := targets[len(artifactTargets):]
+	symbolTargets = targets[len(artifactTargets):]
+	// An implementation-intent query expands abstract seeds into their
+	// concrete implementors before terminality is judged, so the envelope
+	// carries the code that changes and answer_ready can see it.
+	if exploreImplementationIntent(task) {
+		symbolTargets = s.expandImplementationTargets(ctx, symbolTargets)
+		targets = append(targets[:len(artifactTargets):len(artifactTargets)], symbolTargets...)
+	} else if queryClass == rerank.QueryClassConcept {
+		// Concept answers prefer the owning type when several of its members
+		// rank together; implementation-intent queries are exempt because
+		// they ask for exactly those members.
+		symbolTargets = preserveExploreDivergentDefaultOrder(s.foldMemberOwners(ctx, symbolTargets))
+		// Owner folding is weaker than a unique source-literal callsite whose
+		// callee was resolved and hydrated. Re-promote that proof after folding
+		// so terminality is judged against the same strongest evidence that the
+		// final envelope exposes, rather than against a synthetic owner row.
+		symbolTargets = promoteExploreStrongSourceLiteralTarget(symbolTargets)
+		// Owner folding may insert a type above two retained members. Preserve the
+		// fold without violating the request's max_symbols contract: evict only an
+		// unreserved tail target, or the inserted owner itself when every direct
+		// candidate is protected by an earlier evidence lane.
+		symbolTargets = limitExploreFoldedTargets(task, symbolTargets, maxSymbols, protectedFinalCandidateIDs)
+		targets = append(targets[:len(artifactTargets):len(artifactTargets)], symbolTargets...)
+	}
 	answerReady := exploreAnswerReady(task, symbolTargets) || artifactLane.ready
+	if answerReady && !artifactLane.ready {
+		eng := s.engineFor(ctx)
+		if eng != nil && exploreImplementationAnswerBlocked(task, symbolTargets, eng.GetOutEdges, eng.GetSymbol) {
+			// Only abstract declarations in evidence for an implementation
+			// question: stay nonterminal so the permitted refinement read
+			// can reach the concrete side.
+			answerReady = false
+		}
+	}
 	// File evidence can make localization answer-ready, but it never becomes a
 	// synthetic exact-symbol read. Exact reads remain declaration-only.
 	exactSymbol := exploreLocalizationExplicitTarget(task, symbolTargets)
+	// A unique graph + default-flow proof identifies the upstream cause behind
+	// an issue author's downstream symbol anchor. Read that proven constructor,
+	// while retaining the explicitly named consumer immediately after it in the
+	// evidence projection.
+	if causalSymbol := exploreDivergentDefaultOwnerSymbol(symbolTargets); causalSymbol != "" {
+		exactSymbol = causalSymbol
+	}
 	if !answerReady && exactSymbol == "" {
 		// Uncertain localization is still useful evidence. Returning it as an
 		// MCP error makes hosts discard the ranked candidates and restart broad
 		// exploration, multiplying turns and payloads. Name one concrete ranked
 		// target for the only permitted refinement read; source-literal evidence
 		// wins because it is absent from ordinary symbol metadata.
-		preferredSymbol := explorePreferredRefinementSymbol(symbolTargets)
-		completion := newLocalizationRefinementCompletion(preferredSymbol)
-		result, returnedSymbols := buildLocalizationExploreResultForTask(completion, task, targets, budget)
-		// Authorization is derived from the exact serialized projection, not
-		// the larger pre-budget candidate set. The preferred symbol is mandatory
-		// in that projection and is the only candidate accepted by the session
-		// guard, so the instruction and enforcement cannot diverge.
-		s.localizationFor(ctx).armRefinementForTask(task, preferredSymbol, returnedSymbols)
+		routes := exploreLocalizationRefinementRoutes(symbolTargets)
+		preferredSymbol := explorePreferredRoutedRefinementSymbol(
+			explorePreferredRefinementSymbol(task, symbolTargets), symbolTargets, routes,
+		)
+		result, refinement, boundedRoutes, digest := buildLocalizationRefinementResultForTask(
+			preferredSymbol, task, targets, budget, routes,
+		)
+		if refinement.State != localizationStateNeedsRefinement {
+			refinement.digest = digest
+			s.localizationFor(ctx).armForTask(refinement, task)
+			return result, nil
+		}
+		// Wire and server authorization are derived from the same finalized
+		// post-budget set. Known generic wrappers without a visible, unique
+		// concrete hop remain evidence but are never authorized.
+		s.localizationFor(ctx).armRefinementRoutesForTask(
+			task, refinement.refinementSymbol, refinement.AllowedSymbols, boundedRoutes, digest,
+		)
 		return result, nil
 	}
 	completion := newLocalizationCompletion(answerReady, exactSymbol)
+	// The digest derives from the same serialized projection the host sees,
+	// and is retained for post-terminal replay — for the exact-read contract
+	// too, whose success promotes to answer_ready with the evidence already
+	// stashed.
+	result, _, digest, completion := buildLocalizationExploreResultForTaskFinalized(completion, task, targets, budget)
+	// Literal-driven terminality must show its evidence: when the verdict
+	// rests on a quoted-literal match but the budgeted envelope shed the
+	// literal, downgrade to the bounded refinement read instead of telling
+	// the host to answer from evidence it cannot see.
+	if answerReady && exactSymbol == "" &&
+		exploreAnswerReadyViaLiteralOnly(task, symbolTargets) && !completion.Enforceable &&
+		!exploreResultCitesTaskLiteral(result, task) {
+		routes := exploreLocalizationRefinementRoutes(symbolTargets)
+		preferredSymbol := explorePreferredRoutedRefinementSymbol(
+			explorePreferredRefinementSymbol(task, symbolTargets), symbolTargets, routes,
+		)
+		refined, refinement, boundedRoutes, refinedDigest := buildLocalizationRefinementResultForTask(
+			preferredSymbol, task, targets, budget, routes,
+		)
+		if refinement.State != localizationStateNeedsRefinement {
+			refinement.digest = refinedDigest
+			s.localizationFor(ctx).armForTask(refinement, task)
+			return refined, nil
+		}
+		s.localizationFor(ctx).armRefinementRoutesForTask(
+			task, refinement.refinementSymbol, refinement.AllowedSymbols, boundedRoutes, refinedDigest,
+		)
+		return refined, nil
+	}
+	completion.digest = digest
 	s.localizationFor(ctx).armForTask(completion, task)
-	return newLocalizationExploreResultForTask(completion, task, targets, budget), nil
+	return result, nil
 }
 
 // localizationExploreEnvelope is the compact, machine-readable result for an
@@ -1850,38 +2307,39 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 // human-oriented legacy rendering; localize does not duplicate it.
 type localizationExploreEnvelope struct {
 	Completion localizationCompletion `json:"completion"`
+	Terminal   bool                   `json:"terminal"`
 	Files      []string               `json:"files"`
 	Symbols    []string               `json:"symbols"`
 	Evidence   []localizationEvidence `json:"evidence"`
 }
 
 type localizationEvidence struct {
-	Rank      int      `json:"rank"`
-	ID        string   `json:"id"`
-	Name      string   `json:"name"`
-	QualName  string   `json:"qual_name,omitempty"`
-	Kind      string   `json:"kind"`
-	File      string   `json:"file"`
-	Line      int      `json:"line"`
-	EndLine   int      `json:"end_line,omitempty"`
-	Signature string   `json:"signature,omitempty"`
-	Callers   []string `json:"callers,omitempty"`
-	Callees   []string `json:"callees,omitempty"`
-	Source    string   `json:"source,omitempty"`
+	Rank       int      `json:"rank"`
+	ID         string   `json:"id"`
+	Name       string   `json:"name"`
+	QualName   string   `json:"qual_name,omitempty"`
+	Kind       string   `json:"kind"`
+	File       string   `json:"file"`
+	Line       int      `json:"line"`
+	EndLine    int      `json:"end_line,omitempty"`
+	Signature  string   `json:"signature,omitempty"`
+	Callers    []string `json:"callers,omitempty"`
+	Callees    []string `json:"callees,omitempty"`
+	Provenance string   `json:"provenance,omitempty"`
+	Source     string   `json:"source,omitempty"`
 }
 
 func (s *Server) completeEmptyLocalization(ctx context.Context, task string, budget int) *mcp.CallToolResult {
-	completion := localizationCompletion{
-		State:            localizationStateInactive,
-		Scope:            "localization",
-		RequiredAction:   "continue",
-		AllowedToolCalls: 0,
-	}
-	// An empty result supersedes any previous task contract but must not arm
-	// answer-ready or an exact-read allowance. Stage the open state so facade
-	// dispatch commits it only after the successful response.
-	s.localizationFor(ctx).keepOpenForTask(task)
-	return newLocalizationExploreResult(completion, []exploreTarget{}, budget)
+	// No bounded source read can improve an empty projection. Return a compact,
+	// advisory terminal contract so the host gets a final response instead of
+	// an unbounded navigation loop with an eventually empty final.
+	completion := newLocalizationCompletion(true, "")
+	result, _, digest, completion := buildLocalizationExploreResultForTaskFinalized(
+		completion, task, nil, budget,
+	)
+	completion.digest = digest
+	s.localizationFor(ctx).armForTask(completion, task)
+	return result
 }
 
 // exploreAllowsStructuralBody keeps graph-expanded source reads exclusive to
@@ -1890,7 +2348,7 @@ func (s *Server) completeEmptyLocalization(ctx context.Context, task string, bud
 // literal symbol and signature queries retain their direct-only behavior.
 func exploreAllowsStructuralBody(task string) bool {
 	shaped := shapeExploreQuery(task)
-	class := rerank.ClassifyQuery(shaped)
+	class := exploreQueryClass(shaped)
 	_, directoryQualified := exploreQueryPathAnchors(shaped)
 	return !directoryQualified && class != rerank.QueryClassSymbol && class != rerank.QueryClassSignature
 }
@@ -1972,6 +2430,14 @@ func materializeExploreStructuralSourceWithReader(
 	if len(targets) == 0 || !exploreAllowsStructuralBody(task) || ctx.Err() != nil || readSource == nil {
 		return targets
 	}
+	// Promotion already spent this request's single structural read proving the
+	// child forwards its divergent default. Reuse that source and never open a
+	// second boundary merely for presentation.
+	for _, target := range targets {
+		if target.divergentDefaultOwner {
+			return targets
+		}
+	}
 	draft := exploreAnswerDraft(task, targets)
 	present := make(map[string]struct{}, len(targets))
 	for _, target := range targets {
@@ -2027,18 +2493,151 @@ func exploreNodeWithinQueryScope(n *graph.Node, scope query.QueryOptions) bool {
 // one concrete, bounded follow-up. Exact source-literal evidence wins because
 // ordinary symbol metadata cannot represent it; otherwise the ranked head is
 // the deterministic refinement target.
-func explorePreferredRefinementSymbol(targets []exploreTarget) string {
-	for _, target := range targets {
-		if target.sourceLiteral && target.node != nil && target.node.ID != "" {
-			return target.node.ID
+// explorePreferredRefinementSymbol picks the single permitted refinement
+// read with the same preference ladder the answer draft uses, instead of the
+// raw rank-one symbol. A generic head (a builder type that shares no term
+// with the query) must not consume the only read while a query-aligned
+// candidate sits lower in the same envelope:
+//
+//  1. explicit path / qualified-symbol / call anchor
+//  2. strongest non-literal semantic coverage across declaration and body
+//  3. smallest actionable callable, then verified literal provenance
+//  4. protected concept implementation and non-generic declaration quality
+//  5. answer-draft rank and raw rank as deterministic final tie-breaks
+func explorePreferredRefinementSymbol(task string, targets []exploreTarget) string {
+	if len(targets) == 0 {
+		return ""
+	}
+	query := shapeExploreQuery(task)
+	syntacticAnchors := exploreSyntacticAnchors(task)
+	if exploreQueryIsConceptTask(query) {
+		query = stripLeadingExploreDirective(query)
+	}
+	semanticTerms := exploreTerminalTerms(query)
+	for _, literal := range exploreQuotedRecallTerms(task) {
+		for term := range exploreTerminalTerms(literal) {
+			delete(semanticTerms, term)
 		}
 	}
-	for _, target := range targets {
-		if target.node != nil && target.node.ID != "" {
-			return target.node.ID
+
+	// The answer-draft order already incorporates rare-term density and generic
+	// declaration demotion. Retain it as the final deterministic tie-break while
+	// comparing all direct targets on their non-literal semantic evidence.
+	draftRank := make(map[string]int, len(targets))
+	for index, entry := range exploreAnswerDraft(task, targets) {
+		if entry.node != nil {
+			draftRank[exploreDraftNodeKey(entry.node)] = index
 		}
 	}
-	return ""
+	type refinementCandidate struct {
+		target            exploreTarget
+		index             int
+		draftRank         int
+		identifierOverlap int
+		bodyOverlap       int
+		longest           int
+		anchorMatches     int
+		explicit          bool
+		callable          bool
+		generic           bool
+	}
+	candidates := make([]refinementCandidate, 0, len(targets))
+	for index, target := range targets {
+		if target.node == nil || target.node.ID == "" {
+			continue
+		}
+		identifierOverlap, longest := exploreDraftTermOverlap(semanticTerms, target.node)
+		bodyOverlap := exploreDraftTermSetOverlap(semanticTerms, exploreTerminalTerms(target.source))
+		rank, ranked := draftRank[exploreDraftNodeKey(target.node)]
+		if !ranked {
+			rank = len(targets) + index
+		}
+		callable := target.node.Kind == graph.KindFunction || target.node.Kind == graph.KindMethod
+		candidates = append(candidates, refinementCandidate{
+			target:            target,
+			index:             index,
+			draftRank:         rank,
+			identifierOverlap: identifierOverlap,
+			bodyOverlap:       bodyOverlap,
+			longest:           longest,
+			anchorMatches:     exploreSyntacticAnchorTargetMatchesAnchors(syntacticAnchors, target),
+			explicit:          exploreLocalizationExplicitAnchor(query, target.node),
+			callable:          callable,
+			generic:           exploreDraftGenericCandidate(target.node, target.source),
+		})
+	}
+	if len(candidates) == 0 {
+		return ""
+	}
+	alignment := func(candidate refinementCandidate) int {
+		body := candidate.bodyOverlap
+		if body > 2 {
+			body = 2
+		}
+		return candidate.identifierOverlap + body
+	}
+	better := func(left, right refinementCandidate) bool {
+		// A divergent-default owner is promoted only after a unique constructor
+		// call + inheritance proof over complete bounded projections. That causal
+		// proof supersedes an issue author's downstream symbol guess.
+		if left.target.divergentDefaultOwner != right.target.divergentDefaultOwner {
+			return left.target.divergentDefaultOwner
+		}
+		if left.explicit != right.explicit {
+			return left.explicit
+		}
+		if left.anchorMatches != right.anchorMatches {
+			return left.anchorMatches > right.anchorMatches
+		}
+		if left.anchorMatches > 0 && left.generic != right.generic {
+			return !left.generic
+		}
+		leftAlignment, rightAlignment := alignment(left), alignment(right)
+		if leftAlignment != rightAlignment {
+			return leftAlignment > rightAlignment
+		}
+		if left.identifierOverlap != right.identifierOverlap {
+			return left.identifierOverlap > right.identifierOverlap
+		}
+		if left.bodyOverlap != right.bodyOverlap {
+			return left.bodyOverlap > right.bodyOverlap
+		}
+		// With no semantic alignment, verified source provenance is the only
+		// concrete evidence. Do not let an arbitrary callable beat the exact
+		// literal merely because the literal maps to a type or field owner.
+		if leftAlignment == 0 && left.target.sourceLiteral != right.target.sourceLiteral {
+			return left.target.sourceLiteral
+		}
+		// Once both candidates cover task concepts, prefer the smallest
+		// actionable declaration before provenance: a literal mapped to an
+		// enclosing type/file must not outrank an aligned callable.
+		if left.callable != right.callable {
+			return left.callable
+		}
+		if left.target.sourceLiteral != right.target.sourceLiteral {
+			return left.target.sourceLiteral
+		}
+		if left.target.conceptImplementation != right.target.conceptImplementation {
+			return left.target.conceptImplementation
+		}
+		if left.generic != right.generic {
+			return !left.generic
+		}
+		if left.longest != right.longest {
+			return left.longest > right.longest
+		}
+		if left.draftRank != right.draftRank {
+			return left.draftRank < right.draftRank
+		}
+		return left.index < right.index
+	}
+	best := candidates[0]
+	for _, candidate := range candidates[1:] {
+		if better(candidate, best) {
+			best = candidate
+		}
+	}
+	return best.target.node.ID
 }
 
 // localizationEvidenceTargets projects the same bounded answer-draft evidence
@@ -2047,6 +2646,27 @@ func explorePreferredRefinementSymbol(targets []exploreTarget) string {
 // the response cardinality. Direct targets retain their source and neighbors.
 func localizationEvidenceTargets(task, exactID string, targets []exploreTarget) []exploreTarget {
 	return localizationEvidenceTargetsFromDraft(task, exactID, targets, nil)
+}
+
+func prioritizeLocalizationEvidenceTarget(requiredID string, targets []exploreTarget) []exploreTarget {
+	if requiredID == "" || len(targets) < 2 {
+		return targets
+	}
+	requiredIndex := -1
+	for index, target := range targets {
+		if target.node != nil && target.node.ID == requiredID {
+			requiredIndex = index
+			break
+		}
+	}
+	if requiredIndex <= 0 {
+		return targets
+	}
+	ordered := make([]exploreTarget, 0, len(targets))
+	ordered = append(ordered, targets[requiredIndex])
+	ordered = append(ordered, targets[:requiredIndex]...)
+	ordered = append(ordered, targets[requiredIndex+1:]...)
+	return ordered
 }
 
 func localizationEvidenceTargetsFromDraft(task, exactID string, targets []exploreTarget, draft []exploreDraftEntry) []exploreTarget {
@@ -2076,10 +2696,26 @@ func localizationEvidenceTargetsFromDraft(task, exactID string, targets []explor
 	if draft == nil && strings.TrimSpace(task) != "" {
 		draft = exploreAnswerDraft(task, targets)
 	}
+	// A graph-proven causal constructor and its owning type outrank the
+	// downstream retrieval seed. Their explicit admission metadata survives
+	// draft ranking, owner folding, and byte-budget packing, so this ordering is
+	// evidence-driven rather than a late symbol-name sort.
+	for _, target := range targets {
+		if target.divergentDefaultOwner {
+			appendTarget(target)
+			break
+		}
+	}
+	for _, target := range targets {
+		if target.divergentDefaultType {
+			appendTarget(target)
+			break
+		}
+	}
+	// Primary retrieval evidence remains contractual under tight budgets and
+	// follows the causal pair as its supporting consumer. A needs-refinement
+	// caller may move its authorized target ahead afterward.
 	appendTarget(targets[0])
-	// The completion contract names the exact refinement target. Reserve it
-	// before promoted structural neighbors so a tight evidence limit cannot
-	// advertise an exact_symbol that is absent from files/symbols/evidence.
 	if exactID != "" {
 		for _, target := range targets {
 			if target.node != nil && target.node.ID == exactID {
@@ -2091,10 +2727,29 @@ func localizationEvidenceTargetsFromDraft(task, exactID string, targets []explor
 	// A source-body literal is the only direct evidence that can identify an
 	// implementation absent from symbol metadata. Reserve the strongest one
 	// before draft promotion and byte-budget packing can consume every slot.
+	// A construction-aligned callee — one that instantiates the task's value —
+	// is the strongest literal owner; reserve it ahead of a generic literal
+	// callee that merely leads primary retrieval, so it is never the sacrificial
+	// tail when the projection is at the max_symbols boundary.
+	for _, target := range targets {
+		if target.sourceLiteral && target.sourceLiteralAligned {
+			appendTarget(target)
+			break
+		}
+	}
 	for _, target := range targets {
 		if target.sourceLiteral {
 			appendTarget(target)
 			break
+		}
+	}
+	// A typed-field projection is admitted only after a complete bounded
+	// field→owner←consumer→member proof. Reserve its consumer/member pair before
+	// ordinary draft expansion, but behind pre-existing exact and source-literal
+	// contracts so the new lane cannot demote stronger evidence.
+	for _, target := range targets {
+		if target.typedAnchorProjection {
+			appendTarget(target)
 		}
 	}
 	appendEntry := func(entry exploreDraftEntry) {
@@ -2151,27 +2806,114 @@ func localizationEnvelopeFits(envelope localizationExploreEnvelope, maxBytes int
 }
 
 func newLocalizationExploreResultForTask(completion localizationCompletion, task string, targets []exploreTarget, budget int) *mcp.CallToolResult {
-	result, _ := buildLocalizationExploreResultForTask(completion, task, targets, budget)
+	result, _, _ := buildLocalizationExploreResultForTask(completion, task, targets, budget)
 	return result
 }
 
-// buildLocalizationExploreResultForTask returns both the result and the exact
-// bounded symbol projection serialized into it. Refinement authorization uses
-// this projection so every authorized ID is visible and every visible evidence
-// target is authorized without a second ranking or budgeting pass.
-func buildLocalizationExploreResultForTask(completion localizationCompletion, task string, targets []exploreTarget, budget int) (*mcp.CallToolResult, []string) {
+// buildLocalizationExploreResultForTask returns the packed result and the exact
+// bounded symbol projection serialized into it. Callers that also need the
+// post-budget completion use buildLocalizationExploreResultForTaskFinalized.
+func buildLocalizationExploreResultForTask(
+	completion localizationCompletion,
+	task string,
+	targets []exploreTarget,
+	budget int,
+	finalize ...localizationCompletionFinalizer,
+) (*mcp.CallToolResult, []string, *localizationEvidenceDigest) {
+	result, symbols, digest, _ := buildLocalizationExploreResultForTaskFinalized(
+		completion, task, targets, budget, finalize...,
+	)
+	return result, symbols, digest
+}
+
+type localizationCompletionFinalizer func(localizationExploreEnvelope) localizationCompletion
+
+func buildLocalizationRefinementResultForTask(
+	preferredSymbol, task string,
+	targets []exploreTarget,
+	budget int,
+	routes map[string]localizationRefinementRoute,
+) (*mcp.CallToolResult, localizationCompletion, map[string]localizationRefinementRoute, *localizationEvidenceDigest) {
+	choosePreferred := func(symbols []string, requested string) (string, []string, map[string]localizationRefinementRoute) {
+		authorized, bounded := boundedLocalizationRefinementRoutes(symbols, routes, requested)
+		if requested != "" {
+			if _, ok := bounded[requested]; ok {
+				return requested, authorized, bounded
+			}
+		}
+		_, bounded = boundedLocalizationRefinementRoutes(symbols, routes, "")
+		for _, symbol := range symbols {
+			if _, ok := bounded[symbol]; !ok {
+				continue
+			}
+			authorized, bounded = boundedLocalizationRefinementRoutes(symbols, routes, symbol)
+			return symbol, authorized, bounded
+		}
+		return "", nil, nil
+	}
+
+	candidateSymbols := exploreLocalizationTargetSymbols(targets)
+	preferredSymbol, preauthorized, prebounded := choosePreferred(candidateSymbols, preferredSymbol)
+	if preferredSymbol == "" {
+		advisory := newLocalizationCompletion(true, "")
+		result, _, digest, packedCompletion := buildLocalizationExploreResultForTaskFinalized(advisory, task, targets, budget)
+		return result, packedCompletion, nil, digest
+	}
+
+	// Budget against the largest completion this envelope can expose. The final
+	// allowed set is an equal or smaller intersection with serialized symbols,
+	// so replacing this provisional contract cannot invalidate the byte cap.
+	budgetCompletion := newLocalizationRefinementCompletionForSymbols(preferredSymbol, preauthorized)
+	budgetCompletion.refinementRoutes = prebounded
+	var finalRoutes map[string]localizationRefinementRoute
+	result, _, digest, packedCompletion := buildLocalizationExploreResultForTaskFinalized(
+		budgetCompletion, task, targets, budget,
+		func(packed localizationExploreEnvelope) localizationCompletion {
+			packedPreferred, allowedSymbols, bounded := choosePreferred(packed.Symbols, preferredSymbol)
+			if packedPreferred == "" {
+				finalRoutes = nil
+				return newLocalizationCompletion(true, "")
+			}
+			finalRoutes = localizationBoundRouteEvidence(bounded, packed)
+			completion := newLocalizationRefinementCompletionForSymbols(packedPreferred, allowedSymbols)
+			completion.refinementRoutes = finalRoutes
+			return completion
+		},
+	)
+	return result, packedCompletion, finalRoutes, digest
+}
+
+// The finalized variant additionally returns the exact completion used by both
+// visible text and authoritative host metadata after byte-budget packing.
+func buildLocalizationExploreResultForTaskFinalized(
+	completion localizationCompletion,
+	task string,
+	targets []exploreTarget,
+	budget int,
+	finalize ...localizationCompletionFinalizer,
+) (*mcp.CallToolResult, []string, *localizationEvidenceDigest, localizationCompletion) {
 	var draft []exploreDraftEntry
 	if strings.TrimSpace(task) != "" {
 		draft = exploreAnswerDraft(task, targets)
 	}
 	preferredBodyIDs := explorePreferredFullBodyIDs(task, targets, draft, exploreFullBodyLimit)
+	primarySymbol := ""
+	if len(targets) > 0 && targets[0].node != nil {
+		primarySymbol = targets[0].node.ID
+	}
 	requiredSymbol := completion.ExactSymbol
-	if completion.State == localizationStateNeedsRefinement {
+	refinementFirst := completion.State == localizationStateNeedsRefinement
+	if refinementFirst {
 		requiredSymbol = completion.refinementSymbol
 	}
 	targets = localizationEvidenceTargetsFromDraft(task, requiredSymbol, targets, draft)
+	if refinementFirst {
+		targets = prioritizeLocalizationEvidenceTarget(requiredSymbol, targets)
+	}
+	contract := localizationContractFor(completion)
 	envelope := localizationExploreEnvelope{
-		Completion: completion,
+		Completion: contract.Completion,
+		Terminal:   contract.Terminal,
 		Files:      make([]string, 0),
 		Symbols:    make([]string, 0),
 		Evidence:   make([]localizationEvidence, 0),
@@ -2185,9 +2927,34 @@ func buildLocalizationExploreResultForTask(completion localizationCompletion, ta
 	if len(targets) > 0 {
 		mandatoryCount = 1
 	}
-	if requiredSymbol != "" {
+	for index, target := range targets {
+		if (target.divergentDefaultOwner || target.divergentDefaultType) && index+1 > mandatoryCount {
+			mandatoryCount = index + 1
+		}
+		if target.typedAnchorProjection && index+1 > mandatoryCount {
+			mandatoryCount = index + 1
+		}
+	}
+	// Primary retrieval evidence and the authorized exact/refinement symbol are
+	// both mandatory regardless of which one leads the serialized projection.
+	// A generic preferred candidate also reserves its one prevalidated concrete
+	// hop, because the route is invalid unless both IDs are visible on the wire.
+	mandatoryIDs := []string{primarySymbol, requiredSymbol}
+	if route, routed := completion.refinementRoutes[requiredSymbol]; routed {
+		if route.implementationSymbol != "" {
+			mandatoryIDs = append(mandatoryIDs, route.implementationSymbol)
+		}
+		if route.proofSymbol != "" {
+			mandatoryIDs = append(mandatoryIDs, route.proofSymbol)
+		}
+	}
+	// Packing operates on a prefix, so retain through the latest mandatory ID.
+	for _, mandatoryID := range mandatoryIDs {
+		if mandatoryID == "" {
+			continue
+		}
 		for index, target := range targets {
-			if target.node != nil && target.node.ID == requiredSymbol && index+1 > mandatoryCount {
+			if target.node != nil && target.node.ID == mandatoryID && index+1 > mandatoryCount {
 				mandatoryCount = index + 1
 				break
 			}
@@ -2195,6 +2962,15 @@ func buildLocalizationExploreResultForTask(completion localizationCompletion, ta
 	}
 	for index, target := range targets {
 		if target.sourceLiteral && index+1 > mandatoryCount {
+			mandatoryCount = index + 1
+			break
+		}
+	}
+	// The construction-aligned literal owner is reserved evidence: guarantee its
+	// identifier survives byte-budget packing even when a generic literal callee
+	// leads the projection and holds the first source-literal slot.
+	for index, target := range targets {
+		if target.sourceLiteral && target.sourceLiteralAligned && index+1 > mandatoryCount {
 			mandatoryCount = index + 1
 			break
 		}
@@ -2214,10 +2990,11 @@ func buildLocalizationExploreResultForTask(completion localizationCompletion, ta
 			Name: compactLocalizationField(n.Name, localizationMaxNameRunes),
 			Kind: string(n.Kind), File: path,
 			Line: n.StartLine, EndLine: n.EndLine,
-			QualName:  compactLocalizationField(retrieval.QualName, localizationMaxQualNameRunes),
-			Signature: compactLocalizationField(retrieval.Signature, localizationMaxSignatureRunes),
-			Callers:   boundedLocalizationNeighborIDs(target.callers, localizationMaxNeighborIDs),
-			Callees:   boundedLocalizationNeighborIDs(target.callees, localizationMaxNeighborIDs),
+			QualName:   compactLocalizationField(retrieval.QualName, localizationMaxQualNameRunes),
+			Signature:  compactLocalizationField(retrieval.Signature, localizationMaxSignatureRunes),
+			Callers:    boundedLocalizationNeighborIDs(target.callers, localizationMaxNeighborIDs),
+			Callees:    boundedLocalizationNeighborIDs(target.callees, localizationMaxNeighborIDs),
+			Provenance: localizationTargetProvenance(completion, target),
 		}
 
 		candidate := envelope
@@ -2292,11 +3069,23 @@ func buildLocalizationExploreResultForTask(completion localizationCompletion, ta
 		}
 	}
 
+	if len(finalize) > 0 && finalize[0] != nil {
+		envelope.Completion = finalize[0](envelope)
+	}
+	// Strong enforcement is derived only from proof rows that survived final
+	// byte-budget packing. Visible text, retained state, and host metadata then
+	// share this one normalized completion value.
+	envelope.Completion = localizationFinalizeCompletionEvidence(envelope.Completion, acceptedTargets, envelope)
+	contract = localizationContractFor(envelope.Completion)
+	envelope.Completion = contract.Completion
+	envelope.Terminal = contract.Terminal
 	body, err := json.Marshal(envelope)
 	if err != nil {
-		return mcp.NewToolResultError("encode localization result: " + err.Error()), nil
+		return mcp.NewToolResultError("encode localization result: " + err.Error()), nil, nil, envelope.Completion
 	}
-	return mcp.NewToolResultText(string(body)), append([]string(nil), envelope.Symbols...)
+	digest := newLocalizationEvidenceDigest(envelope)
+	result := attachLocalizationHostEnvelope(mcp.NewToolResultText(string(body)), envelope.Completion, digest)
+	return result, append([]string(nil), envelope.Symbols...), digest, envelope.Completion
 }
 
 func boundedLocalizationNeighborIDs(nodes []*graph.Node, limit int) []string {
@@ -2517,17 +3306,30 @@ func exploreLocalizableKind(k graph.NodeKind) bool {
 // ringNeighbors filters a traversal result's nodes to real neighbors (not
 // the focus node itself, not param/local/import noise), capped.
 func ringNeighbors(nodes []*graph.Node, selfID string, cap int) []*graph.Node {
+	out, _ := ringNeighborsProjection(nodes, selfID, cap)
+	return out
+}
+
+// ringNeighborsProjection also reports whether every eligible neighbor fit in
+// the projection. Callers can reject uniqueness claims made from a saturated
+// ring without issuing another graph query.
+func ringNeighborsProjection(nodes []*graph.Node, selfID string, cap int) ([]*graph.Node, bool) {
+	if cap < 1 {
+		return nil, false
+	}
 	out := make([]*graph.Node, 0, cap)
+	complete := true
 	for _, n := range nodes {
 		if n == nil || n.ID == selfID || !exploreLocalizableKind(n.Kind) {
 			continue
 		}
-		out = append(out, n)
 		if len(out) >= cap {
-			break
+			complete = false
+			continue
 		}
+		out = append(out, n)
 	}
-	return out
+	return out, complete
 }
 
 // joinNeighbors renders a neighbor ring as "name (path:line), name (path:line)".
@@ -2760,6 +3562,10 @@ const (
 	// be worth repeating — below it the "clause" is a sentence fragment
 	// whose repetition would over-weight one or two words.
 	shapeInlineMinLeadChars = 20
+	// A long single-line paraphrase with sentence structure is report-like even
+	// when it contains no flags or hashes. Short focused queries stay byte-for-
+	// byte unchanged.
+	shapeInlineLongQueryChars = 180
 	// shaMinHexLen / shaMaxHexLen bound a commit-SHA-shaped token: git
 	// abbreviates to >=7 hex chars; a full SHA-1 is 40.
 	shaMinHexLen = 7
@@ -2787,11 +3593,17 @@ var (
 // shapeExploreQuery: drop provably-inert tokens and weight the lead
 // clause, gated on structural noise so a clean query is untouched.
 func shapeInlineQuery(task string) string {
-	if !hasInlineNoise(task) {
+	noisy := hasInlineNoise(task)
+	lead := inlineLeadClause(task)
+	if !noisy && (len(task) < shapeInlineLongQueryChars || lead == "") {
 		return task
 	}
-	cleaned := dropInertTokens(task)
-	if lead := inlineLeadClause(cleaned); lead != "" {
+	cleaned := task
+	if noisy {
+		cleaned = dropInertTokens(task)
+		lead = inlineLeadClause(cleaned)
+	}
+	if lead != "" {
 		cleaned += " " + lead
 	}
 	return cleaned
@@ -2939,6 +3751,13 @@ func inlineLeadClause(task string) string {
 			if i > 0 && t[i-1] != ':' && t[i-1] != ' ' && i+1 < len(t) && t[i+1] == ' ' {
 				end = i
 			}
+		case '.', '?', '!':
+			// A sentence boundary in a long single-line report is the inline
+			// equivalent of a title newline. Requiring following whitespace
+			// avoids splitting .ignore, dotted identifiers, and quoted ".".
+			if i+1 < len(t) && (t[i+1] == ' ' || t[i+1] == '\t') {
+				end = i + 1
+			}
 		}
 		if end >= 0 {
 			break
@@ -2960,6 +3779,10 @@ const (
 	exploreContentRecallExactSignal     = "explore_content_exact"
 	exploreContentRecallAmbiguousSignal = "explore_content_exact_ambiguous"
 	exploreSourceLiteralSignal          = "explore_source_literal"
+	exploreSourceLiteralCalleeSignal    = "explore_source_literal_callee"
+	exploreSourceLiteralCoverageSignal  = "explore_source_literal_coverage"
+	exploreSourceLiteralTaskAlignSignal = "explore_source_literal_task_alignment"
+	exploreSourceLiteralReservationMax  = 2
 	exploreQuotedRecallMaxTerms         = 3
 	exploreQuotedRecallMaxPerTerm       = 12
 	exploreQuotedRecallRetryMaxRows     = 24
@@ -3003,6 +3826,9 @@ func exploreQuotedRecallTerms(task string) []string {
 		if len(literal) < 2 || len(literal) > 128 || quotedLiteralIsNoise(literal) {
 			continue
 		}
+		if exploreTwoLetterQuotedAnchor(literal) && !exploreAllowsTwoLetterQuotedAnchor(task) {
+			continue
+		}
 		key := strings.ToLower(literal)
 		if _, duplicate := seen[key]; duplicate {
 			continue
@@ -3014,6 +3840,45 @@ func exploreQuotedRecallTerms(task string) []string {
 		}
 	}
 	return out
+}
+
+func exploreTwoLetterQuotedAnchor(literal string) bool {
+	if utf8.RuneCountInString(literal) != 2 {
+		return false
+	}
+	for _, r := range literal {
+		if !unicode.IsLetter(r) {
+			return false
+		}
+	}
+	return true
+}
+
+// exploreAllowsTwoLetterQuotedAnchor keeps exceptionally collision-prone
+// literals out of fallback source scans unless the request identifies them as
+// a culture, locale, language, registry, protocol, or configuration value.
+// This is task-class gating rather than a vocabulary of specific codes, so it
+// applies equally to future repositories and languages.
+func exploreAllowsTwoLetterQuotedAnchor(task string) bool {
+	lower := strings.ToLower(task)
+	for _, phrase := range []string{
+		"configuration key", "config key", "country code", "culture code",
+		"language code", "language tag", "locale code", "protocol code",
+		"region code", "status code",
+	} {
+		if strings.Contains(lower, phrase) {
+			return true
+		}
+	}
+	for _, token := range strings.FieldsFunc(lower, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '_'
+	}) {
+		switch token {
+		case "bcp47", "charset", "culture", "cultureinfo", "cultures", "currency", "encoding", "ietf", "iso", "locale", "locales", "register", "registered", "registering", "registration", "registrations", "registry":
+			return true
+		}
+	}
+	return false
 }
 
 func exploreQuotedRecallHasExactSourceCandidate(
@@ -3040,16 +3905,50 @@ func exploreQuotedRecallHasExactSourceNode(
 		!exploreLocalizableKind(node.Kind) || !exploreCodeDefinitionKind(node.Kind) {
 		return false
 	}
+	if exploreDraftIsTestNode(node) && !exploreQueryHasTestIntent(task) {
+		return false
+	}
 	if exploreLocalizationExplicitAnchor(task, node) {
 		return true
 	}
 	retrieval := node.RetrievalMetadata()
-	fields := [...]string{node.Name, retrieval.QualName, retrieval.Signature}
 	for _, term := range terms {
-		for _, field := range fields {
+		// Compact values such as locale and protocol codes are usually source
+		// literals, not declaration identities. Trust an exact declaration name
+		// or signature, but never a path-derived qualified name such as a test
+		// namespace ending in `.ku`.
+		fields := [...]string{node.Name, retrieval.Signature, retrieval.QualName}
+		fieldCount := len(fields)
+		if exploreCompactSourceLiteral(term, utf8.RuneCountInString(term)) {
+			fieldCount--
+		}
+		for _, field := range fields[:fieldCount] {
 			if exploreTextHasExactLiteral(field, term) {
 				return true
 			}
+		}
+	}
+	return false
+}
+
+func exploreQueryHasTestIntent(task string) bool {
+	for _, token := range rerank.Tokenize(task) {
+		switch strings.ToLower(token) {
+		case "test", "tests", "testing", "spec", "specs", "fixture", "fixtures":
+			return true
+		}
+	}
+	return false
+}
+
+func exploreSourceLiteralConstructionIntent(task string) bool {
+	for _, token := range rerank.Tokenize(task) {
+		switch strings.ToLower(token) {
+		case "construct", "constructed", "constructing", "construction", "constructor", "constructors",
+			"initialise", "initialised", "initialises", "initialising", "initialisation",
+			"initialize", "initialized", "initializes", "initializing", "initialization",
+			"instantiate", "instantiated", "instantiates", "instantiating", "instantiation":
+			return true
 		}
 	}
 	return false
@@ -3151,6 +4050,11 @@ func (s *Server) gatherExploreQuotedContentCandidates(
 	uniqueExact := make(map[string]bool, len(pages)*perTerm)
 	ambiguousExact := make(map[string]bool, len(pages)*perTerm)
 	sourceLiteralHit := make(map[string]float64)
+	sourceLiteralAnchors := make(map[string]map[int]struct{})
+	sourceLiteralAmbiguous := make(map[string]bool)
+	sourceLiteralSettled := make(map[string]bool)
+	sourceLiteralCallee := make(map[string]bool)
+	sourceLiteralTaskAligned := make(map[string]bool)
 	for _, page := range pages {
 		seenForTerm := make(map[string]struct{}, len(page.hits))
 		exactIDs := make(map[string]struct{})
@@ -3187,22 +4091,33 @@ func (s *Server) gatherExploreQuotedContentCandidates(
 	if len(order) > 0 {
 		nodes = s.graph.GetNodesByIDs(order)
 	}
-	exactSourceFound := exploreQuotedRecallHasExactSourceCandidate(task, terms, ordinary, scope)
-	if !exactSourceFound {
-		for _, id := range order {
-			if exploreQuotedRecallHasExactSourceNode(task, terms, nodes[id], scope) {
-				exactSourceFound = true
-				break
+	// Decide source coverage per quoted term. An exact metadata hit for one
+	// symbol-like term must not suppress a different compact value whose only
+	// useful evidence is inside a registration body. The selected missing term
+	// still feeds one bounded source scan, so this preserves the fixed I/O cap.
+	sourceRecallTerms := make([]string, 0, len(terms))
+	for _, term := range terms {
+		oneTerm := []string{term}
+		exactSourceFound := exploreQuotedRecallHasExactSourceCandidate(task, oneTerm, ordinary, scope)
+		if !exactSourceFound {
+			for _, id := range order {
+				if exploreQuotedRecallHasExactSourceNode(task, oneTerm, nodes[id], scope) {
+					exactSourceFound = true
+					break
+				}
 			}
+		}
+		if !exactSourceFound {
+			sourceRecallTerms = append(sourceRecallTerms, term)
 		}
 	}
 
 	// content_fts stores content-class nodes rather than ordinary source bodies.
 	// An exact document hit therefore does not prove that the source declaration
-	// containing the literal is represented. Only a miss across both ordinary
-	// retrieval and hydrated content symbols activates the bounded source scan.
-	if ctx.Err() == nil && !exactSourceFound {
-		sourceRecall := s.gatherExploreSourceLiteralRecall(ctx, terms, repoPrefix, scope)
+	// containing the literal is represented. Only a per-term miss across both
+	// ordinary retrieval and hydrated content symbols activates the bounded scan.
+	if ctx.Err() == nil && len(sourceRecallTerms) > 0 {
+		sourceRecall := s.gatherExploreSourceLiteralRecall(ctx, sourceRecallTerms, repoPrefix, scope)
 		missingNodes := make([]string, 0, len(sourceRecall.hits))
 		for _, hit := range sourceRecall.hits {
 			if previous, exists := bestRank[hit.nodeID]; !exists {
@@ -3212,8 +4127,14 @@ func (s *Server) gatherExploreQuotedContentCandidates(
 			} else if hit.rank < previous {
 				bestRank[hit.nodeID] = hit.rank
 			}
-			if termCount[hit.nodeID] == 0 {
-				termCount[hit.nodeID] = 1
+			anchors := sourceLiteralAnchors[hit.nodeID]
+			if anchors == nil {
+				anchors = make(map[int]struct{}, exploreSourceLiteralRecallMaxTerms)
+				sourceLiteralAnchors[hit.nodeID] = anchors
+			}
+			anchors[hit.anchor] = struct{}{}
+			if termCount[hit.nodeID] < len(anchors) {
+				termCount[hit.nodeID] = len(anchors)
 			}
 			exactHit[hit.nodeID] = true
 			sourceRank := 1.0
@@ -3223,15 +4144,48 @@ func (s *Server) gatherExploreQuotedContentCandidates(
 			if sourceRank > sourceLiteralHit[hit.nodeID] {
 				sourceLiteralHit[hit.nodeID] = sourceRank
 			}
-			if sourceRecall.ambiguous {
-				ambiguousExact[hit.nodeID] = true
+			if hit.callee {
+				sourceLiteralCallee[hit.nodeID] = true
+			}
+			if hit.ambiguous {
+				sourceLiteralAmbiguous[hit.nodeID] = true
 			} else {
-				uniqueExact[hit.nodeID] = true
+				sourceLiteralSettled[hit.nodeID] = true
+			}
+		}
+		for id := range sourceLiteralAnchors {
+			if sourceLiteralAmbiguous[id] && !sourceLiteralSettled[id] {
+				ambiguousExact[id] = true
+			} else {
+				uniqueExact[id] = true
 			}
 		}
 		if len(missingNodes) > 0 {
 			for id, node := range s.graph.GetNodesByIDs(missingNodes) {
 				nodes[id] = node
+			}
+		}
+		// A collision-heavy literal alone cannot justify replacing two semantic
+		// candidates. When the task explicitly asks about construction, however,
+		// an exact callsite whose resolved callable instantiates a value is a
+		// language-neutral causal discriminator. One batched edge lookup covers
+		// the already-bounded owner set; no source body or recursive walk is added.
+		if exploreSourceLiteralConstructionIntent(task) {
+			calleeIDs := make([]string, 0, len(sourceLiteralCallee))
+			for id, callee := range sourceLiteralCallee {
+				if callee {
+					calleeIDs = append(calleeIDs, id)
+				}
+			}
+			if len(calleeIDs) > 0 {
+				for id, edges := range s.graph.GetOutEdgesByNodeIDs(calleeIDs) {
+					for _, edge := range edges {
+						if edge != nil && edge.Kind == graph.EdgeInstantiates {
+							sourceLiteralTaskAligned[id] = true
+							break
+						}
+					}
+				}
 			}
 		}
 	}
@@ -3257,6 +4211,13 @@ func (s *Server) gatherExploreQuotedContentCandidates(
 		}
 		if sourceRank := sourceLiteralHit[id]; sourceRank > 0 {
 			signals[exploreSourceLiteralSignal] = sourceRank
+			signals[exploreSourceLiteralCoverageSignal] = float64(len(sourceLiteralAnchors[id]))
+			if sourceLiteralCallee[id] {
+				signals[exploreSourceLiteralCalleeSignal] = 1
+			}
+			if sourceLiteralTaskAligned[id] {
+				signals[exploreSourceLiteralTaskAlignSignal] = 1
+			}
 		}
 		candidates = append(candidates, &rerank.Candidate{
 			Node:       node,
@@ -3268,13 +4229,63 @@ func (s *Server) gatherExploreQuotedContentCandidates(
 	return candidates
 }
 
+// exploreConceptTermPresent recognizes a bounded family of inflectional forms
+// when concept prose and source identifiers use different grammatical forms
+// (for example matching versus matched_ignore). It never uses a raw stem
+// substring: that would incorrectly equate building with Builder.
+func exploreConceptTermPresent(text, term string) bool {
+	if strings.Contains(text, term) {
+		return true
+	}
+	for _, suffix := range [...]string{"ing", "ed"} {
+		if !strings.HasSuffix(term, suffix) {
+			continue
+		}
+		stem := strings.TrimSuffix(term, suffix)
+		if len(stem) < 5 {
+			continue
+		}
+		alternate := stem + "ing"
+		if suffix == "ing" {
+			alternate = stem + "ed"
+		}
+		if exploreConceptFormAtBoundary(text, alternate, false) ||
+			exploreConceptFormAtBoundary(text, stem, true) {
+			return true
+		}
+	}
+	return false
+}
+
+func exploreConceptFormAtBoundary(text, form string, requireEnd bool) bool {
+	for offset := 0; offset < len(text); {
+		index := strings.Index(text[offset:], form)
+		if index < 0 {
+			return false
+		}
+		index += offset
+		startOK := index == 0 || !exploreASCIIAlphaNumeric(text[index-1])
+		end := index + len(form)
+		endOK := !requireEnd || end == len(text) || !exploreASCIIAlphaNumeric(text[end])
+		if startOK && endOK {
+			return true
+		}
+		offset = index + 1
+	}
+	return false
+}
+
+func exploreASCIIAlphaNumeric(value byte) bool {
+	return value >= 'a' && value <= 'z' || value >= '0' && value <= '9'
+}
+
 // rerankExploreConceptCoverage corrects the principal weakness of prefix-OR
 // symbol retrieval: one rare identifier can otherwise outrank an implementation
 // whose metadata covers several independent task concepts. Explicit anchors and
 // bounded exact body-literal hits remain strongest. Vector-backed candidates
 // retain their semantic ordering; coverage only reorders lexical-only rows.
 func rerankExploreConceptCoverage(query string, candidates []*rerank.Candidate) []*rerank.Candidate {
-	if rerank.ClassifyQuery(query) != rerank.QueryClassConcept || len(candidates) < 2 {
+	if exploreQueryClass(query) != rerank.QueryClassConcept || len(candidates) < 2 {
 		return candidates
 	}
 	queryTerms := exploreTerminalTerms(query)
@@ -3282,14 +4293,19 @@ func rerankExploreConceptCoverage(query string, candidates []*rerank.Candidate) 
 		return candidates
 	}
 	type evidence struct {
+		text           string
 		explicit       bool
 		exactContent   bool
 		ambiguousExact bool
+		callable       bool
+		generic        bool
 		overlap        int
 		contentTerms   float64
 		contentRank    float64
 	}
 	metrics := make(map[*rerank.Candidate]evidence, len(candidates))
+	termFrequency := make(map[string]int, len(queryTerms))
+	candidateCount := 0
 	for _, candidate := range candidates {
 		if candidate == nil || candidate.Node == nil {
 			continue
@@ -3299,22 +4315,41 @@ func rerankExploreConceptCoverage(query string, candidates []*rerank.Candidate) 
 		if len(doc) > 768 {
 			doc = doc[:768]
 		}
-		// Candidate-side token maps are disproportionately expensive on the
-		// 80-row over-fetch window. Query terms are already normalized and at
-		// least three bytes long; a lowercase retrieval projection plus bounded
-		// substring checks preserves camelCase/path matching with no per-term
-		// allocations.
 		text := strings.ToLower(strings.Join([]string{
 			candidate.Node.Name, retrieval.QualName, nodeDisplayPath(candidate.Node),
 			retrieval.Signature, doc,
 		}, " "))
+		metrics[candidate] = evidence{text: text}
+		candidateCount++
+		for term := range queryTerms {
+			if exploreConceptTermPresent(text, term) {
+				termFrequency[term]++
+			}
+		}
+	}
+	// A task noun shared by more than a third of the retrieval window (path is
+	// the common case) carries no discriminating evidence. Counting it as a
+	// second concept turns every path wrapper into a strong semantic peer and
+	// freezes the upstream rank order. Frequency is computed only inside the
+	// already-bounded window, so this adds no graph or index work.
+	maxFrequency := max(1, candidateCount/3)
+	for _, candidate := range candidates {
+		if candidate == nil || candidate.Node == nil {
+			continue
+		}
+		metric := metrics[candidate]
+		text := metric.text
 		overlap := 0
 		for term := range queryTerms {
-			if strings.Contains(text, term) {
+			if frequency := termFrequency[term]; frequency > 0 && frequency <= maxFrequency &&
+				exploreConceptTermPresent(text, term) {
 				overlap++
 			}
 		}
-		metric := evidence{explicit: exploreLocalizationExplicitAnchor(query, candidate.Node), overlap: overlap}
+		metric.explicit = exploreLocalizationExplicitAnchor(query, candidate.Node)
+		metric.callable = candidate.Node.Kind == graph.KindFunction || candidate.Node.Kind == graph.KindMethod
+		metric.generic = exploreDraftGenericCandidate(candidate.Node, "")
+		metric.overlap = overlap
 		if candidate.Signals != nil {
 			metric.contentTerms = candidate.Signals[exploreContentRecallTermSignal]
 			metric.contentRank = candidate.Signals[exploreContentRecallRankSignal]
@@ -3348,20 +4383,33 @@ func rerankExploreConceptCoverage(query string, candidates []*rerank.Candidate) 
 			return 0
 		}
 	}
+	strongConjunctive := func(candidate *rerank.Candidate) bool {
+		metric := metrics[candidate]
+		return metric.callable && !metric.generic && metric.overlap >= 2
+	}
+	weakCollision := func(candidate *rerank.Candidate) bool {
+		metric := metrics[candidate]
+		return metric.generic || metric.overlap <= 1
+	}
 	// Explicit anchors and verified full quoted literals may cross semantic
 	// candidates. Unique exact evidence leads ambiguous pages; ambiguous exact
-	// peers use task coverage before content-channel rank. All other evidence
-	// only reorders lexical-only slots, preserving vector ordering.
+	// peers use task coverage before content-channel rank. Outside those proof
+	// tiers, one concrete callable covering two independent concepts may cross a
+	// generic one-token exact/vector collision, but never another multi-concept
+	// semantic candidate.
 	sort.SliceStable(candidates, func(i, j int) bool {
 		a, b := candidates[i], candidates[j]
 		at, bt := priorityTier(a), priorityTier(b)
 		if at != bt {
 			return at > bt
 		}
+		am, bm := metrics[a], metrics[b]
+		if at == 0 {
+			return false
+		}
 		if at != 1 {
 			return false
 		}
-		am, bm := metrics[a], metrics[b]
 		ac, bc := coverageTier(am.overlap), coverageTier(bm.overlap)
 		if ac != bc {
 			return ac > bc
@@ -3374,6 +4422,24 @@ func rerankExploreConceptCoverage(query string, candidates []*rerank.Candidate) 
 		}
 		return am.contentRank > bm.contentRank
 	})
+	// Within the ordinary evidence tier, promote a strong conjunctive callable
+	// only across adjacent weak collisions. A multi-concept non-callable is a
+	// barrier: crossing it would violate the promise that semantic peers retain
+	// their upstream order. Expressing that barrier relation inside sort.Less is
+	// non-transitive (strong~medium, medium~weak, strong<weak), so use this
+	// explicit stable insertion pass instead.
+	for index := 1; index < len(candidates); index++ {
+		candidate := candidates[index]
+		if priorityTier(candidate) != 0 || !strongConjunctive(candidate) {
+			continue
+		}
+		insert := index
+		for insert > 0 && priorityTier(candidates[insert-1]) == 0 && weakCollision(candidates[insert-1]) {
+			candidates[insert] = candidates[insert-1]
+			insert--
+		}
+		candidates[insert] = candidate
+	}
 	priorityEnd := 0
 	for priorityEnd < len(candidates) && priorityTier(candidates[priorityEnd]) > 0 {
 		priorityEnd++
@@ -3451,6 +4517,9 @@ func mergeExploreCandidates(primary, expanded []*rerank.Candidate, expansionRank
 				exploreContentRecallExactSignal,
 				exploreContentRecallAmbiguousSignal,
 				exploreSourceLiteralSignal,
+				exploreSourceLiteralCalleeSignal,
+				exploreSourceLiteralCoverageSignal,
+				exploreSourceLiteralTaskAlignSignal,
 			} {
 				if clone.Signals == nil || clone.Signals[key] <= current.Signals[key] {
 					continue
@@ -3531,9 +4600,10 @@ func limitExploreCandidates(candidates []*rerank.Candidate, limit int) []*rerank
 }
 
 // limitExploreCandidatesPreservingSourceLiteral reserves one slot for the best
-// request-local raw-source literal hit after the ordinary retrieval union is
-// full. The reservation replaces the weakest bounded candidate; it never grows
-// the candidate set or performs another graph lookup.
+// request-local raw-source literal owners after the ordinary retrieval union is
+// full. The bounded reservation prefers multi-anchor owners, preserves one
+// semantic candidate, and never grows the candidate set or performs another
+// graph lookup.
 func limitExploreCandidatesPreservingSourceLiteral(candidates []*rerank.Candidate, limit int) []*rerank.Candidate {
 	bounded := limitExploreCandidates(candidates, limit)
 	if limit <= 0 || len(candidates) <= limit || len(bounded) == 0 {
@@ -3542,35 +4612,129 @@ func limitExploreCandidatesPreservingSourceLiteral(candidates []*rerank.Candidat
 	return reserveExploreSourceLiteralCandidate(candidates, bounded)
 }
 
-// reserveExploreSourceLiteralCandidate inserts the strongest source-literal
-// candidate into an already-selected window. It deliberately leaves the
-// window's established order untouched unless a replacement is required.
+// reserveExploreSourceLiteralCandidate inserts up to two bounded source-literal
+// owners into an already-selected window, preferring owners that cover multiple
+// anchors while preserving at least one semantic candidate. It leaves the
+// established order untouched unless replacement is required.
 func reserveExploreSourceLiteralCandidate(candidates, bounded []*rerank.Candidate) []*rerank.Candidate {
 	if len(bounded) == 0 || len(candidates) <= len(bounded) {
 		return bounded
 	}
-	var best *rerank.Candidate
-	bestSignal := 0.0
-	for _, candidate := range candidates {
-		if candidate == nil || candidate.Node == nil || candidate.Signals == nil {
-			continue
-		}
-		if signal := candidate.Signals[exploreSourceLiteralSignal]; signal > bestSignal {
-			best = candidate
-			bestSignal = signal
-		}
-	}
-	if best == nil {
+	// A source-body fallback may occupy at most the slots after the ranked
+	// semantic head. This remains true even for a one-slot response.
+	reservationLimit := min(exploreSourceLiteralReservationMax, len(bounded)-1)
+	if reservationLimit <= 0 {
 		return bounded
 	}
-	for _, candidate := range bounded {
-		if candidate != nil && candidate.Node != nil && candidate.Node.ID == best.Node.ID {
-			return bounded
+
+	sources := make([]*rerank.Candidate, 0, exploreSourceLiteralReservationMax)
+	seenSourceIDs := make(map[string]struct{}, exploreSourceLiteralReservationMax)
+	for _, candidate := range candidates {
+		if candidate == nil || candidate.Node == nil || candidate.Node.ID == "" || candidate.Signals == nil ||
+			candidate.Signals[exploreSourceLiteralSignal] <= 0 {
+			continue
+		}
+		if _, duplicate := seenSourceIDs[candidate.Node.ID]; duplicate {
+			continue
+		}
+		seenSourceIDs[candidate.Node.ID] = struct{}{}
+		sources = append(sources, candidate)
+	}
+	directProductionCallee := func(candidate *rerank.Candidate) bool {
+		return candidate != nil && candidate.Node != nil && candidate.Signals != nil &&
+			candidate.Signals[exploreSourceLiteralCalleeSignal] > 0 &&
+			!exploreDraftIsTestNode(candidate.Node)
+	}
+	callableSpecificity := func(candidate *rerank.Candidate) int {
+		if !directProductionCallee(candidate) {
+			return 0
+		}
+		return exploreIdentifierSegmentCountBounded(candidate.Node.Name)
+	}
+	sort.SliceStable(sources, func(i, j int) bool {
+		leftCoverage := sources[i].Signals[exploreSourceLiteralCoverageSignal]
+		rightCoverage := sources[j].Signals[exploreSourceLiteralCoverageSignal]
+		if leftCoverage != rightCoverage {
+			return leftCoverage > rightCoverage
+		}
+		leftSettled := sources[i].Signals[exploreContentRecallAmbiguousSignal] <= 0
+		rightSettled := sources[j].Signals[exploreContentRecallAmbiguousSignal] <= 0
+		if leftSettled != rightSettled {
+			return leftSettled
+		}
+		leftDirect := directProductionCallee(sources[i])
+		rightDirect := directProductionCallee(sources[j])
+		if leftDirect != rightDirect {
+			return leftDirect
+		}
+		leftAligned := sources[i].Signals[exploreSourceLiteralTaskAlignSignal] > 0
+		rightAligned := sources[j].Signals[exploreSourceLiteralTaskAlignSignal] > 0
+		if leftAligned != rightAligned {
+			return leftAligned
+		}
+		leftRank := sources[i].Signals[exploreSourceLiteralSignal]
+		rightRank := sources[j].Signals[exploreSourceLiteralSignal]
+		if leftRank != rightRank {
+			return leftRank > rightRank
+		}
+		return callableSpecificity(sources[i]) > callableSpecificity(sources[j])
+	})
+	selectedSources := sources[:0]
+	for _, source := range sources {
+		coverage := source.Signals[exploreSourceLiteralCoverageSignal]
+		settled := source.Signals[exploreContentRecallAmbiguousSignal] <= 0
+		// One ambiguous single-anchor owner may preserve recall, but allowing a
+		// second would spend most of a three-slot answer on collision evidence.
+		// Multi-anchor corroboration is strong enough to keep despite ambiguity.
+		if len(selectedSources) > 0 && coverage < 2 && !settled {
+			continue
+		}
+		selectedSources = append(selectedSources, source)
+		if len(selectedSources) == reservationLimit {
+			break
 		}
 	}
+	sources = selectedSources
+	if len(sources) == 0 {
+		return bounded
+	}
 
+	desired := make(map[string]struct{}, len(sources))
+	present := make(map[string]struct{}, len(bounded))
+	for _, candidate := range sources {
+		desired[candidate.Node.ID] = struct{}{}
+	}
+	for _, candidate := range bounded {
+		if candidate != nil && candidate.Node != nil {
+			present[candidate.Node.ID] = struct{}{}
+		}
+	}
 	reserved := append([]*rerank.Candidate(nil), bounded...)
-	reserved[len(reserved)-1] = best
+	for _, source := range sources {
+		if _, exists := present[source.Node.ID]; exists {
+			continue
+		}
+		replace := -1
+		for index := len(reserved) - 1; index >= 1; index-- {
+			candidate := reserved[index]
+			if candidate == nil || candidate.Node == nil {
+				replace = index
+				break
+			}
+			if _, protected := desired[candidate.Node.ID]; !protected {
+				replace = index
+				break
+			}
+		}
+		if replace < 0 {
+			break
+		}
+		if previous := reserved[replace]; previous != nil && previous.Node != nil {
+			delete(present, previous.Node.ID)
+		}
+		reserved[replace] = source
+		present[source.Node.ID] = struct{}{}
+	}
 	return reserved
 }
 
@@ -3580,14 +4744,18 @@ func reserveExploreSourceLiteralCandidate(candidates, bounded []*rerank.Candidat
 // the ordinary retrieval head.
 func promoteExploreSourceLiteralCandidate(candidates []*rerank.Candidate) []*rerank.Candidate {
 	bestIndex := -1
+	bestCoverage := 0.0
 	bestSignal := 0.0
 	for index, candidate := range candidates {
 		if candidate == nil || candidate.Node == nil || candidate.Signals == nil ||
 			candidate.Signals[exploreContentRecallAmbiguousSignal] > 0 {
 			continue
 		}
-		if signal := candidate.Signals[exploreSourceLiteralSignal]; signal > bestSignal {
+		coverage := candidate.Signals[exploreSourceLiteralCoverageSignal]
+		signal := candidate.Signals[exploreSourceLiteralSignal]
+		if signal > 0 && (coverage > bestCoverage || coverage == bestCoverage && signal > bestSignal) {
 			bestIndex = index
+			bestCoverage = coverage
 			bestSignal = signal
 		}
 	}
@@ -3599,6 +4767,40 @@ func promoteExploreSourceLiteralCandidate(candidates []*rerank.Candidate) []*rer
 	best := promoted[bestIndex]
 	copy(promoted[1:bestIndex+1], promoted[:bestIndex])
 	promoted[0] = best
+	return promoted
+}
+
+// promoteExploreStrongSourceLiteralTarget keeps terminality aligned with the
+// final evidence projection after concept owner folding. A unique, hydrated
+// source-literal callee is direct implementation proof; an owner inserted from
+// member_of metadata must not displace it. Ambiguous or incomplete literal
+// hits deliberately retain their established order.
+func promoteExploreStrongSourceLiteralTarget(targets []exploreTarget) []exploreTarget {
+	hasDivergentOwner, hasDivergentType := false, false
+	for _, target := range targets {
+		hasDivergentOwner = hasDivergentOwner || target.divergentDefaultOwner
+		hasDivergentType = hasDivergentType || target.divergentDefaultType
+	}
+	if hasDivergentOwner && hasDivergentType {
+		// The paired constructor/default-flow proof identifies why behavior
+		// diverges, while a literal callee identifies only where the literal is
+		// consumed. Preserve the stronger causal ordering.
+		return targets
+	}
+	best := -1
+	for index, target := range targets {
+		if localizationStrongSourceLiteralCallee(target) {
+			best = index
+			break
+		}
+	}
+	if best <= 0 {
+		return targets
+	}
+	promoted := append([]exploreTarget(nil), targets...)
+	target := promoted[best]
+	copy(promoted[1:best+1], promoted[:best])
+	promoted[0] = target
 	return promoted
 }
 
@@ -3632,24 +4834,108 @@ func selectFinalExploreCandidates(prod, test []*rerank.Candidate, maxSymbols int
 // first-seen order for the ordinary concept recall channel. The same generic
 // and stopword filter used by answer-readiness keeps agent verbs and task
 // boilerplate from consuming the bounded expansion bag.
+func exploreConceptRecallTokenStream(text string) []string {
+	fields := strings.FieldsFunc(text, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '_'
+	})
+	tokens := make([]string, 0, len(fields))
+	for _, field := range fields {
+		tokens = append(tokens, rerank.Tokenize(field)...)
+	}
+	return tokens
+}
+
 func exploreConceptRecallTerms(text string) []string {
-	const maxTerms = 12
+	const (
+		maxTerms     = 12
+		frequentCap  = 8
+		lateMinChars = 6
+	)
 	allowed := exploreTerminalTerms(text)
-	seen := make(map[string]struct{}, len(allowed))
-	out := make([]string, 0, min(len(allowed), maxTerms))
-	for _, raw := range rerank.Tokenize(text) {
+	type termStat struct {
+		term        string
+		first, last int
+		count       int
+	}
+	stats := make([]termStat, 0, len(allowed))
+	byTerm := make(map[string]int, len(allowed))
+	weightedTokens := exploreConceptRecallTokenStream(text)
+	for position, raw := range weightedTokens {
 		term := exploreTerminalTermRoot(strings.ToLower(strings.TrimSpace(raw)))
 		if _, ok := allowed[term]; !ok {
 			continue
 		}
-		if _, ok := seen[term]; ok {
+		if index, ok := byTerm[term]; ok {
+			stats[index].count++
+			stats[index].last = position
 			continue
 		}
-		seen[term] = struct{}{}
-		out = append(out, term)
-		if len(out) >= maxTerms {
+		byTerm[term] = len(stats)
+		stats = append(stats, termStat{term: term, first: position, last: position, count: 1})
+	}
+	if len(stats) <= maxTerms {
+		out := make([]string, len(stats))
+		for index := range stats {
+			out[index] = stats[index].term
+		}
+		return out
+	}
+
+	// Repetition captures the weighted lead; length breaks ties toward more
+	// informative concepts. Reserve the remaining slots by scanning the
+	// original tail so late technical constraints survive the fixed bag even
+	// when the lead was deliberately repeated for primary retrieval.
+	ranked := append([]termStat(nil), stats...)
+	sort.SliceStable(ranked, func(i, j int) bool {
+		if ranked[i].count != ranked[j].count {
+			return ranked[i].count > ranked[j].count
+		}
+		if len(ranked[i].term) != len(ranked[j].term) {
+			return len(ranked[i].term) > len(ranked[j].term)
+		}
+		return ranked[i].first < ranked[j].first
+	})
+	selected := make(map[string]struct{}, maxTerms)
+	for _, stat := range ranked {
+		if len(selected) >= frequentCap {
 			break
 		}
+		selected[stat.term] = struct{}{}
+	}
+	baseText := strings.TrimSpace(text)
+	if lead := inlineLeadClause(baseText); lead != "" {
+		suffix := " " + lead
+		if strings.HasSuffix(baseText, suffix) {
+			baseText = strings.TrimSpace(strings.TrimSuffix(baseText, suffix))
+		}
+	}
+	baseTokens := exploreConceptRecallTokenStream(baseText)
+	for index := len(baseTokens) - 1; index >= 0 && len(selected) < maxTerms; index-- {
+		term := exploreTerminalTermRoot(strings.ToLower(strings.TrimSpace(baseTokens[index])))
+		if len(term) < lateMinChars {
+			continue
+		}
+		if _, ok := allowed[term]; !ok {
+			continue
+		}
+		selected[term] = struct{}{}
+	}
+	for _, stat := range ranked {
+		if len(selected) >= maxTerms {
+			break
+		}
+		selected[stat.term] = struct{}{}
+	}
+	chosen := make([]termStat, 0, len(selected))
+	for _, stat := range stats {
+		if _, ok := selected[stat.term]; ok {
+			chosen = append(chosen, stat)
+		}
+	}
+	sort.SliceStable(chosen, func(i, j int) bool { return chosen[i].first < chosen[j].first })
+	out := make([]string, len(chosen))
+	for index := range chosen {
+		out[index] = chosen[index].term
 	}
 	return out
 }

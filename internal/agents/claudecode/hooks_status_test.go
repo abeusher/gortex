@@ -21,7 +21,7 @@ func TestPreToolUseStatusMessageReflectsMode(t *testing.T) {
 	}
 }
 
-func TestRewriteGortexPreToolUseStatusPreservesCustomMessage(t *testing.T) {
+func TestRewriteGortexPreToolUseStatusPreservesMixedGroup(t *testing.T) {
 	generated := map[string]any{
 		"command":       "/opt/gortex hook --mode=enrich",
 		"statusMessage": preToolUseStatusEnrich,
@@ -34,14 +34,30 @@ func TestRewriteGortexPreToolUseStatusPreservesCustomMessage(t *testing.T) {
 		"PreToolUse": []any{map[string]any{"hooks": []any{generated, custom}}},
 	}
 
+	if got := rewriteGortexPreToolUseStatus(hooks, HookModeDeny); got != 0 {
+		t.Fatalf("rewritten count = %d, want 0 for mixed-ownership group", got)
+	}
+	if got := generated["statusMessage"]; got != preToolUseStatusEnrich {
+		t.Fatalf("generated message changed inside mixed group: %#v", got)
+	}
+	if got := custom["statusMessage"]; got != "custom user-set message" {
+		t.Fatalf("custom message changed: %#v", got)
+	}
+}
+
+func TestRewriteGortexPreToolUseStatusRewritesPureManagedGroup(t *testing.T) {
+	generated := map[string]any{
+		"command":       "/opt/gortex hook --mode=enrich",
+		"statusMessage": preToolUseStatusEnrich,
+	}
+	hooks := map[string]any{
+		"PreToolUse": []any{map[string]any{"hooks": []any{generated}}},
+	}
 	if got := rewriteGortexPreToolUseStatus(hooks, HookModeDeny); got != 1 {
 		t.Fatalf("rewritten count = %d, want 1", got)
 	}
 	if got := generated["statusMessage"]; got != preToolUseStatusDeny {
 		t.Fatalf("generated message = %#v, want %q", got, preToolUseStatusDeny)
-	}
-	if got := custom["statusMessage"]; got != "custom user-set message" {
-		t.Fatalf("custom message changed: %#v", got)
 	}
 }
 

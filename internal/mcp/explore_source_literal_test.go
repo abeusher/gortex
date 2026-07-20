@@ -28,12 +28,24 @@ import (
 
 type exploreSourceLiteralCountingStore struct {
 	graph.Store
-	allNodesCalls int
+	allNodesCalls     int
+	outEdgeBatchCalls int
+	nodeLookupBatches int
 }
 
 func (s *exploreSourceLiteralCountingStore) AllNodes() []*graph.Node {
 	s.allNodesCalls++
 	return s.Store.AllNodes()
+}
+
+func (s *exploreSourceLiteralCountingStore) GetOutEdgesByNodeIDs(ids []string) map[string][]*graph.Edge {
+	s.outEdgeBatchCalls++
+	return s.Store.GetOutEdgesByNodeIDs(ids)
+}
+
+func (s *exploreSourceLiteralCountingStore) GetNodesByIDs(ids []string) map[string]*graph.Node {
+	s.nodeLookupBatches++
+	return s.Store.GetNodesByIDs(ids)
 }
 
 type exploreSourceLiteralBlockingStore struct {
@@ -66,6 +78,10 @@ func (s *exploreSourceLiteralOrderedStore) GetFileNodesContext(ctx context.Conte
 	return s.nodesByPath[path]
 }
 
+func (s *exploreSourceLiteralOrderedStore) GetOutEdgesByNodeIDs([]string) map[string][]*graph.Edge {
+	return nil
+}
+
 func newExploreSourceLiteralServer(t testing.TB, nodes []*graph.Node) *Server {
 	t.Helper()
 	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
@@ -75,12 +91,147 @@ func newExploreSourceLiteralServer(t testing.TB, nodes []*graph.Node) *Server {
 	return &Server{graph: store}
 }
 
+func newExploreSourceLiteralGraphServer(
+	t testing.TB,
+	nodes []*graph.Node,
+	edges []*graph.Edge,
+) (*Server, *exploreSourceLiteralCountingStore) {
+	t.Helper()
+	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	store.AddBatch(nodes, edges)
+	counting := &exploreSourceLiteralCountingStore{Store: store}
+	return &Server{graph: counting}, counting
+}
+
 func sourceLiteralNode(id, name, path string, kind graph.NodeKind, start, end int) *graph.Node {
 	return &graph.Node{
 		ID: id, Name: name, QualName: id, Kind: kind,
 		FilePath: path, RepoPrefix: "demo", Language: "csharp",
 		StartLine: start, EndLine: end,
 	}
+}
+
+func TestExploreSourceLiteralCallNameAcrossLanguages(t *testing.T) {
+	tests := []struct {
+		name string
+		line string
+		want string
+		ok   bool
+	}{
+		{name: "csharp", line: `RegisterDefaultFormatter("ku", formatter);`, want: "RegisterDefaultFormatter", ok: true},
+		{name: "rust", line: `register_default_formatter("ku", formatter);`, want: "register_default_formatter", ok: true},
+		{name: "typescript member", line: `registry.registerDefaultFormatter('ku', formatter);`, want: "registerDefaultFormatter", ok: true},
+		{name: "nested", line: `install(resolve("ku"));`, want: "resolve", ok: true},
+		{name: "assignment", line: `const locale = "ku";`},
+		{name: "control expression", line: `if (locale == "ku") { register(); }`},
+		{name: "ambiguous calls", line: `left("ku"); right("ku");`},
+		{name: "multiline is conservative", line: `RegisterDefaultFormatter(`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, ok := exploreSourceLiteralCallName(test.line, "ku")
+			require.Equal(t, test.ok, ok)
+			require.Equal(t, test.want, got)
+		})
+	}
+}
+
+func TestMapExploreSourceLiteralMatchesPromotesUniqueDirectCalleeAcrossLanguages(t *testing.T) {
+	tests := []struct {
+		name     string
+		language string
+		line     string
+		callee   string
+	}{
+		{name: "csharp", language: "csharp", line: `RegisterDefaultFormatter("ku");`, callee: "RegisterDefaultFormatter"},
+		{name: "rust", language: "rust", line: `register_default_formatter("ku");`, callee: "register_default_formatter"},
+		{name: "typescript", language: "typescript", line: `registry.registerDefaultFormatter('ku');`, callee: "registerDefaultFormatter"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := "demo/src/registry"
+			owner := sourceLiteralNode(path+"::configure", "configure", path, graph.KindMethod, 1, 5)
+			callee := sourceLiteralNode(path+"::"+test.callee, test.callee, path, graph.KindMethod, 7, 9)
+			owner.Language = test.language
+			callee.Language = test.language
+			server, counting := newExploreSourceLiteralGraphServer(t, []*graph.Node{owner, callee}, []*graph.Edge{{
+				From: owner.ID, To: callee.ID, Kind: graph.EdgeCalls, FilePath: path, Line: 3,
+			}})
+
+			recall := server.mapExploreSourceLiteralMatches("ku", []trigram.Match{{
+				Path: path, Line: 3, Text: test.line,
+			}}, query.QueryOptions{RepoAllow: map[string]bool{"demo": true}})
+
+			require.Equal(t, []exploreSourceLiteralHit{{nodeID: callee.ID, rank: 0, callee: true}}, recall.hits)
+			require.Equal(t, callee.FilePath, recall.ownerFiles[callee.ID])
+			require.Zero(t, counting.allNodesCalls, "callee promotion must remain batch- and file-bounded")
+			require.Equal(t, 1, counting.outEdgeBatchCalls)
+			require.Equal(t, 1, counting.nodeLookupBatches)
+		})
+	}
+}
+
+func TestMapExploreSourceLiteralMatchesDoesNotPromoteAmbiguousCallee(t *testing.T) {
+	path := "demo/src/registry.cs"
+	owner := sourceLiteralNode(path+"::configure", "configure", path, graph.KindMethod, 1, 5)
+	first := sourceLiteralNode(path+"::register-string", "RegisterDefaultFormatter", path, graph.KindMethod, 7, 9)
+	second := sourceLiteralNode(path+"::register-provider", "RegisterDefaultFormatter", path, graph.KindMethod, 11, 13)
+	server, _ := newExploreSourceLiteralGraphServer(t, []*graph.Node{owner, first, second}, []*graph.Edge{
+		{From: owner.ID, To: first.ID, Kind: graph.EdgeCalls, FilePath: path, Line: 3},
+		{From: owner.ID, To: second.ID, Kind: graph.EdgeCalls, FilePath: path, Line: 3},
+	})
+
+	recall := server.mapExploreSourceLiteralMatches("ku", []trigram.Match{{
+		Path: path, Line: 3, Text: `RegisterDefaultFormatter("ku");`,
+	}}, query.QueryOptions{RepoAllow: map[string]bool{"demo": true}})
+
+	require.Equal(t, []exploreSourceLiteralHit{{nodeID: owner.ID, rank: 0}}, recall.hits)
+}
+
+func TestMapExploreSourceLiteralMatchesDoesNotPromoteAssignment(t *testing.T) {
+	path := "demo/src/registry.cs"
+	owner := sourceLiteralNode(path+"::configure", "configure", path, graph.KindMethod, 1, 5)
+	callee := sourceLiteralNode(path+"::register", "RegisterDefaultFormatter", path, graph.KindMethod, 7, 9)
+	server, counting := newExploreSourceLiteralGraphServer(t, []*graph.Node{owner, callee}, []*graph.Edge{{
+		From: owner.ID, To: callee.ID, Kind: graph.EdgeCalls, FilePath: path, Line: 3,
+	}})
+
+	recall := server.mapExploreSourceLiteralMatches("ku", []trigram.Match{{
+		Path: path, Line: 3, Text: `const locale = "ku";`,
+	}}, query.QueryOptions{RepoAllow: map[string]bool{"demo": true}})
+
+	require.Equal(t, []exploreSourceLiteralHit{{nodeID: owner.ID, rank: 0}}, recall.hits,
+		"an unrelated same-line edge must not turn an assignment into a callsite")
+	require.Zero(t, counting.outEdgeBatchCalls, "non-call literal hits must not query graph adjacency")
+	require.Zero(t, counting.nodeLookupBatches, "non-call literal hits must not query callee nodes")
+}
+
+func TestExploreSourceLiteralLocalCalleeRejectsCrossRepositoryTarget(t *testing.T) {
+	owner := sourceLiteralNode("demo/registry.cs::configure", "configure", "demo/registry.cs", graph.KindMethod, 1, 5)
+	callee := sourceLiteralNode("other/registry.cs::register", "RegisterDefaultFormatter", "other/registry.cs", graph.KindMethod, 7, 9)
+	callee.RepoPrefix = "other"
+	require.False(t, exploreSourceLiteralLocalCallee(owner, callee, "RegisterDefaultFormatter", query.QueryOptions{}))
+}
+
+func TestSourceLiteralCalleeRemainsAuthorizedForRefinement(t *testing.T) {
+	task := `find where culture "ku" is registered`
+	owner := sourceLiteralNode("demo/registry.cs::configure", "configure", "demo/registry.cs", graph.KindMethod, 1, 5)
+	callee := sourceLiteralNode("demo/registry.cs::RegisterDefaultFormatter", "RegisterDefaultFormatter", "demo/registry.cs", graph.KindMethod, 7, 10)
+	targets := []exploreTarget{
+		{node: owner, source: `void configure() { ... }`},
+		{node: callee, source: `void RegisterDefaultFormatter(string culture) { ... }`, sourceLiteral: true},
+	}
+	preferred := explorePreferredRefinementSymbol(task, targets)
+	require.Equal(t, callee.ID, preferred)
+
+	_, completion, _, _ := buildLocalizationRefinementResultForTask(
+		preferred, task, targets, exploreDefaultBudgetTokens, exploreLocalizationRefinementRoutes(targets),
+	)
+	require.Equal(t, localizationStateNeedsRefinement, completion.State)
+	require.Contains(t, completion.AllowedSymbols, callee.ID)
+	require.Contains(t, completion.RequiredAction, callee.ID)
 }
 
 func TestMapExploreSourceLiteralMatchesFindsCSharpConstructor(t *testing.T) {
@@ -237,9 +388,24 @@ func TestMapDiscoveredExploreSourceLiteralMatchesPreservesHitsAfterDiscoveryDead
 	require.True(t, recall.ambiguous, "deadline-truncated discovery must remain non-terminal")
 }
 
-func TestExploreHighestInformationQuotedLiteral(t *testing.T) {
-	require.Equal(t, "registration-key", exploreHighestInformationQuotedLiteral([]string{"ku", "日本", "registration-key"}))
-	require.Empty(t, exploreHighestInformationQuotedLiteral(nil))
+func TestExplorePreferredSourceLiteralReservesCompactValue(t *testing.T) {
+	require.Equal(t, "ku", explorePreferredSourceLiteral([]string{"registration-key", "ku", "日本"}))
+	require.Equal(t, "日本", explorePreferredSourceLiteral([]string{"registration-key", "日本"}))
+	require.Empty(t, explorePreferredSourceLiteral(nil))
+}
+
+func TestExplorePreferredSourceLiteralRejectsCompactNoise(t *testing.T) {
+	for _, noise := range []string{"it", "x-1", "test", "file", "true"} {
+		require.Equal(t, "registration-key", explorePreferredSourceLiteral([]string{noise, "registration-key"}), noise)
+	}
+	// A short prose value remains searchable when it is the only literal; it
+	// simply no longer displaces a more selective term.
+	require.Equal(t, "test", explorePreferredSourceLiteral([]string{"test"}))
+}
+
+func TestExploreSourceLiteralFallbackUsesLongestRemainingTerm(t *testing.T) {
+	require.Equal(t, "registration-key", exploreSourceLiteralFallback([]string{"ku", "name", "registration-key"}, "ku"))
+	require.Empty(t, exploreSourceLiteralFallback([]string{"ku", "KU"}, "ku"))
 }
 
 func TestGatherExploreQuotedContentCandidatesMergesSourceLiteralWithExactContentNode(t *testing.T) {
@@ -279,6 +445,36 @@ func TestGatherExploreQuotedContentCandidatesMergesSourceLiteralWithExactContent
 
 	require.NotNil(t, candidateByID(candidates, document.ID), "exact content evidence must be retained")
 	require.NotNil(t, candidateByID(candidates, constructor.ID), "an exact non-source content hit must not suppress bounded source recall")
+}
+
+func TestGatherExploreQuotedContentCandidatesKeepsMissingCompactLiteralBesideExactPeer(t *testing.T) {
+	root := t.TempDir()
+	rel := "src/Registry.cs"
+	path := filepath.Join(root, filepath.FromSlash(rel))
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+	require.NoError(t, os.WriteFile(path, []byte("public sealed class Registry {\n    public void Configure() {\n        Register(\"xy\");\n    }\n}\n"), 0o644))
+
+	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	idx := indexer.New(store, parser.NewRegistry(), config.IndexConfig{}, zap.NewNop())
+	_, err = idx.IndexCtx(context.Background(), root)
+	require.NoError(t, err)
+	idx.SetFileMtimes(map[string]int64{rel: 1})
+
+	exactPeer := sourceLiteralNode("demo/src/VisibleType.cs::VisibleType", "VisibleType", "src/VisibleType.cs", graph.KindType, 1, 2)
+	configure := sourceLiteralNode("demo/src/Registry.cs::Registry.Configure", "Registry.Configure", rel, graph.KindMethod, 2, 4)
+	store.AddBatch([]*graph.Node{exactPeer, configure}, nil)
+	server := &Server{graph: store, indexer: idx, logger: zap.NewNop()}
+
+	candidates := server.gatherExploreQuotedContentCandidates(
+		context.Background(), `locate where "xy" is registered; "VisibleType" is contextual`,
+		[]*rerank.Candidate{{Node: exactPeer, TextRank: 0, VectorRank: -1}}, 20,
+		query.QueryOptions{RepoAllow: map[string]bool{"demo": true}},
+	)
+
+	require.NotNil(t, candidateByID(candidates, configure.ID),
+		"an exact metadata peer for one term must not suppress source recall for another quoted value")
 }
 
 func TestGatherExploreQuotedContentCandidatesSkipsSourceScanForExactOrdinaryCandidate(t *testing.T) {
@@ -321,8 +517,238 @@ func TestExplorePreferredRefinementSymbolPrefersSourceLiteral(t *testing.T) {
 	source := &graph.Node{ID: "repo/source.go::source"}
 	targets := []exploreTarget{{node: ordinary}, {node: source, sourceLiteral: true}}
 
-	require.Equal(t, source.ID, explorePreferredRefinementSymbol(targets))
-	require.Equal(t, ordinary.ID, explorePreferredRefinementSymbol(targets[:1]))
+	require.Equal(t, source.ID, explorePreferredRefinementSymbol("locate the helper", targets))
+	require.Equal(t, ordinary.ID, explorePreferredRefinementSymbol("locate the helper", targets[:1]))
+}
+
+func TestRetainExploreSourceLiteralOwnersDiversifiesFilesWithinCaps(t *testing.T) {
+	recall := exploreSourceLiteralRecall{
+		hits: []exploreSourceLiteralHit{
+			{nodeID: "first-a", rank: 0},
+			{nodeID: "first-b", rank: 1},
+			{nodeID: "second", rank: 2},
+			{nodeID: "third", rank: 3},
+		},
+		ownerFiles: map[string]string{
+			"first-a": "src/first.go",
+			"first-b": "src/first.go",
+			"second":  "src/second.go",
+			"third":   "src/third.go",
+		},
+	}
+
+	hits, files, reason := retainExploreSourceLiteralOwners(recall)
+
+	require.Equal(t, []string{"first-a", "second", "first-b"}, []string{
+		hits[0].nodeID, hits[1].nodeID, hits[2].nodeID,
+	})
+	require.Equal(t, exploreSourceLiteralRecallMaxFilesPerTerm, files)
+	require.Equal(t, "file_cap", reason)
+}
+
+func TestGatherExploreSourceLiteralRecallAggregatesCompactAnchorsAcrossLanguages(t *testing.T) {
+	fixtures := []struct {
+		name     string
+		language string
+		ext      string
+		first    string
+		second   string
+	}{
+		{
+			name: "csharp", language: "csharp", ext: ".cs",
+			first:  "public void First() {\n    Register(\"aa\");\n}\n",
+			second: "public void Second() {\n    Register(\"aa\");\n    Register(\"bb\");\n}\n",
+		},
+		{
+			name: "rust", language: "rust", ext: ".rs",
+			first:  "fn first() {\n    register(\"aa\");\n}\n",
+			second: "fn second() {\n    register(\"aa\");\n    register(\"bb\");\n}\n",
+		},
+		{
+			name: "typescript", language: "typescript", ext: ".ts",
+			first:  "function first() {\n    register(\"aa\");\n}\n",
+			second: "function second() {\n    register(\"aa\");\n    register(\"bb\");\n}\n",
+		},
+	}
+	for _, fixture := range fixtures {
+		t.Run(fixture.name, func(t *testing.T) {
+			root := t.TempDir()
+			firstRel := "src/first" + fixture.ext
+			secondRel := "src/second" + fixture.ext
+			for rel, source := range map[string]string{firstRel: fixture.first, secondRel: fixture.second} {
+				path := filepath.Join(root, filepath.FromSlash(rel))
+				require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+				require.NoError(t, os.WriteFile(path, []byte(source), 0o644))
+			}
+
+			store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, store.Close()) })
+			idx := indexer.New(store, parser.NewRegistry(), config.IndexConfig{}, zap.NewNop())
+			_, err = idx.IndexCtx(context.Background(), root)
+			require.NoError(t, err)
+			idx.SetFileMtimes(map[string]int64{firstRel: 1, secondRel: 1})
+
+			first := sourceLiteralNode("demo/first::owner", "first", firstRel, graph.KindFunction, 1, 3)
+			second := sourceLiteralNode("demo/second::owner", "second", secondRel, graph.KindFunction, 1, 4)
+			first.Language = fixture.language
+			second.Language = fixture.language
+			store.AddBatch([]*graph.Node{first, second}, nil)
+			counting := &exploreSourceLiteralCountingStore{Store: store}
+			server := &Server{graph: counting, indexer: idx, logger: zap.NewNop()}
+
+			recall := server.gatherExploreSourceLiteralRecall(
+				context.Background(), []string{"aa", "bb"}, "", query.QueryOptions{},
+			)
+			coverage := make(map[string]map[int]struct{})
+			for _, hit := range recall.hits {
+				if coverage[hit.nodeID] == nil {
+					coverage[hit.nodeID] = make(map[int]struct{})
+				}
+				coverage[hit.nodeID][hit.anchor] = struct{}{}
+			}
+			require.Len(t, coverage[first.ID], 1)
+			require.Len(t, coverage[second.ID], 2)
+			require.Len(t, recall.diagnostics, 2)
+			require.Equal(t, []string{"aa", "bb"}, []string{
+				recall.diagnostics[0].literal, recall.diagnostics[1].literal,
+			})
+			require.Equal(t, 2, recall.diagnostics[0].rawHits)
+			require.Equal(t, 2, recall.diagnostics[0].mappedOwners)
+			require.Equal(t, 2, recall.diagnostics[0].retainedOwners)
+			require.Equal(t, 2, recall.diagnostics[0].retainedFiles)
+			require.Empty(t, recall.diagnostics[0].reason)
+			require.Equal(t, 1, recall.diagnostics[1].rawHits)
+			require.Equal(t, 1, recall.diagnostics[1].mappedOwners)
+			require.Equal(t, 1, recall.diagnostics[1].retainedOwners)
+			require.Equal(t, 1, recall.diagnostics[1].retainedFiles)
+			require.Empty(t, recall.diagnostics[1].reason)
+			require.Zero(t, counting.allNodesCalls, "anchor aggregation must remain file-bounded")
+
+			candidates := server.gatherExploreQuotedContentCandidates(
+				context.Background(), `locate registrations for "aa" and "bb"`, nil, 20,
+				query.QueryOptions{RepoAllow: map[string]bool{"demo": true}},
+			)
+			firstCandidate := candidateByID(candidates, first.ID)
+			secondCandidate := candidateByID(candidates, second.ID)
+			require.NotNil(t, firstCandidate)
+			require.NotNil(t, secondCandidate)
+			require.Equal(t, float64(1), firstCandidate.Signals[exploreSourceLiteralCoverageSignal])
+			require.Equal(t, float64(2), secondCandidate.Signals[exploreSourceLiteralCoverageSignal])
+			require.Positive(t, firstCandidate.Signals[exploreContentRecallAmbiguousSignal])
+			require.Zero(t, secondCandidate.Signals[exploreContentRecallAmbiguousSignal])
+		})
+	}
+}
+
+func TestGatherExploreSourceLiteralRecallKeepsMultiAnchorOwnerUnderNearCapCompetitors(t *testing.T) {
+	root := t.TempDir()
+	competitorRel := "src/00_CompetingDefaults.cs"
+	targetRel := "src/99_FormatterRegistry.cs"
+	competitorSource := "public sealed class CompetingDefaults {\n"
+	nodes := make([]*graph.Node, 0, 45)
+	line := 2
+	for i := 0; i < 44; i++ {
+		term := "pl"
+		if i%2 == 1 {
+			term = "ku"
+		}
+		name := fmt.Sprintf("Candidate%02d", i)
+		competitorSource += fmt.Sprintf("    public void %s() {\n        Register(\"%s\");\n    }\n", name, term)
+		node := sourceLiteralNode("demo/competitors::"+name, name, competitorRel, graph.KindMethod, line, line+2)
+		node.Language = "csharp"
+		nodes = append(nodes, node)
+		line += 3
+	}
+	competitorSource += "}\n"
+	targetSource := "public sealed class FormatterRegistry {\n" +
+		"    public void RegisterDefaultFormatter() {\n" +
+		"        Register(\"pl\");\n" +
+		"        Register(\"ku\");\n" +
+		"    }\n" +
+		"}\n"
+	target := sourceLiteralNode(
+		"demo/formatter::RegisterDefaultFormatter", "RegisterDefaultFormatter",
+		targetRel, graph.KindMethod, 2, 5,
+	)
+	target.Language = "csharp"
+	nodes = append(nodes, target)
+	for rel, source := range map[string]string{
+		competitorRel: competitorSource,
+		targetRel:     targetSource,
+	} {
+		path := filepath.Join(root, filepath.FromSlash(rel))
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+		require.NoError(t, os.WriteFile(path, []byte(source), 0o644))
+	}
+
+	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	idx := indexer.New(store, parser.NewRegistry(), config.IndexConfig{}, zap.NewNop())
+	_, err = idx.IndexCtx(context.Background(), root)
+	require.NoError(t, err)
+	idx.SetFileMtimes(map[string]int64{competitorRel: 1, targetRel: 1})
+	store.AddBatch(nodes, nil)
+	counting := &exploreSourceLiteralCountingStore{Store: store}
+	server := &Server{graph: counting, indexer: idx, logger: zap.NewNop()}
+	scope := query.QueryOptions{RepoAllow: map[string]bool{"demo": true}}
+
+	started := time.Now()
+	recall := server.gatherExploreSourceLiteralRecall(context.Background(), []string{"pl", "ku"}, "", scope)
+	require.Less(t, time.Since(started), 500*time.Millisecond, "near-cap two-anchor recall must honor the shared deadline")
+	require.Len(t, recall.diagnostics, 2)
+	for _, diagnostic := range recall.diagnostics {
+		// Bounded grep collapses repeated lines to one hit per file. The large
+		// competitor body still exercises production parsing and both per-anchor
+		// deadlines without multiplying retained owners.
+		require.Equal(t, 2, diagnostic.rawHits)
+		require.Equal(t, 2, diagnostic.mappedOwners)
+		require.Equal(t, 2, diagnostic.retainedOwners)
+		require.Equal(t, 2, diagnostic.retainedFiles)
+		require.Empty(t, diagnostic.reason)
+	}
+	coverage := make(map[int]struct{})
+	for _, hit := range recall.hits {
+		if hit.nodeID == target.ID {
+			coverage[hit.anchor] = struct{}{}
+		}
+	}
+	require.Len(t, coverage, 2, "the second-file owner must survive both collision-heavy anchor pages")
+	require.Zero(t, counting.allNodesCalls, "near-cap recall must remain file-bounded")
+
+	sourceCandidates := server.gatherExploreQuotedContentCandidates(
+		context.Background(), `locate default formatter registrations for "pl" and "ku"`, nil, 20, scope,
+	)
+	targetCandidate := candidateByID(sourceCandidates, target.ID)
+	require.NotNil(t, targetCandidate)
+	require.Equal(t, float64(2), targetCandidate.Signals[exploreSourceLiteralCoverageSignal])
+	require.Positive(t, targetCandidate.Signals[exploreContentRecallAmbiguousSignal])
+	ordinary := []*rerank.Candidate{
+		sourcePreservationCandidate("semantic-0", 0, 0),
+		sourcePreservationCandidate("semantic-1", 1, 0),
+		sourcePreservationCandidate("semantic-2", 2, 0),
+	}
+	selected := selectFinalExploreCandidates(
+		mergeExploreCandidates(ordinary, sourceCandidates, len(ordinary)), nil, 3,
+	)
+	require.NotNil(t, candidateByID(selected, target.ID), "multi-anchor owner must survive global pruning")
+	require.NotNil(t, candidateByID(selected, "semantic-0"))
+	require.NotNil(t, candidateByID(selected, "semantic-1"), "ambiguous single-anchor competitors must not consume the second reserve slot")
+}
+
+func TestGatherExploreSourceLiteralRecallRecordsTermCapDiagnostic(t *testing.T) {
+	server := &Server{logger: zap.NewNop()}
+	recall := server.gatherExploreSourceLiteralRecall(
+		context.Background(), []string{"aa", "bb", "cc"}, "demo", query.QueryOptions{},
+	)
+
+	require.Len(t, recall.diagnostics, 3)
+	byLiteral := make(map[string]exploreSourceLiteralDiagnostic, len(recall.diagnostics))
+	for _, diagnostic := range recall.diagnostics {
+		byLiteral[diagnostic.literal] = diagnostic
+	}
+	require.Equal(t, "term_cap", byLiteral["cc"].reason)
 }
 
 func TestGatherExploreSourceLiteralRecallMapsParsedCSharpConstructor(t *testing.T) {
@@ -330,7 +756,7 @@ func TestGatherExploreSourceLiteralRecallMapsParsedCSharpConstructor(t *testing.
 	rel := "src/Humanizer/Configuration/FormatterRegistry.cs"
 	path := filepath.Join(root, filepath.FromSlash(rel))
 	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
-	require.NoError(t, os.WriteFile(path, []byte("public sealed class FormatterRegistry {\n    public FormatterRegistry() {\n        RegisterDefaultFormatter(\"ku\");\n    }\n}\n"), 0o644))
+	require.NoError(t, os.WriteFile(path, []byte("public sealed class FormatterRegistry {\n    public FormatterRegistry() {\n        RegisterDefaultFormatter(\"ku\");\n    }\n\n    private void RegisterDefaultFormatter(string culture) {\n    }\n}\n"), 0o644))
 
 	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
 	require.NoError(t, err)
@@ -340,6 +766,10 @@ func TestGatherExploreSourceLiteralRecallMapsParsedCSharpConstructor(t *testing.
 	idx := indexer.New(store, registry, config.IndexConfig{}, zap.NewNop())
 	_, err = idx.IndexCtx(context.Background(), root)
 	require.NoError(t, err)
+	constructors := store.FindNodesByName("FormatterRegistry.<init>")
+	callees := store.FindNodesByName("RegisterDefaultFormatter")
+	require.NotEmpty(t, constructors)
+	require.NotEmpty(t, callees)
 	counting := &exploreSourceLiteralCountingStore{Store: store}
 	server := &Server{graph: counting, indexer: idx, logger: zap.NewNop()}
 
@@ -350,14 +780,16 @@ func TestGatherExploreSourceLiteralRecallMapsParsedCSharpConstructor(t *testing.
 	found := false
 	for _, hit := range recall.hits {
 		node := store.GetNode(hit.nodeID)
-		if node != nil && node.FilePath == rel && node.Name == "FormatterRegistry.<init>" {
+		if node != nil && node.FilePath == rel && node.Name == "RegisterDefaultFormatter" {
 			found = true
+			require.True(t, hit.callee, "unique call-edge promotion must retain strong provenance")
 		}
 	}
-	require.True(t, found, "literal line must map to the parsed enclosing constructor")
+	require.True(t, found, "literal callsite must promote the uniquely resolved invoked method")
 
 	task := `CultureNotFoundException for "ku" culture - code adds/uses "ku" (Kurdish) CultureInfo which is not supported on Xamarin.Android, causing crash. Find where "ku" culture is registered/used in fallback resolution logic.`
-	require.NotEqual(t, rerank.QueryClassConcept, rerank.ClassifyQuery(shapeExploreQuery(task)), "regression requires the non-concept retrieval branch")
+	require.Equal(t, rerank.QueryClassConcept, exploreQueryClass(shapeExploreQuery(task)),
+		"long parenthesized issue prose must use concept retrieval without losing its unique literal proof")
 	engine := query.NewEngine(counting)
 	engine.SetSearchProvider(idx.Search)
 	fullServer := NewServer(engine, counting, idx, nil, zap.NewNop(), nil)
@@ -373,11 +805,132 @@ func TestGatherExploreSourceLiteralRecallMapsParsedCSharpConstructor(t *testing.
 	var envelope localizationExploreEnvelope
 	require.NoError(t, json.Unmarshal([]byte(text.Text), &envelope))
 	require.NotEmpty(t, envelope.Evidence)
-	require.Equal(t, "FormatterRegistry.<init>", envelope.Evidence[0].Name, "source evidence must lead the final localization envelope")
-	if envelope.Completion.State == localizationStateNeedsRefinement {
-		require.Contains(t, envelope.Completion.RequiredAction, envelope.Evidence[0].ID)
-	}
+	require.Equal(t, "RegisterDefaultFormatter", envelope.Evidence[0].Name, "invoked source evidence must lead the final localization envelope")
+	require.Equal(t, localizationProvenanceSourceLiteralCallee, envelope.Evidence[0].Provenance)
+	require.Equal(t, localizationStateAnswerReady, envelope.Completion.State)
+	require.True(t, envelope.Terminal)
+	require.True(t, envelope.Completion.Enforceable)
+	require.NotNil(t, result.Meta)
+	host, ok := result.Meta.AdditionalFields[localizationHostMetaKey].(localizationHostEnvelope)
+	require.True(t, ok, "initial explore must attach an authoritative host envelope")
+	require.Equal(t, localizationContractFor(envelope.Completion), host.Contract)
+	require.NotNil(t, host.Evidence)
+	require.NotEmpty(t, host.Evidence.Evidence)
+	require.Equal(t, localizationProvenanceSourceLiteralCallee, host.Evidence.Evidence[0].Provenance)
 	require.Zero(t, counting.allNodesCalls, "literal mapping must stay bounded to matched files")
+}
+
+func TestExploreQuotedRecallCompactMetadataUsesDeclarationEvidenceOnly(t *testing.T) {
+	scope := query.QueryOptions{}
+	compactName := &graph.Node{
+		ID: "src/locale.rs::KU", Name: "KU", QualName: "locale.KU",
+		Kind: graph.KindFunction, FilePath: "src/locale.rs", Language: "rust",
+	}
+	require.True(t, exploreQuotedRecallHasExactSourceNode(`find locale "ku"`, []string{"ku"}, compactName, scope))
+
+	pathOnly := &graph.Node{
+		ID: "src/locales/ku/registry.rs::register", Name: "register", QualName: "locales.ku.register",
+		Kind: graph.KindFunction, FilePath: "src/locales/ku/registry.rs", Language: "rust",
+	}
+	require.False(t, exploreQuotedRecallHasExactSourceNode(`find locale "ku"`, []string{"ku"}, pathOnly, scope),
+		"a path-derived qualified name must not suppress bounded source recall")
+}
+
+func TestExploreQuotedRecallTestMetadataRequiresTestIntent(t *testing.T) {
+	testNode := &graph.Node{
+		ID: "pkg/locale_test.go::TestKurdish", Name: "TestKurdish", QualName: "tests.ku.TestKurdish",
+		Kind: graph.KindFunction, FilePath: "pkg/locale_test.go", Language: "go",
+		Meta: map[string]any{"is_test": true, "signature": `func TestKurdish() // "ku"`},
+	}
+	require.False(t, exploreQuotedRecallHasExactSourceNode(`find where locale "ku" is registered`, []string{"ku"}, testNode, query.QueryOptions{}))
+	require.True(t, exploreQuotedRecallHasExactSourceNode(`find the test for locale "ku"`, []string{"ku"}, testNode, query.QueryOptions{}))
+}
+
+func TestExploreCompactLiteralIgnoresTestMetadataAndPrefersSpecificProductionCallee(t *testing.T) {
+	root := t.TempDir()
+	files := map[string]string{
+		"src/Humanizer/Configuration/FormatterRegistry.cs": `namespace Humanizer.Configuration {
+    internal class FormatterRegistry {
+        public FormatterRegistry() { RegisterDefaultFormatter("ku"); }
+        private void RegisterDefaultFormatter(string localeCode) { var formatter = new DefaultFormatter(localeCode); }
+    }
+    internal class DefaultFormatter { public DefaultFormatter(string localeCode) { } }
+}`,
+		"src/Humanizer/Configuration/NumberToWordsConverterRegistry.cs": `namespace Humanizer.Configuration {
+    internal class NumberToWordsConverterRegistry {
+        public NumberToWordsConverterRegistry() { Register("ku"); }
+        private void Register(string localeCode) { }
+    }
+}`,
+		"src/Humanizer.Tests.Shared/Localisation/ku/NumberToWordsTests.cs": `namespace Humanizer.Tests.Localisation.ku {
+    [UseCulture("ku")]
+    public class NumberToWordsTests {
+        public void ToOrdinalWordsKurdish() { }
+    }
+}`,
+	}
+	for rel, source := range files {
+		path := filepath.Join(root, filepath.FromSlash(rel))
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+		require.NoError(t, os.WriteFile(path, []byte(source), 0o644))
+	}
+
+	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	registry := parser.NewRegistry()
+	languages.RegisterAll(registry)
+	idx := indexer.New(store, registry, config.IndexConfig{}, zap.NewNop())
+	_, err = idx.IndexCtx(context.Background(), root)
+	require.NoError(t, err)
+	counting := &exploreSourceLiteralCountingStore{Store: store}
+	server := &Server{graph: counting, indexer: idx, logger: zap.NewNop()}
+
+	task := `CultureNotFoundException for culture "ku" (Kurdish) thrown when code enumerates or references all supported cultures, e.g. in number-to-words or collection initialization; find where "ku" locale/culture is registered or iterated causing crash on platforms lacking that culture.`
+	testNodes := store.FindNodesByName("ToOrdinalWordsKurdish")
+	require.NotEmpty(t, testNodes)
+	candidates := server.gatherExploreQuotedContentCandidates(
+		context.Background(), task,
+		[]*rerank.Candidate{{Node: testNodes[0], TextRank: 0, VectorRank: -1}},
+		20, query.QueryOptions{},
+	)
+	specificID := "src/Humanizer/Configuration/FormatterRegistry.cs::FormatterRegistry.RegisterDefaultFormatter"
+	genericID := "src/Humanizer/Configuration/NumberToWordsConverterRegistry.cs::NumberToWordsConverterRegistry.Register"
+	specificCandidate := candidateByID(candidates, specificID)
+	genericCandidate := candidateByID(candidates, genericID)
+	require.NotNil(t, specificCandidate, "test metadata must not suppress production literal recall")
+	require.NotNil(t, genericCandidate, "both production direct callees must remain available")
+	require.Equal(t, 1.0, specificCandidate.Signals[exploreSourceLiteralTaskAlignSignal],
+		"construction intent must align with the exact owner that instantiates a value")
+	require.Zero(t, genericCandidate.Signals[exploreSourceLiteralTaskAlignSignal],
+		"a generic registration helper must not gain construction alignment")
+
+	engine := query.NewEngine(counting)
+	engine.SetSearchProvider(idx.Search)
+	fullServer := NewServer(engine, counting, idx, nil, zap.NewNop(), nil)
+	req := mcpgo.CallToolRequest{}
+	req.Params.Arguments = map[string]any{
+		"task": task, "localize": true, "max_symbols": 6,
+	}
+	result, err := fullServer.handleExplore(context.Background(), req)
+	require.NoError(t, err)
+	require.NotEmpty(t, result.Content)
+	text, ok := result.Content[0].(mcpgo.TextContent)
+	require.True(t, ok)
+	var envelope localizationExploreEnvelope
+	require.NoError(t, json.Unmarshal([]byte(text.Text), &envelope))
+
+	specificRank := -1
+	for rank, evidence := range envelope.Evidence {
+		if evidence.ID == specificID {
+			specificRank = rank
+		}
+	}
+	require.NotEqual(t, -1, specificRank, "construction-aligned source evidence must survive final packing")
+	require.Equal(t, localizationStateNeedsRefinement, envelope.Completion.State)
+	require.False(t, envelope.Terminal)
+	require.False(t, envelope.Completion.Enforceable, "ambiguous production literal sites remain advisory")
+	require.Contains(t, envelope.Completion.AllowedSymbols, specificID)
 }
 
 func TestGatherExploreSourceLiteralRecallBoundsMappingByRequestDeadline(t *testing.T) {

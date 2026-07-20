@@ -167,6 +167,70 @@ impl Server {
 	assert.Len(t, funcs, 0)
 }
 
+func TestRsExtractor_GenericImplMemberOfTargetsBareType(t *testing.T) {
+	src := []byte(`
+struct Replacer<M> { matcher: M }
+
+impl<M> Replacer<M> {
+    fn replace_all(&self) {}
+}
+`)
+	result, err := NewRustExtractor().Extract("util.rs", src)
+	require.NoError(t, err)
+
+	methodID := "util.rs::Replacer<M>.replace_all"
+	typeID := "util.rs::Replacer"
+	var method *graph.Node
+	var owner *graph.Node
+	for _, node := range result.Nodes {
+		if node.ID == methodID {
+			method = node
+		}
+		if node.ID == typeID {
+			owner = node
+		}
+	}
+	require.NotNil(t, method, "generic impl method must retain its instantiated receiver ID")
+	assert.Equal(t, "Replacer<M>", method.Meta["receiver"])
+	require.NotNil(t, owner, "bare owner target must name a real type node")
+
+	found := false
+	for _, edge := range edgesOfKind(result.Edges, graph.EdgeMemberOf) {
+		if edge.From == methodID {
+			found = true
+			assert.Equal(t, typeID, edge.To, "member_of must target the type declaration's bare ID")
+			assert.NotEqual(t, "util.rs::Replacer<M>", edge.To, "generic owner aliases must not remain dangling")
+		}
+	}
+	assert.True(t, found, "generic impl method must have a member_of edge")
+}
+
+func TestRsExtractor_GenericScopedImplDoesNotBindSameFileBasename(t *testing.T) {
+	src := []byte(`
+struct Vec;
+trait LocalTrait { fn inspect(&self); }
+
+impl<T> LocalTrait for std::vec::Vec<T> {
+    fn inspect(&self) {}
+}
+`)
+	result, err := NewRustExtractor().Extract("scoped.rs", src)
+	require.NoError(t, err)
+
+	methodID := "scoped.rs::std::vec::Vec<T>.inspect"
+	localTypeID := "scoped.rs::Vec"
+	found := false
+	for _, edge := range edgesOfKind(result.Edges, graph.EdgeMemberOf) {
+		if edge.From != methodID {
+			continue
+		}
+		found = true
+		assert.NotEqual(t, localTypeID, edge.To, "qualified external impl must not bind a same-file basename")
+		assert.Equal(t, "scoped.rs::std::vec::Vec<T>", edge.To)
+	}
+	assert.True(t, found, "scoped generic impl method must retain an unresolved owner edge")
+}
+
 func TestRsExtractor_ImplMethodMeta(t *testing.T) {
 	src := []byte(`struct Foo {}
 

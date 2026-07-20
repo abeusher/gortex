@@ -22,13 +22,26 @@ var _ graph.FnValuePlaceholderScanner = (*Store)(nil)
 // EdgeReferences kind (placeholders + every real reference) and Go-filter on
 // every whole-graph synthesizer pass; it pulls the handful of placeholders
 // straight off the index instead.
+// The two forms run as SEPARATE queries: inside an OR, the planner's
+// implication prover would not bind the partial edges_fnvalue_prefixed
+// index to the infix arm and walked every unresolved edge instead
+// (measured against a production store). Standalone, each arm rides its
+// own index; the namespaces are disjoint (the bare form starts at the
+// marker, the infix form requires a repo prefix before it), so no dedupe.
 func (s *Store) FnValuePlaceholderEdges() iter.Seq[*graph.Edge] {
 	return func(yield func(*graph.Edge) bool) {
-		out := s.queryEdgesSQL(`SELECT ` + lookupEdgeCols + `
+		bare := s.queryEdgesSQL(`SELECT ` + lookupEdgeCols + `
 FROM edges
-WHERE (to_id >= 'unresolved::fnvalue::' AND to_id < 'unresolved::fnvalue:;')
-   OR (is_unresolved = 1 AND to_id LIKE '%::unresolved::fnvalue::%')`)
-		for _, e := range out {
+WHERE to_id >= 'unresolved::fnvalue::' AND to_id < 'unresolved::fnvalue:;'`)
+		for _, e := range bare {
+			if !yield(e) {
+				return
+			}
+		}
+		prefixed := s.queryEdgesSQL(`SELECT ` + lookupEdgeCols + `
+FROM edges
+WHERE to_id LIKE '%::unresolved::fnvalue::%'`)
+		for _, e := range prefixed {
 			if !yield(e) {
 				return
 			}

@@ -82,28 +82,39 @@ type hotNodeGen struct {
 	bytes int64
 }
 
-func newHotNodeGen() *hotNodeGen {
+func newHotNodeGen(pendingHint int) *hotNodeGen {
+	if pendingHint <= 0 {
+		return &hotNodeGen{}
+	}
+	nameHint := min(pendingHint, 4096)
+	nodeHint := 4096
+	if pendingHint <= 2048 {
+		nodeHint = pendingHint * 2
+	}
 	return &hotNodeGen{
-		nodes: make(map[string]*graph.Node, 4096),
-		names: make(map[string][]*graph.Node, 4096),
+		nodes: make(map[string]*graph.Node, nodeHint),
+		names: make(map[string][]*graph.Node, nameHint),
 	}
 }
 
 // resolveHotCache is used only while the owning Resolver holds its resolve
 // mutex; it needs no locking of its own.
 type resolveHotCache struct {
-	cur, prev *hotNodeGen
-	budget    int64
+	cur, prev   *hotNodeGen
+	budget      int64
+	pendingHint int
 
 	nodeHits, nodeMisses int64
 	nameHits, nameMisses int64
 }
 
-func newResolveHotCache(budget int64) *resolveHotCache {
+func newResolveHotCache(budget int64, pendingHint int) *resolveHotCache {
 	if budget <= 0 {
 		budget = int64(defaultResolveHotCacheMB) << 20
 	}
-	return &resolveHotCache{cur: newHotNodeGen(), prev: newHotNodeGen(), budget: budget}
+	return &resolveHotCache{
+		cur: newHotNodeGen(pendingHint), budget: budget, pendingHint: pendingHint,
+	}
 }
 
 func (c *resolveHotCache) rotateIfNeeded() {
@@ -111,15 +122,15 @@ func (c *resolveHotCache) rotateIfNeeded() {
 		return
 	}
 	c.prev = c.cur
-	c.cur = newHotNodeGen()
+	c.cur = newHotNodeGen(c.pendingHint)
 }
 
 func (c *resolveHotCache) flush() {
 	if c == nil {
 		return
 	}
-	c.cur = newHotNodeGen()
-	c.prev = newHotNodeGen()
+	c.cur = newHotNodeGen(c.pendingHint)
+	c.prev = nil
 }
 
 func (c *resolveHotCache) getNode(id string) (*graph.Node, bool) {
@@ -127,12 +138,17 @@ func (c *resolveHotCache) getNode(id string) (*graph.Node, bool) {
 		c.nodeHits++
 		return n, true
 	}
-	if n, ok := c.prev.nodes[id]; ok {
-		// Promote so a hot entry survives the next rotation.
-		c.cur.nodes[id] = n
-		c.cur.bytes += approxResolveNodeBytes(n)
-		c.nodeHits++
-		return n, true
+	if c.prev != nil {
+		if n, ok := c.prev.nodes[id]; ok {
+			// Promote so a hot entry survives the next rotation.
+			if c.cur.nodes == nil {
+				c.cur.nodes = make(map[string]*graph.Node)
+			}
+			c.cur.nodes[id] = n
+			c.cur.bytes += approxResolveNodeBytes(n)
+			c.nodeHits++
+			return n, true
+		}
 	}
 	c.nodeMisses++
 	return nil, false
@@ -146,6 +162,9 @@ func (c *resolveHotCache) putNode(n *graph.Node) {
 	}
 	if _, exists := c.cur.nodes[n.ID]; exists {
 		return
+	}
+	if c.cur.nodes == nil {
+		c.cur.nodes = make(map[string]*graph.Node)
 	}
 	c.cur.nodes[n.ID] = n
 	c.cur.bytes += approxResolveNodeBytes(n)
@@ -163,13 +182,18 @@ func (c *resolveHotCache) getNames(key string) ([]*graph.Node, bool) {
 		c.nameHits++
 		return hits, true
 	}
-	if hits, ok := c.prev.names[key]; ok {
-		c.cur.names[key] = hits
-		for _, n := range hits {
-			c.cur.bytes += approxResolveNodeBytes(n)
+	if c.prev != nil {
+		if hits, ok := c.prev.names[key]; ok {
+			if c.cur.names == nil {
+				c.cur.names = make(map[string][]*graph.Node)
+			}
+			c.cur.names[key] = hits
+			for _, n := range hits {
+				c.cur.bytes += approxResolveNodeBytes(n)
+			}
+			c.nameHits++
+			return hits, true
 		}
-		c.nameHits++
-		return hits, true
 	}
 	c.nameMisses++
 	return nil, false
@@ -181,6 +205,9 @@ func (c *resolveHotCache) getNames(key string) ([]*graph.Node, bool) {
 func (c *resolveHotCache) putNames(key string, hits []*graph.Node) {
 	if _, exists := c.cur.names[key]; exists {
 		return
+	}
+	if c.cur.names == nil {
+		c.cur.names = make(map[string][]*graph.Node)
 	}
 	c.cur.names[key] = hits
 	c.cur.bytes += int64(len(key)) + 48

@@ -34,6 +34,14 @@ const (
 //
 // Returns the number of dispatcher → function edges synthesized.
 func ResolveFnPointerDispatch(g graph.Store) int {
+	return resolveFnPointerDispatch(g, nil)
+}
+
+// resolveFnPointerDispatch is the census-multiplexed form: cands, when
+// non-nil, replaces both whole-stream decodes — the EdgeReferences
+// registration arm and the EdgeCalls dispatch arm — with the shared walk's
+// pre-matched candidates.
+func resolveFnPointerDispatch(g graph.Store, cands *frameworkPassCandidates) int {
 	if g == nil {
 		return 0
 	}
@@ -50,8 +58,12 @@ func ResolveFnPointerDispatch(g graph.Store) int {
 	type copyEdge struct{ to, from string }
 	var copies []copyEdge
 
+	regStream := g.EdgesByKind(graph.EdgeReferences)
+	if cands != nil {
+		regStream = frameworkEdgeSeq(refetchFrameworkCandidates(g, cands.refs))
+	}
 	var regReindex []graph.EdgeReindex
-	for e := range g.EdgesByKind(graph.EdgeReferences) {
+	for e := range regStream {
 		if e == nil || e.Meta == nil {
 			continue
 		}
@@ -111,10 +123,14 @@ func ResolveFnPointerDispatch(g graph.Store) int {
 		}
 	}
 
+	dispatchStream := g.EdgesByKind(graph.EdgeCalls)
+	if cands != nil {
+		dispatchStream = frameworkEdgeSeq(refetchFrameworkCandidates(g, cands.calls))
+	}
 	resolved := 0
 	var reindex []graph.EdgeReindex
 	var batch []*graph.Edge
-	for e := range g.EdgesByKind(graph.EdgeCalls) {
+	for e := range dispatchStream {
 		if e == nil || e.Meta == nil {
 			continue
 		}

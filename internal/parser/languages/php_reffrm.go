@@ -18,7 +18,7 @@ import (
 //     type is a Capitalized name / qualified_name → EdgeInstantiates
 //   - INHERITANCE     `class X extends Base` (base_clause) /
 //     `class X implements I, J` (class_interface_clause)
-//     → EdgeReferences, Meta["ref_context"]="inherit"
+//     → EdgeExtends / EdgeImplements, Meta["ref_context"]="inherit"
 //   - TYPE-TEST       `$x instanceof Foo` (binary_expression with the
 //     `instanceof` operator) → EdgeReferences, Meta["ref_context"]="cast"
 //   - STATIC / CONST  `Foo::CONST` / `Foo::class`
@@ -28,12 +28,11 @@ import (
 //   - ATTRIBUTE       `#[Foo]` / `#[Foo(...)]` (attribute, PHP 8) names the
 //     attribute type Foo → EdgeReferences, Meta["ref_context"]="static_access"
 //
-// The inheritance forms are emitted here as EdgeReferences (ref_context
-// "inherit") rather than EdgeExtends / EdgeImplements: #143's
-// extractPhpTraitUse already owns trait composition (EdgeExtends via:trait),
-// and scope_parent on the class node carries the single base class for the
-// scope resolver. These ref edges give find_usages a "used as a base /
-// conformed interface" surface without changing the inheritance modelling.
+// Inheritance forms use their structural edge kinds. The earlier generic
+// EdgeReferences representation made hierarchy consumers unable to distinguish
+// inheritance from ordinary type mentions even though the parser has exact
+// syntax. #143's extractPhpTraitUse separately owns trait composition
+// (EdgeExtends via:trait); this path covers class/interface declarations.
 //
 // Each expression-site edge attributes to the enclosing function / method
 // (file node when nothing encloses the line); each inheritance edge
@@ -125,20 +124,22 @@ func emitPHPReferenceForms(root *sitter.Node, src []byte, filePath, fileID strin
 			}
 
 		case "base_clause":
-			// `class X extends Base` — emit one inherit reference per base
+			// `class X extends Base` / `interface X extends A, B` — emit one
+			// structural inheritance edge per base
 			// name (PHP single inheritance for classes, but interfaces may
 			// extend several). Attributed to the enclosing class node.
 			owner := ownerFor(line)
 			for _, name := range phpClauseTypeNames(n, src) {
-				emit(name, int(n.StartPoint().Row)+1, owner, graph.EdgeReferences, graph.RefContextInherit)
+				emit(name, int(n.StartPoint().Row)+1, owner, graph.EdgeExtends, graph.RefContextInherit)
 			}
 
 		case "class_interface_clause":
 			// `class X implements I, J` / `interface X extends A, B` — one
-			// inherit reference per named interface.
+			// conformance edge per named interface. tree-sitter-php represents
+			// interface-to-interface extends with base_clause, handled above.
 			owner := ownerFor(line)
 			for _, name := range phpClauseTypeNames(n, src) {
-				emit(name, int(n.StartPoint().Row)+1, owner, graph.EdgeReferences, graph.RefContextInherit)
+				emit(name, int(n.StartPoint().Row)+1, owner, graph.EdgeImplements, graph.RefContextInherit)
 			}
 
 		case "binary_expression":

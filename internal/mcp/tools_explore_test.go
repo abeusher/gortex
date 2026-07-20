@@ -586,12 +586,20 @@ func TestExploreDraftExactAnchorUsesTokenBoundaries(t *testing.T) {
 
 func TestExploreBroadWellAlignedNeighborhoodGetsExplicitAnswerReadyContract(t *testing.T) {
 	targets := []exploreTarget{{
-		node:  &graph.Node{ID: "internal/mcp/facade_tools.go::registerFacadeTools", Name: "registerFacadeTools", Kind: graph.KindMethod, FilePath: "internal/mcp/facade_tools.go"},
-		score: 1.2,
+		node:                  &graph.Node{ID: "internal/mcp/facade_tools.go::registerFacadeTools", Name: "registerFacadeTools", Kind: graph.KindMethod, FilePath: "internal/mcp/facade_tools.go"},
+		score:                 1.2,
+		conceptImplementation: true,
+		source:                "func registerFacadeTools() { registerRoutingSchema() }",
 	}}
 	task := "investigate mcp facade tool routing schema registration operation dispatch surface architecture integration behavior"
 	if !exploreAnswerReady(task, targets) {
-		t.Fatal("well-aligned ranked head should produce answer_ready for explore(localize)")
+		t.Fatal("well-aligned hydrated implementation should produce answer_ready for explore(localize)")
+	}
+	metadataOnly := targets[0]
+	metadataOnly.conceptImplementation = false
+	metadataOnly.source = ""
+	if exploreAnswerReady(task, []exploreTarget{metadataOnly}) {
+		t.Fatal("metadata alignment without a hydrated implementation must remain nonterminal")
 	}
 	out := (&Server{}).renderExplore(task, targets, 1600)
 	if !strings.Contains(out, "RANKED LOCALIZATION:") || strings.Contains(out, "LOCALIZATION COMPLETE:") {
@@ -1152,7 +1160,7 @@ func TestRefinementEnvelopeAuthorizesSerializedEvidenceAndOmitsSource(t *testing
 		{node: buildParallel, source: "fn build_parallel(&self) {}", callees: []*graph.Node{unrelated, buildWithCWD}},
 		{node: &graph.Node{ID: "crates/ignore/src/walk.rs::WalkParallel", Name: "WalkParallel", Kind: graph.KindType, FilePath: "crates/ignore/src/walk.rs"}, source: "struct WalkParallel;"},
 	}
-	result, authorized := buildLocalizationExploreResultForTask(
+	result, authorized, _ := buildLocalizationExploreResultForTask(
 		newLocalizationRefinementCompletion(buildParallel.ID),
 		"nondeterministic WalkBuilder parallel multi-root walk build_parallel",
 		targets,
