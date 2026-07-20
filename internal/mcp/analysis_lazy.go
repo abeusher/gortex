@@ -6,7 +6,6 @@ import (
 
 	"github.com/zzet/gortex/internal/analysis"
 	"github.com/zzet/gortex/internal/graph"
-	"github.com/zzet/gortex/internal/runtimeactivity"
 	"go.uber.org/zap"
 )
 
@@ -144,14 +143,17 @@ func (s *Server) analysisProcessesForNodes(nodeIDs []string) ([]graph.AnalysisPr
 // generation receipt and graph tokens remain published, so the next request can
 // query bounded rows without a whole-graph recomputation.
 func (s *Server) releaseTransientAnalysisIfIdle() bool {
-	if runtimeactivity.Current().Active != 0 {
-		return false
-	}
 	s.analysisMu.Lock()
 	defer s.analysisMu.Unlock()
 	if !s.analysisGenerationReady {
 		return false
 	}
+	// The durable generation is the source of truth once published. Dropping
+	// these compatibility views is safe even while requests are active: a
+	// request that already copied a pointer keeps that object alive, while new
+	// requests materialize bounded rows from the generation store. Waiting for
+	// process-wide idleness can retain the entire analysis corpus forever when
+	// a cancelled MCP handler ignores its context.
 	s.communities = nil
 	s.leidenCache = nil
 	s.processes = nil

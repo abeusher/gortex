@@ -775,6 +775,12 @@ func (s *Server) handleAnalyze(ctx context.Context, req mcp.CallToolRequest) (*m
 		return mcp.NewToolResultText(analyzeHelpResult()), nil
 	}
 
+	releaseAnalysis, admissionErr := s.acquireAnalyzeAdmission(ctx, kind)
+	if admissionErr != nil {
+		return mcp.NewToolResultError(admissionErr.Error()), nil
+	}
+	defer releaseAnalysis()
+
 	// Uniform repo/project/workspace/scope narrowing, clamped to the
 	// session workspace. A few kinds own one of the uniform arg names as
 	// a kind-specific filter, so strip those from the scope-resolution
