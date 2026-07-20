@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -12,6 +13,8 @@ import (
 
 	"github.com/spf13/cobra"
 	"golang.org/x/mod/semver"
+
+	"github.com/zzet/gortex/internal/daemon"
 )
 
 // InstallMethod is how this gortex binary was installed, inferred from where it
@@ -198,9 +201,12 @@ func runUpgrade(cmd *cobra.Command, args []string) error {
 		fmt.Fprintf(out, "Run:\n  %s\n", command)
 	} else {
 		fmt.Fprintf(out, "$ %s\n", command)
-		ex := upgradeExecCommand(cmd.Context(), command)
-		ex.Stdout, ex.Stderr, ex.Stdin = out, cmd.ErrOrStderr(), os.Stdin
-		if rerr := ex.Run(); rerr != nil {
+		run := func() error {
+			ex := upgradeExecCommand(cmd.Context(), command)
+			ex.Stdout, ex.Stderr, ex.Stdin = out, cmd.ErrOrStderr(), os.Stdin
+			return ex.Run()
+		}
+		if rerr := runUpgradeCommand(out, cmd.ErrOrStderr(), defaultUpgradeDaemonOps(cmd), run); rerr != nil {
 			return fmt.Errorf("upgrade command failed: %w", rerr)
 		}
 	}
@@ -230,6 +236,77 @@ func upgradeExecCommand(ctx context.Context, command string) *exec.Cmd {
 // quoting) — the signal that it must not be split into a raw argv vector.
 func upgradeCommandNeedsShell(command string) bool {
 	return strings.ContainsAny(command, "|&;<>()$`\\\"'")
+}
+
+// upgradeDaemonOps captures the daemon-lifecycle hooks runUpgradeCommand uses
+// to bounce the daemon around the binary swap. Defaults wire to the real
+// daemon; tests substitute fakes to assert the stop→swap→restart ordering
+// without a live daemon or an OS supervisor.
+type upgradeDaemonOps struct {
+	isRunning    func() bool
+	supervised   func() bool
+	stop         func() error
+	start        func() error
+	superRestart func(io.Writer) error
+}
+
+// defaultUpgradeDaemonOps wires upgradeDaemonOps to the real daemon lifecycle.
+func defaultUpgradeDaemonOps(cmd *cobra.Command) upgradeDaemonOps {
+	return upgradeDaemonOps{
+		isRunning:  daemon.IsRunning,
+		supervised: serviceActive,
+		stop: func() error {
+			// Suppress the stop-intent marker (as `daemon restart` does) so a
+			// failed upgrade can't leave autostart permanently disabled.
+			daemonRestartActive = true
+			defer func() { daemonRestartActive = false }()
+			return runDaemonStop(cmd, nil)
+		},
+		start: func() error {
+			daemonDetach = true
+			return runDaemonStart(cmd, nil)
+		},
+		superRestart: serviceRestart,
+	}
+}
+
+// runUpgradeCommand executes the install command (run) with the daemon bounced
+// around it, so the upgraded binary is what serves afterwards and the old
+// process isn't holding the store lock during an in-place replace. A daemon
+// owned by an OS supervisor is bounced THROUGH the supervisor (keeping its
+// ownership): the binary is swapped in place first — the running daemon keeps
+// the old inode — then the supervisor re-execs the new binary. A manually
+// started daemon is stopped before the swap and restarted after. The daemon is
+// always brought back, even when the install command fails, so a failed
+// upgrade never leaves the user with the daemon down.
+func runUpgradeCommand(out, errw io.Writer, ops upgradeDaemonOps, run func() error) error {
+	running := ops.isRunning()
+	supervised := running && ops.supervised()
+
+	switch {
+	case supervised:
+		if err := run(); err != nil {
+			return err
+		}
+		fmt.Fprintln(out, "Restarting daemon via service supervisor…")
+		if err := ops.superRestart(errw); err != nil {
+			fmt.Fprintf(errw, "warning: upgrade succeeded but service restart failed: %v\n", err)
+		}
+		return nil
+	case running:
+		fmt.Fprintln(out, "Stopping daemon before upgrade…")
+		if err := ops.stop(); err != nil {
+			return fmt.Errorf("stop daemon before upgrade: %w", err)
+		}
+		runErr := run()
+		fmt.Fprintln(out, "Restarting daemon…")
+		if err := ops.start(); err != nil {
+			fmt.Fprintf(errw, "warning: daemon restart after upgrade failed: %v\n", err)
+		}
+		return runErr
+	default:
+		return run()
+	}
 }
 
 // goBinDir returns the directory `go install` drops binaries into — $GOBIN, or
