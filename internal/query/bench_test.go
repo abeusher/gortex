@@ -1,6 +1,7 @@
 package query
 
 import (
+	"sync"
 	"testing"
 
 	"go.uber.org/zap"
@@ -12,18 +13,30 @@ import (
 	"github.com/zzet/gortex/internal/parser/languages"
 )
 
-// buildTestEngine indexes the Gortex repo and returns an engine.
+var (
+	benchmarkEngineOnce sync.Once
+	benchmarkEngine     *Engine
+	benchmarkEngineErr  error
+)
+
+// buildTestEngine indexes the Gortex repo once and shares the read-only engine
+// across all benchmarks in this package.
 func buildTestEngine(b *testing.B) *Engine {
 	b.Helper()
-	g := graph.New()
-	reg := parser.NewRegistry()
-	languages.RegisterAll(reg)
-	idx := indexer.New(g, reg, config.IndexConfig{}, zap.NewNop())
-	_, err := idx.Index("../..")
-	if err != nil {
-		b.Fatal(err)
+	benchmarkEngineOnce.Do(func() {
+		g := graph.New()
+		reg := parser.NewRegistry()
+		languages.RegisterAll(reg)
+		idx := indexer.New(g, reg, config.IndexConfig{}, zap.NewNop())
+		_, benchmarkEngineErr = idx.Index("../..")
+		if benchmarkEngineErr == nil {
+			benchmarkEngine = NewEngine(g)
+		}
+	})
+	if benchmarkEngineErr != nil {
+		b.Fatal(benchmarkEngineErr)
 	}
-	return NewEngine(g)
+	return benchmarkEngine
 }
 
 func BenchmarkSearchSymbols(b *testing.B) {
