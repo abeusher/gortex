@@ -280,13 +280,13 @@ func (s *Server) wrapLegacyFacade(name string, raw server.ToolHandlerFunc) serve
 	}
 }
 
-// decorateLocalizationReadResult makes the successful refinement read
-// self-terminal. JSON object results retain their public shape with one added
+// decorateLocalizationReadResult makes a reserved localization read carry its
+// next completion. JSON object results retain their public shape with one added
 // completion field; text results receive the same compact JSON contract in one
-// text block. Existing content blocks, structured payloads, annotations, and
-// metadata remain intact.
+// text block. Existing content blocks, structured payloads, error status,
+// annotations, and metadata remain intact.
 func decorateLocalizationReadResult(result *mcpgo.CallToolResult, completion localizationCompletion) *mcpgo.CallToolResult {
-	if result == nil || result.IsError {
+	if result == nil {
 		return result
 	}
 	originalContent := append([]mcpgo.Content(nil), result.Content...)
@@ -516,11 +516,11 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 			terminal.keepOpenForTask(req.GetString("task", ""))
 		}
 	}
-	localizationReadReserved := false
+	localizationReadReservation := uint64(0)
 	localizationReadSucceeded := false
 	defer func() {
-		if localizationReadReserved {
-			terminal.finishReservedRead(localizationReadSucceeded)
+		if localizationReadReservation != 0 {
+			terminal.finishReservedReadToken(localizationReadReservation, localizationReadSucceeded)
 		}
 		if localizeReservation != 0 && !localizeFinished {
 			// Errors and panics roll back to the previous completion contract.
@@ -528,24 +528,27 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 		}
 	}()
 	if !transactionalExploreFlow {
-		blocked, reserved := terminal.authorize(facade, operation, req.GetArguments())
+		blocked, reservation := terminal.authorizeWithToken(facade, operation, req.GetArguments())
 		if blocked != nil {
 			s.recordFacadeTelemetry(facade, operation, facadeOutcomeBlocked, time.Since(started))
 			return blocked, nil
 		}
-		localizationReadReserved = reserved
+		localizationReadReservation = reservation
 	}
 	result, err := s.invokeFacadeSpec(ctx, req, spec)
 	succeeded := err == nil && result != nil && !result.IsError
-	if localizationReadReserved {
+	if localizationReadReservation != 0 {
 		localizationReadSucceeded = succeeded
+		// Finalize before decorating so a preclassified route can expose its
+		// next exact hop in this same response. An exhausted failed allowance is
+		// also converted to a tool error result carrying answer_ready; otherwise
+		// a Go handler error would hide the terminal contract from the host.
+		completion := terminal.finishReservedReadToken(localizationReadReservation, succeeded)
+		localizationReadReservation = 0
 		if succeeded {
-			// Finalize before decorating so a preclassified generic forwarder can
-			// expose its one exact implementation hop in this same response. The
-			// dispatcher never inspects or reparses the read payload.
-			completion := terminal.finishReservedRead(true)
-			localizationReadReserved = false
 			result = decorateLocalizationReadResult(result, completion)
+		} else if completion.State == localizationStateAnswerReady {
+			result, err = decorateExhaustedLocalizationReadFailure(result, err, completion, spec)
 		}
 	}
 	if transactionalExploreFlow {
@@ -553,6 +556,23 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 		localizeFinished = true
 	}
 	return result, err
+}
+
+func decorateExhaustedLocalizationReadFailure(
+	result *mcpgo.CallToolResult,
+	err error,
+	completion localizationCompletion,
+	spec facadeOperationSpec,
+) (*mcpgo.CallToolResult, error) {
+	if result == nil || (err != nil && !result.IsError) {
+		message := "localization read failed"
+		if err != nil {
+			message = err.Error()
+		}
+		result = mcpgo.NewToolResultError(message)
+	}
+	result = decorateFacadeResultIdentity(result, spec)
+	return decorateLocalizationReadResult(result, completion), nil
 }
 
 func inferFacadeOperation(facade string, input map[string]any) string {
@@ -816,21 +836,27 @@ func (s *Server) invokeFacadeSpec(ctx context.Context, req mcpgo.CallToolRequest
 	if err == nil {
 		result = s.decorateFacadeFreshness(spec.Legacy, forwarded, result)
 	}
-	if result != nil {
-		if result.Meta == nil {
-			result.Meta = &mcpgo.Meta{}
-		}
-		if result.Meta.AdditionalFields == nil {
-			result.Meta.AdditionalFields = make(map[string]any)
-		}
-		result.Meta.AdditionalFields["gortex_facade"] = map[string]any{
-			"surface_version": FacadeSurfaceVersion,
-			"facade":          spec.Facade,
-			"operation":       spec.Operation,
-			"canonical_tool":  spec.Legacy,
-		}
-	}
+	result = decorateFacadeResultIdentity(result, spec)
 	return result, err
+}
+
+func decorateFacadeResultIdentity(result *mcpgo.CallToolResult, spec facadeOperationSpec) *mcpgo.CallToolResult {
+	if result == nil {
+		return nil
+	}
+	if result.Meta == nil {
+		result.Meta = &mcpgo.Meta{}
+	}
+	if result.Meta.AdditionalFields == nil {
+		result.Meta.AdditionalFields = make(map[string]any)
+	}
+	result.Meta.AdditionalFields["gortex_facade"] = map[string]any{
+		"surface_version": FacadeSurfaceVersion,
+		"facade":          spec.Facade,
+		"operation":       spec.Operation,
+		"canonical_tool":  spec.Legacy,
+	}
+	return result
 }
 
 func (s *Server) resolveFacadeSymbolShorthand(ctx context.Context, id string) (string, []string) {

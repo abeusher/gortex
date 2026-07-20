@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -512,6 +513,126 @@ func TestHandleFacadeExactReadCommitsOnlyOnSuccess(t *testing.T) {
 		t.Fatalf("successful exact read must make later navigation terminal: result=%#v err=%v calls=%d", third, err, calls)
 	}
 	requireLocalizationTerminalError(t, third, "read", "source")
+}
+
+func TestHandleFacadeExhaustedCorrectionFailureCarriesTerminalCompletion(t *testing.T) {
+	registry := newFacadeRegistry()
+	preferred := "repo/pkg/find.go::Find"
+	alternate := "repo/pkg/resolve.go::Resolve"
+	alternateCalls := 0
+	registry.capture(mcpgo.NewTool("get_symbol_source", mcpgo.WithString("id", mcpgo.Required())), func(_ context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+		if req.GetString("id", "") == preferred {
+			return mcpgo.NewToolResultText("func Find() {}"), nil
+		}
+		alternateCalls++
+		if alternateCalls == 1 {
+			return mcpgo.NewToolResultError("transient correction failure"), nil
+		}
+		return nil, errors.New("persistent correction failure")
+	})
+	server := &Server{facades: registry, localization: newLocalizationTerminalState(), sessions: newSessionMap()}
+	ctx := WithSessionID(context.Background(), "exhausted-correction")
+	server.localizationFor(ctx).armRefinementRoutesForTask(
+		"locate resolver behavior",
+		preferred,
+		[]string{preferred, alternate},
+		map[string]localizationRefinementRoute{
+			preferred: {},
+			alternate: {enforceable: true},
+		},
+		testEvidenceDigest(),
+	)
+
+	read := func(symbol string) (*mcpgo.CallToolResult, error) {
+		req := mcpgo.CallToolRequest{}
+		req.Params.Name = "read"
+		req.Params.Arguments = map[string]any{
+			"operation": "source",
+			"target":    map[string]any{"symbol": symbol},
+		}
+		return server.handleFacade(ctx, "read", req)
+	}
+	first, err := read(preferred)
+	if err != nil || first == nil || first.IsError {
+		t.Fatalf("preferred read = (%#v, %v), want success", first, err)
+	}
+	firstBody, _ := singleTextContent(first)
+	if !strings.Contains(firstBody, `"state":"needs_exact_read"`) ||
+		!strings.Contains(firstBody, `"required_action":"read_exact"`) ||
+		!strings.Contains(firstBody, alternate) {
+		t.Fatalf("preferred read omitted correction contract: %q", firstBody)
+	}
+
+	second, err := read(alternate)
+	if err != nil || second == nil || !second.IsError {
+		t.Fatalf("first correction failure = (%#v, %v), want tool error", second, err)
+	}
+	third, err := read(alternate)
+	if err != nil || third == nil || !third.IsError {
+		t.Fatalf("exhausted correction failure = (%#v, %v), want observable tool error", third, err)
+	}
+	thirdBody, _ := singleTextContent(third)
+	if !strings.Contains(thirdBody, "persistent correction failure") ||
+		!strings.Contains(thirdBody, `"state":"answer_ready"`) ||
+		!strings.Contains(thirdBody, `"required_action":"respond"`) ||
+		!strings.Contains(thirdBody, `"terminal":true`) {
+		t.Fatalf("exhausted failure omitted terminal completion: %q", thirdBody)
+	}
+	requireFacadeIdentity(t, third, facadeOperationSpec{Facade: "read", Operation: "source", Legacy: "get_symbol_source"})
+	if blocked, err := read(alternate); err != nil {
+		t.Fatalf("post-terminal read returned transport error: %v", err)
+	} else {
+		requireLocalizationTerminalError(t, blocked, "read", "source")
+	}
+}
+
+func TestDecorateExhaustedLocalizationReadFailureKeepsErrorAndFacadeIdentity(t *testing.T) {
+	spec := facadeOperationSpec{Facade: "read", Operation: "source", Legacy: "get_symbol_source"}
+	completion := newLocalizationCompletion(true, "")
+
+	t.Run("transport error overrides success-shaped result", func(t *testing.T) {
+		result, err := decorateExhaustedLocalizationReadFailure(
+			mcpgo.NewToolResultText("stale success payload"),
+			errors.New("transport read failure"),
+			completion,
+			spec,
+		)
+		if err != nil || result == nil || !result.IsError {
+			t.Fatalf("decorated transport failure = (%#v, %v), want tool error", result, err)
+		}
+		body, _ := singleTextContent(result)
+		if !strings.Contains(body, "transport read failure") || strings.Contains(body, "stale success payload") ||
+			!strings.Contains(body, `"state":"answer_ready"`) {
+			t.Fatalf("transport failure payload = %q", body)
+		}
+		requireFacadeIdentity(t, result, spec)
+	})
+
+	t.Run("existing tool error metadata is preserved", func(t *testing.T) {
+		original := mcpgo.NewToolResultError("tool read failure")
+		original.Meta = mcpgo.NewMetaFromMap(map[string]any{"handler": "kept"})
+		result, err := decorateExhaustedLocalizationReadFailure(original, nil, completion, spec)
+		if err != nil || result == nil || !result.IsError {
+			t.Fatalf("decorated tool failure = (%#v, %v), want tool error", result, err)
+		}
+		if result.Meta.AdditionalFields["handler"] != "kept" {
+			t.Fatalf("existing handler metadata lost: %#v", result.Meta)
+		}
+		requireFacadeIdentity(t, result, spec)
+	})
+}
+
+func requireFacadeIdentity(t *testing.T, result *mcpgo.CallToolResult, spec facadeOperationSpec) {
+	t.Helper()
+	if result == nil || result.Meta == nil || result.Meta.AdditionalFields == nil {
+		t.Fatalf("facade result has no metadata: %#v", result)
+	}
+	identity, ok := result.Meta.AdditionalFields["gortex_facade"].(map[string]any)
+	if !ok || identity["surface_version"] != FacadeSurfaceVersion ||
+		identity["facade"] != spec.Facade || identity["operation"] != spec.Operation ||
+		identity["canonical_tool"] != spec.Legacy {
+		t.Fatalf("facade identity = %#v, want %#v", identity, spec)
+	}
 }
 
 func TestHandleFacadeFailedDifferentLocalizePreservesTerminalState(t *testing.T) {
