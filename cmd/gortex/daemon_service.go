@@ -154,6 +154,8 @@ func runDaemonInstallService(cmd *cobra.Command, _ []string) error {
 		return installLaunchd(w, exe)
 	case "linux":
 		return installSystemd(w, exe)
+	case "windows":
+		return installWindowsTask(w, exe)
 	default:
 		return fmt.Errorf("service install is not supported on %s — run 'gortex daemon start --detach' to keep the daemon running in the background", runtime.GOOS)
 	}
@@ -166,6 +168,8 @@ func runDaemonUninstallService(cmd *cobra.Command, _ []string) error {
 		return uninstallLaunchd(w)
 	case "linux":
 		return uninstallSystemd(w)
+	case "windows":
+		return uninstallWindowsTask(w)
 	default:
 		return fmt.Errorf("service uninstall not supported on %s", runtime.GOOS)
 	}
@@ -178,6 +182,8 @@ func runDaemonServiceStatus(cmd *cobra.Command, _ []string) error {
 		return statusLaunchd(w)
 	case "linux":
 		return statusSystemd(w)
+	case "windows":
+		return statusWindowsTask(w)
 	default:
 		return fmt.Errorf("service status not supported on %s", runtime.GOOS)
 	}
@@ -466,4 +472,76 @@ func runCmd(w io.Writer, name string, args ...string) error {
 	c.Stdout = w
 	c.Stderr = w
 	return c.Run()
+}
+
+// --- Task Scheduler (Windows) --------------------------------------------
+//
+// Windows has no user-level unit file the way launchd / systemd --user do,
+// and a true Windows Service would require admin rights plus Service Control
+// Manager integration in the daemon. The per-user analogue that keeps the
+// no-admin, autostart-at-login contract is a Task Scheduler logon task, driven
+// through schtasks: it runs `gortex daemon start` at each logon under the
+// current limited user. (schtasks' CLI flags don't expose restart-on-failure —
+// that's a Task-Scheduler-XML-only setting — so crash-restart parity with
+// launchd KeepAlive / systemd Restart=on-failure is a follow-up.)
+
+// windowsTaskName is the Task Scheduler task that autostarts the daemon at
+// logon on Windows.
+const windowsTaskName = "GortexDaemon"
+
+// windowsTaskCreateArgs builds the schtasks argv that registers the logon
+// autostart task. Split out so the arg vector is unit-testable without a
+// Windows host: the task runs `"<exe>" daemon start` at each logon (ONLOGON)
+// under the current limited user (RL LIMITED), replacing any existing task (F).
+func windowsTaskCreateArgs(taskName, exe string) []string {
+	return []string{
+		"/Create",
+		"/TN", taskName,
+		"/TR", fmt.Sprintf(`"%s" daemon start`, exe),
+		"/SC", "ONLOGON",
+		"/RL", "LIMITED",
+		"/F",
+	}
+}
+
+func installWindowsTask(w io.Writer, exe string) error {
+	if err := runCmd(w, "schtasks", windowsTaskCreateArgs(windowsTaskName, exe)...); err != nil {
+		return fmt.Errorf("schtasks create: %w", err)
+	}
+	// Start it now so the user gets a running daemon in one command — the
+	// Windows analogue of systemd `enable --now` / launchd RunAtLoad.
+	_ = runCmd(w, "schtasks", "/Run", "/TN", windowsTaskName)
+	fmt.Fprintf(w, "[gortex daemon] logon task installed (%s)\n", windowsTaskName)
+	fmt.Fprintf(w, "  logs: %s\n", daemon.LogFilePath())
+	fmt.Fprintf(w, "  check: gortex daemon service-status\n")
+	return nil
+}
+
+func uninstallWindowsTask(w io.Writer) error {
+	// End a running instance, then delete the task. Both are swallowed so
+	// uninstall is idempotent on a host where the task was never installed
+	// (schtasks exits non-zero for an unknown task).
+	_ = runCmd(w, "schtasks", "/End", "/TN", windowsTaskName)
+	_ = runCmd(w, "schtasks", "/Delete", "/TN", windowsTaskName, "/F")
+	fmt.Fprintln(w, "[gortex daemon] logon task uninstalled")
+	return nil
+}
+
+func statusWindowsTask(w io.Writer) error {
+	// `schtasks /Query /TN <name>` exits 0 when the task exists, non-zero
+	// otherwise.
+	out, err := exec.Command("schtasks", "/Query", "/TN", windowsTaskName).CombinedOutput()
+	if err != nil {
+		fmt.Fprintf(w, "windows task: not installed (%s)\n", windowsTaskName)
+		return nil
+	}
+	fmt.Fprintf(w, "windows task: installed (%s)\n", windowsTaskName)
+	// Surface the Status column if schtasks printed one.
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "Status:") {
+			fmt.Fprintln(w, "  "+line)
+		}
+	}
+	return nil
 }

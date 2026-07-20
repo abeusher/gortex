@@ -195,14 +195,31 @@ func TestSystemdUnitPath_ResolvesUnderHome(t *testing.T) {
 }
 
 // TestServiceCommands_RejectUnsupportedOS keeps the guard
-// runDaemonInstallService uses from silently succeeding on Windows or
-// other platforms we haven't wired.
+// runDaemonInstallService uses from silently succeeding on a platform we
+// haven't wired (darwin/linux/windows are now all supported).
 func TestServiceCommands_RejectUnsupportedOS(t *testing.T) {
-	if runtime.GOOS == "darwin" || runtime.GOOS == "linux" {
+	if runtime.GOOS == "darwin" || runtime.GOOS == "linux" || runtime.GOOS == "windows" {
 		t.Skip("this test only runs on unsupported platforms")
 	}
 	err := runDaemonInstallService(daemonInstallServiceCmd, nil)
 	require.Error(t, err)
 	assert.True(t, strings.Contains(err.Error(), "not supported"),
 		"install must refuse on unsupported OS: %v", err)
+}
+
+// TestWindowsTaskCreateArgs pins the schtasks command that registers the
+// Windows logon autostart task: a per-user (LIMITED) ONLOGON task running the
+// quoted binary with `daemon start`, force-replacing any existing task.
+func TestWindowsTaskCreateArgs(t *testing.T) {
+	args := windowsTaskCreateArgs("GortexDaemon", `C:\Users\x\scoop\apps\gortex\current\gortex.exe`)
+	require.Equal(t, "/Create", args[0])
+
+	joined := strings.Join(args, " ")
+	assert.Contains(t, joined, "/TN GortexDaemon")
+	assert.Contains(t, joined, "/SC ONLOGON")
+	assert.Contains(t, joined, "/RL LIMITED")
+	assert.Contains(t, joined, "/F")
+	// The run action quotes the exe (so a Program Files path with spaces is one
+	// token) and appends the daemon subcommand.
+	assert.Contains(t, joined, `"C:\Users\x\scoop\apps\gortex\current\gortex.exe" daemon start`)
 }

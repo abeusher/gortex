@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"runtime"
 
 	"github.com/spf13/cobra"
@@ -74,6 +75,9 @@ func serviceUnitPresent() bool {
 		path, err = launchdPlistPath()
 	case "linux":
 		path, err = systemdUnitPath()
+	case "windows":
+		// No unit file — the logon task lives in Task Scheduler; query it.
+		return exec.Command("schtasks", "/Query", "/TN", windowsTaskName).Run() == nil
 	default:
 		return false
 	}
