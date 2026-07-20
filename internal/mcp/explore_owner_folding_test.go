@@ -65,6 +65,214 @@ func TestFoldMemberOwnersPromotesSharedOwner(t *testing.T) {
 	}
 }
 
+func TestLimitExploreFoldedTargetsPreservesReservationsAndCap(t *testing.T) {
+	s, g := newOwnerFoldFixture(t)
+	targets := []exploreTarget{
+		{node: g.GetNode("repo/mw/persist.ts::PersistOptions.serialize"), score: 1.0, typedAnchorProjection: true},
+		{node: g.GetNode("repo/mw/other.ts::unrelated"), score: 0.9},
+		{node: g.GetNode("repo/mw/persist.ts::PersistOptions.hydrate"), score: 0.8, sourceLiteral: true},
+	}
+	folded := s.foldMemberOwners(context.Background(), targets)
+	bounded := limitExploreFoldedTargets("", folded, len(targets), map[string]struct{}{
+		targets[0].node.ID: {},
+		targets[2].node.ID: {},
+	})
+	if len(bounded) != len(targets) {
+		t.Fatalf("bounded owner fold = %d targets, want %d", len(bounded), len(targets))
+	}
+	for _, id := range []string{targets[0].node.ID, targets[2].node.ID} {
+		found := false
+		for _, target := range bounded {
+			found = found || target.node != nil && target.node.ID == id
+		}
+		if !found {
+			t.Fatalf("owner fold cap evicted reserved target %s", id)
+		}
+	}
+}
+
+func TestLimitExploreFoldedTargetsDropsSyntheticOwnerWhenEveryDirectTargetIsReserved(t *testing.T) {
+	s, g := newOwnerFoldFixture(t)
+	targets := []exploreTarget{
+		{node: g.GetNode("repo/mw/persist.ts::PersistOptions.serialize"), score: 1.0, typedAnchorProjection: true},
+		{node: g.GetNode("repo/mw/other.ts::unrelated"), score: 0.9, sourceLiteral: true},
+		{node: g.GetNode("repo/mw/persist.ts::PersistOptions.hydrate"), score: 0.8, typedAnchorProjection: true},
+	}
+	reserved := make(map[string]struct{}, len(targets))
+	for _, target := range targets {
+		reserved[target.node.ID] = struct{}{}
+	}
+	folded := s.foldMemberOwners(context.Background(), targets)
+	if len(folded) != len(targets)+1 || !folded[0].foldedOwner {
+		t.Fatalf("fixture did not insert a tagged synthetic owner: %#v", folded)
+	}
+	bounded := limitExploreFoldedTargets(
+		"Find the PersistOptions type that owns serialize and hydrate behavior.",
+		folded,
+		len(targets),
+		reserved,
+	)
+	if len(bounded) != len(targets) {
+		t.Fatalf("all-protected fold returned %d targets, want %d", len(bounded), len(targets))
+	}
+	for _, target := range bounded {
+		if target.foldedOwner {
+			t.Fatal("synthetic owner survived when every direct target was reserved")
+		}
+	}
+}
+
+func TestLimitExploreFoldedTargetsNeverEvictsDirectWindowForSyntheticOwner(t *testing.T) {
+	s, g := newOwnerFoldFixture(t)
+	direct := []exploreTarget{
+		{node: g.GetNode("repo/mw/persist.ts::PersistOptions.serialize"), score: 1.0},
+		{node: g.GetNode("repo/mw/other.ts::unrelated"), score: 0.9},
+		{node: g.GetNode("repo/mw/persist.ts::PersistOptions.hydrate"), score: 0.8},
+	}
+	folded := s.foldMemberOwners(context.Background(), direct)
+	if len(folded) != len(direct)+1 || !folded[0].foldedOwner {
+		t.Fatalf("fixture did not insert a tagged synthetic owner: %#v", folded)
+	}
+	bounded := limitExploreFoldedTargets("", folded, len(direct), map[string]struct{}{
+		folded[0].node.ID: {}, // even a stale reservation cannot displace direct evidence
+	})
+	if len(bounded) != len(direct) {
+		t.Fatalf("bounded owner fold = %d targets, want %d", len(bounded), len(direct))
+	}
+	want := make(map[string]struct{}, len(direct))
+	for _, target := range direct {
+		want[target.node.ID] = struct{}{}
+	}
+	for _, target := range bounded {
+		if target.foldedOwner {
+			t.Fatal("post-selection synthetic owner displaced a direct candidate")
+		}
+		delete(want, target.node.ID)
+	}
+	if len(want) != 0 {
+		t.Fatalf("direct candidate window was not preserved: missing %v", want)
+	}
+}
+
+func TestLimitExploreFoldedTargetsRetainsDraftSelectedTypeOwnerAtCap(t *testing.T) {
+	s, g := newOwnerFoldFixture(t)
+	direct := []exploreTarget{
+		{node: g.GetNode("repo/mw/persist.ts::PersistOptions.serialize"), score: 1.0},
+		{node: g.GetNode("repo/mw/other.ts::unrelated"), score: 0.9},
+		{node: g.GetNode("repo/mw/persist.ts::PersistOptions.hydrate"), score: 0.8},
+	}
+	folded := s.foldMemberOwners(context.Background(), direct)
+	bounded := limitExploreFoldedTargets(
+		"Find the persist middleware options type that owns serialize and hydrate behavior.",
+		folded,
+		len(direct),
+		nil,
+	)
+	if len(bounded) != len(direct) {
+		t.Fatalf("bounded owner fold = %d targets, want %d", len(bounded), len(direct))
+	}
+	want := map[string]struct{}{
+		"repo/mw/persist.ts::PersistOptions":           {},
+		"repo/mw/persist.ts::PersistOptions.serialize": {},
+		"repo/mw/persist.ts::PersistOptions.hydrate":   {},
+	}
+	for _, target := range bounded {
+		if target.node != nil {
+			delete(want, target.node.ID)
+		}
+	}
+	if len(want) != 0 {
+		t.Fatalf("draft-selected type route was not retained: missing %v; got %#v", want, bounded)
+	}
+	for _, target := range bounded {
+		if target.node != nil && target.node.ID == "repo/mw/other.ts::unrelated" {
+			t.Fatal("draft-rejected unrelated row survived ahead of selected owner route")
+		}
+	}
+}
+
+func TestExploreFoldedOwnerTaskAlignedRequiresOwnerIdentity(t *testing.T) {
+	tests := []struct {
+		name  string
+		task  string
+		owner string
+		want  bool
+	}{
+		{
+			name:  "compound identity",
+			task:  "Find the persist middleware options type that owns hydration.",
+			owner: "PersistOptions",
+			want:  true,
+		},
+		{
+			name:  "single exact identity",
+			task:  "Find the callable that matches ancestor ignore rules.",
+			owner: "Ignore",
+			want:  true,
+		},
+		{
+			name:  "generic declaration words",
+			task:  "Find the configuration options type that owns this behavior.",
+			owner: "ConfigurationOptions",
+			want:  false,
+		},
+		{
+			name:  "literal generic compound identity",
+			task:  "Find ConfigurationOptions and explain its behavior.",
+			owner: "ConfigurationOptions",
+			want:  true,
+		},
+		{
+			name:  "partial compound identity",
+			task:  "Find number-to-words registration for a locale.",
+			owner: "NumberToWordsConverterRegistry",
+			want:  false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			owner := &graph.Node{Name: tt.owner, Kind: graph.KindType}
+			if got := exploreFoldedOwnerTaskAligned(tt.task, owner); got != tt.want {
+				t.Fatalf("owner alignment = %v, want %v for task %q and owner %q", got, tt.want, tt.task, tt.owner)
+			}
+		})
+	}
+}
+
+func TestLimitExploreFoldedTargetsGenericTypeWordsDoNotRetainUnrelatedOwner(t *testing.T) {
+	s, g := newOwnerFoldFixture(t)
+	direct := []exploreTarget{
+		{node: g.GetNode("repo/mw/persist.ts::PersistOptions.serialize"), score: 1.0},
+		{node: g.GetNode("repo/mw/other.ts::unrelated"), score: 0.9},
+		{node: g.GetNode("repo/mw/persist.ts::PersistOptions.hydrate"), score: 0.8},
+	}
+	folded := s.foldMemberOwners(context.Background(), direct)
+	bounded := limitExploreFoldedTargets(
+		"Find the type config options that own this behavior.",
+		folded,
+		len(direct),
+		nil,
+	)
+	if len(bounded) != len(direct) {
+		t.Fatalf("bounded owner fold = %d targets, want %d", len(bounded), len(direct))
+	}
+	want := make(map[string]struct{}, len(direct))
+	for _, target := range direct {
+		want[target.node.ID] = struct{}{}
+	}
+	for _, target := range bounded {
+		if target.foldedOwner {
+			t.Fatal("generic type/config/options wording retained an unrelated synthetic owner")
+		}
+		if target.node != nil {
+			delete(want, target.node.ID)
+		}
+	}
+	if len(want) != 0 {
+		t.Fatalf("generic owner wording displaced direct candidates: missing %v", want)
+	}
+}
+
 // A same-file helper named in a wrapper body is promotable into the answer
 // draft as a callee of the ranked wrapper — the generic wrapper-to-helper
 // shape. Verified covered by the existing draft promotion; pinned so

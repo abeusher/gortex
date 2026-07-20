@@ -6,11 +6,12 @@ import "github.com/zzet/gortex/internal/graph"
 // The latter is a ranking decision; the former requires one of these bounded,
 // production-proven evidence shapes and must survive final response packing.
 const (
-	localizationProvenanceSourceLiteralCallee  = "source_literal_callee"
-	localizationProvenanceDivergentDefault     = "divergent_default_owner"
-	localizationProvenanceDivergentDefaultType = "divergent_default_type"
-	localizationProvenanceImplementationRoute  = "implementation_route"
-	localizationProvenanceImplementationTarget = "implementation_target"
+	localizationProvenanceSourceLiteralCallee   = "source_literal_callee"
+	localizationProvenanceDivergentDefault      = "divergent_default_owner"
+	localizationProvenanceDivergentDefaultType  = "divergent_default_type"
+	localizationProvenanceImplementationRoute   = "implementation_route"
+	localizationProvenanceImplementationTarget  = "implementation_target"
+	localizationProvenanceTypedAnchorProjection = "typed_anchor_projection"
 )
 
 type localizationEvidenceProof struct {
@@ -213,6 +214,9 @@ func localizationTargetProvenance(completion localizationCompletion, target expl
 	}
 	if localizationStrongSourceLiteralCallee(target) {
 		return localizationProvenanceSourceLiteralCallee
+	}
+	if target.typedAnchorProjection {
+		return localizationProvenanceTypedAnchorProjection
 	}
 	return ""
 }

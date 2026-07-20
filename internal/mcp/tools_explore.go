@@ -92,6 +92,8 @@ type exploreTarget struct {
 	exactContentAmbiguous bool   // exact evidence has visible or possibly truncated peers
 	sourceLiteral         bool   // exact source-body hit that must survive final envelope packing
 	sourceLiteralCallee   bool   // exact source callsite uniquely resolved to this invoked callable
+	typedAnchorProjection bool   // bounded field-owner-call proof promoted from a task-aligned typed field
+	foldedOwner           bool   // synthetic owner inserted by concept member folding
 }
 
 type exploreCausalNeighbor struct {
@@ -2055,6 +2057,20 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		}
 		cands = anchorPool
 	}
+	if queryClass == rerank.QueryClassConcept && len(protectedSyntacticAnchors) > 0 {
+		// A protected anchor can leave a matching typed field in the final window
+		// without its behavioral owner. Admit one graph-proven field-owner
+		// consumer and its anchor-aligned typed member before source hydration.
+		// The projection uses a fixed batch pipeline with deterministic fanout
+		// bounds and is a no-op unless every structural link is resolved.
+		cands = projectExploreTypedAnchorCandidates(
+			ctx, task, cands, eng.Reader(), opts, maxSymbols,
+			protectedSyntacticAnchors, protectedImplementationID,
+		)
+	}
+	protectedFinalCandidateIDs := exploreTypedAnchorReservedCandidateIDs(
+		cands, protectedSyntacticAnchors, protectedImplementationID,
+	)
 	if len(cands) == 0 && len(artifactLane.targets) == 0 {
 		if req.GetBool("localize", false) {
 			return s.completeEmptyLocalization(ctx, task, budget), nil
@@ -2099,6 +2115,7 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 			t.exactContentAmbiguous = c.Signals[exploreContentRecallAmbiguousSignal] > 0
 			t.sourceLiteral = c.Signals[exploreSourceLiteralSignal] > 0
 			t.sourceLiteralCallee = c.Signals[exploreSourceLiteralCalleeSignal] > 0
+			t.typedAnchorProjection = c.Signals[exploreTypedAnchorProjectionSignal] > 0
 		}
 		t.source = s.manifestSymbolSource(ctx, n)
 		if callers := eng.GetCallers(n.ID, ringOpts); callers != nil {
@@ -2183,6 +2200,11 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		// so terminality is judged against the same strongest evidence that the
 		// final envelope exposes, rather than against a synthetic owner row.
 		symbolTargets = promoteExploreStrongSourceLiteralTarget(symbolTargets)
+		// Owner folding may insert a type above two retained members. Preserve the
+		// fold without violating the request's max_symbols contract: evict only an
+		// unreserved tail target, or the inserted owner itself when every direct
+		// candidate is protected by an earlier evidence lane.
+		symbolTargets = limitExploreFoldedTargets(task, symbolTargets, maxSymbols, protectedFinalCandidateIDs)
 		targets = append(targets[:len(artifactTargets):len(artifactTargets)], symbolTargets...)
 	}
 	answerReady := exploreAnswerReady(task, symbolTargets) || artifactLane.ready
@@ -2697,6 +2719,15 @@ func localizationEvidenceTargetsFromDraft(task, exactID string, targets []explor
 			break
 		}
 	}
+	// A typed-field projection is admitted only after a complete bounded
+	// field→owner←consumer→member proof. Reserve its consumer/member pair before
+	// ordinary draft expansion, but behind pre-existing exact and source-literal
+	// contracts so the new lane cannot demote stronger evidence.
+	for _, target := range targets {
+		if target.typedAnchorProjection {
+			appendTarget(target)
+		}
+	}
 	appendEntry := func(entry exploreDraftEntry) {
 		if entry.node == nil {
 			return
@@ -2874,6 +2905,9 @@ func buildLocalizationExploreResultForTaskFinalized(
 	}
 	for index, target := range targets {
 		if (target.divergentDefaultOwner || target.divergentDefaultType) && index+1 > mandatoryCount {
+			mandatoryCount = index + 1
+		}
+		if target.typedAnchorProjection && index+1 > mandatoryCount {
 			mandatoryCount = index + 1
 		}
 	}

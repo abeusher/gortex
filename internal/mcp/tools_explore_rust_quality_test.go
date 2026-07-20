@@ -123,6 +123,7 @@ func TestIndexedRustLocalizationRetainsMatchedIgnoreForShortAndLongParaphrases(t
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			envelope := callIndexedRustLocalization(t, newServer(), tt.task)
+			require.LessOrEqual(t, len(envelope.Evidence), 5, "max_symbols must bound owner-folded evidence")
 			found := false
 			for _, evidence := range envelope.Evidence {
 				if evidence.Name == "matched_ignore" && filepath.Base(evidence.File) == "dir.rs" {

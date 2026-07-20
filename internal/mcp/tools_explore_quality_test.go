@@ -392,7 +392,7 @@ func TestHandleExploreLocalizeReturnsBoundedEvidenceWhenConfidenceIsLow(t *testi
 	require.Equal(t, localizationStateNeedsRecovery, state)
 	require.Empty(t, preferred)
 	require.Empty(t, authorized)
-	blocked, reserved := terminal.authorize("search", "symbols", map[string]any{"query": "locale formatter"})
+	blocked, reserved := terminal.authorize("search", "symbols", map[string]any{"query": "culture route"})
 	require.Nil(t, blocked)
 	require.True(t, reserved)
 	require.Equal(t, localizationStateAnswerReady, terminal.finishReservedRead(true).State)

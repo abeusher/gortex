@@ -113,6 +113,28 @@ func TestRecoveryAcceptsTaskAlignedIdentifierAndCompactLiteralAnchors(t *testing
 	}
 }
 
+func TestRecoveryRejectsDigestOnlyTermFromRG2095Incident(t *testing.T) {
+	terminal := newLocalizationTerminalState()
+	task := "--multiline with --replace causes duplicate output when a match spans multiple lines"
+	digest := &localizationEvidenceDigest{Evidence: []localizationDigestRow{{
+		ID:       "ripgrep/crates/printer/src/standard.rs::StandardSink.replacer",
+		Name:     "replacer",
+		QualName: "StandardSink.replacer",
+		File:     "crates/printer/src/standard.rs",
+	}}}
+	completion := newLocalizationRecoveryCompletion()
+	completion.digest = digest
+	terminal.armForTask(completion, task)
+
+	blocked, reserved := terminal.authorize("search", "text", map[string]any{"query": "fn sink_matched"})
+	if blocked == nil {
+		t.Fatal("digest-only generic sink term re-admitted the RG2095 recovery failure")
+	}
+	if reserved {
+		t.Fatal("rejected recovery unexpectedly reserved the one-shot allowance")
+	}
+}
+
 func TestRecoveryFailureRestoresOnceAndTerminalizesSameResponse(t *testing.T) {
 	server := setupPresetServer(t, ToolPolicyConfig{Preset: "core", Mode: "defer"})
 	ctx := WithSessionID(context.Background(), "weak_recovery_failure")

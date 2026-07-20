@@ -244,6 +244,29 @@ func TestLocalizationEvidencePolicyPrefersImplementationRouteForMixedStrongProof
 	require.True(t, finished.Enforceable)
 }
 
+func TestTypedAnchorProvenanceDoesNotOverrideStrongerEvidenceRoles(t *testing.T) {
+	node := &graph.Node{
+		ID: "repo/src/replace.rs::Replacer.replace_all", Name: "replace_all",
+		Kind: graph.KindMethod, FilePath: "src/replace.rs",
+	}
+	target := exploreTarget{
+		node: node, source: "fn replace_all() {}",
+		typedAnchorProjection: true,
+		sourceLiteral:         true, sourceLiteralCallee: true, exactContent: true,
+	}
+	if got := localizationTargetProvenance(newLocalizationCompletion(true, ""), target); got != localizationProvenanceSourceLiteralCallee {
+		t.Fatalf("source-literal provenance = %q, want %q", got, localizationProvenanceSourceLiteralCallee)
+	}
+
+	completion := newLocalizationRefinementCompletionForSymbols(node.ID, []string{node.ID})
+	completion.refinementRoutes = map[string]localizationRefinementRoute{
+		node.ID: {enforceable: true, implementationSymbol: "repo/src/replace.rs::Replacer.replace_impl"},
+	}
+	if got := localizationTargetProvenance(completion, target); got != localizationProvenanceImplementationRoute {
+		t.Fatalf("implementation-route provenance = %q, want %q", got, localizationProvenanceImplementationRoute)
+	}
+}
+
 func TestLocalizationEvidencePolicyRequiresEveryPackedProofRole(t *testing.T) {
 	owner := &graph.Node{
 		ID: "repo/RotatingFileHandler.php::__construct", Name: "__construct",
