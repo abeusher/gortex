@@ -63,6 +63,56 @@ func TestWeakReadAllowsOneBoundedSearchRecoveryThenTerminates(t *testing.T) {
 	}
 }
 
+func TestRecoveryRejectsSearchAnchorUnrelatedToTaskBeforeHandler(t *testing.T) {
+	server := setupPresetServer(t, ToolPolicyConfig{Preset: "core", Mode: "defer"})
+	ctx := WithSessionID(context.Background(), "unrelated_recovery_anchor")
+	terminal := server.localizationFor(ctx)
+	terminal.armForTask(newLocalizationRecoveryCompletion(), "--multiline with --replace duplicates printer output")
+
+	searchSpec, ok := server.facades.operation("search", "text")
+	if !ok {
+		t.Fatal("search.text facade operation is missing")
+	}
+	calls := 0
+	server.facades.capture(mcpgo.NewTool(searchSpec.Legacy), func(context.Context, mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+		calls++
+		return mcpgo.NewToolResultText(`{"matches":[{"text":"fn sink_matched"}]}`), nil
+	})
+
+	result, err := server.handleFacade(ctx, "search", localizationRecoveryRequest("search", "text", map[string]any{
+		"query": "fn sink_matched",
+	}))
+	if err != nil {
+		t.Fatalf("unrelated recovery returned transport error: %v", err)
+	}
+	requireLocalizationTerminalError(t, result, "search", "text")
+	if calls != 0 {
+		t.Fatalf("unrelated recovery reached handler: calls=%d", calls)
+	}
+}
+
+func TestRecoveryAcceptsTaskAlignedIdentifierAndCompactLiteralAnchors(t *testing.T) {
+	tests := []struct {
+		name  string
+		task  string
+		query string
+	}{
+		{name: "identifier segment", task: "find candidate resolution", query: "resolveCandidate"},
+		{name: "flag", task: "--multiline with --replace duplicates output", query: "--replace"},
+		{name: "compact literal", task: `register the locale code "ku"`, query: "ku"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if !localizationRecoveryQueryAligned(tt.task, tt.query) {
+				t.Fatalf("query %q should align with task %q", tt.query, tt.task)
+			}
+		})
+	}
+	if localizationRecoveryQueryAligned("--multiline with --replace duplicates output", "fn sink_matched") {
+		t.Fatal("generic adjacent declaration unexpectedly aligned with task")
+	}
+}
+
 func TestRecoveryFailureRestoresOnceAndTerminalizesSameResponse(t *testing.T) {
 	server := setupPresetServer(t, ToolPolicyConfig{Preset: "core", Mode: "defer"})
 	ctx := WithSessionID(context.Background(), "weak_recovery_failure")
@@ -194,13 +244,13 @@ func TestSchemaInvalidAllowedRecoveryTerminatesBeforeHandler(t *testing.T) {
 
 func TestStaleInvalidRecoveryTicketCannotConsumeNewTaskState(t *testing.T) {
 	state := &localizationTerminalState{}
-	state.armForTask(newLocalizationRecoveryCompletion(), "old task")
+	state.armForTask(newLocalizationRecoveryCompletion(), "old anchor task")
 	blocked, oldGeneration := state.interceptAnswerReady("search", "text", map[string]any{"query": "old anchor"})
 	if blocked != nil || oldGeneration == 0 {
 		t.Fatalf("old invalid-recovery preflight = (%#v, %d)", blocked, oldGeneration)
 	}
 
-	state.armForTask(newLocalizationRecoveryCompletion(), "new task")
+	state.armForTask(newLocalizationRecoveryCompletion(), "new anchor task")
 	if completion, consumed := state.consumeInvalidRecovery("search", "text", oldGeneration); consumed {
 		t.Fatalf("stale invalid request consumed new task: %#v", completion)
 	}
@@ -223,7 +273,7 @@ func TestStaleInvalidRecoveryTicketCannotConsumeNewTaskState(t *testing.T) {
 
 func TestStaleRecoveryCannotConsumeNewTaskState(t *testing.T) {
 	state := &localizationTerminalState{}
-	state.armForTask(newLocalizationRecoveryCompletion(), "old task")
+	state.armForTask(newLocalizationRecoveryCompletion(), "old anchor task")
 	blocked, token := state.authorizeWithToken("search", "text", map[string]any{"query": "old anchor"})
 	if blocked != nil || token == 0 {
 		t.Fatalf("old recovery reservation = (%#v, %d)", blocked, token)
@@ -277,7 +327,7 @@ func requireLocalizationResultStateEqual(
 		if wire.RequiredAction != "recover_once" || len(wire.AllowedOperations) != len(localizationRecoveryOperations) {
 			t.Fatalf("recovery completion is not directional/machine-readable: %#v", wire)
 		}
-		wantInstruction := `Make exactly one bounded Gortex recovery call: search(operation:"text" or "symbols", query:<specific anchor>) or read(operation:"source", target:{symbol:<exact id>}); then respond from the returned evidence.`
+		wantInstruction := `Make exactly one bounded Gortex recovery call: search(operation:"text" or "symbols", query:<specific task anchor>) or read(operation:"source", target:{symbol:<exact id>}); then respond from the returned evidence.`
 		if wire.Instruction != wantInstruction {
 			t.Fatalf("recovery instruction = %q, want %q", wire.Instruction, wantInstruction)
 		}

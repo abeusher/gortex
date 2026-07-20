@@ -103,7 +103,7 @@ func newLocalizationRecoveryCompletion() localizationCompletion {
 		State:             localizationStateNeedsRecovery,
 		Scope:             "localization",
 		RequiredAction:    "recover_once",
-		Instruction:       `Make exactly one bounded Gortex recovery call: search(operation:"text" or "symbols", query:<specific anchor>) or read(operation:"source", target:{symbol:<exact id>}); then respond from the returned evidence.`,
+		Instruction:       `Make exactly one bounded Gortex recovery call: search(operation:"text" or "symbols", query:<specific task anchor>) or read(operation:"source", target:{symbol:<exact id>}); then respond from the returned evidence.`,
 		AllowedToolCalls:  1,
 		ContractVersion:   localizationTerminalContractV2,
 		AllowedOperations: append([]string(nil), localizationRecoveryOperations...),
@@ -460,7 +460,7 @@ func (s *localizationTerminalState) interceptAnswerReady(facade, operation strin
 	case localizationStateAnswerReady:
 		return localizationTerminalResult(s.completionLocked(), facade, operation), 0
 	case localizationStateNeedsRecovery:
-		if localizationRecoveryAllows(facade, operation, arguments) {
+		if s.localizationRecoveryAllowsLocked(facade, operation, arguments) {
 			// Carry the task generation through later schema validation. A stale
 			// invalid request must never consume a newly committed task's recovery.
 			return nil, s.generation
@@ -493,6 +493,52 @@ func localizationRecoveryAllows(facade, operation string, arguments map[string]a
 	}
 }
 
+// localizationRecoveryAllowsLocked keeps the one-shot correction anchored to
+// the user request. Without this check an agent can invent a nearby generic
+// declaration name, receive valid-but-unrelated text hits, and mistake their
+// existence for causal evidence. Exact source reads remain available because
+// their symbol identity is itself a bounded declaration target.
+//
+// s.mu must be held by the caller.
+func (s *localizationTerminalState) localizationRecoveryAllowsLocked(facade, operation string, arguments map[string]any) bool {
+	if !localizationRecoveryAllows(facade, operation, arguments) {
+		return false
+	}
+	if facade != "search" {
+		return true
+	}
+	query, _ := arguments["query"].(string)
+	return localizationRecoveryQueryAligned(s.taskFingerprint, query)
+}
+
+func localizationRecoveryQueryAligned(task, query string) bool {
+	task = strings.TrimSpace(task)
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return false
+	}
+	if task == "" {
+		// Empty task fingerprints occur only in direct state tests and older
+		// sessions. Production recovery is always armed with a localize task.
+		return true
+	}
+	lowerTask := strings.ToLower(task)
+	lowerQuery := strings.ToLower(query)
+	// Preserve compact quoted literals and command-line flags that are too
+	// short for identifier tokenization but occur verbatim in the request.
+	trimmedAnchor := strings.Trim(lowerQuery, " \t\r\n`'\"")
+	if len(trimmedAnchor) >= 2 && strings.Contains(lowerTask, trimmedAnchor) {
+		return true
+	}
+	taskTerms := exploreTerminalTerms(task)
+	for term := range exploreTerminalTerms(query) {
+		if _, aligned := taskTerms[term]; aligned {
+			return true
+		}
+	}
+	return false
+}
+
 func localizationRecoveryOperationAllowed(facade, operation string) bool {
 	switch facade + "." + operation {
 	case "search.text", "search.symbols", "read.source":
@@ -519,7 +565,7 @@ func (s *localizationTerminalState) consumeInvalidRecovery(facade, operation str
 func localizationRecoveryRejectedResult(completion localizationCompletion, facade, operation string) *mcpgo.CallToolResult {
 	return newStructuredErrorResult(StructuredError{
 		ErrorCode: ErrCodeLocalizationTerminal,
-		Message:   "the one bounded localization recovery call must be search.text, search.symbols, or read.source with a concrete query or symbol; localization is now terminal",
+		Message:   "the one bounded localization recovery call must be search.text or search.symbols with a task-aligned query, or read.source with a concrete symbol; localization is now terminal",
 		Retriable: false,
 		Data: map[string]any{
 			"contract":           localizationContractFor(completion),
@@ -652,7 +698,7 @@ func (s *localizationTerminalState) authorizeWithToken(facade, operation string,
 		return localizationTerminalResult(s.completionLocked(), facade, operation), 0
 	}
 	if s.state == localizationStateNeedsRecovery {
-		if localizationRecoveryAllows(facade, operation, arguments) {
+		if s.localizationRecoveryAllowsLocked(facade, operation, arguments) {
 			s.state = localizationStateRecoveryInFlight
 			return nil, s.beginReadReservationLocked()
 		}
