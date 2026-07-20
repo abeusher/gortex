@@ -12,6 +12,7 @@ import (
 
 	"github.com/zzet/gortex/internal/agents"
 	"github.com/zzet/gortex/internal/agents/claudecode"
+	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/progress"
 	"github.com/zzet/gortex/internal/tui"
 )
@@ -19,6 +20,7 @@ import (
 var (
 	uninstallYes             bool
 	uninstallGlobal          bool
+	uninstallPurge           bool
 	uninstallClaudeConfigDir string
 )
 
@@ -43,6 +45,13 @@ config, permission allowlist, hooks, the CLAUDE.md rule block, and the
 gortex skills / commands / sub-agents). --global honors
 $CLAUDE_CONFIG_DIR; target a specific profile with --claude-config-dir.
 
+Pass --purge to additionally tear down the machine-level runtime: stop the
+daemon, remove its OS service unit (launchd / systemd / Task Scheduler),
+and delete the unified ~/.gortex data/cache/config tree — plus the binary
+when it was dropped by the installer script (package-manager installs are
+left to the manager). --purge is orthogonal to per-repo cleanup and can be
+combined with --global.
+
 Destructive by design: the interactive run shows a confirm wizard listing
 every file before any deletion. Non-TTY callers must pass --yes to bypass
 the wizard — that gate is intentional, the safer default is to refuse and
@@ -56,6 +65,7 @@ docs / scripts / muscle memory still work.`,
 func init() {
 	uninstallCmd.Flags().BoolVarP(&uninstallYes, "yes", "y", false, "skip the confirmation prompt (required when stdin is not a TTY)")
 	uninstallCmd.Flags().BoolVar(&uninstallGlobal, "global", false, "also remove the machine-level Claude Code footprint (user MCP config, settings, CLAUDE.md rule block, skills/commands/agents) installed by `gortex install`")
+	uninstallCmd.Flags().BoolVar(&uninstallPurge, "purge", false, "also tear down the machine-level runtime: stop the daemon, remove its OS service unit, and delete the ~/.gortex data/cache/config tree (and the binary, for an installer-script install)")
 	uninstallCmd.Flags().StringVar(&uninstallClaudeConfigDir, "claude-config-dir", "", "Claude Code config root to clean (implies --global); overrides $CLAUDE_CONFIG_DIR, defaults to ~/.claude")
 	uninstallCmd.Flags().StringVar(&uninstallClaudeConfigDir, "config-root", "", "alias for --claude-config-dir")
 	rootCmd.AddCommand(uninstallCmd)
@@ -116,7 +126,20 @@ func runUninstall(cmd *cobra.Command, _ []string) error {
 		globalItems = claudecode.GlobalArtifacts(home)
 	}
 
-	totalPresent := len(presentFiles) + len(presentDirs) + len(globalItems)
+	// --purge extends the removal to the machine-level runtime that `gortex
+	// install` / the daemon created: the OS service unit, the unified
+	// ~/.gortex data/cache/config tree, and (installer-script method) the
+	// binary. Computed up front so the wizard previews the full blast radius.
+	var (
+		purge      purgePlan
+		purgeItems []string
+	)
+	if uninstallPurge {
+		purge = computePurgePlan()
+		purgeItems = purgeWizardItems(purge, daemon.IsRunning())
+	}
+
+	totalPresent := len(presentFiles) + len(presentDirs) + len(globalItems) + len(purgeItems)
 	if totalPresent == 0 {
 		emitUninstallNothingTodo(w)
 		return nil
@@ -129,7 +152,7 @@ func runUninstall(cmd *cobra.Command, _ []string) error {
 		if !progress.IsTTY(w) || noProgress {
 			return fmt.Errorf("`gortex uninstall` is destructive; pass --yes to confirm (or run with a TTY for the interactive prompt)")
 		}
-		accepted, err := runUninstallConfirmWizard(w, presentFiles, presentDirs, globalItems)
+		accepted, err := runUninstallConfirmWizard(w, presentFiles, presentDirs, globalItems, purgeItems)
 		if err != nil {
 			return err
 		}
@@ -152,6 +175,17 @@ func runUninstall(cmd *cobra.Command, _ []string) error {
 		removed += gRemoved
 		failures = append(failures, gFailures...)
 		globalCleaned = true
+	}
+
+	// Machine-level teardown last, so a failure here still reports the
+	// per-repo / global files already removed above.
+	if uninstallPurge {
+		pRemoved, pFailures := executePurge(cmd, purge)
+		removed += pRemoved
+		failures = append(failures, pFailures...)
+		if note := purgeBinaryNote(purge); note != "" {
+			fmt.Fprintln(w, note)
+		}
 	}
 
 	emitUninstallSummary(w, removed, failures, totalPresent, globalCleaned)
@@ -179,8 +213,8 @@ func filterPresentUninstallTargets() ([]string, []string) {
 // runUninstallConfirmWizard renders a confirm wizard listing every target
 // that would be removed, then waits for the user to accept or cancel.
 // Returns accepted=true only on an explicit yes.
-func runUninstallConfirmWizard(w io.Writer, files, dirs, global []string) (bool, error) {
-	items := make([]string, 0, len(files)+len(dirs)+len(global))
+func runUninstallConfirmWizard(w io.Writer, files, dirs, global, purge []string) (bool, error) {
+	items := make([]string, 0, len(files)+len(dirs)+len(global)+len(purge))
 	for _, f := range files {
 		items = append(items, f+"  "+progress.StyleHint.Render("(file)"))
 	}
@@ -190,9 +224,15 @@ func runUninstallConfirmWizard(w io.Writer, files, dirs, global []string) (bool,
 	for _, g := range global {
 		items = append(items, g+"  "+progress.StyleHint.Render("(user-level)"))
 	}
+	for _, p := range purge {
+		items = append(items, p+"  "+progress.StyleHint.Render("(machine-level)"))
+	}
 
 	subtitle := "Remove all Gortex-generated config from this repo."
-	if len(global) > 0 {
+	switch {
+	case len(purge) > 0:
+		subtitle = "Remove Gortex config and tear down the machine-level runtime (daemon, service, ~/.gortex)."
+	case len(global) > 0:
 		subtitle = "Remove Gortex config from this repo and the user-level Claude Code profile."
 	}
 	m := tui.NewConfirmModel(
@@ -200,6 +240,9 @@ func runUninstallConfirmWizard(w io.Writer, files, dirs, global []string) (bool,
 		subtitle,
 	)
 	m.Warning = "This cannot be undone — re-run `gortex init` to restore."
+	if len(purge) > 0 {
+		m.Warning = "This cannot be undone — --purge deletes the daemon's data/cache/config tree."
+	}
 	m.Items = items
 	m.YesLabel = "yes, remove " + strconv.Itoa(len(items)) + " item(s)"
 	m.NoLabel = "no, keep them"
