@@ -86,7 +86,16 @@ func sqliteDSN(path, rawQuery string) string {
 	if absolute, err := filepath.Abs(path); err == nil {
 		path = absolute
 	}
-	escaped := &url.URL{Scheme: "file", Path: filepath.ToSlash(path), RawQuery: rawQuery}
+	slashed := filepath.ToSlash(path)
+	if !strings.HasPrefix(slashed, "/") {
+		// A Windows drive-letter path ("C:/...") must become the URI path
+		// "/C:/..." so url.URL renders file:///C:/... — without the leading
+		// slash it renders file:C:/... and SQLite reads "C:" as a URI
+		// authority ("invalid uri authority: C:"), so the daemon cannot open
+		// a fresh store on Windows at all.
+		slashed = "/" + slashed
+	}
+	escaped := &url.URL{Scheme: "file", Path: slashed, RawQuery: rawQuery}
 	return escaped.String()
 }
 
