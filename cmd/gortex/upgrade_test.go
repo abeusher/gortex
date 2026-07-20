@@ -1,6 +1,14 @@
 package main
 
-import "testing"
+import (
+	"context"
+	"errors"
+	"io"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
 
 // TestUpgradeInstallMethodDetection proves the path-math that maps a binary's
 // location to its install method — so `gortex upgrade` updates the way the user
@@ -44,6 +52,87 @@ func TestUpgradeInstallMethodDetection(t *testing.T) {
 	if cmd, _ := upgradeInstructions(InstallGoInstall, "v0.49.0"); cmd != "go install github.com/zzet/gortex/cmd/gortex@v0.49.0" {
 		t.Errorf("pinned go install cmd = %q", cmd)
 	}
+}
+
+// TestUpgradeRunCommandUsesShellOnlyForPipelines proves --run routes the
+// installer-script pipeline through `sh -c` (so the pipe is interpreted rather
+// than split into raw curl args — issue #281) while plain-argv methods still
+// exec directly with no shell in the way.
+func TestUpgradeRunCommandUsesShellOnlyForPipelines(t *testing.T) {
+	ctx := context.Background()
+	cmd := upgradeExecCommand(ctx, "curl -fsSL https://get.gortex.dev | sh")
+	// Assert on Args[0], not Path: exec.Command resolves a bare name through
+	// LookPath, so Path becomes /bin/sh once sh is on $PATH — Args[0] stays "sh".
+	if got := cmd.Args[0]; got != "sh" {
+		t.Fatalf("script installer should run through sh, got %q args %v", got, cmd.Args)
+	}
+	if len(cmd.Args) != 3 || cmd.Args[1] != "-c" || cmd.Args[2] != "curl -fsSL https://get.gortex.dev | sh" {
+		t.Fatalf("script installer command args = %#v", cmd.Args)
+	}
+
+	cmd = upgradeExecCommand(ctx, "go install github.com/zzet/gortex/cmd/gortex@latest")
+	if got := cmd.Args[0]; got != "go" {
+		t.Fatalf("plain argv command should exec directly, got %q args %v", got, cmd.Args)
+	}
+	if len(cmd.Args) != 3 || cmd.Args[1] != "install" || cmd.Args[2] != "github.com/zzet/gortex/cmd/gortex@latest" {
+		t.Fatalf("go install command args = %#v", cmd.Args)
+	}
+}
+
+// TestRunUpgradeCommandDaemonBounce proves --run bounces the daemon around the
+// binary swap: a manually started daemon is stopped before and restarted after
+// (in that order), a supervised daemon is bounced through its supervisor
+// without a manual stop/start, an idle host just runs the command, and a failed
+// install still brings the daemon back so the host isn't left with it down.
+func TestRunUpgradeCommandDaemonBounce(t *testing.T) {
+	newOps := func(log *[]string, running, supervised bool, stopErr error) upgradeDaemonOps {
+		return upgradeDaemonOps{
+			isRunning:    func() bool { return running },
+			supervised:   func() bool { return supervised },
+			stop:         func() error { *log = append(*log, "stop"); return stopErr },
+			start:        func() error { *log = append(*log, "start"); return nil },
+			superRestart: func(io.Writer) error { *log = append(*log, "superRestart"); return nil },
+		}
+	}
+	runFn := func(log *[]string, err error) func() error {
+		return func() error { *log = append(*log, "run"); return err }
+	}
+
+	t.Run("idle host runs the command only", func(t *testing.T) {
+		var log []string
+		err := runUpgradeCommand(io.Discard, io.Discard, newOps(&log, false, false, nil), runFn(&log, nil))
+		require.NoError(t, err)
+		assert.Equal(t, []string{"run"}, log)
+	})
+
+	t.Run("manual daemon: stop then run then start", func(t *testing.T) {
+		var log []string
+		err := runUpgradeCommand(io.Discard, io.Discard, newOps(&log, true, false, nil), runFn(&log, nil))
+		require.NoError(t, err)
+		assert.Equal(t, []string{"stop", "run", "start"}, log)
+	})
+
+	t.Run("supervised daemon: run then supervisor restart", func(t *testing.T) {
+		var log []string
+		err := runUpgradeCommand(io.Discard, io.Discard, newOps(&log, true, true, nil), runFn(&log, nil))
+		require.NoError(t, err)
+		assert.Equal(t, []string{"run", "superRestart"}, log)
+	})
+
+	t.Run("failed install still restarts the manual daemon", func(t *testing.T) {
+		var log []string
+		boom := errors.New("boom")
+		err := runUpgradeCommand(io.Discard, io.Discard, newOps(&log, true, false, nil), runFn(&log, boom))
+		require.ErrorIs(t, err, boom)
+		assert.Equal(t, []string{"stop", "run", "start"}, log)
+	})
+
+	t.Run("stop failure aborts before the install runs", func(t *testing.T) {
+		var log []string
+		err := runUpgradeCommand(io.Discard, io.Discard, newOps(&log, true, false, errors.New("stopfail")), runFn(&log, nil))
+		require.Error(t, err)
+		assert.Equal(t, []string{"stop"}, log)
+	})
 }
 
 // TestUpgradeReleaseTagParse covers the /releases/latest redirect tag parse.
